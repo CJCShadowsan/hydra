@@ -2079,6 +2079,40 @@ async fn test_api_model_interests_delete_decodes_percent_encoded_model_ref() {
 }
 
 #[tokio::test]
+async fn test_api_model_interests_delete_rejects_empty_model_ref_path() {
+    let state = build_test_mesh_api().await;
+    let (addr, handle) = spawn_management_test_server(state).await;
+    let response = send_management_request(
+        addr,
+        "DELETE /api/model-interests/ HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 400"));
+    let payload = json_body(&response);
+    assert_eq!(payload["error"], json!("Missing model interest path"));
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_api_model_interests_delete_rejects_malformed_model_ref_path() {
+    let state = build_test_mesh_api().await;
+    let (addr, handle) = spawn_management_test_server(state).await;
+    let response = send_management_request(
+        addr,
+        "DELETE /api/model-interests/Qwen%2 HTTP/1.1\r\nHost: localhost\r\n\r\n".into(),
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 400"));
+    let payload = json_body(&response);
+    assert_eq!(payload["error"], json!("Missing model interest path"));
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn test_api_model_interests_reject_direct_urls() {
     let state = build_test_mesh_api().await;
     let (addr, handle) = spawn_management_test_server(state).await;
