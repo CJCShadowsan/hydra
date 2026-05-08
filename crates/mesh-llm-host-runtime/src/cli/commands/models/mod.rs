@@ -6,6 +6,9 @@ use crate::cli::commands::model_package;
 use crate::cli::models::ModelSearchSort;
 use crate::cli::models::ModelsCommand;
 use crate::cli::terminal_progress::{clear_stderr_line, start_spinner, DeterminateProgressLine};
+use crate::inference::skippy::{
+    certify_layer_package, CertificationGateStatus, SkippyCertificationRequest,
+};
 use crate::models::{
     delete, download_model_ref_with_progress_details, find_remote_catalog_model_exact,
     installed_model_capabilities, load_model_usage_record_for_path, model_usage_cache_dir,
@@ -198,6 +201,101 @@ pub fn run_model_installed(json_output: bool) -> Result<()> {
     formatter.render_installed(&rows)
 }
 
+pub async fn run_model_certify(
+    model: &str,
+    report_out: Option<&std::path::Path>,
+    json_output: bool,
+    package_only: bool,
+    api_base: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<()> {
+    let api_base = api_base.map(str::trim).filter(|value| !value.is_empty());
+    validate_model_certify_options(package_only, api_base, prompt, max_tokens)?;
+
+    let report = certify_layer_package(SkippyCertificationRequest {
+        model_ref: model.to_string(),
+        package_only,
+        api_base: api_base.map(ToString::to_string),
+        prompt: prompt.to_string(),
+        max_tokens,
+    })
+    .await?;
+    let report_json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = report_out {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(path, format!("{report_json}\n"))?;
+    }
+    if json_output {
+        println!("{report_json}");
+    } else {
+        println!(
+            "Skippy package certification: {}",
+            status_label(report.status)
+        );
+        println!("Model: {}", report.model_id);
+        println!("Package: {}", report.resolved_package_ref);
+        println!("Manifest: {}", report.manifest_sha256);
+        println!("Layers: {}", report.layer_count);
+        if let Some(path) = report_out {
+            println!("Report: {}", path.display());
+        }
+    }
+    if report.status != CertificationGateStatus::Passed {
+        bail!(
+            "skippy package certification {}",
+            status_label(report.status)
+        );
+    }
+    Ok(())
+}
+
+fn validate_model_certify_options(
+    package_only: bool,
+    api_base: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<()> {
+    let api_base = api_base.map(str::trim).filter(|value| !value.is_empty());
+    if package_only {
+        if api_base.is_some() {
+            bail!("Do not combine --package-only with --api-base; remove --package-only to run runtime smoke gates.");
+        }
+        return Ok(());
+    }
+
+    let Some(api_base) = api_base else {
+        bail!(
+            "models certify requires either --package-only or --api-base for runtime smoke gates"
+        );
+    };
+    let parsed = reqwest::Url::parse(api_base)
+        .map_err(|error| anyhow!("invalid --api-base {api_base:?}: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        bail!("--api-base must be an http(s) URL with a host");
+    }
+    if prompt.trim().is_empty() {
+        bail!("--prompt must not be empty when runtime smoke gates are enabled");
+    }
+    if max_tokens == 0 {
+        bail!("--max-tokens must be greater than 0 when runtime smoke gates are enabled");
+    }
+    Ok(())
+}
+
+fn status_label(status: CertificationGateStatus) -> &'static str {
+    match status {
+        CertificationGateStatus::Passed => "passed",
+        CertificationGateStatus::Failed => "failed",
+        CertificationGateStatus::Incomplete => "incomplete",
+        CertificationGateStatus::NotRequired => "not required",
+    }
+}
+
 pub fn run_model_cleanup(unused_since: Option<&str>, yes: bool, json_output: bool) -> Result<()> {
     let unused_duration = unused_since.map(parse_cleanup_age).transpose()?;
     let plan = plan_model_cleanup(unused_duration)?;
@@ -368,6 +466,26 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             json,
         } => run_model_cleanup(unused_since.as_deref(), *yes, *json)?,
         ModelsCommand::Prune { yes, json } => run_model_prune(*yes, *json)?,
+        ModelsCommand::Certify {
+            model,
+            report_out,
+            json,
+            package_only,
+            api_base,
+            prompt,
+            max_tokens,
+        } => {
+            run_model_certify(
+                model,
+                report_out.as_deref(),
+                *json,
+                *package_only,
+                api_base.as_deref(),
+                prompt,
+                *max_tokens,
+            )
+            .await?
+        }
         ModelsCommand::Search {
             query,
             gguf,
@@ -652,7 +770,10 @@ fn map_search_sort(sort: ModelSearchSort) -> SearchSort {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_delete_preview_model, build_installed_rows, parse_cleanup_age};
+    use super::{
+        build_delete_preview_model, build_installed_rows, parse_cleanup_age,
+        validate_model_certify_options,
+    };
     use serial_test::serial;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -716,6 +837,55 @@ mod tests {
         assert!(parse_cleanup_age("30").is_err());
         assert!(parse_cleanup_age("2months").is_err());
         assert!(parse_cleanup_age("").is_err());
+    }
+
+    #[test]
+    fn model_certify_requires_explicit_certification_mode() {
+        let error = validate_model_certify_options(false, None, "Say ok.", 2)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--package-only"), "{error}");
+        assert!(error.contains("--api-base"), "{error}");
+    }
+
+    #[test]
+    fn model_certify_rejects_ambiguous_package_and_runtime_modes() {
+        let error =
+            validate_model_certify_options(true, Some("http://127.0.0.1:9337"), "Say ok.", 2)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("Do not combine"), "{error}");
+    }
+
+    #[test]
+    fn model_certify_rejects_empty_runtime_prompt() {
+        let error = validate_model_certify_options(false, Some("http://127.0.0.1:9337"), "   ", 2)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--prompt"), "{error}");
+    }
+
+    #[test]
+    fn model_certify_rejects_zero_runtime_tokens() {
+        let error =
+            validate_model_certify_options(false, Some("http://127.0.0.1:9337"), "Say ok.", 0)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("--max-tokens"), "{error}");
+    }
+
+    #[test]
+    fn model_certify_rejects_non_http_runtime_base() {
+        let error = validate_model_certify_options(false, Some("file:///tmp/api"), "Say ok.", 2)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--api-base"), "{error}");
+        assert!(error.contains("http"), "{error}");
     }
 
     #[test]

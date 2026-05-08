@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod certification;
 mod deployment;
 mod family_policy;
 mod hooks;
@@ -30,6 +31,9 @@ use skippy_server::{
     EmbeddedRuntimeStatus, EmbeddedServerHandle, EmbeddedState, SkippyRuntimeHandle,
 };
 
+pub(crate) use certification::{
+    certify_layer_package, CertificationGateStatus, SkippyCertificationRequest,
+};
 pub(crate) use family_policy::{family_policy_for_model_path, family_policy_for_stage_config};
 pub(crate) use hooks::MeshAutoHookPolicy;
 pub(crate) use kv_cache::KvCachePolicy;

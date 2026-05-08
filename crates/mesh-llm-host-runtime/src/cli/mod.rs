@@ -1300,4 +1300,42 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
     }
+
+    #[test]
+    fn models_certify_parses_package_gate_options() {
+        let cli = Cli::parse_from([
+            "mesh-llm",
+            "models",
+            "certify",
+            "hf://meshllm/demo-layers@abc123",
+            "--package-only",
+            "--report-out",
+            "/tmp/cert.json",
+            "--json",
+            "--prompt",
+            "Say ok.",
+            "--max-tokens",
+            "2",
+        ]);
+
+        match cli.command.expect("models command expected") {
+            Command::Models {
+                command:
+                    ModelsCommand::Certify {
+                        model,
+                        package_only: true,
+                        json: true,
+                        report_out: Some(report_out),
+                        prompt,
+                        max_tokens: 2,
+                        ..
+                    },
+            } => {
+                assert_eq!(model, "hf://meshllm/demo-layers@abc123");
+                assert_eq!(report_out, std::path::PathBuf::from("/tmp/cert.json"));
+                assert_eq!(prompt, "Say ok.");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

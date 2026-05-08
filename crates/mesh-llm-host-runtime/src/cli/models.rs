@@ -100,6 +100,29 @@ pub enum ModelsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Certify a Skippy layer package can be resolved, verified, and smoke-tested.
+    Certify {
+        /// Exact layer package ref, local package dir, or catalog model ref with a package mapping.
+        model: String,
+        /// Write the JSON certification report to this path.
+        #[arg(long)]
+        report_out: Option<std::path::PathBuf>,
+        /// Emit JSON output.
+        #[arg(long)]
+        json: bool,
+        /// Stop after package resolution, integrity checks, and local stage materialization.
+        #[arg(long)]
+        package_only: bool,
+        /// Existing mesh-llm OpenAI-compatible API base for runtime smoke gates.
+        #[arg(long)]
+        api_base: Option<String>,
+        /// Prompt for runtime smoke gates.
+        #[arg(long, default_value = "Say ok.")]
+        prompt: String,
+        /// Maximum tokens for runtime smoke gates.
+        #[arg(long, default_value_t = 2)]
+        max_tokens: u32,
+    },
     // Delete variant defined with explicit clap args later in file (existing block).
     /// List remote catalog models.
     #[command(hide = true)]

@@ -99,6 +99,7 @@ Subcommands:
 - `search`
 - `show`
 - `download`
+- `certify`
 - `updates`
 
 ### `models recommended`
@@ -167,6 +168,33 @@ Switches:
 
 - `--draft`: also download the recommended draft model (if available).
 - `--json`: machine-readable output.
+
+### `models certify`
+
+Use this when you want a repeatable Skippy layer-package confidence report
+before treating a split package as ready for a release or rollout.
+
+Choose exactly one mode: use `--package-only` for package integrity and local
+stage materialization, or pass `--api-base` to also prove an already running
+OpenAI-compatible mesh endpoint. Runtime certification checks the model list and
+requires real text-bearing responses from both chat completions and Responses
+API smoke requests, not only successful HTTP status codes.
+
+Usage:
+
+```bash
+mesh-llm models certify hf://meshllm/Qwen3-8B-Q4_K_M-layers --package-only --report-out cert.json
+mesh-llm models certify unsloth/Qwen3-8B-GGUF:Q4_K_M --api-base http://127.0.0.1:9337 --json
+```
+
+Switches:
+
+- `--package-only`: verify package resolution, artifact integrity, and local stage materialization without claiming runtime OpenAI readiness.
+- `--api-base <URL>`: run `/v1/models`, `/v1/chat/completions`, and `/v1/responses` smoke gates against an already running mesh-llm API. The URL must be an `http` or `https` base URL.
+- `--report-out <PATH>`: write the JSON certification report to disk.
+- `--prompt <PROMPT>`: prompt for runtime smoke gates.
+- `--max-tokens <N>`: max tokens for runtime smoke gates. Must be greater than zero when runtime gates are enabled.
+- `--json`: print the certification report.
 
 ### `models updates`
 
