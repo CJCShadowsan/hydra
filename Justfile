@@ -274,7 +274,7 @@ benchmark-build-intel-windows:
 ui-dev api="http://127.0.0.1:3131" port="5173":
     #!/usr/bin/env bash
     set -euo pipefail
-    cd "{{ ui_dir }}"
+    cd "{{ ui_preview_dir }}"
     MESH_UI_API_ORIGIN="{{ api }}" npm run dev -- --host 0.0.0.0 --port {{ port }}
 
 # Run the preview UI with Vite HMR and proxy /api to mesh-llm (default: http://127.0.0.1:3131)
@@ -292,7 +292,7 @@ ui-preview-public: (ui-dev-preview "https://meshllm.cloud" "5174" "https://meshl
 
 # Run UI unit tests (vitest)
 ui-test:
-    cd "{{ ui_dir }}" && npm test
+    cd "{{ ui_preview_dir }}" && npm test
 
 # Start a lite client — no GPU, no model, just a local HTTP proxy to the mesh host.
 
@@ -317,12 +317,13 @@ llama-summary old new:
 # Clean UI build artifacts (node_modules, dist). Fixes stale npm state.
 [unix]
 clean-ui:
-    cd "{{ ui_dir }}" && rm -rf node_modules dist
+    cd "{{ ui_preview_dir }}" && rm -rf node_modules dist
+    rm -rf "{{ ui_dir }}/dist"
     echo "Cleaned UI: node_modules + dist removed"
 
 [windows]
 clean-ui:
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location '{{ ui_dir }}'; Remove-Item -Recurse -Force node_modules,dist -ErrorAction SilentlyContinue"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location '{{ ui_preview_dir }}'; Remove-Item -Recurse -Force node_modules,dist -ErrorAction SilentlyContinue; Set-Location '{{ ui_dir }}'; Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue"
     echo "Cleaned UI: node_modules + dist removed"
 # Stop mesh-llm processes
 stop:
