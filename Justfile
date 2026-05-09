@@ -318,12 +318,12 @@ llama-summary old new:
 [unix]
 clean-ui:
     cd "{{ ui_preview_dir }}" && rm -rf node_modules dist
-    rm -rf "{{ ui_dir }}/dist"
+    rm -rf "{{ ui_dir }}/dist" "{{ ui_dir }}/node_modules"
     echo "Cleaned UI: node_modules + dist removed"
 
 [windows]
 clean-ui:
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location '{{ ui_preview_dir }}'; Remove-Item -Recurse -Force node_modules,dist -ErrorAction SilentlyContinue; Set-Location '{{ ui_dir }}'; Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-Location '{{ ui_preview_dir }}'; Remove-Item -Recurse -Force node_modules,dist -ErrorAction SilentlyContinue; Set-Location '{{ ui_dir }}'; Remove-Item -Recurse -Force dist,node_modules -ErrorAction SilentlyContinue"
     echo "Cleaned UI: node_modules + dist removed"
 # Stop mesh-llm processes
 stop:

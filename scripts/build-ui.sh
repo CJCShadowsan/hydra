@@ -16,6 +16,7 @@ ui_build_inputs=(
     "$PREVIEW_DIR/vite.config.ts"
     "$PREVIEW_DIR/tsconfig.json"
     "$PREVIEW_DIR/tsconfig.app.json"
+    "$PREVIEW_DIR/tsconfig.node.json"
     "$PREVIEW_DIR/index.html"
     "$PREVIEW_DIR/src"
     "$PREVIEW_DIR/public"
