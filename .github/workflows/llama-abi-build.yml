@@ -1,6 +1,7 @@
 name: Build shared llama.cpp CPU ABI cache
 
 on:
+  workflow_call:
   # TEMPORARY: also runs on PRs to test shared CPU ABI cache flow — remove after verification
   pull_request:
     paths:
