@@ -63,8 +63,14 @@ jobs:
       - name: Format check (all crates)
         run: cargo fmt --all -- --check
 
-  rust-clippy-batches:
+  # Warm CPU ABI cache before clippy runs. Only on PRs where Rust changes detected.
+  warm_llama_cpu:
     needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.all_rust_changed == 'true' }}
+    uses: ./.github/workflows/llama-abi-build.yml
+
+  rust-clippy-batches:
+    needs: [changes, warm_llama_cpu]
     if: ${{ needs.changes.outputs.affected_crates != '[]' }}
     runs-on: ubuntu-latest
     env:
@@ -89,7 +95,7 @@ jobs:
           prefix-key: mesh-llm-rust-pr-checks-${{ hashFiles('.github/cache-version.txt') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Restore shared CPU ABI build
+      - name: Restore shared CPU ABI build (required)
         id: llama_cache_cpu
         if: ${{ needs.changes.outputs.all_rust_changed == 'true' || matrix.batch == 0 }}
         uses: actions/cache/restore@v5
@@ -97,11 +103,11 @@ jobs:
           path: .deps/llama-build/build-stage-abi-cpu
           key: mesh-llm-skippy-abi-cpu-${{ hashFiles('third_party/llama.cpp/upstream.txt') }}-${{ hashFiles('scripts/build-llama.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/workflows/ci.yml', '.github/workflows/pr-checks.yml', '.github/workflows/warm-caches.yml', '.github/workflows/gpu-warm-cache-job.yml', '.github/workflows/llama-abi-build.yml', '.github/workflows/llama-cache-keys.yml', '.github/cache-version.txt') }}
 
-      - name: Prepare & build CPU ABI on cache miss
+      - name: Verify CPU ABI cache hit
         if: ${{ (needs.changes.outputs.all_rust_changed == 'true' || matrix.batch == 0) && steps.llama_cache_cpu.outputs.cache-hit != 'true' }}
         run: |
-          scripts/prepare-llama.sh pinned
-          LLAMA_STAGE_BUILD_DIR=.deps/llama-build/build-stage-abi-cpu scripts/build-llama.sh
+          echo "::error::CPU ABI cache miss — llama.cpp build not available. This is unexpected on PRs."
+          exit 1
 
       - name: Clippy (all crates — shared file changed)
         if: ${{ needs.changes.outputs.all_rust_changed == 'true' && matrix.batch == 0 }}
