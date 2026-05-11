@@ -41,6 +41,7 @@ pub(crate) use materialization::{
     configure_materialized_stage_cache, is_layer_package_ref, materialize_stage_config,
     materialized_stage_cache_dir, materialized_stages_for_sources,
     prune_unpinned_materialized_stages, remove_materialized_stages_for_sources,
+    resolve_hf_package_to_local,
 };
 pub(crate) use package::{
     identity_from_layer_package, synthetic_direct_gguf_package, SkippyPackageIdentity,

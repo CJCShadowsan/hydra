@@ -281,6 +281,14 @@ impl GgufKvCacheType {
         }
     }
 
+    pub const fn as_llama_arg(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+        }
+    }
+
     fn block_shape(self) -> (u64, u64) {
         match self {
             Self::F16 => (1, 2),
@@ -305,14 +313,47 @@ pub struct GgufKvCacheQuant {
 }
 
 impl GgufKvCacheQuant {
+    /// f16 K + f16 V — highest quality, largest KV cache.
+    pub const F16: Self = Self {
+        k: GgufKvCacheType::F16,
+        v: GgufKvCacheType::F16,
+    };
+
+    /// q8_0 K + q8_0 V — moderate compression.
+    pub const Q8_0: Self = Self {
+        k: GgufKvCacheType::Q8_0,
+        v: GgufKvCacheType::Q8_0,
+    };
+
+    /// q4_0 K + q4_0 V — most aggressive compression, smallest KV cache.
+    pub const Q4_0: Self = Self {
+        k: GgufKvCacheType::Q4_0,
+        v: GgufKvCacheType::Q4_0,
+    };
+
     pub const fn new(k: GgufKvCacheType, v: GgufKvCacheType) -> Self {
         Self { k, v }
     }
 
     pub const fn f16() -> Self {
-        Self {
-            k: GgufKvCacheType::F16,
-            v: GgufKvCacheType::F16,
+        Self::F16
+    }
+
+    /// Returns `true` if `self` uses more aggressive (smaller) quantisation
+    /// than `other`.
+    pub const fn is_more_aggressive_than(self, other: Self) -> bool {
+        Self::aggressiveness(self) > Self::aggressiveness(other)
+    }
+
+    const fn aggressiveness(q: Self) -> u8 {
+        Self::type_aggressiveness(q.k) + Self::type_aggressiveness(q.v)
+    }
+
+    const fn type_aggressiveness(t: GgufKvCacheType) -> u8 {
+        match t {
+            GgufKvCacheType::F16 => 0,
+            GgufKvCacheType::Q8_0 => 1,
+            GgufKvCacheType::Q4_0 => 2,
         }
     }
 
