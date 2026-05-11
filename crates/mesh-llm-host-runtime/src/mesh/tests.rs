@@ -61,6 +61,9 @@ fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
         shutdown_generation: 3,
+        coordinator_term: 11,
+        coordinator_id: None,
+        lease_until_unix_ms: 999_999,
         load_mode: skippy_protocol::LoadMode::RuntimeSlice,
         upstream: None,
         downstream: None,
@@ -1835,12 +1838,19 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
                 canonical_ref: Some("hf/bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf".into()),
                 repository: Some("bartowski/Qwen3-8B-GGUF".into()),
                 revision: Some("main".into()),
+                artifact: Some("Qwen3-8B-Q4_K_M.gguf".into()),
+                local_file_name: Some("Qwen3-8B-Q4_K_M.gguf".into()),
+                identity_hash: Some("identity-hash".into()),
             },
-            format: ModelFormat::LlamaGGUF,
-            quantization: "Q4_K_M".to_string(),
-            size_bytes: 4_800_000_000,
+            capabilities: Default::default(),
+            topology: None,
         }],
-        served_model_runtime: vec![],
+        served_model_runtime: vec![ModelRuntimeDescriptor {
+            model_name: "Qwen3-8B-Q4_K_M".to_string(),
+            identity_hash: Some("identity-hash".to_string()),
+            context_length: Some(32768),
+            ready: true,
+        }],
         owner_attestation: None,
         artifact_transfer_supported: false,
         stage_status_list_supported: false,
@@ -2078,7 +2088,7 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         latency_observer_id: None,
     };
 
-    apply_transitive_ann(&mut existing, &addr, &ann, test_endpoint_id(0xee));
+    apply_transitive_ann(&mut existing, &addr, &ann, make_test_endpoint_id(0xee));
 
     assert!(
         existing.available_models.is_empty(),
@@ -2162,7 +2172,7 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         latency_observer_id: None,
     };
 
-    apply_transitive_ann(&mut existing, &weak_addr, &ann, test_endpoint_id(0xee));
+    apply_transitive_ann(&mut existing, &weak_addr, &ann, make_test_endpoint_id(0xee));
 
     assert_eq!(
         existing.addr.addrs.len(),
@@ -2214,8 +2224,17 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         owner_attestation: None,
         artifact_transfer_supported: true,
         stage_status_list_supported: true,
+        latency_ms: None,
+        latency_source: None,
+        latency_age_ms: None,
+        latency_observer_id: None,
     };
-    apply_transitive_ann(&mut existing, &richer_addr, &ann2, test_endpoint_id(0xee));
+    apply_transitive_ann(
+        &mut existing,
+        &richer_addr,
+        &ann2,
+        make_test_endpoint_id(0xee),
+    );
 
     assert_eq!(
         existing.addr.addrs.len(),
@@ -2792,7 +2811,7 @@ fn transitive_peer_update_refreshes_last_mentioned() {
         latency_observer_id: None,
     };
 
-    apply_transitive_ann(&mut peer, &addr, &ann, test_endpoint_id(0xee));
+    apply_transitive_ann(&mut peer, &addr, &ann, make_test_endpoint_id(0xee));
 
     // Before refreshing last_mentioned, verify the peer WOULD be pruned.
     let prune_cutoff_pre =
@@ -5586,6 +5605,9 @@ fn test_stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         cache_type_v: "f16".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
         shutdown_generation: 7,
+        coordinator_term: 11,
+        coordinator_id: Some(make_test_endpoint_id(0x70)),
+        lease_until_unix_ms: 999_999,
         load_mode: skippy_protocol::LoadMode::RuntimeSlice,
         upstream: None,
         downstream: Some(crate::inference::skippy::StagePeerDescriptor {
@@ -5617,6 +5639,9 @@ fn test_preparation_status(
         bind_addr: Some("127.0.0.1:51234".to_string()),
         error: None,
         shutdown_generation: 7,
+        coordinator_term: 11,
+        coordinator_id: Some(make_test_endpoint_id(0x70)),
+        lease_until_unix_ms: 999_999,
     }
 }
 

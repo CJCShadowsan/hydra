@@ -1969,15 +1969,16 @@ impl Node {
         request: &crate::inference::skippy::StageControlRequest,
     ) -> std::time::Duration {
         match request {
-            crate::inference::skippy::StageControlRequest::Load(load) => {
-                crate::inference::skippy::stage_load_timeout(load)
-            }
-            crate::inference::skippy::StageControlRequest::Stop(_)
+            crate::inference::skippy::StageControlRequest::Claim(_)
+            | crate::inference::skippy::StageControlRequest::Stop(_)
             | crate::inference::skippy::StageControlRequest::Status(_)
             | crate::inference::skippy::StageControlRequest::Inventory(_)
             | crate::inference::skippy::StageControlRequest::CancelPrepare(_)
             | crate::inference::skippy::StageControlRequest::StatusUpdate(_) => {
                 std::time::Duration::from_secs(30)
+            }
+            crate::inference::skippy::StageControlRequest::Load(load) => {
+                crate::inference::skippy::stage_load_timeout(load)
             }
             crate::inference::skippy::StageControlRequest::Prepare(prepare) => {
                 crate::inference::skippy::stage_load_timeout(&prepare.load)
@@ -4585,6 +4586,7 @@ impl Node {
         request: &mut crate::inference::skippy::StageControlRequest,
     ) -> anyhow::Result<()> {
         match request {
+            crate::inference::skippy::StageControlRequest::Claim(_) => {}
             crate::inference::skippy::StageControlRequest::Load(load) => {
                 if load.load_mode == skippy_protocol::LoadMode::RuntimeSlice
                     && load
@@ -5832,6 +5834,9 @@ fn stage_snapshot_from_runtime_status(
         flash_attn_type: status.flash_attn_type,
         error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
     }
 }
 
@@ -5865,6 +5870,9 @@ fn stage_control_request_to_proto(
     use skippy_stage_proto::stage_control_request::Command;
 
     let command = match request {
+        crate::inference::skippy::StageControlRequest::Claim(claim) => {
+            Command::ClaimCoordinator(stage_coordinator_claim_to_proto(claim))
+        }
         crate::inference::skippy::StageControlRequest::Load(load) => {
             Command::LoadStage(stage_load_to_proto(load))
         }
@@ -5874,6 +5882,7 @@ fn stage_control_request_to_proto(
                 run_id: stop.run_id,
                 stage_id: stop.stage_id,
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
             })
         }
         crate::inference::skippy::StageControlRequest::Status(status) => {
@@ -5948,6 +5957,9 @@ fn stage_load_to_proto(
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_to_proto(load.flash_attn_type) as i32,
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: load.lease_until_unix_ms,
         load_mode: match load.load_mode {
             skippy_protocol::LoadMode::RuntimeSlice => {
                 skippy_stage_proto::StageLoadMode::RuntimeSlice as i32
@@ -5961,6 +5973,23 @@ fn stage_load_to_proto(
         },
         upstream: load.upstream.map(stage_peer_to_proto),
         downstream: load.downstream.map(stage_peer_to_proto),
+    }
+}
+
+fn stage_coordinator_claim_to_proto(
+    claim: crate::inference::skippy::StageCoordinatorClaim,
+) -> skippy_stage_proto::ClaimCoordinator {
+    skippy_stage_proto::ClaimCoordinator {
+        model_id: claim.model_id,
+        package_ref: claim.package_ref,
+        manifest_sha256: claim.manifest_sha256,
+        topology_id: claim.topology_id,
+        run_id: claim.run_id,
+        coordinator_id: claim.coordinator_id,
+        coordinator_term: claim.coordinator_term,
+        participant_set_hash: claim.participant_set_hash,
+        topology_hash: claim.topology_hash,
+        lease_until_unix_ms: claim.lease_until_unix_ms,
     }
 }
 
@@ -5993,6 +6022,11 @@ fn stage_control_request_from_proto(
         .command
         .ok_or_else(|| anyhow::anyhow!("missing stage control command"))?
     {
+        Command::ClaimCoordinator(claim) => {
+            Ok(crate::inference::skippy::StageControlRequest::Claim(
+                stage_coordinator_claim_from_proto(claim)?,
+            ))
+        }
         Command::LoadStage(load) => Ok(crate::inference::skippy::StageControlRequest::Load(
             stage_load_from_proto(load)?,
         )),
@@ -6002,6 +6036,7 @@ fn stage_control_request_from_proto(
                 run_id: stop.run_id,
                 stage_id: stop.stage_id,
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
             },
         )),
         Command::GetStageStatus(status) => {
@@ -6096,9 +6131,33 @@ fn stage_load_from_proto(
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_from_proto(load.flash_attn_type),
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load
+            .coordinator_id
+            .map(|id| id.parse())
+            .transpose()
+            .context("invalid stage load coordinator_id")?,
+        lease_until_unix_ms: load.lease_until_unix_ms,
         load_mode: stage_load_mode_from_proto(load.load_mode),
         upstream: load.upstream.map(stage_peer_from_proto).transpose()?,
         downstream: load.downstream.map(stage_peer_from_proto).transpose()?,
+    })
+}
+
+fn stage_coordinator_claim_from_proto(
+    claim: skippy_stage_proto::ClaimCoordinator,
+) -> anyhow::Result<crate::inference::skippy::StageCoordinatorClaim> {
+    Ok(crate::inference::skippy::StageCoordinatorClaim {
+        model_id: claim.model_id,
+        package_ref: claim.package_ref,
+        manifest_sha256: claim.manifest_sha256,
+        topology_id: claim.topology_id,
+        run_id: claim.run_id,
+        coordinator_id: claim.coordinator_id,
+        coordinator_term: claim.coordinator_term,
+        participant_set_hash: claim.participant_set_hash,
+        topology_hash: claim.topology_hash,
+        lease_until_unix_ms: claim.lease_until_unix_ms,
     })
 }
 
@@ -6168,6 +6227,15 @@ fn stage_control_unavailable_response(
     request: crate::inference::skippy::StageControlRequest,
 ) -> crate::inference::skippy::StageControlResponse {
     let status = match request {
+        crate::inference::skippy::StageControlRequest::Claim(claim) => {
+            return crate::inference::skippy::StageControlResponse::ClaimAccepted(
+                crate::inference::skippy::StageCoordinatorClaimAck {
+                    accepted: false,
+                    claim,
+                    error: Some("stage control is not available".to_string()),
+                },
+            );
+        }
         crate::inference::skippy::StageControlRequest::Load(load) => {
             stage_status_from_load(&load, crate::inference::skippy::StageRuntimeState::Failed)
         }
@@ -6201,6 +6269,9 @@ fn stage_control_unavailable_response(
                 flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
                 error: Some("stage control is not available".to_string()),
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
+                coordinator_id: None,
+                lease_until_unix_ms: 0,
             }
         }
         crate::inference::skippy::StageControlRequest::Status(_) => {
@@ -6296,6 +6367,9 @@ fn stage_status_from_load(
         flash_attn_type: load.flash_attn_type,
         error: Some("stage control is not available".to_string()),
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
     }
 }
 
@@ -6321,6 +6395,9 @@ fn stage_preparation_status_from_load(
         bind_addr: None,
         error,
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
     }
 }
 
@@ -6346,6 +6423,9 @@ fn stage_preparation_status_from_cancel(
         bind_addr: None,
         error,
         shutdown_generation: cancel.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
     }
 }
 
@@ -6356,6 +6436,13 @@ fn stage_control_response_to_proto(
     use skippy_stage_proto::stage_control_response::Response;
 
     let response = match response {
+        crate::inference::skippy::StageControlResponse::ClaimAccepted(accepted) => {
+            Response::CoordinatorClaimAccepted(skippy_stage_proto::CoordinatorClaimAccepted {
+                accepted: accepted.accepted,
+                claim: Some(stage_coordinator_claim_to_proto(accepted.claim)),
+                error: accepted.error,
+            })
+        }
         crate::inference::skippy::StageControlResponse::Ready(ready) => {
             Response::StageReady(skippy_stage_proto::StageReady {
                 accepted: ready.accepted,
@@ -6414,6 +6501,20 @@ fn stage_control_response_from_proto(
         .response
         .ok_or_else(|| anyhow::anyhow!("missing stage control response"))?
     {
+        Response::CoordinatorClaimAccepted(accepted) => {
+            let claim = accepted
+                .claim
+                .ok_or_else(|| anyhow::anyhow!("coordinator claim accepted missing claim"))?;
+            Ok(
+                crate::inference::skippy::StageControlResponse::ClaimAccepted(
+                    crate::inference::skippy::StageCoordinatorClaimAck {
+                        accepted: accepted.accepted,
+                        claim: stage_coordinator_claim_from_proto(claim)?,
+                        error: accepted.error,
+                    },
+                ),
+            )
+        }
         Response::StageReady(ready) => {
             let status = ready
                 .status
@@ -6619,6 +6720,9 @@ fn stage_preparation_status_to_proto(
         bind_addr: status.bind_addr,
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6642,6 +6746,9 @@ fn stage_preparation_status_from_proto(
         bind_addr: status.bind_addr,
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.and_then(|id| id.parse().ok()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6677,6 +6784,9 @@ fn stage_status_to_proto(
         materialized_pinned: Some(status.materialized_pinned),
         projector_path: status.projector_path,
         flash_attn_type: stage_flash_attn_type_to_proto(status.flash_attn_type) as i32,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6719,6 +6829,13 @@ fn stage_status_from_proto(
         flash_attn_type: stage_flash_attn_type_from_proto(status.flash_attn_type),
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status
+            .coordinator_id
+            .map(|id| id.parse())
+            .transpose()
+            .context("invalid stage status coordinator_id")?,
+        lease_until_unix_ms: status.lease_until_unix_ms,
     })
 }
 

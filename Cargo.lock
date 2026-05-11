@@ -4101,6 +4101,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
+ "skippy-coordinator",
  "skippy-protocol",
  "skippy-runtime",
  "skippy-server",
@@ -7188,6 +7189,13 @@ dependencies = [
  "anyhow",
  "blake3",
  "skippy-protocol",
+]
+
+[[package]]
+name = "skippy-coordinator"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]

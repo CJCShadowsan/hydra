@@ -48,10 +48,11 @@ pub(crate) use package::{
 pub(crate) use stage::{
     spawn_stage_control_loop, stage_load_timeout, LayerRange, SourceModelKind,
     StageCancelPrepareRequest, StageControlCommand, StageControlRequest, StageControlResponse,
-    StageInventoryRequest, StageLayerInventory, StageLoadRequest, StagePackagePrefetcher,
-    StagePeerDescriptor, StagePreparationState, StagePreparationStatus,
-    StagePrepareAcceptedResponse, StagePrepareRequest, StageReadyResponse, StageRuntimeState,
-    StageStatusAck, StageStatusFilter, StageStatusSnapshot, StageStopRequest, StageWireDType,
+    StageCoordinatorClaim, StageCoordinatorClaimAck, StageInventoryRequest, StageLayerInventory,
+    StageLoadRequest, StagePackagePrefetcher, StagePeerDescriptor, StagePreparationState,
+    StagePreparationStatus, StagePrepareAcceptedResponse, StagePrepareRequest, StageReadyResponse,
+    StageRuntimeState, StageStatusAck, StageStatusFilter, StageStatusSnapshot, StageStopRequest,
+    StageWireDType,
 };
 pub(crate) use topology::{plan_package_identity_topology, StageTopologyParticipant};
 

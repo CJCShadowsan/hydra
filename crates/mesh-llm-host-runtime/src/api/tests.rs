@@ -1536,6 +1536,9 @@ async fn runtime_data_api_routes_remain_payload_stable() {
             flash_attn_type: skippy_protocol::FlashAttentionType::Enabled,
             error: None,
             shutdown_generation: 7,
+            coordinator_term: 11,
+            coordinator_id: Some(node.id()),
+            lease_until_unix_ms: 999_999,
         },
     )
     .await;

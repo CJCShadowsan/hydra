@@ -695,6 +695,7 @@ mod tests {
                 run_id: "run-a".to_string(),
                 stage_id: "stage-0".to_string(),
                 shutdown_generation: 7,
+                coordinator_term: 7,
             })),
             ..frame.clone()
         };

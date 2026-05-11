@@ -42,6 +42,9 @@ fn load_request() -> StageLoadRequest {
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: FlashAttentionType::Enabled,
         shutdown_generation: 7,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
         load_mode: LoadMode::RuntimeSlice,
         upstream: None,
         downstream: Some(StagePeerDescriptor {
@@ -50,6 +53,28 @@ fn load_request() -> StageLoadRequest {
             endpoint: "127.0.0.1:9001".to_string(),
             node_id: None,
         }),
+    }
+}
+
+fn coordinator_id() -> iroh::EndpointId {
+    iroh::EndpointId::from(iroh::SecretKey::from_bytes(&[0x5a; 32]).public())
+}
+
+fn coordinator_claim_from_load(
+    load: &StageLoadRequest,
+    coordinator_id: iroh::EndpointId,
+) -> StageCoordinatorClaim {
+    StageCoordinatorClaim {
+        model_id: load.model_id.clone(),
+        package_ref: load.package_ref.clone(),
+        manifest_sha256: load.manifest_sha256.clone(),
+        topology_id: load.topology_id.clone(),
+        run_id: load.run_id.clone(),
+        coordinator_id: coordinator_id.to_string(),
+        coordinator_term: load.coordinator_term,
+        participant_set_hash: "participants".to_string(),
+        topology_hash: "topology".to_string(),
+        lease_until_unix_ms: u64::MAX,
     }
 }
 
@@ -86,6 +111,53 @@ impl StagePackagePrefetcher for BlockingPackagePrefetcher {
             .await
             .unwrap_or_else(|_| Err(anyhow!("prefetch cancelled")))
     }
+}
+
+#[tokio::test]
+async fn fenced_prepare_requires_accepted_coordinator_claim() {
+    let mut load = load_request();
+    let coordinator_id = coordinator_id();
+    load.coordinator_term = 11;
+    load.coordinator_id = Some(coordinator_id);
+    load.lease_until_unix_ms = u64::MAX;
+    let mut state = StageControlState::default();
+
+    let response = state
+        .prepare(StagePrepareRequest {
+            load,
+            coordinator_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(!response.accepted);
+    assert_eq!(response.error.as_deref(), Some("missing coordinator claim"));
+    assert_eq!(response.status.state, StagePreparationState::Failed);
+}
+
+#[tokio::test]
+async fn accepted_coordinator_claim_allows_fenced_prepare() {
+    let mut load = load_request();
+    let coordinator_id = coordinator_id();
+    load.coordinator_term = 11;
+    load.coordinator_id = Some(coordinator_id);
+    load.lease_until_unix_ms = u64::MAX;
+    let claim = coordinator_claim_from_load(&load, coordinator_id);
+    let mut state = StageControlState::default();
+
+    let ack = state.claim(claim).await.unwrap();
+    assert!(ack.accepted);
+
+    let response = state
+        .prepare(StagePrepareRequest {
+            load,
+            coordinator_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(response.accepted);
+    assert_eq!(response.status.state, StagePreparationState::Assigned);
 }
 
 #[test]
@@ -490,7 +562,7 @@ async fn stale_cancel_prepare_keeps_newer_prepare_status() {
     let load = load_request();
     let key = stage_key(&load.topology_id, &load.run_id, &load.stage_id);
     let mut state = StageControlState::default();
-    let current = preparation_status_from_load(&load, StagePreparationState::Resolving);
+    let current = preparation_status_from_load(&load, StagePreparationState::Resolving, None);
     state.preparations.lock().await.insert(key, current.clone());
 
     let status = state
@@ -511,7 +583,7 @@ async fn stale_cancel_prepare_keeps_newer_prepare_status() {
 async fn status_update_upserts_preparation_status_and_rejects_stale_generation() {
     let load = load_request();
     let mut state = StageControlState::default();
-    let mut update = preparation_status_from_load(&load, StagePreparationState::Loading);
+    let mut update = preparation_status_from_load(&load, StagePreparationState::Loading, None);
     update.bytes_done = Some(1024);
     update.bytes_total = Some(4096);
 
@@ -564,7 +636,7 @@ async fn inventory_retains_failed_prepare_status() {
     let load = load_request();
     let key = stage_key(&load.topology_id, &load.run_id, &load.stage_id);
     let state = StageControlState::default();
-    let mut failed = preparation_status_from_load(&load, StagePreparationState::Failed);
+    let mut failed = preparation_status_from_load(&load, StagePreparationState::Failed, None);
     failed.error = Some("source unavailable".to_string());
     state.preparations.lock().await.insert(key, failed);
 

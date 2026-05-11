@@ -89,7 +89,7 @@ pub(super) async fn run_stage_prepare_task(
     if !update_preparation(
         &preparations,
         &key,
-        preparation_status_from_load(&load, StagePreparationState::Resolving),
+        preparation_status_from_load(&load, StagePreparationState::Resolving, None),
     )
     .await
         || cancelled.load(Ordering::Acquire)
@@ -107,7 +107,7 @@ pub(super) async fn run_stage_prepare_task(
         && !update_preparation(
             &preparations,
             &key,
-            preparation_status_from_load(&load, StagePreparationState::Downloading),
+            preparation_status_from_load(&load, StagePreparationState::Downloading, None),
         )
         .await
     {
@@ -119,13 +119,15 @@ pub(super) async fn run_stage_prepare_task(
     }
     let state = match result {
         Ok(PrepareSourceResult { bytes_total }) => {
-            let mut status = preparation_status_from_load(&load, StagePreparationState::Available);
+            let mut status =
+                preparation_status_from_load(&load, StagePreparationState::Available, None);
             status.bytes_done = bytes_total;
             status.bytes_total = bytes_total;
             status
         }
         Err(error) => {
-            let mut status = preparation_status_from_load(&load, StagePreparationState::Failed);
+            let mut status =
+                preparation_status_from_load(&load, StagePreparationState::Failed, None);
             status.error = Some(match peer_prefetch_error {
                 Some(prefetch_error) => {
                     format!("{error}; peer artifact prefetch failed: {prefetch_error}")
@@ -152,7 +154,7 @@ async fn prefetch_stage_package_if_needed(
     let _ = update_preparation(
         preparations,
         key,
-        preparation_status_from_load(load, StagePreparationState::Downloading),
+        preparation_status_from_load(load, StagePreparationState::Downloading, None),
     )
     .await;
     match prefetcher.prefetch_stage_package(request).await {

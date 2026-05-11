@@ -1,0 +1,9 @@
+[package]
+name = "skippy-coordinator"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+version.workspace = true
+
+[dependencies]
+thiserror = "2"

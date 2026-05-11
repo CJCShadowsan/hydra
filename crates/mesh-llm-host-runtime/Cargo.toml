@@ -19,6 +19,7 @@ model-ref = { path = "../model-ref" }
 model-resolver = { path = "../model-resolver" }
 openai-frontend = { path = "../openai-frontend" }
 skippy-protocol = { path = "../skippy-protocol" }
+skippy-coordinator = { path = "../skippy-coordinator" }
 skippy-runtime = { path = "../skippy-runtime" }
 skippy-server = { path = "../skippy-server" }
 skippy-topology = { path = "../skippy-topology" }

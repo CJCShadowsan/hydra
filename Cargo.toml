@@ -19,6 +19,7 @@ members = [
     "crates/model-hf",
     "crates/model-resolver",
     "crates/skippy-protocol",
+    "crates/skippy-coordinator",
     "crates/skippy-topology",
     "crates/skippy-cache",
     "crates/skippy-metrics",

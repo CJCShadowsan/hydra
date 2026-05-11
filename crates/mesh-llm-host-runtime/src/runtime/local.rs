@@ -10,6 +10,7 @@ use crate::runtime_data::{
     RuntimeLlamaEndpointStatus, RuntimeLlamaSlotSnapshot, RuntimeLlamaSlotsSnapshot,
 };
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ const SPLIT_PARTICIPANT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SPLIT_PARTICIPANT_STABLE_FOR: Duration = Duration::from_secs(2);
 const SPLIT_DEFAULT_MIN_PARTICIPANTS: usize = 2;
 const SPLIT_INITIAL_SHUTDOWN_GENERATION: u64 = 1;
+const SPLIT_COORDINATOR_LEASE_SECS: u64 = 4 * 60 * 60;
 const RUNTIME_MODEL_FIT_HEADROOM_NUMERATOR: u64 = 11;
 const RUNTIME_MODEL_FIT_HEADROOM_DENOMINATOR: u64 = 10;
 
@@ -118,6 +120,10 @@ fn current_time_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn split_coordinator_lease_until_unix_ms() -> u64 {
+    current_time_unix_ms().saturating_add(SPLIT_COORDINATOR_LEASE_SECS.saturating_mul(1000))
 }
 
 pub(super) struct ManagedModelController {
@@ -787,6 +793,8 @@ async fn load_split_runtime_generation_inner(
         spec.node.id().fmt_short()
     );
 
+    claim_split_coordinator_lease(spec.node, spec.model_ref, spec.package, spec.generation).await?;
+
     let mut ready_by_stage: HashMap<String, skippy::StageStatusSnapshot> = HashMap::new();
     let mut downstream: Option<skippy::StagePeerDescriptor> = None;
     let kv_cache = skippy::KvCachePolicy::for_model_size(spec.package.source_model_bytes);
@@ -864,6 +872,9 @@ async fn load_split_runtime_generation_inner(
             cache_type_v: effective_cache_type_v.clone(),
             flash_attn_type: resolved_flash_attn_type,
             shutdown_generation: spec.generation.generation,
+            coordinator_term: spec.generation.coordinator_term,
+            coordinator_id: Some(spec.node.id()),
+            lease_until_unix_ms: spec.generation.lease_until_unix_ms,
             load_mode: load_mode.clone(),
             upstream: None,
             downstream: downstream.clone(),
@@ -1006,6 +1017,79 @@ async fn load_split_runtime_generation_inner(
     })
 }
 
+async fn claim_split_coordinator_lease(
+    node: &mesh::Node,
+    model_ref: &str,
+    package: &skippy::SkippyPackageIdentity,
+    generation: &SplitTopologyGeneration,
+) -> Result<()> {
+    let claim = split_coordinator_claim(node.id(), model_ref, package, generation);
+    let required_accepts = skippy_coordinator::quorum_requirement(generation.stages.len());
+    let mut accepted = 0usize;
+    let mut errors = Vec::new();
+
+    for stage in &generation.stages {
+        let request = skippy::StageControlRequest::Claim(claim.clone());
+        let response = if stage.node_id == node.id() {
+            node.send_local_stage_control(request).await
+        } else {
+            node.send_stage_control(stage.node_id, request).await
+        };
+        match response {
+            Ok(skippy::StageControlResponse::ClaimAccepted(ack)) if ack.accepted => {
+                accepted += 1;
+            }
+            Ok(skippy::StageControlResponse::ClaimAccepted(ack)) => {
+                errors.push(format!(
+                    "{} rejected claim: {}",
+                    stage.node_id.fmt_short(),
+                    ack.error.unwrap_or_else(|| "unknown rejection".to_string())
+                ));
+            }
+            Ok(other) => {
+                errors.push(format!(
+                    "{} returned unexpected claim response: {other:?}",
+                    stage.node_id.fmt_short()
+                ));
+            }
+            Err(err) => {
+                errors.push(format!(
+                    "{} claim failed: {err:#}",
+                    stage.node_id.fmt_short()
+                ));
+            }
+        }
+    }
+
+    anyhow::ensure!(
+        accepted >= required_accepts,
+        "coordinator claim for {model_ref} accepted by {accepted}/{} planned stage(s), need {required_accepts}: {}",
+        generation.stages.len(),
+        errors.join("; ")
+    );
+    Ok(())
+}
+
+fn split_coordinator_claim(
+    coordinator_id: iroh::EndpointId,
+    model_ref: &str,
+    package: &skippy::SkippyPackageIdentity,
+    generation: &SplitTopologyGeneration,
+) -> skippy::StageCoordinatorClaim {
+    skippy::StageCoordinatorClaim {
+        model_id: model_ref.to_string(),
+        package_ref: package.package_ref.clone(),
+        manifest_sha256: package.manifest_sha256.clone(),
+        topology_id: generation.topology_id.clone(),
+        run_id: generation.run_id.clone(),
+        coordinator_id: coordinator_id.to_string(),
+        coordinator_term: generation.coordinator_term,
+        participant_set_hash: split_participant_set_hash(&generation.participants),
+        topology_hash: split_topology_hash(&generation.stages),
+        lease_until_unix_ms: generation.lease_until_unix_ms,
+    }
+}
+
 fn stage_load_model_path(load_mode: LoadMode, package_ref: &str, model_path: &Path) -> String {
     match load_mode {
         LoadMode::LayerPackage => package_ref.to_string(),
@@ -1030,6 +1114,8 @@ struct SplitTopologyGeneration {
     topology_id: String,
     run_id: String,
     generation: u64,
+    coordinator_term: u64,
+    lease_until_unix_ms: u64,
     participants: Vec<SplitParticipant>,
     stages: Vec<RuntimeSliceStagePlan>,
 }
@@ -1046,6 +1132,8 @@ impl SplitTopologyGeneration {
             topology_id,
             run_id,
             generation,
+            coordinator_term: now_unix_nanos().max(1) as u64,
+            lease_until_unix_ms: split_coordinator_lease_until_unix_ms(),
             participants,
             stages,
         }
@@ -1618,6 +1706,7 @@ async fn stop_split_generation(
             run_id: generation.run_id.clone(),
             stage_id: stage.stage_id.clone(),
             shutdown_generation,
+            coordinator_term: generation.coordinator_term,
         };
         let result = if stage.node_id == node.id() {
             node.send_local_stage_control(skippy::StageControlRequest::Stop(stop))
@@ -1944,6 +2033,33 @@ fn split_participant_signature(participants: &[SplitParticipant]) -> SplitPartic
             )
         })
         .collect()
+}
+
+fn split_participant_set_hash(participants: &[SplitParticipant]) -> String {
+    let mut hasher = Sha256::new();
+    for participant in split_participant_signature(participants) {
+        hasher.update(participant.0.as_bytes());
+        hasher.update(participant.1.to_le_bytes());
+        hasher.update(participant.2.to_le_bytes());
+        hasher.update(participant.3.to_le_bytes());
+        hasher.update(participant.4.unwrap_or_default().to_le_bytes());
+        hasher.update([u8::from(participant.5)]);
+        hasher.update(participant.6.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn split_topology_hash(stages: &[RuntimeSliceStagePlan]) -> String {
+    let mut hasher = Sha256::new();
+    for stage in stages {
+        hasher.update(stage.stage_id.as_bytes());
+        hasher.update(stage.stage_index.to_le_bytes());
+        hasher.update(stage.node_id.to_string().as_bytes());
+        hasher.update(stage.layer_start.to_le_bytes());
+        hasher.update(stage.layer_end.to_le_bytes());
+        hasher.update(stage.parameter_bytes.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn split_participant_labels(participants: &[SplitParticipant]) -> Vec<String> {
@@ -2782,6 +2898,9 @@ mod tests {
             flash_attn_type: load.flash_attn_type,
             error: None,
             shutdown_generation: load.shutdown_generation,
+            coordinator_term: load.coordinator_term,
+            coordinator_id: load.coordinator_id,
+            lease_until_unix_ms: load.lease_until_unix_ms,
         }
     }
 
@@ -2815,6 +2934,9 @@ mod tests {
             flash_attn_type: FlashAttentionType::Auto,
             error: None,
             shutdown_generation: stop.shutdown_generation,
+            coordinator_term: stop.coordinator_term,
+            coordinator_id: None,
+            lease_until_unix_ms: 0,
         }
     }
 
@@ -2838,6 +2960,9 @@ mod tests {
             bind_addr: None,
             error: None,
             shutdown_generation: load.shutdown_generation,
+            coordinator_term: load.coordinator_term,
+            coordinator_id: load.coordinator_id,
+            lease_until_unix_ms: load.lease_until_unix_ms,
         }
     }
 
@@ -3386,6 +3511,15 @@ mod tests {
                             test_inventory_from_request(inventory),
                         ))
                     }
+                    skippy::StageControlRequest::Claim(claim) => {
+                        Ok(skippy::StageControlResponse::ClaimAccepted(
+                            skippy::StageCoordinatorClaimAck {
+                                accepted: true,
+                                claim: claim.clone(),
+                                error: None,
+                            },
+                        ))
+                    }
                     skippy::StageControlRequest::Load(load) if load.stage_id == "stage-1" => {
                         Err(anyhow::anyhow!("injected stage load failure"))
                     }
@@ -3456,6 +3590,11 @@ mod tests {
         );
 
         let requests = requests.lock().unwrap();
+        let claim_count = requests
+            .iter()
+            .filter(|request| matches!(request, skippy::StageControlRequest::Claim(_)))
+            .count();
+        assert_eq!(claim_count, generation.stages.len());
         let load_stage_ids = requests
             .iter()
             .filter_map(|request| match request {
