@@ -1835,10 +1835,12 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
                 canonical_ref: Some("hf/bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf".into()),
                 repository: Some("bartowski/Qwen3-8B-GGUF".into()),
                 revision: Some("main".into()),
+                artifact: None,
+                local_file_name: None,
+                identity_hash: None,
             },
-            format: ModelFormat::LlamaGGUF,
-            quantization: "Q4_K_M".to_string(),
-            size_bytes: 4_800_000_000,
+            capabilities: Default::default(),
+            topology: None,
         }],
         served_model_runtime: vec![],
         owner_attestation: None,
@@ -2078,7 +2080,7 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         latency_observer_id: None,
     };
 
-    apply_transitive_ann(&mut existing, &addr, &ann, test_endpoint_id(0xee));
+    apply_transitive_ann(&mut existing, &addr, &ann, make_test_endpoint_id(0xee));
 
     assert!(
         existing.available_models.is_empty(),
@@ -2162,7 +2164,7 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         latency_observer_id: None,
     };
 
-    apply_transitive_ann(&mut existing, &weak_addr, &ann, test_endpoint_id(0xee));
+    apply_transitive_ann(&mut existing, &weak_addr, &ann, make_test_endpoint_id(0xee));
 
     assert_eq!(
         existing.addr.addrs.len(),
@@ -2214,8 +2216,17 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         owner_attestation: None,
         artifact_transfer_supported: true,
         stage_status_list_supported: true,
+        latency_ms: None,
+        latency_source: None,
+        latency_age_ms: None,
+        latency_observer_id: None,
     };
-    apply_transitive_ann(&mut existing, &richer_addr, &ann2, test_endpoint_id(0xee));
+    apply_transitive_ann(
+        &mut existing,
+        &richer_addr,
+        &ann2,
+        make_test_endpoint_id(0xee),
+    );
 
     assert_eq!(
         existing.addr.addrs.len(),
@@ -2792,7 +2803,7 @@ fn transitive_peer_update_refreshes_last_mentioned() {
         latency_observer_id: None,
     };
 
-    apply_transitive_ann(&mut peer, &addr, &ann, test_endpoint_id(0xee));
+    apply_transitive_ann(&mut peer, &addr, &ann, make_test_endpoint_id(0xee));
 
     // Before refreshing last_mentioned, verify the peer WOULD be pruned.
     let prune_cutoff_pre =

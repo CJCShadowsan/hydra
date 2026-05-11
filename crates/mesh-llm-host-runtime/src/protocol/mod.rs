@@ -1265,6 +1265,7 @@ mod tests {
             gpu_compute_tflops_fp16: None,
             available_model_metadata: vec![],
             experts_summary: None,
+            available_model_sizes: HashMap::new(),
             served_model_descriptors: vec![],
             served_model_runtime: vec![],
             owner_attestation: Some(crate::crypto::SignedNodeOwnership {
@@ -2091,6 +2092,10 @@ mod tests {
             owner_attestation: None,
             artifact_transfer_supported: true,
             stage_status_list_supported: true,
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&ann_with_timestamp);
@@ -2137,6 +2142,10 @@ mod tests {
             owner_attestation: None,
             artifact_transfer_supported: false,
             stage_status_list_supported: false,
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&ann_without_timestamp);
