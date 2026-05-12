@@ -33,6 +33,48 @@ fn quic_bind_addr_keeps_endpoint_default_on_non_windows() {
     assert_eq!(quic_bind_addr(None), None);
 }
 
+#[test]
+fn public_ipv4_classification_excludes_cgnat_and_private_ranges() {
+    assert!(is_public_ipv4_addr("8.8.8.8".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("100.64.0.1".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("100.127.255.254".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("10.0.0.1".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("172.16.0.1".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("192.168.1.1".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("169.254.1.1".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("127.0.0.1".parse().unwrap()));
+    assert!(!is_public_ipv4_addr("192.0.2.10".parse().unwrap()));
+}
+
+#[test]
+fn upnp_wan_helpers_extract_wan_service_endpoint() {
+    let description = r#"
+        <root>
+          <device>
+            <serviceList>
+              <service>
+                <serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
+                <controlURL>/ctl/L3F</controlURL>
+              </service>
+              <service>
+                <serviceType>urn:schemas-upnp-org:service:WANIPConnection:2</serviceType>
+                <controlURL>/ctl/IPConn</controlURL>
+              </service>
+            </serviceList>
+          </device>
+        </root>
+    "#;
+
+    assert_eq!(
+        upnp_wan_service_type(description).as_deref(),
+        Some("urn:schemas-upnp-org:service:WANIPConnection:2")
+    );
+    assert_eq!(
+        upnp_wan_control_url("http://192.168.1.1:5000/rootDesc.xml", description).as_deref(),
+        Some("http://192.168.1.1:5000/ctl/IPConn")
+    );
+}
+
 fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
     crate::inference::skippy::StageLoadRequest {
         topology_id: "topology-a".to_string(),

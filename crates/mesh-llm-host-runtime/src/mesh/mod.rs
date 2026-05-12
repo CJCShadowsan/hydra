@@ -1117,66 +1117,220 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
         req[7] = 0x42; // Magic Cookie
         rand::fill(&mut req[8..20]);
 
-        let dest: SocketAddr = match tokio::net::lookup_host(server).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
-                None => continue,
-            },
+        let addrs = match tokio::net::lookup_host(server).await {
+            Ok(addrs) => addrs,
             Err(_) => continue,
         };
 
-        if sock.send_to(&req, dest).await.is_err() {
-            continue;
-        }
-
-        let mut buf = [0u8; 256];
-        match tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
-            .await
-        {
-            Ok(Ok((len, _))) if len >= 20 => {
-                // Parse STUN response for XOR-MAPPED-ADDRESS (0x0020)
-                // or MAPPED-ADDRESS (0x0001)
-                let magic = &req[4..8];
-                let _txn = &req[8..20];
-                let mut i = 20;
-                while i + 4 <= len {
-                    let attr_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
-                    let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
-                    if i + 4 + attr_len > len {
-                        break;
-                    }
-                    let val = &buf[i + 4..i + 4 + attr_len];
-
-                    if attr_type == 0x0020 && attr_len >= 8 && val[1] == 0x01 {
-                        // XOR-MAPPED-ADDRESS, IPv4 — extract IP only
-                        let ip = Ipv4Addr::new(
-                            val[4] ^ magic[0],
-                            val[5] ^ magic[1],
-                            val[6] ^ magic[2],
-                            val[7] ^ magic[3],
-                        );
-                        let addr = SocketAddr::V4(SocketAddrV4::new(ip, advertised_port));
-                        tracing::info!("STUN discovered public address: {addr}");
-                        return Some(addr);
-                    }
-                    if attr_type == 0x0001 && attr_len >= 8 && val[1] == 0x01 {
-                        // MAPPED-ADDRESS, IPv4 — extract IP only
-                        let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
-                        let addr = SocketAddr::V4(SocketAddrV4::new(ip, advertised_port));
-                        tracing::info!("STUN discovered public address: {addr}");
-                        return Some(addr);
-                    }
-
-                    // Attributes are padded to 4-byte boundary
-                    i += (4 + (attr_len + 3)) & !3;
-                }
+        for dest in addrs.filter(SocketAddr::is_ipv4) {
+            if sock.send_to(&req, dest).await.is_err() {
+                continue;
             }
-            _ => continue,
+
+            let mut buf = [0u8; 256];
+            let len = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sock.recv_from(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok((len, _))) if len >= 20 => len,
+                _ => continue,
+            };
+
+            // Parse STUN response for XOR-MAPPED-ADDRESS (0x0020)
+            // or MAPPED-ADDRESS (0x0001)
+            let magic = &req[4..8];
+            let _txn = &req[8..20];
+            let mut i = 20;
+            while i + 4 <= len {
+                let attr_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
+                let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+                if i + 4 + attr_len > len {
+                    break;
+                }
+                let val = &buf[i + 4..i + 4 + attr_len];
+
+                if attr_type == 0x0020 && attr_len >= 8 && val[1] == 0x01 {
+                    // XOR-MAPPED-ADDRESS, IPv4 — extract IP only
+                    let ip = Ipv4Addr::new(
+                        val[4] ^ magic[0],
+                        val[5] ^ magic[1],
+                        val[6] ^ magic[2],
+                        val[7] ^ magic[3],
+                    );
+                    let addr = SocketAddr::V4(SocketAddrV4::new(ip, advertised_port));
+                    tracing::info!("STUN discovered public address: {addr}");
+                    return Some(addr);
+                }
+                if attr_type == 0x0001 && attr_len >= 8 && val[1] == 0x01 {
+                    // MAPPED-ADDRESS, IPv4 — extract IP only
+                    let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
+                    let addr = SocketAddr::V4(SocketAddrV4::new(ip, advertised_port));
+                    tracing::info!("STUN discovered public address: {addr}");
+                    return Some(addr);
+                }
+
+                // Attributes are padded to 4-byte boundary
+                i += (4 + (attr_len + 3)) & !3;
+            }
         }
     }
 
     tracing::warn!("STUN: could not discover public address");
     None
+}
+
+fn is_cgnat_ipv4_addr(addr: std::net::Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_public_ipv4_addr(addr: std::net::Ipv4Addr) -> bool {
+    !addr.is_private()
+        && !addr.is_loopback()
+        && !addr.is_link_local()
+        && !addr.is_multicast()
+        && !addr.is_broadcast()
+        && !addr.is_documentation()
+        && !addr.is_unspecified()
+        && !is_cgnat_ipv4_addr(addr)
+}
+
+async fn upnp_router_wan_ipv4() -> Option<std::net::Ipv4Addr> {
+    let location = upnp_igd_location().await?;
+    let description = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?
+        .get(location.clone())
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let control_url = upnp_wan_control_url(&location, &description)?;
+    let service_type = upnp_wan_service_type(&description)?;
+    let body = format!(
+        r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+<s:Body><u:GetExternalIPAddress xmlns:u="{service_type}"></u:GetExternalIPAddress></s:Body>
+</s:Envelope>"#
+    );
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?
+        .post(control_url)
+        .header("content-type", r#"text/xml; charset="utf-8""#)
+        .header(
+            "soapaction",
+            format!(r#""{service_type}#GetExternalIPAddress""#),
+        )
+        .body(body)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    xml_tag_text(&response, "NewExternalIPAddress")?
+        .parse()
+        .ok()
+}
+
+async fn upnp_igd_location() -> Option<String> {
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let request = concat!(
+        "M-SEARCH * HTTP/1.1\r\n",
+        "HOST: 239.255.255.250:1900\r\n",
+        "MAN: \"ssdp:discover\"\r\n",
+        "MX: 2\r\n",
+        "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n",
+        "\r\n"
+    );
+    sock.send_to(request.as_bytes(), "239.255.255.250:1900")
+        .await
+        .ok()?;
+
+    let mut buf = [0u8; 2048];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+        let (len, _) = tokio::time::timeout(remaining, sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        let response = std::str::from_utf8(&buf[..len]).ok()?;
+        if let Some(location) = http_header_value(response, "location") {
+            return Some(location);
+        }
+    }
+}
+
+fn http_header_value(response: &str, name: &str) -> Option<String> {
+    response.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+fn upnp_wan_control_url(location: &str, description: &str) -> Option<String> {
+    let block = upnp_wan_service_block(description)?;
+    let control_url = xml_tag_text(block, "controlURL")?;
+    let base = url::Url::parse(location).ok()?;
+    base.join(&control_url).ok().map(|url| url.to_string())
+}
+
+fn upnp_wan_service_type(description: &str) -> Option<String> {
+    let block = upnp_wan_service_block(description)?;
+    xml_tag_text(block, "serviceType")
+}
+
+fn upnp_wan_service_block(description: &str) -> Option<&str> {
+    description.split("</service>").find(|block| {
+        block.contains("urn:schemas-upnp-org:service:WANIPConnection:")
+            || block.contains("urn:schemas-upnp-org:service:WANPPPConnection:")
+    })
+}
+
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = xml.find(&start_tag)? + start_tag.len();
+    let end = xml[start..].find(&end_tag)? + start;
+    Some(xml[start..end].trim().to_string())
+}
+
+async fn warn_if_cgnat_likely(bind_port: Option<u16>, public_addr: Option<std::net::SocketAddr>) {
+    let Some(bind_port) = bind_port else {
+        return;
+    };
+    let Some(std::net::SocketAddr::V4(public_addr)) = public_addr else {
+        return;
+    };
+    let public_ip = *public_addr.ip();
+    if !is_public_ipv4_addr(public_ip) {
+        return;
+    }
+    let Some(router_wan_ip) = upnp_router_wan_ipv4().await else {
+        return;
+    };
+    if router_wan_ip == public_ip || is_public_ipv4_addr(router_wan_ip) {
+        return;
+    }
+
+    let nat_kind = if is_cgnat_ipv4_addr(router_wan_ip) {
+        "CGNAT"
+    } else {
+        "private/double NAT"
+    };
+    emit_mesh_warning(format!(
+        "Direct UDP port forwarding may not work on --bind-port {bind_port}: router WAN appears to be {nat_kind} while STUN sees a different public IPv4. Router port forwards only cover the local router; ask the ISP to opt out of CGNAT/provide a public IPv4, bridge the upstream router, or use relay/tunnel mode."
+    ));
 }
 
 #[derive(Clone)]
@@ -2241,6 +2395,7 @@ impl Node {
         // Relay STUN may not work on sinkholed networks, so we use raw STUN to Google/Cloudflare.
         let stun_port = bind_port.unwrap_or(0);
         let public_addr = stun_public_addr(stun_port).await;
+        warn_if_cgnat_likely(bind_port, public_addr).await;
 
         let (peer_change_tx, peer_change_rx) = watch::channel(0usize);
         let (inflight_change_tx, _inflight_change_rx) = watch::channel(0u64);
@@ -2545,7 +2700,7 @@ impl Node {
             use iroh::TransportAddr;
             let has_public = addr.addrs.iter().any(|a| match a {
                 TransportAddr::Ip(sock) => match sock.ip() {
-                    std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback(),
+                    std::net::IpAddr::V4(v4) => is_public_ipv4_addr(v4),
                     _ => false,
                 },
                 _ => false,
