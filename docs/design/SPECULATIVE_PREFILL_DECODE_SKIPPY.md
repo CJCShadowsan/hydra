@@ -494,16 +494,17 @@ This is the core optimization. A fast model generates a complete answer,
 then the distributed target verifies it in one prefill pass — avoiding
 sequential decode round trips entirely.
 
-**This is NOT standard speculative decoding.** Standard spec decode
-(`DraftRunner` in skippy-server) proposes small rolling windows of tokens
-and verifies them in a tight loop. That helps single-node latency but
-doesn't help distributed splits — each verify window is still a
-sequential forward pass through all nodes. Speculative prefill is
-fundamentally different: one complete draft, one parallel prefill, done.
+Speculative prefill is distinct from standard speculative decoding
+(`DraftRunner` in skippy-server), which proposes small rolling windows
+and verifies them iteratively. Both are valuable — standard spec decode
+speeds up every decode step (including distributed ones), while
+speculative prefill eliminates decode steps wholesale by verifying the
+entire draft in one parallel prefill pass.
 
-> Note: the existing `--draft` CLI flag and `DraftRunner` infra in
-> skippy-server implement standard spec decode. Wiring those through is
-> an independent improvement for single-node serving, not on this path.
+**They are perfectly complementary.** Speculative prefill tries the big
+bet first: verify the whole draft in one shot. When the draft diverges
+at position K, the target decodes from K onward — and that tail decode
+can itself use standard spec decode to go faster.
 
 6. **`pick_draft_model()` in ingress** — given `ModelTargets` and the
    target model name, select the best draft model. Priority: same-family
@@ -531,13 +532,14 @@ fundamentally different: one complete draft, one parallel prefill, done.
      of how long the draft is
    - Find divergence K using `classify_verify_span()` (already exists)
    - K == end → return draft as response (zero decode round trips)
-   - K < end → KV cache is warm to K, decode only the tail from K
+   - K < end → KV cache is warm to K, decode from K onward. The
+     standard spec decode loop (`DraftRunner`) can accelerate this
+     tail decode if a draft model is configured.
 
 9. **Automatic engagement in proxy** — the proxy detects:
-   - Target is a distributed layer split (not single-node local)
    - A draft model is available (from `pick_draft_model()`)
    - Request doesn't have `"speculative_prefill": false`
-   When all conditions hold, transparently engage spec prefill before
+   When conditions hold, transparently engage spec prefill before
    forwarding the request to the target.
 
 ### Phase 3: Adaptive and production hardening
@@ -554,34 +556,32 @@ fundamentally different: one complete draft, one parallel prefill, done.
 
 ## Relationship to Existing Systems
 
-### vs. Standard speculative decoding (llama.cpp)
+### vs. Standard speculative decoding (llama.cpp / skippy DraftRunner)
 
-Standard spec decode operates within a single machine: draft N tokens,
-verify in one batch, accept prefix, re-draft in tight sequential rounds.
-It's designed for single-machine inference where decode is already fast —
-the speedup comes from verifying N tokens in parallel instead of generating
-them one by one.
+Standard spec decode drafts small batches of N tokens and verifies them
+in iterative rounds. It speeds up decode everywhere — single-node and
+distributed. The skippy-server already has a full implementation:
+`DraftRunner`, `classify_verify_span`, adaptive window, checkpoint/restore.
 
-Speculative prefill decoding solves a **different problem**: distributed
-decode latency across skippy layer splits. On a single machine, decode is
-fast (microseconds per token locally). Across a layer split, decode is
-slow (network RTT per token). Standard spec decode doesn't help here
-because even the verification rounds still require distributed forward
-passes.
-
-The key differences:
+Speculative prefill takes a different approach: generate the **entire
+answer** up front, then verify it all in **one prefill pass**. The key
+insight is that prefill is parallel (one network round trip across a
+distributed split regardless of length), while decode — even with
+standard spec decode — is sequential (one round trip per verify window).
 
 | | Standard Spec Decode | Speculative Prefill (this design) |
 |---|---|---|
-| Problem | Single-machine decode throughput | Distributed decode latency |
-| Draft size | N tokens (small batches) | Full response |
+| Draft size | N tokens (small rolling window) | Full response |
 | Verification | Iterative rounds | One prefill pass |
-| When it helps | Always (local speedup) | Only with layer splits (network RTT) |
-| Complementary? | Yes — still applies to single-node | Yes — this is additive |
+| When it helps | Always (local + distributed) | Most on distributed splits (high per-token RTT) |
+| On divergence | Re-draft from rejection point | Decode from K (can use spec decode for the tail) |
+| Complementary? | Yes | Yes — prefill trick first, spec decode for the tail |
 
-Both can coexist. Standard spec decode optimizes local single-node
-inference. Speculative prefill optimizes distributed multi-node inference.
-They target different bottlenecks.
+**They compose perfectly.** Speculative prefill tries the big bet: verify
+the whole draft in one pass. When the draft diverges at position K, the
+target decodes from K onward — and standard spec decode can accelerate
+that tail decode. The prefill trick eliminates the easy prefix; spec
+decode speeds up the hard tail.
 
 ### vs. MoA (Mixture of Agents)
 
@@ -790,11 +790,11 @@ The CLI already has hidden flags for **standard** speculative decoding:
 --no-draft            Disable automatic draft detection
 ```
 
-These control skippy-server's `DraftRunner` — a tight rolling-window
-draft→verify loop for **single-node** serving. This is a different
-optimization from speculative prefill and solves a different problem
-(local decode throughput vs. distributed decode latency). Wiring
-these flags through is independent work.
+These control skippy-server's `DraftRunner` — a rolling-window
+draft→verify loop that speeds up decode on any topology (local or
+distributed). Wiring these flags through is independent and
+complementary work — when spec prefill diverges at K, the tail
+decode from K benefits from standard spec decode.
 
 Speculative prefill operates at the **proxy layer**, not inside
 skippy-server's decode loop. The proxy selects a draft model from the
@@ -808,13 +808,12 @@ engages it automatically when conditions are met.
   *what* you're talking to (multiple models). Spec prefill doesn't change
   the model — it's the same model, just faster. No new model name.
 
-- **Not always-on.** Only activates for distributed layer splits. Single-
-  node serving doesn't benefit (decode is already fast locally). The proxy
-  must check whether the target is split before engaging.
-
 - **Not blocking.** If draft generation takes too long or the draft model
   is unavailable, the request falls through to normal decode. Spec prefill
   is best-effort — the worst case is equivalent to no speculation.
+
+- **Not exclusive.** Spec prefill and standard spec decode compose. The
+  prefill trick skips the prefix; spec decode speeds up the tail.
 
 ## Open Questions
 
