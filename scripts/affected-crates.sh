@@ -147,12 +147,18 @@ EOF
   # Normal path: use cargo metadata to build crate map and reverse-dep graph
   
   # Step 1: Get crate → manifest_path mapping (no deps)
+  local metadata_no_deps
+  metadata_no_deps=$(cargo metadata --format-version=1 --no-deps 2>/dev/null)
+
+  local workspace_root
+  workspace_root=$(echo "$metadata_no_deps" | jq -r '.workspace_root')
+
   local -A crate_to_dir=()
   while IFS='|' read -r crate_name manifest_path; do
     [[ -z "$crate_name" ]] && continue
     dir="${manifest_path%/Cargo.toml}"
     crate_to_dir["$crate_name"]="$dir"
-  done < <(cargo metadata --format-version=1 --no-deps 2>/dev/null | jq -r '.packages[] | "\(.name)|\(.manifest_path)"')
+  done < <(echo "$metadata_no_deps" | jq -r '.packages[] | "\(.name)|\(.manifest_path)"')
   
   # Step 2: Build reverse-dep graph: for each crate, list which crates depend on it
   local -A reverse_deps=()
@@ -217,10 +223,15 @@ EOF
     
     for crate_name in "${!crate_to_dir[@]}"; do
       local crate_dir="${crate_to_dir[$crate_name]}"
-      # Extract the relative part of crate_dir (everything after mesh-llm/)
-      local crate_rel="${crate_dir##*/mesh-llm/}"
+      # Convert absolute manifest dirs to paths relative to the cargo workspace root.
+      local crate_rel="$crate_dir"
+      if [[ "$crate_rel" == "$workspace_root" ]]; then
+        crate_rel=""
+      elif [[ "$crate_rel" == "$workspace_root/"* ]]; then
+        crate_rel="${crate_rel#"$workspace_root/"}"
+      fi
       
-      if [[ "$file" == "$crate_rel"* ]]; then
+      if [[ -n "$crate_rel" ]] && { [[ "$file" == "$crate_rel" ]] || [[ "$file" == "$crate_rel/"* ]]; }; then
         local len=${#crate_rel}
         if [[ $len -gt $best_len ]]; then
           best_crate="$crate_name"
