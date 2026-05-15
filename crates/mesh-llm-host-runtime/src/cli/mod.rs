@@ -332,13 +332,14 @@ pub(crate) struct Cli {
     pub(crate) auto_update: bool,
 
     // ── Advanced options (hidden from default --help) ─────────────
-    /// Draft model for speculative decoding.
+    /// Local GGUF model for speculative prefill (generates draft tokens
+    /// verified in a single batched prefill pass before decoding starts).
     #[arg(long, hide = true)]
-    pub(crate) draft: Option<PathBuf>,
+    pub(crate) prefill_speculative: Option<PathBuf>,
 
-    /// Max draft tokens (default: 8).
+    /// Max speculative prefill tokens (default: 8).
     #[arg(long, default_value = "8", hide = true)]
-    pub(crate) draft_max: u16,
+    pub(crate) prefill_speculative_max: u16,
 
     /// Disable automatic draft model detection.
     #[arg(long, hide = true)]
@@ -757,7 +758,7 @@ where
     // Skip leading global flags to find the pseudo-subcommand position.
     // Recognized value-taking flags: --log-format, --mesh-discovery-mode, --max-vram,
     // --llama-flavor, --device, --tensor-split, --bind-port, --bind-ip, --max-clients,
-    // --port, --console, --draft-max, --ctx-size.
+    // --port, --console, --prefill-speculative-max, --ctx-size.
     // Boolean flags: --help-advanced, --auto, --client, --headless, --publish, --blackboard,
     // --plugin, --auto-update, --no-draft, --split, --no-enumerate-host, --listen-all,
     // --no-console, --owner-required.
@@ -773,7 +774,7 @@ where
         "--max-clients",
         "--port",
         "--console",
-        "--draft-max",
+        "--prefill-speculative-max",
         "--ctx-size",
         "--model",
         "--gguf",
@@ -784,7 +785,7 @@ where
         "--region",
         "--name",
         "--plugin",
-        "--draft",
+        "--prefill-speculative",
         "--bin-dir",
         "--relay",
         "--nostr-relay",

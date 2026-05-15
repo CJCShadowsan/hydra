@@ -4989,8 +4989,8 @@ async fn run_auto(
         cs.set_nostr_relays(nostr_relays(&cli.nostr_relay)).await;
         cs.set_mesh_discovery_mode(cli.mesh_discovery_mode).await;
         cs.set_nostr_discovery(cli.nostr_discovery).await;
-        if let Some(draft) = &cli.draft {
-            let dn = draft
+        if let Some(spec) = &cli.prefill_speculative {
+            let dn = spec
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -5250,8 +5250,8 @@ async fn run_auto(
         flash_attention: primary_flash_attention,
         parallel_override: primary_parallel_override,
         split: startup_split,
-        draft_model_path: cli.draft.clone(),
-        draft_max: cli.draft_max,
+        draft_model_path: cli.prefill_speculative.clone(),
+        draft_max: cli.prefill_speculative_max,
         skippy_telemetry: skippy_telemetry.clone(),
         survey_telemetry: survey_telemetry_for_primary,
         survey_launch_kind: survey::SurveyLaunchKind::Startup,
@@ -5346,8 +5346,8 @@ async fn run_auto(
                     flash_attention: extra_flash_attention,
                     parallel_override: extra_parallel_override,
                     split: startup_split,
-                    draft_model_path: None, // draft only for primary model
-                    draft_max: cli.draft_max,
+                    draft_model_path: None, // speculative prefill only for primary model
+                    draft_max: cli.prefill_speculative_max,
                     skippy_telemetry: skippy_telemetry.clone(),
                     survey_telemetry: extra_survey_telemetry,
                     survey_launch_kind: survey::SurveyLaunchKind::MultiModel,
@@ -5575,8 +5575,8 @@ async fn run_auto(
                                         .unwrap_or(FlashAttentionType::Auto),
                                     parallel_override,
                                     skippy_telemetry: skippy_telemetry_options(&cli),
-                                    draft_model_path: cli.draft.clone(),
-                                    draft_max: cli.draft_max,
+                                    draft_model_path: cli.prefill_speculative.clone(),
+                                    draft_max: cli.prefill_speculative_max,
                                 },
                                 &runtime_model_name,
                             )
