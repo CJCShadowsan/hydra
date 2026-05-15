@@ -4220,6 +4220,7 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
         !cli.no_enumerate_host,
         Some(owner_config),
         cli.config.as_deref(),
+        cli.require_hardened,
     )
     .await?;
     node.start_accepting();
@@ -4344,6 +4345,7 @@ async fn run_auto(
         !cli.no_enumerate_host,
         Some(owner_config),
         cli.config.as_deref(),
+        cli.require_hardened,
     )
     .await?;
     node.set_stage_control_sender(skippy::spawn_stage_control_loop(Some(Arc::new(

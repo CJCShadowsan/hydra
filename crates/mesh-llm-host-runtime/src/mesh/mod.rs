@@ -1377,6 +1377,7 @@ pub struct Node {
     config_revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
     inference_keypair: Arc<crate::crypto::inference_encryption::InferenceKeypair>,
     local_security_posture: Arc<Mutex<Option<mesh_llm_system::hardening::SecurityPosture>>>,
+    require_hardened: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2324,6 +2325,7 @@ impl Node {
         enumerate_host: bool,
         owner_config: Option<OwnerRuntimeConfig>,
         config_path: Option<&std::path::Path>,
+        require_hardened: bool,
     ) -> Result<(Self, TunnelChannels)> {
         // Clients use an ephemeral key so they get a unique identity even
         // when running on the same machine as a GPU node.
@@ -2553,6 +2555,7 @@ impl Node {
                 crate::crypto::inference_encryption::InferenceKeypair::generate(),
             ),
             local_security_posture: Arc::new(Mutex::new(None)),
+            require_hardened,
         };
 
         node.maybe_start_control_listener(
@@ -2700,6 +2703,7 @@ impl Node {
                 crate::crypto::inference_encryption::InferenceKeypair::generate(),
             ),
             local_security_posture: Arc::new(Mutex::new(None)),
+            require_hardened: false,
         }
     }
 
@@ -3885,24 +3889,50 @@ impl Node {
     /// Used for retry: if the first host fails, try the next.
     pub async fn hosts_for_model(&self, model: &str) -> Vec<EndpointId> {
         let state = self.state.lock().await;
-        let mut hosts: Vec<EndpointId> = state
+        let require_hardened = self.require_hardened;
+        let mut hosts: Vec<(EndpointId, bool)> = state
             .peers
             .values()
             .filter(|p| p.routes_http_model(model))
-            .map(|p| p.id)
+            .map(|p| {
+                let hardened = p
+                    .security_posture
+                    .as_ref()
+                    .is_some_and(|sp| sp.is_hardened());
+                (p.id, hardened)
+            })
             .collect();
-        hosts.sort();
+
+        // When --require-hardened is set, drop non-hardened peers entirely.
+        if require_hardened {
+            let before = hosts.len();
+            hosts.retain(|(_, h)| *h);
+            if hosts.len() < before {
+                tracing::debug!(
+                    model,
+                    dropped = before - hosts.len(),
+                    remaining = hosts.len(),
+                    "require-hardened: filtered non-hardened hosts"
+                );
+            }
+        }
+
+        // Sort: hardened hosts first, then by ID for determinism.
+        hosts.sort_by(|(id_a, h_a), (id_b, h_b)| h_b.cmp(h_a).then(id_a.cmp(id_b)));
+
+        let mut result: Vec<EndpointId> = hosts.into_iter().map(|(id, _)| id).collect();
+
         // Put the hash-preferred host first so normal path tries it first
-        if !hosts.is_empty() {
+        if !result.is_empty() {
             let my_id = self.endpoint.id();
             let id_bytes = my_id.as_bytes();
             let hash = id_bytes
                 .iter()
                 .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            let idx = (hash as usize) % hosts.len();
-            hosts.rotate_left(idx);
+            let idx = (hash as usize) % result.len();
+            result.rotate_left(idx);
         }
-        hosts
+        result
     }
 
     /// Find ANY host in the mesh (fallback when no model match).
