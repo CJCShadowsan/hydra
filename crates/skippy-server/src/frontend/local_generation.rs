@@ -344,6 +344,138 @@ impl StageOpenAiBackend {
                     )
                     .map_err(openai_backend_error)?;
             }
+            // ── Speculative prefill ────────────────────────────────
+            // If the request includes a draft response, verify it against
+            // the target model in one pass before entering the decode loop.
+            //
+            // Flow:
+            //   1. Tokenize draft_response as continuation text.
+            //   2. verify_tokens() — single batched forward pass over all
+            //      draft tokens.  Advances KV cache through every position.
+            //   3. Find contiguous acceptance prefix (predicted[i] == draft[i+1]).
+            //   4. Trim KV cache back to prompt + accepted_prefix + 1.
+            //      This discards cache entries for rejected draft tokens.
+            //   5. Emit accepted prefix tokens via on_token().
+            //   6. If fully accepted  → emit trailing token, return.
+            //      If diverged at K   → set `current = divergence_token`,
+            //                           fall through to decode loop.
+            let draft_text = request
+                .hook_request
+                .as_ref()
+                .and_then(|r| r.draft_response.clone());
+            let draft_token_ids = request
+                .hook_request
+                .as_ref()
+                .and_then(|r| r.draft_tokens.clone());
+            let prompt_token_count = request.prompt_token_ids.len() as u64;
+            let mut spec_prefill_accepted = 0usize;
+            let mut spec_prefill_start_current: Option<i32> = None;
+            let mut spec_prefill_fully_accepted = false;
+            let has_draft = draft_token_ids.is_some() || draft_text.is_some();
+            if has_draft {
+                if let Some(result) = spec_prefill::verify_draft(
+                    &self.runtime,
+                    &session_id,
+                    draft_token_ids.as_deref(),
+                    draft_text.as_deref(),
+                )? {
+                    spec_prefill_accepted = result.accepted_tokens;
+                    spec_prefill_fully_accepted = result.fully_accepted;
+
+                    // ── Trim KV cache ──────────────────────────────
+                    // After verify_tokens the KV cache holds:
+                    //   positions [0 .. prompt_tokens + draft_tokens)
+                    //
+                    // We only trust positions up to the accepted prefix.
+                    // The +1 accounts for draft_token[0] which is always
+                    // "processed" (its predicted[0] tells us what the
+                    // target would emit next).
+                    if !result.fully_accepted {
+                        let keep = prompt_token_count + result.accepted_tokens as u64 + 1;
+                        let mut rt = self
+                            .runtime
+                            .lock()
+                            .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                        rt.trim_session(&session_id, keep)
+                            .map_err(openai_backend_error)?;
+                    }
+
+                    // ── Telemetry ──────────────────────────────────
+                    let compare_len = result.total_draft_tokens.saturating_sub(1);
+                    let acceptance_rate = if compare_len > 0 {
+                        result.accepted_tokens as f64 / compare_len as f64
+                    } else {
+                        0.0
+                    };
+                    let mut attrs = self.openai_attrs(request.ids);
+                    attrs.insert(
+                        "llama_stage.spec_prefill.draft_tokens".to_string(),
+                        json!(result.total_draft_tokens),
+                    );
+                    attrs.insert(
+                        "llama_stage.spec_prefill.accepted_tokens".to_string(),
+                        json!(result.accepted_tokens),
+                    );
+                    attrs.insert(
+                        "llama_stage.spec_prefill.fully_accepted".to_string(),
+                        json!(result.fully_accepted),
+                    );
+                    attrs.insert(
+                        "llama_stage.spec_prefill.tokenize_ms".to_string(),
+                        json!(result.tokenize_ms),
+                    );
+                    attrs.insert(
+                        "llama_stage.spec_prefill.verify_ms".to_string(),
+                        json!(result.verify_ms),
+                    );
+                    attrs.insert(
+                        "llama_stage.spec_prefill.acceptance_rate".to_string(),
+                        json!(acceptance_rate),
+                    );
+                    attrs.insert(
+                        "llama_stage.spec_prefill.used_token_ids".to_string(),
+                        json!(draft_token_ids.is_some()),
+                    );
+                    self.telemetry.emit("stage.openai_spec_prefill", attrs);
+
+                    eprintln!(
+                        "spec_prefill: {}/{} accepted ({:.1}%), verify={:.0}ms, fully_accepted={}, token_ids={}",
+                        result.accepted_tokens,
+                        compare_len,
+                        acceptance_rate * 100.0,
+                        result.verify_ms,
+                        result.fully_accepted,
+                        draft_token_ids.is_some(),
+                    );
+
+                    // ── Emit accepted prefix ───────────────────────
+                    // Use the exact token IDs from the verify pass
+                    // (avoids tokenizer round-trip mismatch).
+                    let emit_count = (result.accepted_tokens + 1).min(result.draft_token_ids.len());
+                    for &tok in &result.draft_token_ids[..emit_count] {
+                        let control = on_token(tok)?;
+                        if control == TokenControl::Stop {
+                            spec_prefill_fully_accepted = true;
+                            break;
+                        }
+                    }
+
+                    if result.fully_accepted {
+                        // Emit the target's continuation after the full
+                        // draft (last predicted token).
+                        if let Some(div_tok) = result.divergence_token {
+                            let is_eog = token_is_eog_with_runtime(&self.runtime, div_tok)?;
+                            if !is_eog {
+                                let _ = on_token(div_tok);
+                            }
+                        }
+                    } else if let Some(div_tok) = result.divergence_token {
+                        spec_prefill_start_current = Some(div_tok);
+                    }
+                }
+            }
+            // ── end speculative prefill ──────────────────────────
+
             let decode_timer = PhaseTimer::start();
             let mut decoded_tokens = 0usize;
             let mut runtime_lock_wait_ms = 0.0;
@@ -357,6 +489,26 @@ impl StageOpenAiBackend {
                 .prompt_token_ids
                 .last()
                 .expect("checked non-empty prompt");
+
+            // If spec prefill was fully accepted, skip the decode loop.
+            if spec_prefill_fully_accepted {
+                return Ok(());
+            }
+
+            // If spec prefill partially accepted, start decode from the
+            // divergence token. The KV cache has been trimmed to just
+            // the prompt + accepted prefix, so decode() picks up at the
+            // correct position.
+            if let Some(div_tok) = spec_prefill_start_current {
+                let control = on_token(div_tok)?;
+                if control == TokenControl::Stop {
+                    return Ok(());
+                }
+                current = div_tok;
+                // Account for tokens already emitted so max_tokens is respected.
+                decoded_tokens = spec_prefill_accepted + 2; // prefix + divergence
+            }
+
             let mut hook_request = request.hook_request;
             let hook_runtime = request.hook_runtime;
             let generation_hooks_active =

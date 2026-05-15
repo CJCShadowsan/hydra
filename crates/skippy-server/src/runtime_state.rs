@@ -234,6 +234,15 @@ impl RuntimeState {
         Ok(output)
     }
 
+    /// Verify draft tokens locally (no activation frames). Returns the
+    /// model's greedy prediction at each position.
+    pub fn verify_tokens(&mut self, session_id: &str, token_ids: &[i32]) -> Result<Vec<i32>> {
+        let session = self.session(session_id)?;
+        let predicted = session.verify_tokens(token_ids)?;
+        self.add_session_tokens(session_id, token_ids.len() as u64);
+        Ok(predicted)
+    }
+
     pub fn checkpoint_session(&mut self, session_id: &str) -> Result<()> {
         let checkpoint = self.session(session_id)?.checkpoint()?;
         self.session_checkpoints

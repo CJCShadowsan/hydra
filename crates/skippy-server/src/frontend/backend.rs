@@ -55,8 +55,12 @@ impl OpenAiBackend for StageOpenAiBackend {
         let response_timer = PhaseTimer::start();
         let parsed_tool_calls =
             self.parse_tool_call_output(&output.text, &request, chat_parse_metadata.as_deref())?;
-        let response =
-            chat_response_from_generated_text(request.model.clone(), &output, parsed_tool_calls);
+        let response = chat_response_from_generated_text(
+            request.model.clone(),
+            &output,
+            parsed_tool_calls,
+            request.return_token_ids,
+        );
         let mut response_attrs = self.openai_attrs(&ids);
         response_attrs.insert(
             "llama_stage.openai_operation".to_string(),
