@@ -1032,6 +1032,8 @@ struct StartupLocalModelTask {
     flash_attention: FlashAttentionType,
     parallel_override: Option<usize>,
     split: bool,
+    draft_model_path: Option<PathBuf>,
+    draft_max: u16,
     skippy_telemetry: skippy::SkippyTelemetryOptions,
     survey_telemetry: survey::SurveyTelemetry,
     survey_launch_kind: survey::SurveyLaunchKind,
@@ -1069,6 +1071,8 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
         flash_attention,
         parallel_override,
         split,
+        draft_model_path,
+        draft_max,
         skippy_telemetry,
         survey_telemetry,
         survey_launch_kind,
@@ -1141,6 +1145,8 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
         flash_attention_override: flash_attention,
         parallel_override,
         skippy_telemetry: skippy_telemetry.clone(),
+        draft_model_path: draft_model_path.clone(),
+        draft_max,
     };
     let mut launch_started: Instant;
     let (
@@ -1463,6 +1469,8 @@ async fn startup_local_model_loop(params: StartupLocalModelTask) {
                             flash_attention_override: flash_attention,
                             parallel_override,
                             skippy_telemetry: skippy_telemetry.clone(),
+                            draft_model_path: draft_model_path.clone(),
+                            draft_max,
                         }, &model_ref)
                         .await
                         {
@@ -5074,6 +5082,8 @@ async fn run_auto(
         flash_attention: primary_flash_attention,
         parallel_override: primary_parallel_override,
         split: startup_split,
+        draft_model_path: cli.draft.clone(),
+        draft_max: cli.draft_max,
         skippy_telemetry: skippy_telemetry.clone(),
         survey_telemetry: survey_telemetry_for_primary,
         survey_launch_kind: survey::SurveyLaunchKind::Startup,
@@ -5166,6 +5176,8 @@ async fn run_auto(
                     flash_attention: extra_flash_attention,
                     parallel_override: extra_parallel_override,
                     split: startup_split,
+                    draft_model_path: None, // draft only for primary model
+                    draft_max: cli.draft_max,
                     skippy_telemetry: skippy_telemetry.clone(),
                     survey_telemetry: extra_survey_telemetry,
                     survey_launch_kind: survey::SurveyLaunchKind::MultiModel,
@@ -5375,6 +5387,8 @@ async fn run_auto(
                                         .unwrap_or(FlashAttentionType::Auto),
                                     parallel_override,
                                     skippy_telemetry: skippy_telemetry_options(&cli),
+                                    draft_model_path: cli.draft.clone(),
+                                    draft_max: cli.draft_max,
                                 },
                                 &runtime_model_name,
                             )

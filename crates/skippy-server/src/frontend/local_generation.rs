@@ -345,16 +345,15 @@ impl StageOpenAiBackend {
                     .map_err(openai_backend_error)?;
             }
             // ── Speculative prefill ────────────────────────────────
-            // If the request includes a draft response, verify it against
-            // the target model in one pass before entering the decode loop.
+            // If the request includes draft tokens (from API or from a
+            // local draft model), verify them against the target in one
+            // batched pass before entering the decode loop.
             //
             // Flow:
-            //   1. Tokenize draft_response as continuation text.
-            //   2. verify_tokens() — single batched forward pass over all
-            //      draft tokens.  Advances KV cache through every position.
-            //   3. Find contiguous acceptance prefix (predicted[i] == draft[i+1]).
-            //   4. Trim KV cache back to prompt + accepted_prefix + 1.
-            //      This discards cache entries for rejected draft tokens.
+            //   1. Optionally generate draft tokens from a small local model.
+            //   2. verify_tokens() — batched forward pass over draft tokens.
+            //   3. Find contiguous acceptance prefix.
+            //   4. Trim KV cache to prompt + accepted + 1.
             //   5. Emit accepted prefix tokens via on_token().
             //   6. If fully accepted  → emit trailing token, return.
             //      If diverged at K   → set `current = divergence_token`,
@@ -363,10 +362,39 @@ impl StageOpenAiBackend {
                 .hook_request
                 .as_ref()
                 .and_then(|r| r.draft_response.clone());
-            let draft_token_ids = request
+            let mut draft_token_ids = request
                 .hook_request
                 .as_ref()
                 .and_then(|r| r.draft_tokens.clone());
+
+            // If no external draft provided, generate one from the local
+            // draft model (DraftRunner). Uses same-tokenizer assumption
+            // (draft and target share vocabulary — true for same-family
+            // models like Qwen3-0.6B → Qwen3-8B).
+            const SPEC_PREFILL_DRAFT_CAP: usize = 12;
+            if draft_token_ids.is_none() && draft_text.is_none() {
+                if let Some(ref draft_runner) = self.draft {
+                    if let Ok(mut draft) = draft_runner.lock() {
+                        let draft_timer = PhaseTimer::start();
+                        let prompt_toks = request.prompt_token_ids;
+                        // Feed draft model the prompt context and generate
+                        // a short prefix. The last prompt token becomes the
+                        // first decode input.
+                        if let Ok(()) = draft.reset_to_context(prompt_toks) {
+                            let last_tok = *prompt_toks.last().unwrap_or(&0);
+                            if let Ok(proposed) = draft.propose(last_tok, SPEC_PREFILL_DRAFT_CAP) {
+                                let draft_ms = draft_timer.elapsed_ms();
+                                eprintln!(
+                                    "spec_prefill_draft: generated {} tokens from draft model in {:.0}ms",
+                                    proposed.len(),
+                                    draft_ms,
+                                );
+                                draft_token_ids = Some(proposed);
+                            }
+                        }
+                    }
+                }
+            }
             let prompt_token_count = request.prompt_token_ids.len() as u64;
             let mut spec_prefill_accepted = 0usize;
             let mut spec_prefill_start_current: Option<i32> = None;
