@@ -4220,7 +4220,10 @@ pub(crate) async fn run_plugin_mcp(cli: &Cli) -> Result<()> {
     let (node, _channels) = mesh::Node::start(
         NodeRole::Client,
         &cli.relay,
-        cli.bind_port,
+        mesh::QuicBindSelection {
+            ip: cli.bind_ip,
+            port: cli.bind_port,
+        },
         Some(0.0),
         !cli.no_enumerate_host,
         Some(owner_config),
@@ -4339,7 +4342,10 @@ async fn run_auto(
     let (node, channels) = mesh::Node::start(
         role,
         &cli.relay,
-        cli.bind_port,
+        mesh::QuicBindSelection {
+            ip: cli.bind_ip,
+            port: cli.bind_port,
+        },
         max_vram,
         !cli.no_enumerate_host,
         Some(owner_config),
@@ -5365,8 +5371,21 @@ async fn run_auto(
                                 let p = model_path.clone();
                                 tokio::task::spawn_blocking(move || runtime_model_planning_bytes(&p))
                                     .await
-                                    .unwrap_or(Ok(0))
-                                    .unwrap_or(0)
+                                    .unwrap_or_else(|err| {
+                                        Err(anyhow::anyhow!(
+                                            "join runtime model byte planning task: {err}"
+                                        ))
+                                    })
+                                    .unwrap_or_else(|err| {
+                                        let fallback = election::total_model_bytes(&model_path);
+                                        tracing::warn!(
+                                            model = %requested_model,
+                                            error = %err,
+                                            fallback_bytes = fallback,
+                                            "failed to resolve runtime model planning bytes; using filesystem size fallback"
+                                        );
+                                        fallback
+                                    })
                             };
                             let launch_started = Instant::now();
                             let (loaded_name, handle, death_rx) = match start_runtime_local_model(

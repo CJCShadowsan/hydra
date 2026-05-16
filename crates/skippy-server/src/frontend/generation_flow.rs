@@ -94,6 +94,7 @@ impl StageOpenAiBackend {
                 prefill_chunk_policy,
                 activation_width,
                 downstream_wire_condition,
+                prefill_reply_credit_limit,
                 lane_pool,
             } => {
                 let draft_response = hook_request.as_ref().and_then(|r| r.draft_response.clone());
@@ -104,6 +105,7 @@ impl StageOpenAiBackend {
                         prefill_chunk_policy: &prefill_chunk_policy,
                         activation_width,
                         downstream_wire_condition,
+                        prefill_reply_credit_limit,
                         lane_pool,
                         draft: self.draft.clone(),
                         speculative_window: self.speculative_window,

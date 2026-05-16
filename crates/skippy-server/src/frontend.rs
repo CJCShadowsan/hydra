@@ -207,6 +207,7 @@ pub struct EmbeddedOpenAiArgs {
     pub draft_n_gpu_layers: Option<i32>,
     pub activation_width: i32,
     pub wire_dtype: WireActivationDType,
+    pub reply_credit_limit: Option<usize>,
     pub downstream_connect_timeout_secs: u64,
     pub downstream_wire_condition: WireCondition,
     pub telemetry: Telemetry,
@@ -308,6 +309,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         args.telemetry.clone(),
     )
     .context("create embedded OpenAI persistent downstream lanes")?;
+    let prefill_reply_credit_limit = args.reply_credit_limit.unwrap_or(3);
     let mode = OpenAiBackendMode::EmbeddedStageZero {
         config: args.config.clone(),
         wire_dtype: args.wire_dtype,
@@ -323,6 +325,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         })?,
         activation_width: args.activation_width,
         downstream_wire_condition: args.downstream_wire_condition,
+        prefill_reply_credit_limit,
         lane_pool,
     };
     args.telemetry
@@ -388,6 +391,52 @@ struct GenerationQueueReservation {
 impl Drop for GenerationQueueReservation {
     fn drop(&mut self) {
         self.depth.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+async fn acquire_generation_permit_with_queue(
+    generation_limit: Arc<Semaphore>,
+    generation_queue_depth: Arc<AtomicUsize>,
+    generation_queue_limit: usize,
+    admission_timeout: Duration,
+) -> OpenAiResult<OwnedSemaphorePermit> {
+    match generation_limit.clone().try_acquire_owned() {
+        Ok(permit) => return Ok(permit),
+        Err(TryAcquireError::Closed) => return Err(generation_lanes_busy_error()),
+        Err(TryAcquireError::NoPermits) => {}
+    }
+
+    let _queue_reservation =
+        reserve_generation_queue(generation_queue_depth, generation_queue_limit)
+            .ok_or_else(generation_queue_full_error)?;
+    tokio::time::timeout(admission_timeout, generation_limit.acquire_owned())
+        .await
+        .map_err(|_| generation_queue_timeout_error(admission_timeout))?
+        .map_err(|_| generation_lanes_busy_error())
+}
+
+fn reserve_generation_queue(
+    generation_queue_depth: Arc<AtomicUsize>,
+    generation_queue_limit: usize,
+) -> Option<GenerationQueueReservation> {
+    let mut current = generation_queue_depth.load(Ordering::Acquire);
+    loop {
+        if current >= generation_queue_limit {
+            return None;
+        }
+        match generation_queue_depth.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(GenerationQueueReservation {
+                    depth: generation_queue_depth,
+                });
+            }
+            Err(next) => current = next,
+        }
     }
 }
 
@@ -554,6 +603,7 @@ enum OpenAiBackendMode {
         prefill_chunk_policy: PrefillChunkPolicy,
         activation_width: i32,
         downstream_wire_condition: WireCondition,
+        prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
     },
 }
@@ -1348,6 +1398,7 @@ struct EmbeddedStageZeroGeneration<'a> {
     prefill_chunk_policy: &'a PrefillChunkPolicy,
     activation_width: i32,
     downstream_wire_condition: WireCondition,
+    prefill_reply_credit_limit: usize,
     lane_pool: Option<Arc<PersistentStageLanePool>>,
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
