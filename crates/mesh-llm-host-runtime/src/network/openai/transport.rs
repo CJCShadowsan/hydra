@@ -95,7 +95,7 @@ pub enum PipelineProxyResult {
     FallbackToDirect,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RouteAttemptResult {
     Delivered {
         status_code: u16,
@@ -104,6 +104,15 @@ enum RouteAttemptResult {
     RetryableTimeout,
     RetryableUnavailable,
     RetryableContextOverflow,
+    /// Upstream returned a 5xx server error. Retryable when other targets exist
+    /// — the next peer may serve the same model on a healthier binary.
+    RetryableServerError {
+        status_code: u16,
+        /// Buffered error response to forward to the client if no other target
+        /// succeeds. Contains complete HTTP response bytes (status line, headers,
+        /// body) ready to write to the downstream TCP stream.
+        error_response: Vec<u8>,
+    },
     ClientDisconnected,
 }
 
@@ -113,6 +122,7 @@ fn route_attempt_result_label(result: &RouteAttemptResult) -> &'static str {
         RouteAttemptResult::RetryableTimeout => "retryable_timeout",
         RouteAttemptResult::RetryableUnavailable => "retryable_unavailable",
         RouteAttemptResult::RetryableContextOverflow => "retryable_context_overflow",
+        RouteAttemptResult::RetryableServerError { .. } => "retryable_server_error",
         RouteAttemptResult::ClientDisconnected => "client_disconnected",
     }
 }
@@ -1807,13 +1817,31 @@ async fn relay_error_response<R: AsyncRead + Unpin>(
     probe: ResponseProbe,
 ) -> Result<RouteAttemptResult> {
     let status_code = probe.status_code;
+    let outgoing = build_buffered_error_response(reader, probe).await;
+    tcp_stream.write_all(&outgoing).await?;
+    let _ = tcp_stream.shutdown().await;
+    Ok(RouteAttemptResult::Delivered {
+        status_code,
+        completion_tokens: None,
+    })
+}
+
+/// Read the rest of an error response from `reader` and produce a
+/// complete HTTP response buffer ready to write to a downstream client.
+/// Used both by `relay_error_response` (immediate forward) and by
+/// `RetryableServerError` (buffered for possible retry fallback).
+async fn build_buffered_error_response<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    probe: ResponseProbe,
+) -> Vec<u8> {
+    let status_code = probe.status_code;
     let header_end = probe.header_end;
     let mut buffered = probe.buffered;
     let mut limited = reader.take((MAX_ERROR_RESPONSE_BYTES + 1) as u64);
     if let Err(err) = limited.read_to_end(&mut buffered).await {
         tracing::debug!("error response relay read ended before EOF: {err}");
     }
-    let outgoing = if buffered.len().saturating_sub(header_end) > MAX_ERROR_RESPONSE_BYTES {
+    if buffered.len().saturating_sub(header_end) > MAX_ERROR_RESPONSE_BYTES {
         tracing::warn!(
             "upstream error body exceeded {} bytes for status {}",
             MAX_ERROR_RESPONSE_BYTES,
@@ -1822,13 +1850,7 @@ async fn relay_error_response<R: AsyncRead + Unpin>(
         oversized_error_http_response(status_code)
     } else {
         remap_error_http_response(status_code, header_end, &buffered).unwrap_or(buffered)
-    };
-    tcp_stream.write_all(&outgoing).await?;
-    let _ = tcp_stream.shutdown().await;
-    Ok(RouteAttemptResult::Delivered {
-        status_code,
-        completion_tokens: None,
-    })
+    }
 }
 
 async fn relay_success_response<R: AsyncRead + Unpin>(
@@ -1994,6 +2016,18 @@ async fn route_remote_attempt(
             match probe_http_response(&mut quic_recv).await {
                 Ok(probe) => {
                     let status_code = probe.status_code;
+                    // 5xx from a remote peer is retryable — the next peer
+                    // serving the same model may be running a newer binary
+                    // or simply be healthier. Buffer the error response so
+                    // we can forward it to the client if every target fails.
+                    if (500..600).contains(&status_code) {
+                        let error_response =
+                            build_buffered_error_response(&mut quic_recv, probe).await;
+                        return RouteAttemptResult::RetryableServerError {
+                            status_code,
+                            error_response,
+                        };
+                    }
                     match relay_probed_response(
                         tcp_stream,
                         &mut quic_recv,
@@ -2516,6 +2550,7 @@ pub async fn handle_mesh_request(
     let mut last_retryable = false;
     let mut refreshed = false;
     let mut attempts = 0usize;
+    let mut last_server_error_response: Option<Vec<u8>> = None;
     let total_targets = target_hosts.len();
     for (idx, target_host) in target_hosts.iter().enumerate() {
         attempts += 1;
@@ -2569,6 +2604,17 @@ pub async fn handle_mesh_request(
                 crate::network::metrics::AttemptOutcome::ContextOverflow,
                 None,
             ),
+            RouteAttemptResult::RetryableServerError { status_code, .. } => {
+                node.record_inference_attempt(
+                    effective_model.as_deref(),
+                    &attempt_target,
+                    queue_wait,
+                    attempt_time,
+                    crate::network::metrics::AttemptOutcome::Unavailable,
+                    None,
+                );
+                let _ = status_code;
+            }
             RouteAttemptResult::ClientDisconnected => {}
         }
         match attempt_result {
@@ -2606,6 +2652,33 @@ pub async fn handle_mesh_request(
                 );
                 release_request_objects(&node, &request.request_object_request_ids).await;
                 return;
+            }
+            RouteAttemptResult::RetryableServerError {
+                status_code,
+                error_response,
+            } => {
+                last_server_error_response = Some(error_response);
+                if let Some(key) = auto_session_key {
+                    tracing::debug!(
+                        "auto: upstream returned server error {status_code}, forgetting cached model for session {key:016x}"
+                    );
+                    affinity.forget_auto_model(key);
+                }
+                if let (Some(name), Some(prefix_hash), Some(cached_target)) = (
+                    effective_model.as_ref(),
+                    prepared.learn_prefix_hash,
+                    prepared.cached_target.as_ref(),
+                ) {
+                    let failed = election::InferenceTarget::Remote(*target_host);
+                    if cached_target == &failed {
+                        affinity.forget_target(name, prefix_hash, &failed);
+                    }
+                }
+                tracing::warn!(
+                    "Host {} returned server error {status_code}, trying next",
+                    target_host.fmt_short()
+                );
+                last_retryable = true;
             }
             RouteAttemptResult::RetryableContextOverflow => {
                 if let (Some(name), Some(prefix_hash), Some(cached_target)) = (
@@ -2684,16 +2757,21 @@ pub async fn handle_mesh_request(
             affinity.forget_auto_model(key);
         }
     }
-    let reason = format!(
-        "all {} tunnel(s) to hosts for {:?} failed (mesh request)",
-        total_targets, effective_model,
-    );
     node.record_routed_request(
         effective_model.as_deref(),
         attempts,
         crate::network::metrics::RequestOutcome::Unavailable,
     );
-    let _ = send_503(tcp_stream, &reason).await;
+    if let Some(error_bytes) = last_server_error_response {
+        let _ = tcp_stream.write_all(&error_bytes).await;
+        let _ = tcp_stream.shutdown().await;
+    } else {
+        let reason = format!(
+            "all {} tunnel(s) to hosts for {:?} failed (mesh request)",
+            total_targets, effective_model,
+        );
+        let _ = send_503(tcp_stream, &reason).await;
+    }
     release_request_objects(&node, &request.request_object_request_ids).await;
 }
 
@@ -2733,17 +2811,31 @@ async fn route_attempt_for_target(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn route_model_request(
+/// Result of routing a request to a model's targets.
+#[derive(Debug)]
+pub enum RouteModelResult {
+    /// Response was delivered (success or client-visible error forwarded).
+    Handled,
+    /// Every target returned a 5xx server error. The last error response
+    /// was forwarded to the client, but the caller may choose to retry
+    /// with a different model before that by using `try_route_model_request`.
+    AllTargetsServerError,
+}
+
+/// Like `route_model_request` but returns [`RouteModelResult`] so the
+/// caller can distinguish "delivered" from "all targets returned 5xx".
+/// When `AllTargetsServerError` is returned, **nothing** has been written
+/// to `tcp_stream` — the caller can rewrite the model and retry.
+pub async fn try_route_model_request(
     node: mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: &mut TcpStream,
     targets: &election::ModelTargets,
     model: &str,
     request: &BufferedHttpRequest,
     required_tokens: Option<u32>,
     affinity: &AffinityRouter,
-) -> bool {
+) -> RouteModelResult {
     let route_started = Instant::now();
-    let mut tcp_stream = tcp_stream;
     let ordered_candidates =
         order_targets_by_context(&node, model, required_tokens, &targets.candidates(model)).await;
     if ordered_candidates.is_empty() {
@@ -2752,7 +2844,7 @@ pub async fn route_model_request(
             0,
             crate::network::metrics::RequestOutcome::Unavailable,
         );
-        return false;
+        return RouteModelResult::Handled;
     }
 
     let selection = crate::network::affinity::select_model_target_from_candidates(
@@ -2768,14 +2860,14 @@ pub async fn route_model_request(
             0,
             crate::network::metrics::RequestOutcome::Unavailable,
         );
-        let _ = send_503(
+        let _ = write_503(
             tcp_stream,
             &format!(
                 "target for model '{model}' resolved to None (election in progress or host down)"
             ),
         )
         .await;
-        return true;
+        return RouteModelResult::Handled;
     }
 
     if let (Some(prefix_hash), Some(cached_target)) = (
@@ -2802,13 +2894,14 @@ pub async fn route_model_request(
     let total_targets = ordered.len();
     let mut attempts = 0usize;
     let mut refreshed = false;
+    let mut last_server_error: Option<Vec<u8>> = None;
     for (idx, target) in ordered.into_iter().enumerate() {
         attempts += 1;
         let attempt_started = Instant::now();
         let retry_context_overflow = idx + 1 < total_targets;
         let attempt_result = route_attempt_for_target(
             &node,
-            &mut tcp_stream,
+            tcp_stream,
             &target,
             &request.raw,
             retry_context_overflow,
@@ -2853,6 +2946,17 @@ pub async fn route_model_request(
                 crate::network::metrics::AttemptOutcome::ContextOverflow,
                 None,
             ),
+            RouteAttemptResult::RetryableServerError { status_code, .. } => {
+                node.record_inference_attempt(
+                    Some(model),
+                    &target,
+                    queue_wait,
+                    attempt_time,
+                    crate::network::metrics::AttemptOutcome::Unavailable,
+                    None,
+                );
+                let _ = status_code;
+            }
             RouteAttemptResult::ClientDisconnected => {}
         }
         tracing::info!(
@@ -2898,7 +3002,7 @@ pub async fn route_model_request(
                     route_ms = route_started.elapsed().as_millis(),
                     "openai route_model_request delivered"
                 );
-                return true;
+                return RouteModelResult::Handled;
             }
             RouteAttemptResult::RetryableContextOverflow => {
                 if let (Some(prefix_hash), Some(cached_target)) = (
@@ -2947,6 +3051,23 @@ pub async fn route_model_request(
                 }
                 tracing::warn!("Target {target:?} unavailable, trying next");
             }
+            RouteAttemptResult::RetryableServerError {
+                status_code,
+                error_response,
+            } => {
+                last_server_error = Some(error_response);
+                if let (Some(prefix_hash), Some(cached_target)) = (
+                    selection.learn_prefix_hash,
+                    selection.cached_target.as_ref(),
+                ) {
+                    if cached_target == &target {
+                        affinity.forget_target(model, prefix_hash, &target);
+                    }
+                }
+                tracing::warn!(
+                    "Target {target:?} returned server error {status_code}, trying next"
+                );
+            }
             RouteAttemptResult::ClientDisconnected => {
                 tracing::info!(
                     model = model,
@@ -2954,16 +3075,12 @@ pub async fn route_model_request(
                     route_ms = route_started.elapsed().as_millis(),
                     "openai route_model_request downstream disconnected"
                 );
-                return true;
+                return RouteModelResult::Handled;
             }
         }
     }
 
-    let _ = send_503(
-        tcp_stream,
-        &format!("all {} target(s) for model '{model}' failed", total_targets),
-    )
-    .await;
+    // All targets exhausted. If we have a buffered server error from the
     node.record_routed_request(
         Some(model),
         attempts,
@@ -2975,7 +3092,57 @@ pub async fn route_model_request(
         route_ms = route_started.elapsed().as_millis(),
         "openai route_model_request exhausted targets"
     );
-    true
+
+    // When every target returned a 5xx, signal the caller so it can
+    // retry with a different model (e.g. auto model fallback). Nothing
+    // has been written to tcp_stream yet.
+    if last_server_error.is_some() {
+        return RouteModelResult::AllTargetsServerError;
+    }
+    let _ = write_503(
+        tcp_stream,
+        &format!("all {} target(s) for model '{model}' failed", total_targets),
+    )
+    .await;
+    RouteModelResult::Handled
+}
+
+/// Route a request to targets for a model. Consumes `tcp_stream`.
+/// Returns `true` when a response (success or error) was written to the
+/// client, `false` when no candidates existed at all.
+pub async fn route_model_request(
+    node: mesh::Node,
+    tcp_stream: TcpStream,
+    targets: &election::ModelTargets,
+    model: &str,
+    request: &BufferedHttpRequest,
+    required_tokens: Option<u32>,
+    affinity: &AffinityRouter,
+) -> bool {
+    let mut tcp_stream = tcp_stream;
+    let result = try_route_model_request(
+        node,
+        &mut tcp_stream,
+        targets,
+        model,
+        request,
+        required_tokens,
+        affinity,
+    )
+    .await;
+    match result {
+        RouteModelResult::Handled => true,
+        RouteModelResult::AllTargetsServerError => {
+            // Fallback: forward a generic 503 when every target 5xx'd
+            // and the caller didn't handle the retry.
+            let _ = send_503(
+                tcp_stream,
+                &format!("all targets for model '{model}' returned server errors"),
+            )
+            .await;
+            true
+        }
+    }
 }
 
 /// Route a request to a known inference target (local OpenAI surface or remote host).
@@ -3020,6 +3187,9 @@ pub async fn route_to_target(
             RouteAttemptResult::RetryableContextOverflow => {
                 crate::network::metrics::AttemptOutcome::ContextOverflow
             }
+            RouteAttemptResult::RetryableServerError { .. } => {
+                crate::network::metrics::AttemptOutcome::Unavailable
+            }
             RouteAttemptResult::ClientDisconnected => {
                 crate::network::metrics::AttemptOutcome::Unavailable
             }
@@ -3053,6 +3223,16 @@ pub async fn route_to_target(
             };
             node.record_routed_request(model, 1, request_outcome_for_status(status_code, service));
             true
+        }
+        RouteAttemptResult::RetryableServerError { error_response, .. } => {
+            node.record_routed_request(
+                model,
+                1,
+                crate::network::metrics::RequestOutcome::Unavailable,
+            );
+            let _ = tcp_stream.write_all(&error_response).await;
+            let _ = tcp_stream.shutdown().await;
+            false
         }
         RouteAttemptResult::RetryableTimeout
         | RouteAttemptResult::RetryableContextOverflow
@@ -3111,6 +3291,9 @@ pub async fn route_http_endpoint_request(
             RouteAttemptResult::RetryableContextOverflow => {
                 crate::network::metrics::AttemptOutcome::ContextOverflow
             }
+            RouteAttemptResult::RetryableServerError { .. } => {
+                crate::network::metrics::AttemptOutcome::Unavailable
+            }
             RouteAttemptResult::ClientDisconnected => {
                 crate::network::metrics::AttemptOutcome::Unavailable
             }
@@ -3143,6 +3326,16 @@ pub async fn route_http_endpoint_request(
                 ),
             );
             true
+        }
+        RouteAttemptResult::RetryableServerError { error_response, .. } => {
+            node.record_routed_request(
+                model,
+                1,
+                crate::network::metrics::RequestOutcome::Unavailable,
+            );
+            let _ = tcp_stream.write_all(&error_response).await;
+            let _ = tcp_stream.shutdown().await;
+            false
         }
         RouteAttemptResult::RetryableTimeout
         | RouteAttemptResult::RetryableContextOverflow
@@ -3363,10 +3556,18 @@ pub async fn send_error(mut stream: TcpStream, code: u16, msg: &str) -> std::io:
 
 pub async fn send_503(stream: TcpStream, reason: &str) -> std::io::Result<()> {
     tracing::warn!("503 → client: {reason}");
-    send_503_inner(stream, reason).await
+    let mut stream = stream;
+    write_503_body(&mut stream, reason).await
 }
 
-async fn send_503_inner(mut stream: TcpStream, reason: &str) -> std::io::Result<()> {
+/// Write a 503 to a borrowed stream (usable inside retry loops that
+/// keep ownership of the stream).
+async fn write_503(stream: &mut TcpStream, reason: &str) -> std::io::Result<()> {
+    tracing::warn!("503 → client: {reason}");
+    write_503_body(stream, reason).await
+}
+
+async fn write_503_body(stream: &mut TcpStream, reason: &str) -> std::io::Result<()> {
     let body = serde_json::json!({"error": reason}).to_string();
     let resp = format!(
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",

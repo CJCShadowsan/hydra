@@ -495,6 +495,57 @@ pub fn pick_model_classified<'a>(
     big.into_iter().chain(small).next().map(|&(n, _, _)| n)
 }
 
+/// Like [`pick_model_classified`] but returns **all** candidates in
+/// priority order (big models first, shuffled within each tier). Used by
+/// auto routing to try fallback models when the first choice's targets
+/// all return server errors.
+pub fn rank_models_classified<'a>(
+    classification: &Classification,
+    available_models: &[(&'a str, f64, crate::models::ModelCapabilities)],
+) -> Vec<&'a str> {
+    use crate::models::CapabilityLevel;
+
+    if available_models.is_empty() {
+        return Vec::new();
+    }
+
+    let filtered: Vec<&(&str, f64, crate::models::ModelCapabilities)> =
+        match classification.category {
+            _ if classification.needs_tools => available_models
+                .iter()
+                .filter(|(_, _, caps)| caps.tool_use != CapabilityLevel::None)
+                .collect(),
+            Category::Reasoning => available_models
+                .iter()
+                .filter(|(_, _, caps)| caps.reasoning != CapabilityLevel::None)
+                .collect(),
+            Category::Image => available_models
+                .iter()
+                .filter(|(_, _, caps)| caps.vision != CapabilityLevel::None)
+                .collect(),
+            _ => Vec::new(),
+        };
+
+    let candidates: Vec<&(&str, f64, crate::models::ModelCapabilities)> = if filtered.is_empty() {
+        available_models.iter().collect()
+    } else {
+        filtered
+    };
+
+    let (mut big, mut small): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|(name, _, _)| !is_single_digit_b_name(name));
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    shuffle_in_place(&mut big, nanos);
+    shuffle_in_place(&mut small, nanos.wrapping_add(0x9E37_79B9_7F4A_7C15));
+
+    big.into_iter().chain(small).map(|&(n, _, _)| n).collect()
+}
+
 /// Return true if `name` advertises a single-digit billion-parameter
 /// count, e.g. "Qwen3.5-2B-Q4_K_M" or "llama-3-7b-instruct".
 ///

@@ -157,7 +157,9 @@ pub(crate) async fn api_proxy(
                         return;
                     }
 
-                    let (effective_model, classification) = if request.model_name.is_none()
+                    let (effective_model, classification, auto_fallback_models) = if request
+                        .model_name
+                        .is_none()
                         || request.model_name.as_deref() == Some("auto")
                     {
                         request.ensure_body_json();
@@ -186,23 +188,36 @@ pub(crate) async fn api_proxy(
                                         (name.as_str(), 0.0, caps)
                                     })
                                     .collect();
-                            let picked = router::pick_model_classified(&cl, &available);
-                            if let Some(name) = picked {
+                            let ranked = router::rank_models_classified(&cl, &available);
+                            if let Some(name) = ranked.first() {
                                 tracing::info!(
-                                    "router: {:?}/{:?} tools={} → {name}",
+                                    "router: {:?}/{:?} tools={} → {name} ({})",
                                     cl.category,
                                     cl.complexity,
-                                    cl.needs_tools
+                                    cl.needs_tools,
+                                    if ranked.len() > 1 {
+                                        format!("+{} fallbacks", ranked.len() - 1)
+                                    } else {
+                                        "no fallbacks".to_string()
+                                    }
                                 );
-                                (Some(name.to_string()), Some(cl))
+                                (
+                                    Some(name.to_string()),
+                                    Some(cl),
+                                    ranked
+                                        .into_iter()
+                                        .skip(1)
+                                        .map(String::from)
+                                        .collect::<Vec<_>>(),
+                                )
                             } else {
-                                (None, Some(cl))
+                                (None, Some(cl), Vec::new())
                             }
                         } else {
-                            (None, None)
+                            (None, None, Vec::new())
                         }
                     } else {
-                        (request.model_name.clone(), None)
+                        (request.model_name.clone(), None, Vec::new())
                     };
                     // Enable mesh hooks for auto-routed requests. When the
                     // smart router picks the model, hooks allow the local
@@ -308,9 +323,9 @@ pub(crate) async fn api_proxy(
                                         .map(election::InferenceTarget::Remote)
                                         .collect(),
                                 );
-                                let routed = proxy::route_model_request(
+                                let result = proxy::try_route_model_request(
                                     node.clone(),
-                                    tcp_stream,
+                                    &mut tcp_stream,
                                     &mesh_targets,
                                     name,
                                     &request,
@@ -318,13 +333,94 @@ pub(crate) async fn api_proxy(
                                     &affinity,
                                 )
                                 .await;
-                                proxy::release_request_objects(
-                                    &node,
-                                    &request.request_object_request_ids,
-                                )
-                                .await;
-                                debug_assert!(routed);
-                                return;
+                                match result {
+                                    proxy::RouteModelResult::Handled => {
+                                        proxy::release_request_objects(
+                                            &node,
+                                            &request.request_object_request_ids,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    proxy::RouteModelResult::AllTargetsServerError => {
+                                        // All targets for this model returned 5xx.
+                                        // Try fallback models if available (auto routing).
+                                        let mut routed = false;
+                                        for fallback in &auto_fallback_models {
+                                            tracing::info!(
+                                                "auto: primary model {name} failed, trying fallback {fallback}"
+                                            );
+                                            proxy::rewrite_model_field(&mut request, fallback);
+                                            let fb_hosts = node.hosts_for_model(fallback).await;
+                                            if fb_hosts.is_empty() {
+                                                // Also check local targets
+                                                if !has_available_candidates(&targets, fallback) {
+                                                    continue;
+                                                }
+                                                // Use local targets for this fallback
+                                                let fb_result = proxy::try_route_model_request(
+                                                    node.clone(),
+                                                    &mut tcp_stream,
+                                                    &targets,
+                                                    fallback,
+                                                    &request,
+                                                    required_tokens,
+                                                    &affinity,
+                                                )
+                                                .await;
+                                                match fb_result {
+                                                    proxy::RouteModelResult::Handled => {
+                                                        routed = true;
+                                                        break;
+                                                    }
+                                                    proxy::RouteModelResult::AllTargetsServerError => {
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            let mut fb_targets = targets.clone();
+                                            fb_targets.targets.insert(
+                                                fallback.clone(),
+                                                fb_hosts
+                                                    .into_iter()
+                                                    .map(election::InferenceTarget::Remote)
+                                                    .collect(),
+                                            );
+                                            let fb_result = proxy::try_route_model_request(
+                                                node.clone(),
+                                                &mut tcp_stream,
+                                                &fb_targets,
+                                                fallback,
+                                                &request,
+                                                required_tokens,
+                                                &affinity,
+                                            )
+                                            .await;
+                                            match fb_result {
+                                                proxy::RouteModelResult::Handled => {
+                                                    routed = true;
+                                                    break;
+                                                }
+                                                proxy::RouteModelResult::AllTargetsServerError => {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if !routed {
+                                            let _ = proxy::send_503(
+                                                tcp_stream,
+                                                &format!("all models failed for auto request (tried {name} + {} fallbacks)", auto_fallback_models.len()),
+                                            )
+                                            .await;
+                                        }
+                                        proxy::release_request_objects(
+                                            &node,
+                                            &request.request_object_request_ids,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
                             }
                             if let Some(plugin_manager) = plugin_manager.as_ref() {
                                 match plugin_manager.inference_endpoint_for_model(name).await {
