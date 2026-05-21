@@ -786,25 +786,43 @@ async fn send_moa_as_responses_sse(
         );
     }
 
-    let events = [
-        created,
-        resp::responses_stream_delta_event(&item_id, &content),
-        resp::responses_stream_text_done_event(&item_id, &content),
-        resp::responses_stream_completed_event(
-            &response_id,
-            created_at,
-            &model,
-            &item_id,
-            &content,
-            usage,
-        ),
-    ];
+    // Pre-build the constant events. The deltas in between are
+    // emitted one chunk at a time so the chat UI sees text appearing
+    // incrementally instead of in one pop.
+    let done_event = resp::responses_stream_text_done_event(&item_id, &content);
+    let completed_event = resp::responses_stream_completed_event(
+        &response_id,
+        created_at,
+        &model,
+        &item_id,
+        &content,
+        usage,
+    );
 
-    for event in &events {
+    async fn write_framed_event(
+        stream: &mut TcpStream,
+        event: &serde_json::Value,
+    ) -> std::io::Result<()> {
         let data = format!("data: {}\n\n", event);
         let framed = format!("{:x}\r\n{}\r\n", data.len(), data);
-        stream.write_all(framed.as_bytes()).await?;
+        stream.write_all(framed.as_bytes()).await
     }
+
+    write_framed_event(&mut stream, &created).await?;
+
+    // Emit the content as a series of incremental output_text.delta
+    // events. By the time MoA decides on a winner the content is
+    // already buffered, so this is a presentation chunking — the UI
+    // sees text flowing, the underlying timing is unchanged. Real
+    // streaming (from the winning worker mid-arbitration) is a
+    // bigger change tracked separately.
+    for chunk in chunk_for_streaming(&content) {
+        let delta = resp::responses_stream_delta_event(&item_id, chunk);
+        write_framed_event(&mut stream, &delta).await?;
+    }
+
+    write_framed_event(&mut stream, &done_event).await?;
+    write_framed_event(&mut stream, &completed_event).await?;
 
     let done = "data: [DONE]\n\n";
     let framed = format!("{:x}\r\n{}\r\n", done.len(), done);
@@ -813,6 +831,58 @@ async fn send_moa_as_responses_sse(
     stream.write_all(b"0\r\n\r\n").await?;
     stream.shutdown().await?;
     Ok(())
+}
+
+/// Number of characters per chunk. Roughly approximates ~5 tokens of
+/// English text. Tuned for chat-UX feel — small enough that incremental
+/// text appears smoothly, big enough that we don't spam the wire with
+/// 100s of single-char events.
+const MOA_STREAM_CHUNK_CHARS: usize = 24;
+
+/// Split `content` into chunks of approximately `MOA_STREAM_CHUNK_CHARS`
+/// characters, respecting UTF-8 character boundaries and preferring to
+/// break on whitespace so words aren't sliced mid-letter where avoidable.
+///
+/// Returns at least one chunk (the full content) when content is short.
+/// Returns no chunks only when content is empty — in that case the
+/// caller still emits the done + completed events so the client sees a
+/// well-formed end of stream.
+fn chunk_for_streaming(content: &str) -> Vec<&str> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let bytes = content.as_bytes();
+    while start < bytes.len() {
+        // Walk forward at most MOA_STREAM_CHUNK_CHARS chars, advancing
+        // by UTF-8 character boundaries.
+        let mut chars_seen = 0usize;
+        let mut probe = start;
+        let mut last_ws_byte: Option<usize> = None;
+        while probe < bytes.len() && chars_seen < MOA_STREAM_CHUNK_CHARS {
+            let ch_start = probe;
+            // SAFETY/correctness: `content` is &str so we can find the
+            // next char boundary by checking utf8_char_width on the
+            // first byte. Use core::str primitives instead.
+            let ch = content[ch_start..].chars().next().expect("char");
+            probe = ch_start + ch.len_utf8();
+            chars_seen += 1;
+            if ch.is_whitespace() {
+                last_ws_byte = Some(probe);
+            }
+        }
+        // Prefer to break at the last whitespace boundary we saw,
+        // unless that would produce a tiny chunk (< half the budget),
+        // in which case just take the full window.
+        let end = match last_ws_byte {
+            Some(ws) if ws - start >= MOA_STREAM_CHUNK_CHARS / 2 => ws,
+            _ => probe,
+        };
+        out.push(&content[start..end]);
+        start = end;
+    }
+    out
 }
 
 /// Convert a chat.completion JSON body to a Responses-API JSON body.
@@ -1245,5 +1315,137 @@ mod tests {
             !raw.contains("\"completion_tokens\":"),
             "chat-shape completion_tokens must NOT leak into Responses-API SSE; got: {raw}"
         );
+    }
+
+    // ── chunk_for_streaming ─────────────────────────────────────────────────
+    //
+    // Issue #618: MoA was emitting a single output_text.delta event
+    // with the entire arbitrated answer, making the chat UI feel
+    // like a long spinner followed by a hard pop-in. Splitting the
+    // buffered content into small char-bounded chunks lets the UI
+    // render incrementally even though MoA already has the full
+    // text in hand.
+
+    #[test]
+    fn chunk_for_streaming_empty_returns_no_chunks() {
+        assert_eq!(chunk_for_streaming(""), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn chunk_for_streaming_short_content_returns_single_chunk() {
+        let chunks = chunk_for_streaming("Hello world.");
+        assert_eq!(chunks, vec!["Hello world."]);
+    }
+
+    #[test]
+    fn chunk_for_streaming_long_content_produces_multiple_chunks() {
+        let text = "The quick brown fox jumps over the lazy dog. The five boxing wizards jump quickly. Pack my box with five dozen liquor jugs. Sphinx of black quartz; judge my vow.";
+        let chunks = chunk_for_streaming(text);
+        assert!(
+            chunks.len() >= 5,
+            "expected multiple chunks for {}-char text; got {} chunks",
+            text.len(),
+            chunks.len()
+        );
+        let joined: String = chunks.iter().copied().collect();
+        assert_eq!(joined, text, "chunked output must reassemble to source");
+    }
+
+    #[test]
+    fn chunk_for_streaming_handles_utf8_multibyte_chars() {
+        let text = "é café 你好 👋 world 🌍 こんにちは how are you doing today my friend";
+        let chunks = chunk_for_streaming(text);
+        let joined: String = chunks.iter().copied().collect();
+        assert_eq!(joined, text);
+        for c in &chunks {
+            assert!(!c.is_empty(), "empty chunk in output");
+        }
+    }
+
+    #[test]
+    fn chunk_for_streaming_no_whitespace_falls_back_to_char_window() {
+        let text = "a".repeat(100);
+        let chunks = chunk_for_streaming(&text);
+        let joined: String = chunks.iter().copied().collect();
+        assert_eq!(joined, text);
+        assert!(
+            chunks.len() >= 3,
+            "expected multiple chunks for 100-char run"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_emits_multiple_delta_events_for_long_content() {
+        // Drive the SSE writer against a fabricated MoA body with a
+        // long content string and assert that the wire shows multiple
+        // output_text.delta events, not the old single-delta shape.
+        let long_text = "The quick brown fox jumps over the lazy dog repeatedly while contemplating the meaning of life in the modern world.";
+        let response = serde_json::json!({
+            "id": "chatcmpl-moa-streaming",
+            "object": "chat.completion",
+            "model": "mesh",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": long_text },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let raw = capture_responses_sse_body(response).await;
+
+        // Count delta events. The chunk size is 24 chars so a ~120-char
+        // string should produce ~4-6 deltas.
+        let delta_count = raw
+            .matches("\"type\":\"response.output_text.delta\"")
+            .count();
+        assert!(
+            delta_count >= 3,
+            "expected ≥3 incremental deltas for long content; got {delta_count}.\nRaw:\n{raw}"
+        );
+        // Must still see exactly one done + one completed.
+        assert_eq!(
+            raw.matches("\"type\":\"response.output_text.done\"")
+                .count(),
+            1
+        );
+        assert_eq!(raw.matches("\"type\":\"response.completed\"").count(), 1);
+        // Reassembled deltas (in body string) must contain the full text.
+        assert!(
+            raw.contains("contemplating") && raw.contains("meaning of life"),
+            "delta content lost or corrupted; raw:\n{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_empty_content_still_emits_done_and_completed() {
+        // If content somehow ends up empty (e.g. degenerate worker
+        // output), the stream must still close cleanly with done +
+        // completed + [DONE] so clients don't hang.
+        let response = serde_json::json!({
+            "id": "chatcmpl-moa-empty",
+            "object": "chat.completion",
+            "model": "mesh",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "" },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let raw = capture_responses_sse_body(response).await;
+
+        assert_eq!(
+            raw.matches("\"type\":\"response.output_text.delta\"")
+                .count(),
+            0,
+            "empty content should not produce delta events"
+        );
+        assert_eq!(
+            raw.matches("\"type\":\"response.output_text.done\"")
+                .count(),
+            1
+        );
+        assert_eq!(raw.matches("\"type\":\"response.completed\"").count(), 1);
+        assert!(raw.contains("[DONE]"), "missing [DONE]");
     }
 }
