@@ -66,14 +66,128 @@ This is **net better** for the connection-pair: paths don't get torn down and re
 
 Takeaway: mini's VPN system extension is the most likely environmental cause. Asking the user to disable it would confirm. But the wild won't always cooperate — we need to be resilient regardless.
 
-## Topological resilience experiments still worth running
+## Topological resilience experiments — results from the v2 lab run
 
-1. **Direction reversal**: have mini initiate connections to M4 (mini becomes the proxy). Does the asymmetry flip with direction, or is it always M4→mini that's broken?
-2. **Key rotation**: delete `~/.mesh-llm/key` on either side and restart. Forces a fresh holepunch from scratch. Does the new connection pick different addrs / behave differently?
-3. **Disable mini's VPN system extension**: would confirm or rule out as the cause.
-4. **Capture iroh debug logs** during a flap and see exactly which addresses it tried (`endpoint=` / `path=` events at debug level).
+### Invite token contents (decoded base64)
 
-These are cheap to try in the lab but not in the wild. The point of the resilience work (same-target retry, sticky relay) is to be okay regardless.
+Each node advertises three addresses in its invite token: the iroh relay URL, its public IP/port via STUN-like discovery, and its LAN IP/port. Decoded:
+
+```
+M4     id=cf2d4edab1...  addrs=[relay, 180.181.228.108:36188, 192.168.86.172:56727]
+Mini   id=462bcc96fb...  addrs=[relay, 180.181.228.108:36119, 192.168.86.60:63108]
+Studio id=d0782f712e...  addrs=[relay, 180.181.228.108:0,     192.168.86.24:61252]
+```
+
+All three nodes are behind the same NAT (`180.181.228.108`, Australia Pacific Networks home router). Studio's public-IP port is `0` — meaning STUN-equivalent didn't return a port yet, or studio simply hasn't done the public-address discovery cycle. Both other nodes have specific ports.
+
+### LAN reachability is fine but jittery (zero loss, wide RTT range)
+
+Direct ICMP probes between nodes (all on the same 192.168.86.0/24 subnet via 192.168.86.1 router):
+
+| path | min | avg | max | stddev |
+|---|---|---|---|---|
+| M4 → studio | 7.5 | **22.9** | 64 | 21 |
+| studio → mini | 10.0 | **52.5** | 125 | 36 |
+| mini → studio | 7.8 | **33.0** | 107 | 37 |
+| M4 → mini | 13.3 | **55.6** | 110 | 29 |
+| mini → M4 | 7.7 | **28.3** | 113 | 33 |
+
+**Mini is the jittery node, in both directions.** Not an M4 firewall issue (mini↔studio is also jittery). Not direction-specific. It's mini's wifi link itself. Studio↔M4 (the one stable pair) is the only pair where neither end is mini.
+
+UDP "reachability" via `nc -uvz` succeeds in both directions, but that's misleading — UDP nc just sends a single datagram and exits without waiting for any acknowledgement. It tells us only that the OS didn't reject the send.
+
+### Why iroh's path teardown happens despite 0% loss
+
+iroh's path-quality estimator uses RTT to decide whether a path is healthy. When mini's wifi swings from 8ms to 110ms repeatedly, iroh sees a degraded path. After enough consecutive bad RTTs, multipath marks the path unhealthy, probes a new one, and abandons the old. When all known paths abandon simultaneously, you get `Connection to 462bcc96fb closed: no viable network path exists: last path abandoned, no new path opened`.
+
+Real v2 log excerpts of this lifecycle (paraphrased):
+
+```
+09:40:56  Heartbeat: 462bcc96fb unreachable (1/3), will retry
+09:41:10  failed to read response from host 462bcc96fb: upstream sent no response within 300.000s
+09:42:06  Heartbeat: 462bcc96fb unreachable (2/3), will retry
+09:42:47  failed to read response from host 462bcc96fb: connection lost
+09:42:47  pre-commit failure to host 462bcc96fb — retrying once after 750ms   ← our fix fires
+09:42:48  Address Lookup failed: No address lookup configured
+09:42:56  Peer 462bcc96fb reported dead by d0782f712e, confirmed, removing
+09:42:57  Reconnect to 462bcc96fb failed — removing peer
+09:42:58  503 → client: all 1 target(s) for model 'unsloth/Qwen3.5-9B-GGUF:Q4_K_M' failed
+```
+
+My 750ms retry fired but the peer was disappearing entirely from the mesh, so the second attempt also failed. Within ~10s iroh + mesh gossip reconcile and mini comes back, but the client request had already been told 503.
+
+### Mini OS state at time of lab
+
+What we found and ruled out as causes:
+
+* **No Tailscale running** on any of the three nodes (`pgrep -lf tailscale` empty everywhere). Earlier hypothesis wrong.
+* **macOS VPN system extension** running on mini but with **0 active connections** (`systemextensionsctl list` reports `0 extension(s)`, `scutil --nc list` empty). Benign.
+* **Mini firewall off**; M4 + studio firewall on with stealth, but studio↔M4 is the stable pair, so firewall config doesn't explain anything.
+* **`net.inet.udp.log.enable = 97`** on mini — UDP kernel packet logging enabled. `rate_current: 3` packets/min so it's rate-limited; probably benign.
+* **Wi-Fi link layer healthy** — `netstat -in` shows 0 input errors, 0 output errors out of 48M+ packets received and 76M+ sent.
+* **Power state** — mini awake, displaysleep prevented by UniversalControl. powerNap on but doesn't fire while awake.
+* **6 `utun*` interfaces** on mini, 6 on M4, 4 on studio — all benign (macOS subsystem tunnels).
+
+So the residual cause is **mini's wifi RTT jitter**. Could be:
+* poor signal where the mini sits
+* Wi-Fi channel contention with other devices
+* macOS Wi-Fi power-saving settling into a low-power state and waking on demand
+* Wi-Fi driver bug specific to this hardware/macOS combo
+
+Mic is going to inspect / reboot the mini. After reboot we can re-run the ping matrix and the lab to see if the wifi jitter pattern changes.
+
+### Test status after ≈1 hour with the retry fix on M4
+
+Retry has fired 3 times. All 3 followed a `connection lost` from a transient direct path drop. In 2 of 3 cases, the peer was rapidly disappearing entirely from the mesh, so the second same-host attempt failed too — the request returned 503. In 1 case, retry resolved.
+
+### Topology-rotation experiment (mini reboot + macOS 26.5 update)
+
+After mini was rebooted into macOS 26.5, the ping picture flipped:
+
+| Path | Pre-reboot (15 pkts) | Post-reboot (20 pkts) |
+|---|---|---|
+| M4 → mini | avg 55ms, max 110 | **avg 14ms, max 87** |
+| mini → M4 | avg 28ms, max 113 | **avg 17ms, max 87** |
+| M4 → studio | avg 22ms, max 64 | **avg 36ms, max 114** |
+
+Mini's wifi is now *better* than studio's. **The bad-RTT-jitter window rotated to studio**. This rules out hardware/OS-specific causes (Tailscale, VPN system extension, firewall config) on a single node — the actual variable is moment-by-moment wifi RF conditions affecting whichever node happens to be in the worse spot.
+
+### Cross-validating with studio's view
+
+Studio is also a node and has been gossiping the whole time. Its own log shows `LastOpenPath` events too. Counted with proper ANSI stripping:
+
+| direction (per studio's log) | LastOpenPath count |
+|---|---|
+| studio → mini (remote=462bcc96fb) | 10 |
+| studio → M4 (remote=cf2d4edab1) | 1 (at connection setup) |
+
+So studio sees the same pattern: it loses paths to mini, never to M4. **Both M4 and studio independently agree mini is the bad pair** — which makes "M4's incoming-firewall-stealth" not the cause (studio doesn't have M4's firewall and ALSO loses paths to mini).
+
+My earlier framing "this is M4's incoming-traffic shape" was wrong. The actual variable is: **whichever node has the worse wifi RF at the moment, all of its peer paths flap from everyone else's perspective.**
+
+### Resilience layer is still the right answer
+
+Given that:
+1. Wifi RF jitter is real and rotates between devices day-to-day.
+2. iroh's per-path config is what it is (5s keep-alive, 15s idle, clamped by iroh's API).
+3. The mesh handles peer-removed cleanly within ~10s.
+
+The right shape of the fix is still: **make a single in-flight request survive a transient peer-removed event of <10s.** That requires waiting for re-join, not failing immediately. The 750ms retry I added is a start but probably needs a second tier.
+
+The pattern says: **750ms is too short when the peer is actively in a disconnect/reconnect cycle**. mesh-llm's heartbeat tracker takes ~30-60s to remove a peer (3 strikes of unreachable). iroh's connection-close fires inside that window. A useful retry budget would be:
+
+1. Try once (instant).
+2. If `RetryableUnavailable`, wait 750ms and try once more. (current)
+3. If still `RetryableUnavailable` AND it's the last target, wait up to 5-10s for mesh to re-discover the peer (`mesh::wait_for_peer_alive(remote, timeout)`) and try a third time.
+
+That third tier specifically targets the "peer briefly fell out of the mesh" case. The cost is a 5-10s perceived hang, but the alternative is a 503 to the client.
+
+## Original topology experiments — status
+
+1. **Direction reversal** (mini initiates to M4 instead): we now know the asymmetry isn't direction-specific. Mini↔studio is jittery in both directions too. Skip.
+2. **Key rotation**: not needed — the addresses iroh advertises are STUN-discovered each restart anyway. The lifetime issue is wifi-jitter, not stale keys.
+3. **Disable mini's VPN system extension**: not needed — verified there are 0 active VPN configs.
+4. **Capture iroh debug logs during a flap**: we got enough signal at info level. The path teardown reason is logged (`no viable network path exists: last path abandoned`).
 
 ## Asymmetric M4 ↔ mini connectivity (original framing, kept for context)
 
