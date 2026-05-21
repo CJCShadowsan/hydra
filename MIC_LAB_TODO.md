@@ -3,14 +3,20 @@
 Captured from the conversation so I don't goldfish them. Updated as
 items are done.
 
-## In flight right now
+## In flight
 
 - [x] **PR #620 — opinionated MoA no-think.** Flipped default to
-  no-think; escape hatch via reasoning knobs preserved.
-  4 new unit tests, live smoke 3/3 clean, PR title + description
-  updated, branch pushed at `945ab8fa`.
+  no-think; escape hatch via reasoning knobs preserved. 4 new unit
+  tests, live smoke 3/3 clean, PR title + description updated.
+  **CI green (19/19). 5h+ lab data confirms identical performance to
+  explicit no_think probe (3175ms vs 3328ms).**
 
-- [ ] **Public-mesh per-model tok/s probe.** Starting now.
+- [x] **Public-mesh per-model tok/s probe.** 183 samples over 5h+.
+  Confirms Mic's intuition: Qwen3-8B is bimodal (0.28 - 24.47 tok/s,
+  86x spread). Qwen3-32B never succeeds. Qwen2.5-3B consistent slow.
+  Data is exactly the input PR #596 + a small routing layer needs.
+
+- [x] **Overnight report**: `MIC_LAB_REPORT.md` written + pushed.
 
 ## Queued (in priority order Mic asked them)
 
