@@ -39,6 +39,48 @@ quality, observations on next steps.
 
 All `/tmp/lab/*.csv` files are accumulating data.
 
+## Studio published on public mesh — measured everything
+
+Moved studio from private lab to public mesh (`--auto --publish`), kept the same MiniMax-M2.5 model. Studio is the most powerful node in the network (M3 Ultra 256GB), and it now sits next to whatever else is on the public mesh.
+
+From my M4 public-mesh client (`--auto`, port 9447), three test patterns over 5 runs each, with `model=mesh` opinionated no-think + chunked streaming PRs deployed:
+
+### Direct MiniMax (model=unsloth/MiniMax-M2.5-GGUF:Q4_K_M)
+
+Streaming /v1/responses, 50-token completions:
+
+| run | total | FTT | tok/s |
+|----:|------:|----:|------:|
+| 1 | 5006ms | 3945ms | 47.16 |
+| 2 | 1523ms | 474ms | 47.66 |
+| 3 | 1540ms | 481ms | 47.23 |
+| 4 | 1529ms | 474ms | 47.38 |
+| 5 | 1658ms | 612ms | 47.79 |
+
+**47 tok/s consistent.** First run was cold-path (3.9s FTT) but 4/5 runs landed sub-650ms FTT. This is **dramatically better than any other public-mesh model**:
+- Qwen3-8B (best alternative): bimodal 0.28-24 tok/s
+- Qwen3-32B: 0% success (broken peer)
+- Qwen2.5-3B: 1.21 tok/s
+
+**Studio publishing the same model produced a 2x improvement over the previously-best public-mesh option, and made it reliable.**
+
+### model=mesh (MoA) on public mesh
+
+5/5 successful, **1.8-2.0 seconds each**, all clean short answers. The opinionated no-think default (PR #620) means MoA's workers don't waste turns thinking. Combined with MiniMax being available as a strong worker, MoA on the public mesh is now usable for chat.
+
+### model=auto on public mesh
+
+Before studio joined: **0/10 success** (router picked Qwen3-32B which had no working peer, returned 503 every time).
+
+After studio joined: **5/5 success**, all routed to MiniMax. Times 3.4-9.0s, but with `<think>` leakage in content because direct "auto" calls bypass MoA's no-think injection. The auto-router heuristic DID respond to peer availability — switched from "always Qwen3-32B" to "always MiniMax". So it has some failover logic, just no tok/s awareness.
+
+### Implications
+
+* The public mesh's quality is **entirely determined by who's publishing**. With studio on it, MiniMax becomes the de-facto fast/reliable option.
+* Without health-aware routing, `model=auto` flips between "works fine" and "503 every time" based on whether the router's heuristic match happens to have a working peer.
+* `model=mesh` (MoA) is genuinely the right default for chat UI on the public mesh today — it survives broken peers via fan-out.
+* PR #621 (chunked streaming) **does not improve perceived latency** on these calls because chunks still arrive at the same millisecond (content is buffered before chunking). Option A (real worker-stream splicing) is the proper fix.
+
 ## Bonus A/B: same model, lab vs. public mesh
 
 Mic asked specifically about "how solid the public mesh is from a client
