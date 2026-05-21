@@ -2176,7 +2176,14 @@ async fn route_local_attempt_after_forward(
     }
 }
 
-async fn route_remote_attempt(
+/// Single attempt against a remote host: open tunnel, forward request,
+/// probe response. Returns `RouteAttemptResult` describing what happened.
+///
+/// `route_remote_attempt` (below) wraps this with a one-shot same-target
+/// retry on `RetryableUnavailable`, because real-world meshes have
+/// asymmetric/lossy direct paths and a single transient QUIC path drop
+/// shouldn't doom a request when iroh typically reconnects within ~1s.
+async fn route_remote_attempt_once(
     node: &mesh::Node,
     tcp_stream: &mut TcpStream,
     host_id: iroh::EndpointId,
@@ -2210,6 +2217,66 @@ async fn route_remote_attempt(
             retryable_route_result_from_error(&err)
         }
     }
+}
+
+/// How long to wait between a pre-commit failure and the same-target
+/// retry. iroh typically reopens a fresh connection within ~1s after a
+/// path teardown; 750ms gives that recovery time without making the
+/// retry feel sluggish on the client.
+const REMOTE_ATTEMPT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Decide whether a remote attempt result is safe to retry against the
+/// same host. Extracted as a pure function so we can unit-test the
+/// retry policy without spinning up a real QUIC endpoint.
+fn should_retry_remote_attempt(first: &RouteAttemptResult) -> bool {
+    matches!(first, RouteAttemptResult::RetryableUnavailable)
+}
+
+async fn route_remote_attempt(
+    node: &mesh::Node,
+    tcp_stream: &mut TcpStream,
+    host_id: iroh::EndpointId,
+    prefetched: &[u8],
+    retry_context_overflow: bool,
+    response_adapter: ResponseAdapter,
+) -> RouteAttemptResult {
+    let first = route_remote_attempt_once(
+        node,
+        tcp_stream,
+        host_id,
+        prefetched,
+        retry_context_overflow,
+        response_adapter,
+    )
+    .await;
+
+    // Only `RetryableUnavailable` is safe to retry against the same
+    // host. We only ever set it BEFORE any bytes are written to the
+    // client TCP stream (probe failed, tunnel open failed, buffered
+    // request forward failed). Anything else has either succeeded,
+    // partially committed bytes to the client, or has a different
+    // remediation (timeout = genuinely slow upstream; context overflow
+    // = same failure will recur on retry).
+    if !should_retry_remote_attempt(&first) {
+        return first;
+    }
+
+    tracing::info!(
+        "API proxy: pre-commit failure to host {} — retrying once after {}ms",
+        host_id.fmt_short(),
+        REMOTE_ATTEMPT_RETRY_BACKOFF.as_millis()
+    );
+    tokio::time::sleep(REMOTE_ATTEMPT_RETRY_BACKOFF).await;
+
+    route_remote_attempt_once(
+        node,
+        tcp_stream,
+        host_id,
+        prefetched,
+        retry_context_overflow,
+        response_adapter,
+    )
+    .await
 }
 
 async fn route_remote_attempt_after_forward(
@@ -5512,5 +5579,60 @@ mod tests {
             body.contains("\"type\":\"response.completed\""),
             "missing completed event:\n{body}"
         );
+    }
+
+    // ── Remote attempt same-target retry policy ──────────────────────────────
+    //
+    // Real-world meshes have asymmetric / lossy direct UDP paths
+    // (corporate firewalls, hotel wifi, Tailscale interfering with NAT
+    // traversal, etc.). A single transient QUIC `LastOpenPath` mid-
+    // request shouldn't kill a request when the underlying iroh
+    // endpoint typically reconnects within ~1s. `route_remote_attempt`
+    // retries once against the same target on `RetryableUnavailable`
+    // (and only `RetryableUnavailable`, since that variant is only
+    // ever set before any bytes are written to the client).
+
+    #[test]
+    fn should_retry_remote_attempt_yes_on_retryable_unavailable() {
+        assert!(should_retry_remote_attempt(
+            &RouteAttemptResult::RetryableUnavailable
+        ));
+    }
+
+    #[test]
+    fn should_retry_remote_attempt_no_on_delivered() {
+        assert!(!should_retry_remote_attempt(
+            &RouteAttemptResult::Delivered {
+                status_code: 200,
+                completion_tokens: None
+            }
+        ));
+    }
+
+    #[test]
+    fn should_retry_remote_attempt_no_on_timeout() {
+        // Timeout could mean a genuinely slow upstream; the outer
+        // routing loop has its own timeout policy and retries on a
+        // different target. Not our place to double-retry.
+        assert!(!should_retry_remote_attempt(
+            &RouteAttemptResult::RetryableTimeout
+        ));
+    }
+
+    #[test]
+    fn should_retry_remote_attempt_no_on_context_overflow() {
+        // Same prompt against the same target with the same context
+        // size will overflow again. Don't waste a retry.
+        assert!(!should_retry_remote_attempt(
+            &RouteAttemptResult::RetryableContextOverflow
+        ));
+    }
+
+    #[test]
+    fn should_retry_remote_attempt_no_on_client_disconnected() {
+        // Client already gave up; pointless to retry.
+        assert!(!should_retry_remote_attempt(
+            &RouteAttemptResult::ClientDisconnected
+        ));
     }
 }
