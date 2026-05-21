@@ -39,6 +39,37 @@ quality, observations on next steps.
 
 All `/tmp/lab/*.csv` files are accumulating data.
 
+## Bonus A/B: same model, lab vs. public mesh
+
+Mic asked specifically about "how solid the public mesh is from a client
+here using it via auto / mesh / direct". The most direct apples-to-apples
+is the **same model** (`Qwen2.5-3B`) hit two ways from this M4:
+
+* **LAB**: this M4 serves Qwen2.5-3B locally. The probe loops back to
+  `:9337` (no QUIC). Tells us what the model + hardware can do.
+* **PUB**: through a separate `mesh-llm client --auto` process at `:9447`
+  joined to the public mesh. The probe goes through whichever public
+  peer serves Qwen2.5-3B.
+
+Single data point so far (more accumulating):
+
+| Source | total ms | FTT ms | tok/s |
+|---|---:|---:|---:|
+| LAB Qwen2.5-3B (no QUIC) |   **496** |  **104** | **127.81** |
+| PUB Qwen2.5-3B (some peer) | 42,370 | 1,040 |   1.21 |
+
+**The lab hardware is ~100× faster than whoever's serving Qwen2.5-3B on
+the public mesh.** That's not QUIC overhead — routing layer can't add
+that much. The public-mesh peer is genuinely under-resourced.
+Qwen2.5-3B is a small model that should saturate easily even on modest
+hardware; 1.21 tok/s suggests a CPU-only path or heavily oversubscribed
+GPU on that peer.
+
+The takeaway is that **per-peer health/tok/s gossip would be a huge UX
+win**: routing today picks an arbitrary peer for `Qwen2.5-3B`; with
+gossiped tok/s we'd prefer the 100× faster local-network peer (or
+better peers on the public mesh) automatically.
+
 ## Public mesh per-model tok/s (~5h, 183 probes)
 
 50-token streaming probe for tok/s and first-token latency:
