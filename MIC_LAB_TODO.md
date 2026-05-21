@@ -18,6 +18,17 @@ items are done.
 
 - [x] **Overnight report**: `MIC_LAB_REPORT.md` written + pushed.
 
+- [x] **PR #621 — MoA streaming (chunked).** Issue #618 option C.
+  Implemented `chunk_for_streaming(&str)` + 7 new tests. Lab-validated
+  live: "Write a sentence about the ocean" → 2s total, 4 incremental
+  delta events instead of one-shot. Branch pushed, PR opened, awaiting
+  CI.
+
+- [x] **Bonus A/B: lab Qwen2.5-3B vs public Qwen2.5-3B.** Same model,
+  different mesh. **100× throughput gap** (LAB 127 tok/s vs PUB 1.21
+  tok/s). Strong evidence per-peer tok/s gossip would be a huge UX
+  win. Both probes still accumulating data.
+
 ## Queued (in priority order Mic asked them)
 
 - [ ] **Public-mesh per-model tok/s probe.** Join the public mesh as
