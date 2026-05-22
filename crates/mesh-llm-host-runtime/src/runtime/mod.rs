@@ -6279,7 +6279,7 @@ async fn run_auto_unload_runtime_model(
     let drain_delay = if options.force {
         Duration::ZERO
     } else {
-        options.drain_timeout.min(Duration::from_millis(300))
+        options.drain_timeout
     };
     match unload.owner {
         RuntimeUnloadOwner::Runtime => {
@@ -6294,7 +6294,7 @@ async fn run_auto_unload_runtime_model(
             };
             let model = controller.model_name.clone();
             let _ = controller.stop_tx.send(true);
-            let _ = controller.task.await;
+            await_managed_model_stop(controller.task, drain_delay, options.force, &model).await;
             if !runtime_registry_has_model(ctx.runtime_instance_registry, &model).await {
                 publish_runtime_llama_unavailable(
                     ctx.runtime_data_producer,
@@ -6318,6 +6318,34 @@ async fn run_auto_unload_runtime_model(
                 instance_id: unload.instance_id,
                 unloaded: true,
             })
+        }
+    }
+}
+
+async fn await_managed_model_stop(
+    mut task: tokio::task::JoinHandle<()>,
+    drain_timeout: Duration,
+    force: bool,
+    model: &str,
+) {
+    if force {
+        task.abort();
+        let _ = task.await;
+        return;
+    }
+
+    match tokio::time::timeout(drain_timeout, &mut task).await {
+        Ok(join_result) => {
+            let _ = join_result;
+        }
+        Err(_) => {
+            tracing::warn!(
+                model,
+                drain_timeout_ms = drain_timeout.as_millis(),
+                "managed model task did not stop within unload drain timeout; aborting"
+            );
+            task.abort();
+            let _ = task.await;
         }
     }
 }

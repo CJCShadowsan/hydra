@@ -129,6 +129,40 @@ async fn mesh_node_serving_uses_in_process_controller() {
 }
 
 #[tokio::test]
+async fn mesh_node_serving_forwards_unload_options() {
+    let kp = OwnerKeypair::generate();
+    let token = InviteToken::from_str("mesh-test:abc123").expect("valid token");
+    let controller = Arc::new(FakeServingController::default());
+    let node = MeshNode::builder()
+        .identity(kp)
+        .join(token)
+        .serving_controller(controller.clone())
+        .build()
+        .expect("build node");
+
+    let options = UnloadModelOptions {
+        drain_timeout: std::time::Duration::from_millis(1_250),
+        force: true,
+    };
+    node.serving()
+        .unload_instance("instance-1", options)
+        .await
+        .expect("unload instance");
+
+    let requests = controller.unload_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].target,
+        mesh_llm_node::serving::UnloadTarget::Instance("instance-1".to_string())
+    );
+    assert_eq!(
+        requests[0].options.drain_timeout,
+        std::time::Duration::from_millis(1_250)
+    );
+    assert!(requests[0].options.force);
+}
+
+#[tokio::test]
 async fn mesh_node_models_installed_scans_configured_cache() {
     let kp = OwnerKeypair::generate();
     let token = InviteToken::from_str("mesh-test:abc123").expect("valid token");
@@ -220,7 +254,7 @@ async fn mesh_node_models_download_returns_installed_model_without_network() {
 
     let downloaded = node
         .models()
-        .download("org/repo-GGUF:Q4_K_M", DownloadOptions::default())
+        .download("org/repo-GGUF:Q4_K_M", DownloadOptions)
         .await
         .expect("download installed");
     assert_eq!(downloaded.model_ref, "org/repo-GGUF:Q4_K_M");
@@ -317,6 +351,7 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
 #[derive(Default)]
 struct FakeServingController {
     models: Mutex<Vec<mesh_llm_node::serving::ServedModel>>,
+    unload_requests: Mutex<Vec<mesh_llm_node::serving::UnloadModelRequest>>,
 }
 
 impl ServingController for FakeServingController {
@@ -347,6 +382,7 @@ impl ServingController for FakeServingController {
     ) -> mesh_llm_node::serving::ServingFuture<'a, ()> {
         Box::pin(async move {
             let target = request.target.as_runtime_target();
+            self.unload_requests.lock().unwrap().push(request.clone());
             self.models.lock().unwrap().retain(|model| {
                 model.model_id != target && model.instance_id.as_deref() != Some(target)
             });
