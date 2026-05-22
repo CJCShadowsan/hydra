@@ -39,11 +39,22 @@ rustup target add "$RUST_TARGET" 2>/dev/null || true
 
 "$SWIFT_DIR/scripts/generate-swift-bindings.sh"
 
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+export LLAMA_STAGE_BACKEND="${LLAMA_STAGE_BACKEND:-metal}"
+export LLAMA_STAGE_BUILD_DIR="${LLAMA_STAGE_BUILD_DIR:-$REPO_ROOT/.deps/llama.cpp/build-stage-abi-metal}"
+
+echo "Preparing embedded llama.cpp ABI libraries..."
+"$REPO_ROOT/scripts/prepare-llama.sh" "${MESH_LLM_LLAMA_PIN_SHA:-pinned}"
+LLAMA_BUILD_DIR="$LLAMA_STAGE_BUILD_DIR" "$REPO_ROOT/scripts/build-llama.sh"
+
 RUSTUP_RUSTC="$(rustup run stable which rustc)"
 echo "Using rustc: $RUSTUP_RUSTC"
 echo "Building for $RUST_TARGET..."
+echo "macOS deployment target: $MACOSX_DEPLOYMENT_TARGET"
+echo "llama.cpp backend: $LLAMA_STAGE_BACKEND"
+echo "llama.cpp build dir: $LLAMA_STAGE_BUILD_DIR"
 RUSTC="$RUSTUP_RUSTC" \
-  cargo build --release -p mesh-llm-ffi --target "$RUST_TARGET" --no-default-features --features host
+  cargo build --release -p mesh-llm-ffi --target "$RUST_TARGET" --no-default-features --features host,embedded-runtime
 
 LIB_PATH="$TARGET_DIR/$RUST_TARGET/release/libmeshllm_ffi.a"
 

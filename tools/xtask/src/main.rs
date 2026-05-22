@@ -624,8 +624,8 @@ fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<()> {
 fn check_ci_crate_test_coverage(ci_workflow: &str) -> DynResult<()> {
     const REQUIRED_TEST_CRATES: &[(&str, &str)] = &[
         ("mesh-llm-client", "mesh client crate tests"),
-        ("mesh-api", "mesh API crate tests"),
-        ("mesh-api-ffi", "mesh API FFI crate tests"),
+        ("mesh-llm-api", "mesh LLM API crate tests"),
+        ("mesh-llm-ffi", "mesh LLM FFI crate tests"),
         ("skippy-protocol", "skippy protocol crate tests"),
         ("skippy-server", "skippy server crate tests"),
         ("openai-frontend", "OpenAI frontend crate tests"),
@@ -644,7 +644,7 @@ fn check_ci_crate_test_coverage(ci_workflow: &str) -> DynResult<()> {
     )?;
     ensure_contains(
         ci_workflow,
-        "for c in mesh-llm-client mesh-api mesh-api-ffi; do",
+        "for c in mesh-llm-client mesh-llm-api mesh-llm-ffi; do",
         "CI SDK/API crate test loop",
     )?;
     ensure_contains(

@@ -56,7 +56,12 @@ let package = Package(
             path: "sdk/swift/Sources/MeshLLM",
             exclude: hasFFIBinaryTarget ? [] : ["Generated"],
             linkerSettings: [
+                .linkedFramework("Accelerate"),
+                .linkedFramework("AppKit"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("Metal"),
                 .linkedFramework("SystemConfiguration"),
+                .linkedLibrary("c++"),
             ]
         ),
         .testTarget(

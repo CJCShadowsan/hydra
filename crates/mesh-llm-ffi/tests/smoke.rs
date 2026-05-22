@@ -107,6 +107,7 @@ fn node_model_management_search_and_show_work_without_joining() {
 }
 
 #[test]
+#[cfg(not(feature = "embedded-runtime"))]
 fn node_serving_control_without_controller_is_typed_unsupported() {
     let result = create_node(
         valid_owner_keypair_hex(),
@@ -231,22 +232,4 @@ fn listener_can_reenter_handle_during_callback() {
         .recv_timeout(Duration::from_secs(2))
         .expect("callback should be able to reenter handle without deadlocking");
     assert!(!status.connected);
-}
-
-#[test]
-#[ignore] // Requires real FixtureMesh + Qwen2.5-0.5B-Q4 model
-fn full_lifecycle_against_fixture() {
-    // Run with: cargo test -p mesh-llm-ffi --test smoke -- --ignored
-    //
-    // Expected sequence:
-    // 1. create node handle with a real invite token
-    // 2. start via invite token -> connects to the mesh
-    // 3. list models            -> at least one model returned
-    // 5. start one short stream -> receives TokenDelta(s) + Completed
-    // 6. start second stream and cancel it
-    //                           -> receives Failed { error: "cancelled" }
-    // 7. drop handle cleanly    -> no panic, no leaked threads
-    // 8. repeat create/destroy loop 25 times verifying clean shutdown each time
-    println!("create_destroy_iterations=25");
-    unimplemented!("requires FixtureMesh");
 }

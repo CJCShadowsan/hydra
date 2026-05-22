@@ -8,11 +8,32 @@ use mesh_llm_api::{
     ServingModelState as ApiServingModelState, UnloadModelOptions as ApiUnloadModelOptions,
     UnloadTarget as ApiUnloadTarget,
 };
-use pollster::block_on;
+#[cfg(feature = "embedded-runtime")]
+use mesh_llm_host_runtime::sdk::{EmbeddedChatMessage, EmbeddedServingController};
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 uniffi::setup_scaffolding!("mesh_ffi");
+
+static SDK_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("mesh-llm-sdk")
+        .build()
+        .expect("create mesh-llm SDK runtime")
+});
+
+fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => SDK_RUNTIME.block_on(future),
+    }
+}
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
@@ -318,6 +339,8 @@ impl CoreEventListener for EventListenerBridge {
 #[derive(uniffi::Object)]
 pub struct MeshNodeHandle {
     node: MeshNode,
+    #[cfg(feature = "embedded-runtime")]
+    local_serving: Option<Arc<EmbeddedServingController>>,
 }
 
 /// Generate a fresh owner keypair, returning its hex-encoded form.
@@ -345,7 +368,13 @@ pub fn create_auto_node(
 ) -> Result<Arc<MeshNodeHandle>, FfiError> {
     let kp = parse_owner_keypair(&owner_keypair_bytes_hex)?;
     block_on(sdk_create_auto_node(kp, query.into()))
-        .map(|result| Arc::new(MeshNodeHandle { node: result.node }))
+        .map(|result| {
+            Arc::new(MeshNodeHandle {
+                node: result.node,
+                #[cfg(feature = "embedded-runtime")]
+                local_serving: None,
+            })
+        })
         .map_err(map_mesh_api_error)
 }
 
@@ -361,15 +390,26 @@ pub fn create_node(
         .parse::<InviteToken>()
         .map_err(FfiError::InvalidInviteToken)?;
     let kp = parse_owner_keypair(&owner_keypair_bytes_hex)?;
+    #[cfg(not(feature = "embedded-runtime"))]
     if serving_enabled {
         return Err(FfiError::ServingUnsupported(
-            "in-process serving is not wired into mesh-llm-ffi yet".to_string(),
+            "this native library was built without embedded-runtime support".to_string(),
         ));
     }
-    let mut builder = MeshNode::builder()
-        .identity(kp)
-        .join(token)
-        .serving_enabled(serving_enabled);
+    let mut builder = MeshNode::builder().identity(kp).join(token);
+    #[cfg(feature = "embedded-runtime")]
+    let local_serving = if serving_enabled {
+        let controller = Arc::new(EmbeddedServingController::new());
+        builder = builder.serving_controller(controller.clone());
+        Some(controller)
+    } else {
+        builder = builder.serving_enabled(false);
+        None
+    };
+    #[cfg(not(feature = "embedded-runtime"))]
+    {
+        builder = builder.serving_enabled(serving_enabled);
+    }
     if let Some(path) = non_empty_path(cache_dir) {
         builder = builder.cache_dir(path);
     }
@@ -379,7 +419,11 @@ pub fn create_node(
     let node = builder
         .build()
         .map_err(|error| FfiError::BuildFailed(error.to_string()))?;
-    Ok(Arc::new(MeshNodeHandle { node }))
+    Ok(Arc::new(MeshNodeHandle {
+        node,
+        #[cfg(feature = "embedded-runtime")]
+        local_serving,
+    }))
 }
 
 #[uniffi::export]
@@ -409,6 +453,16 @@ impl MeshNodeHandle {
     }
 
     pub fn inference_list_models(&self) -> Result<Vec<ModelNative>, FfiError> {
+        #[cfg(feature = "embedded-runtime")]
+        if let Some(controller) = &self.local_serving {
+            let models = block_on(controller.model_list());
+            if !models.is_empty() {
+                return Ok(models
+                    .into_iter()
+                    .map(|(id, name)| ModelNative { id, name })
+                    .collect());
+            }
+        }
         block_on(self.node.inference().list_models())
             .map(|models| {
                 models
@@ -427,6 +481,29 @@ impl MeshNodeHandle {
         request: ChatRequestNative,
         listener: Box<dyn EventListener>,
     ) -> Result<String, FfiError> {
+        #[cfg(feature = "embedded-runtime")]
+        if let Some(controller) = &self.local_serving {
+            let request_id = new_request_id();
+            let model = request.model.clone();
+            let messages = request
+                .messages
+                .into_iter()
+                .map(|message| EmbeddedChatMessage {
+                    role: message.role,
+                    content: message.content,
+                })
+                .collect();
+            let content = block_on(controller.chat_completion_text(&model, messages))
+                .map_err(|error| FfiError::StreamFailed(error.to_string()))?;
+            listener.on_event(ClientEvent::TokenDelta {
+                request_id: request_id.clone(),
+                delta: content,
+            });
+            listener.on_event(ClientEvent::Completed {
+                request_id: request_id.clone(),
+            });
+            return Ok(request_id);
+        }
         let bridge = Arc::new(EventListenerBridge { inner: listener });
         block_on(self.node.inference().chat(request.into(), bridge))
             .map(|request_id| request_id.0)
@@ -438,6 +515,26 @@ impl MeshNodeHandle {
         request: ResponsesRequestNative,
         listener: Box<dyn EventListener>,
     ) -> Result<String, FfiError> {
+        #[cfg(feature = "embedded-runtime")]
+        if let Some(controller) = &self.local_serving {
+            let request_id = new_request_id();
+            let content = block_on(controller.chat_completion_text(
+                &request.model,
+                vec![EmbeddedChatMessage {
+                    role: "user".to_string(),
+                    content: request.input,
+                }],
+            ))
+            .map_err(|error| FfiError::StreamFailed(error.to_string()))?;
+            listener.on_event(ClientEvent::TokenDelta {
+                request_id: request_id.clone(),
+                delta: content,
+            });
+            listener.on_event(ClientEvent::Completed {
+                request_id: request_id.clone(),
+            });
+            return Ok(request_id);
+        }
         let bridge = Arc::new(EventListenerBridge { inner: listener });
         block_on(self.node.inference().responses(request.into(), bridge))
             .map(|request_id| request_id.0)
@@ -587,6 +684,14 @@ impl MeshNodeHandle {
     pub fn set_device_policy(&self, policy: DevicePolicy) -> Result<(), FfiError> {
         block_on(self.node.serving().set_device_policy(policy.into())).map_err(map_serving_error)
     }
+}
+
+#[cfg(feature = "embedded-runtime")]
+fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    format!("local-{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 fn non_empty_path(value: Option<String>) -> Option<String> {

@@ -1,7 +1,8 @@
 # mesh-llm-ffi
 
-`mesh-llm-ffi` exposes the Mesh client SDK through a native FFI layer for
-language bindings.
+`mesh-llm-ffi` exposes the Mesh node SDK through a native FFI layer for
+language bindings, including model management, inference, and serving control
+when built with the host runtime feature.
 
 This crate is the bridge used by the generated Swift and Kotlin SDKs. It should
 stay thin and map the public Rust API from `crates/mesh-llm-api/` into an FFI-safe surface.

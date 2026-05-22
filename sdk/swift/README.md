@@ -87,9 +87,9 @@ Useful environment overrides:
 - `MESH_SDK_SKIP_DOWNLOAD=1` — skip `node.models.download` when the model is already installed.
 - `MESH_SDK_PROMPT` — prompt text for the local inference request.
 
-The host-enabled XCFramework is required for this path. The FFI node must also
-be built with an attached in-process host runtime controller; without that
-controller, `node.serving.load(...)` reports serving as unsupported.
+The host-enabled XCFramework is required for this path. The normal Apple
+platform XCFramework is client-only; local model load/unload requires the
+host macOS artifact built by `build-host-macos-xcframework.sh`.
 
 ## App Store Export Compliance
 

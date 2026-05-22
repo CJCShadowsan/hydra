@@ -10,13 +10,15 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [features]
 default = []
 host = ["mesh-llm-node"]
+embedded-runtime = ["mesh-llm-host-runtime"]
 
 [dependencies]
 mesh-llm-api = { path = "../mesh-llm-api" }
+mesh-llm-host-runtime = { path = "../mesh-llm-host-runtime", default-features = false, optional = true }
 mesh-llm-node = { path = "../mesh-llm-node", optional = true }
-uniffi = "=0.31.0"
 thiserror = "2"
-pollster = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+uniffi = "=0.31.0"
 
 [build-dependencies]
 uniffi = { version = "=0.31.0", features = ["build"] }
