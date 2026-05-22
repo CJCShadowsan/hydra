@@ -140,6 +140,7 @@ until CI proves the real path works.
 Minimum validation for SDK work:
 
 ```bash
+scripts/check-sdk-contract.sh
 cargo test -p mesh-llm-ffi
 swift build --package-path sdk/swift/example/MeshExampleApp
 ./gradlew --no-daemon compileKotlin -p sdk/kotlin/example/example-jvm

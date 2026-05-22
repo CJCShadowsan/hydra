@@ -9,6 +9,8 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+scripts/check-sdk-contract.sh
+
 scripts/prepare-llama.sh "${MESH_LLM_LLAMA_PIN_SHA:-pinned}"
 LLAMA_STAGE_BACKEND=cpu \
 LLAMA_STAGE_BUILD_DIR="$REPO_ROOT/.deps/llama-build/build-stage-abi-ci-kotlin-cpu" \
