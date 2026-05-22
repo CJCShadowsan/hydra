@@ -204,7 +204,7 @@ skippy-wan-lab-build-bins:
     cargo build --release --locked -p skippy-server -p skippy-prompt -p metrics-server -p skippy-model-package
 
 # Generate a reproducible benchmark corpus for skippy bench tooling.
-bench-corpus tier="smoke" *ARGS:
+bench-corpus tier *ARGS:
     scripts/generate-bench-corpus.py "{{ tier }}" {{ ARGS }}
 
 # Run skippy family certification checks.
