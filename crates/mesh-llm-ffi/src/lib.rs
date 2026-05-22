@@ -361,6 +361,11 @@ pub fn create_node(
         .parse::<InviteToken>()
         .map_err(FfiError::InvalidInviteToken)?;
     let kp = parse_owner_keypair(&owner_keypair_bytes_hex)?;
+    if serving_enabled {
+        return Err(FfiError::ServingUnsupported(
+            "in-process serving is not wired into mesh-llm-ffi yet".to_string(),
+        ));
+    }
     let mut builder = MeshNode::builder()
         .identity(kp)
         .join(token)

@@ -1,7 +1,4 @@
-use meshllm_ffi::{
-    create_node, ClientEvent, DevicePolicy, EventListener, FfiError, LoadModelOptions,
-    ModelSearchQuery, UnloadModelOptions,
-};
+use meshllm_ffi::{create_node, ClientEvent, EventListener, FfiError, ModelSearchQuery};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,9 +44,12 @@ struct ReentrantListener {
 
 impl EventListener for ReentrantListener {
     fn on_event(&self, event: ClientEvent) {
-        if let ClientEvent::Completed { .. } = event {
-            let status = self.handle.status();
-            let _ = self.sender.lock().unwrap().send(status);
+        match event {
+            ClientEvent::Completed { .. } | ClientEvent::Failed { .. } => {
+                let status = self.handle.status();
+                let _ = self.sender.lock().unwrap().send(status);
+            }
+            _ => {}
         }
     }
 }
@@ -108,37 +108,14 @@ fn node_model_management_search_and_show_work_without_joining() {
 
 #[test]
 fn node_serving_control_without_controller_is_typed_unsupported() {
-    let handle = create_node(
+    let result = create_node(
         valid_owner_keypair_hex(),
         "valid-token".to_string(),
         None,
         None,
         true,
-    )
-    .expect("create_node should accept serving enabled without embedded controller");
-
-    let status = handle
-        .serving_status()
-        .expect("serving status should report configured availability");
-    assert!(status.enabled);
-    assert!(status.models.is_empty());
-
-    let result = handle.load_serving_model(
-        "Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string(),
-        LoadModelOptions {
-            device_policy: DevicePolicy::Auto,
-        },
     );
     assert!(matches!(result, Err(FfiError::ServingUnsupported(_))));
-
-    let unload = handle.unload_serving_model_by_id(
-        "Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string(),
-        UnloadModelOptions {
-            drain_timeout_ms: 0,
-            force: true,
-        },
-    );
-    assert!(matches!(unload, Err(FfiError::ServingUnsupported(_))));
 }
 
 #[test]

@@ -32,15 +32,9 @@ For development from a local checkout, build the native artifact first:
 That generates `sdk/swift/Generated/MeshLLMFFI.xcframework`, which the root
 Swift package picks up automatically for the real UniFFI-backed implementation.
 
-Normal SDK builds require the UniFFI-backed XCFramework. The pure Swift fallback
-is only for wrapper unit tests, and must be opted into explicitly:
-
-```bash
-MESH_SWIFT_FORCE_STUB=1 swift test
-```
-
-Do not use stub mode for examples or application integration. It does not talk
-to the native SDK.
+Normal SDK builds and tests require the UniFFI-backed XCFramework. The package
+does not ship a pure Swift fallback because the SDK must exercise the native
+runtime it exposes.
 
 ## Usage
 
