@@ -198,6 +198,66 @@ Verify produced artifacts:
 scripts/verify-native-sdk-package.sh dist/native-sdk/*.tar.gz
 ```
 
+Generate a crates.io-ready native runtime crate from a verified artifact:
+
+```bash
+scripts/package-native-sdk-crate.sh dist/native-sdk/meshllm-native-darwin-aarch64-metal.tar.gz
+```
+
+The generated crate contains the native runtime under `native/`, copies it into
+Cargo's `OUT_DIR/native` during the crate build, and uses
+`links = "meshllm_native_runtime"` so dependent Rust build scripts can discover
+the build-output paths:
+
+```text
+DEP_MESHLLM_NATIVE_RUNTIME_ARTIFACT_ID
+DEP_MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR
+DEP_MESHLLM_NATIVE_RUNTIME_MANIFEST
+DEP_MESHLLM_NATIVE_RUNTIME_LIB_DIR
+DEP_MESHLLM_NATIVE_RUNTIME_LIBRARY
+DEP_MESHLLM_NATIVE_RUNTIME_UNIFFI_LIBRARY
+```
+
+Rust apps should choose exactly one native runtime crate for the target they are
+building. Use target-specific dependencies so Cargo selects the matching
+platform/backend package:
+
+```toml
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+meshllm-native-darwin-aarch64-metal = "0.66.0"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+meshllm-native-linux-x86-64-cpu = "0.66.0"
+```
+
+Because the runtime crates share `links = "meshllm_native_runtime"`, Cargo will
+reject selecting more than one of them for the same build. Apps that need to
+ship multiple backend choices in one installer should package multiple verified
+tarball artifacts explicitly and choose between those packaged directories at
+runtime.
+
+An app build script can then copy the selected runtime into the final app
+bundle, installer, container image, or package resource directory:
+
+```rust
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let artifact_dir = PathBuf::from(
+        env::var("DEP_MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR")
+            .expect("meshllm native runtime dependency"),
+    );
+    let package_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("meshllm-native");
+    fs::create_dir_all(&package_dir).expect("create package native dir");
+    // Copy artifact_dir recursively into package_dir with the app's packaging helper.
+}
+```
+
+At runtime, the app loads `libmeshllm_ffi` from the packaged artifact directory
+and verifies the `manifest.json` checksum before opening the dynamic library.
+Swift and Kotlin packaging can consume the same verified tarball layout
+directly when Cargo is not involved.
+
 ## Validation
 
 Minimum validation for SDK work:

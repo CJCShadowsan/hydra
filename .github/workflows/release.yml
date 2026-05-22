@@ -194,6 +194,9 @@ jobs:
       - name: Verify native SDK runtime artifact
         run: scripts/verify-native-sdk-package.sh dist/native-sdk/*.tar.gz
 
+      - name: Package native SDK runtime crate
+        run: scripts/package-native-sdk-crate.sh --out dist/native-sdk-crates dist/native-sdk/*.tar.gz
+
       - name: Upload native SDK runtime
         uses: actions/upload-artifact@v6
         with:
@@ -201,6 +204,7 @@ jobs:
           path: |
             dist/native-sdk/*.tar.gz
             dist/native-sdk/*.sha256
+            dist/native-sdk-crates/*/target/package/*.crate
           if-no-files-found: error
 
   build_linux_arm64:
