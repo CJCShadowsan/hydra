@@ -4,15 +4,21 @@ import ai.meshllm.ChatMessage
 import ai.meshllm.ChatRequest
 import ai.meshllm.Event
 import ai.meshllm.InviteToken
+import ai.meshllm.LoadModelOptions
 import ai.meshllm.Node
+import ai.meshllm.UnloadModelOptions
 import com.sun.jna.NativeLibrary
 import kotlinx.coroutines.runBlocking
+import uniffi.mesh_ffi.DevicePolicy
+import uniffi.mesh_ffi.UnloadTarget
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 fun main(args: Array<String>) = runBlocking {
-    val inviteToken = args.firstOrNull { !it.startsWith("--") } ?: run {
+    val modelRef = System.getenv("MESH_SDK_MODEL_REF")
+    val inviteToken = args.firstOrNull { !it.startsWith("--") } ?: modelRef?.let { "local-kotlin-example" } ?: run {
         System.err.println("Usage: ExampleMain <invite_token>")
+        System.err.println("Or set MESH_SDK_MODEL_REF to run local serving.")
         System.err.println("Set jna.library.path to the directory containing libmeshllm_ffi.")
         return@runBlocking
     }
@@ -21,23 +27,69 @@ fun main(args: Array<String>) = runBlocking {
     // Generate an ephemeral owner keypair for the example. In a real app this
     // must be persisted across launches.
     val ownerKeypairHex = uniffi.mesh_ffi.generateOwnerKeypairHex()
-    val node = Node(InviteToken(inviteToken), ownerKeypairHex)
+    val node = Node(
+        InviteToken(inviteToken),
+        ownerKeypairHex,
+        cacheDir = System.getenv("MESH_SDK_CACHE_DIR"),
+        runtimeDir = System.getenv("MESH_SDK_RUNTIME_DIR"),
+        servingEnabled = modelRef != null,
+    )
     val recommended = node.models.recommended()
     val serving = node.serving.status()
     println("[node] recommended_models=${recommended.size} serving_enabled=${serving.enabled}")
 
-    node.start()
-    println("[connected]")
+    try {
+        node.start()
+        println("[connected]")
+
+        val localUnloadTarget: UnloadTarget?
+        val selectedModel = if (modelRef != null) {
+            val served = runLocalServingExample(node, modelRef)
+            localUnloadTarget = served.instanceId?.let { UnloadTarget.Instance(it) }
+                ?: UnloadTarget.Model(served.modelId)
+            served.modelId
+        } else {
+            localUnloadTarget = null
+            val models = waitForModels(node)
+            println("[models] N=${models.size}")
+            check(models.isNotEmpty()) { "mesh reported no models" }
+            System.getenv("MESH_SDK_MODEL_ID") ?: models.first().id
+        }
+
+        runChat(node, selectedModel)
+        if (localUnloadTarget != null) {
+            node.serving.unload(
+                localUnloadTarget,
+                UnloadModelOptions(drainTimeoutMs = 5_000UL, force = false),
+            )
+            println("[serving] unloaded model=$selectedModel")
+        }
+    } finally {
+        node.stop()
+        println("[disconnect] ok")
+    }
+}
+
+private suspend fun runLocalServingExample(node: Node, modelRef: String): ai.meshllm.ServedModel {
+    if (System.getenv("MESH_SDK_SKIP_DOWNLOAD") != "1") {
+        val downloaded = node.models.download(modelRef)
+        println("[download] model_ref=${downloaded.modelRef} path=${downloaded.primaryPath ?: downloaded.paths.firstOrNull()}")
+    }
+
+    val served = node.serving.load(modelRef, LoadModelOptions(DevicePolicy.Auto))
+    println("[serving] model=${served.modelRef} id=${served.modelId} instance=${served.instanceId}")
 
     val models = waitForModels(node)
     println("[models] N=${models.size}")
-    check(models.isNotEmpty()) { "mesh reported no models" }
+    check(models.any { it.id == served.modelId }) { "loaded model was not listed for inference" }
 
-    val selectedModel = System.getenv("MESH_SDK_MODEL_ID") ?: models.first().id
+    return served
+}
 
+private fun runChat(node: Node, selectedModel: String) {
     val chatRequest = ChatRequest(
         model = selectedModel,
-        messages = listOf(ChatMessage(role = "user", content = "hello")),
+        messages = listOf(ChatMessage(role = "user", content = System.getenv("MESH_SDK_PROMPT") ?: "hello")),
     )
 
     val latch = CountDownLatch(1)
@@ -72,15 +124,12 @@ fun main(args: Array<String>) = runBlocking {
     check(firstTokenEmitted) { "chat emitted no token deltas" }
     check(completed) { "chat never completed" }
     println("[chat] done")
-
-    node.stop()
-    println("[disconnect] ok")
 }
 
-private fun waitForModels(node: Node): List<ai.meshllm.Model> {
+private suspend fun waitForModels(node: Node): List<ai.meshllm.Model> {
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
     while (System.nanoTime() < deadline) {
-        val models = runBlocking { node.inference.listModels() }
+        val models = node.inference.listModels()
         if (models.isNotEmpty()) {
             return models
         }

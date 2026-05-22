@@ -57,9 +57,11 @@ let package = Package(
             exclude: hasFFIBinaryTarget ? [] : ["Generated"],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
-                .linkedFramework("AppKit"),
+                .linkedFramework("AppKit", .when(platforms: [.macOS])),
                 .linkedFramework("CoreGraphics"),
+                .linkedFramework("Foundation"),
                 .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedLibrary("c++"),
             ]

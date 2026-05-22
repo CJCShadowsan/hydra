@@ -1,6 +1,7 @@
 # MeshLLM Kotlin SDK
 
-Kotlin/Android bindings for connecting to mesh-llm meshes.
+Kotlin/Android bindings for mesh-llm model management, local serving, and mesh
+inference.
 
 ## GitHub Packages
 
@@ -41,6 +42,8 @@ To build the Android artifact locally:
 ```
 
 This writes the AAR to `sdk/kotlin/build/outputs/aar/meshllm-android.aar`.
+The native libraries in the AAR are built with embedded serving enabled and
+include per-ABI llama.cpp static runtime archives.
 
 ## Usage
 

@@ -69,10 +69,11 @@ fun resolveAndroidNdkHome(): String {
 
 // Task to build native libraries for all Android ABIs
 val buildNativeLibs by tasks.registering {
-    description = "Build mesh-llm-ffi shared libraries for all Android ABIs"
+    description = "Build mesh-llm-ffi shared libraries with embedded serving for all Android ABIs"
     group = "build"
 
     val repoRoot = rootProject.projectDir.parentFile.parentFile
+    val androidPlatform = System.getenv("MESH_LLM_ANDROID_PLATFORM") ?: "android-26"
     val buildTargets = listOf(
         Triple("arm64-v8a", "aarch64-linux-android", "libmeshllm_ffi.so"),
         Triple("armeabi-v7a", "armv7-linux-androideabi", "libmeshllm_ffi.so"),
@@ -90,17 +91,53 @@ val buildNativeLibs by tasks.registering {
             baseEnv["RUSTC"] = rustc
         }
 
+        exec {
+            workingDir = repoRoot
+            commandLine(
+                "bash",
+                "scripts/prepare-llama.sh",
+                System.getenv("MESH_LLM_LLAMA_PIN_SHA") ?: "pinned"
+            )
+        }
+
         buildTargets.forEach { (abi, target, _) ->
+            val llamaBuildDir = repoRoot.resolve(".deps/llama-build/build-stage-abi-android-$abi-cpu")
             exec {
                 workingDir = repoRoot
                 environment(baseEnv)
+                environment(
+                    mapOf(
+                        "LLAMA_STAGE_BACKEND" to "cpu",
+                        "LLAMA_STAGE_BUILD_DIR" to llamaBuildDir.absolutePath,
+                        "LLAMA_BUILD_DIR" to llamaBuildDir.absolutePath,
+                    )
+                )
+                commandLine(
+                    "bash",
+                    "scripts/build-llama.sh",
+                    "-DCMAKE_TOOLCHAIN_FILE=$ndkHome/build/cmake/android.toolchain.cmake",
+                    "-DANDROID_ABI=$abi",
+                    "-DANDROID_PLATFORM=$androidPlatform",
+                )
+            }
+
+            exec {
+                workingDir = repoRoot
+                environment(baseEnv)
+                environment(
+                    mapOf(
+                        "LLAMA_STAGE_BACKEND" to "cpu",
+                        "LLAMA_STAGE_BUILD_DIR" to llamaBuildDir.absolutePath,
+                    )
+                )
                 commandLine(
                     "cargo", "ndk",
                     "-t", abi,
                     "build",
                     "--release",
                     "-p", "mesh-llm-ffi",
-                    "--no-default-features"
+                    "--no-default-features",
+                    "--features", "host,embedded-runtime"
                 )
             }
 
@@ -172,7 +209,7 @@ publishing {
 
             pom {
                 name.set("MeshLLM Android SDK")
-                description.set("Android/Kotlin bindings for connecting to mesh-llm meshes.")
+                description.set("Android/Kotlin bindings for mesh-llm model management, local serving, and mesh inference.")
                 url.set("https://github.com/Mesh-LLM/mesh-llm")
 
                 licenses {

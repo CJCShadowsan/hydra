@@ -68,13 +68,14 @@ for try await event in node.inference.chatStream(request) {
 }
 ```
 
-## Local Mac Inference Example
+## Local Inference Example
 
-The Swift example uses the real UniFFI-backed SDK path for loading a model and
-running inference from the current Mac:
+The Swift example uses the same real UniFFI-backed SDK path that apps use for
+model management, serving load/unload, and inference. On macOS, run it directly
+from the repo:
 
 ```bash
-./sdk/swift/scripts/build-host-macos-xcframework.sh
+./sdk/swift/scripts/build-xcframework.sh
 MESH_SDK_MODEL_REF=Qwen2.5-3B-Instruct-Q4_K_M \
 swift run --package-path sdk/swift/example/MeshExampleApp
 ```
@@ -87,9 +88,9 @@ Useful environment overrides:
 - `MESH_SDK_SKIP_DOWNLOAD=1` — skip `node.models.download` when the model is already installed.
 - `MESH_SDK_PROMPT` — prompt text for the local inference request.
 
-The host-enabled XCFramework is required for this path. The normal Apple
-platform XCFramework is client-only; local model load/unload requires the
-host macOS artifact built by `build-host-macos-xcframework.sh`.
+The generated XCFramework is built with embedded serving support for Apple
+targets. `build-host-macos-xcframework.sh` remains as a faster macOS-only smoke
+artifact for local development; it is not the platform SDK contract.
 
 ## App Store Export Compliance
 

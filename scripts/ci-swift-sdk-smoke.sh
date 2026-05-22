@@ -9,10 +9,10 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-if [[ "${MESH_SWIFT_FULL_XCFRAMEWORK_SMOKE:-0}" == "1" ]]; then
-    ./sdk/swift/scripts/build-xcframework.sh
-else
+if [[ "${MESH_SWIFT_HOST_XCFRAMEWORK_SMOKE:-0}" == "1" ]]; then
     ./sdk/swift/scripts/build-host-macos-xcframework.sh
+else
+    ./sdk/swift/scripts/build-xcframework.sh
 fi
 
 scripts/ci-sdk-fixture.sh "$1" "$2" "$3" -- \
