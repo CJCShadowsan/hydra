@@ -8,6 +8,7 @@ BUILD=0
 OUT_DIR="$REPO_ROOT/dist/native-sdk"
 BACKEND="${LLAMA_STAGE_BACKEND:-${SKIPPY_LLAMA_BACKEND:-cpu}}"
 TARGET_TRIPLE="${MESH_NATIVE_SDK_TARGET:-}"
+PROFILE="${MESH_NATIVE_SDK_PROFILE:-release}"
 LLAMA_WORKDIR="${LLAMA_WORKDIR:-$REPO_ROOT/.deps/llama.cpp}"
 LLAMA_BUILD_ROOT="${MESH_LLM_LLAMA_BUILD_ROOT:-$REPO_ROOT/.deps/llama-build}"
 
@@ -21,6 +22,7 @@ Options:
   --build             Build patched llama.cpp and mesh-llm-ffi before packaging.
   --backend NAME      cpu, metal, cuda, rocm, hip, or vulkan.
   --target TRIPLE     Rust target triple. Defaults to the host target.
+  --profile PROFILE   Cargo profile to package: release or debug. Defaults to release.
   --out DIR           Output directory. Defaults to dist/native-sdk.
   -h, --help          Show this help.
 
@@ -29,6 +31,7 @@ Environment:
   LLAMA_STAGE_AMDGPU_TARGETS / SKIPPY_AMDGPU_TARGETS
   LLAMA_STAGE_BUILD_DIR
   MESH_NATIVE_SDK_TARGET
+  MESH_NATIVE_SDK_PROFILE
   MESH_LLM_LLAMA_PIN_SHA
 EOF
 }
@@ -45,6 +48,10 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --target)
             TARGET_TRIPLE="${2:?missing target triple}"
+            shift 2
+            ;;
+        --profile)
+            PROFILE="${2:?missing cargo profile}"
             shift 2
             ;;
         --out)
@@ -67,6 +74,14 @@ case "$BACKEND" in
     cpu|metal|cuda|rocm|hip|vulkan) ;;
     *)
         echo "unsupported native SDK backend: $BACKEND" >&2
+        exit 1
+        ;;
+esac
+
+case "$PROFILE" in
+    release|debug) ;;
+    *)
+        echo "unsupported native SDK cargo profile: $PROFILE" >&2
         exit 1
         ;;
 esac
@@ -216,7 +231,10 @@ if [[ "$BUILD" == "1" ]]; then
         LLAMA_STAGE_BUILD_DIR="$LLAMA_STAGE_BUILD_DIR" \
         "$SCRIPT_DIR/build-llama.sh"
 
-    cargo_args=(build --release -p mesh-llm-ffi --no-default-features --features host,embedded-runtime)
+    cargo_args=(build -p mesh-llm-ffi --no-default-features --features host,embedded-runtime)
+    if [[ "$PROFILE" == "release" ]]; then
+        cargo_args+=(--release)
+    fi
     if [[ "$TARGET_TRIPLE" != "$(default_target_triple)" ]]; then
         cargo_args+=(--target "$TARGET_TRIPLE")
     fi
@@ -232,20 +250,20 @@ platform="$(target_platform "$TARGET_TRIPLE")"
 flavor="$(backend_flavor)"
 artifact_id="meshllm-native-${platform}-${flavor}"
 
-target_dir="$REPO_ROOT/target/release"
+target_dir="$REPO_ROOT/target/$PROFILE"
 if [[ "$TARGET_TRIPLE" != "$(default_target_triple)" ]]; then
-    target_dir="$REPO_ROOT/target/$TARGET_TRIPLE/release"
+    target_dir="$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE"
 fi
 
 lib_path="$target_dir/$lib_name"
 if [[ ! -f "$lib_path" && -f "$target_dir/deps/$lib_name" ]]; then
     lib_path="$target_dir/deps/$lib_name"
 fi
-if [[ ! -f "$lib_path" && -f "$REPO_ROOT/target/$TARGET_TRIPLE/release/$lib_name" ]]; then
-    lib_path="$REPO_ROOT/target/$TARGET_TRIPLE/release/$lib_name"
+if [[ ! -f "$lib_path" && -f "$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE/$lib_name" ]]; then
+    lib_path="$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE/$lib_name"
 fi
-if [[ ! -f "$lib_path" && -f "$REPO_ROOT/target/$TARGET_TRIPLE/release/deps/$lib_name" ]]; then
-    lib_path="$REPO_ROOT/target/$TARGET_TRIPLE/release/deps/$lib_name"
+if [[ ! -f "$lib_path" && -f "$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE/deps/$lib_name" ]]; then
+    lib_path="$REPO_ROOT/target/$TARGET_TRIPLE/$PROFILE/deps/$lib_name"
 fi
 
 if [[ ! -f "$lib_path" ]]; then
@@ -291,6 +309,7 @@ manifest = {
     "platform": "$platform",
     "backend": "$BACKEND",
     "flavor": "$flavor",
+    "cargo_profile": "$PROFILE",
     "library": "lib/$lib_name",
     "uniffi_library": "lib/$uniffi_name",
     "library_sha256": "$lib_sha",

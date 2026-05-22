@@ -21,6 +21,20 @@ LLAMA_STAGE_BACKEND=cpu \
 LLAMA_STAGE_BUILD_DIR="$REPO_ROOT/.deps/llama-build/build-stage-abi-ci-kotlin-cpu" \
     cargo build -p mesh-llm-ffi --no-default-features --features host,embedded-runtime
 
+native_sdk_out="$REPO_ROOT/target/kotlin-native-sdk"
+LLAMA_STAGE_BACKEND=cpu \
+LLAMA_STAGE_BUILD_DIR="$REPO_ROOT/.deps/llama-build/build-stage-abi-ci-kotlin-cpu" \
+    scripts/package-native-sdk.sh \
+        --backend cpu \
+        --profile debug \
+        --out "$native_sdk_out"
+scripts/verify-native-sdk-package.sh "$native_sdk_out"/meshllm-native-*.tar.gz
+native_runtime_dir="$(find "$native_sdk_out" -mindepth 1 -maxdepth 1 -type d -name 'meshllm-native-*' -print -quit)"
+if [[ -z "$native_runtime_dir" ]]; then
+    echo "native SDK runtime artifact directory was not produced" >&2
+    exit 1
+fi
+
 scripts/ci-sdk-fixture.sh "$1" "$2" "$3" -- \
     bash -lc '
         set -euo pipefail
@@ -32,17 +46,7 @@ scripts/ci-sdk-fixture.sh "$1" "$2" "$3" -- \
             export ORG_GRADLE_JAVA_HOME="${ORG_GRADLE_JAVA_HOME:-$JAVA_HOME}"
             export GRADLE_OPTS="${GRADLE_OPTS:-} -Dorg.gradle.java.installations.auto-detect=false -Dorg.gradle.java.installations.paths=$ORG_GRADLE_JAVA_HOME"
         fi
-        for ext in dylib so; do
-            lib='"$REPO_ROOT"'/target/debug/libmeshllm_ffi.$ext
-            deps_lib='"$REPO_ROOT"'/target/debug/deps/libmeshllm_ffi.$ext
-            if [ ! -f "$lib" ] && [ -f "$deps_lib" ]; then
-                ln -sf deps/libmeshllm_ffi.$ext "$lib"
-            fi
-            if [ -f "$lib" ]; then
-                ln -sf libmeshllm_ffi.$ext '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.$ext
-            fi
-        done
-        export JAVA_TOOL_OPTIONS="-Djna.library.path='"$REPO_ROOT"'/target/debug"
+        export MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR='"$native_runtime_dir"'
         cd '"$REPO_ROOT"'/sdk/kotlin/example/example-jvm
         ./gradlew --no-daemon run --args="$MESH_SDK_INVITE_TOKEN"
     '
