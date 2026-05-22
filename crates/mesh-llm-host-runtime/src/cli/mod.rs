@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::cli::benchmark::BenchmarkCommand;
 use crate::cli::runtime::RuntimeCommand;
 use crate::crypto::TrustPolicy;
+use crate::network::discovery::MeshDiscoveryMode;
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TrustCommand {
@@ -233,7 +235,7 @@ pub enum LogFormat {
     name = "mesh-llm",
     version = crate::VERSION,
     about = "Pool GPUs over the internet for LLM inference",
-    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)"
+    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)\n\nFlash-MoE SSD backend:\n  Add [[plugin]] name = \"flash-moe\" with either command/args or url.\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -247,6 +249,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) debug: bool,
 
+    /// OTLP/gRPC endpoint for embedded Skippy debug telemetry, for example http://127.0.0.1:14317.
+    #[arg(long, hide = true)]
+    pub(crate) skippy_metrics_otlp_grpc: Option<String>,
+
     /// Show all options (including advanced/niche ones).
     #[arg(long, hide = true)]
     pub(crate) help_advanced: bool,
@@ -255,13 +261,17 @@ pub(crate) struct Cli {
     #[arg(long, short)]
     pub(crate) join: Vec<String>,
 
-    /// Discover a mesh via Nostr and join it.
+    /// Discover a mesh and join it.
     #[arg(long, default_missing_value = "", num_args = 0..=1)]
     pub(crate) discover: Option<String>,
 
-    /// Auto-join the best mesh found via Nostr.
+    /// Auto-join the best mesh found via discovery.
     #[arg(long)]
     pub(crate) auto: bool,
+
+    /// Discovery provider for --auto, --discover, --publish, and the discover command.
+    #[arg(long, value_enum, default_value_t = MeshDiscoveryMode::Nostr, global = true)]
+    pub(crate) mesh_discovery_mode: MeshDiscoveryMode,
 
     /// Model to serve (path, remote catalog name, or Hugging Face ref).
     #[arg(long)]
@@ -291,7 +301,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) headless: bool,
 
-    /// Publish this mesh to Nostr for public discovery by other nodes.
+    /// Publish this mesh for discovery by other nodes.
     /// Without this flag, your mesh is private and only joinable via invite token.
     #[arg(long)]
     pub(crate) publish: bool,
@@ -374,6 +384,10 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     pub(crate) bind_port: Option<u16>,
 
+    /// Bind mesh QUIC to a specific local IP address.
+    #[arg(long, hide = true)]
+    pub(crate) bind_ip: Option<IpAddr>,
+
     /// Bind to 0.0.0.0 (for containers/Fly.io).
     #[arg(long, hide = true)]
     pub(crate) listen_all: bool,
@@ -398,6 +412,14 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) owner_key: Option<PathBuf>,
 
+    /// Bind address for the owner-control listener. Defaults to 127.0.0.1:0 when owner identity is configured.
+    #[arg(long, hide = true)]
+    pub(crate) control_bind: Option<std::net::SocketAddr>,
+
+    /// Advertised owner-control address encoded into the local-only bootstrap token.
+    #[arg(long, hide = true)]
+    pub(crate) control_advertise_addr: Option<std::net::SocketAddr>,
+
     /// Fail startup if owner attestation cannot be loaded or signed.
     #[arg(long)]
     pub(crate) owner_required: bool,
@@ -417,6 +439,23 @@ pub(crate) struct Cli {
     /// Internal: set when this node joined via Nostr discovery (not --join).
     #[arg(skip)]
     pub(crate) nostr_discovery: bool,
+}
+
+pub(crate) fn validate_discovery_mode_args(cli: &Cli) -> anyhow::Result<()> {
+    if cli.mesh_discovery_mode != MeshDiscoveryMode::Mdns {
+        return Ok(());
+    }
+
+    if !cli.nostr_relay.is_empty() {
+        anyhow::bail!("--nostr-relay is only valid with --mesh-discovery-mode nostr");
+    }
+    if let Some(Command::Discover { relay, .. }) = cli.command.as_ref() {
+        if !relay.is_empty() {
+            anyhow::bail!("discover --relay is only valid with --mesh-discovery-mode nostr");
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -478,7 +517,7 @@ pub(crate) enum Command {
         #[arg(long, default_value = "3131")]
         port: u16,
     },
-    /// Discover meshes on Nostr and optionally auto-join one.
+    /// Discover meshes and optionally auto-join one.
     Discover {
         /// Filter by mesh name (case-insensitive exact match)
         #[arg(long)]
@@ -716,18 +755,21 @@ where
     let mut explicit_surface = None;
 
     // Skip leading global flags to find the pseudo-subcommand position.
-    // Recognized value-taking flags: --log-format, --max-vram, --llama-flavor, --device,
-    // --tensor-split, --bind-port, --max-clients, --port, --console, --draft-max, --ctx-size.
+    // Recognized value-taking flags: --log-format, --mesh-discovery-mode, --max-vram,
+    // --llama-flavor, --device, --tensor-split, --bind-port, --bind-ip, --max-clients,
+    // --port, --console, --draft-max, --ctx-size.
     // Boolean flags: --help-advanced, --auto, --client, --headless, --publish, --blackboard,
     // --plugin, --auto-update, --no-draft, --split, --no-enumerate-host, --listen-all,
     // --no-console, --owner-required.
     let value_taking_flags = [
         "--log-format",
+        "--mesh-discovery-mode",
         "--max-vram",
         "--llama-flavor",
         "--device",
         "--tensor-split",
         "--bind-port",
+        "--bind-ip",
         "--max-clients",
         "--port",
         "--console",
@@ -748,6 +790,8 @@ where
         "--nostr-relay",
         "--config",
         "--owner-key",
+        "--control-bind",
+        "--control-advertise-addr",
         "--node-label",
         "--trust-policy",
         "--trust-owner",
@@ -894,6 +938,62 @@ fn shell_display(arg: &OsString) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_mesh_requirements_docs_examples_parse() {
+    let unrestricted_args =
+        normalize_runtime_surface_args(["mesh-llm", "serve", "--model", "Qwen3-8B-Q4_K_M"]);
+    let unrestricted = Cli::parse_from(unrestricted_args.normalized.clone());
+    assert!(unrestricted.command.is_none());
+    assert_eq!(unrestricted.model, vec![PathBuf::from("Qwen3-8B-Q4_K_M")]);
+    assert!(!unrestricted.publish);
+
+    let signed_public_args = normalize_runtime_surface_args([
+        "mesh-llm",
+        "serve",
+        "--model",
+        "Qwen3-8B-Q4_K_M",
+        "--publish",
+        "--owner-key",
+        "~/.mesh-llm/owner-keystore.json",
+        "--owner-required",
+        "--trust-policy",
+        "require-owned",
+        "--node-label",
+        "lab-a",
+    ]);
+    let signed_public = Cli::parse_from(signed_public_args.normalized.clone());
+    assert!(signed_public.command.is_none());
+    assert_eq!(signed_public.model, vec![PathBuf::from("Qwen3-8B-Q4_K_M")]);
+    assert!(signed_public.publish);
+    assert_eq!(
+        signed_public.owner_key,
+        Some(PathBuf::from("~/.mesh-llm/owner-keystore.json"))
+    );
+    assert!(signed_public.owner_required);
+    assert_eq!(signed_public.trust_policy, Some(TrustPolicy::RequireOwned));
+    assert_eq!(signed_public.node_label, Some("lab-a".to_string()));
+
+    let signed_bootstrap_args =
+        normalize_runtime_surface_args(["mesh-llm", "serve", "--join", "signed-bootstrap-token"]);
+    let signed_bootstrap = Cli::parse_from(signed_bootstrap_args.normalized.clone());
+    assert!(signed_bootstrap.command.is_none());
+    assert_eq!(
+        signed_bootstrap.join,
+        vec!["signed-bootstrap-token".to_string()]
+    );
+
+    let runtime_bootstrap = Cli::parse_from(["mesh-llm", "runtime", "bootstrap", "--port", "3131"]);
+    match runtime_bootstrap.command.expect("runtime command expected") {
+        Command::Runtime {
+            command: Some(RuntimeCommand::Bootstrap { port, json }),
+        } => {
+            assert_eq!(port, 3131);
+            assert!(!json);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::models::{ModelSearchSort, ModelsCommand};
@@ -1012,6 +1112,11 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn mesh_requirements_docs_examples_parse() {
+        super::assert_mesh_requirements_docs_examples_parse();
     }
 
     #[test]
@@ -1219,6 +1324,82 @@ mod tests {
 
         assert_eq!(cli.log_format, LogFormat::Json);
         assert_eq!(normalized.explicit_surface, Some(RuntimeSurface::Client));
+    }
+
+    #[test]
+    fn cli_accepts_global_bind_ip_before_serve() {
+        let normalized = normalize_runtime_surface_args([
+            "mesh-llm",
+            "--bind-ip",
+            "10.1.2.3",
+            "serve",
+            "--bind-port",
+            "47916",
+        ]);
+        let cli = Cli::parse_from(normalized.normalized);
+
+        assert_eq!(cli.bind_ip, Some("10.1.2.3".parse().unwrap()));
+        assert_eq!(cli.bind_port, Some(47916));
+        assert_eq!(normalized.explicit_surface, Some(RuntimeSurface::Serve));
+    }
+
+    #[test]
+    fn cli_accepts_global_mesh_discovery_mode_before_serve() {
+        let normalized = normalize_runtime_surface_args([
+            "mesh-llm",
+            "--mesh-discovery-mode",
+            "mdns",
+            "serve",
+            "--auto",
+        ]);
+        let cli = Cli::parse_from(normalized.normalized);
+
+        assert_eq!(
+            cli.mesh_discovery_mode,
+            crate::network::discovery::MeshDiscoveryMode::Mdns
+        );
+        assert_eq!(normalized.explicit_surface, Some(RuntimeSurface::Serve));
+    }
+
+    #[test]
+    fn cli_defaults_mesh_discovery_mode_to_nostr() {
+        let normalized = normalize_runtime_surface_args(["mesh-llm", "serve", "--auto"]);
+        let cli = Cli::parse_from(normalized.normalized);
+
+        assert_eq!(
+            cli.mesh_discovery_mode,
+            crate::network::discovery::MeshDiscoveryMode::Nostr
+        );
+    }
+
+    #[test]
+    fn cli_accepts_mdns_discovery_mode_for_runtime_surfaces() {
+        let normalized =
+            normalize_runtime_surface_args(["mesh-llm", "client", "--mesh-discovery-mode", "mdns"]);
+        let cli = Cli::parse_from(normalized.normalized);
+
+        assert!(cli.client);
+        assert_eq!(
+            cli.mesh_discovery_mode,
+            crate::network::discovery::MeshDiscoveryMode::Mdns
+        );
+    }
+
+    #[test]
+    fn cli_rejects_nostr_relays_in_mdns_mode() {
+        let normalized = normalize_runtime_surface_args([
+            "mesh-llm",
+            "serve",
+            "--mesh-discovery-mode",
+            "mdns",
+            "--nostr-relay",
+            "wss://relay.example",
+        ]);
+        let cli = Cli::parse_from(normalized.normalized);
+
+        let err = validate_discovery_mode_args(&cli)
+            .expect_err("mdns mode must reject Nostr relay overrides");
+        assert!(err.to_string().contains("--nostr-relay"));
     }
 
     #[test]

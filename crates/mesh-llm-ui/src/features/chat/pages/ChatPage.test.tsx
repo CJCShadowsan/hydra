@@ -414,7 +414,9 @@ function renderPersistentChatRoute(showChat: boolean) {
 }
 
 function queryAllByTextContent(text: string) {
-  return screen.queryAllByText((_, element) => element?.textContent?.includes(text) ?? false, { selector: 'span' })
+  return screen.queryAllByText((_, element) => element?.textContent?.includes(text) ?? false, {
+    selector: 'span,button'
+  })
 }
 
 function shortTimestamp(date: Date) {
@@ -492,9 +494,12 @@ describe('ChatPage', () => {
     )
 
     expect(screen.getByTestId('chat-layout')).toHaveStyle({
-      height: 'calc(100dvh - 180px)',
-      maxHeight: 'calc(100dvh - 180px)'
+      height: 'var(--chat-layout-height)',
+      maxHeight: 'var(--chat-layout-height)'
     })
+    expect(screen.getByTestId('chat-layout').style.getPropertyValue('--chat-layout-height')).toBe(
+      'calc(100dvh - 180px)'
+    )
     expect(screen.getByTestId('chat-message-list')).toHaveClass(
       'chat-message-scrollbar',
       'overflow-y-auto',
@@ -526,7 +531,7 @@ describe('ChatPage', () => {
 
     renderChatPage({ mode: 'live' })
 
-    expect(await screen.findByText('Start your first conversation')).toBeInTheDocument()
+    expect(await screen.findByText('Start Chatting')).toBeInTheDocument()
     expect(screen.queryByText('Harness persisted only')).not.toBeInTheDocument()
   })
 
@@ -536,7 +541,7 @@ describe('ChatPage', () => {
     renderChatPage()
 
     const trigger = screen.getByRole('combobox', { name: 'Select model' })
-    expect(trigger).toHaveTextContent('Auto (router picks best)')
+    expect(trigger).toHaveTextContent('Mesh — automatic')
 
     await user.click(trigger)
 
@@ -617,7 +622,7 @@ describe('ChatPage', () => {
     await waitFor(() => {
       expect(chatMock.sendCalls[0]).toMatchObject({
         content: 'Summarize active models',
-        model: 'auto',
+        model: 'mesh',
         systemPrompt: 'Answer as a mesh-llm operator.'
       })
     })
@@ -637,7 +642,7 @@ describe('ChatPage', () => {
     await waitFor(() => {
       expect(chatMock.sendCalls[0]).toMatchObject({
         content: 'Route without hidden instructions',
-        model: 'auto',
+        model: 'mesh',
         systemPrompt: ''
       })
     })
@@ -674,7 +679,7 @@ describe('ChatPage', () => {
     await waitFor(() => {
       expect(chatMock.sendCalls[0]).toMatchObject({
         content: 'Send without a system prompt',
-        model: 'auto',
+        model: 'mesh',
         systemPrompt: ''
       })
     })
@@ -686,14 +691,40 @@ describe('ChatPage', () => {
 
     renderChatPage({ mode: 'live' })
 
-    expect(screen.getByRole('combobox', { name: 'Select model' })).toHaveTextContent('Auto (router picks best)')
+    expect(screen.getByRole('combobox', { name: 'Select model' })).toHaveTextContent('Mesh — automatic')
 
     await user.type(screen.getByLabelText('Prompt'), 'Use the router')
     await user.click(screen.getByRole('button', { name: 'Send' }))
 
     await waitFor(() => {
-      expect(chatMock.sendCalls[0]).toMatchObject({ content: 'Use the router', model: 'auto' })
+      expect(chatMock.sendCalls[0]).toMatchObject({ content: 'Use the router', model: 'mesh' })
     })
+  })
+
+  it('keeps Auto highlighted in the dropdown even when other live models are available', async () => {
+    // Regression: the chat "Auto" pick routes to `mesh` on the wire,
+    // but the dropdown's visible selection must stay on the Auto row.
+    // With multiple models present, the buggy version drifted to the
+    // first real model option because Radix Select couldn't find an
+    // option matching value="mesh".
+    const user = userEvent.setup()
+    vi.mocked(adaptModelsToSummary).mockReturnValue(CHAT_HARNESS.models)
+
+    renderChatPage({ mode: 'live' })
+
+    const trigger = screen.getByRole('combobox', { name: 'Select model' })
+    expect(trigger).toHaveTextContent('Mesh — automatic')
+
+    await user.type(screen.getByLabelText('Prompt'), 'multi-model auto')
+    await user.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(chatMock.sendCalls[0]).toMatchObject({ content: 'multi-model auto', model: 'mesh' })
+    })
+
+    // Trigger label must still read the Auto/Mesh label, not whichever
+    // real model happened to be options[0].
+    expect(trigger).toHaveTextContent('Mesh — automatic')
   })
 
   it('shows conversation metadata as message count followed by localized timestamp', async () => {
@@ -971,7 +1002,7 @@ describe('ChatPage', () => {
     expect(chatMock.stopCalls).toHaveLength(0)
     expect(chatMock.hookUnmounts.slice(hookUnmountsBeforeSwitch)).not.toContain(streamingConversationId)
     expect(screen.getByLabelText('Generating response')).toBeInTheDocument()
-    expect(screen.getByText('Start with a clean routing context')).toBeInTheDocument()
+    expect(screen.getByText('Start Chatting')).toBeInTheDocument()
     expect(screen.queryByText('Partial assistant reply')).not.toBeInTheDocument()
 
     await user.click(screen.getAllByRole('button', { name: /Write a long story/i })[0])
@@ -1084,7 +1115,7 @@ describe('ChatPage', () => {
     expect(chatMock.stopCalls).toHaveLength(0)
     expect(chatMock.hookUnmounts.slice(hookUnmountsBeforeThirdChat)).not.toContain(firstStreamingConversationId)
     expect(chatMock.hookUnmounts.slice(hookUnmountsBeforeThirdChat)).not.toContain(secondStreamingConversationId)
-    expect(screen.getByText('Start with a clean routing context')).toBeInTheDocument()
+    expect(screen.getByText('Start Chatting')).toBeInTheDocument()
   })
 
   it('keeps the third chat composer draft isolated while both live lanes stream', async () => {
@@ -1188,7 +1219,7 @@ describe('ChatPage', () => {
     const hookUnmountsBeforeDelete = chatMock.hookUnmounts.length
 
     await user.click(screen.getByRole('button', { name: 'New' }))
-    expect(screen.getByText('Start with a clean routing context')).toBeInTheDocument()
+    expect(screen.getByText('Start Chatting')).toBeInTheDocument()
     expect(screen.queryByText('Partial assistant reply')).not.toBeInTheDocument()
 
     await user.click(await screen.findByRole('button', { name: 'Open actions for New chat' }))
@@ -1432,7 +1463,7 @@ describe('ChatPage', () => {
 
   it('persists submitted live message model labels with the conversation thread', async () => {
     const user = userEvent.setup()
-    const submittedModel = 'auto'
+    const submittedModel = 'mesh'
 
     renderChatPage({ mode: 'live' })
 
@@ -1485,6 +1516,23 @@ describe('ChatPage', () => {
     expect(screen.queryByRole('tablist', { name: 'Chat sidebar views' })).not.toBeInTheDocument()
   })
 
+  it('does not show the floating sidebar control when the sidebar is hidden', () => {
+    render(
+      <ChatLayout
+        actions={null}
+        composer={<textarea aria-label="Prompt" />}
+        hideSidebar
+        sidebar={<div role="tablist" aria-label="Chat sidebar views" />}
+        sidebarMode="compact"
+        title="Chat"
+      >
+        <div data-testid="message-content">Messages</div>
+      </ChatLayout>
+    )
+
+    expect(screen.queryByRole('button', { name: 'Open chat sidebar' })).not.toBeInTheDocument()
+  })
+
   it('hides route disclosure text by default', () => {
     renderChatPage()
 
@@ -1526,7 +1574,7 @@ describe('ChatPage', () => {
     await user.click(screen.getByRole('button', { name: /new/i }))
 
     expect(await screen.findAllByText(/New chat/)).not.toHaveLength(0)
-    expect(await screen.findByText('Start with a clean routing context')).toBeInTheDocument()
+    expect(await screen.findByText('Start Chatting')).toBeInTheDocument()
     expect(screen.queryByText('Partial assistant reply')).not.toBeInTheDocument()
     expect(screen.getByText(`0 messages · ${shortTimestamp(new Date())}`)).toBeInTheDocument()
     await waitFor(() => expect(screen.getByLabelText('Prompt')).toHaveFocus())

@@ -101,6 +101,28 @@ For terminal restoration QA:
 - Press `q` and `Ctrl+C`; the cursor should be visible and the shell prompt should not remain in raw mode.
 - A `SIGKILL` (`kill -9`) cannot run in-process cleanup. If a terminal is left corrupted after a hard kill, recover with `reset` or by closing the terminal pane.
 
+### 0d. Agent tool-call reliability
+
+Run the direct tool-call probe when changing OpenAI chat-completions routing,
+agent integrations, MoA reducer behavior, or anything that may affect
+`tools` / `tool_calls` / tool-result continuation:
+
+```bash
+scripts/qa-agent-tool-call-reliability.py \
+  --base-url http://127.0.0.1:9337/v1 \
+  --models auto,mesh \
+  --attempts 3 \
+  --output target/agent-tool-call-reliability/results.jsonl
+```
+
+- `tool_call` and `stream_tool_call` require real OpenAI-style function calls,
+  not prose that says a tool would be used
+- `tool_result` and `stream_tool_result` verify that the assistant can continue
+  after a matching tool result and include the deterministic fixture value
+- `--print-plan` is side-effect-free and emits machine-readable JSON
+- use `--skip-streaming` only when intentionally narrowing a local diagnosis to
+  non-streaming chat-completions
+
 ## Single-model permutations
 
 ### 1. Solo (single node)
@@ -152,6 +174,27 @@ mesh-llm serve --model Qwen2.5-32B --join <TOKEN>
 - Embedded runtime assigns two participating stage routes
 - Stage placement is proportional to available VRAM (e.g. `0.67,0.33`)
 - Draft model auto-detected and used
+
+#### Multi-interface Docker/Linux bind-IP validation
+
+For host-network Docker or multi-NIC Linux hosts, validate the selected
+host-to-host interface explicitly:
+
+```bash
+# seed on the routable management IP
+mesh-llm serve --model Qwen2.5-32B --split --bind-ip 10.1.2.3 --bind-port 7842
+
+# worker joins the printed token
+mesh-llm serve --model Qwen2.5-32B --split --join <TOKEN>
+```
+
+- Decode the invite token and confirm Docker/CNI bridge addresses such as
+  `172.17.0.1` or `172.23.0.1` are absent when `--bind-ip` is set.
+- The seed sees the worker in `/api/status`; it must not stay at
+  `Waiting for peers...`.
+- `/v1/models` becomes non-empty after split startup and inference works.
+- `--listen-all` is not a substitute for this test; it only affects local
+  HTTP API/console listeners.
 
 ### 4. Two GPU nodes, model too big for one
 
@@ -376,7 +419,7 @@ curl localhost:3131/api/discover # Nostr meshes (current mesh marked by mesh_id)
 - SSE events push every 2s and on topology changes
 - `/api/search` returns 200 JSON with canonical model refs for matching results
 - `/api/model-interests` stores and returns local explicit-interest entries keyed by canonical model refs
-- `/api/model-targets` returns ranked targets with explicit-interest counts, request counts, serving-node counts, and `wanted` for targets not currently served
+- `/api/model-targets` returns ranked targets with explicit-interest counts, request counts, serving-node counts, `wanted` for targets not currently served, and derived `capacity_advice` without changing ranking or routing behavior
 - Discover results can be matched to current mesh by `mesh_id`
 
 ### 24. HTTP proxy single-request connection contract
@@ -427,11 +470,11 @@ The control plane uses QUIC ALPN `mesh-llm/1` with the `meshllm.node.v1` protobu
 | 0x05 | ROUTE_REQUEST | protobuf `RouteTableRequest` / `RouteTable` |
 | 0x06 | PEER_DOWN | protobuf `PeerDown` |
 | 0x07 | PEER_LEAVING | protobuf `PeerLeaving` |
-| 0x0b | CONFIG_SUBSCRIBE | protobuf `ConfigSubscribe` / `ConfigSnapshotResponse` |
-| 0x0c | CONFIG_PUSH | protobuf `ConfigPush` / `ConfigPushResponse` |
+| 0x0b | CONFIG_SUBSCRIBE | reserved legacy mesh-plane config stream ID; do not reuse |
+| 0x0c | CONFIG_PUSH | reserved legacy mesh-plane config stream ID; do not reuse |
 | 0x0d | STREAM_SUBPROTOCOL | protobuf `MeshSubprotocolOpen`, then subprotocol-owned bytes |
 
-Raw TCP relay streams (0x02 RPC, 0x04 HTTP) are unchanged.
+Config and inventory mutation must use `mesh-llm-control/1`; `mesh-llm/1` no longer dispatches request/response handlers for the reserved 0x0b/0x0c config stream IDs. Raw TCP relay streams (0x02 RPC, 0x04 HTTP) are unchanged.
 
 
 ### Verifying protobuf gossip in logs
@@ -474,6 +517,85 @@ cached and a worker does not:
 - Integrity check: corrupt or same-sized cached artifacts must be refetched or
   rejected by SHA-256 verification before stage load.
 
+### 13. Mixed-version owner-control coexistence
+
+Owner-control QA needs to prove two things at the same time:
+
+1. Public-mesh join and routed inference still work across released/current binaries.
+2. Explicit endpoint bootstrap and `mesh-llm-control/1` work for current nodes while released peers continue to coexist on the public mesh plane for join, gossip, routing, and inference. Config and inventory mutation stay on owner-control only.
+
+Use the dedicated harness for the full mixed-version pass:
+
+```bash
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary /absolute/path/to/released/mesh-llm \
+  --current-binary /absolute/path/to/current/mesh-llm \
+  --evidence-dir /absolute/path/to/evidence
+```
+
+For a loopback-only smoke on one machine:
+
+```bash
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary /absolute/path/to/released/mesh-llm \
+  --current-binary /absolute/path/to/current/mesh-llm \
+  --evidence-dir /absolute/path/to/evidence \
+  --local-only
+```
+
+For the owner-control bootstrap lane only:
+
+```bash
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary /absolute/path/to/released/mesh-llm \
+  --current-binary /absolute/path/to/current/mesh-llm \
+  --evidence-dir /absolute/path/to/evidence \
+  --local-only \
+  --config-only
+```
+
+The harness writes a timestamped run directory containing logs, status payloads, owner-control bootstrap evidence, owner-control get-config evidence, and a markdown/json summary.
+It also writes `manifest.json`, `commands.jsonl`, `results.jsonl`, `versions/*.txt`, and grouped `status/`, `models/`, `chat/`, and `control/` payloads so a reviewer can audit which binaries, commands, and local endpoints produced the evidence.
+Use `--print-plan` when CI or review automation needs to validate the planned checks without starting mesh processes or writing evidence; planned check names match the `name` values emitted to `results.jsonl`.
+
+Expected checks:
+
+- Public mode: both binaries must bring up `/api/status`, list at least one model from `/v1/models`, and complete a routed chat request against the public mesh.
+- Loopback mode: the harness runs both mixed-version directions (`current -> released` and `released -> current`) on a private local mesh, waits for peers to appear on both nodes, then runs `mesh-llm runtime bootstrap --json` plus `mesh-llm runtime get-config --json` against the current-version node's explicit endpoint.
+- Config-only mode: the harness skips public probes, runs the same loopback coexistence checks, then executes the compatibility tests that prove new clients require explicit endpoints, use `mesh-llm-control/1`, and reject legacy frames on the owner-control ALPN.
+- The current-version bootstrap payload must keep `requires_explicit_remote_endpoint=true` and expose an endpoint token when owner-control is enabled.
+- If the bootstrap payload reports `enabled=false`, the harness records a `PREREQ` result showing that a signed same-owner keystore is required before runtime owner-control requests can be proven on that machine.
+
+Manual spot checks if the harness fails:
+
+```bash
+mesh-llm runtime bootstrap --port 3131 --json
+mesh-llm runtime get-config --port 3131 --endpoint '<control-endpoint>' --json
+curl -s localhost:3131/api/runtime/control-bootstrap | jq .
+curl -s -X POST localhost:3131/api/runtime/control/get-config \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>"}' | jq .
+```
+
+Failure interpretation:
+
+- `control_endpoint_required`: you did not use the explicit bootstrap endpoint.
+- `control_unsupported`: the target does not negotiate `mesh-llm-control/1`; this should not silently downgrade.
+- `control_unavailable`: listener, token, network path, or local owner-key loading failed.
+- `unauthorized`: same-owner authentication failed.
+- `revision_conflict`: the apply CAS revision is stale; re-read before retrying.
+- `legacy_json_unsupported`: a legacy mesh-plane frame was sent to the owner-control ALPN.
+
+Config-only result interpretation:
+
+- `config-missing-endpoint-required`: executable proof that config bootstrap without an explicit owner-control endpoint is rejected when cargo-backed protocol tests run.
+- `config-new-client-owner-control`: executable proof that new clients prefer `mesh-llm-control/1` when cargo-backed protocol tests run.
+- `config-control-rejects-legacy-frames`: executable proof that owner-control does not silently accept legacy frames on the wrong ALPN when cargo-backed protocol tests run.
+- `PREREQ config-cargo-tests`: cargo-backed protocol tests were skipped or cargo was unavailable.
+- `PREREQ config-runtime-bootstrap`: runtime owner-control requests could not be proven because the local node did not expose a signed owner-control endpoint.
+
+Reserved-ID note: mesh-plane stream IDs 0x0b and 0x0c are kept reserved, but current nodes should not advertise or rely on legacy config subscribe/push behavior there.
+
 ## Single-machine testing with ephemeral keys
 
 Set `MESH_LLM_EPHEMERAL_KEY=1` to give a second process a unique identity on the same machine.
@@ -493,6 +615,61 @@ MESH_LLM_EPHEMERAL_KEY=1 mesh-llm serve --model Qwen2.5-3B --join <TOKEN> --port
 - Worker receives a stage assignment and proxies API requests to the host
 - Stage placement is proportional to VRAM (e.g. `0.98,0.02`)
 - Kill worker → host detects via heartbeat (~60s), reverts to solo mode
+
+#### Split startup + worker-loss recovery certification
+
+For large-model/manual release QA, use the opt-in certification harness after
+building a binary and preparing a model or layer-package ref:
+
+```bash
+scripts/certify-split-startup-recovery.sh \
+  target/release/mesh-llm \
+  /absolute/path/to/model.gguf
+```
+
+The harness starts one seed and two workers with isolated homes, ephemeral mesh
+keys, private join-token bootstrapping, fixed local ports, and per-process
+runtime roots. It then proves:
+
+- a multi-node split topology becomes routable via `/api/runtime/stages` and
+  `/v1/models`;
+- an active downstream worker is terminated;
+- the coordinator reaches the requested recovery outcome without using the
+  killed worker.
+
+By default the expected outcome is replacement:
+
+```bash
+MESH_SPLIT_CERT_EXPECT=replacement \
+scripts/certify-split-startup-recovery.sh target/release/mesh-llm /models/qwen.gguf
+```
+
+Supported expectations are:
+
+- `replacement` — a new ready split topology appears without the killed node;
+- `withdraw` — the split route is explicitly withdrawn after the worker loss;
+- `local-fallback` — serving remains available through a single local route;
+- `any` — accept the first stable explicit recovery state for exploratory QA.
+
+Useful knobs:
+
+```bash
+MESH_SPLIT_CERT_WORKERS=2
+MESH_SPLIT_CERT_SEED_MAX_VRAM=10
+MESH_SPLIT_CERT_WORKER_MAX_VRAM=9,10
+MESH_SPLIT_CERT_CTX_SIZE=2048
+MESH_SPLIT_CERT_DISCOVERY_MODE=mdns
+MESH_SPLIT_CERT_RUN_INFERENCE=1
+MESH_SPLIT_CERT_KEEP_LOGS=1
+MESH_SPLIT_CERT_WORK_DIR=target/split-recovery-cert/manual
+MESH_SPLIT_CERT_PROCESS_ROOT=/tmp/mesh-split-cert-manual
+```
+
+Expected output includes machine-readable `PASS`/`FAIL` lines and a
+`result.jsonl` evidence file in the work directory. The per-process homes and
+runtime roots default to a short temp directory to avoid Unix socket path length
+limits on macOS. The script never publishes a mesh and does not run by default
+in CI.
 
 ### 15. Passive client on one machine
 

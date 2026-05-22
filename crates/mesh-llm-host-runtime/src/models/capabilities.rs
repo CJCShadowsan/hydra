@@ -5,9 +5,13 @@ pub use mesh_llm_types::models::capabilities::{
 
 use super::build_hf_tokio_api;
 use super::remote_catalog;
-use hf_hub::{RepoDownloadFileParams, RepoType};
 use serde_json::Value;
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeMediaCapabilityEvidence {
+    pub vision_projector_loaded: bool,
+}
 
 pub fn infer_remote_catalog_capabilities(
     model: &remote_catalog::RemoteCatalogModel,
@@ -41,6 +45,33 @@ pub fn infer_local_model_capabilities(model_name: &str, path: &Path) -> ModelCap
     );
     for config in read_local_metadata_jsons(path) {
         caps = merge_config_signals(caps, &config);
+    }
+    caps.normalize()
+}
+
+pub fn runtime_verified_model_capabilities(
+    model_name: &str,
+    path: &Path,
+    evidence: RuntimeMediaCapabilityEvidence,
+) -> ModelCapabilities {
+    runtime_verified_capabilities_from_static(
+        infer_local_model_capabilities(model_name, path),
+        evidence,
+    )
+}
+
+pub fn runtime_verified_capabilities_from_static(
+    mut caps: ModelCapabilities,
+    evidence: RuntimeMediaCapabilityEvidence,
+) -> ModelCapabilities {
+    if evidence.vision_projector_loaded {
+        caps.vision = CapabilityLevel::Supported;
+        caps.multimodal = true;
+    } else {
+        caps.vision = CapabilityLevel::None;
+        if caps.audio == CapabilityLevel::None {
+            caps.multimodal = false;
+        }
     }
     caps.normalize()
 }
@@ -127,15 +158,83 @@ async fn fetch_remote_json_with_api(
 ) -> Option<Value> {
     let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
     let path = api
-        .repo(RepoType::Model, owner, name)
-        .download_file(
-            &RepoDownloadFileParams::builder()
-                .filename(file.to_string())
-                .revision(revision)
-                .build(),
-        )
+        .model(owner, name)
+        .download_file()
+        .filename(file.to_string())
+        .revision(revision)
+        .send()
         .await
         .ok()?;
     let text = tokio::fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&text).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        runtime_verified_capabilities_from_static, runtime_verified_model_capabilities,
+        CapabilityLevel, ModelCapabilities, RuntimeMediaCapabilityEvidence,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn runtime_media_verification_downgrades_name_only_vision_without_loaded_projector() {
+        let caps = runtime_verified_model_capabilities(
+            "Qwen3VL-2B-Instruct-Q4_K_M",
+            Path::new("/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf"),
+            RuntimeMediaCapabilityEvidence {
+                vision_projector_loaded: false,
+            },
+        );
+
+        assert_eq!(caps.vision, CapabilityLevel::None);
+        assert_eq!(caps.audio, CapabilityLevel::None);
+        assert!(!caps.multimodal);
+        assert!(!caps.supports_vision_runtime());
+        assert!(!caps.supports_multimodal_runtime());
+    }
+
+    #[test]
+    fn runtime_media_verification_promotes_loaded_projector_to_supported_vision() {
+        let caps = runtime_verified_model_capabilities(
+            "Qwen3VL-2B-Instruct-Q4_K_M",
+            Path::new("/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf"),
+            RuntimeMediaCapabilityEvidence {
+                vision_projector_loaded: true,
+            },
+        );
+
+        assert_eq!(caps.vision, CapabilityLevel::Supported);
+        assert_eq!(caps.audio, CapabilityLevel::None);
+        assert!(caps.multimodal);
+        assert!(caps.supports_vision_runtime());
+        assert!(caps.supports_multimodal_runtime());
+    }
+
+    #[test]
+    fn runtime_media_verification_preserves_audio_and_non_media_traits() {
+        let caps = ModelCapabilities {
+            multimodal: true,
+            vision: CapabilityLevel::Supported,
+            audio: CapabilityLevel::Supported,
+            reasoning: CapabilityLevel::Likely,
+            tool_use: CapabilityLevel::Supported,
+            moe: true,
+        };
+
+        let verified = runtime_verified_capabilities_from_static(
+            caps,
+            RuntimeMediaCapabilityEvidence {
+                vision_projector_loaded: false,
+            },
+        );
+
+        assert_eq!(verified.vision, CapabilityLevel::None);
+        assert_eq!(verified.audio, CapabilityLevel::Supported);
+        assert!(verified.multimodal);
+        assert_eq!(verified.reasoning, CapabilityLevel::Likely);
+        assert_eq!(verified.tool_use, CapabilityLevel::Supported);
+        assert!(verified.moe);
+        assert!(verified.supports_audio_runtime());
+    }
 }

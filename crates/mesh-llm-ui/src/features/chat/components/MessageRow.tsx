@@ -13,6 +13,7 @@ import {
   X
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { MessageRole } from '@/features/app-tabs/types'
 import { cn } from '@/lib/cn'
 import { ResponseStatsBar } from '@/features/chat/components/ResponseStatsBar'
@@ -76,8 +77,9 @@ function AttachmentIcon({ kind }: { kind: MessageAttachmentAction['kind'] }) {
 
 function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled: boolean }) {
   return (
-    <span className="block select-text break-words [&_code]:rounded-[calc(var(--radius)-2px)] [&_code]:bg-panel-strong [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.93em] [&_em]:text-fg-dim [&_strong]:font-semibold [&_strong]:text-foreground">
+    <div className="block select-text break-words [&_code]:rounded-[calc(var(--radius)-2px)] [&_code]:bg-panel-strong [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.93em] [&_em]:text-fg-dim [&_strong]:font-semibold [&_strong]:text-foreground">
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         components={{
           a(props) {
             const { node, ...anchorProps } = props
@@ -96,13 +98,13 @@ function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled:
           blockquote(props) {
             const { node, ...blockquoteProps } = props
             void node
-            return <span {...blockquoteProps} className="my-2 block border-l border-border pl-3 text-fg-dim" />
+            return <blockquote {...blockquoteProps} className="my-2 block border-l border-border pl-3 text-fg-dim" />
           },
           h1(props) {
             const { node, ...headingProps } = props
             void node
             return (
-              <span
+              <h1
                 {...headingProps}
                 className="mb-2 mt-3 block text-[length:var(--density-type-title)] font-semibold first:mt-0"
               />
@@ -112,7 +114,7 @@ function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled:
             const { node, ...headingProps } = props
             void node
             return (
-              <span
+              <h2
                 {...headingProps}
                 className="mb-2 mt-3 block text-[length:var(--density-type-control-lg)] font-semibold first:mt-0"
               />
@@ -122,7 +124,7 @@ function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled:
             const { node, ...headingProps } = props
             void node
             return (
-              <span
+              <h3
                 {...headingProps}
                 className="mb-1.5 mt-3 block text-[length:var(--density-type-body-lg)] font-semibold first:mt-0"
               />
@@ -131,50 +133,100 @@ function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled:
           hr(props) {
             const { node, ...separatorProps } = props
             void node
-            return <span {...separatorProps} aria-hidden={true} className="my-3 block border-t border-border-soft" />
+            return <hr {...separatorProps} className="my-3 block border-t border-border-soft" />
           },
           li(props) {
             const { node, ...itemProps } = props
             void node
             return (
-              <span {...itemProps} className="my-0.5 block pl-1">
+              <li {...itemProps} className="my-0.5 block pl-1">
                 <span aria-hidden={true} className="mr-2 text-fg-faint">
                   •
                 </span>
-                {itemProps.children}
-              </span>
+                <span className="inline [&>span]:my-0 [&>span]:inline">{itemProps.children}</span>
+              </li>
             )
           },
           ol(props) {
             const { node, ...listProps } = props
             void node
-            return <span {...listProps} className="my-2 block pl-4" />
+            return <ol {...listProps} className="my-2 block list-none pl-4" />
           },
           p(props) {
             const { node, ...paragraphProps } = props
             void node
-            return <span {...paragraphProps} className="my-2 block first:mt-0 last:mb-0" />
+            return <p {...paragraphProps} className="my-2 block first:mt-0 last:mb-0" />
           },
           pre(props) {
             const { node, ...preProps } = props
             void node
             return (
-              <span
+              <pre
                 {...preProps}
                 className="my-2 block max-w-full overflow-x-auto whitespace-pre rounded-[var(--radius)] border border-border-soft bg-panel p-3 [&_code]:bg-transparent [&_code]:p-0"
               />
             )
           },
+          table(props) {
+            const { className, node, ...tableProps } = props
+            void node
+            return (
+              <div className="my-2 max-w-full overflow-x-auto">
+                <table
+                  {...tableProps}
+                  className={cn('w-full border-collapse text-[length:var(--density-type-caption)]', className)}
+                />
+              </div>
+            )
+          },
+          tbody(props) {
+            const { node, ...tbodyProps } = props
+            void node
+            return <tbody {...tbodyProps} />
+          },
+          td(props) {
+            const { className, node, ...cellProps } = props
+            void node
+            return (
+              <td
+                {...cellProps}
+                className={cn('border border-border-soft px-2 py-1 align-top text-fg-dim', className)}
+              />
+            )
+          },
+          th(props) {
+            const { className, node, ...cellProps } = props
+            void node
+            return (
+              <th
+                {...cellProps}
+                className={cn(
+                  'border border-border-soft bg-panel-strong px-2 py-1 text-left font-semibold text-foreground',
+                  className
+                )}
+              />
+            )
+          },
+          thead(props) {
+            const { node, ...theadProps } = props
+            void node
+            return <thead {...theadProps} />
+          },
+          tr(props) {
+            const { node, ...rowProps } = props
+            void node
+            return <tr {...rowProps} />
+          },
           ul(props) {
             const { node, ...listProps } = props
             void node
-            return <span {...listProps} className="my-2 block pl-4" />
+            return <ul {...listProps} className="my-2 block list-none pl-4" />
           }
         }}
       >
         {text}
       </ReactMarkdown>
-    </span>
+    </div>
   )
 }
 
@@ -192,7 +244,7 @@ function AssistantMessageContent({
   if (segments.length === 0) return null
 
   return (
-    <span className="block space-y-3">
+    <div className="block space-y-3">
       {segments.map((segment, index) => {
         const key = `${segment.kind}-${index}`
 
@@ -200,7 +252,7 @@ function AssistantMessageContent({
           const active = streaming && segment.open
 
           return (
-            <span
+            <div
               className="block rounded-[var(--radius)] border px-3 py-2.5 text-[length:var(--density-type-body)] leading-[1.5] text-fg-dim"
               data-thinking-state={active ? 'active' : 'complete'}
               key={key}
@@ -218,21 +270,17 @@ function AssistantMessageContent({
                 <span>{active ? 'Thinking' : 'Thinking trace'}</span>
               </span>
               <span className="block select-text whitespace-pre-wrap break-words">{segment.text}</span>
-            </span>
+            </div>
           )
         }
 
         return (
-          <span
-            className="block select-text whitespace-pre-wrap break-words"
-            key={key}
-            style={{ border: '1px solid transparent' }}
-          >
+          <div className="block select-text break-words" key={key} style={{ border: '1px solid transparent' }}>
             <AssistantMarkdown text={segment.text} linksEnabled={linksEnabled} />
-          </span>
+          </div>
         )
       })}
-    </span>
+    </div>
   )
 }
 
@@ -262,17 +310,13 @@ export function MessageRow({
   const isStopped = state === 'stopped'
   const isError = state === 'error'
   const hasAttachmentActions = isUser && attachments.length > 0
-  const canInspect = inspect != null && !hasAttachmentActions
+  const canInspect = inspect != null
   const canRemoveQueued = isQueued && onRemoveQueued != null
   const routeMetadata = showRouteMetadata && ((isUser && routeNode) || (isResponse && route))
   const displayModel = isQueued ? 'Queued' : model
-  const rowClassName = cn(
-    'relative -mx-2 mb-5 block w-[calc(100%+16px)] select-none rounded-[var(--radius-lg)] border-0 bg-transparent px-2 py-1 text-left transition-[background,box-shadow] duration-150',
-    canInspect &&
-      'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent'
-  )
+  const rowClassName =
+    'relative -mx-2 mb-5 block w-[calc(100%+16px)] select-none rounded-[var(--radius-lg)] border-0 bg-transparent px-2 py-1 text-left transition-[background,box-shadow] duration-150'
   const rowStyle: CSSProperties = {
-    ...(canInspect ? { cursor: 'pointer' } : {}),
     ...(inspected ? { background: 'color-mix(in oklab, var(--color-accent) 4%, transparent)' } : {})
   }
   const userContentStyle: CSSProperties = {
@@ -292,7 +336,7 @@ export function MessageRow({
   const headerMetadata = displayModel ? [displayModel] : []
   const messageContent = (
     <>
-      <span className="mb-1.5 flex select-none items-center gap-2 text-[length:var(--density-type-caption)] text-fg-faint">
+      <div className="mb-1.5 flex select-none items-center gap-2 text-[length:var(--density-type-caption)] text-fg-faint">
         <span
           className="inline-flex size-4 items-center justify-center rounded-[var(--radius)]"
           style={{
@@ -315,12 +359,28 @@ export function MessageRow({
           <>
             <span>·</span>
             {isUser && routeNode ? (
-              <span
-                className="inline-flex items-center gap-[5px]"
-                style={{ color: inspected ? 'var(--color-accent)' : 'var(--color-fg-dim)' }}
-              >
-                <Send className="size-[10px]" /> sent to <span className="font-mono">{routeNode}</span>
-              </span>
+              canInspect ? (
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-[5px] outline-none transition-colors hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent"
+                  style={{ color: inspected ? 'var(--color-accent)' : 'var(--color-fg-dim)' }}
+                  aria-label={accessibleInspectLabel}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    inspect?.()
+                  }}
+                >
+                  <Send className="size-[10px]" aria-hidden={true} /> sent to{' '}
+                  <span className="font-mono">{routeNode}</span>
+                </button>
+              ) : (
+                <span
+                  className="inline-flex items-center gap-[5px]"
+                  style={{ color: inspected ? 'var(--color-accent)' : 'var(--color-fg-dim)' }}
+                >
+                  <Send className="size-[10px]" /> sent to <span className="font-mono">{routeNode}</span>
+                </span>
+              )
             ) : isResponse && route ? (
               <span
                 className="inline-flex items-center gap-[5px]"
@@ -332,8 +392,22 @@ export function MessageRow({
             ) : null}
           </>
         ) : null}
-      </span>
-      <span
+        {canInspect && isUser && !routeNode ? (
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 text-fg-faint outline-none transition-colors hover:text-fg-dim focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent"
+            aria-label={accessibleInspectLabel}
+            onClick={(event) => {
+              event.stopPropagation()
+              inspect?.()
+            }}
+          >
+            <Eye className="size-3" aria-hidden={true} />
+            <span>Inspect</span>
+          </button>
+        ) : null}
+      </div>
+      <div
         className="block select-text text-[length:var(--density-type-body-lg)] leading-[1.55]"
         style={{
           padding: isUser || isError ? '6px 0 6px 14px' : '12px 16px',
@@ -343,15 +417,15 @@ export function MessageRow({
         }}
       >
         {isError ? (
-          <span className="block space-y-1">
+          <div className="block space-y-1">
             <span className="block font-medium text-bad">Message failed to send</span>
             <span className="block break-words text-fg-muted">{body}</span>
             <span className="block text-[length:var(--density-type-caption)] text-fg-faint">
               Try selecting another model, then send the prompt again.
             </span>
-          </span>
+          </div>
         ) : isResponse ? (
-          <AssistantMessageContent body={body} linksEnabled={!canInspect} streaming={isStreamingPlaceholder} />
+          <AssistantMessageContent body={body} linksEnabled={true} streaming={isStreamingPlaceholder} />
         ) : (
           body
         )}
@@ -372,23 +446,30 @@ export function MessageRow({
             </button>
           </span>
         ) : null}
-      </span>
+      </div>
       {isResponse && !isError ? (
-        <ResponseStatsBar tokens={tokens} tokPerSec={tokPerSec} ttft={ttft} stopped={isStopped} />
+        <ResponseStatsBar
+          tokens={tokens}
+          tokPerSec={tokPerSec}
+          ttft={ttft}
+          stopped={isStopped}
+          inspect={inspect}
+          inspectLabel={accessibleInspectLabel}
+        />
       ) : null}
     </>
   )
   const content = isError ? (
-    <span className="flex items-center justify-between gap-5" role="alert" style={errorContentStyle}>
-      <span className="min-w-0">{messageContent}</span>
+    <div className="flex items-center justify-between gap-5" role="alert" style={errorContentStyle}>
+      <div className="min-w-0">{messageContent}</div>
       <MessageSquareX aria-hidden={true} className="size-8 shrink-0 text-bad" strokeWidth={1.6} />
-    </span>
+    </div>
   ) : isUser ? (
-    <span
+    <div
       className={cn('relative block', hasAttachmentActions && 'flex items-center justify-between gap-4')}
       style={userContentStyle}
     >
-      <span className="min-w-0">{messageContent}</span>
+      <div className="min-w-0">{messageContent}</div>
       {canRemoveQueued ? (
         <button
           type="button"
@@ -405,21 +486,6 @@ export function MessageRow({
       ) : null}
       {hasAttachmentActions ? (
         <span className="flex shrink-0 flex-col items-end justify-center gap-1.5">
-          {inspect ? (
-            <button
-              type="button"
-              className="ui-control inline-flex h-8 max-w-[12rem] items-center gap-1.5 rounded-[var(--radius)] border px-2.5 text-[length:var(--density-type-caption)] font-medium text-fg-muted outline-none transition-[background,color,box-shadow,transform] hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-              aria-label={accessibleInspectLabel}
-              title={accessibleInspectLabel}
-              onClick={(event) => {
-                event.stopPropagation()
-                inspect()
-              }}
-            >
-              <Eye className="size-3.5" aria-hidden={true} />
-              <span className="truncate">Inspect</span>
-            </button>
-          ) : null}
           {attachments.map((attachment) => (
             <button
               key={attachment.id}
@@ -438,28 +504,14 @@ export function MessageRow({
           ))}
         </span>
       ) : null}
-    </span>
+    </div>
   ) : (
     messageContent
   )
 
-  if (!canInspect) {
-    return (
-      <article className={rowClassName} style={rowStyle}>
-        {content}
-      </article>
-    )
-  }
-
   return (
-    <button
-      aria-label={accessibleInspectLabel}
-      onClick={inspect}
-      type="button"
-      className={rowClassName}
-      style={rowStyle}
-    >
+    <article className={rowClassName} style={rowStyle}>
       {content}
-    </button>
+    </article>
   )
 }

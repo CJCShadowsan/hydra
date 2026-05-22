@@ -250,6 +250,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
                 activation_width,
                 wire_dtype,
+                reply_credit_limit,
                 downstream_connect_timeout_secs,
                 downstream_wire_condition,
                 telemetry: openai_telemetry,
@@ -487,6 +488,13 @@ fn handle_binary_connection(
                 "llama_stage.session_reset".to_string(),
                 json!(drop_stats.reset_session),
             );
+            reset_attrs.insert(
+                "llama_stage.lane_discarded".to_string(),
+                json!(drop_stats.lane_discarded),
+            );
+            if let Some(reason) = drop_stats.lane_discard_reason.as_deref() {
+                reset_attrs.insert("llama_stage.lane_discard_reason".to_string(), json!(reason));
+            }
             reset_attrs.insert(
                 "llama_stage.elapsed_ms".to_string(),
                 json!(elapsed_ms(reset_timer)),
@@ -3171,6 +3179,7 @@ fn runtime_sampling_config(sampling: Option<&StageSamplingConfig>) -> Option<Sam
         temperature: sampling.temperature,
         top_p: sampling.top_p,
         top_k: sampling.top_k,
+        min_p: sampling.min_p,
         presence_penalty: sampling.presence_penalty,
         frequency_penalty: sampling.frequency_penalty,
         repeat_penalty: sampling.repeat_penalty,

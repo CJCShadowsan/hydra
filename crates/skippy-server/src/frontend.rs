@@ -83,7 +83,25 @@ use self::{prefill::*, request::*, speculative::*, util::*, wire_messages::*};
 
 static OPENAI_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Sentinel meaning "no caller-specified max completion length; let the
+/// request consume the entire remaining context window when the client
+/// also omits max_tokens".
+///
+/// This is opt-in and should only be wired in by callers that have made
+/// a deliberate decision to allow unbounded chat completions. The
+/// embedded mesh-llm wiring uses [`DEFAULT_EMBEDDED_MAX_TOKENS`] instead.
 pub const CONTEXT_BUDGET_MAX_TOKENS: u32 = u32::MAX;
+
+/// Default max completion tokens for embedded mesh-llm chat serving when
+/// the client omits max_tokens. Bounded so that an adversarial or
+/// non-terminating generation cannot run for the full context window.
+/// Clients can still request more by sending max_tokens explicitly, up
+/// to the remaining context budget.
+///
+/// When the configured context window is smaller than this value, the
+/// request is silently clamped to whatever remaining budget exists
+/// rather than rejected — see [`GenerationTokenLimit::resolve`].
+pub const DEFAULT_EMBEDDED_MAX_TOKENS: u32 = 4096;
 const GENERATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const GENERATION_RETRY_AFTER_SECS: u64 = 1;
 
@@ -206,6 +224,7 @@ pub struct EmbeddedOpenAiArgs {
     pub draft_n_gpu_layers: Option<i32>,
     pub activation_width: i32,
     pub wire_dtype: WireActivationDType,
+    pub reply_credit_limit: Option<usize>,
     pub downstream_connect_timeout_secs: u64,
     pub downstream_wire_condition: WireCondition,
     pub telemetry: Telemetry,
@@ -297,6 +316,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         args.telemetry.clone(),
     )
     .context("create embedded OpenAI persistent downstream lanes")?;
+    let prefill_reply_credit_limit = args.reply_credit_limit.unwrap_or(3);
     let mode = OpenAiBackendMode::EmbeddedStageZero {
         config: args.config.clone(),
         wire_dtype: args.wire_dtype,
@@ -312,6 +332,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         })?,
         activation_width: args.activation_width,
         downstream_wire_condition: args.downstream_wire_condition,
+        prefill_reply_credit_limit,
         lane_pool,
     };
     args.telemetry
@@ -380,9 +401,66 @@ impl Drop for GenerationQueueReservation {
     }
 }
 
+async fn acquire_generation_permit_with_queue(
+    generation_limit: Arc<Semaphore>,
+    generation_queue_depth: Arc<AtomicUsize>,
+    generation_queue_limit: usize,
+    admission_timeout: Duration,
+) -> OpenAiResult<OwnedSemaphorePermit> {
+    match generation_limit.clone().try_acquire_owned() {
+        Ok(permit) => return Ok(permit),
+        Err(TryAcquireError::Closed) => return Err(generation_lanes_busy_error()),
+        Err(TryAcquireError::NoPermits) => {}
+    }
+
+    let _queue_reservation =
+        reserve_generation_queue(generation_queue_depth, generation_queue_limit)
+            .ok_or_else(generation_queue_full_error)?;
+    tokio::time::timeout(admission_timeout, generation_limit.acquire_owned())
+        .await
+        .map_err(|_| generation_queue_timeout_error(admission_timeout))?
+        .map_err(|_| generation_lanes_busy_error())
+}
+
+fn reserve_generation_queue(
+    generation_queue_depth: Arc<AtomicUsize>,
+    generation_queue_limit: usize,
+) -> Option<GenerationQueueReservation> {
+    let mut current = generation_queue_depth.load(Ordering::Acquire);
+    loop {
+        if current >= generation_queue_limit {
+            return None;
+        }
+        match generation_queue_depth.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(GenerationQueueReservation {
+                    depth: generation_queue_depth,
+                });
+            }
+            Err(next) => current = next,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationTokenLimit {
+    /// Client sent a concrete `max_tokens`. Must fit in the context
+    /// window; otherwise return a context_length_exceeded error so the
+    /// client knows their request couldn't be honored as-asked.
     Explicit(u32),
+    /// Caller didn't send `max_tokens`, but the server has a configured
+    /// default cap. Clamp down to whatever fits in the remaining
+    /// context budget rather than rejecting — the client didn't ask
+    /// for the specific number, the server picked it.
+    Default(u32),
+    /// Caller didn't send `max_tokens` and the server is configured
+    /// with [`CONTEXT_BUDGET_MAX_TOKENS`] (opt-in unbounded). Use the
+    /// entire remaining context window.
     ContextBudget,
 }
 
@@ -391,7 +469,7 @@ impl GenerationTokenLimit {
         match requested {
             Some(max_tokens) => Self::Explicit(max_tokens),
             None if default_max_tokens == CONTEXT_BUDGET_MAX_TOKENS => Self::ContextBudget,
-            None => Self::Explicit(default_max_tokens),
+            None => Self::Default(default_max_tokens),
         }
     }
 
@@ -400,6 +478,14 @@ impl GenerationTokenLimit {
             Self::Explicit(max_tokens) => {
                 ensure_context_capacity(prompt_token_count, max_tokens, ctx_size)?;
                 Ok(max_tokens)
+            }
+            Self::Default(default_max_tokens) => {
+                // Server-picked default. Always clamp to the remaining
+                // context budget. If the prompt already exceeds the
+                // window, surface that as a real error — but never
+                // reject just because our default wouldn't fit.
+                let remaining = context_budget_completion_tokens(prompt_token_count, ctx_size)?;
+                Ok(remaining.min(default_max_tokens))
             }
             Self::ContextBudget => context_budget_completion_tokens(prompt_token_count, ctx_size),
         }
@@ -543,6 +629,7 @@ enum OpenAiBackendMode {
         prefill_chunk_policy: PrefillChunkPolicy,
         activation_width: i32,
         downstream_wire_condition: WireCondition,
+        prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
     },
 }
@@ -1121,6 +1208,13 @@ struct ParsedToolCalls {
     tool_calls: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedChatMessage {
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Value>,
+}
+
 fn tool_calls_requested(request: &ChatCompletionRequest) -> bool {
     request.tools.as_ref().is_some_and(has_requested_tools)
         && !request
@@ -1132,9 +1226,14 @@ fn tool_calls_requested(request: &ChatCompletionRequest) -> bool {
 fn chat_response_from_generated_text(
     model: String,
     output: &GeneratedText,
-    parsed_tool_calls: Option<ParsedToolCalls>,
+    parsed_message: Option<ParsedChatMessage>,
 ) -> ChatCompletionResponse {
-    if let Some(parsed) = parsed_tool_calls {
+    if let Some(parsed) = parsed_message {
+        let finish_reason = if parsed.tool_calls.is_some() {
+            FinishReason::ToolCalls
+        } else {
+            output.finish_reason
+        };
         return ChatCompletionResponse {
             id: openai_frontend::completion_id("chatcmpl"),
             object: "chat.completion",
@@ -1145,10 +1244,11 @@ fn chat_response_from_generated_text(
                 message: openai_frontend::AssistantMessage {
                     role: "assistant",
                     content: parsed.content,
-                    tool_calls: Some(parsed.tool_calls),
+                    reasoning_content: parsed.reasoning_content,
+                    tool_calls: parsed.tool_calls,
                 },
                 logprobs: None,
-                finish_reason: Some(FinishReason::ToolCalls),
+                finish_reason: Some(finish_reason),
             }],
             usage: output.usage(),
         };
@@ -1162,11 +1262,36 @@ fn chat_response_from_generated_text(
     )
 }
 
+fn parsed_chat_message_from_json(
+    message_json: &str,
+    request: &ChatCompletionRequest,
+) -> Option<ParsedChatMessage> {
+    let value = serde_json::from_str::<Value>(message_json).ok()?;
+    let tool_calls =
+        parsed_tool_calls_from_message_value(&value, request).map(|parsed| parsed.tool_calls);
+    Some(ParsedChatMessage {
+        content: string_field(&value, "content"),
+        reasoning_content: string_field(&value, "reasoning_content"),
+        tool_calls,
+    })
+}
+
+#[cfg(test)]
 fn parsed_tool_calls_from_message_json(
     message_json: &str,
     request: &ChatCompletionRequest,
 ) -> Option<ParsedToolCalls> {
     let value = serde_json::from_str::<Value>(message_json).ok()?;
+    parsed_tool_calls_from_message_value(&value, request)
+}
+
+fn parsed_tool_calls_from_message_value(
+    value: &Value,
+    request: &ChatCompletionRequest,
+) -> Option<ParsedToolCalls> {
+    if !tool_calls_requested(request) {
+        return None;
+    }
     let allowed_names = request_allowed_tool_names(request);
     let mut tool_calls = value
         .get("tool_calls")
@@ -1182,13 +1307,17 @@ fn parsed_tool_calls_from_message_json(
         return None;
     }
     Some(ParsedToolCalls {
-        content: value
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|content| !content.is_empty())
-            .map(ToString::to_string),
+        content: string_field(value, "content"),
         tool_calls: Value::Array(tool_calls),
     })
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+        .map(ToString::to_string)
 }
 
 fn request_allowed_tool_names(request: &ChatCompletionRequest) -> Vec<String> {
@@ -1327,6 +1456,7 @@ struct EmbeddedStageZeroGeneration<'a> {
     prefill_chunk_policy: &'a PrefillChunkPolicy,
     activation_width: i32,
     downstream_wire_condition: WireCondition,
+    prefill_reply_credit_limit: usize,
     lane_pool: Option<Arc<PersistentStageLanePool>>,
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
@@ -1397,9 +1527,93 @@ type GenerationStream =
 
 enum GenerationStreamEvent {
     Delta(String),
+    ReasoningDelta(String),
     ToolCalls(Value),
     Usage(Usage),
     Done(FinishReason),
+}
+
+struct ChatOutputStreamParser {
+    backend: StageOpenAiBackend,
+    request: ChatCompletionRequest,
+    metadata: String,
+    text: String,
+    emitted_content: String,
+    emitted_reasoning_content: String,
+    emitted_tool_calls: bool,
+}
+
+impl ChatOutputStreamParser {
+    fn new(backend: StageOpenAiBackend, request: ChatCompletionRequest, metadata: String) -> Self {
+        Self {
+            backend,
+            request,
+            metadata,
+            text: String::new(),
+            emitted_content: String::new(),
+            emitted_reasoning_content: String::new(),
+            emitted_tool_calls: false,
+        }
+    }
+
+    fn push_delta(&mut self, delta: &str) -> OpenAiResult<Vec<GenerationStreamEvent>> {
+        self.text.push_str(delta);
+        self.events_for_text(true)
+    }
+
+    fn finish(&mut self, text: &str) -> OpenAiResult<Vec<GenerationStreamEvent>> {
+        if self.text != text {
+            self.text = text.to_string();
+        }
+        self.events_for_text(false)
+    }
+
+    fn events_for_text(&mut self, is_partial: bool) -> OpenAiResult<Vec<GenerationStreamEvent>> {
+        let Some(parsed) = self.backend.parse_chat_output(
+            &self.text,
+            &self.request,
+            Some(&self.metadata),
+            is_partial,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::new();
+        if let Some(delta) = suffix_delta(
+            parsed.reasoning_content.as_deref(),
+            &mut self.emitted_reasoning_content,
+        ) {
+            events.push(GenerationStreamEvent::ReasoningDelta(delta));
+        }
+        if let Some(delta) = suffix_delta(parsed.content.as_deref(), &mut self.emitted_content) {
+            events.push(GenerationStreamEvent::Delta(delta));
+        }
+        if !is_partial && !self.emitted_tool_calls {
+            if let Some(tool_calls) = parsed.tool_calls {
+                self.emitted_tool_calls = true;
+                events.push(GenerationStreamEvent::ToolCalls(tool_calls));
+            }
+        }
+        Ok(events)
+    }
+
+    fn finish_reason(&self, fallback: FinishReason) -> FinishReason {
+        if self.emitted_tool_calls {
+            FinishReason::ToolCalls
+        } else {
+            fallback
+        }
+    }
+}
+
+fn suffix_delta(current: Option<&str>, emitted: &mut String) -> Option<String> {
+    let current = current?;
+    let delta = current.strip_prefix(emitted.as_str())?;
+    if delta.is_empty() {
+        return None;
+    }
+    emitted.push_str(delta);
+    Some(delta.to_string())
 }
 
 fn generation_event_to_chat_chunk(
@@ -1410,6 +1624,24 @@ fn generation_event_to_chat_chunk(
         GenerationStreamEvent::Delta(delta) => {
             Ok(ChatCompletionChunk::delta(model.to_string(), delta))
         }
+        GenerationStreamEvent::ReasoningDelta(delta) => Ok(ChatCompletionChunk {
+            id: openai_frontend::completion_id("chatcmpl"),
+            object: "chat.completion.chunk",
+            created: openai_frontend::now_unix_secs(),
+            model: model.to_string(),
+            choices: vec![openai_frontend::ChatCompletionChunkChoice {
+                index: 0,
+                delta: openai_frontend::ChatCompletionDelta {
+                    role: None,
+                    content: None,
+                    reasoning_content: Some(delta),
+                    tool_calls: None,
+                },
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage: None,
+        }),
         GenerationStreamEvent::ToolCalls(tool_calls) => Ok(ChatCompletionChunk {
             id: openai_frontend::completion_id("chatcmpl"),
             object: "chat.completion.chunk",
@@ -1420,6 +1652,7 @@ fn generation_event_to_chat_chunk(
                 delta: openai_frontend::ChatCompletionDelta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(tool_calls_stream_delta(tool_calls)),
                 },
                 logprobs: None,
@@ -1443,6 +1676,9 @@ fn generation_event_to_completion_chunk(
 ) -> OpenAiResult<CompletionChunk> {
     match event? {
         GenerationStreamEvent::Delta(delta) => Ok(CompletionChunk::delta(model.to_string(), delta)),
+        GenerationStreamEvent::ReasoningDelta(_) => {
+            Ok(CompletionChunk::delta(model.to_string(), ""))
+        }
         GenerationStreamEvent::ToolCalls(_) => Ok(CompletionChunk::delta(model.to_string(), "")),
         GenerationStreamEvent::Usage(usage) => Ok(CompletionChunk::usage(model.to_string(), usage)),
         GenerationStreamEvent::Done(reason) => {

@@ -1,22 +1,31 @@
 [package]
 name = "mesh-llm-host-runtime"
-version = "0.65.1"
+version.workspace = true
 edition = "2021"
 
 [features]
+default = ["web-ui"]
+# Embed the React web console into the binary. Default on; turn off for
+# lib-style / headless consumers that don't need the console assets.
+# Propagates to `mesh-llm-ui/embed-assets`.
+web-ui = ["mesh-llm-ui/embed-assets"]
 gpu-bench-cuda = ["mesh-llm-system/gpu-bench-cuda"]
 gpu-bench-hip = ["mesh-llm-system/gpu-bench-hip"]
 gpu-bench-intel = ["mesh-llm-system/gpu-bench-intel"]
 
+[lints]
+workspace = true
+
 [dependencies]
 ansi-to-tui = "8"
+mesh-mixture-of-agents = { path = "../mesh-mixture-of-agents" }
 mesh-llm-plugin = { path = "../mesh-llm-plugin" }
 mesh-llm-identity = { path = "../mesh-llm-identity" }
 mesh-llm-protocol = { path = "../mesh-llm-protocol" }
 mesh-llm-routing = { path = "../mesh-llm-routing" }
 mesh-llm-system = { path = "../mesh-llm-system", features = ["skippy-devices"] }
 mesh-llm-types = { path = "../mesh-llm-types" }
-mesh-llm-ui = { path = "../mesh-llm-ui" }
+mesh-llm-ui = { path = "../mesh-llm-ui", default-features = false }
 mesh-llm-node = { path = "../mesh-llm-node" }
 mesh-llm-api = { path = "../mesh-llm-api" }
 mesh-client = { package = "mesh-llm-client", path = "../mesh-client", features = ["host-io"] }
@@ -69,13 +78,14 @@ ratatui = "0.30"
 url = "2"
 urlencoding = "2"
 libc = "0.2.183"
+mdns-sd = "0.19"
 regex-lite = "0.1"
 rmcp = { version = "1.2", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 schemars = "1"
 prost = "0.14"
 toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-hf_hub = { package = "huggingface-hub", git = "https://github.com/huggingface/huggingface_hub_rust.git", rev = "c9749ef76a294d5e97acae6b644071e39854aeb8", default-features = false, features = ["blocking", "xet"] }
+hf_hub = { package = "hf-hub", git = "https://github.com/huggingface/hf-hub.git", rev = "4cd6d8acd3192021381ff85210be9192b394e0eb", default-features = false, features = ["blocking"] }
 tabwriter = "1"
 
 [dev-dependencies]

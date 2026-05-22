@@ -14,6 +14,10 @@
 //!   GET  /api/runtime/endpoints — registered plugin endpoint state (JSON)
 //!   GET  /api/runtime/processes — local inference process state (JSON)
 //!   GET  /api/runtime/stages — backend-neutral staged-serving state (JSON)
+//!   GET  /api/runtime/control-bootstrap — local-only owner-control bootstrap policy (JSON)
+//!   POST /api/runtime/control/get-config — run local owner-control get-config against an explicit endpoint
+//!   POST /api/runtime/control/refresh-inventory — run local owner-control refresh-inventory against an explicit endpoint
+//!   POST /api/runtime/control/apply-config — run local owner-control apply-config against an explicit endpoint
 //!   POST /api/runtime/models — load a local model
 //!   DELETE /api/runtime/models/{model} — unload a local model
 //!   DELETE /api/runtime/instances/{instance_id} — unload one local runtime instance
@@ -36,6 +40,7 @@
 
 mod assets;
 mod http;
+mod model_target_capacity;
 mod model_targets;
 mod routes;
 mod server;
@@ -46,8 +51,8 @@ pub(crate) use self::server::start_with_listener;
 #[cfg(test)]
 pub(crate) use self::server::{handle_request, is_ui_only_route};
 pub use self::state::{
-    LocalModelInterest, MeshApi, PublicationState, RuntimeControlRequest, RuntimeLoadResponse,
-    RuntimeModelPayload, RuntimeProcessPayload, RuntimeUnloadResponse,
+    ControlBootstrapPayload, LocalModelInterest, MeshApi, PublicationState, RuntimeControlRequest,
+    RuntimeLoadResponse, RuntimeModelPayload, RuntimeProcessPayload, RuntimeUnloadResponse,
 };
 pub(crate) use self::status::classify_runtime_error;
 
@@ -64,7 +69,6 @@ use crate::runtime_data;
 use mesh_llm_node::serving::{
     DevicePolicy as NodeDevicePolicy, LoadModelRequest, ServedModel, ServingController,
     ServingError, ServingFuture, ServingModelState, ServingStatus, UnloadModelRequest,
-    UnloadOptions, UnloadTarget,
 };
 use mesh_llm_types::models::capabilities::merge_name_signals;
 use std::sync::Arc;
@@ -143,6 +147,7 @@ pub struct MeshApiConfig {
     pub(crate) model_name: String,
     pub(crate) api_port: u16,
     pub(crate) model_size_bytes: u64,
+    pub(crate) owner_key_path: Option<std::path::PathBuf>,
     pub(crate) plugin_manager: plugin::PluginManager,
     pub(crate) affinity_router: affinity::AffinityRouter,
     pub(crate) runtime_data_collector: runtime_data::RuntimeDataCollector,
@@ -156,6 +161,7 @@ impl MeshApi {
             model_name,
             api_port,
             model_size_bytes,
+            owner_key_path,
             plugin_manager,
             affinity_router,
             runtime_data_collector,
@@ -218,9 +224,12 @@ impl MeshApi {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                mesh_discovery_mode: crate::network::discovery::MeshDiscoveryMode::Nostr,
                 nostr_discovery: false,
                 publication_state: state::PublicationState::Private,
                 runtime_control: None,
+                control_bootstrap: state::ControlBootstrapPayload::default(),
+                owner_key_path,
                 local_processes: Vec::new(),
                 sse_clients: Vec::new(),
                 model_interests: std::collections::HashMap::new(),
@@ -350,6 +359,13 @@ impl MeshApi {
         self.inner.lock().await.nostr_relays = relays;
     }
 
+    pub async fn set_mesh_discovery_mode(
+        &self,
+        mode: crate::network::discovery::MeshDiscoveryMode,
+    ) {
+        self.inner.lock().await.mesh_discovery_mode = mode;
+    }
+
     pub async fn set_nostr_discovery(&self, v: bool) {
         self.inner.lock().await.nostr_discovery = v;
     }
@@ -376,6 +392,23 @@ impl MeshApi {
         tx: tokio::sync::mpsc::UnboundedSender<RuntimeControlRequest>,
     ) {
         self.inner.lock().await.runtime_control = Some(tx);
+    }
+
+    pub async fn control_bootstrap(&self) -> ControlBootstrapPayload {
+        self.inner.lock().await.control_bootstrap.clone()
+    }
+
+    pub async fn set_control_bootstrap(&self, control_bootstrap: ControlBootstrapPayload) {
+        self.inner.lock().await.control_bootstrap = control_bootstrap;
+    }
+
+    pub(crate) async fn owner_key_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.lock().await.owner_key_path.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_owner_key_path(&self, owner_key_path: Option<std::path::PathBuf>) {
+        self.inner.lock().await.owner_key_path = owner_key_path;
     }
 
     pub(crate) async fn status_snapshot_string(&self) -> String {
@@ -901,13 +934,6 @@ impl MeshApi {
         inner.runtime_data_producer.mark_status_dirty();
         inner.sse_clients.retain(|tx| !tx.is_closed());
     }
-
-    pub fn configure_sdk_node_builder(
-        &self,
-        builder: mesh_llm_api::MeshNodeBuilder,
-    ) -> mesh_llm_api::MeshNodeBuilder {
-        builder.serving_controller(Arc::new(self.clone()))
-    }
 }
 
 impl ServingController for MeshApi {
@@ -1017,23 +1043,6 @@ impl ServingController for MeshApi {
                 })),
             }
         })
-    }
-}
-
-impl MeshApi {
-    pub async fn load_serving_model(
-        &self,
-        request: LoadModelRequest,
-    ) -> anyhow::Result<ServedModel> {
-        ServingController::load(self, request).await
-    }
-
-    pub async fn unload_serving_model(
-        &self,
-        target: UnloadTarget,
-        options: UnloadOptions,
-    ) -> anyhow::Result<()> {
-        ServingController::unload(self, UnloadModelRequest { target, options }).await
     }
 }
 

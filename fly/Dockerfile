@@ -7,13 +7,20 @@
 # syntax=docker/dockerfile:1.7
 
 FROM node:24-alpine AS ui-builder
+ARG VITE_API_URL=https://meshllm.cloud
+ARG VITE_APP_VERSION=
+ARG VITE_STORAGE_NAMESPACE=mesh-llm-ui-production
+ARG NODE_ENV=production
+ENV NODE_ENV=$NODE_ENV
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_STORAGE_NAMESPACE=$VITE_STORAGE_NAMESPACE
 RUN npm install -g pnpm
 WORKDIR /app
 COPY crates/mesh-llm-ui/package.json crates/mesh-llm-ui/pnpm-lock.yaml crates/mesh-llm-ui/pnpm-workspace.yaml ./
 RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 COPY crates/mesh-llm-ui/ ./
-RUN pnpm run build
+RUN VITE_APP_VERSION="${VITE_APP_VERSION:-$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')}" pnpm run build
 
 FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,6 +31,7 @@ ENV PATH="/root/.cargo/bin:$PATH"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/mesh-llm-ui/ crates/mesh-llm-ui/
+COPY crates/mesh-llm-gpu-bench/ crates/mesh-llm-gpu-bench/
 COPY crates/mesh-llm-identity/ crates/mesh-llm-identity/
 COPY crates/mesh-llm-protocol/ crates/mesh-llm-protocol/
 COPY crates/mesh-llm-routing/ crates/mesh-llm-routing/
@@ -62,6 +70,7 @@ COPY crates/skippy-correctness/ crates/skippy-correctness/
 COPY crates/llama-spec-bench/ crates/llama-spec-bench/
 COPY crates/skippy-bench/ crates/skippy-bench/
 COPY crates/skippy-prompt/ crates/skippy-prompt/
+COPY crates/mesh-mixture-of-agents/ crates/mesh-mixture-of-agents/
 COPY tools/xtask/ tools/xtask/
 COPY scripts/prepare-llama.sh scripts/build-llama.sh scripts/
 COPY third_party/llama.cpp/upstream.txt third_party/llama.cpp/upstream.txt
@@ -83,5 +92,6 @@ COPY --from=builder /usr/local/bin/mesh-llm /usr/local/bin/mesh-llm
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENV APP_MODE=console
+ENV NODE_ENV=production
 EXPOSE 3131 9337
 ENTRYPOINT ["/entrypoint.sh"]

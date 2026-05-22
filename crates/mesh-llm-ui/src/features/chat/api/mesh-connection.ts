@@ -14,13 +14,19 @@ function nowMs() {
   return performance.now()
 }
 
-function resolveModel(model: string | (() => string)): string {
-  return typeof model === 'function' ? model() : model
+type StringSource = string | (() => string) | { readonly value: string }
+
+function resolveModel(model: StringSource): string {
+  if (typeof model === 'function') return model()
+  if (typeof model === 'string') return model
+  return model.value
 }
 
-function resolveSystemPrompt(systemPrompt: string | (() => string) | undefined): string {
+function resolveSystemPrompt(systemPrompt: StringSource | undefined): string {
   if (!systemPrompt) return ''
-  return typeof systemPrompt === 'function' ? systemPrompt() : systemPrompt
+  if (typeof systemPrompt === 'function') return systemPrompt()
+  if (typeof systemPrompt === 'string') return systemPrompt
+  return systemPrompt.value
 }
 
 function parseChatSSEEvent(data: string) {
@@ -196,16 +202,37 @@ async function* runConnect(
   }
 
   let messageStarted = false
+  let reasoningOpen = false
   let firstDeltaAt: number | undefined
 
   for await (const event of parseSSEStream(response.body, abortSignal)) {
     if (abortSignal?.aborted) break
+
+    if (event.type === 'response.reasoning_text.delta') {
+      firstDeltaAt ??= nowMs()
+      if (!messageStarted) {
+        messageStarted = true
+        yield { type: EventType.TEXT_MESSAGE_START, messageId, role: 'assistant' }
+      }
+      if (!reasoningOpen) {
+        reasoningOpen = true
+        yield { type: EventType.REASONING_START, messageId }
+        yield { type: EventType.REASONING_MESSAGE_START, messageId, role: 'reasoning' }
+      }
+      yield { type: EventType.REASONING_MESSAGE_CONTENT, messageId, delta: event.delta }
+      continue
+    }
 
     if (event.type === 'response.output_text.delta') {
       firstDeltaAt ??= nowMs()
       if (!messageStarted) {
         messageStarted = true
         yield { type: EventType.TEXT_MESSAGE_START, messageId, role: 'assistant' }
+      }
+      if (reasoningOpen) {
+        reasoningOpen = false
+        yield { type: EventType.REASONING_MESSAGE_END, messageId }
+        yield { type: EventType.REASONING_END, messageId }
       }
       yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta: event.delta }
       continue
@@ -236,6 +263,10 @@ async function* runConnect(
   if (abortSignal?.aborted) return
 
   if (messageStarted) {
+    if (reasoningOpen) {
+      yield { type: EventType.REASONING_MESSAGE_END, messageId }
+      yield { type: EventType.REASONING_END, messageId }
+    }
     yield { type: EventType.TEXT_MESSAGE_END, messageId }
   }
 
@@ -243,9 +274,9 @@ async function* runConnect(
 }
 
 export function createMeshConnectionAdapter(
-  model: string | (() => string),
+  model: StringSource,
   onResponseMetadata?: (metadata: ChatResponseMetadata) => void,
-  systemPrompt?: string | (() => string)
+  systemPrompt?: StringSource
 ): ConnectConnectionAdapter {
   return {
     connect: (_messages, _data, abortSignal) =>

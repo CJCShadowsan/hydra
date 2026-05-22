@@ -1,8 +1,18 @@
 use super::*;
 use std::io::Cursor;
-use std::{env, fs, net::SocketAddr};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
+use axum::{http::StatusCode, response::IntoResponse};
 use serde_json::json;
+use tokio::sync::Semaphore;
 
 const MM_MODEL_ENV: &str = "SKIPPY_MM_MODEL";
 const MM_PROJECTOR_ENV: &str = "SKIPPY_MM_PROJECTOR";
@@ -139,6 +149,106 @@ fn unsupported_code(error: OpenAiError) -> Option<String> {
     error.body().error.code
 }
 
+fn assert_generation_rate_limit(error: OpenAiError, message_fragment: &str) {
+    assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = error.body();
+    assert_eq!(body.error.code.as_deref(), Some("rate_limit_exceeded"));
+    assert!(
+        body.error.message.contains(message_fragment),
+        "expected {:?} to contain {:?}",
+        body.error.message,
+        message_fragment
+    );
+
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+}
+
+#[tokio::test]
+async fn generation_admission_uses_open_lane_without_queueing() {
+    let generation_limit = Arc::new(Semaphore::new(1));
+    let generation_queue_depth = Arc::new(AtomicUsize::new(0));
+
+    let permit = acquire_generation_permit_with_queue(
+        generation_limit,
+        generation_queue_depth.clone(),
+        1,
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(generation_queue_depth.load(Ordering::Acquire), 0);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn generation_admission_rejects_when_queue_full() {
+    let generation_limit = Arc::new(Semaphore::new(0));
+    let generation_queue_depth = Arc::new(AtomicUsize::new(1));
+
+    let error = acquire_generation_permit_with_queue(
+        generation_limit,
+        generation_queue_depth.clone(),
+        1,
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap_err();
+
+    assert_generation_rate_limit(error, "queue is full");
+    assert_eq!(generation_queue_depth.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn generation_admission_times_out_and_releases_queue_slot() {
+    let generation_limit = Arc::new(Semaphore::new(0));
+    let generation_queue_depth = Arc::new(AtomicUsize::new(0));
+
+    let error = acquire_generation_permit_with_queue(
+        generation_limit,
+        generation_queue_depth.clone(),
+        1,
+        Duration::from_millis(5),
+    )
+    .await
+    .unwrap_err();
+
+    assert_generation_rate_limit(error, "timed out waiting");
+    assert_eq!(generation_queue_depth.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn generation_admission_waits_for_released_lane() {
+    let generation_limit = Arc::new(Semaphore::new(0));
+    let generation_queue_depth = Arc::new(AtomicUsize::new(0));
+    let release_limit = generation_limit.clone();
+    let release_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        release_limit.add_permits(1);
+    });
+
+    let permit = acquire_generation_permit_with_queue(
+        generation_limit,
+        generation_queue_depth.clone(),
+        1,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    release_task.await.unwrap();
+    assert_eq!(generation_queue_depth.load(Ordering::Acquire), 0);
+    drop(permit);
+}
+
 #[test]
 fn chat_runtime_feature_guard_allows_noop_parity_fields() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -235,6 +345,77 @@ fn parses_llama_message_tool_calls() {
         parsed.tool_calls[0]["function"]["arguments"],
         "{\"city\":\"Sydney\"}"
     );
+}
+
+#[test]
+fn parses_llama_message_reasoning_content() {
+    let parsed = parsed_chat_message_from_json(
+        r#"{"role":"assistant","reasoning_content":"Checked facts first.","content":"Final answer."}"#,
+        &ChatCompletionRequest {
+            tools: None,
+            ..tool_request()
+        },
+    )
+    .expect("parsed message");
+
+    assert_eq!(parsed.content.as_deref(), Some("Final answer."));
+    assert_eq!(
+        parsed.reasoning_content.as_deref(),
+        Some("Checked facts first.")
+    );
+    assert_eq!(parsed.tool_calls, None);
+}
+
+#[test]
+fn chat_response_from_parsed_message_separates_reasoning_content() {
+    let output = GeneratedText {
+        prompt_tokens: 4,
+        completion_tokens: 7,
+        cached_prompt_tokens: 0,
+        matched_prefix_tokens: 0,
+        suffix_prefill_tokens: 0,
+        cache_hit_kind: None,
+        text: "Checked facts first.</think>Final answer.".to_string(),
+        finish_reason: FinishReason::Stop,
+        detokenize_ms: 0.0,
+        text_emit_ms: 0.0,
+        eog_check_ms: 0.0,
+    };
+    let parsed = ParsedChatMessage {
+        content: Some("Final answer.".to_string()),
+        reasoning_content: Some("Checked facts first.".to_string()),
+        tool_calls: None,
+    };
+
+    let response = chat_response_from_generated_text("qwen".to_string(), &output, Some(parsed));
+
+    let message = &response.choices[0].message;
+    assert_eq!(message.content.as_deref(), Some("Final answer."));
+    assert_eq!(
+        message.reasoning_content.as_deref(),
+        Some("Checked facts first.")
+    );
+    assert_eq!(message.tool_calls, None);
+    assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+}
+
+#[test]
+fn generation_event_to_chat_chunk_emits_reasoning_delta() {
+    let chunk = generation_event_to_chat_chunk(
+        Ok(GenerationStreamEvent::ReasoningDelta(
+            "Checking the premise.".to_string(),
+        )),
+        "qwen",
+    )
+    .unwrap();
+
+    let delta = &chunk.choices[0].delta;
+    assert_eq!(delta.content, None);
+    assert_eq!(
+        delta.reasoning_content.as_deref(),
+        Some("Checking the premise.")
+    );
+    assert_eq!(delta.tool_calls, None);
 }
 
 #[test]
@@ -612,6 +793,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             prefill_chunk_policy: PrefillChunkPolicy::Fixed { chunk_size: 64 },
             activation_width: fixture.activation_width,
             downstream_wire_condition: WireCondition::new(0.0, None)?,
+            prefill_reply_credit_limit: 0,
             lane_pool: Some(lane_pool),
         },
         draft: None,
@@ -803,16 +985,21 @@ fn mid_generation_window_fires_on_repetition_even_with_low_entropy() {
 
 #[test]
 fn default_sampling_controls_are_allowed() {
+    // When no sampling params are specified, the server applies its own
+    // defaults (temp=0.8, top_k=40, top_p=0.95, min_p=0.05) which enable
+    // the sampling chain automatically.
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
-        "messages": [{"role": "user", "content": "hello"}],
-        "temperature": 1.0,
-        "top_p": 1.0
+        "messages": [{"role": "user", "content": "hello"}]
     }))
     .unwrap();
 
     let sampling = chat_sampling_config(&request).unwrap();
-    assert!(!sampling.enabled);
+    assert!(sampling.enabled);
+    assert_eq!(sampling.temperature, 0.8);
+    assert_eq!(sampling.top_p, 0.95);
+    assert_eq!(sampling.top_k, 40);
+    assert_eq!(sampling.min_p, 0.05);
 }
 
 #[test]
@@ -1004,7 +1191,7 @@ fn unsupported_extra_generation_fields_return_openai_error() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
         "messages": [{"role": "user", "content": "hello"}],
-        "min_p": 0.1
+        "typical_p": 0.5
     }))
     .unwrap();
 
@@ -1013,6 +1200,20 @@ fn unsupported_extra_generation_fields_return_openai_error() {
         error.body().error.code.as_deref(),
         Some("unsupported_model_feature")
     );
+}
+
+#[test]
+fn min_p_is_accepted_and_forwarded() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M",
+        "messages": [{"role": "user", "content": "hello"}],
+        "min_p": 0.1
+    }))
+    .unwrap();
+
+    let sampling = chat_sampling_config(&request).unwrap();
+    assert!(sampling.enabled);
+    assert_eq!(sampling.min_p, 0.1);
 }
 
 #[test]
@@ -1222,8 +1423,49 @@ fn omitted_max_tokens_can_use_remaining_context_budget() {
 }
 
 #[test]
-fn configured_default_max_tokens_remains_explicit() {
-    let limit = GenerationTokenLimit::from_request(None, 4);
+fn omitted_max_tokens_with_embedded_default_is_bounded() {
+    // Server picked DEFAULT_EMBEDDED_MAX_TOKENS as the cap because the
+    // client omitted max_tokens. With a large ctx window the cap is
+    // the binding limit.
+    let limit = GenerationTokenLimit::from_request(None, DEFAULT_EMBEDDED_MAX_TOKENS);
+    let ctx_size = 32_000;
+    let resolved = limit.resolve(128, ctx_size).unwrap();
+    assert_eq!(resolved, DEFAULT_EMBEDDED_MAX_TOKENS);
+    assert!((resolved as usize) < ctx_size);
+}
+
+#[test]
+fn omitted_max_tokens_clamps_to_remaining_budget_in_small_ctx() {
+    // When the configured ctx_size is smaller than the server-picked
+    // default, the omitted-max_tokens path must clamp to remaining
+    // budget rather than reject the request. The client didn't ask
+    // for the specific number; the server picked it.
+    let limit = GenerationTokenLimit::from_request(None, DEFAULT_EMBEDDED_MAX_TOKENS);
+    let ctx_size = 1024;
+    let prompt_tokens = 128;
+    let resolved = limit.resolve(prompt_tokens, ctx_size).unwrap();
+    assert_eq!(resolved, (ctx_size - prompt_tokens) as u32);
+    assert!(resolved < DEFAULT_EMBEDDED_MAX_TOKENS);
+}
+
+#[test]
+fn omitted_max_tokens_errors_only_when_prompt_already_exceeds_ctx() {
+    // Even on the silently-clamping default path, a prompt that
+    // already overflows the context window is an error the client
+    // needs to see.
+    let limit = GenerationTokenLimit::from_request(None, DEFAULT_EMBEDDED_MAX_TOKENS);
+    let error = limit.resolve(2048, 1024).unwrap_err();
+    assert_eq!(
+        error.body().error.code.as_deref(),
+        Some("context_length_exceeded")
+    );
+}
+
+#[test]
+fn explicit_max_tokens_still_errors_when_too_large_for_ctx() {
+    // Client-asserted max_tokens that won't fit is still a hard error.
+    // The clamping behavior applies only to the server-picked default.
+    let limit = GenerationTokenLimit::from_request(Some(4), 999);
     assert_eq!(limit.resolve(4, 8).unwrap(), 4);
 
     let error = limit.resolve(5, 8).unwrap_err();

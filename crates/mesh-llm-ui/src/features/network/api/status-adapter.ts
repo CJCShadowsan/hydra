@@ -168,13 +168,14 @@ function adaptPeer(peer: PeerInfo, fallbackIndex: number): Peer {
     nodeState,
     toksPerSec: peer.tok_per_sec,
     hardwareLabel: peer.hardware_label,
-    owner: resolveOwner(peer.owner)
+    owner: resolveOwner(peer.owner),
+    firstJoinedMeshTs: peer.first_joined_mesh_ts
   }
 }
 
 function isSplitParticipant(payload: StatusPayload): boolean {
   const stages = payload.runtime?.stages ?? []
-  return stages.some((s) => s.node_id === payload.node_id || s.node_id.startsWith(payload.node_id))
+  return stages.some((s) => s.node_id === payload.node_id)
 }
 
 function adaptSelfPeer(payload: StatusPayload): Peer {
@@ -204,7 +205,8 @@ function adaptSelfPeer(payload: StatusPayload): Peer {
     nodeState: effectiveState,
     version: payload.version,
     vramGB: payload.my_vram_gb,
-    toksPerSec: payload.tok_per_sec
+    toksPerSec: payload.tok_per_sec,
+    firstJoinedMeshTs: payload.first_joined_mesh_ts
   }
 }
 
@@ -302,7 +304,8 @@ function adaptMeshNodeSeeds(payload: StatusPayload): MeshNode[] {
     meshState: payload.node_state,
     servingModels: payload.serving_models.map(servingModelName),
     hostname: payload.hostname,
-    vramGB: payload.my_vram_gb
+    vramGB: payload.my_vram_gb,
+    firstJoinedMeshTs: payload.first_joined_mesh_ts
   }
 
   return [selfNode]
@@ -321,6 +324,7 @@ export function adaptStatusToDashboard(payload: StatusPayload, models: ModelSumm
     meshNodeSeeds: adaptMeshNodeSeeds(payload),
     meshId: payload.mesh_id ?? '',
     models,
-    connect: adaptConnect(payload)
+    connect: adaptConnect(payload),
+    wakeableNodes: payload.wakeable_nodes
   }
 }

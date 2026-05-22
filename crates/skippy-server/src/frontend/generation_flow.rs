@@ -94,6 +94,7 @@ impl StageOpenAiBackend {
                 prefill_chunk_policy,
                 activation_width,
                 downstream_wire_condition,
+                prefill_reply_credit_limit,
                 lane_pool,
             } => self.generate_embedded_stage_zero_tokens(
                 EmbeddedStageZeroGeneration {
@@ -102,6 +103,7 @@ impl StageOpenAiBackend {
                     prefill_chunk_policy: &prefill_chunk_policy,
                     activation_width,
                     downstream_wire_condition,
+                    prefill_reply_credit_limit,
                     lane_pool,
                     draft: self.draft.clone(),
                     speculative_window: self.speculative_window,
@@ -439,6 +441,13 @@ impl StageOpenAiBackend {
                     "llama_stage.session_reset".to_string(),
                     json!(drop_stats.reset_session),
                 );
+                attrs.insert(
+                    "llama_stage.lane_discarded".to_string(),
+                    json!(drop_stats.lane_discarded),
+                );
+                if let Some(reason) = drop_stats.lane_discard_reason.as_deref() {
+                    attrs.insert("llama_stage.lane_discard_reason".to_string(), json!(reason));
+                }
                 Self::insert_runtime_session_stats(
                     &mut attrs,
                     "llama_stage.runtime_sessions_after",
@@ -850,6 +859,13 @@ impl StageOpenAiBackend {
                     "llama_stage.session_reset".to_string(),
                     json!(drop_stats.reset_session),
                 );
+                attrs.insert(
+                    "llama_stage.lane_discarded".to_string(),
+                    json!(drop_stats.lane_discarded),
+                );
+                if let Some(reason) = drop_stats.lane_discard_reason.as_deref() {
+                    attrs.insert("llama_stage.lane_discard_reason".to_string(), json!(reason));
+                }
                 Self::insert_runtime_session_stats(
                     &mut attrs,
                     "llama_stage.runtime_sessions_after",

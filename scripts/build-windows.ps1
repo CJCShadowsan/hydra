@@ -322,6 +322,40 @@ function Invoke-NativeCommand {
     }
 }
 
+function Invoke-CmakeBuild {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BuildDir,
+        [Parameter(Mandatory = $true)]
+        [int]$ParallelJobs
+    )
+
+    $arguments = @("--build", $BuildDir, "--config", "Release", "--parallel", "$ParallelJobs", "--target", "llama", "llama-common", "mtmd")
+    try {
+        Invoke-NativeCommand "cmake" $arguments
+    } catch {
+        if ($backendName -ne "cuda" -or -not (Test-Sccache) -or $env:MESH_LLM_RETRY_SCCACHE_CUDA_BUILD -eq "0") {
+            throw
+        }
+
+        Write-Warning "CUDA ABI build failed while using sccache; restarting sccache and retrying once."
+        # `sccache --stop-server` exits non-zero when the server is already dead
+        # (which is precisely the case this retry path exists to handle). Tolerate
+        # that instead of letting $ErrorActionPreference='Stop' turn it into a
+        # terminating error that aborts the retry before cmake runs again.
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $compilerCacheBin --stop-server 2>&1 | Out-Null
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        Start-Sleep -Seconds 2
+        Reset-SccacheStats
+        Invoke-NativeCommand "cmake" $arguments
+    }
+}
+
 function Test-UiBuildRequired {
     param(
         [Parameter(Mandatory = $true)]
@@ -891,7 +925,7 @@ Invoke-InRepo {
         [Environment]::ProcessorCount
     }
     Invoke-NativeCommand "cmake" $cmakeArgs
-    Invoke-NativeCommand "cmake" @("--build", $buildDir, "--config", "Release", "--parallel", "$parallelJobs", "--target", "llama", "llama-common", "mtmd")
+    Invoke-CmakeBuild -BuildDir $buildDir -ParallelJobs $parallelJobs
     Write-Host "Patched llama.cpp ABI build complete: $buildDir"
     $sccacheStats = Get-SccacheStats
     Show-SccacheStats

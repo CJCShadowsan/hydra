@@ -3,13 +3,19 @@ use crate::mesh::RouteEntry;
 use crate::mesh::{ModelDemand, NodeRole, PeerAnnouncement, RoutingTable};
 use crate::protocol::NODE_PROTOCOL_GENERATION;
 use iroh::{EndpointAddr, EndpointId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn skippy_stage_subprotocols(
     artifact_transfer_supported: bool,
+    stage_protocol_generation_supported: bool,
     status_list_supported: bool,
 ) -> Vec<crate::proto::node::MeshSubprotocol> {
     let mut features = vec![skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL.to_string()];
+    if stage_protocol_generation_supported {
+        features.push(
+            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2.to_string(),
+        );
+    }
     if artifact_transfer_supported {
         features.push(skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_ARTIFACT_TRANSFER.to_string());
     }
@@ -34,6 +40,16 @@ fn supports_skippy_status_list(subprotocols: &[crate::proto::node::MeshSubprotoc
     supports_skippy_stage_feature(
         subprotocols,
         skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST,
+    )
+}
+
+fn supports_skippy_stage_generation(subprotocols: &[crate::proto::node::MeshSubprotocol]) -> bool {
+    supports_skippy_stage_feature(
+        subprotocols,
+        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2,
+    ) && supports_skippy_stage_feature(
+        subprotocols,
+        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL,
     )
 }
 
@@ -92,33 +108,15 @@ fn join_optional_csv(values: &[Option<String>]) -> Option<String> {
 fn local_owner_attestation_to_proto(
     attestation: &crate::crypto::SignedNodeOwnership,
 ) -> Option<crate::proto::node::SignedNodeOwnership> {
-    let owner_sign_public_key = match hex::decode(&attestation.claim.owner_sign_public_key) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                "dropping local owner attestation from gossip: invalid owner_sign_public_key hex: {err}"
-            );
-            return None;
-        }
-    };
-    let node_endpoint_id = match hex::decode(&attestation.claim.node_endpoint_id) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                "dropping local owner attestation from gossip: invalid node_endpoint_id hex: {err}"
-            );
-            return None;
-        }
-    };
-    let signature = match hex::decode(&attestation.signature) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                "dropping local owner attestation from gossip: invalid signature hex: {err}"
-            );
-            return None;
-        }
-    };
+    let owner_sign_public_key = decode_local_owner_attestation_hex(
+        "owner_sign_public_key",
+        &attestation.claim.owner_sign_public_key,
+    )?;
+    let node_endpoint_id = decode_local_owner_attestation_hex(
+        "node_endpoint_id",
+        &attestation.claim.node_endpoint_id,
+    )?;
+    let signature = decode_local_owner_attestation_hex("signature", &attestation.signature)?;
     Some(crate::proto::node::SignedNodeOwnership {
         version: attestation.claim.version,
         cert_id: attestation.claim.cert_id.clone(),
@@ -131,6 +129,18 @@ fn local_owner_attestation_to_proto(
         hostname_hint: attestation.claim.hostname_hint.clone(),
         signature,
     })
+}
+
+fn decode_local_owner_attestation_hex(field_name: &str, value: &str) -> Option<Vec<u8>> {
+    match hex::decode(value) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::warn!(
+                "dropping local owner attestation from gossip: invalid {field_name} hex: {err}"
+            );
+            None
+        }
+    }
 }
 
 fn proto_owner_attestation_to_local(
@@ -247,6 +257,7 @@ fn legacy_descriptor_from_identity(
 ) -> crate::mesh::ServedModelDescriptor {
     crate::mesh::ServedModelDescriptor {
         identity: proto_identity_to_local(identity),
+        capabilities_known: false,
         capabilities: crate::models::ModelCapabilities::default(),
         topology: None,
     }
@@ -403,7 +414,45 @@ pub(crate) fn sanitize_gossip_announcement_for_wire(ann: &PeerAnnouncement) -> P
     sanitized.available_models.clear();
     sanitized.available_model_metadata.clear();
     sanitized.available_model_sizes.clear();
+    sanitized.advertised_model_throughput = sanitize_model_throughput_hints_for_ann(&sanitized);
     sanitized
+}
+
+fn routable_model_names(ann: &PeerAnnouncement) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for model in ann
+        .hosted_models
+        .iter()
+        .flatten()
+        .chain(&ann.serving_models)
+    {
+        let model = model.trim();
+        if !model.is_empty() {
+            names.insert(model.to_string());
+        }
+    }
+    for descriptor in &ann.served_model_descriptors {
+        let model = descriptor.identity.model_name.trim();
+        if !model.is_empty() {
+            names.insert(model.to_string());
+        }
+    }
+    names
+}
+
+fn sanitize_model_throughput_hints_for_ann(
+    ann: &PeerAnnouncement,
+) -> Vec<crate::network::metrics::ModelThroughputHint> {
+    let routable = routable_model_names(ann);
+    if routable.is_empty() {
+        return Vec::new();
+    }
+    crate::network::metrics::sanitize_model_throughput_hints(
+        ann.advertised_model_throughput.clone(),
+    )
+    .into_iter()
+    .filter(|hint| routable.contains(&hint.model_name))
+    .collect()
 }
 
 pub(crate) fn local_role_to_proto(role: &NodeRole) -> (i32, Option<u32>) {
@@ -424,6 +473,26 @@ pub(crate) fn proto_role_to_local(role_int: i32, http_port: Option<u32>) -> Node
         },
         crate::proto::node::NodeRole::Client => NodeRole::Client,
         _ => NodeRole::Worker,
+    }
+}
+
+fn local_throughput_hint_to_proto(
+    hint: &crate::network::metrics::ModelThroughputHint,
+) -> crate::proto::node::AdvertisedModelThroughput {
+    crate::proto::node::AdvertisedModelThroughput {
+        model_name: hint.model_name.clone(),
+        avg_tokens_per_second_milli: hint.avg_tokens_per_second_milli,
+        throughput_samples: hint.throughput_samples,
+    }
+}
+
+fn proto_throughput_hint_to_local(
+    hint: &crate::proto::node::AdvertisedModelThroughput,
+) -> crate::network::metrics::ModelThroughputHint {
+    crate::network::metrics::ModelThroughputHint {
+        model_name: hint.model_name.clone(),
+        avg_tokens_per_second_milli: hint.avg_tokens_per_second_milli,
+        throughput_samples: hint.throughput_samples,
     }
 }
 
@@ -454,6 +523,7 @@ pub(crate) fn local_ann_to_proto_ann(
         .iter()
         .map(|descriptor| crate::proto::node::ServedModelDescriptor {
             identity: Some(descriptor_identity_to_proto(&descriptor.identity)),
+            capabilities_known: Some(descriptor.capabilities_known),
             capabilities: Some(crate::proto::node::ModelCapabilities {
                 vision: local_capability_level_to_proto(descriptor.capabilities.vision),
                 reasoning: local_capability_level_to_proto(descriptor.capabilities.reasoning),
@@ -541,8 +611,13 @@ pub(crate) fn local_ann_to_proto_ann(
             .latency_observer_id
             .as_ref()
             .map(|id| id.as_bytes().to_vec()),
+        advertised_model_throughput: sanitize_model_throughput_hints_for_ann(&ann)
+            .iter()
+            .map(local_throughput_hint_to_proto)
+            .collect(),
         subprotocols: skippy_stage_subprotocols(
             ann.artifact_transfer_supported,
+            ann.stage_protocol_generation_supported,
             ann.stage_status_list_supported,
         ),
     }
@@ -644,49 +719,54 @@ pub(crate) fn proto_ann_to_local(
             .map(proto_runtime_descriptor_to_local)
             .collect(),
         served_model_descriptors: if !pa.served_model_descriptors.is_empty() {
-            let descriptors: Vec<_> = pa
-                .served_model_descriptors
-                .iter()
-                .filter(|descriptor| proto_descriptor_has_valid_identity(descriptor))
-                .map(|descriptor| crate::mesh::ServedModelDescriptor {
-                    identity: descriptor
-                        .identity
-                        .as_ref()
-                        .map(proto_identity_to_local)
-                        .unwrap_or_default(),
-                    capabilities: descriptor
-                        .capabilities
-                        .as_ref()
-                        .map(|caps| crate::models::ModelCapabilities {
-                            multimodal: caps.multimodal,
-                            vision: proto_capability_level_to_local(caps.vision),
-                            audio: proto_capability_level_to_local(caps.audio),
-                            reasoning: proto_capability_level_to_local(caps.reasoning),
-                            tool_use: proto_capability_level_to_local(caps.tool_use),
-                            moe: caps.moe,
-                        })
-                        .unwrap_or_default(),
-                    topology: descriptor.topology.as_ref().map(|topology| {
-                        crate::models::ModelTopology {
-                            moe: topology
-                                .moe
+            let descriptors: Vec<_> =
+                pa.served_model_descriptors
+                    .iter()
+                    .filter(|descriptor| proto_descriptor_has_valid_identity(descriptor))
+                    .map(|descriptor| {
+                        let capabilities = descriptor
+                            .capabilities
+                            .as_ref()
+                            .map(|caps| crate::models::ModelCapabilities {
+                                multimodal: caps.multimodal,
+                                vision: proto_capability_level_to_local(caps.vision),
+                                audio: proto_capability_level_to_local(caps.audio),
+                                reasoning: proto_capability_level_to_local(caps.reasoning),
+                                tool_use: proto_capability_level_to_local(caps.tool_use),
+                                moe: caps.moe,
+                            })
+                            .unwrap_or_default();
+                        crate::mesh::ServedModelDescriptor {
+                            identity: descriptor
+                                .identity
                                 .as_ref()
-                                .map(|moe| crate::models::ModelMoeInfo {
-                                    expert_count: moe.expert_count,
-                                    used_expert_count: moe.used_expert_count,
-                                    min_experts_per_node: moe.min_experts_per_node,
-                                    source: moe.source.clone(),
-                                    ranking_source: moe.ranking_source.clone(),
-                                    ranking_origin: moe.ranking_origin.clone(),
-                                    ranking: moe.ranking.clone(),
-                                    ranking_prompt_count: moe.ranking_prompt_count,
-                                    ranking_tokens: moe.ranking_tokens,
-                                    ranking_layer_scope: moe.ranking_layer_scope.clone(),
-                                }),
+                                .map(proto_identity_to_local)
+                                .unwrap_or_default(),
+                            capabilities_known: descriptor.capabilities_known.unwrap_or(
+                                capabilities != crate::models::ModelCapabilities::default(),
+                            ),
+                            capabilities,
+                            topology: descriptor.topology.as_ref().map(|topology| {
+                                crate::models::ModelTopology {
+                                    moe: topology.moe.as_ref().map(|moe| {
+                                        crate::models::ModelMoeInfo {
+                                            expert_count: moe.expert_count,
+                                            used_expert_count: moe.used_expert_count,
+                                            min_experts_per_node: moe.min_experts_per_node,
+                                            source: moe.source.clone(),
+                                            ranking_source: moe.ranking_source.clone(),
+                                            ranking_origin: moe.ranking_origin.clone(),
+                                            ranking: moe.ranking.clone(),
+                                            ranking_prompt_count: moe.ranking_prompt_count,
+                                            ranking_tokens: moe.ranking_tokens,
+                                            ranking_layer_scope: moe.ranking_layer_scope.clone(),
+                                        }
+                                    }),
+                                }
+                            }),
                         }
-                    }),
-                })
-                .collect();
+                    })
+                    .collect();
             if descriptors.is_empty() {
                 // All descriptors were invalid — fall back to legacy identity list.
                 pa.served_model_identities
@@ -707,7 +787,13 @@ pub(crate) fn proto_ann_to_local(
             .as_ref()
             .map(proto_owner_attestation_to_local),
         artifact_transfer_supported: supports_skippy_artifact_transfer(&pa.subprotocols),
+        stage_protocol_generation_supported: supports_skippy_stage_generation(&pa.subprotocols),
         stage_status_list_supported: supports_skippy_status_list(&pa.subprotocols),
+        advertised_model_throughput: pa
+            .advertised_model_throughput
+            .iter()
+            .map(proto_throughput_hint_to_local)
+            .collect(),
         latency_ms: pa.latency_ms,
         latency_source: crate::proto::node::LatencySource::try_from(pa.latency_source).ok(),
         latency_age_ms: pa.latency_age_ms.map(|v| v as u64),
@@ -717,6 +803,7 @@ pub(crate) fn proto_ann_to_local(
         }),
     };
     crate::mesh::backfill_legacy_descriptors(&mut ann);
+    ann.advertised_model_throughput = sanitize_model_throughput_hints_for_ann(&ann);
     Some((addr, ann))
 }
 
@@ -838,6 +925,7 @@ pub(crate) fn proto_config_to_mesh(
             assignment,
             parallel: None,
         },
+        owner_control: Default::default(),
         telemetry: Default::default(),
         models,
         plugins,

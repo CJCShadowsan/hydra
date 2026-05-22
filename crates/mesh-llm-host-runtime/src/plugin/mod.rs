@@ -50,6 +50,7 @@ use mesh_llm_plugin::MeshVisibility;
 
 pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
+pub const FLASH_MOE_PLUGIN_ID: &str = "flash-moe";
 pub const OPENAI_ENDPOINT_PLUGIN_ID: &str = "openai-endpoint";
 pub const TELEMETRY_PLUGIN_ID: &str = "telemetry";
 pub const TELEMETRY_CAPABILITY: &str = "telemetry.metrics.v1";
@@ -243,79 +244,24 @@ impl PluginManager {
         host_mode: PluginHostMode,
         mesh_tx: mpsc::Sender<PluginMeshEvent>,
     ) -> Result<Self> {
-        if specs.externals.is_empty() {
-            tracing::info!("Plugin manager: no plugins enabled");
-        } else {
-            let names = specs
-                .externals
-                .iter()
-                .map(|spec| spec.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::info!(
-                "Plugin manager: loading {} plugin(s): {}",
-                specs.externals.len(),
-                names
-            );
-        }
+        Self::log_startup_plan(specs);
 
         let rpc_bridge = Arc::new(Mutex::new(None));
         let runtime_data = RuntimeDataCollector::new();
         let instance_id = make_instance_id();
-        let mut plugins = BTreeMap::new();
-        for spec in &specs.externals {
-            tracing::info!(
-                plugin = %spec.name,
-                command = %spec.command,
-                args = %format_args_for_log(&spec.args),
-                "Loading plugin"
-            );
-            let plugin = match ExternalPlugin::spawn(
-                spec,
-                instance_id.clone(),
-                host_mode,
-                mesh_tx.clone(),
-                rpc_bridge.clone(),
-                runtime_data.producer(RuntimeDataSource {
-                    scope: "plugin",
-                    plugin_data_key: Some(PluginDataKey {
-                        plugin_name: spec.name.clone(),
-                        data_key: "summary".into(),
-                    }),
-                    plugin_endpoint_key: None,
-                }),
-            )
-            .await
-            {
-                Ok(plugin) => plugin,
-                Err(err) => {
-                    tracing::error!(
-                        plugin = %spec.name,
-                        error = %err,
-                        "Plugin failed to load"
-                    );
-                    return Err(err);
-                }
-            };
-            let summary = plugin.summary().await;
-            tracing::info!(
-                plugin = %summary.name,
-                version = %summary.version.as_deref().unwrap_or("unknown"),
-                capabilities = %format_slice_for_log(&summary.capabilities),
-                tools = %format_tool_names_for_log(&summary.tools),
-                "Plugin loaded successfully"
-            );
-            plugins.insert(spec.name.clone(), plugin);
-        }
+        let plugins = Self::load_external_plugins(
+            specs,
+            host_mode,
+            mesh_tx,
+            instance_id,
+            rpc_bridge.clone(),
+            &runtime_data,
+        )
+        .await?;
         let manager = Self {
             inner: Arc::new(PluginManagerInner {
                 plugins,
-                inactive: specs
-                    .inactive
-                    .iter()
-                    .cloned()
-                    .map(|summary| (summary.name.clone(), summary))
-                    .collect(),
+                inactive: Self::inactive_plugins(specs),
                 endpoint_health: Arc::new(Mutex::new(BTreeMap::new())),
                 runtime_data,
                 rpc_bridge,
@@ -343,6 +289,112 @@ impl PluginManager {
         }
         manager.start_supervisor();
         Ok(manager)
+    }
+
+    fn log_startup_plan(specs: &ResolvedPlugins) {
+        if specs.externals.is_empty() {
+            tracing::info!("Plugin manager: no plugins enabled");
+            return;
+        }
+
+        let names = specs
+            .externals
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            "Plugin manager: loading {} plugin(s): {}",
+            specs.externals.len(),
+            names
+        );
+    }
+
+    fn summary_runtime_source(plugin_name: String) -> RuntimeDataSource {
+        RuntimeDataSource {
+            scope: "plugin",
+            plugin_data_key: Some(PluginDataKey {
+                plugin_name,
+                data_key: "summary".into(),
+            }),
+            plugin_endpoint_key: None,
+        }
+    }
+
+    async fn load_external_plugins(
+        specs: &ResolvedPlugins,
+        host_mode: PluginHostMode,
+        mesh_tx: mpsc::Sender<PluginMeshEvent>,
+        instance_id: String,
+        rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+        runtime_data: &RuntimeDataCollector,
+    ) -> Result<BTreeMap<String, ExternalPlugin>> {
+        let mut plugins = BTreeMap::new();
+        for spec in &specs.externals {
+            let plugin = Self::load_external_plugin(
+                spec,
+                host_mode,
+                mesh_tx.clone(),
+                instance_id.clone(),
+                rpc_bridge.clone(),
+                runtime_data,
+            )
+            .await?;
+            plugins.insert(spec.name.clone(), plugin);
+        }
+        Ok(plugins)
+    }
+
+    async fn load_external_plugin(
+        spec: &ExternalPluginSpec,
+        host_mode: PluginHostMode,
+        mesh_tx: mpsc::Sender<PluginMeshEvent>,
+        instance_id: String,
+        rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+        runtime_data: &RuntimeDataCollector,
+    ) -> Result<ExternalPlugin> {
+        tracing::info!(
+            plugin = %spec.name,
+            command = %spec.command,
+            args = %format_args_for_log(&spec.args),
+            "Loading plugin"
+        );
+        let plugin = ExternalPlugin::spawn(
+            spec,
+            instance_id,
+            host_mode,
+            mesh_tx,
+            rpc_bridge,
+            runtime_data.producer(Self::summary_runtime_source(spec.name.clone())),
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                plugin = %spec.name,
+                error = %err,
+                "Plugin failed to load"
+            );
+            err
+        })?;
+
+        let summary = plugin.summary().await;
+        tracing::info!(
+            plugin = %summary.name,
+            version = %summary.version.as_deref().unwrap_or("unknown"),
+            capabilities = %format_slice_for_log(&summary.capabilities),
+            tools = %format_tool_names_for_log(&summary.tools),
+            "Plugin loaded successfully"
+        );
+        Ok(plugin)
+    }
+
+    fn inactive_plugins(specs: &ResolvedPlugins) -> BTreeMap<String, PluginSummary> {
+        specs
+            .inactive
+            .iter()
+            .cloned()
+            .map(|summary| (summary.name.clone(), summary))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1718,6 +1770,7 @@ pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
         BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name).await,
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
+        FLASH_MOE_PLUGIN_ID => crate::plugins::flash_moe::run_plugin(name).await,
         OPENAI_ENDPOINT_PLUGIN_ID => crate::plugins::openai_endpoint::run_plugin(name).await,
         TELEMETRY_PLUGIN_ID => crate::plugins::telemetry::run_plugin(name).await,
         _ => bail!("Unknown built-in plugin '{}'", name),
@@ -1920,6 +1973,112 @@ mod tests {
         };
         let result = resolve_plugins(&config, private_host_mode());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn flash_moe_can_be_enabled_with_managed_command() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: Some(" /opt/flash-moe/infer ".into()),
+                args: vec![
+                    "--model".into(),
+                    "/models/qwen3.5".into(),
+                    "--weights".into(),
+                    "/models/experts.bin".into(),
+                ],
+                url: None,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+
+        assert_eq!(resolved.externals.len(), 4);
+        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, FLASH_MOE_PLUGIN_ID);
+        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[2];
+        assert!(spec.args.contains(&"--plugin".to_string()));
+        assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
+        assert_eq!(
+            spec.env
+                .get("MESH_LLM_FLASH_MOE_COMMAND")
+                .map(String::as_str),
+            Some("/opt/flash-moe/infer")
+        );
+        assert_eq!(
+            spec.env
+                .get("MESH_LLM_FLASH_MOE_ARGS_JSON")
+                .map(String::as_str),
+            Some(r#"["--model","/models/qwen3.5","--weights","/models/experts.bin"]"#)
+        );
+        assert!(!spec.env.contains_key("MESH_LLM_FLASH_MOE_URL"));
+        assert_eq!(spec.url, None);
+    }
+
+    #[test]
+    fn flash_moe_can_attach_existing_endpoint() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: None,
+                args: Vec::new(),
+                url: Some(" http://127.0.0.1:8000/v1/ ".into()),
+            }],
+            ..MeshConfig::default()
+        };
+
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        let spec = resolved
+            .externals
+            .iter()
+            .find(|spec| spec.name == FLASH_MOE_PLUGIN_ID)
+            .expect("flash-moe spec");
+
+        assert_eq!(
+            spec.env.get("MESH_LLM_FLASH_MOE_URL").map(String::as_str),
+            Some("http://127.0.0.1:8000/v1/")
+        );
+        assert!(!spec.env.contains_key("MESH_LLM_FLASH_MOE_COMMAND"));
+        assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
+    }
+
+    #[test]
+    fn flash_moe_rejects_missing_command_or_url() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: None,
+                args: Vec::new(),
+                url: None,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let err = resolve_plugins(&config, private_host_mode()).unwrap_err();
+        assert!(err.to_string().contains("requires `command` or `url`"));
+    }
+
+    #[test]
+    fn flash_moe_rejects_user_supplied_serve_arg() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: Some("/opt/flash-moe/infer".into()),
+                args: vec!["--serve".into(), "9000".into()],
+                url: None,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let err = resolve_plugins(&config, private_host_mode()).unwrap_err();
+        assert!(err.to_string().contains("owns the flash-moe `--serve`"));
     }
 
     #[test]

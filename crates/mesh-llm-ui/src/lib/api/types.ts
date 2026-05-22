@@ -2,6 +2,10 @@
 // STATUS API TYPES (GET /api/status + SSE /api/events)
 // ============================================================
 
+import type { WakeableNode } from '@/features/app-shell/lib/status-types'
+
+export type { WakeableNode }
+
 export interface GpuInfo {
   idx: number
   name: string
@@ -81,6 +85,7 @@ export interface PeerInfo {
   hardware_label?: string
   owner?: string | { status?: string; verified?: boolean; name?: string; display_name?: string }
   gpus?: GpuInfo[]
+  first_joined_mesh_ts?: number
 }
 
 export type MeshPublicationState = 'private' | 'public' | 'publish_failed'
@@ -88,7 +93,7 @@ export type MeshPublicationState = 'private' | 'public' | 'publish_failed'
 export interface RuntimeStageInfo {
   stage_id: string
   model_id: string
-  node_id: string
+  node_id?: string
   layer_start: number
   layer_end: number
   state: string
@@ -125,6 +130,8 @@ export interface StatusPayload {
   owner?: PeerInfo['owner']
   nostr_discovery?: boolean
   publication_state?: MeshPublicationState
+  first_joined_mesh_ts?: number
+  wakeable_nodes?: WakeableNode[]
 }
 
 // ============================================================
@@ -246,6 +253,14 @@ export interface ChatSSEDeltaEvent {
   content_index?: number
 }
 
+export interface ChatSSEReasoningDeltaEvent {
+  type: 'response.reasoning_text.delta'
+  delta: string
+  response_id?: string
+  output_index?: number
+  content_index?: number
+}
+
 export interface ChatUsage {
   input_tokens: number
   output_tokens: number
@@ -269,7 +284,7 @@ export interface ChatSSECompletedEvent {
   }
 }
 
-export type ChatSSEEvent = ChatSSEDeltaEvent | ChatSSECompletedEvent
+export type ChatSSEEvent = ChatSSEDeltaEvent | ChatSSEReasoningDeltaEvent | ChatSSECompletedEvent
 
 // ============================================================
 // ATTACHMENT / OBJECTS API TYPES (POST /api/objects)

@@ -41,6 +41,7 @@ import {
 import { useModelsQuery } from '@/features/network/api/use-models-query'
 import { useStatusQuery } from '@/features/network/api/use-status-query'
 import { adaptModelsToSummary } from '@/features/network/api/models-adapter'
+import { cn } from '@/lib/utils'
 import { useDataMode } from '@/lib/data-mode'
 import { useBooleanFeatureFlag } from '@/lib/feature-flags'
 import { CHAT_HARNESS } from '@/features/app-tabs/data'
@@ -86,11 +87,23 @@ type FailedSubmission = ComposerSubmission & {
 }
 type DeleteConversationOptions = { returnFocusElement?: HTMLElement | null }
 
+// The dropdown shows a single "Mesh — automatic" entry. Selecting it
+// keeps `model === AUTO_MODEL_VALUE` in UI state (so the Radix Select
+// can highlight it correctly) but sends `AUTO_BACKEND_MODEL` on the
+// wire so requests fan out through the Mixture-of-Agents gateway.
+//
+// To flip the chat default back to the single-model router when peer
+// health is reliable enough, change AUTO_BACKEND_MODEL to 'auto'. The
+// two-variable split (selectedModelValue for UI, activeModelName for
+// the wire) is already in place exactly so this stays a one-line
+// change with no other UI surgery. See PR #615 and Issue #617 for the
+// trade-offs that led to the current 'mesh' default.
 const AUTO_MODEL_VALUE = 'auto'
+const AUTO_BACKEND_MODEL = 'mesh'
+const AUTO_MODEL_LABEL = 'Mesh — automatic'
 const AUTO_MODEL_OPTION: ModelSelectOption = {
   value: AUTO_MODEL_VALUE,
-  label: 'Auto',
-  meta: 'Router picks best model for each request',
+  label: AUTO_MODEL_LABEL,
   status: { label: 'Auto', tone: 'accent' }
 }
 
@@ -267,21 +280,24 @@ function AttachmentProcessingPanel({ status }: { status: AttachmentProcessingSta
             return (
               <li
                 key={step.stage}
-                className="rounded-[var(--radius)] border border-border-soft bg-panel px-3 py-3"
+                className={cn(
+                  'rounded-[var(--radius)] border px-3 py-3 transition-colors',
+                  active
+                    ? 'border-[color:color-mix(in_oklab,var(--color-accent)_35%,var(--color-border-soft))] bg-[color:color-mix(in_oklab,var(--color-accent)_6%,var(--color-panel))]'
+                    : 'border-border-soft bg-panel'
+                )}
                 aria-current={active ? 'step' : undefined}
               >
                 <div className="mb-2 flex items-center gap-2">
                   <span
-                    className="inline-flex size-6 items-center justify-center rounded-full border text-[length:var(--density-type-label)]"
-                    style={{
-                      borderColor: active || complete ? 'var(--color-accent)' : 'var(--color-border)',
-                      background: complete
-                        ? 'var(--color-accent)'
+                    className={cn(
+                      'inline-flex size-6 items-center justify-center rounded-full border text-[length:var(--density-type-label)] transition-colors',
+                      complete
+                        ? 'border-accent bg-accent text-panel'
                         : active
-                          ? 'color-mix(in oklab, var(--color-accent) 18%, transparent)'
-                          : 'transparent',
-                      color: complete ? 'var(--color-panel)' : active ? 'var(--color-accent)' : 'var(--color-fg-faint)'
-                    }}
+                          ? 'border-accent bg-[color:color-mix(in_oklab,var(--color-accent)_18%,transparent)] text-accent'
+                          : 'border-border text-fg-faint'
+                    )}
                   >
                     {complete ? (
                       <Check className="size-3.5" aria-hidden={true} />
@@ -291,7 +307,12 @@ function AttachmentProcessingPanel({ status }: { status: AttachmentProcessingSta
                       <Icon className="size-3.5" aria-hidden={true} />
                     )}
                   </span>
-                  <span className={active ? 'font-semibold text-foreground' : 'font-medium text-fg-muted'}>
+                  <span
+                    className={cn(
+                      'text-[length:var(--density-type-caption)]',
+                      active ? 'font-semibold text-foreground' : 'font-medium text-fg-muted'
+                    )}
+                  >
                     {copy.title}
                   </span>
                 </div>
@@ -425,8 +446,8 @@ function ChatMetricBadge({ metric }: { metric: ChatActionMetric }) {
   const Icon = metric.icon === 'cpu' ? Cpu : HardDrive
 
   return (
-    <span className="hidden shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-border px-2 py-px text-[length:var(--density-type-label)] font-medium text-fg-faint md:inline-flex">
-      <Icon className="size-[10px]" /> {metric.label}
+    <span className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-border px-2.5 py-0.5 text-[length:var(--density-type-caption)] font-medium text-fg-faint md:inline-flex">
+      <Icon className="size-3" /> {metric.label}
     </span>
   )
 }
@@ -469,7 +490,12 @@ export function ChatPageContent({ data = CHAT_HARNESS }: ChatPageProps) {
   const [composerDrafts, setComposerDrafts] = useState<Record<string, ConversationComposerDraft>>({})
   const [model, setModel] = useState('')
   const modelExists = selectableModels.some((item) => item.name === model)
-  const activeModelName = model === AUTO_MODEL_VALUE ? AUTO_MODEL_VALUE : modelExists ? model : AUTO_MODEL_VALUE
+  // selectedModelValue is what the dropdown shows (always a value
+  // present in `options`, so Radix Select can highlight it).
+  // activeModelName is what we send on the wire — the "Auto" pick
+  // routes through the MoA gateway via the virtual `mesh` model.
+  const selectedModelValue = modelExists ? model : AUTO_MODEL_VALUE
+  const activeModelName = selectedModelValue === AUTO_MODEL_VALUE ? AUTO_BACKEND_MODEL : selectedModelValue
   const [queuedSubmissions, setQueuedSubmissions] = useState<QueuedSubmission[]>([])
   const [attachmentProcessingStatus, setAttachmentProcessingStatus] = useState<AttachmentProcessingStatus | null>(null)
   const [submittedAttachmentsByMessageId, setSubmittedAttachmentsByMessageId] = useState<
@@ -1134,7 +1160,7 @@ export function ChatPageContent({ data = CHAT_HARNESS }: ChatPageProps) {
         <span className="hidden shrink-0 whitespace-nowrap text-[length:var(--density-type-caption)] text-fg-faint md:inline">
           {data.modelLabel}
         </span>
-        <ModelSelect options={options} value={activeModelName} onChange={setModel} />
+        <ModelSelect options={options} value={selectedModelValue} onChange={setModel} />
       </div>
     </>
   )
@@ -1235,17 +1261,13 @@ export function ChatPageContent({ data = CHAT_HARNESS }: ChatPageProps) {
           <EmptyState
             tone="accent"
             icon={<MessageSquareMore aria-hidden={true} className="size-10" strokeWidth={1.4} />}
-            title={
-              conversations.conversations.length === 0
-                ? 'Start your first conversation'
-                : 'Start with a clean routing context'
-            }
+            title="Start Chatting"
             description={
               conversations.conversations.length === 0 ? (
-                'Type a prompt below to begin. A local copy stays in this browser, and the mesh node receives what it needs to answer.'
+                'Type a message below to begin. Your chats stay in this browser, and the mesh routes requests automatically.'
               ) : (
                 <>
-                  No messages yet. Type a prompt to begin, and responses will use{' '}
+                  No messages yet. Send a message to begin a fresh conversation; replies use{' '}
                   <span className="font-mono text-fg">{activeModelName}</span> unless you choose another model.
                 </>
               )

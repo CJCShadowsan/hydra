@@ -58,6 +58,8 @@ mesh-llm serve --auto --headless
 | Join by invite token | `mesh-llm serve --join <token>` | [docs/MESHES.md](docs/MESHES.md) |
 | Run an API-only client | `mesh-llm client --auto` | [docs/MESHES.md](docs/MESHES.md) |
 | Run a big model with splits | `mesh-llm serve --model hf://meshllm/<repo>@<rev> --split` | [docs/SKIPPY_SPLITS.md](docs/SKIPPY_SPLITS.md) |
+| Attach a Flash-MoE SSD backend | `mesh-llm serve` with `[[plugin]] name = "flash-moe"` | [docs/plugins/flash-moe.md](docs/plugins/flash-moe.md) |
+| Fan out one prompt to every model in the mesh | `curl ... -d '{"model":"mesh", ...}'` | [docs/design/MOA_GATEWAY.md](docs/design/MOA_GATEWAY.md) |
 | Use Goose, OpenCode, Claude Code, or Pi | `mesh-llm goose`, `mesh-llm opencode`, `mesh-llm claude`, `mesh-llm pi` | [docs/AGENTS.md](docs/AGENTS.md) |
 | Build or contribute | `just build` | [CONTRIBUTING.md](CONTRIBUTING.md) |
 
@@ -67,6 +69,10 @@ mesh-llm serve --auto --headless
   the model locally without stage traffic.
 - **Mesh routing.** Every node exposes the same `/v1` API. Requests are routed
   by the `model` field to the peer that can serve that model.
+- **Owner-control plane.** Operator config and inventory actions use an
+  additive `mesh-llm-control/1` lane with explicit endpoint bootstrap, while
+  public mesh join, gossip, routing, and inference stay on the public mesh
+  plane for mixed-version compatibility.
 - **Skippy stage splits.** Large dense models can load as package-backed layer
   stages. The coordinator plans contiguous layer ranges, starts downstream
   stages first, waits for readiness, then publishes the stage-0 route.
@@ -77,6 +83,32 @@ mesh-llm serve --auto --headless
 
 For a deeper operator guide, see [docs/USAGE.md](docs/USAGE.md). For every CLI
 command and switch, see [docs/CLI.md](docs/CLI.md).
+
+## Mixture-of-Agents (`model: "mesh"`) — experimental
+
+> ⚠️ **Experimental.** The MoA gateway is new in this release. Behavior,
+> routing heuristics, error shapes, and tuning knobs may change between
+> versions while we tune it. Treat `model: "mesh"` as a preview feature
+> rather than a stable production path; use a specific model id when you
+> need stable semantics.
+
+Send a request with `"model": "mesh"` and the proxy fans it out to every
+model available in the mesh in parallel, arbitrates their responses with
+deterministic logic, and returns one OpenAI-compatible reply. The arbiter
+runs in code (not as another model call) and only escalates to a reducer
+LLM on genuine conflict. Tool calls flow through the full pipeline.
+
+```bash
+curl http://localhost:9337/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mesh","messages":[{"role":"user","content":"What is the capital of Japan?"}]}'
+```
+
+Requires at least two distinct models in the mesh. See
+[docs/design/MOA_GATEWAY.md](docs/design/MOA_GATEWAY.md) for the
+architecture, arbitration rules, and tuning knobs.
+
+
 
 ## Supported model families
 
@@ -126,7 +158,9 @@ plus `glslc`.
 | [docs/AGENTS.md](docs/AGENTS.md) | Goose, Claude Code, OpenCode, Pi, curl, and blackboard |
 | [docs/EXO_COMPARISON.md](docs/EXO_COMPARISON.md) | Balanced comparison with Exo |
 | [docs/CLI.md](docs/CLI.md) | Command reference and JSON automation |
-| [docs/USAGE.md](docs/USAGE.md) | Longer operational usage guide |
+| [docs/USAGE.md](docs/USAGE.md) | Longer operational usage guide, runtime control, owner-control operator flows |
+| [docs/design/TESTING.md](docs/design/TESTING.md) | Testing playbook, mixed-version QA, remote deploy checks |
+| [docs/plugins/flash-moe.md](docs/plugins/flash-moe.md) | Optional Flash-MoE SSD expert streaming backend setup |
 | [docs/skippy/FAMILY_STATUS.md](docs/skippy/FAMILY_STATUS.md) | Certified Skippy model-family status |
 | [docs/specs/layer-package-repos.md](docs/specs/layer-package-repos.md) | Manifest and artifact format spec |
 
