@@ -130,6 +130,18 @@ impl AffinityRouter {
         self.target_health.eligible_candidates(model, candidates)
     }
 
+    /// Strict view of which candidates are not in cooldown. Empty when
+    /// every candidate is currently cooling. Used by the auto-router to
+    /// skip a model entirely in favor of the next-best alternative.
+    pub(crate) fn strict_eligible_candidates(
+        &self,
+        model: &str,
+        candidates: &[election::InferenceTarget],
+    ) -> Vec<election::InferenceTarget> {
+        self.target_health
+            .strict_eligible_candidates(model, candidates)
+    }
+
     pub(crate) fn record_target_outcome(
         &self,
         model: Option<&str>,

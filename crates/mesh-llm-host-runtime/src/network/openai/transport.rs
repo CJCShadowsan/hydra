@@ -3335,7 +3335,7 @@ async fn resolve_auto_model_request(
     let Some(available) = router::filter_media_compatible_candidates(&with_caps, &media) else {
         return AutoModelResolution::UnsupportedMedia;
     };
-    let picked = router::pick_model_classified(&cl, &available).map(str::to_string);
+    let picked = pick_model_with_fallback(node, affinity, &cl, &available).await;
     if let Some(name) = picked.as_deref() {
         tracing::info!(
             "router: {:?}/{:?} tools={} media={} → {name}",
@@ -3349,6 +3349,51 @@ async fn resolve_auto_model_request(
         }
     }
     AutoModelResolution::Model(picked)
+}
+
+/// Walk the classifier's preferred ladder, skipping any model whose only
+/// peers are currently in target-health cooldown. Falls back to the raw
+/// top pick when every ladder entry is cooling (the existing
+/// availability semantics in `route_eligible_candidates` will then
+/// retry the cooling peer).
+const AUTO_LADDER_DEPTH: usize = 4;
+
+async fn pick_model_with_fallback(
+    node: &mesh::Node,
+    affinity: &AffinityRouter,
+    classification: &router::Classification,
+    available: &[router::RoutingCandidate<'_>],
+) -> Option<String> {
+    let ladder = router::pick_model_ladder_classified(classification, available, AUTO_LADDER_DEPTH);
+    if ladder.is_empty() {
+        return None;
+    }
+
+    for name in &ladder {
+        let hosts = node.hosts_for_model(name).await;
+        if hosts.is_empty() {
+            continue;
+        }
+        let candidates: Vec<election::InferenceTarget> = hosts
+            .into_iter()
+            .map(election::InferenceTarget::Remote)
+            .collect();
+        if !affinity
+            .strict_eligible_candidates(name, &candidates)
+            .is_empty()
+        {
+            return Some((*name).to_string());
+        }
+        tracing::debug!(
+            "router: skipping {name}, all hosts in cooldown ({} candidate(s))",
+            candidates.len(),
+        );
+    }
+
+    // Every ladder model is cooling; fall back to the top pick. The
+    // downstream `route_eligible_candidates` keeps availability by
+    // sending to a cooling peer rather than failing closed.
+    Some(ladder[0].to_string())
 }
 
 async fn lookup_cached_auto_model(

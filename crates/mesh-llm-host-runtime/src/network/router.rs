@@ -615,6 +615,79 @@ pub fn pick_model_classified<'a>(
     None
 }
 
+/// Same classification + capability filtering + size-tier split as
+/// `pick_model_classified`, but returns an *ordered ladder* of up to
+/// `max_len` candidate model names. The first element matches what
+/// `pick_model_classified` would have returned; later elements give
+/// the auto-router fallback choices when the top pick's peers all fail.
+///
+/// Ordering within a tier is by repeated tok/s-weighted draw without
+/// replacement so high-throughput models surface first; the big tier
+/// is exhausted before any small-tier candidates appear.
+pub fn pick_model_ladder_classified<'a>(
+    classification: &Classification,
+    available_models: &[RoutingCandidate<'a>],
+    max_len: usize,
+) -> Vec<&'a str> {
+    use crate::models::CapabilityLevel;
+
+    if available_models.is_empty() || max_len == 0 {
+        return Vec::new();
+    }
+    if available_models.len() == 1 {
+        return vec![available_models[0].name];
+    }
+
+    let filtered: Vec<&RoutingCandidate<'a>> = match classification.category {
+        _ if classification.needs_tools => available_models
+            .iter()
+            .filter(|c| c.caps.tool_use != CapabilityLevel::None)
+            .collect(),
+        Category::Reasoning => available_models
+            .iter()
+            .filter(|c| c.caps.reasoning != CapabilityLevel::None)
+            .collect(),
+        Category::Image => available_models
+            .iter()
+            .filter(|c| c.caps.vision != CapabilityLevel::None)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    let candidates: Vec<&RoutingCandidate<'a>> = if filtered.is_empty() {
+        available_models.iter().collect()
+    } else {
+        filtered
+    };
+
+    let (mut big, mut small): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| !is_single_digit_b_name(c.name));
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+
+    let mut ladder = Vec::with_capacity(max_len);
+
+    let mut seed = nanos;
+    while ladder.len() < max_len && !big.is_empty() {
+        let pick = pick_weighted(&big, seed);
+        ladder.push(pick);
+        big.retain(|c| c.name != pick);
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    }
+    while ladder.len() < max_len && !small.is_empty() {
+        let pick = pick_weighted(&small, seed);
+        ladder.push(pick);
+        small.retain(|c| c.name != pick);
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    }
+
+    ladder
+}
+
 /// Compute the routing weight for a single candidate. See the module-level
 /// `TPS_*` constants for the rationale on each clamp.
 fn candidate_weight(candidate: &RoutingCandidate<'_>) -> f64 {
@@ -1493,5 +1566,112 @@ mod tests {
             (wc - TPS_NEUTRAL_WEIGHT).abs() < f64::EPSILON,
             "cold weight should be neutral: {wc}",
         );
+    }
+
+    // ─── pick_model_ladder_classified ───────────────────────────────
+    // Used by the auto-router to fall back to a different model when the
+    // top pick's peers are all in cooldown.
+
+    #[test]
+    fn ladder_returns_empty_when_no_candidates() {
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        assert!(pick_model_ladder_classified(&cl, &[], 4).is_empty());
+    }
+
+    #[test]
+    fn ladder_returns_single_when_one_candidate() {
+        use crate::models::ModelCapabilities;
+        let available = vec![RoutingCandidate::unscored(
+            "only-model",
+            ModelCapabilities::default(),
+        )];
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        assert_eq!(
+            pick_model_ladder_classified(&cl, &available, 4),
+            vec!["only-model"]
+        );
+    }
+
+    #[test]
+    fn ladder_returns_all_distinct_when_capped_at_size() {
+        use crate::models::ModelCapabilities;
+        let caps = ModelCapabilities::default();
+        let available = vec![
+            RoutingCandidate::unscored("alpha-32B", caps),
+            RoutingCandidate::unscored("beta-32B", caps),
+            RoutingCandidate::unscored("gamma-32B", caps),
+        ];
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+
+        let ladder = pick_model_ladder_classified(&cl, &available, 4);
+        assert_eq!(ladder.len(), 3, "all candidates exhausted");
+
+        let mut sorted: Vec<&str> = ladder.to_vec();
+        sorted.sort();
+        assert_eq!(sorted, vec!["alpha-32B", "beta-32B", "gamma-32B"]);
+    }
+
+    #[test]
+    fn ladder_exhausts_big_tier_before_small_tier() {
+        // Big-tier names (no single-digit-B) must all surface before any
+        // small-tier name. Mirrors pick_model_classified's tier rule.
+        use crate::models::ModelCapabilities;
+        let caps = ModelCapabilities::default();
+        let available = vec![
+            RoutingCandidate::unscored("small-3B", caps),
+            RoutingCandidate::unscored("big-32B", caps),
+            RoutingCandidate::unscored("big-MiniMax", caps),
+        ];
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+
+        let ladder = pick_model_ladder_classified(&cl, &available, 4);
+        assert_eq!(ladder.len(), 3);
+        // Last entry is the small-tier one regardless of order in the big tier.
+        assert_eq!(*ladder.last().unwrap(), "small-3B");
+        let mut head: Vec<&str> = ladder[..2].to_vec();
+        head.sort();
+        assert_eq!(head, vec!["big-32B", "big-MiniMax"]);
+    }
+
+    #[test]
+    fn ladder_respects_max_len() {
+        use crate::models::ModelCapabilities;
+        let caps = ModelCapabilities::default();
+        let available = vec![
+            RoutingCandidate::unscored("a-32B", caps),
+            RoutingCandidate::unscored("b-32B", caps),
+            RoutingCandidate::unscored("c-32B", caps),
+            RoutingCandidate::unscored("d-32B", caps),
+        ];
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+
+        let ladder = pick_model_ladder_classified(&cl, &available, 2);
+        assert_eq!(ladder.len(), 2);
+        assert_ne!(ladder[0], ladder[1], "no duplicates in ladder");
     }
 }

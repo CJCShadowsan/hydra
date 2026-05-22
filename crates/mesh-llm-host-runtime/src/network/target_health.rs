@@ -165,6 +165,39 @@ impl TargetHealth {
         }
     }
 
+    /// Like `eligible_candidates`, but never falls back to "include all
+    /// cooling candidates anyway". Returns the *true* eligible set, even
+    /// if empty. Used by the auto-router when deciding whether to skip a
+    /// model entirely in favor of the next best alternative.
+    ///
+    /// Unlike `eligible_candidates` this does not short-circuit on
+    /// single-candidate inputs — a single peer can still be observed as
+    /// cooling so the auto-router can route around it.
+    pub(crate) fn strict_eligible_candidates(
+        &self,
+        model: &str,
+        candidates: &[InferenceTarget],
+    ) -> Vec<InferenceTarget> {
+        let Some(model) = normalized_model(Some(model)) else {
+            return candidates.to_vec();
+        };
+        let now = Instant::now();
+        let mut state = self.inner.lock().unwrap();
+        state.prune_expired(now);
+
+        candidates
+            .iter()
+            .filter(|candidate| {
+                let key = TargetKey {
+                    model: model.clone(),
+                    target: (*candidate).clone(),
+                };
+                !state.is_cooling(&key, now)
+            })
+            .cloned()
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> TargetHealthSnapshot {
         let mut state = self.inner.lock().unwrap();
@@ -368,6 +401,63 @@ mod tests {
 
         assert_eq!(health.eligible_candidates("qwen", &candidates), candidates);
         assert_eq!(health.snapshot().cooling_targets, 0);
+    }
+
+    // ─── strict_eligible_candidates ────────────────────────────────────
+    // Used by the auto-router to decide whether to skip a model.
+
+    #[test]
+    fn strict_returns_empty_when_sole_candidate_is_cooling() {
+        let health = TargetHealth::default();
+        let candidates = vec![local(9001)];
+
+        health.record_outcome(Some("qwen"), &local(9001), TargetHealthOutcome::Timeout);
+
+        // eligible_candidates falls back to the cooling target to preserve
+        // availability for callers that have no alternative.
+        assert_eq!(health.eligible_candidates("qwen", &candidates), candidates);
+        // strict_eligible_candidates exposes the true state so the auto
+        // router can pick a different model entirely.
+        assert!(health
+            .strict_eligible_candidates("qwen", &candidates)
+            .is_empty());
+    }
+
+    #[test]
+    fn strict_returns_eligible_subset_when_some_candidates_cool() {
+        let health = TargetHealth::default();
+        let candidates = vec![local(9001), local(9002)];
+
+        health.record_outcome(Some("qwen"), &local(9001), TargetHealthOutcome::Unavailable);
+
+        assert_eq!(
+            health.strict_eligible_candidates("qwen", &candidates),
+            vec![local(9002)]
+        );
+    }
+
+    #[test]
+    fn strict_returns_all_when_no_candidate_is_cooling() {
+        let health = TargetHealth::default();
+        let candidates = vec![local(9001), local(9002)];
+
+        assert_eq!(
+            health.strict_eligible_candidates("qwen", &candidates),
+            candidates
+        );
+    }
+
+    #[test]
+    fn strict_returns_empty_when_all_candidates_cool() {
+        let health = TargetHealth::default();
+        let candidates = vec![local(9001), local(9002)];
+
+        health.record_outcome(Some("qwen"), &local(9001), TargetHealthOutcome::Timeout);
+        health.record_outcome(Some("qwen"), &local(9002), TargetHealthOutcome::Unavailable);
+
+        assert!(health
+            .strict_eligible_candidates("qwen", &candidates)
+            .is_empty());
     }
 
     #[test]
