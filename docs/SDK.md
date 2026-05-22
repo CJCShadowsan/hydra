@@ -317,11 +317,7 @@ meshllm-native-<platform>-<flavor>/
   README.md
   lib/
     libmeshllm_ffi.{dylib|so}
-    libuniffi_mesh_ffi.{dylib|so}
 ```
-
-The duplicate `libuniffi_mesh_ffi` file exists because generated UniFFI loaders
-look up the component library name. Both files contain the same native runtime.
 
 The manifest records the SDK version, target triple, backend flavor, library
 checksum, llama.cpp upstream SHA, patched SHA, and patch digest. SDK loaders
@@ -390,7 +386,6 @@ DEP_MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR
 DEP_MESHLLM_NATIVE_RUNTIME_MANIFEST
 DEP_MESHLLM_NATIVE_RUNTIME_LIB_DIR
 DEP_MESHLLM_NATIVE_RUNTIME_LIBRARY
-DEP_MESHLLM_NATIVE_RUNTIME_UNIFFI_LIBRARY
 ```
 
 Rust applications that want Cargo to select a runtime should depend on exactly

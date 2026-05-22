@@ -13,7 +13,6 @@ data class NativeRuntimeArtifact(
     val artifactDir: File,
     val manifest: File,
     val library: File,
-    val uniffiLibrary: File,
 )
 
 object NativeRuntime {
@@ -21,7 +20,7 @@ object NativeRuntime {
 
     fun configure(config: NativeRuntimeConfig = NativeRuntimeConfig()): NativeRuntimeArtifact {
         val artifact = resolve(config)
-        System.setProperty(COMPONENT_LIBRARY_OVERRIDE, artifact.uniffiLibrary.absolutePath)
+        System.setProperty(COMPONENT_LIBRARY_OVERRIDE, artifact.library.absolutePath)
         return artifact
     }
 
@@ -65,20 +64,14 @@ object NativeRuntime {
         val manifestText = manifest.readText()
         val artifactId = stringField(manifestText, "artifact_id")
         val libraryRelativePath = stringField(manifestText, "library")
-        val uniffiLibraryRelativePath = stringField(manifestText, "uniffi_library")
         val expectedSha256 = stringField(manifestText, "library_sha256").lowercase()
 
         val library = normalizedDir.resolve(libraryRelativePath).normalized()
-        val uniffiLibrary = normalizedDir.resolve(uniffiLibraryRelativePath).normalized()
         require(library.isFile) { "native library does not exist: ${library.path}" }
-        require(uniffiLibrary.isFile) { "UniFFI library does not exist: ${uniffiLibrary.path}" }
 
         val actualLibrarySha256 = sha256(library)
         require(actualLibrarySha256 == expectedSha256) {
             "native library checksum mismatch for ${library.path}"
-        }
-        require(sha256(uniffiLibrary) == expectedSha256) {
-            "UniFFI library checksum mismatch for ${uniffiLibrary.path}"
         }
 
         return NativeRuntimeArtifact(
@@ -86,7 +79,6 @@ object NativeRuntime {
             artifactDir = normalizedDir,
             manifest = manifest,
             library = library,
-            uniffiLibrary = uniffiLibrary,
         )
     }
 

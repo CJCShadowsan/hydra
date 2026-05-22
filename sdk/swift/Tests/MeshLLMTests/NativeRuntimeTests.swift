@@ -11,7 +11,6 @@ final class NativeRuntimeTests: XCTestCase {
 
         XCTAssertEqual(artifact.artifactId, "meshllm-native-test-cpu")
         XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.library.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.uniffiLibrary.path))
     }
 
     func testValidateRejectsChecksumMismatch() throws {
@@ -44,16 +43,13 @@ final class NativeRuntimeTests: XCTestCase {
         try FileManager.default.createDirectory(at: libDirectory, withIntermediateDirectories: true)
 
         let library = libDirectory.appendingPathComponent("libmeshllm_ffi.dylib")
-        let uniffiLibrary = libDirectory.appendingPathComponent("libuniffi_mesh_ffi.dylib")
         let bytes = Data("native runtime".utf8)
         try bytes.write(to: library)
-        try bytes.write(to: uniffiLibrary)
         let sha256 = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
         let manifest = """
         {
           "artifact_id": "meshllm-native-test-cpu",
           "library": "lib/libmeshllm_ffi.dylib",
-          "uniffi_library": "lib/libuniffi_mesh_ffi.dylib",
           "library_sha256": "\(sha256)"
         }
         """

@@ -16,7 +16,6 @@ class NativeRuntimeTest {
 
         assertEquals("meshllm-native-test-cpu", artifact.artifactId)
         assertTrue(artifact.library.isFile)
-        assertTrue(artifact.uniffiLibrary.isFile)
     }
 
     @Test
@@ -39,7 +38,7 @@ class NativeRuntimeTest {
             val artifact = NativeRuntime.configure(NativeRuntimeConfig(artifactDir = artifactDir))
 
             assertEquals(
-                artifact.uniffiLibrary.absolutePath,
+                artifact.library.absolutePath,
                 System.getProperty("uniffi.component.mesh_ffi.libraryOverride"),
             )
         } finally {
@@ -56,16 +55,13 @@ class NativeRuntimeTest {
         val libDir = artifactDir.resolve("lib")
         libDir.mkdirs()
         val library = libDir.resolve("libmeshllm_ffi.so")
-        val uniffiLibrary = libDir.resolve("libuniffi_mesh_ffi.so")
         library.writeText("native runtime")
-        uniffiLibrary.writeText("native runtime")
         val sha256 = sha256(library)
         artifactDir.resolve("manifest.json").writeText(
             """
             {
               "artifact_id": "meshllm-native-test-cpu",
               "library": "lib/libmeshllm_ffi.so",
-              "uniffi_library": "lib/libuniffi_mesh_ffi.so",
               "library_sha256": "$sha256"
             }
             """.trimIndent(),

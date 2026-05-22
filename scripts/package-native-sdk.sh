@@ -144,13 +144,6 @@ library_basename() {
     esac
 }
 
-uniffi_basename() {
-    case "$1" in
-        dll) printf 'uniffi_mesh_ffi.dll\n' ;;
-        *) printf 'libuniffi_mesh_ffi.%s\n' "$1" ;;
-    esac
-}
-
 sanitize_component() {
     printf '%s' "$1" | tr ';, /:' '_____' | tr -cd 'A-Za-z0-9_.-'
 }
@@ -245,7 +238,6 @@ fi
 
 lib_ext="$(library_extension "$TARGET_TRIPLE")"
 lib_name="$(library_basename "$lib_ext")"
-uniffi_name="$(uniffi_basename "$lib_ext")"
 platform="$(target_platform "$TARGET_TRIPLE")"
 flavor="$(backend_flavor)"
 artifact_id="meshllm-native-${platform}-${flavor}"
@@ -278,7 +270,6 @@ rm -rf "$stage_dir"
 mkdir -p "$stage_dir/lib"
 
 cp "$lib_path" "$stage_dir/lib/$lib_name"
-cp "$lib_path" "$stage_dir/lib/$uniffi_name"
 
 patched_sha=""
 upstream_sha=""
@@ -311,7 +302,6 @@ manifest = {
     "flavor": "$flavor",
     "cargo_profile": "$PROFILE",
     "library": "lib/$lib_name",
-    "uniffi_library": "lib/$uniffi_name",
     "library_sha256": "$lib_sha",
     "llama_upstream_sha": "$upstream_sha" or None,
     "llama_patched_sha": "$patched_sha" or None,
@@ -342,8 +332,7 @@ This artifact contains the MeshLLM native SDK runtime for:
 - flavor: \`$flavor\`
 
 SDK loaders should read \`manifest.json\`, verify \`library_sha256\`, then load
-\`$lib_name\`. \`$uniffi_name\` is included for UniFFI-generated loaders that use
-the component library name.
+\`$lib_name\`.
 EOF
 
 mkdir -p "$OUT_DIR"

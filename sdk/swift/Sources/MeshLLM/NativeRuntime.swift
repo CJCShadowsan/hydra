@@ -16,7 +16,6 @@ public struct NativeRuntimeArtifact: Sendable, Equatable {
     public let artifactDirectory: URL
     public let manifest: URL
     public let library: URL
-    public let uniffiLibrary: URL
 }
 
 public enum NativeRuntimeError: Error, LocalizedError, Equatable {
@@ -95,28 +94,20 @@ public enum NativeRuntime {
             from: Data(contentsOf: manifestURL)
         )
         let library = artifactDirectory.appendingPathComponent(manifest.library)
-        let uniffiLibrary = artifactDirectory.appendingPathComponent(manifest.uniffiLibrary)
         guard FileManager.default.fileExists(atPath: library.path) else {
             throw NativeRuntimeError.invalidArtifact("native library does not exist: \(library.path)")
-        }
-        guard FileManager.default.fileExists(atPath: uniffiLibrary.path) else {
-            throw NativeRuntimeError.invalidArtifact("UniFFI library does not exist: \(uniffiLibrary.path)")
         }
 
         let expected = manifest.librarySha256.lowercased()
         guard try sha256Hex(library) == expected else {
             throw NativeRuntimeError.checksumMismatch(library)
         }
-        guard try sha256Hex(uniffiLibrary) == expected else {
-            throw NativeRuntimeError.checksumMismatch(uniffiLibrary)
-        }
 
         return NativeRuntimeArtifact(
             artifactId: manifest.artifactId,
             artifactDirectory: artifactDirectory,
             manifest: manifestURL,
-            library: library,
-            uniffiLibrary: uniffiLibrary
+            library: library
         )
     }
 
@@ -165,13 +156,11 @@ public enum NativeRuntime {
 private struct NativeRuntimeManifest: Decodable {
     let artifactId: String
     let library: String
-    let uniffiLibrary: String
     let librarySha256: String
 
     enum CodingKeys: String, CodingKey {
         case artifactId = "artifact_id"
         case library
-        case uniffiLibrary = "uniffi_library"
         case librarySha256 = "library_sha256"
     }
 }

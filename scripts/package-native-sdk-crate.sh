@@ -28,7 +28,6 @@ Cargo exposes build metadata to dependents as:
   DEP_MESHLLM_NATIVE_RUNTIME_MANIFEST
   DEP_MESHLLM_NATIVE_RUNTIME_LIB_DIR
   DEP_MESHLLM_NATIVE_RUNTIME_LIBRARY
-  DEP_MESHLLM_NATIVE_RUNTIME_UNIFFI_LIBRARY
 EOF
 }
 
@@ -168,27 +167,17 @@ fn main() {
     let manifest = fs::read_to_string(&manifest_path).expect("read native runtime manifest");
     let artifact_id = json_string_field(&manifest, "artifact_id").expect("manifest artifact_id");
     let library = json_string_field(&manifest, "library").expect("manifest library");
-    let uniffi_library = json_string_field(&manifest, "uniffi_library").expect("manifest uniffi_library");
 
     let library_path = artifact_dir.join(&library);
-    let uniffi_library_path = artifact_dir.join(&uniffi_library);
 
     println!("cargo:rerun-if-changed={}", source_manifest_path.display());
     println!("cargo:rerun-if-changed={}", source_artifact_dir.join(&library).display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        source_artifact_dir.join(&uniffi_library).display()
-    );
 
     println!("cargo:artifact_id={artifact_id}");
     println!("cargo:artifact_dir={}", artifact_dir.display());
     println!("cargo:manifest={}", manifest_path.display());
     println!("cargo:lib_dir={}", lib_dir.display());
     println!("cargo:library={}", library_path.display());
-    println!(
-        "cargo:uniffi_library={}",
-        uniffi_library_path.display()
-    );
 
     println!("cargo:rustc-env=MESHLLM_NATIVE_RUNTIME_ARTIFACT_ID={artifact_id}");
     println!(
@@ -206,10 +195,6 @@ fn main() {
     println!(
         "cargo:rustc-env=MESHLLM_NATIVE_RUNTIME_LIBRARY={}",
         library_path.display()
-    );
-    println!(
-        "cargo:rustc-env=MESHLLM_NATIVE_RUNTIME_UNIFFI_LIBRARY={}",
-        uniffi_library_path.display()
     );
 }
 
@@ -279,9 +264,6 @@ pub fn library_path() -> PathBuf {
     PathBuf::from(env!("MESHLLM_NATIVE_RUNTIME_LIBRARY"))
 }
 
-pub fn uniffi_library_path() -> PathBuf {
-    PathBuf::from(env!("MESHLLM_NATIVE_RUNTIME_UNIFFI_LIBRARY"))
-}
 EOF
 
 cat > "$crate_dir/README.md" <<EOF
@@ -304,7 +286,6 @@ DEP_MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR
 DEP_MESHLLM_NATIVE_RUNTIME_MANIFEST
 DEP_MESHLLM_NATIVE_RUNTIME_LIB_DIR
 DEP_MESHLLM_NATIVE_RUNTIME_LIBRARY
-DEP_MESHLLM_NATIVE_RUNTIME_UNIFFI_LIBRARY
 \`\`\`
 
 Application build scripts should copy \`DEP_MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR\`
@@ -317,7 +298,6 @@ Rust code that depends on this crate directly can also call:
 \`\`\`rust
 $lib_name::artifact_dir();
 $lib_name::library_path();
-$lib_name::uniffi_library_path();
 \`\`\`
 EOF
 

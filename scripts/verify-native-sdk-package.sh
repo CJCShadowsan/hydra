@@ -12,7 +12,7 @@ Verifies MeshLLM native SDK runtime artifacts:
   - archive checksum sidecar when present
   - manifest schema and required fields
   - artifact directory name matches manifest artifact_id
-  - library and UniFFI alias exist
+  - native library exists
   - library_sha256 matches the primary library
   - artifact_id matches platform/flavor
 EOF
@@ -113,7 +113,6 @@ required = [
     "backend",
     "flavor",
     "library",
-    "uniffi_library",
     "library_sha256",
     "features",
 ]
@@ -135,8 +134,7 @@ if dir_name != manifest["artifact_id"]:
     raise SystemExit(f"artifact directory name does not match artifact_id: {dir_name} != {manifest['artifact_id']}")
 
 library = manifest["library"]
-uniffi_library = manifest["uniffi_library"]
-for key, rel_path in (("library", library), ("uniffi_library", uniffi_library)):
+for key, rel_path in (("library", library),):
     if os.path.isabs(rel_path) or ".." in rel_path.split(os.sep):
         raise SystemExit(f"{key} must be a relative path inside the artifact: {rel_path}")
     path = os.path.join(artifact_dir, rel_path)
@@ -144,19 +142,28 @@ for key, rel_path in (("library", library), ("uniffi_library", uniffi_library)):
         raise SystemExit(f"missing {key}: {path}")
 
 library_path = os.path.join(artifact_dir, library)
-uniffi_library_path = os.path.join(artifact_dir, uniffi_library)
 with open(library_path, "rb") as fh:
     actual = hashlib.sha256(fh.read()).hexdigest()
 if actual != manifest["library_sha256"]:
     raise SystemExit(
         f"library_sha256 mismatch for {library}: {actual} != {manifest['library_sha256']}"
     )
-with open(uniffi_library_path, "rb") as fh:
-    uniffi_actual = hashlib.sha256(fh.read()).hexdigest()
-if uniffi_actual != actual:
-    raise SystemExit(
-        f"uniffi_library checksum mismatch: {uniffi_actual} != {actual}"
-    )
+
+legacy_uniffi_library = manifest.get("uniffi_library")
+if legacy_uniffi_library:
+    if os.path.isabs(legacy_uniffi_library) or ".." in legacy_uniffi_library.split(os.sep):
+        raise SystemExit(
+            f"uniffi_library must be a relative path inside the artifact: {legacy_uniffi_library}"
+        )
+    legacy_path = os.path.join(artifact_dir, legacy_uniffi_library)
+    if not os.path.isfile(legacy_path):
+        raise SystemExit(f"missing uniffi_library: {legacy_path}")
+    with open(legacy_path, "rb") as fh:
+        legacy_actual = hashlib.sha256(fh.read()).hexdigest()
+    if legacy_actual != actual:
+        raise SystemExit(
+            f"uniffi_library checksum mismatch: {legacy_actual} != {actual}"
+        )
 
 features = set(manifest["features"])
 for feature in ("mesh-inference", "model-management", "local-serving", "chat", "responses"):

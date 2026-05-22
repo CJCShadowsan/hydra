@@ -23,16 +23,16 @@ require() {
 }
 
 required_doc_terms=(
-    "One canonical SDK contract"
-    "Real end-to-end example apps"
-    "SDK lifecycle polish"
-    "First-class errors"
-    "Platform support matrix"
+    "MeshLLM SDK Usage Guide"
+    "Language SDKs"
+    "Native runtime artifacts"
+    "Node Lifecycle"
+    "Native Runtime Artifacts"
     "Node"
-    "inference.listModels()"
-    "models.download()"
-    "serving.load()"
-    "ServingUnsupported"
+    "list mesh models"
+    "download the model"
+    "load the model through serving"
+    "Serving unsupported"
 )
 
 for term in "${required_doc_terms[@]}"; do
