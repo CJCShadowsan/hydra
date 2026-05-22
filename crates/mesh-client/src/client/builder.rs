@@ -129,15 +129,10 @@ impl MeshClient {
             ));
         };
 
-        let response = self
-            .runtime
-            .handle()
-            .block_on(http_get_json::<ModelsResponse>(
-                base_url,
-                "/v1/models",
-                &self.config.user_agent,
-            ))
-            .map_err(ClientError::Endpoint)?;
+        let response =
+            http_get_json::<ModelsResponse>(base_url, "/v1/models", &self.config.user_agent)
+                .await
+                .map_err(ClientError::Endpoint)?;
 
         Ok(response
             .data

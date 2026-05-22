@@ -14,9 +14,11 @@ let inviteTokenArg = args.first { !$0.hasPrefix("--") }
 let token = inviteTokenArg
     ?? ProcessInfo.processInfo.environment["MESH_SDK_INVITE_TOKEN"]
     ?? "local-mac-example"
-let selectedModelRef = ProcessInfo.processInfo.environment["MESH_SDK_MODEL_REF"]
-    ?? ProcessInfo.processInfo.environment["MESH_SDK_MODEL_ID"]
-    ?? "Qwen2.5-3B-Instruct-Q4_K_M"
+let localModelRef = ProcessInfo.processInfo.environment["MESH_SDK_MODEL_REF"]
+    ?? (inviteTokenArg == nil && ProcessInfo.processInfo.environment["MESH_SDK_INVITE_TOKEN"] == nil
+        ? "Qwen2.5-3B-Instruct-Q4_K_M"
+        : nil)
+let remoteModelId = ProcessInfo.processInfo.environment["MESH_SDK_MODEL_ID"]
 let cacheDir = ProcessInfo.processInfo.environment["MESH_SDK_CACHE_DIR"]
 let runtimeDir = ProcessInfo.processInfo.environment["MESH_SDK_RUNTIME_DIR"]
 let skipDownload = ProcessInfo.processInfo.environment["MESH_SDK_SKIP_DOWNLOAD"] == "1"
@@ -34,7 +36,7 @@ Task {
             ownerKeypairBytesHex: ownerKeypairHex,
             cacheDir: cacheDir,
             runtimeDir: runtimeDir,
-            servingEnabled: true
+            servingEnabled: localModelRef != nil
         )
         let recommended = try await node.models.recommended()
         let serving = try await node.serving.status()
@@ -43,27 +45,34 @@ Task {
         try await node.start()
         print("[connected]")
 
-        if !skipDownload {
-            let downloaded = try await node.models.download(selectedModelRef)
-            print("[download] model_ref=\(downloaded.modelRef) files=\(downloaded.paths.count)")
+        let selectedModel: String
+        let loadedInstanceId: String?
+        if let localModelRef {
+            if !skipDownload {
+                let downloaded = try await node.models.download(localModelRef)
+                print("[download] model_ref=\(downloaded.modelRef) files=\(downloaded.paths.count)")
+            }
+
+            let loaded = try await node.serving.load(
+                localModelRef,
+                options: LoadModelOptions(devicePolicy: .auto)
+            )
+            guard loaded.state == .ready else {
+                throw ExampleError.servingDidNotLoad(loaded.error ?? "\(loaded.state)")
+            }
+            print("[serving] model=\(loaded.modelId) instance=\(loaded.instanceId ?? "-")")
+            selectedModel = loaded.modelId
+            loadedInstanceId = loaded.instanceId
+        } else {
+            loadedInstanceId = nil
+            let models = try await waitForModels(node)
+            print("[models] N=\(models.count)")
+            guard !models.isEmpty else {
+                throw ExampleError.noModels
+            }
+            selectedModel = remoteModelId ?? models[0].id
         }
 
-        let loaded = try await node.serving.load(
-            selectedModelRef,
-            options: LoadModelOptions(devicePolicy: .auto)
-        )
-        guard loaded.state == .ready else {
-            throw ExampleError.servingDidNotLoad(loaded.error ?? "\(loaded.state)")
-        }
-        print("[serving] model=\(loaded.modelId) instance=\(loaded.instanceId ?? "-")")
-
-        let models = try await waitForModels(node)
-        print("[models] N=\(models.count)")
-        guard !models.isEmpty else {
-            throw ExampleError.noModels
-        }
-
-        let selectedModel = loaded.modelId
         let request = ChatRequest(
             model: selectedModel,
             messages: [ChatMessage(role: "user", content: prompt)]
@@ -101,7 +110,7 @@ Task {
             throw ExampleError.didNotComplete
         }
 
-        if let instanceId = loaded.instanceId {
+        if let instanceId = loadedInstanceId {
             try await node.serving.unloadInstance(
                 instanceId,
                 options: UnloadModelOptions(drainTimeoutMs: 1_000, force: false)

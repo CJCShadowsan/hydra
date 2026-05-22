@@ -30,12 +30,16 @@ scripts/ci-sdk-fixture.sh "$1" "$2" "$3" -- \
             export ORG_GRADLE_JAVA_HOME="${ORG_GRADLE_JAVA_HOME:-$JAVA_HOME}"
             export GRADLE_OPTS="${GRADLE_OPTS:-} -Dorg.gradle.java.installations.auto-detect=false -Dorg.gradle.java.installations.paths=$ORG_GRADLE_JAVA_HOME"
         fi
-        if [ -f '"$REPO_ROOT"'/target/debug/libmeshllm_ffi.dylib ] && [ ! -e '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.dylib ]; then
-            ln -sf libmeshllm_ffi.dylib '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.dylib
-        fi
-        if [ -f '"$REPO_ROOT"'/target/debug/libmeshllm_ffi.so ] && [ ! -e '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.so ]; then
-            ln -sf libmeshllm_ffi.so '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.so
-        fi
+        for ext in dylib so; do
+            lib='"$REPO_ROOT"'/target/debug/libmeshllm_ffi.$ext
+            deps_lib='"$REPO_ROOT"'/target/debug/deps/libmeshllm_ffi.$ext
+            if [ ! -f "$lib" ] && [ -f "$deps_lib" ]; then
+                ln -sf deps/libmeshllm_ffi.$ext "$lib"
+            fi
+            if [ -f "$lib" ]; then
+                ln -sf libmeshllm_ffi.$ext '"$REPO_ROOT"'/target/debug/libuniffi_mesh_ffi.$ext
+            fi
+        done
         export JAVA_TOOL_OPTIONS="-Djna.library.path='"$REPO_ROOT"'/target/debug"
         cd '"$REPO_ROOT"'/sdk/kotlin/example/example-jvm
         ./gradlew --no-daemon run --args="$MESH_SDK_INVITE_TOKEN"
