@@ -27,6 +27,27 @@ dependencies {
     testImplementation("io.mockk:mockk:1.13.8")
 }
 
+val repoRoot = rootProject.projectDir.parentFile.parentFile
+
+val generateKotlinBindings by tasks.registering(Exec::class) {
+    description = "Generate Kotlin UniFFI bindings from the mesh-llm FFI UDL"
+    group = "build"
+
+    workingDir = repoRoot
+    commandLine("bash", "sdk/kotlin/scripts/generate-kotlin-bindings.sh")
+    inputs.file(repoRoot.resolve("crates/mesh-llm-ffi/src/mesh_ffi.udl"))
+    outputs.file(projectDir.resolve("src/main/kotlin/uniffi/mesh_ffi/mesh_ffi.kt"))
+    outputs.file(projectDir.resolve("example/example-jvm/src/main/kotlin/uniffi/mesh_ffi/mesh_ffi.kt"))
+}
+
+tasks.named("compileKotlin") {
+    dependsOn(generateKotlinBindings)
+}
+
+tasks.named("compileTestKotlin") {
+    dependsOn(generateKotlinBindings)
+}
+
 fun resolveAndroidNdkHome(): String {
     val env = System.getenv()
     val direct = listOf("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT")
@@ -72,7 +93,6 @@ val buildNativeLibs by tasks.registering {
     description = "Build mesh-llm-ffi shared libraries with embedded serving for all Android ABIs"
     group = "build"
 
-    val repoRoot = rootProject.projectDir.parentFile.parentFile
     val androidPlatform = System.getenv("MESH_LLM_ANDROID_PLATFORM") ?: "android-26"
     val buildTargets = listOf(
         Triple("arm64-v8a", "aarch64-linux-android", "libmeshllm_ffi.so"),
@@ -191,6 +211,7 @@ val sourcesJar by tasks.registering(Jar::class) {
     description = "Assemble Kotlin sources jar for Maven publication"
     group = "build"
 
+    dependsOn(generateKotlinBindings)
     archiveClassifier.set("sources")
     from("src/main/kotlin")
 }

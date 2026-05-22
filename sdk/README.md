@@ -28,5 +28,10 @@ The customer-facing SDK release gates live in `docs/SDK.md`. SDK changes should
 keep Rust, Swift, and Kotlin aligned to that canonical contract: real examples,
 polished lifecycle, typed errors, and an honest platform support matrix.
 
+Generated UniFFI bindings and Apple binary artifacts are build outputs, not
+source. Do not check in `sdk/*/Generated`, generated `uniffi/mesh_ffi` Kotlin
+sources, or `MeshLLMFFI.xcframework`; regenerate them from
+`crates/mesh-llm-ffi/src/mesh_ffi.udl` in local builds and CI.
+
 If you add another top-level SDK here, include a `README.md` in that SDK
 directory explaining its packaging and public surface.
