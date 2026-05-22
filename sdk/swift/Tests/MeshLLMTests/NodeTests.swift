@@ -7,6 +7,14 @@ final class NodeTests: XCTestCase {
         XCTAssertNotNil(node)
     }
 
+    func testMeshErrorAliasExposesTypedFfiErrors() {
+        let error = MeshError.InvalidInviteToken(message: "bad token")
+        guard case .InvalidInviteToken(let message) = error else {
+            return XCTFail("expected InvalidInviteToken")
+        }
+        XCTAssertEqual(message, "bad token")
+    }
+
     func testStatusBeforeStart() async throws {
         let node = try makeTestNode()
         let status = await node.status()

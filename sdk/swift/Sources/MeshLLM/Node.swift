@@ -63,6 +63,8 @@ public struct ResponsesRequest: Sendable {
 }
 
 #if canImport(MeshLLMFFI)
+public typealias MeshError = FfiError
+
 public final class Node: @unchecked Sendable {
     private let handle: MeshNodeHandle
 

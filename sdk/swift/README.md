@@ -2,6 +2,10 @@
 
 Swift Package for connecting to mesh-llm meshes from iOS, Mac Catalyst, and macOS apps.
 
+The canonical SDK contract, release gates, and platform support matrix live in
+[`docs/SDK.md`](../../docs/SDK.md). This package should stay a thin Swift-native
+wrapper over that shared contract.
+
 ## Installation
 
 Add to your app's `Package.swift` using a tagged release:
@@ -68,6 +72,30 @@ for try await event in node.inference.chatStream(request) {
 }
 ```
 
+Local serving follows the same lifecycle:
+
+```swift
+let served = try await node.serving.load(
+    "Qwen2.5-3B-Instruct-Q4_K_M",
+    options: LoadModelOptions(devicePolicy: .auto)
+)
+defer {
+    Task {
+        if let instanceId = served.instanceId {
+            try? await node.serving.unloadInstance(
+                instanceId,
+                options: UnloadModelOptions(drainTimeoutMs: 1_000, force: false)
+            )
+        }
+        try? await node.stop()
+    }
+}
+```
+
+Typed SDK failures are exposed as `MeshError`, an alias for the generated UniFFI
+error enum. Handle `MeshError.ServingUnsupported` when local serving is not
+available for the current target or native artifact.
+
 ## Local Inference Example
 
 The Swift example uses the same real UniFFI-backed SDK path that apps use for
@@ -91,6 +119,17 @@ Useful environment overrides:
 The generated XCFramework is built with embedded serving support for Apple
 targets. `build-host-macos-xcframework.sh` remains as a faster macOS-only smoke
 artifact for local development; it is not the platform SDK contract.
+
+## Platform Status
+
+| Target | Mesh inference | Model management | Local serving |
+|---|---:|---:|---:|
+| macOS | yes | yes | yes, validated with the host Metal framework |
+| Mac Catalyst | yes | yes | planned validation |
+| iOS | yes | limited by app filesystem policy | no |
+
+Targets without validated local serving must throw `MeshError.ServingUnsupported`
+instead of silently degrading to a fake implementation.
 
 ## App Store Export Compliance
 

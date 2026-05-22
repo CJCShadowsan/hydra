@@ -24,5 +24,9 @@ consume inference from the mesh, manage local models, serve local models, or
 combine those roles. See `docs/design/EMBEDDED_CLIENT_ADR.md` for the current
 SDK direction.
 
+The customer-facing SDK release gates live in `docs/SDK.md`. SDK changes should
+keep Rust, Swift, and Kotlin aligned to that canonical contract: real examples,
+polished lifecycle, typed errors, and an honest platform support matrix.
+
 If you add another top-level SDK here, include a `README.md` in that SDK
 directory explaining its packaging and public surface.

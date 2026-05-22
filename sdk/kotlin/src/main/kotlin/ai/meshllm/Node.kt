@@ -24,6 +24,7 @@ typealias DeleteModelOptions = uniffi.mesh_ffi.DeleteModelOptions
 typealias DeleteModelResult = uniffi.mesh_ffi.DeleteModelResult
 typealias DevicePolicy = uniffi.mesh_ffi.DevicePolicy
 typealias DownloadedModel = uniffi.mesh_ffi.DownloadedModel
+typealias MeshException = uniffi.mesh_ffi.FfiException
 typealias InstalledModel = uniffi.mesh_ffi.InstalledModel
 typealias LoadModelOptions = uniffi.mesh_ffi.LoadModelOptions
 typealias ModelCacheStatus = uniffi.mesh_ffi.ModelCacheStatus
