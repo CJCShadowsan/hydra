@@ -16,8 +16,8 @@ pub use mesh_llm_node::serving::ServingController;
 pub use node::{
     CapabilityLevel, CleanupPolicy, CleanupResult, DeleteModelOptions, DeleteModelResult,
     DevicePolicy, DownloadId, DownloadOptions, DownloadedModel, InstalledModel, LoadModelOptions,
-    MeshEvents, MeshInference, MeshModels, MeshNode, MeshNodeBuilder, MeshNodeConfig, MeshServing,
-    MeshStatusApi, ModelCacheStatus, ModelCapabilities, ModelDetails, ModelKind, ModelSearchQuery,
-    ModelSource, ModelSummary, PrunePolicy, PruneResult, ServedModel, ServingModelState,
-    ServingStatus, UnloadModelOptions, UnloadTarget,
+    MeshEvents, MeshInference, MeshModels, MeshNode, MeshNodeBuilder, MeshNodeConfig, MeshQuicBind,
+    MeshRole, MeshServing, MeshStatusApi, ModelCacheStatus, ModelCapabilities, ModelDetails,
+    ModelKind, ModelSearchQuery, ModelSource, ModelSummary, PrunePolicy, PruneResult, ServedModel,
+    ServingModelState, ServingStatus, UnloadModelOptions, UnloadTarget,
 };

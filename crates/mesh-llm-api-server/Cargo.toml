@@ -13,11 +13,25 @@ categories = ["api-bindings", "network-programming"]
 [features]
 host-io = ["mesh-llm-api-client/host-io"]
 
+# Run a real iroh-backed mesh node in-process (gossip, relay registration,
+# invite tokens, QUIC peer connections) instead of the default HTTP-shim
+# client behaviour. Drags `mesh-llm-host-runtime` and its transitive deps
+# (skippy, llama.cpp link path, etc.) into the build, so it is off by
+# default. Consumers who want a Rust app to act as a real mesh peer
+# should enable it.
+#
+# Note: gated iroh-relay (--relay-auth URL=TOKEN) support is a separate,
+# in-flight piece of work; once it lands, this feature will pick it up
+# transparently with no consumer-side change.
+host-runtime = ["dep:mesh-llm-host-runtime"]
+
 [dependencies]
 anyhow.workspace = true
 mesh-llm-api-client = { path = "../mesh-llm-api-client", version = "0.66.0" }
 mesh-llm-node = { path = "../mesh-llm-node", version = "0.66.0" }
+# Optional, gated by the `host-runtime` feature.
+mesh-llm-host-runtime = { path = "../mesh-llm-host-runtime", optional = true, default-features = false }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -15,6 +15,7 @@ mod runtime;
 mod runtime_data;
 mod system;
 
+pub mod host_node;
 pub mod sdk;
 
 pub mod proto {

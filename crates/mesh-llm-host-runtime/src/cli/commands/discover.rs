@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mesh_llm_api_server::{discover_public_meshes, PublicMesh, PublicMeshQuery};
+use mesh_llm_api_client::{discover_public_meshes, PublicMesh, PublicMeshQuery};
 
 use crate::mesh;
 use crate::network::{discovery, nostr};

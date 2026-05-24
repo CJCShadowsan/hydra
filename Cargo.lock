@@ -3674,6 +3674,7 @@ version = "0.66.0"
 dependencies = [
  "anyhow",
  "mesh-llm-api-client",
+ "mesh-llm-host-runtime",
  "mesh-llm-node",
  "tokio",
 ]
@@ -3767,7 +3768,7 @@ dependencies = [
  "keyring",
  "libc",
  "mdns-sd",
- "mesh-llm-api-server",
+ "mesh-llm-api-client",
  "mesh-llm-client",
  "mesh-llm-guardrails",
  "mesh-llm-identity",

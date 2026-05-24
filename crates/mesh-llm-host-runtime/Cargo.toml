@@ -28,7 +28,7 @@ mesh-llm-system = { version = "0.66.0", path = "../mesh-llm-system", features = 
 mesh-llm-types = { version = "0.66.0", path = "../mesh-llm-types" }
 mesh-llm-ui = { version = "0.66.0", path = "../mesh-llm-ui", default-features = false }
 mesh-llm-node = { version = "0.66.0", path = "../mesh-llm-node" }
-mesh-llm-api-server = { version = "0.66.0", path = "../mesh-llm-api-server" }
+mesh-llm-api-client = { version = "0.66.0", path = "../mesh-llm-api-client" }
 mesh-client = { package = "mesh-llm-client", version = "0.66.0", path = "../mesh-client", features = ["host-io"] }
 model-artifact = { version = "0.66.0", path = "../model-artifact" }
 model-package = { version = "0.66.0", path = "../model-package" }
