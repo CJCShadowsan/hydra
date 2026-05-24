@@ -122,14 +122,17 @@ impl PrefixCandidatePolicy {
         if token_count == 0 {
             return Vec::new();
         }
-        // Candidates are page-aligned at absolute token positions so two
-        // prompts that share a long prefix land on the same candidate set
-        // regardless of their total length. Previously the candidates were
-        // computed by walking down from `token_count` in stride steps,
-        // which only matched between identical-length prompts; "same
-        // system prompt + different conversation tail" workloads (typical
-        // for chat and agent harnesses) cache-missed despite sharing
-        // thousands of identical leading tokens. See #662.
+        // Preserve the legacy `min_tokens == 0` semantics: return only
+        // the exact length. Walking a per-token grid here would generate
+        // O(token_count) candidates per lookup and blow up allocations.
+        if self.min_tokens == 0 {
+            return vec![token_count];
+        }
+        // Page-aligned absolute boundaries so two prompts sharing a long
+        // prefix land on the same candidate set regardless of total length.
+        // See #662 for the prior stride-from-prompt-length scheme that
+        // structurally missed on agent/chat workloads (same system prompt,
+        // varying conversation tail).
         let page = self.page_size_tokens.max(1);
         let min_t = self.min_tokens.max(page);
         if token_count < min_t {

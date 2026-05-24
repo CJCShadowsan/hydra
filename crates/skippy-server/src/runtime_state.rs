@@ -355,15 +355,21 @@ impl RuntimeState {
         if let Some(mut lane_session) = self.sessions.remove(session_id) {
             let lane_index = lane_session.index;
             // Always release the lane's native KV cells back to the
-            // unified pool. The trim+preserve path was intended to let
-            // a future request with the same session_id reuse the cells
-            // via `acquire_resident_prefix_lane`, but session_labels are
-            // regenerated per request server-side (frontend.rs ~line 839),
-            // so the optimization can never actually match. Holding
-            // cells on idle lanes under that mistaken assumption starves
-            // the pool and produces `failed to find a memory slot`
-            // errors. Prefix reuse across requests is the cache layer's
-            // responsibility (matched by `page_id`, not `session_id`).
+            // unified pool. The trim+preserve path kept the lane's cells
+            // pinned to a specific (`page_id`, `token_count`) pair so a
+            // future request whose content prefix hashed to the *exact*
+            // same `page_id` AND same `token_count` could acquire the
+            // warm lane via `acquire_resident_prefix_lane`. Real chat /
+            // agent workloads vary the conversation tail every turn, so
+            // both the hash and the length change request-to-request and
+            // that exact-match acquisition almost never fires. Meanwhile
+            // the pinned cells remain claimed in the unified pool, in
+            // parallel with the cells the cache layer itself pins, and
+            // the pool runs out of contiguous space — producing
+            // `decode: failed to find a memory slot` under repeated
+            // tool-using agent traffic (#652). Cross-request prefix
+            // reuse is still done by the cache layer (by `page_id`); we
+            // just stop double-claiming cells on the lane side.
             self.session_resident_prefixes.remove(session_id);
             reset_session = true;
             match lane_session.session.reset() {
