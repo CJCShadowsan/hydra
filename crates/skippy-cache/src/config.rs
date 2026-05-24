@@ -122,19 +122,34 @@ impl PrefixCandidatePolicy {
         if token_count == 0 {
             return Vec::new();
         }
-        let mut counts = vec![token_count];
-        if self.min_tokens == 0 || token_count <= self.min_tokens {
-            return counts;
+        // Candidates are page-aligned at absolute token positions so two
+        // prompts that share a long prefix land on the same candidate set
+        // regardless of their total length. Previously the candidates were
+        // computed by walking down from `token_count` in stride steps,
+        // which only matched between identical-length prompts; "same
+        // system prompt + different conversation tail" workloads (typical
+        // for chat and agent harnesses) cache-missed despite sharing
+        // thousands of identical leading tokens. See #662.
+        let page = self.page_size_tokens.max(1);
+        let min_t = self.min_tokens.max(page);
+        if token_count < min_t {
+            return vec![token_count];
         }
-        let stride = self.stride_tokens.max(1).min(self.page_size_tokens.max(1));
-        let mut candidate = token_count.saturating_sub(1);
-        while candidate >= self.min_tokens {
-            counts.push(candidate);
-            if candidate == self.min_tokens {
+        let mut counts: Vec<u64> = Vec::new();
+        let floor = (token_count / page) * page;
+        if floor < min_t {
+            return vec![token_count];
+        }
+        if token_count > floor {
+            counts.push(token_count);
+        }
+        let mut c = floor;
+        while c >= min_t {
+            counts.push(c);
+            if c == min_t {
                 break;
             }
-            let next = candidate.saturating_sub(stride);
-            candidate = next.max(self.min_tokens);
+            c = c.saturating_sub(page).max(min_t);
         }
         counts.sort_unstable_by(|a, b| b.cmp(a));
         counts.dedup();
@@ -209,10 +224,7 @@ mod tests {
             page_size_tokens: 64,
         };
 
-        assert_eq!(
-            policy.candidate_token_counts(160),
-            vec![160, 159, 127, 95, 64]
-        );
+        assert_eq!(policy.candidate_token_counts(160), vec![160, 128, 64]);
     }
 
     #[test]
@@ -251,7 +263,7 @@ mod tests {
 
         assert_eq!(
             policy.record_candidate_token_counts(160),
-            vec![160, 159, 127, 95, 64]
+            vec![160, 128, 64]
         );
     }
 }
