@@ -3782,8 +3782,14 @@ name = "mesh-llm-api-server"
 version = "0.66.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "futures-util",
+ "iroh",
+ "iroh-relay",
  "mesh-llm-api-client",
+ "mesh-llm-host-runtime",
  "mesh-llm-node",
+ "serde_json",
  "tokio",
 ]
 
@@ -3878,7 +3884,6 @@ dependencies = [
  "keyring",
  "libc",
  "mdns-sd",
- "mesh-llm-api-server",
  "mesh-llm-client",
  "mesh-llm-guardrails",
  "mesh-llm-identity",

@@ -5,10 +5,42 @@ use crate::{
 };
 pub use mesh_llm_node::models::{CapabilityLevel, ModelCapabilities, ModelKind, ModelSource};
 use mesh_llm_node::serving::ServingController;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+#[cfg(feature = "host-runtime")]
+use mesh_llm_host_runtime::host_node::{
+    self, HostNode, HostNodeSpec, MeshNodeRole as HostNodeRole,
+    MeshQuicBindSelection as HostQuicBindSelection,
+};
+
+/// Mesh role for the SDK — mirrors `mesh-llm`'s `--client` flag.
+///
+/// Default is `Serve` (the binary's default surface). Pick `Client` for
+/// a no-GPU, no-model client-only node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshRole {
+    /// Serve a model (or join `--auto` as a serve candidate).
+    #[default]
+    Serve,
+    /// Client only — no GPU, no model.
+    Client,
+}
+
+/// QUIC bind selection for the in-process mesh node.
+///
+/// Defaults to ephemeral OS-chosen port on all interfaces, matching the
+/// CLI's default behaviour.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MeshQuicBind {
+    /// Optional bind IP.
+    pub ip: Option<std::net::IpAddr>,
+    /// Optional fixed UDP port (e.g. for NAT port forwarding).
+    pub port: Option<u16>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub enum DevicePolicy {
@@ -190,6 +222,16 @@ pub struct MeshNodeBuilder {
     serving_enabled: bool,
     device_policy: DevicePolicy,
     serving_controller: Option<Arc<dyn ServingController>>,
+    // Real in-process mesh-node knobs (used under the `host-runtime`
+    // feature). Kept here even without the feature so the builder API
+    // is stable across feature combinations; without `host-runtime` they
+    // are stored but ignored.
+    role: MeshRole,
+    relays: Vec<String>,
+    relay_auths: HashMap<String, String>,
+    quic_bind: MeshQuicBind,
+    max_vram_gb: Option<f64>,
+    no_enumerate_host: bool,
 }
 
 impl MeshNodeBuilder {
@@ -239,6 +281,51 @@ impl MeshNodeBuilder {
         self
     }
 
+    /// Set the mesh role. Equivalent to the binary's `--client` flag
+    /// (passing [`MeshRole::Client`]) or the default `serve` surface.
+    pub fn role(mut self, role: MeshRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Add an iroh relay URL. Equivalent to `mesh-llm … --relay <url>`,
+    /// callable multiple times. Without any call, the bundled default
+    /// relays are used.
+    pub fn relay(mut self, url: impl Into<String>) -> Self {
+        self.relays.push(url.into());
+        self
+    }
+
+    /// Per-relay bearer token for gated iroh relays. Equivalent to
+    /// `mesh-llm … --relay-auth URL=TOKEN`. The token is sent as
+    /// `Authorization: Bearer <TOKEN>` on the WebSocket upgrade to the
+    /// matching relay URL. Callable multiple times; only relays present
+    /// in the map use auth.
+    pub fn relay_auth(mut self, relay_url: impl Into<String>, token: impl Into<String>) -> Self {
+        self.relay_auths.insert(relay_url.into(), token.into());
+        self
+    }
+
+    /// QUIC bind selection (IP / fixed port).
+    pub fn quic_bind(mut self, bind: MeshQuicBind) -> Self {
+        self.quic_bind = bind;
+        self
+    }
+
+    /// VRAM cap in GB used for planning and mesh advertisement.
+    /// `Some(0.0)` for client-only nodes.
+    pub fn max_vram_gb(mut self, gb: f64) -> Self {
+        self.max_vram_gb = Some(gb);
+        self
+    }
+
+    /// Disable broadcasting GPU name, hostname, VRAM, and reserved
+    /// bytes to peers. Equivalent to `mesh-llm … --no-enumerate-host`.
+    pub fn no_enumerate_host(mut self, no_enumerate: bool) -> Self {
+        self.no_enumerate_host = no_enumerate;
+        self
+    }
+
     pub fn build(self) -> Result<MeshNode, MeshApiError> {
         let owner_keypair = self.owner_keypair.ok_or(MeshApiError::InvalidConfig {
             message: "MeshNode identity is required",
@@ -261,11 +348,23 @@ impl MeshNodeBuilder {
             device_policy: self.device_policy,
         };
 
+        let host_node_spec = HostNodeSpecHolder {
+            role: self.role,
+            relays: self.relays,
+            relay_auths: self.relay_auths,
+            quic_bind: self.quic_bind,
+            max_vram_gb: self.max_vram_gb,
+            enumerate_host: !self.no_enumerate_host,
+        };
+
         Ok(MeshNode {
             inner: Arc::new(MeshNodeInner {
                 client: Mutex::new(client),
                 config,
                 serving_controller: self.serving_controller,
+                host_node_spec,
+                #[cfg(feature = "host-runtime")]
+                host_node: Mutex::new(None),
             }),
         })
     }
@@ -283,14 +382,36 @@ impl Default for MeshNodeBuilder {
             serving_enabled: false,
             device_policy: DevicePolicy::Auto,
             serving_controller: None,
+            role: MeshRole::default(),
+            relays: Vec::new(),
+            relay_auths: HashMap::new(),
+            quic_bind: MeshQuicBind::default(),
+            max_vram_gb: None,
+            no_enumerate_host: false,
         }
     }
+}
+
+/// Captured-from-builder spec used by `start()` under the
+/// `host-runtime` feature. Stored unconditionally so the type layout
+/// doesn't shift across feature combinations.
+#[cfg_attr(not(feature = "host-runtime"), allow(dead_code))]
+struct HostNodeSpecHolder {
+    role: MeshRole,
+    relays: Vec<String>,
+    relay_auths: HashMap<String, String>,
+    quic_bind: MeshQuicBind,
+    max_vram_gb: Option<f64>,
+    enumerate_host: bool,
 }
 
 struct MeshNodeInner {
     client: Mutex<MeshClient>,
     config: MeshNodeConfig,
     serving_controller: Option<Arc<dyn ServingController>>,
+    host_node_spec: HostNodeSpecHolder,
+    #[cfg(feature = "host-runtime")]
+    host_node: Mutex<Option<HostNode>>,
 }
 
 #[derive(Clone)]
@@ -304,16 +425,79 @@ impl MeshNode {
     }
 
     pub async fn start(&self) -> Result<(), MeshApiError> {
-        self.inner.client.lock().await.join().await
+        #[cfg(feature = "host-runtime")]
+        {
+            let spec = HostNodeSpec {
+                role: match self.inner.host_node_spec.role {
+                    MeshRole::Client => HostNodeRole::Client,
+                    MeshRole::Serve => HostNodeRole::default(),
+                },
+                relays: self.inner.host_node_spec.relays.clone(),
+                relay_auths: self.inner.host_node_spec.relay_auths.clone(),
+                quic_bind: HostQuicBindSelection {
+                    ip: self.inner.host_node_spec.quic_bind.ip,
+                    port: self.inner.host_node_spec.quic_bind.port,
+                },
+                max_vram_gb: self.inner.host_node_spec.max_vram_gb,
+                enumerate_host: self.inner.host_node_spec.enumerate_host,
+            };
+            let node =
+                host_node::start_host_node(spec)
+                    .await
+                    .map_err(|err| MeshApiError::Serving {
+                        message: format!("host node start failed: {err}"),
+                    })?;
+            node.start_accepting();
+            *self.inner.host_node.lock().await = Some(node);
+            // Also flip the legacy HTTP-shim client's connected flag so
+            // status()/events() callers see a connected node. Harmless.
+            self.inner.client.lock().await.join().await
+        }
+        #[cfg(not(feature = "host-runtime"))]
+        {
+            // Touch the spec to silence dead-code on builds without the
+            // feature, and avoid surprising no-op stores.
+            let _ = &self.inner.host_node_spec;
+            self.inner.client.lock().await.join().await
+        }
     }
 
     pub async fn stop(&self) -> Result<(), MeshApiError> {
+        #[cfg(feature = "host-runtime")]
+        if let Some(node) = self.inner.host_node.lock().await.take() {
+            node.shutdown().await;
+        }
         self.inner.client.lock().await.disconnect().await;
         Ok(())
     }
 
     pub async fn reconnect(&self) -> Result<(), MeshApiError> {
         self.inner.client.lock().await.reconnect().await
+    }
+
+    /// Invite token other peers can use to join this node.
+    ///
+    /// Only meaningful when running under the `host-runtime` feature with
+    /// `start()` having been called. Without the feature, or before
+    /// `start()`, returns `None`.
+    #[cfg(feature = "host-runtime")]
+    pub async fn invite_token(&self) -> Option<String> {
+        self.inner
+            .host_node
+            .lock()
+            .await
+            .as_ref()
+            .map(|n| n.invite_token())
+    }
+
+    /// Set the display name advertised to peers.
+    ///
+    /// Only takes effect under the `host-runtime` feature after `start()`.
+    #[cfg(feature = "host-runtime")]
+    pub async fn set_display_name(&self, name: String) {
+        if let Some(node) = self.inner.host_node.lock().await.as_ref() {
+            node.set_display_name(name).await;
+        }
     }
 
     pub fn inference(&self) -> MeshInference {
