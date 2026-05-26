@@ -16,6 +16,7 @@ members = [
     "crates/mesh-llm-api-server",
     "crates/mesh-llm-node",
     "crates/mesh-llm-ffi",
+    "crates/mesh-llm-native-sdk",
     "crates/mesh-llm-nodejs",
     "crates/mesh-llm-test-harness",
     "crates/model-ref",

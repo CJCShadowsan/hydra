@@ -1,0 +1,33 @@
+[package]
+name = "mesh-llm-native-sdk"
+version.workspace = true
+edition = "2021"
+description = "Prebuilt native mesh-llm runtime: fetches libmeshllm_ffi from the GitHub release and links it for the consumer."
+license = "Apache-2.0"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+readme = "README.md"
+
+# Owns the link to libmeshllm_ffi for the entire crate graph. Cargo
+# enforces that no two crates share the same `links` value, which is
+# how we guarantee at most one copy of the prebuilt FFI is linked into
+# any given consumer binary.
+links = "meshllm_ffi"
+
+[features]
+# Default is "no backend selected"; build.rs will refuse to fetch unless
+# one of these is set. Mutually exclusive — only one may be enabled.
+default = []
+metal = []
+cpu = []
+cuda = []
+rocm = []
+vulkan = []
+
+[build-dependencies]
+# Use the system curl/tar via Command for the trial — zero new
+# dependencies. We can swap to a reqwest/zip stack later if needed.
+
+[dependencies]
+# Nothing yet — the crate's job today is purely to host the link.
+# Future revisions can add a thin Rust wrapper around the UniFFI ABI.
