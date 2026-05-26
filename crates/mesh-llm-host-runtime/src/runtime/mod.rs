@@ -3183,9 +3183,23 @@ async fn prepare_runtime_startup(
 }
 
 pub(crate) async fn run() -> Result<()> {
+    run_with_args(std::env::args_os()).await
+}
+
+/// Same as [`run`] but with a caller-supplied argv instead of
+/// `std::env::args_os()`. This is the SDK entry point for running a
+/// full mesh-llm runtime in-process — the binary's `main()` ultimately
+/// calls here with the real process argv, and SDK consumers can call it
+/// with an argv they build themselves (e.g. from a typed
+/// `crate::host_node::MeshServeSpec`).
+pub(crate) async fn run_with_args<I, S>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
     initialize_runtime_entrypoint()?;
 
-    let normalized_args = crate::cli::normalize_runtime_surface_args(std::env::args_os());
+    let normalized_args = crate::cli::normalize_runtime_surface_args(args);
     let mut cli = Cli::parse_from(normalized_args.normalized.clone());
     crate::cli::validate_discovery_mode_args(&cli)?;
     crate::cli::output::OutputManager::init_global(
