@@ -520,8 +520,8 @@ fn build_blackboard_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
         },
         on_mesh_event: move |event, context| {
             Box::pin(async move {
-                if event.kind() == mesh_llm_plugin::proto::mesh_event::Kind::PeerUp {
-                    if let Some(peer) = event.peer {
+                if event.kind() == mesh_llm_plugin::proto::mesh_event::Kind::PeerUp
+                    && let Some(peer) = event.peer {
                         context
                             .send_json_channel(
                                 BLACKBOARD_CHANNEL,
@@ -531,7 +531,6 @@ fn build_blackboard_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
                             )
                             .await?;
                     }
-                }
                 Ok(())
             })
         },

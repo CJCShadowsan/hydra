@@ -41,15 +41,15 @@ pub(crate) async fn run_blackboard(
         .get(format!("{base}/api/blackboard/feed?limit=1"))
         .send()
         .await;
-    if let Ok(resp) = feed_check {
-        if resp.status().as_u16() == 404 {
-            output.exit_code = Some(1);
-            output.stderr.push_str(
-                "Mesh is running but blackboard is disabled on that node.\n\
-                 Re-enable it in the mesh config if you want to use the blackboard plugin.\n",
-            );
-            return Ok(output);
-        }
+    if let Ok(resp) = feed_check
+        && resp.status().as_u16() == 404
+    {
+        output.exit_code = Some(1);
+        output.stderr.push_str(
+            "Mesh is running but blackboard is disabled on that node.\n\
+             Re-enable it in the mesh config if you want to use the blackboard plugin.\n",
+        );
+        return Ok(output);
     }
 
     let default_hours = 24.0;
