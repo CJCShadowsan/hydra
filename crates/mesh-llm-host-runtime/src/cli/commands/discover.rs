@@ -1,9 +1,34 @@
 use anyhow::Result;
+use mesh_llm_api_server::{discover_public_meshes, PublicMesh, PublicMeshQuery};
 
 use crate::mesh;
 use crate::network::{discovery, nostr};
-use crate::runtime;
 use crate::system::backend;
+
+/// Local lift from the SDK's `PublicMesh` shape into the host-runtime's
+/// `DiscoveredMesh`, which carries the `Display` impl + scoring helpers
+/// the CLI display uses. Field-by-field copy — the two structs are
+/// historically the same.
+fn lift_public_mesh(mesh: PublicMesh) -> nostr::DiscoveredMesh {
+    nostr::DiscoveredMesh {
+        listing: nostr::MeshListing {
+            invite_token: mesh.invite_token,
+            serving: mesh.serving,
+            wanted: mesh.wanted,
+            on_disk: mesh.on_disk,
+            total_vram_bytes: mesh.total_vram_bytes,
+            node_count: mesh.node_count,
+            client_count: mesh.client_count,
+            max_clients: mesh.max_clients,
+            name: mesh.name,
+            region: mesh.region,
+            mesh_id: mesh.mesh_id,
+        },
+        publisher_npub: mesh.publisher_npub,
+        published_at: mesh.published_at,
+        expires_at: mesh.expires_at,
+    }
+}
 
 pub(crate) struct DiscoverOptions {
     pub(crate) name: Option<String>,
@@ -45,10 +70,25 @@ async fn run_nostr_discover(
     auto_join: bool,
     relays: Vec<String>,
 ) -> Result<()> {
-    let relays = runtime::nostr_relays(&relays);
+    // Route the Nostr fetch through the SDK so the binary uses the
+    // same public surface external consumers do.
+    // `PublicMeshQuery` handles relay defaulting + target-name
+    // filtering equivalently to the previous direct nostr::discover
+    // call.
+    let query = PublicMeshQuery {
+        model: filter.model.clone(),
+        min_vram_gb: filter.min_vram_gb,
+        region: filter.region.clone(),
+        target_name: filter.name.clone(),
+        relays,
+    };
 
     eprintln!("🔍 Searching Nostr relays for mesh-llm meshes...");
-    let meshes = nostr::discover(&relays, &filter, None).await?;
+    let public_meshes = discover_public_meshes(query).await?;
+    // Convert back into the host-runtime `DiscoveredMesh` shape so the
+    // existing CLI display + scoring + Display impl stay intact.
+    let meshes: Vec<nostr::DiscoveredMesh> =
+        public_meshes.into_iter().map(lift_public_mesh).collect();
 
     if meshes.is_empty() {
         eprintln!("No meshes found.");

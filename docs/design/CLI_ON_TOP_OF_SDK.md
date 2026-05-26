@@ -121,39 +121,55 @@ Three changes, each tractable on its own:
 
 ### Change 1 — Domain commands route through the SDK
 
-`discover.rs`, `download.rs`, the models dispatcher, and the
-`blackboard.rs` post/search paths replace their `crate::network::*` and
-`crate::models::*` calls with `mesh_llm_api_server::MeshNode` and
-`mesh_llm_api_server::discover_public_meshes` calls.
+**Status: started on this branch.** `discover` is done; `download` and
+the `models` dispatcher are blocked on SDK extensions (see below).
 
-Concretely, `cli::commands::discover::run_nostr_discover` today does:
+#### Done: `discover`
 
-```rust
-let meshes = nostr::discover(&relays, &filter, None).await?;
-```
+`cli::commands::discover::run_nostr_discover` previously called
+`nostr::discover(&relays, &filter, None)` directly. Now it calls
+`mesh_llm_api_server::discover_public_meshes(PublicMeshQuery { ... })`
+and lifts each `PublicMesh` back into the host-runtime
+`DiscoveredMesh` shape via a small local helper so the existing CLI
+display + scoring + `Display` impl stay untouched.
 
-…and would become:
+Net effect: one fewer copy of "how to talk to Nostr." Same UX. The
+`mesh-llm discover [--name|--model|--min-vram|--region]` commands
+verified against the live public mesh, same output.
 
-```rust
-let meshes = mesh_llm_api_server::discover_public_meshes(
-    mesh_llm_api_server::PublicMeshQuery {
-        model: filter.model.clone(),
-        min_vram_gb: filter.min_vram_gb,
-        region: filter.region.clone(),
-        target_name: filter.name.clone(),
-        relays,
-    },
-).await?;
-```
+Diff: ~40 lines in one file (`cli/commands/discover.rs`), plus a
+standing `lift_public_mesh` helper. No core type changes, no Cargo.toml
+changes — `mesh-llm-host-runtime` already depended on
+`mesh-llm-api-server`.
 
-Same exact behaviour; one fewer copy of "how to talk to nostr."
+#### Blocked: `download`
 
-`download.rs` collapses from "find model in remote catalog, download
-with progress" into a single
-`MeshNode::models().download(model_ref).await?`.
+The CLI's `download` command uses
+`crate::models::download_model_ref_with_progress_details` which prints
+a live progress bar to the terminal. The SDK's
+`MeshNode::models().download(...)` exists but has no progress callback,
+so routing through it would silently lose the progress bar — a real
+UX regression.
 
-Each of these is a small, mechanical PR. They don't change CLI UX or
-output.
+Unblocker: extend `MeshModels::download` with an optional progress
+callback (e.g. `download_with_progress(model_ref, options, |progress|
+{ ... })`) before re-pointing the CLI. Separate small SDK PR.
+
+#### Blocked: `models` dispatcher
+
+The CLI's `models` subcommand (`search`, `installed`, `show`, `cleanup`,
+`prune`, `delete`, `certify`) reaches deep into host-runtime internals
+that have no SDK equivalent today: `installed_model_display_name`,
+`layered_package_layer_count_for_path`,
+`huggingface_identity_for_path`, `installed_model_capabilities`,
+`load_model_usage_record_for_path`, `find_model_path`,
+layer-package introspection, certification gate state, etc.
+
+Unblocker: substantially expand `MeshModels` to surface these (or accept
+that the CLI `models` subcommand stays bespoke because no external
+consumer wants this level of detail). Probably best left until an
+external consumer actually asks for it; the SDK shouldn't grow on
+speculation.
 
 ### Change 2 — `serve` and `client` route through `run_serve(MeshServeSpec)`
 
