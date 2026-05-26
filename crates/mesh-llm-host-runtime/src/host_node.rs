@@ -29,18 +29,25 @@
 //!
 //! ## What this does not do (yet)
 //!
-//! - It does not start the OpenAI HTTP proxy. That's the
-//!   `mesh-llm serve` runtime's responsibility and lives in
-//!   `crate::runtime`. An SDK consumer who wants the proxy should call
-//!   into [`run_with_args`][crate::run_with_args] with the relevant
-//!   flags; that path drives a full runtime including proxy + console.
 //! - It does not start local model serving. That requires plugging an
 //!   `EmbeddedServingController` from [`crate::sdk`] into the SDK's
-//!   `MeshNodeBuilder`.
+//!   `MeshNodeBuilder`. For client-only embedders (no GPU) this is
+//!   not needed — the OpenAI proxy still routes requests to remote
+//!   mesh peers serving the model.
+//! - It does not start auto-discovery (`--auto`) of public meshes.
+//!   Consumers can call [`HostNode::join`] with an invite token they
+//!   obtained out of band (e.g. through Nostr).
 
+use crate::api;
+use crate::inference::election;
 use crate::mesh::{self, NodeRole, QuicBindSelection, RelayConfig};
-use anyhow::Result;
+use crate::network::affinity::AffinityRouter;
+use crate::network::openai::ingress::api_proxy;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 /// Configuration for [`start_host_node`].
 ///
@@ -152,6 +159,125 @@ pub async fn start_host_node(spec: HostNodeSpec) -> Result<HostNode> {
 // the curated `host_node` namespace, NOT at the crate root, so we can
 // keep refactoring the underlying `mesh` module.
 pub use mesh::{NodeRole as MeshNodeRole, QuicBindSelection as MeshQuicBindSelection};
+
+/// Handle to a running in-process OpenAI HTTP proxy started by
+/// [`start_openai_proxy`].
+///
+/// Drop the handle (or call [`OpenAiProxyHandle::shutdown`]) to stop the
+/// proxy. While alive, requests against
+/// `http://{bound_addr}/v1/{chat/completions,models,…}` route to mesh
+/// peers via the underlying `HostNode`'s gossip + QUIC transport.
+pub struct OpenAiProxyHandle {
+    addr: SocketAddr,
+    task: JoinHandle<()>,
+    /// Held so the no-op runtime-control receiver isn't dropped while the
+    /// proxy is alive (the proxy sends control requests on this channel;
+    /// dropping the receiver would close the sender and surface spurious
+    /// errors). Drained on a background task.
+    _control_drain: JoinHandle<()>,
+}
+
+impl OpenAiProxyHandle {
+    /// The local address the proxy is bound to. When the embedder asks for
+    /// port 0 this is the OS-assigned ephemeral port.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Base URL suitable for OpenAI-compatible client libraries.
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Stop the proxy task. Idempotent; safe to call after drop().
+    pub fn shutdown(&self) {
+        self.task.abort();
+        self._control_drain.abort();
+    }
+}
+
+impl Drop for OpenAiProxyHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+        self._control_drain.abort();
+    }
+}
+
+/// Start an OpenAI-compatible HTTP proxy that fronts a [`HostNode`].
+///
+/// Equivalent to the `--port` slice of `mesh-llm serve` / `mesh-llm
+/// client`: binds a TCP listener, accepts HTTP connections, parses
+/// requests, and routes them to mesh peers that advertise the requested
+/// model in gossip. Suitable for client-only embedders (no local
+/// serving) and for embedders that have plugged a `ServingController`
+/// into their `MeshNode` for local inference.
+///
+/// Returns once the listener is bound; the proxy keeps running in a
+/// background task until [`OpenAiProxyHandle::shutdown`] or drop.
+///
+/// The `port = 0` case is supported and asks the OS for an ephemeral
+/// port; read it from [`OpenAiProxyHandle::local_addr`] after this call
+/// returns.
+pub async fn start_openai_proxy(
+    node: &HostNode,
+    port: u16,
+    listen_all: bool,
+) -> Result<OpenAiProxyHandle> {
+    let bind_addr = if listen_all {
+        format!("0.0.0.0:{port}")
+    } else {
+        format!("127.0.0.1:{port}")
+    };
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("binding OpenAI proxy to {bind_addr}"))?;
+    let local_addr = listener
+        .local_addr()
+        .context("reading OpenAI proxy local addr")?;
+
+    // Targets watch channel: starts empty. Routing to remote peers does
+    // not read this — it reads `node.hosts_for_model()` at request time.
+    // The channel only matters if the embedder later wires local serving
+    // through `crate::sdk::EmbeddedServingController`.
+    let (_target_tx, target_rx) = watch::channel(election::ModelTargets::default());
+
+    // Runtime-control channel: the proxy sends model load/unload commands
+    // here. Embedders without local serving have no one to handle these,
+    // so spawn a background drain that just logs and discards.
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<api::RuntimeControlRequest>();
+    let control_drain = tokio::spawn(async move {
+        // Discard with a single line per request. We deliberately don't
+        // {:?} the request because RuntimeControlRequest doesn't impl
+        // Debug and is an internal type the SDK shouldn't widen for a
+        // background log line.
+        while control_rx.recv().await.is_some() {
+            tracing::debug!(
+                "SDK-mode OpenAI proxy received a runtime-control request with no handler attached; discarding"
+            );
+        }
+    });
+
+    let affinity = AffinityRouter::new();
+    let node_for_proxy = node.inner.clone();
+    let task = tokio::spawn(async move {
+        api_proxy(
+            node_for_proxy,
+            local_addr.port(),
+            target_rx,
+            control_tx,
+            Some(listener),
+            listen_all,
+            affinity,
+        )
+        .await;
+    });
+
+    Ok(OpenAiProxyHandle {
+        addr: local_addr,
+        task,
+        _control_drain: control_drain,
+    })
+}
 
 #[cfg(test)]
 mod tests {

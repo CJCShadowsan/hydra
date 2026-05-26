@@ -232,6 +232,8 @@ pub struct MeshNodeBuilder {
     quic_bind: MeshQuicBind,
     max_vram_gb: Option<f64>,
     no_enumerate_host: bool,
+    openai_port: Option<u16>,
+    openai_listen_all: bool,
 }
 
 impl MeshNodeBuilder {
@@ -326,6 +328,25 @@ impl MeshNodeBuilder {
         self
     }
 
+    /// Bind an OpenAI-compatible HTTP proxy on this port when the node
+    /// starts. Equivalent to `mesh-llm … --port <port>`. Use `0` for an
+    /// OS-assigned ephemeral port; read it back from
+    /// [`MeshNode::openai_base_url`] after `start()`.
+    ///
+    /// Only honoured under the `host-runtime` feature. Without the
+    /// feature this setter is a no-op.
+    pub fn openai_port(mut self, port: u16) -> Self {
+        self.openai_port = Some(port);
+        self
+    }
+
+    /// Bind the OpenAI proxy on `0.0.0.0` instead of `127.0.0.1`.
+    /// Equivalent to `mesh-llm … --listen-all`. Default `false`.
+    pub fn openai_listen_all(mut self, listen_all: bool) -> Self {
+        self.openai_listen_all = listen_all;
+        self
+    }
+
     pub fn build(self) -> Result<MeshNode, MeshApiError> {
         let owner_keypair = self.owner_keypair.ok_or(MeshApiError::InvalidConfig {
             message: "MeshNode identity is required",
@@ -355,6 +376,8 @@ impl MeshNodeBuilder {
             quic_bind: self.quic_bind,
             max_vram_gb: self.max_vram_gb,
             enumerate_host: !self.no_enumerate_host,
+            openai_port: self.openai_port,
+            openai_listen_all: self.openai_listen_all,
         };
 
         Ok(MeshNode {
@@ -365,6 +388,8 @@ impl MeshNodeBuilder {
                 host_node_spec,
                 #[cfg(feature = "host-runtime")]
                 host_node: Mutex::new(None),
+                #[cfg(feature = "host-runtime")]
+                openai_proxy: Mutex::new(None),
             }),
         })
     }
@@ -388,6 +413,8 @@ impl Default for MeshNodeBuilder {
             quic_bind: MeshQuicBind::default(),
             max_vram_gb: None,
             no_enumerate_host: false,
+            openai_port: None,
+            openai_listen_all: false,
         }
     }
 }
@@ -403,6 +430,8 @@ struct HostNodeSpecHolder {
     quic_bind: MeshQuicBind,
     max_vram_gb: Option<f64>,
     enumerate_host: bool,
+    openai_port: Option<u16>,
+    openai_listen_all: bool,
 }
 
 struct MeshNodeInner {
@@ -412,6 +441,8 @@ struct MeshNodeInner {
     host_node_spec: HostNodeSpecHolder,
     #[cfg(feature = "host-runtime")]
     host_node: Mutex<Option<HostNode>>,
+    #[cfg(feature = "host-runtime")]
+    openai_proxy: Mutex<Option<mesh_llm_host_runtime::host_node::OpenAiProxyHandle>>,
 }
 
 #[derive(Clone)]
@@ -454,6 +485,21 @@ impl MeshNode {
                 });
             }
             node.start_accepting();
+
+            // Spin up the OpenAI HTTP proxy if the builder asked for one.
+            // Equivalent to `mesh-llm … --port <port>`. Routes inference
+            // requests to mesh peers serving the requested model.
+            if let Some(port) = self.inner.host_node_spec.openai_port {
+                let listen_all = self.inner.host_node_spec.openai_listen_all;
+                let handle =
+                    mesh_llm_host_runtime::host_node::start_openai_proxy(&node, port, listen_all)
+                        .await
+                        .map_err(|err| MeshApiError::Serving {
+                            message: format!("openai proxy bind failed: {err}"),
+                        })?;
+                *self.inner.openai_proxy.lock().await = Some(handle);
+            }
+
             *self.inner.host_node.lock().await = Some(node);
             // Also flip the legacy HTTP-shim client's connected flag so
             // status()/events() callers see a connected node. Harmless.
@@ -470,8 +516,13 @@ impl MeshNode {
 
     pub async fn stop(&self) -> Result<(), MeshApiError> {
         #[cfg(feature = "host-runtime")]
-        if let Some(node) = self.inner.host_node.lock().await.take() {
-            node.shutdown().await;
+        {
+            if let Some(proxy) = self.inner.openai_proxy.lock().await.take() {
+                proxy.shutdown();
+            }
+            if let Some(node) = self.inner.host_node.lock().await.take() {
+                node.shutdown().await;
+            }
         }
         self.inner.client.lock().await.disconnect().await;
         Ok(())
@@ -494,6 +545,25 @@ impl MeshNode {
             .await
             .as_ref()
             .map(|n| n.invite_token())
+    }
+
+    /// Base URL of the in-process OpenAI HTTP proxy started via
+    /// [`MeshNodeBuilder::openai_port`].
+    ///
+    /// Returns `None` if the builder didn't request a proxy or
+    /// `start()` has not been called. The returned URL is the value SDK
+    /// consumers feed to any OpenAI-compatible client library to route
+    /// inference requests through the mesh.
+    ///
+    /// Only meaningful under the `host-runtime` feature.
+    #[cfg(feature = "host-runtime")]
+    pub async fn openai_base_url(&self) -> Option<String> {
+        self.inner
+            .openai_proxy
+            .lock()
+            .await
+            .as_ref()
+            .map(|p| p.base_url())
     }
 
     /// Set the display name advertised to peers.
