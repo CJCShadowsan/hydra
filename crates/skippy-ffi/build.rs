@@ -23,16 +23,14 @@ fn main() {
     // unaffected.
     if std::env::var("SKIPPY_LLAMA_BUILD_DIR").is_err()
         && std::env::var("LLAMA_STAGE_BUILD_DIR").is_err()
+        && let Ok(url) = std::env::var("SKIPPY_LLAMA_TARBALL_URL")
+        && !url.is_empty()
     {
-        if let Ok(url) = std::env::var("SKIPPY_LLAMA_TARBALL_URL") {
-            if !url.is_empty() {
-                let build_dir = fetch_and_extract_llama_stage(&url);
-                // Safety: setting env vars at the start of build.rs before any
-                // thread spawn is OK; build scripts are single-threaded by
-                // convention.
-                unsafe { std::env::set_var("SKIPPY_LLAMA_BUILD_DIR", &build_dir) };
-            }
-        }
+        let build_dir = fetch_and_extract_llama_stage(&url);
+        // Safety: setting env vars at the start of build.rs before any
+        // thread spawn is OK; build scripts are single-threaded by
+        // convention.
+        unsafe { std::env::set_var("SKIPPY_LLAMA_BUILD_DIR", &build_dir) };
     }
 
     let link_mode =

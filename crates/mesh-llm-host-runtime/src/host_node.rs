@@ -538,91 +538,13 @@ pub async fn run_serve(spec: MeshServeSpec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::endpoint::{presets, Endpoint, RelayMode};
-    use iroh::SecretKey;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-    use std::time::Duration;
 
-    fn free_local_udp_port() -> u16 {
-        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .expect("allocate local UDP port");
-        socket.local_addr().expect("read local UDP port").port()
-    }
-
-    async fn probe_quic_port_released(port: u16) -> anyhow::Result<()> {
-        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let mut last_error = None;
-
-        for _ in 0..20 {
-            match Endpoint::builder(presets::Minimal)
-                .secret_key(SecretKey::generate())
-                .relay_mode(RelayMode::Disabled)
-                .bind_addr(bind_addr)?
-                .bind()
-                .await
-            {
-                Ok(endpoint) => {
-                    endpoint.close().await;
-                    return Ok(());
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "host-node shutdown should release UDP port {port}: {:?}",
-            last_error
-        ))
-    }
-
-    #[tokio::test]
-    async fn id_returns_bare_hex_endpoint_id() -> anyhow::Result<()> {
-        let inner = mesh::Node::new_for_tests(mesh::NodeRole::Client).await?;
-        let expected = inner.id().to_string();
-        let node = HostNode { inner };
-
-        assert_eq!(node.id(), expected);
-        assert!(!node.id().contains("PublicKey"));
-
-        node.shutdown().await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_closes_the_mesh_endpoint() -> anyhow::Result<()> {
-        let inner = mesh::Node::new_for_tests(mesh::NodeRole::Client).await?;
-        let node = HostNode { inner };
-
-        node.shutdown().await;
-
-        assert!(node.inner.endpoint_is_closed_for_tests());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shutdown_releases_fixed_quic_bind() -> anyhow::Result<()> {
-        let quic_port = free_local_udp_port();
-        let node = start_host_node(HostNodeSpec {
-            role: MeshNodeRole::Client,
-            quic_bind: MeshQuicBindSelection {
-                ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                port: Some(quic_port),
-            },
-            max_vram_gb: Some(0.0),
-            enumerate_host: false,
-            ..HostNodeSpec::default()
-        })
-        .await?;
-
-        node.start_accepting();
-        node.shutdown().await;
-        drop(node);
-
-        probe_quic_port_released(quic_port).await
-    }
+    // The bare-hex `HostNode::id()` shape and the QUIC-bind release on
+    // shutdown both depend on follow-up polish that lives on the
+    // separate gated-relay PR (the same one that adds
+    // `Node::endpoint_is_closed_for_tests`). The runtime-lifecycle tests
+    // and their UDP-port test helpers come back once that work is on
+    // main.
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
@@ -686,14 +608,10 @@ mod tests {
         assert_eq!(cli.port, 9337);
         assert_eq!(cli.console, 3131);
         assert!(cli.headless);
-        assert_eq!(cli.relay, vec!["https://gated.example/".to_string()]);
-        assert_eq!(
-            cli.relay_auth,
-            vec![(
-                "https://gated.example/".to_string(),
-                "bearer-abc".to_string()
-            )],
-        );
+        assert_eq!(cli.relay, vec!["https://public.example/".to_string()]);
+        // The corresponding cli.relay_auth assertion lands once the
+        // gated-relay PR adds the `--relay-auth URL=TOKEN` flag back
+        // to the Clap surface.
         assert_eq!(cli.bind_port, Some(45000));
         assert_eq!(cli.max_vram, Some(0.0));
         assert!(cli.no_enumerate_host);
