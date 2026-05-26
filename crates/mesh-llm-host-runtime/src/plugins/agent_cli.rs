@@ -608,14 +608,27 @@ fn load_existing_config(path: &std::path::Path) -> Result<serde_json::Value> {
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let config: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse {} as JSON", path.display()))?;
+    let config: serde_json::Value = parse_config_content(path, &content)?;
 
     if !config.is_object() {
         anyhow::bail!("Expected {} to contain a JSON object", path.display());
     }
 
     Ok(config)
+}
+
+fn parse_config_content(path: &std::path::Path, content: &str) -> Result<serde_json::Value> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("jsonc") {
+        json5::from_str(content).with_context(|| {
+            format!(
+                "Failed to parse {} as JSONC-compatible OpenCode config",
+                path.display()
+            )
+        })
+    } else {
+        serde_json::from_str(content)
+            .with_context(|| format!("Failed to parse {} as JSON", path.display()))
+    }
 }
 
 fn provider_map_mut<'a>(
@@ -839,11 +852,7 @@ fn resolve_opencode_config_path_from_home(
         return Ok(json_path);
     }
     if jsonc_path.exists() {
-        anyhow::bail!(
-            "Found {} but mesh-llm only writes opencode.json. Rename or migrate it to {} and rerun `mesh-llm opencode --write`.",
-            jsonc_path.display(),
-            json_path.display()
-        );
+        return Ok(jsonc_path);
     }
 
     Ok(json_path)
@@ -1795,19 +1804,44 @@ mod tests {
     }
 
     #[test]
-    fn resolve_opencode_config_path_rejects_jsonc_only_configs() {
+    fn resolve_opencode_config_path_accepts_jsonc_only_configs() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let config_dir = temp_dir.path().join(".config").join("opencode");
         std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
         let jsonc_path = config_dir.join("opencode.jsonc");
         std::fs::write(&jsonc_path, "{/* comments */}").expect("failed to write jsonc config");
 
-        let err = resolve_opencode_config_path_from_home(temp_dir.path())
-            .expect_err("jsonc-only config should be rejected");
-        let rendered = err.to_string();
+        let resolved =
+            resolve_opencode_config_path_from_home(temp_dir.path()).expect("jsonc should resolve");
 
-        assert!(rendered.contains("only writes opencode.json"));
-        assert!(rendered.contains("Rename or migrate"));
+        assert_eq!(resolved, jsonc_path);
+    }
+
+    #[test]
+    fn opencode_write_accepts_jsonc_config_with_comments_and_trailing_commas() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let config_path = temp_dir.path().join("opencode.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{
+              // Existing OpenCode setting
+              "$schema": "https://opencode.ai/config.json",
+              "theme": "opencode",
+            }"#,
+        )
+        .expect("failed to write jsonc config");
+
+        write_config(
+            &config_path,
+            &["Qwen3.5-27B".to_string()],
+            LOCAL_OPENCODE_HOST,
+        )
+        .expect("jsonc config should be updated");
+
+        let content = std::fs::read_to_string(&config_path).expect("failed to read config");
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("written JSON");
+        assert_eq!(parsed["theme"], "opencode");
+        assert!(parsed["provider"]["mesh"].is_object());
     }
 
     #[test]
