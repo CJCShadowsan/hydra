@@ -458,6 +458,16 @@ impl MeshNode {
     pub async fn start(&self) -> Result<(), MeshApiError> {
         #[cfg(feature = "host-runtime")]
         {
+            // Idempotency guard: if the host node is already running,
+            // calling start() again would otherwise spawn a second iroh
+            // endpoint (and possibly a second OpenAI proxy bind on the
+            // same port, which would just fail) and orphan the first —
+            // stop() only tracks the most recent one. Cheap to make
+            // this a no-op.
+            if self.inner.host_node.lock().await.is_some() {
+                return Ok(());
+            }
+
             let spec = HostNodeSpec {
                 role: match self.inner.host_node_spec.role {
                     MeshRole::Client => HostNodeRole::Client,

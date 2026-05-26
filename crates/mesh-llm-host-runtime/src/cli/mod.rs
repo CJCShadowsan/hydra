@@ -513,8 +513,14 @@ pub(crate) struct Cli {
     ///
     /// Splits on the first `=` only, so tokens may contain `=` (base64
     /// padding, JWTs, etc.).
-    #[arg(long = "relay-auth", value_parser = parse_relay_auth_pair, hide = true)]
-    pub(crate) relay_auth: Vec<(String, String)>,
+    ///
+    /// Parsed opaquely by Clap; validation/splitting happens via
+    /// [`Cli::parse_relay_auths`] so we control the error output and
+    /// can guarantee bearer tokens never appear in failure messages
+    /// (Clap's default `invalid value '...' for '--relay-auth'` would
+    /// echo the full URL=TOKEN input on parse failure).
+    #[arg(long = "relay-auth", hide = true)]
+    pub(crate) relay_auth: Vec<String>,
 
     /// Bind QUIC to a fixed UDP port (for NAT port forwarding).
     #[arg(long, hide = true)]
@@ -575,6 +581,24 @@ pub(crate) struct Cli {
     /// Internal: set when this node joined via Nostr discovery (not --join).
     #[arg(skip)]
     pub(crate) nostr_discovery: bool,
+}
+
+impl Cli {
+    /// Split each `--relay-auth URL=TOKEN` entry into a `(url, token)`
+    /// pair, validating that both sides are present.
+    ///
+    /// On failure, the error message redacts the token portion of the
+    /// input. This is the contract the CLI surface promises: bearer
+    /// tokens never leak into terminal output, logs, or bug reports,
+    /// even on misconfiguration. (The opaque `Vec<String>` Clap field
+    /// exists specifically so Clap's default `invalid value '...'`
+    /// error path can never echo the secret.)
+    pub(crate) fn parse_relay_auths(&self) -> anyhow::Result<Vec<(String, String)>> {
+        self.relay_auth
+            .iter()
+            .map(|raw| parse_relay_auth_pair(raw).map_err(anyhow::Error::msg))
+            .collect()
+    }
 }
 
 pub(crate) fn validate_discovery_mode_args(cli: &Cli) -> anyhow::Result<()> {
@@ -1220,10 +1244,16 @@ mod tests {
         );
 
         // And the resulting argv must actually parse cleanly through Clap so
-        // the relay-auth value reaches `Cli::relay_auth`.
+        // the relay-auth value reaches `Cli::relay_auth`, and the
+        // post-Clap split via parse_relay_auths() yields the expected
+        // (url, token) pair.
         let cli = Cli::try_parse_from(&normalized.normalized).expect("clap parse");
         assert_eq!(
             cli.relay_auth,
+            vec!["https://gated.example/=token".to_string()],
+        );
+        assert_eq!(
+            cli.parse_relay_auths().expect("parse pair"),
             vec![("https://gated.example/".to_string(), "token".to_string())],
         );
     }
@@ -1245,6 +1275,10 @@ mod tests {
         assert!(cli.client, "client surface flag should be set");
         assert_eq!(
             cli.relay_auth,
+            vec!["https://gated.example/=eyJhbGciOiJFZERTQSJ9.payload==".to_string()],
+        );
+        assert_eq!(
+            cli.parse_relay_auths().expect("parse pair"),
             vec![(
                 "https://gated.example/".to_string(),
                 "eyJhbGciOiJFZERTQSJ9.payload==".to_string()

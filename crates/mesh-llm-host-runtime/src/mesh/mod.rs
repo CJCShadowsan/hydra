@@ -436,13 +436,30 @@ fn relay_map_from_urls(
     urls: &[String],
     auths: &std::collections::HashMap<String, String>,
 ) -> Result<iroh::RelayMap> {
+    // Canonicalise auth-map keys via `iroh::RelayUrl` parse so logically
+    // equivalent URLs match (e.g. `https://x.example/` vs `https://x.example`).
+    // Without this, a user-supplied auth keyed by `https://x.example` would
+    // be silently dropped when `urls` contains `https://x.example/`,
+    // causing a gated relay to reject the registration.
+    //
+    // Invalid auth keys are surfaced as Err so misconfiguration is loud
+    // rather than silent.
+    let mut canonical_auths: std::collections::HashMap<iroh::RelayUrl, &String> =
+        std::collections::HashMap::with_capacity(auths.len());
+    for (raw_url, token) in auths {
+        let canonical: iroh::RelayUrl = raw_url
+            .parse()
+            .with_context(|| format!("invalid relay-auth URL `{raw_url}`"))?;
+        canonical_auths.insert(canonical, token);
+    }
+
     let configs = urls.iter().map(|url| {
-        let parsed = url
+        let parsed: iroh::RelayUrl = url
             .parse()
             .with_context(|| format!("invalid relay URL `{url}`"))?;
-        let cfg = iroh::RelayConfig::new(parsed, None);
-        Ok(match auths.get(url) {
-            Some(token) => cfg.with_auth_token(token.clone()),
+        let cfg = iroh::RelayConfig::new(parsed.clone(), None);
+        Ok(match canonical_auths.get(&parsed) {
+            Some(token) => cfg.with_auth_token((*token).clone()),
             None => cfg,
         })
     });
@@ -482,6 +499,46 @@ mod relay_map_tests {
         let cfgs = configs(&map);
         assert_eq!(cfgs.len(), 1);
         assert_eq!(cfgs[0].auth_token.as_deref(), Some("nip98-bearer"));
+    }
+
+    #[test]
+    fn auth_token_matches_canonicalised_url_with_or_without_trailing_slash() {
+        // Regression: relay_map_from_urls used to do a raw string lookup
+        // on the auths map, so `auths={"https://x/":token}` would silently
+        // miss `urls=["https://x"]`. A gated relay would then reject the
+        // registration with no clear signal. Canonicalising via
+        // iroh::RelayUrl normalises both sides.
+        let urls = vec!["https://gated.example".to_string()]; // no trailing /
+        let mut auths = HashMap::new();
+        auths.insert("https://gated.example/".to_string(), "bearer".into()); // with /
+
+        let map = relay_map_from_urls(&urls, &auths).expect("relay map");
+        let cfgs = configs(&map);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(
+            cfgs[0].auth_token.as_deref(),
+            Some("bearer"),
+            "trailing-slash variation must still match the auth token"
+        );
+    }
+
+    #[test]
+    fn malformed_relay_auth_key_surfaces_as_error() {
+        // Misconfigured auth keys should be loud, not silent. Without
+        // canonicalisation a bad key would just fail to match any URL
+        // and the gated relay would reject us without context. Now the
+        // build returns an Err naming the offending key.
+        let urls = vec!["https://gated.example/".to_string()];
+        let mut auths = HashMap::new();
+        auths.insert("not a url".to_string(), "bearer".into());
+
+        let err =
+            relay_map_from_urls(&urls, &auths).expect_err("malformed auth key must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid relay-auth URL") && msg.contains("not a url"),
+            "error should name the offending auth key: {msg}"
+        );
     }
 
     #[test]

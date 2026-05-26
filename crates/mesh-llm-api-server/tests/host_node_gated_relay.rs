@@ -36,9 +36,23 @@ async fn spawn_gated_relay(expected_token: &'static str) -> (String, iroh_relay:
     (relay_url.to_string(), server)
 }
 
-async fn anchor_invite_token() -> (String, mesh_llm_host_runtime::host_node::HostNode) {
+/// Start an anchor `HostNode` pointed at the given relay so the test
+/// stays offline / deterministic. Without an explicit relay, the anchor
+/// would fall back to the bundled public relays and depend on the
+/// internet being reachable. Optionally takes an auth token if the
+/// target relay is gated (`AccessConfig::Restricted`).
+async fn anchor_on_relay(
+    relay_url: &str,
+    relay_token: Option<&str>,
+) -> (String, mesh_llm_host_runtime::host_node::HostNode) {
+    let mut relay_auths = std::collections::HashMap::new();
+    if let Some(token) = relay_token {
+        relay_auths.insert(relay_url.to_string(), token.to_string());
+    }
     let anchor = start_host_node(HostNodeSpec {
         role: MeshNodeRole::Client,
+        relays: vec![relay_url.to_string()],
+        relay_auths,
         max_vram_gb: Some(0.0),
         enumerate_host: false,
         ..HostNodeSpec::default()
@@ -86,7 +100,7 @@ async fn probe_quic_port_released(port: u16) {
 async fn mesh_node_builder_threads_relay_auth_to_real_iroh_endpoint() {
     const TOKEN: &str = "secret-bearer-token";
     let (gated_url, _server) = spawn_gated_relay(TOKEN).await;
-    let (invite, anchor) = anchor_invite_token().await;
+    let (invite, anchor) = anchor_on_relay(&gated_url, Some(TOKEN)).await;
     let invite_token: InviteToken = invite.parse().expect("parse invite");
 
     let node = MeshNode::builder()

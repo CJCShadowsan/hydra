@@ -54,7 +54,12 @@ use tokio::task::JoinHandle;
 /// Field shape mirrors the slice of `mesh-llm`'s CLI flags that
 /// `crate::mesh::Node::start` consumes. New fields here track new CLI
 /// flags as they get added.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` is implemented manually and redacts every `relay_auths` token
+/// (keys are still printed). This mirrors the token redaction in the
+/// CLI parser so panics, log lines, and other `{:?}` outputs never
+/// expose bearer credentials.
+#[derive(Clone, Default)]
 pub struct HostNodeSpec {
     /// Mesh role.
     pub role: NodeRole,
@@ -71,6 +76,34 @@ pub struct HostNodeSpec {
     pub max_vram_gb: Option<f64>,
     /// Whether to publish a hardware survey to gossip.
     pub enumerate_host: bool,
+}
+
+impl std::fmt::Debug for HostNodeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostNodeSpec")
+            .field("role", &self.role)
+            .field("relays", &self.relays)
+            .field("relay_auths", &RedactedAuthMap(&self.relay_auths))
+            .field("quic_bind", &self.quic_bind)
+            .field("max_vram_gb", &self.max_vram_gb)
+            .field("enumerate_host", &self.enumerate_host)
+            .finish()
+    }
+}
+
+/// Helper that renders a `relay_auths` map with token values replaced
+/// by `<redacted>` and a length hint. Keys (relay URLs) are public.
+struct RedactedAuthMap<'a>(&'a HashMap<String, String>);
+
+impl std::fmt::Debug for RedactedAuthMap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut m = f.debug_map();
+        for (url, token) in self.0 {
+            m.key(url);
+            m.value(&format_args!("<redacted {} bytes>", token.len()));
+        }
+        m.finish()
+    }
 }
 
 /// A running mesh node started by [`start_host_node`].
@@ -290,7 +323,11 @@ pub async fn start_openai_proxy(
 /// path `mesh-llm serve` / `mesh-llm client` use. That means election,
 /// tunnel manager, OpenAI proxy, management console, auto-discovery,
 /// local model serving, plugin host — everything the binary does.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` is implemented manually and redacts every `relay_auths`
+/// token (keys are still printed) so bearer credentials never appear
+/// in log/panic output.
+#[derive(Clone, Default)]
 pub struct MeshServeSpec {
     /// Run as a client only (no GPU, no model). Maps to `--client`.
     pub client: bool,
@@ -363,6 +400,43 @@ pub struct MeshServeSpec {
     /// Extra raw argv flags for anything this struct doesn't yet
     /// expose typed. Inserted after the typed flags. Use sparingly.
     pub extra_args: Vec<String>,
+}
+
+impl std::fmt::Debug for MeshServeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshServeSpec")
+            .field("client", &self.client)
+            .field("auto", &self.auto)
+            .field("publish", &self.publish)
+            .field("mesh_name", &self.mesh_name)
+            .field("region", &self.region)
+            .field("display_name", &self.display_name)
+            .field("join", &self.join)
+            .field("discover", &self.discover)
+            .field("models", &self.models)
+            .field("ggufs", &self.ggufs)
+            .field("mmproj", &self.mmproj)
+            .field("port", &self.port)
+            .field("console_port", &self.console_port)
+            .field("headless", &self.headless)
+            .field("blackboard", &self.blackboard)
+            .field("relays", &self.relays)
+            .field("relay_auths", &RedactedAuthMap(&self.relay_auths))
+            .field("nostr_relays", &self.nostr_relays)
+            .field("bind_port", &self.bind_port)
+            .field("bind_ip", &self.bind_ip)
+            .field("listen_all", &self.listen_all)
+            .field("max_vram_gb", &self.max_vram_gb)
+            .field("no_enumerate_host", &self.no_enumerate_host)
+            .field("config", &self.config)
+            .field("owner_key", &self.owner_key)
+            .field("owner_required", &self.owner_required)
+            .field("node_label", &self.node_label)
+            .field("trust_owners", &self.trust_owners)
+            .field("debug", &self.debug)
+            .field("extra_args", &self.extra_args)
+            .finish()
+    }
 }
 
 impl MeshServeSpec {
@@ -713,6 +787,10 @@ mod tests {
         assert_eq!(cli.relay, vec!["https://gated.example/".to_string()]);
         assert_eq!(
             cli.relay_auth,
+            vec!["https://gated.example/=bearer-abc".to_string()],
+        );
+        assert_eq!(
+            cli.parse_relay_auths().expect("parse pair"),
             vec![(
                 "https://gated.example/".to_string(),
                 "bearer-abc".to_string()
