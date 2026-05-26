@@ -5,11 +5,35 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_LIB_DIR");
     println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_LINK_MODE");
+    println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_TARBALL_URL");
+    println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_TARBALL_SHA256");
+    println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_TARBALL_FLAVOR");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=LLVMInstallDir");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+
+    // External-consumer path: if SKIPPY_LLAMA_TARBALL_URL is set, download
+    // a prebuilt tarball containing the patched llama.cpp static archives,
+    // extract it to a stable per-user cache directory, and point
+    // SKIPPY_LLAMA_BUILD_DIR at the extracted root. The rest of this file
+    // then proceeds as if the consumer had run `just llama-build`
+    // themselves. Workspace-internal builds (no env var set) are
+    // unaffected.
+    if std::env::var("SKIPPY_LLAMA_BUILD_DIR").is_err()
+        && std::env::var("LLAMA_STAGE_BUILD_DIR").is_err()
+    {
+        if let Ok(url) = std::env::var("SKIPPY_LLAMA_TARBALL_URL") {
+            if !url.is_empty() {
+                let build_dir = fetch_and_extract_llama_stage(&url);
+                // Safety: setting env vars at the start of build.rs before any
+                // thread spawn is OK; build scripts are single-threaded by
+                // convention.
+                unsafe { std::env::set_var("SKIPPY_LLAMA_BUILD_DIR", &build_dir) };
+            }
+        }
+    }
 
     let link_mode =
         std::env::var("LLAMA_STAGE_LINK_MODE").or_else(|_| std::env::var("SKIPPY_LLAMA_LINK_MODE"));
@@ -201,6 +225,120 @@ fn main() {
             link_windows_vulkan_libs();
         }
     }
+}
+
+fn fetch_and_extract_llama_stage(url: &str) -> String {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let flavor = std::env::var("SKIPPY_LLAMA_TARBALL_FLAVOR").unwrap_or_else(|_| {
+        if target.contains("apple") { "metal".into() } else { "cpu".into() }
+    });
+    let artifact_id = format!("llama-stage-{target}-{flavor}");
+    let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+
+    let cache_root = std::env::var("SKIPPY_LLAMA_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".cache").join("skippy-llama-stage")
+        });
+    let cache_dir = cache_root.join(&version).join(&artifact_id);
+    std::fs::create_dir_all(&cache_dir).expect("create skippy-llama-stage cache dir");
+
+    let tarball_name = format!("{artifact_id}.tar.gz");
+    let tarball_path = cache_dir.join(&tarball_name);
+    let sha_path = cache_dir.join(format!("{tarball_name}.sha256"));
+
+    fetch_url(url, &tarball_path);
+    fetch_url(&format!("{url}.sha256"), &sha_path);
+
+    let expected_sha = std::env::var("SKIPPY_LLAMA_TARBALL_SHA256")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::fs::read_to_string(&sha_path)
+                .unwrap_or_else(|e| panic!("skippy-ffi: missing .sha256 sidecar at {} and SKIPPY_LLAMA_TARBALL_SHA256 not set: {e}", sha_path.display()))
+                .split_whitespace()
+                .next()
+                .expect("sha sidecar empty")
+                .to_string()
+        });
+    let actual_sha = sha256_of_file(&tarball_path);
+    assert_eq!(
+        actual_sha.to_lowercase(),
+        expected_sha.to_lowercase(),
+        "skippy-ffi: tarball sha256 mismatch: expected {expected_sha}, got {actual_sha}"
+    );
+
+    let extract_root = cache_dir.join("extracted");
+    if extract_root.exists() {
+        std::fs::remove_dir_all(&extract_root).expect("clean previous extract");
+    }
+    std::fs::create_dir_all(&extract_root).expect("create extract dir");
+    let status = Command::new("tar")
+        .arg("xzf")
+        .arg(&tarball_path)
+        .arg("-C")
+        .arg(&extract_root)
+        .status()
+        .expect("invoke tar");
+    assert!(status.success(), "skippy-ffi: tar extraction failed");
+
+    // Tarball layout: <artifact_id-without-flavor-suffix>/<llama build files>.
+    // We accept either `<target>-<flavor>/...` or a single top-level dir.
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&extract_root)
+        .expect("read extract root")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "skippy-ffi: expected exactly one top-level directory in tarball, got {}",
+        entries.len()
+    );
+    let build_dir = entries.remove(0);
+    build_dir.to_string_lossy().into_owned()
+}
+
+fn fetch_url(url: &str, dest: &std::path::Path) {
+    use std::process::Command;
+
+    if let Some(local) = url.strip_prefix("file://") {
+        if dest.exists() {
+            std::fs::remove_file(dest).ok();
+        }
+        let src = std::path::PathBuf::from(local);
+        if src.exists() {
+            std::fs::copy(&src, dest)
+                .unwrap_or_else(|e| panic!("skippy-ffi: failed to copy {}: {e}", src.display()));
+        }
+        return;
+    }
+    let status = Command::new("curl")
+        .args(["--fail", "--silent", "--show-error", "--location", "--retry", "5", "-o"])
+        .arg(dest)
+        .arg(url)
+        .status()
+        .expect("invoke curl");
+    assert!(status.success(), "skippy-ffi: curl failed to fetch {url}");
+}
+
+fn sha256_of_file(path: &std::path::Path) -> String {
+    let output = std::process::Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .expect("invoke shasum");
+    assert!(output.status.success(), "shasum failed");
+    String::from_utf8(output.stdout)
+        .expect("shasum utf8")
+        .split_whitespace()
+        .next()
+        .expect("shasum empty")
+        .to_string()
 }
 
 fn default_build_dir(workspace_root: &std::path::Path, target: &str) -> std::path::PathBuf {
