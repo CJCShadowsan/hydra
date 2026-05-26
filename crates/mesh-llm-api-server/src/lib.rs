@@ -23,8 +23,38 @@ pub use mesh_llm_node::serving::ServingController;
 /// management console, and local model serving (when configured) —
 /// without spawning the binary as a subprocess.
 ///
-/// See [`mesh_llm_host_runtime::host_node::run_serve`] for the full
-/// documentation.
+/// # Example
+///
+/// ```no_run
+/// use mesh_llm_api_server::{run_serve, MeshServeSpec};
+///
+/// # async fn run() -> anyhow::Result<()> {
+/// run_serve(MeshServeSpec {
+///     // Same flags `mesh-llm serve` / `mesh-llm client` accept.
+///     client: true,                       // false (default) = serve role
+///     auto: true,                         // == --auto
+///     relays: vec!["https://public.example/".into()],
+///     port: Some(9337),                   // OpenAI HTTP proxy port
+///     console_port: Some(3131),           // management API / web console
+///     headless: true,                     // skip embedded web UI
+///     max_vram_gb: Some(0.0),             // client-only, no VRAM advert
+///     ..MeshServeSpec::default()
+/// })
+/// .await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// (Gated iroh-relay support — per-relay bearer tokens via
+/// `--relay-auth URL=TOKEN` and a `relay_auths` field on
+/// `MeshServeSpec` — lives on the separate gated-relay PR.)
+///
+/// The future blocks until the runtime exits. The runtime is not
+/// currently `Send`-clean; if you need concurrent work, run on a
+/// `tokio::task::LocalSet` rather than `tokio::spawn`.
+///
+/// For finer-grained control — composing pieces without running the
+/// whole orchestration — see [`MeshNodeBuilder`] instead.
 #[cfg(feature = "host-runtime")]
 pub use mesh_llm_host_runtime::host_node::{run_serve, MeshServeSpec};
 pub use node::{

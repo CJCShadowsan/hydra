@@ -33,3 +33,48 @@ high-level serving errors.
 If an API is meant for client-only app integration, it belongs in
 `mesh-llm-api-client`. If it requires model management or local serving, it
 belongs in `mesh-llm-api-server`.
+
+## Running the full mesh-llm runtime in-process (`host-runtime` feature)
+
+For applications that want to run **exactly what `mesh-llm serve` /
+`mesh-llm client` does** — not just consume mesh inference, but be the
+running node — enable the `host-runtime` feature:
+
+```toml
+mesh-llm-api-server = { version = "0.66.0", features = ["host-runtime"] }
+```
+
+Then call `run_serve(MeshServeSpec { ... })`:
+
+```rust
+use mesh_llm_api_server::{run_serve, MeshServeSpec};
+
+run_serve(MeshServeSpec {
+    client: true,
+    auto: true,
+    relays: vec!["https://public.example/".into()],
+    port: Some(9337),
+    console_port: Some(3131),
+    headless: true,
+    max_vram_gb: Some(0.0),
+    ..Default::default()
+})
+.await?;
+```
+
+(Gated iroh-relay support — per-relay bearer tokens via `--relay-auth
+URL=TOKEN` and a `relay_auths` field on `MeshServeSpec` — lives on the
+separate gated-relay PR. Once that lands, this snippet will gain the
+`HashMap` shape used by `mesh-llm`'s CLI today.)
+
+This drives the same `runtime::run_with_args` entry point the binary
+uses. You get auto-discovery, election, tunnel manager, OpenAI HTTP
+proxy on `--port`, management console on `--console`, local model
+serving (when configured), plugin host — the entire mesh-llm runtime
+inside your process.
+
+`MeshNode::builder()` (`host-runtime` feature also required for the
+fine-grained options like `.relay(...)`) is the
+composable alternative for apps that want to wire pieces themselves
+rather than running the whole orchestration. See `docs/SDK.md` for the
+full comparison.
