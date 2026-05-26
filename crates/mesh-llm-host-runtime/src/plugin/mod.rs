@@ -39,8 +39,8 @@ pub(crate) use self::config::{
 #[allow(unused_imports)]
 pub use self::config::{
     GpuAssignment, GpuConfig, MeshConfig, ModelConfigEntry, PluginConfigEntry, PluginHostMode,
-    ResolvedPlugins, TelemetryConfig, TelemetryMetricsConfig, config_path, load_config,
-    resolve_plugins,
+    ResolvedPlugins, TelemetryConfig, TelemetryMetricsConfig, bundled_cli_plugin_spec, config_path,
+    load_config, resolve_plugins,
 };
 pub(crate) use self::config::{telemetry_plugin_enabled, validate_config};
 use self::runtime::ExternalPlugin;
@@ -57,6 +57,10 @@ use mesh_llm_plugin::MeshVisibility;
 pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
 pub const FLASH_MOE_PLUGIN_ID: &str = "flash-moe";
+pub const GOOSE_PLUGIN_ID: &str = "goose";
+pub const CLAUDE_PLUGIN_ID: &str = "claude";
+pub const PI_PLUGIN_ID: &str = "pi";
+pub const OPENCODE_PLUGIN_ID: &str = "opencode";
 pub const OPENAI_ENDPOINT_PLUGIN_ID: &str = "openai-endpoint";
 pub const TELEMETRY_PLUGIN_ID: &str = "telemetry";
 pub const TELEMETRY_CAPABILITY: &str = "telemetry.metrics.v1";
@@ -703,6 +707,32 @@ impl PluginManager {
         plugin.call_tool(tool_name, arguments_json).await
     }
 
+    pub async fn call_tool_without_timeout(
+        &self,
+        plugin_name: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Result<ToolCallResult> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            return self.call_tool(plugin_name, tool_name, arguments_json).await;
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin
+            .call_tool_without_timeout(tool_name, arguments_json)
+            .await
+    }
+
     pub async fn invoke_operation(
         &self,
         plugin_name: &str,
@@ -710,6 +740,16 @@ impl PluginManager {
         input_json: &str,
     ) -> Result<ToolCallResult> {
         self.call_tool(plugin_name, operation_name, input_json)
+            .await
+    }
+
+    pub async fn invoke_operation_without_timeout(
+        &self,
+        plugin_name: &str,
+        operation_name: &str,
+        input_json: &str,
+    ) -> Result<ToolCallResult> {
+        self.call_tool_without_timeout(plugin_name, operation_name, input_json)
             .await
     }
 
@@ -959,7 +999,12 @@ impl PluginManager {
         let input_json = serde_json::to_string(params)
             .with_context(|| format!("Serialize service params for plugin '{plugin_name}'"))?;
         let response = plugin
-            .invoke_service(kind, service_name, &input_json)
+            .invoke_service(
+                kind,
+                service_name,
+                &input_json,
+                Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
         serde_json::from_str(&response.output_json).with_context(|| {
             format!(
@@ -1776,6 +1821,9 @@ pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
         BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name).await,
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
+        GOOSE_PLUGIN_ID | CLAUDE_PLUGIN_ID | PI_PLUGIN_ID | OPENCODE_PLUGIN_ID => {
+            crate::plugins::agent_cli::run_plugin(name).await
+        }
         FLASH_MOE_PLUGIN_ID => crate::plugins::flash_moe::run_plugin(name).await,
         OPENAI_ENDPOINT_PLUGIN_ID => crate::plugins::openai_endpoint::run_plugin(name).await,
         TELEMETRY_PLUGIN_ID => crate::plugins::telemetry::run_plugin(name).await,

@@ -753,6 +753,9 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Run a CLI command contributed by a configured plugin.
+    #[command(external_subcommand)]
+    ExternalPlugin(Vec<OsString>),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1320,6 +1323,35 @@ mod tests {
 
         let rendered = err.to_string();
         assert!(rendered.contains("--port"));
+    }
+
+    #[test]
+    fn unknown_top_level_command_is_captured_for_plugin_dispatch() {
+        let normalized = normalize_runtime_surface_args([
+            "mesh-llm",
+            "goose-next",
+            "--model",
+            "auto",
+            "--",
+            "prompt.txt",
+        ]);
+        let cli = Cli::parse_from(normalized.normalized);
+
+        match cli.command.expect("external plugin command expected") {
+            Command::ExternalPlugin(args) => {
+                assert_eq!(
+                    args,
+                    vec![
+                        OsString::from("goose-next"),
+                        OsString::from("--model"),
+                        OsString::from("auto"),
+                        OsString::from("--"),
+                        OsString::from("prompt.txt"),
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

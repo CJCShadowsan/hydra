@@ -6,9 +6,13 @@
 #[cfg(test)]
 pub mod mcp;
 
+mod cli;
+
 use anyhow::Result;
+use clap::Parser;
 use mesh_llm_plugin::{
-    PluginMetadata, PluginRuntime, PluginStartupPolicy, capability, plugin_server_info,
+    OperationRouter, PluginMetadata, PluginRuntime, PluginStartupPolicy, capability,
+    json_schema_operation, plugin_server_info,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,7 @@ const TTL_SECS: u64 = 48 * 3600; // 48 hours
 const RATE_LIMIT_PER_MIN: usize = 10;
 /// Max text length per message (bytes).
 const MAX_TEXT_LEN: usize = 4096;
+const CLI_RUN_OPERATION: &str = "cli.run";
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -96,6 +101,36 @@ pub struct PostRequest {
     pub from: String,
     #[serde(default = "default_post_peer_id")]
     pub peer_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CliRunRequest {
+    args: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CliRunResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    stdout: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    stderr: String,
+}
+
+#[derive(Debug, Parser)]
+struct BlackboardCliArgs {
+    text: Option<String>,
+    #[arg(long)]
+    search: Option<String>,
+    #[arg(long)]
+    from: Option<String>,
+    #[arg(long)]
+    since: Option<f64>,
+    #[arg(long, default_value = "20")]
+    limit: usize,
+    #[arg(long, default_value = "3131")]
+    port: u16,
 }
 
 fn default_limit() -> usize {
@@ -320,7 +355,7 @@ fn build_blackboard_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
     let search_store = store.clone();
     let post_store = store.clone();
 
-    mesh_llm_plugin::plugin! {
+    let plugin = mesh_llm_plugin::plugin! {
         metadata: PluginMetadata::new(
             name,
             crate::VERSION,
@@ -500,7 +535,48 @@ fn build_blackboard_plugin(name: String) -> mesh_llm_plugin::SimplePlugin {
                 Ok(())
             })
         },
-    }
+    };
+
+    plugin.extend_operation_router(blackboard_cli_operation_router())
+}
+
+fn blackboard_cli_operation_router() -> OperationRouter {
+    let mut router = OperationRouter::new();
+    router.add_json(
+        json_schema_operation::<CliRunRequest>(
+            CLI_RUN_OPERATION,
+            "Run the mesh-llm blackboard command-line interface.",
+        ),
+        |request: CliRunRequest, _context| {
+            Box::pin(async move {
+                let args = BlackboardCliArgs::try_parse_from(argv("blackboard", request.args))
+                    .map_err(|err| anyhow::anyhow!("{err}"))?;
+                if args.text.as_deref() == Some("install-skill") {
+                    cli::install_skill()?;
+                    return Ok(CliRunResponse::default());
+                }
+                let output = cli::run_blackboard(
+                    args.text,
+                    args.search,
+                    args.from,
+                    args.since,
+                    args.limit,
+                    args.port,
+                )
+                .await?;
+                Ok(CliRunResponse {
+                    exit_code: output.exit_code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            })
+        },
+    );
+    router
+}
+
+fn argv(name: &str, args: Vec<String>) -> Vec<String> {
+    std::iter::once(name.to_string()).chain(args).collect()
 }
 // ── PII filter ──
 

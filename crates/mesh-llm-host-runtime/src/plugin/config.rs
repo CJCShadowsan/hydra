@@ -1,6 +1,7 @@
 use super::{
-    BLACKBOARD_PLUGIN_ID, BLOBSTORE_PLUGIN_ID, FLASH_MOE_PLUGIN_ID, OPENAI_ENDPOINT_PLUGIN_ID,
-    PluginSummary, TELEMETRY_PLUGIN_ID,
+    BLACKBOARD_PLUGIN_ID, BLOBSTORE_PLUGIN_ID, CLAUDE_PLUGIN_ID, FLASH_MOE_PLUGIN_ID,
+    GOOSE_PLUGIN_ID, OPENAI_ENDPOINT_PLUGIN_ID, OPENCODE_PLUGIN_ID, PI_PLUGIN_ID, PluginSummary,
+    TELEMETRY_PLUGIN_ID,
 };
 use anyhow::{Context, Result, bail};
 use mesh_llm_plugin::MeshVisibility;
@@ -2140,6 +2141,40 @@ pub fn telemetry_plugin_spec() -> Result<ExternalPluginSpec> {
             "json".into(),
             "--plugin".into(),
             TELEMETRY_PLUGIN_ID.into(),
+        ],
+        url: None,
+        env: BTreeMap::new(),
+    })
+}
+
+pub fn bundled_cli_plugin_spec(name: &str) -> Result<Option<ExternalPluginSpec>> {
+    if name == BLACKBOARD_PLUGIN_ID {
+        return blackboard_plugin_spec().map(Some);
+    }
+
+    if matches!(
+        name,
+        GOOSE_PLUGIN_ID | CLAUDE_PLUGIN_ID | PI_PLUGIN_ID | OPENCODE_PLUGIN_ID
+    ) {
+        return bundled_agent_cli_plugin_spec(name).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn bundled_agent_cli_plugin_spec(name: &str) -> Result<ExternalPluginSpec> {
+    let command = std::env::current_exe()
+        .context("Cannot determine mesh-llm executable path")?
+        .display()
+        .to_string();
+    Ok(ExternalPluginSpec {
+        name: name.to_string(),
+        command,
+        args: vec![
+            "--log-format".into(),
+            "json".into(),
+            "--plugin".into(),
+            name.to_string(),
         ],
         url: None,
         env: BTreeMap::new(),

@@ -1,3 +1,4 @@
+pub mod agent_cli;
 pub mod blackboard;
 pub mod blobstore;
 pub mod flash_moe;

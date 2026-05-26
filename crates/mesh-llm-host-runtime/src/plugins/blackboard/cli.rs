@@ -1,6 +1,13 @@
 use anyhow::{Context, Result};
 
-use crate::blackboard;
+use super::{BlackboardItem, pii_check, pii_scrub};
+
+#[derive(Debug, Default)]
+pub(crate) struct BlackboardCliOutput {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
 
 pub(crate) async fn run_blackboard(
     text: Option<String>,
@@ -9,7 +16,8 @@ pub(crate) async fn run_blackboard(
     since_hours: Option<f64>,
     limit: usize,
     port: u16,
-) -> Result<()> {
+) -> Result<BlackboardCliOutput> {
+    let mut output = BlackboardCliOutput::default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -17,15 +25,16 @@ pub(crate) async fn run_blackboard(
 
     let status_resp = client.get(format!("{base}/api/status")).send().await;
     if status_resp.is_err() {
-        eprintln!("No mesh-llm node running on port {port}.");
-        eprintln!();
-        eprintln!("Blackboard requires a running mesh node:");
-        eprintln!("  Private mesh:  mesh-llm client  (share the join token printed out)");
-        eprintln!("  Join a mesh:   mesh-llm client --join <token>");
-        eprintln!("  Public mesh:   mesh-llm client --auto");
-        eprintln!();
-        eprintln!("See https://github.com/Mesh-LLM/mesh-llm for setup guide.");
-        std::process::exit(1);
+        output.exit_code = Some(1);
+        output.stderr.push_str(&format!(
+            "No mesh-llm node running on port {port}.\n\n\
+             Blackboard requires a running mesh node:\n\
+             Private mesh:  mesh-llm client  (share the join token printed out)\n\
+             Join a mesh:   mesh-llm client --join <token>\n\
+             Public mesh:   mesh-llm client --auto\n\n\
+             See https://github.com/Mesh-LLM/mesh-llm for setup guide.\n"
+        ));
+        return Ok(output);
     }
 
     let feed_check = client
@@ -34,9 +43,12 @@ pub(crate) async fn run_blackboard(
         .await;
     if let Ok(resp) = feed_check {
         if resp.status().as_u16() == 404 {
-            eprintln!("Mesh is running but blackboard is disabled on that node.");
-            eprintln!("Re-enable it in the mesh config if you want to use the blackboard plugin.");
-            std::process::exit(1);
+            output.exit_code = Some(1);
+            output.stderr.push_str(
+                "Mesh is running but blackboard is disabled on that node.\n\
+                 Re-enable it in the mesh config if you want to use the blackboard plugin.\n",
+            );
+            return Ok(output);
         }
     }
 
@@ -51,15 +63,15 @@ pub(crate) async fn run_blackboard(
     };
 
     if let Some(msg) = text {
-        let issues = blackboard::pii_check(&msg);
+        let issues = pii_check(&msg);
         if !issues.is_empty() {
-            eprintln!("⚠️  PII/secret issues detected:");
+            output.stderr.push_str("⚠️  PII/secret issues detected:\n");
             for issue in &issues {
-                eprintln!("   • {issue}");
+                output.stderr.push_str(&format!("   • {issue}\n"));
             }
-            eprintln!("Scrubbing and posting...");
+            output.stderr.push_str("Scrubbing and posting...\n");
         }
-        let clean = blackboard::pii_scrub(&msg);
+        let clean = pii_scrub(&msg);
 
         let body = serde_json::json!({ "text": clean });
         let resp = client
@@ -69,13 +81,15 @@ pub(crate) async fn run_blackboard(
             .await
             .context("Cannot reach mesh-llm — is it running?")?;
         if resp.status().is_success() {
-            let item: blackboard::BlackboardItem = resp.json().await?;
-            eprintln!("📝 Posted (id: {:x})", item.id);
+            let item: BlackboardItem = resp.json().await?;
+            output
+                .stderr
+                .push_str(&format!("📝 Posted (id: {:x})\n", item.id));
         } else {
             let err = resp.text().await.unwrap_or_default();
-            eprintln!("Error: {err}");
+            output.stderr.push_str(&format!("Error: {err}\n"));
         }
-        return Ok(());
+        return Ok(output);
     }
 
     if let Some(q) = search {
@@ -89,13 +103,13 @@ pub(crate) async fn run_blackboard(
             .send()
             .await
             .context("Cannot reach mesh-llm — is it running?")?;
-        let items: Vec<blackboard::BlackboardItem> = resp.json().await?;
+        let items: Vec<BlackboardItem> = resp.json().await?;
         if items.is_empty() {
-            eprintln!("No results.");
+            output.stderr.push_str("No results.\n");
         } else {
-            print_blackboard_items(&items);
+            output.stdout.push_str(&format_blackboard_items(&items));
         }
-        return Ok(());
+        return Ok(output);
     }
 
     let mut params = vec![
@@ -111,24 +125,26 @@ pub(crate) async fn run_blackboard(
         .send()
         .await
         .context("Cannot reach mesh-llm — is it running?")?;
-    let items: Vec<blackboard::BlackboardItem> = resp.json().await?;
+    let items: Vec<BlackboardItem> = resp.json().await?;
     if items.is_empty() {
-        eprintln!("Blackboard is empty.");
+        output.stderr.push_str("Blackboard is empty.\n");
     } else {
-        print_blackboard_items(&items);
+        output.stdout.push_str(&format_blackboard_items(&items));
     }
-    Ok(())
+    Ok(output)
 }
 
-fn print_blackboard_items(items: &[blackboard::BlackboardItem]) {
+fn format_blackboard_items(items: &[BlackboardItem]) -> String {
+    let mut output = String::new();
     for item in items {
         let time = chrono_format(item.timestamp);
-        println!("{:x} │ {} │ {}", item.id, time, item.from);
+        output.push_str(&format!("{:x} │ {} │ {}\n", item.id, time, item.from));
         for line in item.text.lines() {
-            println!("  {line}");
+            output.push_str(&format!("  {line}\n"));
         }
-        println!();
+        output.push('\n');
     }
+    output
 }
 
 fn chrono_format(ts: u64) -> String {

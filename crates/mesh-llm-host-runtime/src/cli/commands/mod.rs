@@ -1,26 +1,24 @@
 mod auth;
 mod benchmark;
-mod blackboard;
 mod discover;
 mod download;
 mod gpus;
-mod integrations;
 mod model_package;
 mod models;
 mod plugin;
+mod plugin_cli;
 mod runtime;
 mod update;
 
 use anyhow::Result;
 
 use crate::cli::commands::benchmark::dispatch_benchmark_command;
-use crate::cli::commands::blackboard::{install_skill, run_blackboard};
 use crate::cli::commands::discover::{DiscoverOptions, run_discover, run_stop};
 use crate::cli::commands::download::dispatch_download_command;
 use crate::cli::commands::gpus::dispatch_gpu_command;
-use crate::cli::commands::integrations::{run_claude, run_goose, run_opencode, run_pi};
 use crate::cli::commands::models::dispatch_models_command;
 use crate::cli::commands::plugin::run_plugin_command;
+use crate::cli::commands::plugin_cli::{run_external_plugin_command, run_named_plugin_command};
 use crate::cli::commands::runtime::{dispatch_runtime_command, run_drop, run_load, run_status};
 use crate::cli::commands::update::run_update;
 use crate::cli::{AuthCommand, Cli, Command};
@@ -83,16 +81,47 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
             .await
         }
         Command::RotateKey => nostr::rotate_keys(),
-        Command::Goose { model, port } => run_goose(model.clone(), *port).await,
-        Command::Claude { model, port } => run_claude(model.clone(), *port).await,
-        Command::Pi { model, host, write } => run_pi(model.clone(), host, *write).await,
-        Command::Opencode { model, host, write } => run_opencode(model.clone(), host, *write).await,
+        Command::Goose { model, port } => {
+            run_named_plugin_command(cli, "goose", model_port_plugin_args(model, *port)).await
+        }
+        Command::Claude { model, port } => {
+            run_named_plugin_command(cli, "claude", model_port_plugin_args(model, *port)).await
+        }
+        Command::Pi { model, host, write } => {
+            run_named_plugin_command(cli, "pi", host_write_plugin_args(model, host, *write)).await
+        }
+        Command::Opencode { model, host, write } => {
+            run_named_plugin_command(cli, "opencode", host_write_plugin_args(model, host, *write))
+                .await
+        }
         Command::Blackboard { .. } => dispatch_blackboard_command(cli, cmd).await,
         Command::Plugin { command } => run_plugin_command(command, cli).await,
         Command::Benchmark { command } => dispatch_benchmark_command(command).await,
         Command::ModelPrepare { .. } => dispatch_model_prepare(cmd).await,
         Command::Auth { command } => dispatch_auth_command(command),
+        Command::ExternalPlugin(args) => run_external_plugin_command(cli, args).await,
     }
+}
+
+fn model_port_plugin_args(model: &Option<String>, port: u16) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(model) = model {
+        args.extend(["--model".to_string(), model.clone()]);
+    }
+    args.extend(["--port".to_string(), port.to_string()]);
+    args
+}
+
+fn host_write_plugin_args(model: &Option<String>, host: &str, write: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(model) = model {
+        args.extend(["--model".to_string(), model.clone()]);
+    }
+    args.extend(["--host".to_string(), host.to_string()]);
+    if write {
+        args.push("--write".to_string());
+    }
+    args
 }
 
 async fn dispatch_blackboard_command(cli: &Cli, cmd: &Command) -> Result<()> {
@@ -112,18 +141,38 @@ async fn dispatch_blackboard_command(cli: &Cli, cmd: &Command) -> Result<()> {
     if *mcp {
         return crate::runtime::run_plugin_mcp(cli).await;
     }
-    if text.as_deref() == Some("install-skill") {
-        return install_skill();
-    }
-    run_blackboard(
-        text.clone(),
-        search.clone(),
-        from.clone(),
-        *since,
-        *limit,
-        *port,
+    run_named_plugin_command(
+        cli,
+        crate::plugin::BLACKBOARD_PLUGIN_ID,
+        blackboard_plugin_args(text, search, from, *since, *limit, *port),
     )
     .await
+}
+
+fn blackboard_plugin_args(
+    text: &Option<String>,
+    search: &Option<String>,
+    from: &Option<String>,
+    since: Option<f64>,
+    limit: usize,
+    port: u16,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(text) = text {
+        args.push(text.clone());
+    }
+    if let Some(search) = search {
+        args.extend(["--search".to_string(), search.clone()]);
+    }
+    if let Some(from) = from {
+        args.extend(["--from".to_string(), from.clone()]);
+    }
+    if let Some(since) = since {
+        args.extend(["--since".to_string(), since.to_string()]);
+    }
+    args.extend(["--limit".to_string(), limit.to_string()]);
+    args.extend(["--port".to_string(), port.to_string()]);
+    args
 }
 
 async fn dispatch_model_prepare(cmd: &Command) -> Result<()> {
