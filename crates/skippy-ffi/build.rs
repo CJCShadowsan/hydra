@@ -233,7 +233,11 @@ fn fetch_and_extract_llama_stage(url: &str) -> String {
 
     let target = std::env::var("TARGET").unwrap_or_default();
     let flavor = std::env::var("SKIPPY_LLAMA_TARBALL_FLAVOR").unwrap_or_else(|_| {
-        if target.contains("apple") { "metal".into() } else { "cpu".into() }
+        if target.contains("apple") {
+            "metal".into()
+        } else {
+            "cpu".into()
+        }
     });
     let artifact_id = format!("llama-stage-{target}-{flavor}");
     let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
@@ -242,7 +246,9 @@ fn fetch_and_extract_llama_stage(url: &str) -> String {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".cache").join("skippy-llama-stage")
+            PathBuf::from(home)
+                .join(".cache")
+                .join("skippy-llama-stage")
         });
     let cache_dir = cache_root.join(&version).join(&artifact_id);
     std::fs::create_dir_all(&cache_dir).expect("create skippy-llama-stage cache dir");
@@ -318,7 +324,15 @@ fn fetch_url(url: &str, dest: &std::path::Path) {
         return;
     }
     let status = Command::new("curl")
-        .args(["--fail", "--silent", "--show-error", "--location", "--retry", "5", "-o"])
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--retry",
+            "5",
+            "-o",
+        ])
         .arg(dest)
         .arg(url)
         .status()
