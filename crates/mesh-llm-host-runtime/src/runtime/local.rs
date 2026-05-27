@@ -5447,8 +5447,24 @@ max_tokens = 222
         );
     }
 
-    #[tokio::test]
-    async fn load_split_runtime_generation_stops_candidate_stages_after_partial_load_failure() {
+    #[test]
+    fn load_split_runtime_generation_stops_candidate_stages_after_partial_load_failure() {
+        std::thread::Builder::new()
+            .name("split-load-partial-failure-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(load_split_runtime_generation_partial_failure_case());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn load_split_runtime_generation_partial_failure_case() {
         let node = mesh::Node::new_for_tests(NodeRole::Host { http_port: 9337 })
             .await
             .unwrap();

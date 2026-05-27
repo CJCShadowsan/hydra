@@ -198,26 +198,7 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
     );
 
     if !submitting {
-        let redacted = redacted_spec(&job.spec);
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "dryRun": true,
-                    "confirmRequired": true,
-                    "sourceRepo": job.source_repo,
-                    "sourceFile": job.source_file,
-                    "targetRepo": job.target_repo,
-                    "modelId": job.model_id,
-                    "jobPlan": job.job_plan,
-                    "spec": redacted,
-                }))?
-            );
-        } else {
-            eprintln!();
-            eprintln!("🔍 Dry run — no HF Job was submitted. Add --confirm to submit.");
-            println!("{}", serde_json::to_string_pretty(&redacted)?);
-        }
+        print_package_job_dry_run(&job, json)?;
         return Ok(());
     }
 
@@ -263,6 +244,30 @@ pub async fn dispatch_model_package(args: ModelPrepareArgs<'_>) -> Result<()> {
         follow_until_done(jobs_client, &job.namespace, &info.id).await?;
     }
 
+    Ok(())
+}
+
+fn print_package_job_dry_run(job: &prepare::PrepareJob, json_output: bool) -> Result<()> {
+    let redacted = redacted_spec(&job.spec);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dryRun": true,
+                "confirmRequired": true,
+                "sourceRepo": job.source_repo,
+                "sourceFile": job.source_file,
+                "targetRepo": job.target_repo,
+                "modelId": job.model_id,
+                "jobPlan": job.job_plan,
+                "spec": redacted,
+            }))?
+        );
+    } else {
+        eprintln!();
+        eprintln!("🔍 Dry run — no HF Job was submitted. Add --confirm to submit.");
+        println!("{}", serde_json::to_string_pretty(&redacted)?);
+    }
     Ok(())
 }
 
