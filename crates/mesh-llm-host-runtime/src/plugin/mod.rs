@@ -57,10 +57,6 @@ use mesh_llm_plugin::MeshVisibility;
 pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
 pub const FLASH_MOE_PLUGIN_ID: &str = "flash-moe";
-pub const GOOSE_PLUGIN_ID: &str = "goose";
-pub const CLAUDE_PLUGIN_ID: &str = "claude";
-pub const PI_PLUGIN_ID: &str = "pi";
-pub const OPENCODE_PLUGIN_ID: &str = "opencode";
 pub const OPENAI_ENDPOINT_PLUGIN_ID: &str = "openai-endpoint";
 pub const TELEMETRY_PLUGIN_ID: &str = "telemetry";
 pub const TELEMETRY_CAPABILITY: &str = "telemetry.metrics.v1";
@@ -1819,11 +1815,7 @@ fn endpoint_models_url(address: &str) -> Option<Url> {
 
 pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
-        BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name).await,
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
-        GOOSE_PLUGIN_ID | CLAUDE_PLUGIN_ID | PI_PLUGIN_ID | OPENCODE_PLUGIN_ID => {
-            crate::plugins::agent_cli::run_plugin(name).await
-        }
         FLASH_MOE_PLUGIN_ID => crate::plugins::flash_moe::run_plugin(name).await,
         OPENAI_ENDPOINT_PLUGIN_ID => crate::plugins::openai_endpoint::run_plugin(name).await,
         TELEMETRY_PLUGIN_ID => crate::plugins::telemetry::run_plugin(name).await,

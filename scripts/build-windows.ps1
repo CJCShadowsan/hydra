@@ -1016,25 +1016,29 @@ Invoke-InRepo {
         }
     }
 
-    Write-Host "Building mesh-llm..."
+    Write-Host "Building mesh-llm and bundled CLI plugins..."
     $env:LLAMA_STAGE_BUILD_DIR = $buildDir
     $cargoFeatureArgs = @()
+    $meshPackages = @(
+        "-p", "mesh-llm",
+        "-p", "mesh-llm-plugin-blackboard"
+    )
     switch ($backendName) {
         "cuda" { $cargoFeatureArgs = @("--features", "gpu-bench-cuda") }
         "rocm" { $cargoFeatureArgs = @("--features", "gpu-bench-hip") }
     }
     switch ($buildProfile) {
         "dev" {
-            Invoke-NativeCommand "cargo" (@("build", "-p", "mesh-llm", "--bin", "mesh-llm") + $cargoFeatureArgs)
-            Write-Host "Mesh binary: target\debug\mesh-llm.exe"
+            Invoke-NativeCommand "cargo" (@("build") + $meshPackages + $cargoFeatureArgs)
+            Write-Host "Mesh binaries: target\debug\mesh-llm.exe, target\debug\mesh-llm-plugin-blackboard.exe"
         }
         "debug" {
-            Invoke-NativeCommand "cargo" (@("build", "-p", "mesh-llm", "--bin", "mesh-llm") + $cargoFeatureArgs)
-            Write-Host "Mesh binary: target\debug\mesh-llm.exe"
+            Invoke-NativeCommand "cargo" (@("build") + $meshPackages + $cargoFeatureArgs)
+            Write-Host "Mesh binaries: target\debug\mesh-llm.exe, target\debug\mesh-llm-plugin-blackboard.exe"
         }
         "release" {
-            Invoke-NativeCommand "cargo" (@("build", "--release", "--locked", "-p", "mesh-llm") + $cargoFeatureArgs)
-            Write-Host "Mesh binary: target\release\mesh-llm.exe"
+            Invoke-NativeCommand "cargo" (@("build", "--release", "--locked") + $meshPackages + $cargoFeatureArgs)
+            Write-Host "Mesh binaries: target\release\mesh-llm.exe, target\release\mesh-llm-plugin-blackboard.exe"
         }
         default {
             throw "Unsupported MESH_LLM_BUILD_PROFILE/BuildProfile '$buildProfile'. Expected debug, dev, or release."

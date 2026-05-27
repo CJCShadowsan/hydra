@@ -1,4 +1,4 @@
-pub mod agent_cli;
+#[cfg(test)]
 pub mod blackboard;
 pub mod blobstore;
 pub mod flash_moe;

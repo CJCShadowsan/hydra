@@ -166,7 +166,7 @@ fn chrono_format(ts: u64) -> String {
 }
 
 pub(crate) fn install_skill() -> Result<()> {
-    let skill_content = include_str!("../../../skills/blackboard/SKILL.md");
+    let skill_content = include_str!("../skills/blackboard/SKILL.md");
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     let skill_dir = home.join(".agents").join("skills").join("blackboard");

@@ -1,3 +1,4 @@
+mod agent_cli;
 mod auth;
 mod benchmark;
 mod discover;
@@ -12,6 +13,7 @@ mod update;
 
 use anyhow::Result;
 
+use crate::cli::commands::agent_cli::{run_claude, run_goose, run_opencode, run_pi};
 use crate::cli::commands::benchmark::dispatch_benchmark_command;
 use crate::cli::commands::discover::{DiscoverOptions, run_discover, run_stop};
 use crate::cli::commands::download::dispatch_download_command;
@@ -81,19 +83,10 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
             .await
         }
         Command::RotateKey => nostr::rotate_keys(),
-        Command::Goose { model, port } => {
-            run_named_plugin_command(cli, "goose", model_port_plugin_args(model, *port)).await
-        }
-        Command::Claude { model, port } => {
-            run_named_plugin_command(cli, "claude", model_port_plugin_args(model, *port)).await
-        }
-        Command::Pi { model, host, write } => {
-            run_named_plugin_command(cli, "pi", host_write_plugin_args(model, host, *write)).await
-        }
-        Command::Opencode { model, host, write } => {
-            run_named_plugin_command(cli, "opencode", host_write_plugin_args(model, host, *write))
-                .await
-        }
+        Command::Goose { model, port } => run_goose(model.clone(), *port).await,
+        Command::Claude { model, port } => run_claude(model.clone(), *port).await,
+        Command::Pi { model, host, write } => run_pi(model.clone(), host, *write).await,
+        Command::Opencode { model, host, write } => run_opencode(model.clone(), host, *write).await,
         Command::Blackboard { .. } => dispatch_blackboard_command(cli, cmd).await,
         Command::Plugin { command } => run_plugin_command(command, cli).await,
         Command::Benchmark { command } => dispatch_benchmark_command(command).await,
@@ -101,27 +94,6 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
         Command::Auth { command } => dispatch_auth_command(command),
         Command::ExternalPlugin(args) => run_external_plugin_command(cli, args).await,
     }
-}
-
-fn model_port_plugin_args(model: &Option<String>, port: u16) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(model) = model {
-        args.extend(["--model".to_string(), model.clone()]);
-    }
-    args.extend(["--port".to_string(), port.to_string()]);
-    args
-}
-
-fn host_write_plugin_args(model: &Option<String>, host: &str, write: bool) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(model) = model {
-        args.extend(["--model".to_string(), model.clone()]);
-    }
-    args.extend(["--host".to_string(), host.to_string()]);
-    if write {
-        args.push("--write".to_string());
-    }
-    args
 }
 
 async fn dispatch_blackboard_command(cli: &Cli, cmd: &Command) -> Result<()> {

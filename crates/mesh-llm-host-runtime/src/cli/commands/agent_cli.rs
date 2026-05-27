@@ -1,122 +1,14 @@
 use anyhow::{Context, Result};
-use clap::Parser;
-use mesh_llm_plugin::{
-    InternalRpcPluginBuilder, OperationRouter, PluginMetadata, PluginRuntime,
-    json_schema_operation, plugin_server_info,
-};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 
-use crate::{cli::shell, plugin, runtime};
+use crate::{cli::shell, runtime};
 use url::Url;
 
-const CLI_RUN_OPERATION: &str = "cli.run";
 const OPENCODE_PROVIDER_ID: &str = "mesh";
 const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 const OPENCODE_API_KEY_ENV: &str = "OPENAI_API_KEY";
 const OPENCODE_API_KEY_VALUE: &str = "dummy";
 const OPENCODE_INSTALL_HINT: &str = "curl -fsSL https://opencode.ai/install | bash";
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct CliRunRequest {
-    args: Vec<String>,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct CliRunResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    stderr: String,
-}
-
-#[derive(Debug, Parser)]
-struct ModelPortArgs {
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long, default_value = "9337")]
-    port: u16,
-}
-
-#[derive(Debug, Parser)]
-struct HostWriteArgs {
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long, default_value = "127.0.0.1:9337")]
-    host: String,
-    #[arg(long)]
-    write: bool,
-}
-
-pub(crate) async fn run_plugin(name: String) -> anyhow::Result<()> {
-    PluginRuntime::run(build_agent_cli_plugin(name)).await
-}
-
-fn build_agent_cli_plugin(name: String) -> mesh_llm_plugin::InternalRpcPlugin {
-    let title = format!("Mesh {} CLI Plugin", name);
-    let description = format!("Launches {name} with mesh-llm as the inference provider.");
-    let operation_name = name.clone();
-    let mut router = OperationRouter::new();
-    router.add_json(
-        json_schema_operation::<CliRunRequest>(CLI_RUN_OPERATION, description.clone()),
-        move |request, _context| {
-            let operation_name = operation_name.clone();
-            Box::pin(async move {
-                match run_agent_cli_command(&operation_name, request).await {
-                    Ok(()) => Ok(CliRunResponse::default()),
-                    Err(err) => Ok(CliRunResponse {
-                        exit_code: Some(1),
-                        stderr: format!("{err:#}\n"),
-                    }),
-                }
-            })
-        },
-    );
-
-    InternalRpcPluginBuilder::new(PluginMetadata::new(
-        name.clone(),
-        crate::VERSION,
-        plugin_server_info(name, crate::VERSION, title, description, None::<String>),
-    ))
-    .with_capabilities(vec!["cli.command.v1".into()])
-    .with_operation_router(router)
-    .build()
-}
-
-async fn run_agent_cli_command(name: &str, request: CliRunRequest) -> Result<()> {
-    match name {
-        plugin::GOOSE_PLUGIN_ID => {
-            let args = parse_model_port_args(name, request.args)?;
-            run_goose(args.model, args.port).await
-        }
-        plugin::CLAUDE_PLUGIN_ID => {
-            let args = parse_model_port_args(name, request.args)?;
-            run_claude(args.model, args.port).await
-        }
-        plugin::PI_PLUGIN_ID => {
-            let args = parse_host_write_args(name, request.args)?;
-            run_pi(args.model, &args.host, args.write).await
-        }
-        plugin::OPENCODE_PLUGIN_ID => {
-            let args = parse_host_write_args(name, request.args)?;
-            run_opencode(args.model, &args.host, args.write).await
-        }
-        _ => anyhow::bail!("Unknown agent CLI plugin '{name}'"),
-    }
-}
-
-fn parse_model_port_args(name: &str, args: Vec<String>) -> Result<ModelPortArgs> {
-    ModelPortArgs::try_parse_from(argv(name, args)).map_err(|err| anyhow::anyhow!("{err}"))
-}
-
-fn parse_host_write_args(name: &str, args: Vec<String>) -> Result<HostWriteArgs> {
-    HostWriteArgs::try_parse_from(argv(name, args)).map_err(|err| anyhow::anyhow!("{err}"))
-}
-
-fn argv(name: &str, args: Vec<String>) -> Vec<String> {
-    std::iter::once(name.to_string()).chain(args).collect()
-}
 
 fn configure_interactive_stdio(command: &mut Command) {
     #[cfg(unix)]

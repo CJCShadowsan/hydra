@@ -3762,7 +3762,6 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
- "biip",
  "chacha20poly1305",
  "chrono",
  "clap",
@@ -3784,6 +3783,7 @@ dependencies = [
  "mesh-llm-identity",
  "mesh-llm-node",
  "mesh-llm-plugin",
+ "mesh-llm-plugin-blackboard",
  "mesh-llm-protocol",
  "mesh-llm-routing",
  "mesh-llm-system",
@@ -3886,6 +3886,25 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mesh-llm-plugin-blackboard"
+version = "0.66.0"
+dependencies = [
+ "anyhow",
+ "biip",
+ "clap",
+ "dirs",
+ "mesh-llm-plugin",
+ "regex-lite",
+ "reqwest 0.12.28",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
