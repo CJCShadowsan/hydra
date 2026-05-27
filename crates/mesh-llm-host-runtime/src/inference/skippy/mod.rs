@@ -783,8 +783,12 @@ pub(crate) fn single_stage_config(options: &SkippyModelLoadOptions) -> Result<St
             "skippy selected backend device must not be empty"
         );
     }
+    let path_ref = options.model_path.to_string_lossy();
+    let inferred_layer_package =
+        options.package_identity.is_none() && is_layer_package_ref(&path_ref);
     let package_identity = match options.package_identity.as_ref() {
         Some(identity) => identity.clone(),
+        None if inferred_layer_package => identity_from_layer_package(&path_ref)?,
         None => synthetic_direct_gguf_package(&options.model_id, &options.model_path)?,
     };
     let layer_start = options.layer_start;
@@ -832,10 +836,14 @@ pub(crate) fn single_stage_config(options: &SkippyModelLoadOptions) -> Result<St
         cache_type_k: options.cache_type_k.clone(),
         cache_type_v: options.cache_type_v.clone(),
         flash_attn_type: options.flash_attn_type,
-        filter_tensors_on_load: false,
+        filter_tensors_on_load: inferred_layer_package,
         selected_device: options.selected_device.clone().map(Into::into),
         kv_cache: None,
-        load_mode: LoadMode::RuntimeSlice,
+        load_mode: if inferred_layer_package {
+            LoadMode::LayerPackage
+        } else {
+            LoadMode::RuntimeSlice
+        },
         bind_addr: "127.0.0.1:0".to_string(),
         upstream: None,
         downstream: None,
