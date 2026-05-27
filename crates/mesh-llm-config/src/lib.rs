@@ -6,7 +6,7 @@ mod validate;
 
 pub use authoring::{
     ConfigEditor, LocalServingNodeConfig, ModelConfigEditor, ModelDefaultsEditor,
-    PluginConfigEditor,
+    PluginConfigEditor, SpeculativeConfigEditor,
 };
 pub use model::*;
 pub use store::{ConfigStore, config_path, config_to_toml, load_config, parse_config_toml};
@@ -202,6 +202,71 @@ ctx_size = 4096
             Some("http://localhost:8000/v1")
         );
         assert!(fs::read_to_string(path).unwrap().contains("[[plugin]]"));
+    }
+
+    #[test]
+    fn config_editor_updates_model_speculative_without_callers_writing_toml() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let store = ConfigStore::open(&path);
+
+        let config = store
+            .update(|config| {
+                config
+                    .upsert_model("meta-llama/Llama-3.3-70B-Instruct-GGUF:Q3_K_M")?
+                    .speculative()
+                    .mode("draft")
+                    .draft_hf_source(
+                        "unsloth/Llama-3.2-1B-Instruct-GGUF",
+                        "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+                    )
+                    .draft_selection_policy("manual")
+                    .pairing_fault("warn_disable")
+                    .draft_max_tokens(16)
+                    .draft_gpu_layers(-1);
+                Ok(())
+            })
+            .unwrap();
+
+        let speculative = config.models[0].speculative.as_ref().unwrap();
+        assert_eq!(speculative.mode.as_deref(), Some("draft"));
+        assert_eq!(speculative.draft_max_tokens, Some(16));
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(raw.contains("[[models]]"));
+        assert!(raw.contains("[models.speculative]"));
+        assert!(raw.contains("draft_selection_policy = \"manual\""));
+    }
+
+    #[test]
+    fn config_editor_updates_default_speculative_package_strategy() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let store = ConfigStore::open(&path);
+
+        let config = store
+            .update(|config| {
+                config
+                    .defaults()
+                    .speculative()
+                    .mode("auto")
+                    .package_strategy("llama32-1b-q4");
+                Ok(())
+            })
+            .unwrap();
+
+        let speculative = config
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.speculative.as_ref())
+            .unwrap();
+        assert_eq!(speculative.mode.as_deref(), Some("auto"));
+        assert_eq!(
+            speculative.package_strategy.as_deref(),
+            Some("llama32-1b-q4")
+        );
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(raw.contains("[defaults.speculative]"));
+        assert!(raw.contains("package_strategy = \"llama32-1b-q4\""));
     }
 
     #[test]

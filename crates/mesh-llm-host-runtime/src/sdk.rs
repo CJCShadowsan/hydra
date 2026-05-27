@@ -27,9 +27,9 @@ pub mod config {
         ModelConfigEntry, ModelDefaultsEditor, ModelFitConfig, ModelRuntimeKind, MultimodalConfig,
         OwnerControlConfig, PluginConfigEditor, PluginConfigEntry, PrefixCacheConfig,
         ReasoningBudget, ReasoningEnabled, RequestDefaultsConfig, ReservedObjectConfig,
-        SkippyConfig, SpeculativeConfig, StringOrStringList, TelemetryConfig,
-        TelemetryMetricsConfig, TensorSplitConfig, ThroughputConfig, config_path, config_to_toml,
-        load_config, parse_config_toml, validate_config,
+        SkippyConfig, SpeculativeConfig, SpeculativeConfigEditor, StringOrStringList,
+        TelemetryConfig, TelemetryMetricsConfig, TensorSplitConfig, ThroughputConfig, config_path,
+        config_to_toml, load_config, parse_config_toml, validate_config,
     };
 }
 

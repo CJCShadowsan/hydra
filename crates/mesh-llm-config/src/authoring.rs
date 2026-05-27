@@ -1,6 +1,7 @@
 use crate::{
     GpuAssignment, HardwareConfig, MeshConfig, ModelConfigDefaults, ModelConfigEntry,
-    ModelFitConfig, MultimodalConfig, PluginConfigEntry, RequestDefaultsConfig, ThroughputConfig,
+    ModelFitConfig, MultimodalConfig, PluginConfigEntry, RequestDefaultsConfig, SpeculativeConfig,
+    ThroughputConfig,
 };
 use anyhow::{Result, bail};
 use mesh_llm_types::runtime::ModelRuntimeKind;
@@ -256,6 +257,20 @@ impl ModelDefaultsEditor<'_> {
         self
     }
 
+    pub fn speculative(&mut self) -> SpeculativeConfigEditor<'_> {
+        SpeculativeConfigEditor {
+            speculative: self
+                .defaults
+                .speculative
+                .get_or_insert_with(Default::default),
+        }
+    }
+
+    pub fn clear_speculative(&mut self) -> &mut Self {
+        self.defaults.speculative = None;
+        self
+    }
+
     fn hardware(&mut self) -> &mut HardwareConfig {
         self.defaults.hardware.get_or_insert_with(Default::default)
     }
@@ -332,6 +347,17 @@ impl ModelConfigEditor<'_> {
         self
     }
 
+    pub fn speculative(&mut self) -> SpeculativeConfigEditor<'_> {
+        SpeculativeConfigEditor {
+            speculative: self.model.speculative.get_or_insert_with(Default::default),
+        }
+    }
+
+    pub fn clear_speculative(&mut self) -> &mut Self {
+        self.model.speculative = None;
+        self
+    }
+
     fn hardware(&mut self) -> &mut HardwareConfig {
         self.model.hardware.get_or_insert_with(Default::default)
     }
@@ -352,6 +378,82 @@ impl ModelConfigEditor<'_> {
 
     fn multimodal(&mut self) -> &mut MultimodalConfig {
         self.model.multimodal.get_or_insert_with(Default::default)
+    }
+}
+
+pub struct SpeculativeConfigEditor<'a> {
+    speculative: &'a mut SpeculativeConfig,
+}
+
+impl SpeculativeConfigEditor<'_> {
+    pub fn mode(&mut self, mode: impl Into<String>) -> &mut Self {
+        self.speculative.mode = Some(mode.into());
+        self
+    }
+
+    pub fn package_strategy(&mut self, strategy: impl Into<String>) -> &mut Self {
+        self.speculative.package_strategy = Some(strategy.into());
+        self
+    }
+
+    pub fn draft_model_path(&mut self, path: impl Into<String>) -> &mut Self {
+        self.speculative.draft_model_path = Some(path.into());
+        self
+    }
+
+    pub fn draft_hf_source(
+        &mut self,
+        repo: impl Into<String>,
+        file: impl Into<String>,
+    ) -> &mut Self {
+        self.speculative.draft_hf_repo = Some(repo.into());
+        self.speculative.draft_hf_file = Some(file.into());
+        self
+    }
+
+    pub fn draft_selection_policy(&mut self, policy: impl Into<String>) -> &mut Self {
+        self.speculative.draft_selection_policy = Some(policy.into());
+        self
+    }
+
+    pub fn pairing_fault(&mut self, policy: impl Into<String>) -> &mut Self {
+        self.speculative.pairing_fault = Some(policy.into());
+        self
+    }
+
+    pub fn draft_max_tokens(&mut self, tokens: u32) -> &mut Self {
+        self.speculative.draft_max_tokens = Some(tokens);
+        self
+    }
+
+    pub fn draft_min_tokens(&mut self, tokens: u32) -> &mut Self {
+        self.speculative.draft_min_tokens = Some(tokens);
+        self
+    }
+
+    pub fn draft_gpu_layers(&mut self, layers: i32) -> &mut Self {
+        self.speculative.draft_gpu_layers = Some(layers);
+        self
+    }
+
+    pub fn draft_device(&mut self, device: impl Into<String>) -> &mut Self {
+        self.speculative.draft_device = Some(device.into());
+        self
+    }
+
+    pub fn draft_threads(&mut self, threads: usize) -> &mut Self {
+        self.speculative.draft_threads = Some(threads);
+        self
+    }
+
+    pub fn draft_cache_types(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> &mut Self {
+        self.speculative.draft_cache_type_k = Some(key.into());
+        self.speculative.draft_cache_type_v = Some(value.into());
+        self
     }
 }
 

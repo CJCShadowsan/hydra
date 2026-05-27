@@ -130,6 +130,31 @@ store.update(|config| {
 })?;
 ```
 
+### Configure speculative decoding
+
+Use the editor API for speculative defaults or model-specific speculative
+settings. This keeps SDKs and apps on the same validated config schema as the
+CLI.
+
+```rust
+use mesh_llm_config::ConfigStore;
+
+let store = ConfigStore::default_path()?;
+store.update(|config| {
+    config
+        .upsert_model("meta-llama/Llama-3.3-70B-Instruct-GGUF:Q3_K_M")?
+        .speculative()
+        .mode("draft")
+        .draft_hf_source(
+            "unsloth/Llama-3.2-1B-Instruct-GGUF",
+            "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        )
+        .draft_selection_policy("manual")
+        .draft_max_tokens(16);
+    Ok(())
+})?;
+```
+
 ### Configure plugins
 
 Use plugin helpers for common cases instead of writing `[[plugin]]` tables.
