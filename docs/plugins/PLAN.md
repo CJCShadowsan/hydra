@@ -142,7 +142,7 @@ Create the public Hugging Face Dataset as part of the implementation plan. The
 suggested dataset is:
 
 ```text
-mesh-llm/plugin-catalog
+meshllm/plugin-catalog
 ```
 
 The dataset is metadata only. GitHub releases remain the source of native plugin

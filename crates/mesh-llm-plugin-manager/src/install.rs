@@ -15,7 +15,7 @@ use crate::{
 };
 
 pub const DEFAULT_CATALOG_URL: &str =
-    "https://huggingface.co/datasets/mesh-llm/plugin-catalog/resolve/main/plugins.jsonl";
+    "https://huggingface.co/datasets/meshllm/plugin-catalog/resolve/main/plugins.jsonl";
 
 pub trait PluginProgressReporter {
     fn report(&mut self, event: PluginProgressEvent);
