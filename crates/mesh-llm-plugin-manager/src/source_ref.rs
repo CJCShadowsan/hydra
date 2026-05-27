@@ -247,7 +247,7 @@ fn split_optional_version(
             "name before version cannot be empty",
         ));
     }
-    Ok((left, Some(PluginVersion::new(right.to_string())?)))
+    PluginVersion::new(right.to_string()).map(|version| (left, Some(version)))
 }
 
 fn is_valid_version(value: &str) -> bool {
