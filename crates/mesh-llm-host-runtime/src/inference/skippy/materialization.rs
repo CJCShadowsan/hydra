@@ -6,8 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
-use hf_hub::{DownloadEvent, Progress, ProgressEvent, ProgressHandler};
+use anyhow::{Context, Result, bail};
+use hf_hub::progress::{DownloadEvent, Progress, ProgressEvent, ProgressHandler};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use skippy_protocol::{LoadMode, StageConfig};
@@ -15,10 +15,12 @@ use skippy_runtime::package::{
     self, LayerPackageInfo, PackageIntegrityOptions, PackageStageRequest,
 };
 
-use crate::cli::output::{emit_event, interactive_tui_active, ModelProgressStatus, OutputEvent};
-use crate::cli::terminal_progress::{start_spinner, SpinnerHandle};
+use crate::cli::output::{ModelProgressStatus, OutputEvent, emit_event, interactive_tui_active};
+use crate::cli::terminal_progress::{SpinnerHandle, start_spinner};
 
 use super::StageLoadRequest;
+
+mod cache_resolution;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StagePackageRef {
@@ -141,7 +143,8 @@ struct PinFile {
 
 pub(crate) fn configure_materialized_stage_cache() {
     if std::env::var_os("SKIPPY_MATERIALIZED_DIR").is_none() {
-        std::env::set_var("SKIPPY_MATERIALIZED_DIR", materialized_stage_cache_dir());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("SKIPPY_MATERIALIZED_DIR", materialized_stage_cache_dir()) };
     }
 }
 
@@ -471,10 +474,10 @@ impl ProgressHandler for LayerPackageDownloadProgress {
         let force = matches!(event, DownloadEvent::Complete) && should_show_progress;
         if should_show_progress {
             self.draw(&mut state, force);
-        } else if matches!(event, DownloadEvent::Complete) {
-            if let Ok(mut spinner) = self.preflight_spinner.lock() {
-                spinner.take();
-            }
+        } else if matches!(event, DownloadEvent::Complete)
+            && let Ok(mut spinner) = self.preflight_spinner.lock()
+        {
+            spinner.take();
         }
     }
 }
@@ -589,31 +592,29 @@ fn resolve_local_package_files(
         "missing shared metadata: {}",
         metadata_path.display()
     );
-    if include_embeddings {
-        if let Some(path) = manifest
+    if include_embeddings
+        && let Some(path) = manifest
             .pointer("/shared/embeddings/path")
             .and_then(|v| v.as_str())
-        {
-            let path = safe_manifest_file_path(path)?;
-            anyhow::ensure!(
-                package_dir.join(&path).is_file(),
-                "missing shared embeddings: {}",
-                path.display()
-            );
-        }
+    {
+        let path = safe_manifest_file_path(path)?;
+        anyhow::ensure!(
+            package_dir.join(&path).is_file(),
+            "missing shared embeddings: {}",
+            path.display()
+        );
     }
-    if include_output {
-        if let Some(path) = manifest
+    if include_output
+        && let Some(path) = manifest
             .pointer("/shared/output/path")
             .and_then(|v| v.as_str())
-        {
-            let path = safe_manifest_file_path(path)?;
-            anyhow::ensure!(
-                package_dir.join(&path).is_file(),
-                "missing shared output: {}",
-                path.display()
-            );
-        }
+    {
+        let path = safe_manifest_file_path(path)?;
+        anyhow::ensure!(
+            package_dir.join(&path).is_file(),
+            "missing shared output: {}",
+            path.display()
+        );
     }
     // Verify needed layer files exist
     if let Some(layers) = manifest.get("layers").and_then(|l| l.as_array()) {
@@ -622,15 +623,16 @@ fn resolve_local_package_files(
                 .get("layer_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(i as u64) as u32;
-            if idx >= layer_start && idx < layer_end {
-                if let Some(path) = layer.get("path").and_then(|a| a.as_str()) {
-                    let path = safe_manifest_file_path(path)?;
-                    anyhow::ensure!(
-                        package_dir.join(&path).is_file(),
-                        "missing layer file: {}",
-                        path.display()
-                    );
-                }
+            if idx >= layer_start
+                && idx < layer_end
+                && let Some(path) = layer.get("path").and_then(|a| a.as_str())
+            {
+                let path = safe_manifest_file_path(path)?;
+                anyhow::ensure!(
+                    package_dir.join(&path).is_file(),
+                    "missing layer file: {}",
+                    path.display()
+                );
             }
         }
     }
@@ -670,7 +672,14 @@ fn verify_resolved_hf_package_files(
         include_embeddings,
         include_output,
     );
-    let options = PackageIntegrityOptions::verify_with_cache(package_integrity_cache_dir());
+    let options = if metadata_only {
+        // Metadata-only probes hash only the small shared metadata artifact.
+        // Avoid the cross-run integrity cache here so a same-size metadata
+        // rewrite cannot be hidden by coarse filesystem timestamp resolution.
+        PackageIntegrityOptions::verify_without_cache()
+    } else {
+        PackageIntegrityOptions::verify_with_cache(package_integrity_cache_dir())
+    };
     let report = if metadata_only {
         package::verify_layer_package_metadata_integrity(&local_ref, &options)
     } else {
@@ -748,7 +757,7 @@ fn layer_package_progress_label(repo: &str, revision: &str) -> String {
 }
 
 fn download_layer_package_file(
-    model_api: &hf_hub::HFRepositorySync,
+    model_api: &hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>,
     revision: &str,
     label: &str,
     file_name: &str,
@@ -764,15 +773,13 @@ fn download_layer_package_file(
         completed_before,
     ));
     progress.emit_ensuring();
-    let progress_handler: Progress = Some(progress.clone());
+    let progress_handler: Option<Progress> = Some(progress.clone().into());
     let path = model_api
-        .download_file(
-            &hf_hub::RepoDownloadFileParams::builder()
-                .filename(file_name.to_string())
-                .revision(revision.to_string())
-                .progress(progress_handler)
-                .build(),
-        )
+        .download_file()
+        .filename(file_name.to_string())
+        .revision(revision.to_string())
+        .maybe_progress(progress_handler)
+        .send()
         .with_context(|| format!("download layer package file: {file_name}"))?;
     progress.emit_ready(&path);
     Ok(path)
@@ -818,16 +825,16 @@ pub(crate) fn resolve_hf_package_to_local(
         .join(&repo_folder)
         .join("snapshots")
         .join(&revision_cache_path);
-    if direct_snapshot_dir.join("model-package.json").is_file() {
-        if let Some(local_ref) = verify_cached_hf_package_files(
+    if direct_snapshot_dir.join("model-package.json").is_file()
+        && let Some(local_ref) = cache_resolution::resolve_cached_hf_package_snapshot(
             &direct_snapshot_dir,
             layer_start,
             layer_end,
             include_embeddings,
             include_output,
-        )? {
-            return Ok(local_ref);
-        }
+        )?
+    {
+        return Ok(local_ref);
     }
     if let Ok(commit_hash) = fs::read_to_string(&ref_path) {
         let commit_hash = commit_hash.trim();
@@ -838,20 +845,19 @@ pub(crate) fn resolve_hf_package_to_local(
             .join(&repo_folder)
             .join("snapshots")
             .join(commit_hash_path);
-        if snapshot_dir.join("model-package.json").is_file() {
-            if let Some(local_ref) = verify_cached_hf_package_files(
+        if snapshot_dir.join("model-package.json").is_file()
+            && let Some(local_ref) = cache_resolution::resolve_cached_hf_package_snapshot(
                 &snapshot_dir,
                 layer_start,
                 layer_end,
                 include_embeddings,
                 include_output,
-            )? {
-                return Ok(local_ref);
-            }
+            )?
+        {
+            return Ok(local_ref);
         }
     }
-
-    crate::models::run_hf_sync(move || {
+    let downloaded = crate::models::run_hf_sync(move || {
         download_hf_package_to_local_sync(
             &repo,
             &revision,
@@ -860,7 +866,57 @@ pub(crate) fn resolve_hf_package_to_local(
             include_embeddings,
             include_output,
         )
-    })
+    })?;
+
+    // Metadata-only probes (layer_start == layer_end == 0) download the
+    // manifest and shared metadata but no layer files.  The downloaded
+    // snapshot may be a skeleton whose hash must not propagate through
+    // topology configs and stage loads.  Re-scan the local cache for a
+    // snapshot that has at least one real layer artifact.
+    //
+    // Real stage loads (layer_start < layer_end) always download the
+    // requested layer range, so the downloaded snapshot is guaranteed to
+    // have the needed files — no fallback scan needed.
+    let is_metadata_only = layer_start == 0 && layer_end == 0;
+    if is_metadata_only {
+        let downloaded_dir = std::path::Path::new(&downloaded);
+        if downloaded_dir.join("model-package.json").is_file()
+            && cache_resolution::resolve_cached_hf_package_snapshot(
+                downloaded_dir,
+                layer_start,
+                layer_end,
+                include_embeddings,
+                include_output,
+            )?
+            .is_none()
+        {
+            // Downloaded snapshot is a skeleton — find one with real layers.
+            let cache_dir = crate::models::huggingface_hub_cache_dir();
+            for snapshot_dir in
+                cache_resolution::cached_package_snapshots(&cache_dir, &repo_folder)?
+            {
+                if snapshot_dir.as_path() == downloaded_dir {
+                    continue;
+                }
+                if let Ok(Some(better)) = cache_resolution::resolve_cached_hf_package_snapshot(
+                    &snapshot_dir,
+                    layer_start,
+                    layer_end,
+                    include_embeddings,
+                    include_output,
+                ) {
+                    tracing::debug!(
+                        downloaded = %downloaded,
+                        better = %better,
+                        "post-download: preferring cached snapshot with layer artifacts over skeleton"
+                    );
+                    return Ok(better);
+                }
+            }
+        }
+    }
+
+    Ok(downloaded)
 }
 
 fn download_hf_package_to_local_sync(
@@ -913,25 +969,23 @@ fn download_hf_package_to_local_sync(
         safe_manifest_file_path(metadata_path)?,
         manifest_artifact_bytes(metadata_artifact),
     ));
-    if include_embeddings {
-        if let Some(artifact) = manifest.pointer("/shared/embeddings") {
-            if let Some(path) = artifact.get("path").and_then(|v| v.as_str()) {
-                needed_files.push((
-                    safe_manifest_file_path(path)?,
-                    manifest_artifact_bytes(artifact),
-                ));
-            }
-        }
+    if include_embeddings
+        && let Some(artifact) = manifest.pointer("/shared/embeddings")
+        && let Some(path) = artifact.get("path").and_then(|v| v.as_str())
+    {
+        needed_files.push((
+            safe_manifest_file_path(path)?,
+            manifest_artifact_bytes(artifact),
+        ));
     }
-    if include_output {
-        if let Some(artifact) = manifest.pointer("/shared/output") {
-            if let Some(path) = artifact.get("path").and_then(|v| v.as_str()) {
-                needed_files.push((
-                    safe_manifest_file_path(path)?,
-                    manifest_artifact_bytes(artifact),
-                ));
-            }
-        }
+    if include_output
+        && let Some(artifact) = manifest.pointer("/shared/output")
+        && let Some(path) = artifact.get("path").and_then(|v| v.as_str())
+    {
+        needed_files.push((
+            safe_manifest_file_path(path)?,
+            manifest_artifact_bytes(artifact),
+        ));
     }
 
     // Layer files for assigned range — use explicit layer_index if present,
@@ -942,25 +996,26 @@ fn download_hf_package_to_local_sync(
                 .get("layer_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(i as u64) as u32;
-            if idx >= layer_start && idx < layer_end {
-                if let Some(path) = layer.get("path").and_then(|a| a.as_str()) {
-                    needed_files.push((
-                        safe_manifest_file_path(path)?,
-                        manifest_artifact_bytes(layer),
-                    ));
-                }
+            if idx >= layer_start
+                && idx < layer_end
+                && let Some(path) = layer.get("path").and_then(|a| a.as_str())
+            {
+                needed_files.push((
+                    safe_manifest_file_path(path)?,
+                    manifest_artifact_bytes(layer),
+                ));
             }
         }
     }
-    if layer_start == 0 {
-        if let Some(projectors) = manifest.get("projectors").and_then(|p| p.as_array()) {
-            for projector in projectors {
-                if let Some(path) = projector.get("path").and_then(|value| value.as_str()) {
-                    needed_files.push((
-                        safe_manifest_file_path(path)?,
-                        manifest_artifact_bytes(projector),
-                    ));
-                }
+    if layer_start == 0
+        && let Some(projectors) = manifest.get("projectors").and_then(|p| p.as_array())
+    {
+        for projector in projectors {
+            if let Some(path) = projector.get("path").and_then(|value| value.as_str()) {
+                needed_files.push((
+                    safe_manifest_file_path(path)?,
+                    manifest_artifact_bytes(projector),
+                ));
             }
         }
     }
@@ -985,8 +1040,7 @@ fn download_hf_package_to_local_sync(
             *total_bytes,
             Some(Arc::clone(&package_scope)),
             index + 1,
-        )
-        .with_context(|| format!("download layer package file: {file_name}"))?;
+        )?;
     }
 
     verify_resolved_hf_package_files(
@@ -1147,8 +1201,9 @@ pub(crate) fn prune_unpinned_materialized_stages() -> Result<usize> {
         if pins.iter().any(|pin| pin == &path) {
             continue;
         }
-        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
-        removed += 1;
+        if remove_materialized_stage_artifact(&path)? {
+            removed += 1;
+        }
     }
     for entry in fs::read_dir(&root).with_context(|| format!("read {}", root.display()))? {
         let path = entry?.path();
@@ -1178,9 +1233,7 @@ pub(crate) fn remove_materialized_stages_for_sources(sources: &[PathBuf]) -> Res
     let candidates = materialized_stage_removal_candidates(sources)?;
     let mut removed = 0usize;
     for candidate in candidates {
-        if candidate.artifact_path.exists() {
-            fs::remove_file(&candidate.artifact_path)
-                .with_context(|| format!("remove {}", candidate.artifact_path.display()))?;
+        if remove_materialized_stage_artifact(&candidate.artifact_path)? {
             removed += 1;
         }
         let _ = fs::remove_file(candidate.source_index_path);
@@ -1251,6 +1304,23 @@ fn materialized_stage_removal_candidates(
 struct MaterializedStageRemovalCandidate {
     artifact_path: PathBuf,
     source_index_path: PathBuf,
+}
+
+fn remove_materialized_stage_artifact(path: &Path) -> Result<bool> {
+    let removed = match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
+    };
+    let record_path = package::materialized_layer_package_cache_record_path(path);
+    match fs::remove_file(&record_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("remove {}", record_path.display()));
+        }
+    }
+    Ok(removed)
 }
 
 fn stage_package_info(package_ref: &str, info: LayerPackageInfo) -> Result<StagePackageInfo> {
@@ -1401,9 +1471,11 @@ mod tests {
 
     fn restore_env(key: &str, previous: Option<OsString>) {
         if let Some(value) = previous {
-            std::env::set_var(key, value);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(key, value) };
         } else {
-            std::env::remove_var(key);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -1507,6 +1579,9 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             shutdown_generation: 1,
+            coordinator_term: 0,
+            coordinator_id: None,
+            lease_until_unix_ms: 0,
             load_mode: LoadMode::LayerPackage,
             upstream: None,
             downstream: None,
@@ -1752,9 +1827,12 @@ mod tests {
         let prev_huggingface_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
 
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HOME", temp.path());
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", temp.path()) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
 
         let error = resolve_hf_package_to_local("hf://owner/repo@../../evil", 0, 0, false, false)
             .unwrap_err()
@@ -1777,9 +1855,12 @@ mod tests {
         let prev_huggingface_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
 
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HOME", temp.path());
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", temp.path()) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
 
         let refs_dir = temp
             .path()
@@ -1810,9 +1891,12 @@ mod tests {
         let prev_huggingface_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
 
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HOME", temp.path());
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", temp.path()) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
 
         let snapshot = temp
             .path()
@@ -1834,6 +1918,52 @@ mod tests {
 
     #[test]
     #[serial]
+    /// With an explicit pinned revision that has all requested layers, the
+    /// cache lookup returns it directly without downloading or scanning other
+    /// snapshots.  A stale snapshot with different content must NOT be picked.
+    fn pinned_revision_resolves_directly_from_cache() {
+        let prev_hf_home = std::env::var_os("HF_HOME");
+        let prev_hf_cache = std::env::var_os("HF_HUB_CACHE");
+        let prev_huggingface_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
+        let prev_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
+
+        let temp = tempfile::tempdir().unwrap();
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", temp.path().join("hf")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", temp.path().join("mesh-cache")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
+
+        let repo_cache = temp
+            .path()
+            .join("hf")
+            .join("hub")
+            .join("models--owner--repo");
+
+        // Create a complete snapshot at the pinned revision.
+        let pinned_snapshot = repo_cache.join("snapshots").join("abc123");
+        write_cached_package_snapshot(&pinned_snapshot, sha256_hex(b"layer"));
+
+        // Create a stale snapshot that also has layers — must NOT be used.
+        let stale_snapshot = repo_cache.join("snapshots").join("old-stale");
+        write_cached_package_snapshot(&stale_snapshot, sha256_hex(b"layer"));
+
+        let resolved =
+            resolve_hf_package_to_local("hf://owner/repo@abc123", 0, 0, false, false).unwrap();
+
+        assert_eq!(PathBuf::from(resolved), pinned_snapshot);
+
+        restore_env("HF_HOME", prev_hf_home);
+        restore_env("HF_HUB_CACHE", prev_hf_cache);
+        restore_env("HUGGINGFACE_HUB_CACHE", prev_huggingface_cache);
+        restore_env("XDG_CACHE_HOME", prev_xdg_cache);
+    }
+
+    #[test]
+    #[serial]
     fn hf_package_metadata_only_cache_resolution_uses_metadata_integrity_scope() {
         let prev_hf_home = std::env::var_os("HF_HOME");
         let prev_hf_cache = std::env::var_os("HF_HUB_CACHE");
@@ -1841,10 +1971,14 @@ mod tests {
         let prev_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
 
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HOME", temp.path().join("hf"));
-        std::env::set_var("XDG_CACHE_HOME", temp.path().join("mesh-cache"));
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", temp.path().join("hf")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", temp.path().join("mesh-cache")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
 
         let snapshot = temp
             .path()
@@ -1888,10 +2022,14 @@ mod tests {
         let prev_xdg_cache = std::env::var_os("XDG_CACHE_HOME");
 
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("HF_HOME", temp.path().join("hf"));
-        std::env::set_var("XDG_CACHE_HOME", temp.path().join("mesh-cache"));
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", temp.path().join("hf")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", temp.path().join("mesh-cache")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
 
         let snapshot = temp
             .path()
@@ -1950,6 +2088,9 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
             shutdown_generation: 0,
+            coordinator_term: 0,
+            coordinator_id: None,
+            lease_until_unix_ms: 0,
             load_mode: LoadMode::LayerPackage,
             upstream: None,
             downstream: None,
@@ -1977,7 +2118,8 @@ mod tests {
         };
 
         let temp = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CACHE_HOME", temp.path());
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", temp.path()) };
 
         let root = materialized_stage_cache_dir();
         fs::create_dir_all(&root).unwrap();
@@ -1990,6 +2132,8 @@ mod tests {
         let fixture_id = cache_key(&temp.path().to_string_lossy());
         let artifact = root.join(format!("stage-{fixture_id}.gguf"));
         fs::write(&artifact, b"stage").unwrap();
+        let cache_record_path = package::materialized_layer_package_cache_record_path(&artifact);
+        fs::write(&cache_record_path, b"{}").unwrap();
         let index = SourceIndex {
             artifact_path: artifact.clone(),
             source_model_path: source.to_string_lossy().to_string(),
@@ -2006,6 +2150,7 @@ mod tests {
             remove_materialized_stages_for_sources(std::slice::from_ref(&source)).unwrap();
         assert_eq!(removed, 1);
         assert!(!artifact.exists());
+        assert!(!cache_record_path.exists());
         assert!(!index_path.exists());
         fs::remove_dir(unreadable_index_path).unwrap();
     }

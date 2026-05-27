@@ -493,11 +493,10 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
             }
         }
         speculative_stats.adaptive_window_final = adaptive_window;
-        if decision.rejected() || reached_eog {
-            if let Some(draft) = draft.as_deref_mut() {
+        if (decision.rejected() || reached_eog)
+            && let Some(draft) = draft.as_deref_mut() {
                 draft.reset_to_context(&context_tokens)?;
             }
-        }
         if reached_eog {
             break;
         }
@@ -510,8 +509,9 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
             generated.iter().take(16).collect::<Vec<_>>()
         );
     }
-    if live_enabled {
-        rematerialize_live_transcript(
+    let mut live_rematerialize_failed = false;
+    if live_enabled
+        && let Err(error) = rematerialize_live_transcript(
             stream,
             tokenizer,
             chat_template_model,
@@ -525,8 +525,13 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
             &generated,
             &assistant_raw_text,
             generation_reached_eog,
-        )?;
-    }
+        ) {
+            live_rematerialize_failed = true;
+            eprintln!(
+                "warning: live transcript rematerialization failed after generation; \
+                 the next prompt will reset the live session: {error:#}"
+            );
+        }
 
     if !live_enabled {
         stop_prompt_stream(stream, wire_dtype, request_id, wire_session_id, args)?;
@@ -546,16 +551,18 @@ fn run_prompt(run: PromptRun<'_>) -> Result<()> {
     };
     let mut resident_tokens_after = 0usize;
     if let Some(live) = live_session {
+        if live_rematerialize_failed {
+            live.stream = None;
+        }
         live.messages = live_messages;
-        if let Some(last) = live.messages.last_mut() {
-            if last.role == "user" {
+        if let Some(last) = live.messages.last_mut()
+            && last.role == "user" {
                 live.messages
                     .push(ChatTemplateMessage::new("assistant", &assistant_raw_text));
             }
-        }
         live.resident_tokens =
             live_transcript_tokens(tokenizer, chat_template_model, args, &live.messages)?;
-        live.dirty = !generation_reached_eog;
+        live.dirty = !generation_reached_eog || live_rematerialize_failed;
         resident_tokens_after = live.resident_tokens.len();
     }
     session_reuse.resident_tokens_after = resident_tokens_after;

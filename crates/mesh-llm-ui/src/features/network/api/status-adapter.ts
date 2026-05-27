@@ -204,7 +204,8 @@ function adaptPeer(peer: PeerInfo, fallbackIndex: number, runtimeStages: Runtime
     toksPerSec: peer.tok_per_sec,
     hardwareLabel: peer.hardware_label,
     owner: resolveOwner(peer.owner),
-    splitStages
+    splitStages,
+    firstJoinedMeshTs: peer.first_joined_mesh_ts
   }
 }
 
@@ -214,12 +215,16 @@ function adaptSelfPeer(payload: StatusPayload, runtimeStages: RuntimeStageInfo[]
     payload.node_state === 'serving' ? payload.model_name : undefined
   ])
   const splitStages = splitStagesForNode(runtimeStages, payload.node_id)
+  const splitParticipant = splitStages.length > 0
+
+  // A split worker is in standby but actively participating — treat it as serving
+  const effectiveState = splitParticipant && payload.node_state === 'standby' ? 'serving' : payload.node_state
 
   return {
     id: payload.node_id,
     hostname: payload.hostname ?? payload.my_hostname ?? 'localhost',
     region: payload.region ?? '',
-    status: mapNodeState(payload.node_state),
+    status: mapNodeState(effectiveState),
     hostedModels: appendSplitModels(servingModels, splitStages),
     sharePct: 0,
     latencyMs: 0,
@@ -229,11 +234,12 @@ function adaptSelfPeer(payload: StatusPayload, runtimeStages: RuntimeStageInfo[]
     loadPct: payload.load_pct ?? 0,
     shortId: payload.node_id.slice(0, 8),
     role: 'you' as const,
-    nodeState: payload.node_state,
+    nodeState: effectiveState,
     version: payload.version,
     vramGB: payload.my_vram_gb,
     toksPerSec: payload.tok_per_sec,
-    splitStages
+    splitStages,
+    firstJoinedMeshTs: payload.first_joined_mesh_ts
   }
 }
 
@@ -331,7 +337,8 @@ function adaptMeshNodeSeeds(payload: StatusPayload): MeshNode[] {
     meshState: payload.node_state,
     servingModels: payload.serving_models.map(servingModelName),
     hostname: payload.hostname,
-    vramGB: payload.my_vram_gb
+    vramGB: payload.my_vram_gb,
+    firstJoinedMeshTs: payload.first_joined_mesh_ts
   }
 
   return [selfNode]
@@ -351,6 +358,7 @@ export function adaptStatusToDashboard(payload: StatusPayload, models: ModelSumm
     meshNodeSeeds: adaptMeshNodeSeeds(payload),
     meshId: payload.mesh_id ?? '',
     models,
-    connect: adaptConnect(payload)
+    connect: adaptConnect(payload),
+    wakeableNodes: payload.wakeable_nodes
   }
 }

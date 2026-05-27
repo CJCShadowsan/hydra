@@ -1,6 +1,5 @@
-use hf_hub::cache::scan_cache_dir;
-use hf_hub::types::cache::{CachedFileInfo, CachedRepoInfo, CachedRevisionInfo, HFCacheInfo};
-use hf_hub::RepoType;
+use hf_hub::cache::{CachedFileInfo, CachedRepoInfo, CachedRevisionInfo, HFCacheInfo};
+use hf_hub::{HFClientBuilder, RepoType, RepoTypeModel};
 use model_ref::{format_model_ref, gguf_matches_quant_selector, normalize_gguf_distribution_id};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -126,9 +125,9 @@ pub fn huggingface_hub_cache_dir() -> PathBuf {
     huggingface_hub_cache()
 }
 
-pub(crate) fn huggingface_repo_folder_name(repo_id: &str, repo_type: RepoType) -> String {
-    let type_plural = format!("{}s", repo_type);
-    std::iter::once(type_plural.as_str())
+pub(crate) fn huggingface_repo_folder_name(repo_id: &str, repo_type: impl RepoType) -> String {
+    let type_plural = repo_type.plural();
+    std::iter::once(type_plural)
         .chain(repo_id.split('/'))
         .collect::<Vec<_>>()
         .join("--")
@@ -137,7 +136,7 @@ pub(crate) fn huggingface_repo_folder_name(repo_id: &str, repo_type: RepoType) -
 #[cfg(test)]
 pub(crate) fn huggingface_snapshot_path(
     repo_id: &str,
-    repo_type: RepoType,
+    repo_type: impl RepoType,
     revision: &str,
 ) -> PathBuf {
     huggingface_hub_cache_dir()
@@ -153,7 +152,16 @@ pub(crate) fn scan_hf_cache_info(cache_root: &Path) -> Option<HFCacheInfo> {
             .enable_all()
             .build()
             .ok()?;
-        runtime.block_on(scan_cache_dir(&cache_root)).ok()
+        runtime
+            .block_on(
+                HFClientBuilder::new()
+                    .cache_dir(cache_root)
+                    .build()
+                    .ok()?
+                    .scan_cache()
+                    .send(),
+            )
+            .ok()
     };
 
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -164,7 +172,7 @@ pub(crate) fn scan_hf_cache_info(cache_root: &Path) -> Option<HFCacheInfo> {
 }
 
 fn cache_repo_id(repo: &CachedRepoInfo) -> Option<&str> {
-    (repo.repo_type == RepoType::Model).then_some(repo.repo_id.as_str())
+    (repo.repo_type == RepoTypeModel.singular()).then_some(repo.repo_id.as_str())
 }
 
 pub fn mesh_llm_cache_dir() -> PathBuf {
@@ -316,31 +324,30 @@ pub fn huggingface_identity_for_path(path: &Path) -> Option<HuggingFaceModelIden
     let resolved_cache_root = cache_root
         .canonicalize()
         .unwrap_or_else(|_| cache_root.clone());
-    if resolved_cache_root != *cache_root {
-        if let Some(identity) = identity_from_cache_snapshot_path(path, &resolved_cache_root) {
-            return Some(identity);
-        }
+    if resolved_cache_root != *cache_root
+        && let Some(identity) = identity_from_cache_snapshot_path(path, &resolved_cache_root)
+    {
+        return Some(identity);
     }
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if resolved != path {
         if let Some(identity) = identity_from_cache_snapshot_path(&resolved, &cache_root) {
             return Some(identity);
         }
-        if resolved_cache_root != *cache_root {
-            if let Some(identity) =
+        if resolved_cache_root != *cache_root
+            && let Some(identity) =
                 identity_from_cache_snapshot_path(&resolved, &resolved_cache_root)
-            {
-                return Some(identity);
-            }
+        {
+            return Some(identity);
         }
     }
     if let Some(identity) = identity_from_snapshot_layout_ancestors(path) {
         return Some(identity);
     }
-    if resolved != path {
-        if let Some(identity) = identity_from_snapshot_layout_ancestors(&resolved) {
-            return Some(identity);
-        }
+    if resolved != path
+        && let Some(identity) = identity_from_snapshot_layout_ancestors(&resolved)
+    {
+        return Some(identity);
     }
     scan_hf_cache_identity_for_path(path, &cache_root)
 }
@@ -404,8 +411,12 @@ fn cache_scanned_file_path(
         .file_path
         .strip_prefix(&revision.snapshot_path)
         .unwrap_or(file.file_path.as_path());
-    cache_root
-        .join(huggingface_repo_folder_name(&repo.repo_id, repo.repo_type))
+    repo.repo_path
+        .strip_prefix(cache_root)
+        .map_or_else(
+            |_| repo.repo_path.clone(),
+            |relative| cache_root.join(relative),
+        )
         .join("snapshots")
         .join(&revision.commit_hash)
         .join(relative)
@@ -481,29 +492,35 @@ fn scan_hf_cache_models(names: &mut Vec<String>, seen: &mut HashSet<String>, min
         push_model_name(&path, names, seen, min_size_bytes);
     }
 
-    let Some(cache_info) = scan_hf_cache_info(&cache_root) else {
-        return;
-    };
-    for repo in &cache_info.repos {
-        if repo.repo_type != RepoType::Model {
-            continue;
-        }
-        for revision in &repo.revisions {
-            let mut files = revision.files.iter().collect::<Vec<_>>();
-            files.sort_by(|left, right| {
-                let left_relative = cached_relative_file(revision, left);
-                let right_relative = cached_relative_file(revision, right);
-                layered_package_relative_preference(&left_relative)
-                    .cmp(&layered_package_relative_preference(&right_relative))
-                    .then_with(|| left_relative.cmp(&right_relative))
-            });
-            for file in files {
-                if !file.file_name.ends_with(".gguf") {
-                    continue;
-                }
-                let path = cache_scanned_file_path(&cache_root, repo, revision, file);
-                push_model_name(&path, names, seen, min_size_bytes);
+    if std::env::var("MESH_LLM_ALLOW_FULL_HF_CACHE_SCAN").unwrap_or_default() == "1" {
+        let Some(cache_info) = scan_hf_cache_info(&cache_root) else {
+            return;
+        };
+        for repo in &cache_info.repos {
+            if repo.repo_type != RepoTypeModel.singular() {
+                continue;
             }
+            for revision in &repo.revisions {
+                let mut files = revision.files.iter().collect::<Vec<_>>();
+                files.sort_by(|left, right| {
+                    let left_relative = cached_relative_file(revision, left);
+                    let right_relative = cached_relative_file(revision, right);
+                    layered_package_relative_preference(&left_relative)
+                        .cmp(&layered_package_relative_preference(&right_relative))
+                        .then_with(|| left_relative.cmp(&right_relative))
+                });
+                for file in files {
+                    if !file.file_name.ends_with(".gguf") {
+                        continue;
+                    }
+                    let path = cache_scanned_file_path(&cache_root, repo, revision, file);
+                    push_model_name(&path, names, seen, min_size_bytes);
+                }
+            }
+        }
+    } else {
+        for path in scan_hf_cache_fast(&cache_root) {
+            push_model_name(&path, names, seen, min_size_bytes);
         }
     }
 }
@@ -616,6 +633,23 @@ fn collect_gguf_paths_recursive(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+pub(crate) fn scan_hf_cache_fast(cache_root: &Path) -> Vec<PathBuf> {
+    let mut gguf_paths = Vec::new();
+    let Ok(entries) = std::fs::read_dir(cache_root) else {
+        return gguf_paths;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let snapshots = path.join("snapshots");
+            if snapshots.exists() {
+                collect_gguf_paths_recursive(&snapshots, &mut gguf_paths);
+            }
+        }
+    }
+    gguf_paths
+}
+
 pub fn layered_package_layer_count_for_path(path: &Path) -> Option<usize> {
     let (root, paths) = layered_package_gguf_paths(path)?;
     let layers = paths
@@ -679,14 +713,14 @@ fn find_hf_cache_model_ref_path(root: &Path, model: &model_ref::ModelRef) -> Opt
     let cache_info = scan_hf_cache_info(root)?;
     let mut candidates = Vec::new();
     for repo in &cache_info.repos {
-        if repo.repo_type != RepoType::Model || repo.repo_id != model.repo {
+        if repo.repo_type != RepoTypeModel.singular() || repo.repo_id != model.repo {
             continue;
         }
         for revision in &repo.revisions {
-            if let Some(wanted_revision) = model.revision.as_deref() {
-                if revision.commit_hash != wanted_revision {
-                    continue;
-                }
+            if let Some(wanted_revision) = model.revision.as_deref()
+                && revision.commit_hash != wanted_revision
+            {
+                continue;
             }
             for file in &revision.files {
                 if !file.file_name.ends_with(".gguf") {
@@ -716,7 +750,7 @@ fn find_synthetic_local_gguf_path(root: &Path, model: &model_ref::ModelRef) -> O
     let cache_info = scan_hf_cache_info(root);
     if let Some(cache_info) = cache_info {
         for repo in &cache_info.repos {
-            if repo.repo_type != RepoType::Model {
+            if repo.repo_type != RepoTypeModel.singular() {
                 continue;
             }
             for revision in &repo.revisions {
@@ -745,7 +779,7 @@ fn find_hf_cache_model_path(root: &Path, stem: &str) -> Option<PathBuf> {
     let cache_root = huggingface_hub_cache_dir();
     let cache_info = scan_hf_cache_info(&cache_root)?;
     for repo in &cache_info.repos {
-        if repo.repo_type != RepoType::Model {
+        if repo.repo_type != RepoTypeModel.singular() {
             continue;
         }
         for revision in &repo.revisions {
@@ -790,10 +824,10 @@ pub fn find_model_path(model_ref: &str) -> PathBuf {
         return path;
     }
     let canonical_dir = huggingface_hub_cache_dir();
-    if let Ok(parsed) = model_ref::ModelRef::parse(model_ref) {
-        if let Some(found) = find_hf_cache_model_ref_path(&canonical_dir, &parsed) {
-            return found;
-        }
+    if let Ok(parsed) = model_ref::ModelRef::parse(model_ref)
+        && let Some(found) = find_hf_cache_model_ref_path(&canonical_dir, &parsed)
+    {
+        return found;
     }
 
     if let Some(found) = find_hf_cache_model_path(&canonical_dir, model_ref) {
@@ -861,10 +895,9 @@ fn is_named_mmproj_match(lower: &str, model_base: &str, model_stem: &str) -> boo
     if let Some((prefix, _)) = lower
         .split_once("-mmproj")
         .or_else(|| lower.split_once("_mmproj"))
+        && (model_base.starts_with(prefix) || model_stem.starts_with(prefix))
     {
-        if model_base.starts_with(prefix) || model_stem.starts_with(prefix) {
-            return true;
-        }
+        return true;
     }
     // Try pattern: mmproj-<model>... (model name after mmproj)
     if let Some(after) = lower
@@ -980,24 +1013,22 @@ pub fn find_mmproj_path(model_name: &str, model_path: &Path) -> Option<PathBuf> 
 
     if !named_matches.is_empty() {
         // Multiple named matches: try quant-aware selection before precision fallback
-        if named_matches.len() > 1 {
-            if let Some(ref quant) = model_quant {
-                if let Some(candidate) = pick_quant_match(&named_matches, quant) {
-                    return Some(candidate);
-                }
-            }
+        if named_matches.len() > 1
+            && let Some(ref quant) = model_quant
+            && let Some(candidate) = pick_quant_match(&named_matches, quant)
+        {
+            return Some(candidate);
         }
         // Single named match, or quant-match failed: precision-variant pick or None
         return choose_mmproj_candidate(&named_matches);
     }
 
     // No named matches: try quant-aware selection among all siblings, then precision fallback
-    if mmproj_siblings.len() > 1 {
-        if let Some(ref quant) = model_quant {
-            if let Some(candidate) = pick_quant_match(&mmproj_siblings, quant) {
-                return Some(candidate);
-            }
-        }
+    if mmproj_siblings.len() > 1
+        && let Some(ref quant) = model_quant
+        && let Some(candidate) = pick_quant_match(&mmproj_siblings, quant)
+    {
+        return Some(candidate);
     }
     choose_mmproj_candidate(&mmproj_siblings)
 }
@@ -1025,10 +1056,14 @@ mod tests {
         let prev_huggingface_hub_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
         let prev_hf_home = std::env::var_os("HF_HOME");
         let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("HF_HUB_CACHE", "/tmp/mesh-llm-hub-cache");
-        std::env::set_var("HUGGINGFACE_HUB_CACHE", "/tmp/mesh-llm-alt-hub-cache");
-        std::env::set_var("HF_HOME", "/tmp/mesh-llm-hf-home");
-        std::env::set_var("XDG_CACHE_HOME", "/tmp/mesh-llm-xdg");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", "/tmp/mesh-llm-hub-cache") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HUGGINGFACE_HUB_CACHE", "/tmp/mesh-llm-alt-hub-cache") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", "/tmp/mesh-llm-hf-home") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", "/tmp/mesh-llm-xdg") };
 
         assert_eq!(
             huggingface_hub_cache_dir(),
@@ -1048,10 +1083,14 @@ mod tests {
         let prev_huggingface_hub_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
         let prev_hf_home = std::env::var_os("HF_HOME");
         let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::set_var("HUGGINGFACE_HUB_CACHE", "/tmp/mesh-llm-alt-hub-cache");
-        std::env::set_var("HF_HOME", "/tmp/mesh-llm-hf-home");
-        std::env::set_var("XDG_CACHE_HOME", "/tmp/mesh-llm-xdg");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HUGGINGFACE_HUB_CACHE", "/tmp/mesh-llm-alt-hub-cache") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", "/tmp/mesh-llm-hf-home") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", "/tmp/mesh-llm-xdg") };
 
         assert_eq!(
             huggingface_hub_cache_dir(),
@@ -1071,10 +1110,14 @@ mod tests {
         let prev_huggingface_hub_cache = std::env::var_os("HUGGINGFACE_HUB_CACHE");
         let prev_hf_home = std::env::var_os("HF_HOME");
         let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
-        std::env::remove_var("HF_HUB_CACHE");
-        std::env::remove_var("HUGGINGFACE_HUB_CACHE");
-        std::env::set_var("HF_HOME", "/tmp/mesh-llm-hf-home");
-        std::env::set_var("XDG_CACHE_HOME", "/tmp/mesh-llm-xdg");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HUGGINGFACE_HUB_CACHE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", "/tmp/mesh-llm-hf-home") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", "/tmp/mesh-llm-xdg") };
 
         assert_eq!(
             huggingface_hub_cache_dir(),
@@ -1125,9 +1168,12 @@ mod tests {
         std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
         std::fs::write(&snapshot_path, b"gguf").unwrap();
 
-        std::env::set_var("HF_HUB_CACHE", &temp);
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let identity = huggingface_identity_for_path(&snapshot_path).unwrap();
         assert_eq!(identity.repo_id, "bartowski/Llama-3.2-1B-Instruct-GGUF");
@@ -1173,9 +1219,12 @@ mod tests {
         std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
         std::fs::write(&snapshot_path, b"gguf").unwrap();
 
-        std::env::set_var("HF_HUB_CACHE", temp.join("some-other-cache-root"));
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.join("some-other-cache-root")) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let identity = huggingface_identity_for_path(&snapshot_path).unwrap();
         assert_eq!(identity.repo_id, "bartowski/Llama-3.2-1B-Instruct-GGUF");
@@ -1300,14 +1349,19 @@ mod tests {
         std::fs::create_dir_all(&temp).unwrap();
         std::fs::write(temp.join("Direct-Root-Q4_K_M.gguf"), b"gguf").unwrap();
 
-        std::env::set_var("HF_HUB_CACHE", &temp);
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let installed = scan_installed_models();
-        assert!(installed
-            .iter()
-            .any(|name| name.starts_with("local-gguf/sha256-")));
+        assert!(
+            installed
+                .iter()
+                .any(|name| name.starts_with("local-gguf/sha256-"))
+        );
 
         let _ = std::fs::remove_dir_all(&temp);
         restore_env("HF_HUB_CACHE", prev_hub_cache);
@@ -1355,9 +1409,12 @@ mod tests {
         std::fs::write(&nested_layer_002, b"layer-002").unwrap();
         std::fs::write(&nested_shared, b"nested").unwrap();
 
-        std::env::set_var("HF_HUB_CACHE", &temp);
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let installed = scan_installed_models();
 
@@ -1482,9 +1539,11 @@ mod tests {
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
         if let Some(value) = value {
-            std::env::set_var(key, value);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(key, value) };
         } else {
-            std::env::remove_var(key);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(key) };
         }
     }
 

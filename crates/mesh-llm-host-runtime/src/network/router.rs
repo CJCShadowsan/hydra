@@ -40,6 +40,22 @@ pub struct MediaRequirements {
     pub needs_audio: bool,
 }
 
+impl MediaRequirements {
+    pub fn requires_runtime_modality(self) -> bool {
+        self.needs_vision || self.needs_audio
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RouterSignalScores {
+    code: usize,
+    reasoning: usize,
+    creative: usize,
+    info: usize,
+    image: usize,
+    deep: usize,
+}
+
 // ── Model capabilities for routing ──────────────────────────────────
 
 /// Strip split GGUF suffix like "-00001-of-00004" from a model name.
@@ -74,25 +90,36 @@ pub fn strip_split_suffix_owned(name: &str) -> String {
 /// Tools presence is an attribute, not a category override — a code request
 /// with tools is still Code (with needs_tools=true), not ToolCall.
 pub fn classify(body: &Value) -> Classification {
-    // Collect all text from messages for keyword analysis
     let text = collect_message_text(body);
     let lower = text.to_lowercase();
     let media = media_requirements(body);
+    let needs_tools = detect_tool_requirement(body);
+    let last_user_len = last_user_message_len(body);
+    let scores = router_signal_scores(&lower);
+    let category = classify_category(scores, detect_system_code_hint(body), media, needs_tools);
+    let complexity = classify_complexity(scores, last_user_len, message_count(body));
 
-    // Check if the request actually needs tool execution.
-    // If the client sends a tools schema, this is an agentic session (Claude Code,
-    // Goose, etc.) — always prefer the strongest tool-capable model regardless of
-    // what the first message says.  Keyword matching on content is a secondary signal
-    // but not required when tools are present.
-    let has_tools_schema = body
-        .get("tools")
+    Classification {
+        category,
+        complexity,
+        needs_tools,
+        has_media_inputs: media.has_media,
+    }
+}
+
+fn detect_tool_requirement(body: &Value) -> bool {
+    has_tools_schema(body) || has_tool_blocks(body)
+}
+
+fn has_tools_schema(body: &Value) -> bool {
+    body.get("tools")
         .and_then(|t| t.as_array())
         .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    // Anthropic-style requests may include structured content blocks with
-    // explicit tool_use/tool_result blocks — definitely tool-driven.
-    let has_tool_blocks = body
-        .get("messages")
+        .unwrap_or(false)
+}
+
+fn has_tool_blocks(body: &Value) -> bool {
+    body.get("messages")
         .and_then(|m| m.as_array())
         .map(|msgs| {
             msgs.iter().any(|msg| {
@@ -109,216 +136,227 @@ pub fn classify(body: &Value) -> Classification {
                     .unwrap_or(false)
             })
         })
-        .unwrap_or(false);
-    let needs_tools = has_tools_schema || has_tool_blocks;
+        .unwrap_or(false)
+}
 
-    // Count last user message tokens (rough proxy for complexity)
-    let last_user_len = last_user_message_len(body);
-
-    // Code signals
-    let code_signals = [
-        "```",
-        "def ",
-        "fn ",
-        "func ",
-        "class ",
-        "import ",
-        "function",
-        "const ",
-        "let ",
-        "var ",
-        "return ",
-        "write a program",
-        "write code",
-        "implement",
-        "refactor",
-        "debug",
-        "fix the bug",
-        "write a script",
-        "code review",
-        "pull request",
-        "git ",
-        "compile",
-        "syntax",
-        "python",
-        "javascript",
-        "typescript",
-        " rust ",
-        "golang",
-        "java ",
-        "c++",
-        " ruby ",
-        " swift ",
-        "kotlin",
-        "algorithm",
-        "binary search",
-        " sort ",
-        "regex",
-        " api ",
-        " http ",
-        " sql ",
-        "database",
-        " query ",
-    ];
-    let code_score: usize = code_signals.iter().filter(|s| lower.contains(*s)).count();
-
-    // Reasoning signals
-    let reasoning_signals = [
-        "prove",
-        "explain why",
-        "step by step",
-        "calculate",
-        "solve",
-        "derive",
-        "what is the probability",
-        "how many",
-        "analyze",
-        "compare and contrast",
-        "evaluate",
-        "mathematical",
-        "theorem",
-        "equation",
-        "logic",
-        "think carefully",
-        "reason about",
-    ];
-    let reasoning_score: usize = reasoning_signals
+fn count_signals(lower: &str, signals: &[&str]) -> usize {
+    signals
         .iter()
-        .filter(|s| lower.contains(*s))
-        .count();
+        .filter(|signal| lower.contains(*signal))
+        .count()
+}
 
-    // Creative signals
-    let creative_signals = [
-        "write a story",
-        "write a poem",
-        "creative",
-        "imagine",
-        "fiction",
-        "narrative",
-        "compose",
-        "brainstorm",
-        "write a song",
-        "screenplay",
-        "dialogue",
-    ];
-    let creative_score: usize = creative_signals
-        .iter()
-        .filter(|s| lower.contains(*s))
-        .count();
-
-    // Info/knowledge signals — factual lookup, summarization
-    let info_signals = [
-        "what is",
-        "who is",
-        "when did",
-        "where is",
-        "how does",
-        "define ",
-        "explain ",
-        "summarize",
-        "summary",
-        "overview",
-        "tell me about",
-        "describe ",
-        "what are the",
-        "list the",
-        "difference between",
-        "compare ",
-        "history of",
-    ];
-    let info_score: usize = info_signals.iter().filter(|s| lower.contains(*s)).count();
-
-    // Image signals — generation or analysis (future)
-    let image_signals = [
-        "image",
-        "picture",
-        "photo",
-        "draw",
-        "generate an image",
-        "visualize",
-        "diagram",
-        "screenshot",
-        "describe this image",
-    ];
-    let image_score: usize = image_signals.iter().filter(|s| lower.contains(*s)).count();
-
-    // Deep-thinking signals (want the biggest brain)
-    let deep_signals = [
-        "architect",
-        "design a system",
-        "trade-off",
-        "tradeoff",
-        "in depth",
-        "comprehensive",
-        "thorough",
-        "detailed analysis",
-        "long-term",
-        "strategy",
-        "plan for",
-        "review this codebase",
-        "rewrite",
-        "from scratch",
-    ];
-    let deep_score: usize = deep_signals.iter().filter(|s| lower.contains(*s)).count();
-
-    // System prompt hints
-    let mut system_code = false;
-    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
-            if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    let sys = content.to_lowercase();
-                    if sys.contains("developer")
-                        || sys.contains("coding")
-                        || sys.contains("programmer")
-                    {
-                        system_code = true;
-                    }
-                }
-            }
-        }
+fn router_signal_scores(lower: &str) -> RouterSignalScores {
+    RouterSignalScores {
+        code: count_signals(
+            lower,
+            &[
+                "```",
+                "def ",
+                "fn ",
+                "func ",
+                "class ",
+                "import ",
+                "function",
+                "const ",
+                "let ",
+                "var ",
+                "return ",
+                "write a program",
+                "write code",
+                "implement",
+                "refactor",
+                "debug",
+                "fix the bug",
+                "write a script",
+                "code review",
+                "pull request",
+                "git ",
+                "compile",
+                "syntax",
+                "python",
+                "javascript",
+                "typescript",
+                " rust ",
+                "golang",
+                "java ",
+                "c++",
+                " ruby ",
+                " swift ",
+                "kotlin",
+                "algorithm",
+                "binary search",
+                " sort ",
+                "regex",
+                " api ",
+                " http ",
+                " sql ",
+                "database",
+                " query ",
+            ],
+        ),
+        reasoning: count_signals(
+            lower,
+            &[
+                "prove",
+                "explain why",
+                "step by step",
+                "calculate",
+                "solve",
+                "derive",
+                "what is the probability",
+                "how many",
+                "analyze",
+                "compare and contrast",
+                "evaluate",
+                "mathematical",
+                "theorem",
+                "equation",
+                "logic",
+                "think carefully",
+                "reason about",
+            ],
+        ),
+        creative: count_signals(
+            lower,
+            &[
+                "write a story",
+                "write a poem",
+                "creative",
+                "imagine",
+                "fiction",
+                "narrative",
+                "compose",
+                "brainstorm",
+                "write a song",
+                "screenplay",
+                "dialogue",
+            ],
+        ),
+        info: count_signals(
+            lower,
+            &[
+                "what is",
+                "who is",
+                "when did",
+                "where is",
+                "how does",
+                "define ",
+                "explain ",
+                "summarize",
+                "summary",
+                "overview",
+                "tell me about",
+                "describe ",
+                "what are the",
+                "list the",
+                "difference between",
+                "compare ",
+                "history of",
+            ],
+        ),
+        image: count_signals(
+            lower,
+            &[
+                "image",
+                "picture",
+                "photo",
+                "draw",
+                "generate an image",
+                "visualize",
+                "diagram",
+                "screenshot",
+                "describe this image",
+            ],
+        ),
+        deep: count_signals(
+            lower,
+            &[
+                "architect",
+                "design a system",
+                "trade-off",
+                "tradeoff",
+                "in depth",
+                "comprehensive",
+                "thorough",
+                "detailed analysis",
+                "long-term",
+                "strategy",
+                "plan for",
+                "review this codebase",
+                "rewrite",
+                "from scratch",
+            ],
+        ),
     }
+}
 
-    // Pick category — tools don't override, content wins
-    let category = if system_code
-        || code_score >= 2
-        || (code_score >= 1 && reasoning_score == 0 && creative_score == 0)
+fn detect_system_code_hint(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|messages| {
+            messages.iter().any(|msg| {
+                msg.get("role").and_then(|r| r.as_str()) == Some("system")
+                    && msg
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|content| {
+                            let sys = content.to_lowercase();
+                            sys.contains("developer")
+                                || sys.contains("coding")
+                                || sys.contains("programmer")
+                        })
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn classify_category(
+    scores: RouterSignalScores,
+    system_code: bool,
+    media: MediaRequirements,
+    needs_tools: bool,
+) -> Category {
+    if system_code
+        || scores.code >= 2
+        || (scores.code >= 1 && scores.reasoning == 0 && scores.creative == 0)
     {
         Category::Code
-    } else if reasoning_score >= 2 {
+    } else if scores.reasoning >= 2 {
         Category::Reasoning
-    } else if creative_score >= 1 {
+    } else if scores.creative >= 1 {
         Category::Creative
-    } else if media.needs_vision || image_score >= 1 {
+    } else if media.needs_vision || scores.image >= 1 {
         Category::Image
-    } else if needs_tools && code_score == 0 && reasoning_score == 0 && creative_score == 0 {
-        // Only ToolCall if tools present AND no other signal dominates
+    } else if needs_tools && scores.code == 0 && scores.reasoning == 0 && scores.creative == 0 {
         Category::ToolCall
-    } else if info_score >= 2 && code_score == 0 {
+    } else if scores.info >= 2 && scores.code == 0 {
         Category::Info
     } else {
         Category::Chat
-    };
+    }
+}
 
-    // Complexity: Quick / Moderate / Deep
-    let total_messages = body
-        .get("messages")
+fn message_count(body: &Value) -> usize {
+    body.get("messages")
         .and_then(|m| m.as_array())
         .map(|a| a.len())
-        .unwrap_or(0);
-    let complexity = if deep_score >= 1 || last_user_len > 500 || total_messages > 10 {
+        .unwrap_or(0)
+}
+
+fn classify_complexity(
+    scores: RouterSignalScores,
+    last_user_len: usize,
+    total_messages: usize,
+) -> Complexity {
+    if scores.deep >= 1 || last_user_len > 500 || total_messages > 10 {
         Complexity::Deep
-    } else if last_user_len < 60 && total_messages <= 2 && reasoning_score == 0 && deep_score == 0 {
+    } else if last_user_len < 60 && total_messages <= 2 && scores.reasoning == 0 && scores.deep == 0
+    {
         Complexity::Quick
     } else {
         Complexity::Moderate
-    };
-
-    Classification {
-        category,
-        complexity,
-        needs_tools,
-        has_media_inputs: media.has_media,
     }
 }
 
@@ -370,8 +408,26 @@ pub(crate) fn model_satisfies_media_requirements(
     caps: &crate::models::ModelCapabilities,
     media: &MediaRequirements,
 ) -> bool {
-    (!media.needs_vision || caps.vision_label().is_some())
-        && (!media.needs_audio || caps.audio_label().is_some())
+    (!media.needs_vision || caps.supports_vision_runtime())
+        && (!media.needs_audio || caps.supports_audio_runtime())
+}
+
+pub(crate) fn filter_media_compatible_candidates<'a>(
+    candidates: &[RoutingCandidate<'a>],
+    media: &MediaRequirements,
+) -> Option<Vec<RoutingCandidate<'a>>> {
+    let media_available: Vec<_> = candidates
+        .iter()
+        .filter(|c| model_satisfies_media_requirements(&c.caps, media))
+        .cloned()
+        .collect();
+    if media_available.is_empty() && media.requires_runtime_modality() {
+        None
+    } else if media_available.is_empty() {
+        Some(candidates.to_vec())
+    } else {
+        Some(media_available)
+    }
 }
 
 /// Length of last user message in characters (rough complexity proxy).
@@ -425,8 +481,64 @@ fn message_text(msg: &Value) -> String {
 
 // ── Model selection ─────────────────────────────────────────────────
 
-/// Pick the best model using full classification (category + complexity + tools).
-/// Pick the best model for a classified request using gossiped capabilities.
+/// A candidate model in the auto-routing pool.
+///
+/// `tps_hint` and `throughput_samples` come from the node's locally
+/// observed `RoutingMetrics`. They are `None` / `0` when we've never
+/// successfully completed a token-bearing request against this model
+/// (cold start, brand-new peer) — such candidates get a neutral weight
+/// so they still participate in routing while accumulating data.
+#[derive(Clone, Debug)]
+pub struct RoutingCandidate<'a> {
+    pub name: &'a str,
+    pub caps: crate::models::ModelCapabilities,
+    /// Locally observed throughput in tokens/sec. `None` if no
+    /// throughput-bearing attempts have completed for this model yet.
+    pub tps_hint: Option<f64>,
+    /// How many throughput samples back `tps_hint`. Used to decide
+    /// whether we trust the hint or treat the model as "cold".
+    pub throughput_samples: u64,
+}
+
+impl<'a> RoutingCandidate<'a> {
+    /// Build a candidate without any throughput hint. Useful for
+    /// pre-startup paths or test fixtures.
+    pub fn unscored(name: &'a str, caps: crate::models::ModelCapabilities) -> Self {
+        Self {
+            name,
+            caps,
+            tps_hint: None,
+            throughput_samples: 0,
+        }
+    }
+}
+
+/// Minimum number of throughput samples before `tps_hint` is allowed
+/// to influence weighting. Below this, the candidate is treated as
+/// cold (neutral weight).
+const TPS_MIN_SAMPLES: u64 = 3;
+
+/// Lower clamp on tps used as a weight. Prevents catastrophic peers
+/// (~1 tok/s) from being completely starved — they still get the
+/// occasional request so they can re-prove themselves.
+const TPS_WEIGHT_MIN: f64 = 5.0;
+
+/// Upper clamp on tps used as a weight. Prevents a single very fast
+/// outlier from monopolizing routing.
+const TPS_WEIGHT_MAX: f64 = 100.0;
+
+/// Neutral weight assigned to cold / unscored candidates so they get
+/// a fair shot at picking up data. Set to the midpoint of the clamp
+/// range so a cold model is treated as "average" against scored peers.
+const TPS_NEUTRAL_WEIGHT: f64 = 25.0;
+
+/// Probability of ignoring weights and picking uniformly. Keeps the
+/// system from locking onto stale rankings and gives cold models a
+/// guaranteed share of traffic so they accumulate data.
+const EXPLORATION_PROBABILITY: f64 = 0.15;
+
+/// Pick the best model for a classified request using gossiped capabilities
+/// and locally observed throughput.
 ///
 /// Filtering:
 ///   - `needs_tools` → prefer models with `tool_use != None`
@@ -434,11 +546,14 @@ fn message_text(msg: &Value) -> String {
 ///   - `Image`       → prefer models with `vision != None`
 ///   - anything else → no capability filter
 ///
-/// Falls back to all models if the filter matches nothing.
-/// Among candidates, pick randomly to spread load.
+/// Falls back to all models if the filter matches nothing. Then biases
+/// toward larger models by partitioning single-digit-B names to the
+/// bottom tier. Within the chosen tier, picks weighted by observed
+/// tok/s (with cold models treated as average), with a configurable
+/// exploration probability that ignores weights and picks uniformly.
 pub fn pick_model_classified<'a>(
     classification: &Classification,
-    available_models: &[(&'a str, f64, crate::models::ModelCapabilities)],
+    available_models: &[RoutingCandidate<'a>],
 ) -> Option<&'a str> {
     use crate::models::CapabilityLevel;
 
@@ -446,29 +561,28 @@ pub fn pick_model_classified<'a>(
         return None;
     }
     if available_models.len() == 1 {
-        return Some(available_models[0].0);
+        return Some(available_models[0].name);
     }
 
-    // Capability filter based on what the request needs
-    let filtered: Vec<&(&str, f64, crate::models::ModelCapabilities)> =
-        match classification.category {
-            _ if classification.needs_tools => available_models
-                .iter()
-                .filter(|(_, _, caps)| caps.tool_use != CapabilityLevel::None)
-                .collect(),
-            Category::Reasoning => available_models
-                .iter()
-                .filter(|(_, _, caps)| caps.reasoning != CapabilityLevel::None)
-                .collect(),
-            Category::Image => available_models
-                .iter()
-                .filter(|(_, _, caps)| caps.vision != CapabilityLevel::None)
-                .collect(),
-            _ => Vec::new(),
-        };
+    // Capability filter based on what the request needs.
+    let filtered: Vec<&RoutingCandidate<'a>> = match classification.category {
+        _ if classification.needs_tools => available_models
+            .iter()
+            .filter(|c| c.caps.tool_use != CapabilityLevel::None)
+            .collect(),
+        Category::Reasoning => available_models
+            .iter()
+            .filter(|c| c.caps.reasoning != CapabilityLevel::None)
+            .collect(),
+        Category::Image => available_models
+            .iter()
+            .filter(|c| c.caps.vision != CapabilityLevel::None)
+            .collect(),
+        _ => Vec::new(),
+    };
 
-    // Fall back to all models if filter matched nothing
-    let candidates: Vec<&(&str, f64, crate::models::ModelCapabilities)> = if filtered.is_empty() {
+    // Fall back to all models if the filter matched nothing.
+    let candidates: Vec<&RoutingCandidate<'a>> = if filtered.is_empty() {
         available_models.iter().collect()
     } else {
         filtered
@@ -478,21 +592,103 @@ pub fn pick_model_classified<'a>(
     // parameter count (e.g. "2B", "9B") go to the bottom. Everything
     // else — multi-digit billions (31B, 70B) or names that don't encode
     // a size at all (MiniMax, Coder-Next, fine-tune tags) — stays on
-    // top. Each tier is shuffled independently so sessions organically
-    // spread across the strong-tier models over time while smalls still
-    // act as a fallback when nothing stronger is around.
-    let (mut big, mut small): (Vec<_>, Vec<_>) = candidates
+    // top. The big tier is sampled by tok/s-weighted draw; the small
+    // tier acts only as a fallback when the big tier is empty.
+    let (big, small): (Vec<_>, Vec<_>) = candidates
         .into_iter()
-        .partition(|(name, _, _)| !is_single_digit_b_name(name));
+        .partition(|c| !is_single_digit_b_name(c.name));
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos() as u64;
-    shuffle_in_place(&mut big, nanos);
-    shuffle_in_place(&mut small, nanos.wrapping_add(0x9E37_79B9_7F4A_7C15));
 
-    big.into_iter().chain(small).next().map(|&(n, _, _)| n)
+    if !big.is_empty() {
+        return Some(pick_weighted(&big, nanos));
+    }
+    if !small.is_empty() {
+        return Some(pick_weighted(
+            &small,
+            nanos.wrapping_add(0x9E37_79B9_7F4A_7C15),
+        ));
+    }
+    None
+}
+
+/// Compute the routing weight for a single candidate. See the module-level
+/// `TPS_*` constants for the rationale on each clamp.
+fn candidate_weight(candidate: &RoutingCandidate<'_>) -> f64 {
+    if candidate.throughput_samples >= TPS_MIN_SAMPLES {
+        candidate
+            .tps_hint
+            .unwrap_or(TPS_NEUTRAL_WEIGHT)
+            .clamp(TPS_WEIGHT_MIN, TPS_WEIGHT_MAX)
+    } else {
+        TPS_NEUTRAL_WEIGHT
+    }
+}
+
+/// Pick one candidate from a non-empty slice using tok/s-weighted draw,
+/// with `EXPLORATION_PROBABILITY` chance of a uniform pick.
+fn pick_weighted<'a>(candidates: &[&RoutingCandidate<'a>], seed: u64) -> &'a str {
+    debug_assert!(!candidates.is_empty(), "pick_weighted requires non-empty");
+
+    let mut rng = SplitMix64::new(seed);
+
+    // Exploration branch: ignore weights, pick uniformly. Keeps the
+    // system from locking onto stale rankings.
+    if rng.next_f64() < EXPLORATION_PROBABILITY {
+        let idx = (rng.next_u64() as usize) % candidates.len();
+        return candidates[idx].name;
+    }
+
+    let total_weight: f64 = candidates.iter().map(|c| candidate_weight(c)).sum();
+    // Defensive: if all weights are somehow zero (shouldn't happen given
+    // TPS_WEIGHT_MIN > 0), fall back to a uniform pick.
+    if total_weight <= 0.0 {
+        let idx = (rng.next_u64() as usize) % candidates.len();
+        return candidates[idx].name;
+    }
+
+    let pick = rng.next_f64() * total_weight;
+    let mut acc = 0.0;
+    for c in candidates {
+        acc += candidate_weight(c);
+        if pick < acc {
+            return c.name;
+        }
+    }
+    // Numerical tail: pick the last candidate.
+    candidates[candidates.len() - 1].name
+}
+
+/// Small deterministic PRNG so a single seed drives both the
+/// exploration coin flip and the weighted draw. Avoids pulling in a
+/// rand dependency just for routing.
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        // Avoid the zero state which gives a degenerate sequence.
+        Self {
+            state: seed.wrapping_add(0x9E37_79B9_7F4A_7C15),
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        // Use the top 53 bits for a uniform float in [0, 1).
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
 }
 
 /// Return true if `name` advertises a single-digit billion-parameter
@@ -536,29 +732,14 @@ fn is_single_digit_b_name(name: &str) -> bool {
             continue;
         }
         // And the byte after that must not be another digit (avoid BF16-like continuations)
-        if let Some(&after) = bytes.get(i + 2) {
-            if after.is_ascii_digit() {
-                continue;
-            }
+        if let Some(&after) = bytes.get(i + 2)
+            && after.is_ascii_digit()
+        {
+            continue;
         }
         return true;
     }
     false
-}
-
-/// In-place Fisher-Yates shuffle seeded from `seed`.
-fn shuffle_in_place<T>(items: &mut [T], seed: u64) {
-    if items.len() < 2 {
-        return;
-    }
-    let mut state = seed.wrapping_mul(0x2545_F491_4F6C_DD1D).wrapping_add(1);
-    for i in (1..items.len()).rev() {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let j = (state as usize) % (i + 1);
-        items.swap(i, j);
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -821,6 +1002,51 @@ mod tests {
             &vision_audio_caps,
             &image_and_audio
         ));
+
+        let likely_vision_caps = ModelCapabilities {
+            multimodal: true,
+            vision: CapabilityLevel::Likely,
+            ..Default::default()
+        };
+        assert!(!model_satisfies_media_requirements(
+            &likely_vision_caps,
+            &image
+        ));
+    }
+
+    #[test]
+    fn test_filter_media_candidates_blocks_hard_media_miss() {
+        use crate::models::{CapabilityLevel, ModelCapabilities};
+
+        let text_caps = ModelCapabilities::default();
+        let vision_caps = ModelCapabilities {
+            vision: CapabilityLevel::Supported,
+            ..Default::default()
+        };
+        let image = MediaRequirements {
+            has_media: true,
+            needs_vision: true,
+            needs_audio: false,
+        };
+        let text_only = MediaRequirements::default();
+
+        let text_candidates = vec![RoutingCandidate::unscored("text", text_caps)];
+        assert!(filter_media_compatible_candidates(&text_candidates, &image).is_none());
+
+        let mixed_candidates = vec![
+            RoutingCandidate::unscored("text", text_caps),
+            RoutingCandidate::unscored("vision", vision_caps),
+        ];
+        let filtered = filter_media_compatible_candidates(&mixed_candidates, &image)
+            .expect("vision candidate should satisfy image media request");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "vision");
+
+        let unfiltered = filter_media_compatible_candidates(&text_candidates, &text_only)
+            .expect("text-only requests should keep normal router fallback behavior");
+        // Text-only requests with text-only candidates pass through unfiltered.
+        assert_eq!(unfiltered.len(), text_candidates.len());
+        assert_eq!(unfiltered[0].name, text_candidates[0].name);
     }
 
     #[test]
@@ -834,8 +1060,8 @@ mod tests {
         let no_caps = ModelCapabilities::default();
 
         let available = vec![
-            ("reasoning-model", 10.0, no_caps),
-            ("tool-model", 10.0, tool_caps),
+            RoutingCandidate::unscored("reasoning-model", no_caps),
+            RoutingCandidate::unscored("tool-model", tool_caps),
         ];
         let cl = Classification {
             category: Category::Code,
@@ -858,8 +1084,8 @@ mod tests {
         let no_caps = ModelCapabilities::default();
 
         let available = vec![
-            ("chat-model", 10.0, no_caps),
-            ("reasoning-model", 10.0, reasoning_caps),
+            RoutingCandidate::unscored("chat-model", no_caps),
+            RoutingCandidate::unscored("reasoning-model", reasoning_caps),
         ];
         let cl = Classification {
             category: Category::Reasoning,
@@ -882,8 +1108,8 @@ mod tests {
         let no_caps = ModelCapabilities::default();
 
         let available = vec![
-            ("text-model", 10.0, no_caps),
-            ("vision-model", 10.0, vision_caps),
+            RoutingCandidate::unscored("text-model", no_caps),
+            RoutingCandidate::unscored("vision-model", vision_caps),
         ];
         let cl = Classification {
             category: Category::Image,
@@ -900,7 +1126,10 @@ mod tests {
         use crate::models::ModelCapabilities;
 
         let no_caps = ModelCapabilities::default();
-        let available = vec![("model-a", 10.0, no_caps), ("model-b", 10.0, no_caps)];
+        let available = vec![
+            RoutingCandidate::unscored("model-a", no_caps),
+            RoutingCandidate::unscored("model-b", no_caps),
+        ];
         let cl = Classification {
             category: Category::Code,
             complexity: Complexity::Moderate,
@@ -914,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_pick_empty_returns_none() {
-        let available: Vec<(&str, f64, crate::models::ModelCapabilities)> = vec![];
+        let available: Vec<RoutingCandidate<'_>> = vec![];
         let cl = Classification {
             category: Category::Chat,
             complexity: Complexity::Moderate,
@@ -928,7 +1157,10 @@ mod tests {
     fn test_pick_single_model() {
         use crate::models::ModelCapabilities;
 
-        let available = vec![("only-model", 10.0, ModelCapabilities::default())];
+        let available = vec![RoutingCandidate::unscored(
+            "only-model",
+            ModelCapabilities::default(),
+        )];
         let cl = Classification {
             category: Category::Chat,
             complexity: Complexity::Moderate,
@@ -943,7 +1175,10 @@ mod tests {
         use crate::models::ModelCapabilities;
 
         let no_caps = ModelCapabilities::default();
-        let available = vec![("model-a", 10.0, no_caps), ("model-b", 10.0, no_caps)];
+        let available = vec![
+            RoutingCandidate::unscored("model-a", no_caps),
+            RoutingCandidate::unscored("model-b", no_caps),
+        ];
         let cl = Classification {
             category: Category::Chat,
             complexity: Complexity::Moderate,
@@ -1010,12 +1245,12 @@ mod tests {
 
         let no_caps = ModelCapabilities::default();
         let available = vec![
-            ("Qwen3.5-2B-Q4_K_M", 0.0, no_caps),
-            ("Qwen3.5-9B-Q4_K_M", 0.0, no_caps),
-            ("gemma-4-31B-it-Q8_0", 0.0, no_caps),
-            ("Qwen3.6-35B-A3B-BF16", 0.0, no_caps),
-            ("MiniMax-M2.5-Q4_K_M", 0.0, no_caps),
-            ("Qwen3-Coder-Next-Q4_K_M", 0.0, no_caps),
+            RoutingCandidate::unscored("Qwen3.5-2B-Q4_K_M", no_caps),
+            RoutingCandidate::unscored("Qwen3.5-9B-Q4_K_M", no_caps),
+            RoutingCandidate::unscored("gemma-4-31B-it-Q8_0", no_caps),
+            RoutingCandidate::unscored("Qwen3.6-35B-A3B-BF16", no_caps),
+            RoutingCandidate::unscored("MiniMax-M2.5-Q4_K_M", no_caps),
+            RoutingCandidate::unscored("Qwen3-Coder-Next-Q4_K_M", no_caps),
         ];
         let cl = Classification {
             category: Category::Chat,
@@ -1041,8 +1276,8 @@ mod tests {
 
         let no_caps = ModelCapabilities::default();
         let available = vec![
-            ("Qwen3.5-2B-Q4_K_M", 0.0, no_caps),
-            ("Qwen3.5-9B-Q4_K_M", 0.0, no_caps),
+            RoutingCandidate::unscored("Qwen3.5-2B-Q4_K_M", no_caps),
+            RoutingCandidate::unscored("Qwen3.5-9B-Q4_K_M", no_caps),
         ];
         let cl = Classification {
             category: Category::Chat,
@@ -1062,10 +1297,10 @@ mod tests {
 
         let no_caps = ModelCapabilities::default();
         let available = vec![
-            ("gemma-4-31B-it-Q8_0", 0.0, no_caps),
-            ("Qwen3.6-35B-A3B-BF16", 0.0, no_caps),
-            ("MiniMax-M2.5-Q4_K_M", 0.0, no_caps),
-            ("Qwen3-Coder-Next-Q4_K_M", 0.0, no_caps),
+            RoutingCandidate::unscored("gemma-4-31B-it-Q8_0", no_caps),
+            RoutingCandidate::unscored("Qwen3.6-35B-A3B-BF16", no_caps),
+            RoutingCandidate::unscored("MiniMax-M2.5-Q4_K_M", no_caps),
+            RoutingCandidate::unscored("Qwen3-Coder-Next-Q4_K_M", no_caps),
         ];
         let cl = Classification {
             category: Category::Chat,
@@ -1088,6 +1323,175 @@ mod tests {
         assert!(
             seen.len() >= 3,
             "expected spread across big-tier models, only saw {seen:?}"
+        );
+    }
+
+    // ── tok/s-aware weighting ────────────────────────────────────────
+
+    /// Helper: build a scored candidate.
+    fn scored<'a>(
+        name: &'a str,
+        caps: crate::models::ModelCapabilities,
+        tps: f64,
+        samples: u64,
+    ) -> RoutingCandidate<'a> {
+        RoutingCandidate {
+            name,
+            caps,
+            tps_hint: Some(tps),
+            throughput_samples: samples,
+        }
+    }
+
+    fn count_picks(available: &[RoutingCandidate<'_>], iterations: usize) -> HashMapCounts {
+        use std::collections::HashMap;
+        let cl = Classification {
+            category: Category::Chat,
+            complexity: Complexity::Moderate,
+            needs_tools: false,
+            has_media_inputs: false,
+        };
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..iterations {
+            if let Some(name) = pick_model_classified(&cl, available) {
+                *counts.entry(name.to_string()).or_insert(0) += 1;
+            }
+            // Bump the nanosecond seed between iterations.
+            std::thread::sleep(std::time::Duration::from_nanos(1));
+        }
+        HashMapCounts(counts)
+    }
+
+    struct HashMapCounts(std::collections::HashMap<String, usize>);
+
+    impl HashMapCounts {
+        fn get(&self, name: &str) -> usize {
+            self.0.get(name).copied().unwrap_or(0)
+        }
+        fn total(&self) -> usize {
+            self.0.values().sum()
+        }
+    }
+
+    #[test]
+    fn weighted_pick_all_cold_is_roughly_uniform() {
+        // Backwards-compat: when nothing has tps data, picks should be
+        // roughly uniform — same effective shape as the old random shuffle.
+        use crate::models::ModelCapabilities;
+        let no_caps = ModelCapabilities::default();
+        let available = vec![
+            RoutingCandidate::unscored("alpha-31B", no_caps),
+            RoutingCandidate::unscored("beta-31B", no_caps),
+            RoutingCandidate::unscored("gamma-31B", no_caps),
+        ];
+        let counts = count_picks(&available, 600);
+        let expected = counts.total() / 3;
+        // Allow ±50% (300 picks across 3 models is loose statistical ground,
+        // but we just need to see no model is starved).
+        for name in ["alpha-31B", "beta-31B", "gamma-31B"] {
+            let got = counts.get(name);
+            assert!(
+                got > expected / 2,
+                "cold model {name} was starved: {got}/{expected} expected"
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_pick_fast_wins_majority_but_slow_still_gets_some() {
+        // Core design claim: fast tok/s tilts routing without starving the slow.
+        use crate::models::ModelCapabilities;
+        let no_caps = ModelCapabilities::default();
+        let available = vec![
+            scored("fast-31B", no_caps, 80.0, 50),
+            scored("slow-31B", no_caps, 6.0, 50),
+        ];
+        let counts = count_picks(&available, 600);
+        let fast = counts.get("fast-31B");
+        let slow = counts.get("slow-31B");
+        // Fast should win clearly more often.
+        assert!(
+            fast > slow,
+            "fast tok/s model should win majority: fast={fast} slow={slow}"
+        );
+        // Fast wins by a meaningful margin (≥ 1.5x).
+        assert!(
+            fast as f64 > 1.5 * slow as f64,
+            "fast model should win by at least 1.5x: fast={fast} slow={slow}",
+        );
+        // Slow model still gets meaningful traffic (exploration + clamp keep it alive).
+        assert!(
+            slow > 30,
+            "slow model must not be starved (exploration keeps it alive): got {slow}",
+        );
+    }
+
+    #[test]
+    fn weighted_pick_cold_model_competes_with_hot_fast() {
+        // A brand-new peer (no samples) must still get meaningful traffic
+        // against an established fast peer — otherwise it can never
+        // accumulate the data it needs to be scored.
+        use crate::models::ModelCapabilities;
+        let no_caps = ModelCapabilities::default();
+        let available = vec![
+            scored("hot-fast-31B", no_caps, 80.0, 50),
+            RoutingCandidate::unscored("cold-newcomer-31B", no_caps),
+        ];
+        let counts = count_picks(&available, 600);
+        let cold = counts.get("cold-newcomer-31B");
+        // Cold gets NEUTRAL_WEIGHT (25) vs hot's clamped 80 — so cold
+        // should still see at least a healthy minority of traffic.
+        assert!(
+            cold > 100,
+            "cold newcomer must get fair traffic to accumulate samples: got {cold}/600"
+        );
+    }
+
+    #[test]
+    fn weighted_pick_low_sample_count_treated_as_cold() {
+        // A model with only 1-2 samples shouldn't have those samples
+        // dominate routing — we want a few real measurements before tps
+        // participates.
+        use crate::models::ModelCapabilities;
+        let no_caps = ModelCapabilities::default();
+        let available = vec![
+            // Both are 31B "big-tier" names — single-digit-B partition
+            // doesn't separate them.
+            scored("alpha-31B", no_caps, 100.0, 1), // 1 sample of "fast" — should be ignored
+            scored("beta-31B", no_caps, 100.0, 1),
+            scored("gamma-31B", no_caps, 100.0, 1),
+        ];
+        let counts = count_picks(&available, 600);
+        // All three should land near uniform since none has enough samples.
+        let expected = counts.total() / 3;
+        for name in ["alpha-31B", "beta-31B", "gamma-31B"] {
+            let got = counts.get(name);
+            assert!(
+                got > expected / 2,
+                "low-sample model {name} was treated as scored instead of cold: {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_weight_clamps_extremes() {
+        // Sanity: weight stays bounded so no peer can fully starve or monopolize.
+        use crate::models::ModelCapabilities;
+        let no_caps = ModelCapabilities::default();
+
+        let glacial = scored("glacial", no_caps, 0.5, 100);
+        let blazing = scored("blazing", no_caps, 500.0, 100);
+        let cold = RoutingCandidate::unscored("cold", no_caps);
+
+        let wg = candidate_weight(&glacial);
+        let wb = candidate_weight(&blazing);
+        let wc = candidate_weight(&cold);
+
+        assert!(wg >= TPS_WEIGHT_MIN, "glacial weight floored: {wg}");
+        assert!(wb <= TPS_WEIGHT_MAX, "blazing weight capped: {wb}");
+        assert!(
+            (wc - TPS_NEUTRAL_WEIGHT).abs() < f64::EPSILON,
+            "cold weight should be neutral: {wc}",
         );
     }
 }

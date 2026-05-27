@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
-use skippy_protocol::{binary::WireActivationDType, StageConfig, StageTopology};
+use anyhow::{Context, Result, bail};
+use skippy_protocol::{StageConfig, StageTopology, binary::WireActivationDType};
 
 use crate::{cli::ServeBinaryArgs, config::load_json, telemetry::TelemetryLevel};
 
@@ -96,7 +96,7 @@ impl BinaryStageOptions {
             telemetry_level: args.telemetry_level,
             max_inflight: args.max_inflight,
             reply_credit_limit: args.reply_credit_limit,
-            async_prefill_forward: args.async_prefill_forward,
+            async_prefill_forward: args.async_prefill_forward || !args.no_async_prefill_forward,
             downstream_wire_condition,
             downstream_connect_timeout_secs: args.downstream_connect_timeout_secs,
             openai,

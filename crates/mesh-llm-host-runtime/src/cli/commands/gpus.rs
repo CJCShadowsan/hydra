@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::cli::GpuCommand;
 
@@ -17,7 +17,6 @@ pub(crate) fn dispatch_gpu_command(json_output: bool, command: Option<&GpuComman
 
 pub(crate) fn run_gpus(json_output: bool) -> Result<()> {
     let mut hw = hardware::survey();
-    hardware::augment_gpu_facts_with_vulkan_devices(&mut hw.gpus);
     attach_cached_bandwidth(&mut hw);
 
     if json_output {

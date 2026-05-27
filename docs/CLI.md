@@ -72,19 +72,44 @@ Runtime switches:
 - `--client`: API-only mode (no GPU/model serving).
 - `--console <CONSOLE>`: console/API management port (default `3131`).
 - `--headless`: disable the embedded web UI; keep the management API on the `--console` port.
+- `--bind-ip <IP>`: bind mesh QUIC to a specific local IP address and advertise
+  only that selected direct IP, plus relay/public candidates. Use this on
+  multi-interface hosts where Docker/CNI bridge addresses overlap across nodes.
+- `--bind-port <PORT>`: bind mesh QUIC to a fixed UDP port, usually paired
+  with `--bind-ip` for firewall or NAT rules.
+- `--swarm-capture <DIR>`: write passive local mesh membership and connection
+  diagnostics as JSONL. See [SWARM_CAPTURE.md](SWARM_CAPTURE.md) for the full
+  debug-capture workflow.
 - `--publish`: publish your mesh for discovery.
 - `--mesh-name <MESH_NAME>`: friendly mesh name in discovery.
 - `--region <REGION>`: region hint for discovery.
-- `--blackboard`: enable blackboard on public meshes.
-- `--name <NAME>`: your blackboard display name.
+- `--name <NAME>`: display name for this node.
 - `--max-vram <MAX_VRAM>`: cap VRAM used for planning and fit decisions.
 - `--llama-flavor <LLAMA_FLAVOR>`: force backend binary flavor (`cpu|cuda|rocm|vulkan|metal`).
-- `--config <CONFIG>`: explicit config file path.
+- `--config <CONFIG>`: explicit config file path. The file applies on future
+  starts or owner-control reloads, not to already running sessions.
 - `--owner-key <OWNER_KEY>`: keystore used to attest this runtime node.
 - `--owner-required`: fail startup if owner attestation cannot be loaded.
 - `--node-label <NODE_LABEL>`: attach a human label to this runtime node certificate.
 - `--trust-policy <TRUST_POLICY>`: override peer ownership trust policy.
 - `--trust-owner <TRUST_OWNER>`: add trusted owner IDs on top of the local trust store.
+- `--mesh-guardrails <MODE>`: server-side mesh guardrail mode for hosted
+  Skippy backends (`disabled`, `metrics`, or `enforce`; default `disabled`).
+  This controls `GuardrailPolicy.mode`; request-level `mesh_guardrails` flags
+  cannot upgrade a disabled server.
+
+Config file semantics:
+
+- `mesh-llm serve` reads `~/.mesh-llm/config.toml` by default.
+- Precedence is request values, then per-model config, then `[defaults.*]`, then
+  family or topology policy, then built-in runtime defaults.
+- Request defaults only fill absent or null request fields at the OpenAI
+  frontend boundary. Explicit request values win, and the defaults never flow
+  into `StageConfig`, runtime load structs, protobuf, or lower runtime.
+- Staged-only controls stay staged-only. Activation wire dtype, prefill
+  controls, speculative draft controls, and manual stage layer ranges only
+  execute in staged mode.
+- Unsupported or deferred rows are documented as rejected, not silent no-ops.
 
 ## Commands
 
@@ -96,11 +121,15 @@ Subcommands:
 
 - `recommended`
 - `installed`
+- `cleanup`
+- `prune`
 - `search`
 - `show`
 - `download`
+- `package`
 - `certify`
 - `updates`
+- `delete`
 
 ### `models recommended`
 
@@ -117,6 +146,23 @@ Run this when you want to see what’s already on your machine.
 Switches:
 
 - `--json`: machine-readable output.
+
+### `models cleanup`
+
+Run this when you want to remove stale managed model-cache entries that are no
+longer usable or referenced.
+
+Use `mesh-llm models cleanup --help` for the current safety and confirmation
+switches before deleting anything.
+
+### `models prune`
+
+Run this when you want to clean derived Skippy materialized stage cache. The
+default mode is a preview; pass the confirmation switch shown by
+`mesh-llm models prune --help` to apply the cleanup.
+
+This command treats materialized stages as derived cache and preserves active or
+pinned stage artifacts.
 
 ### `models search`
 
@@ -169,6 +215,43 @@ Switches:
 - `--draft`: also download the recommended draft model (if available).
 - `--json`: machine-readable output.
 
+### `models package`
+
+Use this to plan or submit a Hugging Face Job that splits a source GGUF into a
+Skippy layer-package repository. This is spend-bearing, so the command defaults
+to dry-run behavior and requires `--confirm` before it submits jobs.
+
+Usage:
+
+```bash
+mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --dry-run
+mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --confirm --follow
+mesh-llm models package --status <job-id>
+mesh-llm models package --logs <job-id>
+mesh-llm models package --list
+```
+
+Switches:
+
+- `--target <REPO>`: destination Hugging Face package repo.
+- `--model-id <MODEL_ID>`: OpenAI-facing package model id.
+- `--flavor <FLAVOR>`: package flavor, default `auto`.
+- `--timeout <DURATION>`: HF Jobs timeout, default `1h` unless size estimates raise it.
+- `--mesh-llm-ref <REF>`: mesh-llm git ref used inside the job, default `main`.
+- `--dry-run`: print the resolved plan, selected hardware, timeout, and maximum cost without side effects.
+- `--confirm`: submit the job.
+- `--follow`: wait for submitted job progress.
+- `--json`: machine-readable output.
+- `--status <JOB_ID>`: inspect a job.
+- `--logs <JOB_ID>`: fetch job logs.
+- `--cancel <JOB_ID>`: cancel a job.
+- `--list`: list known jobs.
+- `--update-script`: refresh the bucket script before a confirmed submission.
+
+Keep source refs in colon-selector form such as
+`unsloth/Qwen3-8B-GGUF:Q4_K_M`. Do not use the deprecated separate `--quant`
+form in generated job inputs.
+
 ### `models certify`
 
 Use this when you want a repeatable Skippy layer-package confidence report
@@ -213,6 +296,13 @@ Switches:
 - `--all`: operate on all cached HF repos.
 - `--check`: check only; do not refresh cache.
 - `--json`: machine-readable output.
+
+### `models delete`
+
+Use this when you need to remove a specific managed model entry. Run
+`mesh-llm models delete --help` first; deletion commands intentionally keep
+confirmation behavior close to the CLI implementation so operators see the
+current safety prompts.
 
 ### `download`
 
@@ -273,6 +363,40 @@ Switches:
 
 - `--port <PORT>`: target management/API port (default `3131`).
 
+### `runtime guardrails`
+
+Use this to switch mesh guardrail mode on a running local runtime without
+restarting it. The command updates the server-side shared guardrail policy used
+by hosted Skippy backends and future runtime-loaded/replacement models.
+
+Usage:
+
+```bash
+mesh-llm runtime guardrails --mode metrics --port 3131
+mesh-llm runtime guardrails --mode enforce --port 3131 --json
+```
+
+Switches:
+
+- `--mode <MODE>`: `disabled`, `metrics`, or `enforce`.
+- `--port <PORT>`: target management/API port (default `3131`).
+- `--json`: machine-readable response with `mode`, `updated_models`, and the
+  current `status` payload.
+
+Equivalent REST call:
+
+```bash
+curl -s -X POST localhost:3131/api/runtime/mesh-guardrails \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"metrics"}' | jq .
+```
+
+Verify the active posture through `/api/status`:
+
+```bash
+curl -s localhost:3131/api/status | jq '.runtime.openai_guardrails'
+```
+
 ### `discover`
 
 Use this to discover meshes via Nostr and optionally select one automatically.
@@ -323,15 +447,16 @@ Use this to stop local `mesh-llm` instances tracked in the runtime root.
 
 ### `blackboard`
 
-Use this to post/search/read shared mesh notes, or to run blackboard as MCP over stdio.
+Use this external plugin command to post/search/read shared mesh notes after
+installing and configuring the blackboard plugin.
 
 Usage:
 
 ```bash
+mesh-llm plugins install blackboard
 mesh-llm blackboard
 mesh-llm blackboard "STATUS: testing gguf resolution"
 mesh-llm blackboard --search "gemma"
-mesh-llm blackboard --mcp
 ```
 
 Switches:
@@ -341,7 +466,6 @@ Switches:
 - `--since <SINCE>`: last N hours.
 - `--limit <LIMIT>`: max rows (default `20`).
 - `--port <PORT>`: target management/API port (default `3131`).
-- `--mcp`: run as MCP server over stdio.
 
 ### `plugin`
 
@@ -350,7 +474,8 @@ Use this to inspect plugin status or run plugin compatibility shims.
 Subcommands:
 
 - `plugin list`: list auto-registered/configured plugins.
-- `plugin install <NAME>`: old install workflow shim.
+- `plugin install <NAME>`: compatibility shim for older install workflows.
+- `plugin mcp`: run configured plugin tools as an MCP server over stdio.
 
 
 ### `auth`
@@ -421,6 +546,15 @@ mesh-llm models show mlx-community/SmolLM-135M-8bit
 mesh-llm models download mlx-community/SmolLM-135M-8bit
 ```
 
+5. Skippy layer package ref:
+
+```bash
+mesh-llm models show hf://meshllm/Qwen3-235B-A22B-UD-Q4_K_XL-layers@<commit-sha>
+mesh-llm serve --model hf://meshllm/Qwen3-235B-A22B-UD-Q4_K_XL-layers@<commit-sha> --split
+```
+
+Prefer immutable `hf://namespace/repo@revision` refs for production split runs.
+
 ## Model resolution behavior
 
 Resolution order:
@@ -468,6 +602,7 @@ Shape summary:
 - `installed --json`: `{ cache_dir, results[] }`
 - `recommended --json`: `{ source, results[] }`
 - `updates --json`: check/update results
+- `package --json`: package job plan/status/log/list output
 
 Automation tips:
 

@@ -236,16 +236,26 @@ LLAMA_WORKDIR="$LLAMA_DIR" \
 if [[ "$SKIP_UI" == "1" ]]; then
     echo "Skipping UI build (MESH_LLM_SKIP_UI=1 or --skip-ui)."
 elif [[ -d "$UI_DIR" ]]; then
-    "$SCRIPT_DIR/build-ui.sh" "$UI_DIR"
+    MESH_LLM_BUILD_PROFILE="${MESH_LLM_BUILD_PROFILE:-debug}" "$SCRIPT_DIR/build-ui.sh" "$UI_DIR"
 fi
 
 if [[ "${MESH_LLM_BUILD_PROFILE:-debug}" == "dev" || "${MESH_LLM_BUILD_PROFILE:-debug}" == "debug" ]]; then
     echo "Building mesh-llm (profile: dev, bin only)..."
-    (cd "$REPO_ROOT" && cargo build -p mesh-llm --bin mesh-llm)
+    cargo_features=()
+    case "$BACKEND" in
+        cuda) cargo_features=(--features gpu-bench-cuda) ;;
+        rocm) cargo_features=(--features gpu-bench-hip) ;;
+    esac
+    (cd "$REPO_ROOT" && cargo build -p mesh-llm --bin mesh-llm "${cargo_features[@]}")
     echo "Mesh binary: target/debug/mesh-llm"
 elif [[ "${MESH_LLM_BUILD_PROFILE:-debug}" == "release" ]]; then
     echo "Building mesh-llm (profile: release)..."
-    (cd "$REPO_ROOT" && cargo build --release -p mesh-llm)
+    cargo_features=()
+    case "$BACKEND" in
+        cuda) cargo_features=(--features gpu-bench-cuda) ;;
+        rocm) cargo_features=(--features gpu-bench-hip) ;;
+    esac
+    (cd "$REPO_ROOT" && cargo build --release -p mesh-llm "${cargo_features[@]}")
     echo "Mesh binary: target/release/mesh-llm"
 else
     echo "Unsupported MESH_LLM_BUILD_PROFILE '${MESH_LLM_BUILD_PROFILE:-debug}'. Expected debug, dev, or release." >&2

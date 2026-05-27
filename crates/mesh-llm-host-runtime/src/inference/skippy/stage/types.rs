@@ -11,6 +11,7 @@ pub(crate) struct StageControlCommand {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum StageControlRequest {
+    Claim(StageCoordinatorClaim),
     Load(StageLoadRequest),
     Stop(StageStopRequest),
     Status(StageStatusFilter),
@@ -23,12 +24,22 @@ pub(crate) enum StageControlRequest {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum StageControlResponse {
+    ClaimAccepted(StageCoordinatorClaimAck),
     Ready(StageReadyResponse),
     Status(Vec<StageStatusSnapshot>),
     Inventory(StageLayerInventory),
     PrepareAccepted(StagePrepareAcceptedResponse),
     PreparationStatus(StagePreparationStatus),
     StatusAck(StageStatusAck),
+}
+
+pub(crate) type StageCoordinatorClaim = skippy_coordinator::CoordinatorClaim;
+
+#[derive(Clone, Debug)]
+pub(crate) struct StageCoordinatorClaimAck {
+    pub(crate) accepted: bool,
+    pub(crate) claim: StageCoordinatorClaim,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +70,9 @@ pub(crate) struct StageLoadRequest {
     pub(crate) cache_type_v: String,
     pub(crate) flash_attn_type: FlashAttentionType,
     pub(crate) shutdown_generation: u64,
+    pub(crate) coordinator_term: u64,
+    pub(crate) coordinator_id: Option<iroh::EndpointId>,
+    pub(crate) lease_until_unix_ms: u64,
     pub(crate) load_mode: LoadMode,
     pub(crate) upstream: Option<StagePeerDescriptor>,
     pub(crate) downstream: Option<StagePeerDescriptor>,
@@ -70,6 +84,7 @@ pub(crate) struct StageStopRequest {
     pub(crate) run_id: String,
     pub(crate) stage_id: String,
     pub(crate) shutdown_generation: u64,
+    pub(crate) coordinator_term: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,6 +217,9 @@ pub(crate) struct StageStatusSnapshot {
     pub(crate) flash_attn_type: FlashAttentionType,
     pub(crate) error: Option<String>,
     pub(crate) shutdown_generation: u64,
+    pub(crate) coordinator_term: u64,
+    pub(crate) coordinator_id: Option<iroh::EndpointId>,
+    pub(crate) lease_until_unix_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +240,9 @@ pub(crate) struct StagePreparationStatus {
     pub(crate) bind_addr: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) shutdown_generation: u64,
+    pub(crate) coordinator_term: u64,
+    pub(crate) coordinator_id: Option<iroh::EndpointId>,
+    pub(crate) lease_until_unix_ms: u64,
 }
 
 #[derive(Clone, Debug)]

@@ -1,15 +1,16 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use hf_hub::types::cache::{CachedFileInfo, CachedRevisionInfo, HFCacheInfo};
+use anyhow::{Context, Result, bail};
+use hf_hub::cache::{CachedFileInfo, CachedRevisionInfo, HFCacheInfo};
+use hf_hub::{RepoType, RepoTypeModel};
 
 use crate::models::local::{
     gguf_metadata_cache_path, huggingface_hub_cache_dir, huggingface_identity_for_path,
     mesh_llm_cache_dir, scan_hf_cache_info, split_gguf_base_name,
 };
 use crate::models::resolve::{
-    parse_delete_model_ref, resolve_huggingface_file_from_sibling_entries, DeleteModelRef,
+    DeleteModelRef, parse_delete_model_ref, resolve_huggingface_file_from_sibling_entries,
 };
 use crate::models::usage;
 
@@ -61,8 +62,7 @@ async fn resolve_cached_hf_ref(
     };
 
     for repo in &cache_info.repos {
-        use hf_hub::RepoType;
-        if repo.repo_type != RepoType::Model || repo.repo_id != repo_id {
+        if repo.repo_type != RepoTypeModel.singular() || repo.repo_id != repo_id {
             continue;
         }
         for cached_revision in &repo.revisions {
@@ -158,8 +158,7 @@ fn find_related_hf_cache_paths(cache_info: &HFCacheInfo, path: &Path) -> Vec<Pat
     let expected = normalized_gguf_stem(file_name);
 
     for repo in &cache_info.repos {
-        use hf_hub::RepoType;
-        if repo.repo_type != RepoType::Model || repo.repo_id != identity.repo_id {
+        if repo.repo_type != RepoTypeModel.singular() || repo.repo_id != identity.repo_id {
             continue;
         }
         for revision in &repo.revisions {
@@ -192,11 +191,12 @@ pub fn collect_delete_paths(resolved_paths: &[PathBuf]) -> Result<Vec<PathBuf>> 
     }
 
     let primary_path = &resolved_paths[0];
-    if let Some(record) = usage::load_model_usage_record_for_path(primary_path) {
-        if record.mesh_managed && !record.managed_paths.is_empty() {
-            for p in &record.managed_paths {
-                to_delete.insert(normalize_path(p));
-            }
+    if let Some(record) = usage::load_model_usage_record_for_path(primary_path)
+        && record.mesh_managed
+        && !record.managed_paths.is_empty()
+    {
+        for p in &record.managed_paths {
+            to_delete.insert(normalize_path(p));
         }
     }
 
@@ -233,13 +233,13 @@ pub async fn delete_model_by_identifier(identifier: &str) -> Result<DeleteResult
             std::fs::remove_file(path).with_context(|| format!("Remove {}", path.display()))?;
             deleted_paths.push(path.clone());
 
-            if let Some(metadata_path) = gguf_metadata_cache_path(path) {
-                if metadata_path.exists() {
-                    std::fs::remove_file(&metadata_path).with_context(|| {
-                        format!("Remove metadata cache {}", metadata_path.display())
-                    })?;
-                    removed_metadata_files += 1;
-                }
+            if let Some(metadata_path) = gguf_metadata_cache_path(path)
+                && metadata_path.exists()
+            {
+                std::fs::remove_file(&metadata_path).with_context(|| {
+                    format!("Remove metadata cache {}", metadata_path.display())
+                })?;
+                removed_metadata_files += 1;
             }
 
             prune_empty_ancestors(path, &huggingface_hub_cache_dir());

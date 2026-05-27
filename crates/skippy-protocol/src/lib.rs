@@ -12,9 +12,15 @@ pub const STAGE_ALPN_V1: &[u8] = b"skippy-stage/1";
 pub const STAGE_SUBPROTOCOL_NAME: &str = "skippy-stage";
 pub const STAGE_SUBPROTOCOL_MAJOR: u32 = 1;
 pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL: &str = "stage-control";
+pub const STAGE_PROTOCOL_GENERATION: u32 = 2;
+/// Generation-scoped stage capability. A peer can advertise `stage-control`
+/// while still rejecting current-generation frames, so split planning gates on
+/// this exact token before sending gen=2 control requests.
+pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2: &str = "stage-generation-2";
+pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_GENERATION: &str =
+    STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2;
 pub const STAGE_SUBPROTOCOL_FEATURE_ARTIFACT_TRANSFER: &str = "artifact-transfer";
 pub const STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST: &str = "status-list";
-pub const STAGE_PROTOCOL_GENERATION: u32 = 2;
 pub const STAGE_STREAM_CONTROL: u8 = 0x01;
 pub const STAGE_STREAM_TRANSPORT: u8 = 0x02;
 pub const STAGE_STREAM_ARTIFACT_TRANSFER: u8 = 0x03;
@@ -75,7 +81,7 @@ impl std::error::Error for StageFrameError {}
 pub fn validate_stage_control_request(
     frame: &proto::stage::StageControlRequest,
 ) -> Result<(), StageFrameError> {
-    validate_generation(frame.gen)?;
+    validate_generation(frame.r#gen)?;
     validate_endpoint_id(frame.requester_id.len())?;
     if frame.command.is_none() {
         return Err(StageFrameError::MissingStageControlCommand);
@@ -86,7 +92,7 @@ pub fn validate_stage_control_request(
 pub fn validate_stage_control_response(
     frame: &proto::stage::StageControlResponse,
 ) -> Result<(), StageFrameError> {
-    validate_generation(frame.gen)?;
+    validate_generation(frame.r#gen)?;
     if frame.response.is_none() {
         return Err(StageFrameError::MissingStageControlResponse);
     }
@@ -96,7 +102,7 @@ pub fn validate_stage_control_response(
 pub fn validate_stage_transport_open(
     frame: &proto::stage::StageTransportOpen,
 ) -> Result<(), StageFrameError> {
-    validate_generation(frame.gen)?;
+    validate_generation(frame.r#gen)?;
     validate_endpoint_id(frame.requester_id.len())?;
     if frame.topology_id.is_empty() || frame.run_id.is_empty() || frame.stage_id.is_empty() {
         return Err(StageFrameError::MissingStageTransportTarget);
@@ -107,7 +113,7 @@ pub fn validate_stage_transport_open(
 pub fn validate_stage_artifact_transfer_request(
     frame: &proto::stage::StageArtifactTransferRequest,
 ) -> Result<(), StageFrameError> {
-    validate_generation(frame.gen)?;
+    validate_generation(frame.r#gen)?;
     validate_endpoint_id(frame.requester_id.len())?;
     if frame.topology_id.is_empty()
         || frame.run_id.is_empty()
@@ -130,16 +136,16 @@ pub fn validate_stage_artifact_transfer_request(
 pub fn validate_stage_artifact_transfer_response(
     frame: &proto::stage::StageArtifactTransferResponse,
 ) -> Result<(), StageFrameError> {
-    validate_generation(frame.gen)?;
+    validate_generation(frame.r#gen)?;
     if let Some(sha256) = frame.sha256.as_deref() {
         validate_artifact_digest(sha256)?;
     }
     Ok(())
 }
 
-fn validate_generation(gen: u32) -> Result<(), StageFrameError> {
-    if gen != STAGE_PROTOCOL_GENERATION {
-        return Err(StageFrameError::BadGeneration { got: gen });
+fn validate_generation(r#gen: u32) -> Result<(), StageFrameError> {
+    if r#gen != STAGE_PROTOCOL_GENERATION {
+        return Err(StageFrameError::BadGeneration { got: r#gen });
     }
     Ok(())
 }
@@ -637,23 +643,33 @@ mod tests {
     use prost::Message as _;
 
     use super::proto::stage::{
-        stage_control_request, stage_control_response, CancelPrepareStage, GetLayerInventory,
-        GetStageStatus, LayerInventory, LayerRange, LoadStage, PrepareStage, PrepareStageAccepted,
-        SourceModelKind, StageArtifactTransferRequest, StageArtifactTransferResponse,
-        StageControlRequest, StageControlResponse, StagePreparationState, StagePreparationStatus,
-        StageReady, StageRuntimeState, StageStatus, StageStatusAck, StageStatusList,
-        StageStatusUpdate, StageTransportOpen, StageWireDType, StopStage,
+        CancelPrepareStage, GetLayerInventory, GetStageStatus, LayerInventory, LayerRange,
+        LoadStage, PrepareStage, PrepareStageAccepted, SourceModelKind,
+        StageArtifactTransferRequest, StageArtifactTransferResponse, StageControlRequest,
+        StageControlResponse, StagePreparationState, StagePreparationStatus, StageReady,
+        StageRuntimeState, StageStatus, StageStatusAck, StageStatusList, StageStatusUpdate,
+        StageTransportOpen, StageWireDType, StopStage, stage_control_request,
+        stage_control_response,
     };
     use super::{
-        validate_stage_artifact_transfer_request, validate_stage_artifact_transfer_response,
-        validate_stage_control_request, validate_stage_control_response,
-        validate_stage_transport_open, StageFrameError, STAGE_PROTOCOL_GENERATION,
+        STAGE_PROTOCOL_GENERATION, STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2,
+        StageFrameError, validate_stage_artifact_transfer_request,
+        validate_stage_artifact_transfer_response, validate_stage_control_request,
+        validate_stage_control_response, validate_stage_transport_open,
     };
+
+    #[test]
+    fn stage_protocol_generation_feature_names_current_generation() {
+        assert_eq!(
+            STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2,
+            format!("stage-generation-{STAGE_PROTOCOL_GENERATION}")
+        );
+    }
 
     #[test]
     fn stage_control_request_validates_generation_sender_and_command() {
         let frame = StageControlRequest {
-            gen: STAGE_PROTOCOL_GENERATION,
+            r#gen: STAGE_PROTOCOL_GENERATION,
             requester_id: vec![9u8; 32],
             command: Some(stage_control_request::Command::GetStageStatus(
                 GetStageStatus {
@@ -695,6 +711,7 @@ mod tests {
                 run_id: "run-a".to_string(),
                 stage_id: "stage-0".to_string(),
                 shutdown_generation: 7,
+                coordinator_term: 7,
             })),
             ..frame.clone()
         };
@@ -780,7 +797,7 @@ mod tests {
             Err(StageFrameError::MissingStageControlCommand)
         ));
 
-        let wrong_gen = StageControlRequest { gen: 1, ..frame };
+        let wrong_gen = StageControlRequest { r#gen: 1, ..frame };
         assert!(matches!(
             validate_stage_control_request(&wrong_gen),
             Err(StageFrameError::BadGeneration { got: 1 })
@@ -790,7 +807,7 @@ mod tests {
     #[test]
     fn stage_control_response_validates_generation_and_response() {
         let frame = StageControlResponse {
-            gen: STAGE_PROTOCOL_GENERATION,
+            r#gen: STAGE_PROTOCOL_GENERATION,
             response: Some(stage_control_response::Response::StageReady(StageReady {
                 accepted: true,
                 status: Some(StageStatus {
@@ -923,7 +940,7 @@ mod tests {
             Err(StageFrameError::MissingStageControlResponse)
         ));
 
-        let wrong_gen = StageControlResponse { gen: 1, ..frame };
+        let wrong_gen = StageControlResponse { r#gen: 1, ..frame };
         assert!(matches!(
             validate_stage_control_response(&wrong_gen),
             Err(StageFrameError::BadGeneration { got: 1 })
@@ -933,7 +950,7 @@ mod tests {
     #[test]
     fn stage_transport_open_validates_generation_sender_and_target() {
         let frame = StageTransportOpen {
-            gen: STAGE_PROTOCOL_GENERATION,
+            r#gen: STAGE_PROTOCOL_GENERATION,
             requester_id: vec![7u8; 32],
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
@@ -950,7 +967,7 @@ mod tests {
             Err(StageFrameError::MissingStageTransportTarget)
         ));
 
-        let wrong_gen = StageTransportOpen { gen: 1, ..frame };
+        let wrong_gen = StageTransportOpen { r#gen: 1, ..frame };
         assert!(matches!(
             validate_stage_transport_open(&wrong_gen),
             Err(StageFrameError::BadGeneration { got: 1 })
@@ -960,7 +977,7 @@ mod tests {
     #[test]
     fn stage_artifact_transfer_frames_validate_skippy_owned_contract() {
         let request = StageArtifactTransferRequest {
-            gen: STAGE_PROTOCOL_GENERATION,
+            r#gen: STAGE_PROTOCOL_GENERATION,
             requester_id: vec![7u8; 32],
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
@@ -999,7 +1016,7 @@ mod tests {
         ));
 
         let response = StageArtifactTransferResponse {
-            gen: STAGE_PROTOCOL_GENERATION,
+            r#gen: STAGE_PROTOCOL_GENERATION,
             accepted: true,
             total_size: 8,
             sha256: Some("b".repeat(64)),

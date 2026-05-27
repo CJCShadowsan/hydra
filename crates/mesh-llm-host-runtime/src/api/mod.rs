@@ -14,6 +14,10 @@
 //!   GET  /api/runtime/endpoints — registered plugin endpoint state (JSON)
 //!   GET  /api/runtime/processes — local inference process state (JSON)
 //!   GET  /api/runtime/stages — backend-neutral staged-serving state (JSON)
+//!   GET  /api/runtime/control-bootstrap — local-only owner-control bootstrap policy (JSON)
+//!   POST /api/runtime/control/get-config — run local owner-control get-config against an explicit endpoint
+//!   POST /api/runtime/control/refresh-inventory — run local owner-control refresh-inventory against an explicit endpoint
+//!   POST /api/runtime/control/apply-config — run local owner-control apply-config against an explicit endpoint
 //!   POST /api/runtime/models — load a local model
 //!   DELETE /api/runtime/models/{model} — unload a local model
 //!   DELETE /api/runtime/instances/{instance_id} — unload one local runtime instance
@@ -36,6 +40,7 @@
 
 mod assets;
 mod http;
+mod model_target_capacity;
 mod model_targets;
 mod routes;
 mod server;
@@ -46,28 +51,35 @@ pub(crate) use self::server::start_with_listener;
 #[cfg(test)]
 pub(crate) use self::server::{handle_request, is_ui_only_route};
 pub use self::state::{
-    LocalModelInterest, MeshApi, PublicationState, RuntimeControlRequest, RuntimeLoadResponse,
-    RuntimeModelPayload, RuntimeProcessPayload, RuntimeUnloadResponse,
+    ControlBootstrapPayload, LocalModelInterest, MeshApi, OpenAiGuardrailModeUpdateResponse,
+    PublicationState, RuntimeControlRequest, RuntimeLoadResponse, RuntimeModelPayload,
+    RuntimeProcessPayload, RuntimeUnloadResponse,
 };
 pub(crate) use self::status::classify_runtime_error;
 
 use self::state::ApiInner;
 use self::status::{
-    build_runtime_processes_payload, build_runtime_stage_payloads, build_runtime_status_payload,
-    runtime_stage_state_label, runtime_stage_wire_dtype_label, MeshModelPayload,
-    RuntimeLlamaPayload, RuntimeProcessesPayload, RuntimeStatusPayload, StatusPayload,
+    MeshModelPayload, OpenAiGuardrailsPayload, RuntimeLlamaPayload, RuntimeProcessesPayload,
+    RuntimeStatusPayload, StatusPayload, build_runtime_processes_payload,
+    build_runtime_stage_payloads, build_runtime_status_payload, runtime_stage_state_label,
+    runtime_stage_wire_dtype_label,
 };
 use crate::mesh;
 use crate::network::{affinity, nostr};
 use crate::plugin;
 use crate::runtime_data;
+use mesh_llm_node::serving::{
+    DevicePolicy as NodeDevicePolicy, LoadModelRequest, ServedModel, ServingController,
+    ServingError, ServingFuture, ServingModelState, ServingStatus, UnloadModelRequest,
+};
+use mesh_llm_types::models::capabilities::merge_name_signals;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[cfg(test)]
 use self::http::http_body_text;
 #[cfg(test)]
-use self::status::{build_gpus, LocalInstance, NodeState, WakeableNode, WakeableNodeState};
+use self::status::{LocalInstance, NodeState, WakeableNode, WakeableNodeState, build_gpus};
 #[cfg(test)]
 use crate::inference::election;
 #[cfg(test)]
@@ -137,6 +149,7 @@ pub struct MeshApiConfig {
     pub(crate) model_name: String,
     pub(crate) api_port: u16,
     pub(crate) model_size_bytes: u64,
+    pub(crate) owner_key_path: Option<std::path::PathBuf>,
     pub(crate) plugin_manager: plugin::PluginManager,
     pub(crate) affinity_router: affinity::AffinityRouter,
     pub(crate) runtime_data_collector: runtime_data::RuntimeDataCollector,
@@ -150,6 +163,7 @@ impl MeshApi {
             model_name,
             api_port,
             model_size_bytes,
+            owner_key_path,
             plugin_manager,
             affinity_router,
             runtime_data_collector,
@@ -190,6 +204,7 @@ impl MeshApi {
             runtime_data_producer.initial_process_count(),
         );
         MeshApi {
+            capture_node: node.clone(),
             inner: Arc::new(Mutex::new(ApiInner {
                 node,
                 plugin_manager,
@@ -203,6 +218,7 @@ impl MeshApi {
                 llama_port: None,
                 model_name,
                 primary_backend: None,
+                openai_guardrails: None,
                 draft_name: None,
                 api_port,
                 model_size_bytes,
@@ -212,9 +228,12 @@ impl MeshApi {
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
+                mesh_discovery_mode: crate::network::discovery::MeshDiscoveryMode::Nostr,
                 nostr_discovery: false,
                 publication_state: state::PublicationState::Private,
                 runtime_control: None,
+                control_bootstrap: state::ControlBootstrapPayload::default(),
+                owner_key_path,
                 local_processes: Vec::new(),
                 sse_clients: Vec::new(),
                 model_interests: std::collections::HashMap::new(),
@@ -318,6 +337,10 @@ impl MeshApi {
             });
     }
 
+    pub async fn set_openai_guardrails(&self, openai_guardrails: Option<OpenAiGuardrailsPayload>) {
+        self.inner.lock().await.openai_guardrails = openai_guardrails;
+    }
+
     pub async fn set_draft_name(&self, name: String) {
         self.inner.lock().await.draft_name = Some(name);
     }
@@ -342,6 +365,13 @@ impl MeshApi {
 
     pub async fn set_nostr_relays(&self, relays: Vec<String>) {
         self.inner.lock().await.nostr_relays = relays;
+    }
+
+    pub async fn set_mesh_discovery_mode(
+        &self,
+        mode: crate::network::discovery::MeshDiscoveryMode,
+    ) {
+        self.inner.lock().await.mesh_discovery_mode = mode;
     }
 
     pub async fn set_nostr_discovery(&self, v: bool) {
@@ -370,6 +400,23 @@ impl MeshApi {
         tx: tokio::sync::mpsc::UnboundedSender<RuntimeControlRequest>,
     ) {
         self.inner.lock().await.runtime_control = Some(tx);
+    }
+
+    pub async fn control_bootstrap(&self) -> ControlBootstrapPayload {
+        self.inner.lock().await.control_bootstrap.clone()
+    }
+
+    pub async fn set_control_bootstrap(&self, control_bootstrap: ControlBootstrapPayload) {
+        self.inner.lock().await.control_bootstrap = control_bootstrap;
+    }
+
+    pub(crate) async fn owner_key_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.lock().await.owner_key_path.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_owner_key_path(&self, owner_key_path: Option<std::path::PathBuf>) {
+        self.inner.lock().await.owner_key_path = owner_key_path;
     }
 
     pub(crate) async fn status_snapshot_string(&self) -> String {
@@ -471,15 +518,17 @@ impl MeshApi {
     }
 
     async fn runtime_status(&self) -> RuntimeStatusPayload {
-        let runtime_status = self
-            .inner
-            .lock()
-            .await
-            .runtime_data_collector
-            .runtime_status_snapshot();
+        let (runtime_status, openai_guardrails) = {
+            let inner = self.inner.lock().await;
+            (
+                inner.runtime_data_collector.runtime_status_snapshot(),
+                inner.openai_guardrails.clone(),
+            )
+        };
         build_runtime_status_payload(
             runtime_status.primary_model.as_deref().unwrap_or_default(),
             runtime_status.primary_backend,
+            openai_guardrails,
             runtime_status.is_host,
             runtime_status.llama_ready,
             runtime_status.llama_port,
@@ -775,6 +824,7 @@ impl MeshApi {
             nostr_discovery,
             publication_state,
             wakeable_inventory,
+            openai_guardrails,
         ) = {
             let inner = self.inner.lock().await;
             (
@@ -794,6 +844,7 @@ impl MeshApi {
                 inner.nostr_discovery,
                 inner.publication_state,
                 inner.wakeable_inventory.clone(),
+                inner.openai_guardrails.clone(),
             )
         };
         let runtime_status = runtime_data_collector.runtime_status_snapshot();
@@ -803,6 +854,7 @@ impl MeshApi {
         let mut runtime = build_runtime_status_payload(
             &model_name,
             runtime_status.primary_backend.clone(),
+            openai_guardrails,
             runtime_status.is_host,
             runtime_status.llama_ready,
             runtime_status.llama_port,
@@ -894,6 +946,159 @@ impl MeshApi {
         let mut inner = self.inner.lock().await;
         inner.runtime_data_producer.mark_status_dirty();
         inner.sse_clients.retain(|tx| !tx.is_closed());
+    }
+}
+
+impl ServingController for MeshApi {
+    fn load<'a>(&'a self, request: LoadModelRequest) -> ServingFuture<'a, ServedModel> {
+        Box::pin(async move {
+            let model_ref = request.model_ref;
+            if !matches!(request.device_policy, NodeDevicePolicy::Auto) {
+                return Err(anyhow::anyhow!(ServingError::UnsupportedDevicePolicy {
+                    policy: request.device_policy,
+                }));
+            }
+            let control_tx = self
+                .inner
+                .lock()
+                .await
+                .runtime_control
+                .clone()
+                .ok_or_else(|| runtime_unavailable("runtime control unavailable"))?;
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            control_tx
+                .send(RuntimeControlRequest::Load {
+                    spec: model_ref.clone(),
+                    resp: resp_tx,
+                })
+                .map_err(|_| runtime_unavailable("runtime control unavailable"))?;
+            let loaded = resp_rx
+                .await
+                .map_err(|_| runtime_unavailable("runtime control response dropped"))?
+                .map_err(|error| {
+                    anyhow::anyhow!(ServingError::LoadFailed {
+                        model_ref: model_ref.clone(),
+                        message: error.to_string(),
+                    })
+                })?;
+            let capabilities = infer_served_model_capabilities(&model_ref, &loaded.model);
+            Ok(ServedModel {
+                model_ref: loaded.model_ref,
+                model_id: loaded.model,
+                instance_id: Some(loaded.instance_id),
+                state: ServingModelState::Ready,
+                backend: loaded.backend,
+                capabilities,
+                context_length: loaded.context_length,
+                error: None,
+            })
+        })
+    }
+
+    fn unload<'a>(&'a self, request: UnloadModelRequest) -> ServingFuture<'a, ()> {
+        Box::pin(async move {
+            let control_tx = self
+                .inner
+                .lock()
+                .await
+                .runtime_control
+                .clone()
+                .ok_or_else(|| runtime_unavailable("runtime control unavailable"))?;
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            let target = request.target;
+            control_tx
+                .send(RuntimeControlRequest::Unload {
+                    target: target.clone(),
+                    options: request.options,
+                    resp: resp_tx,
+                })
+                .map_err(|_| runtime_unavailable("runtime control unavailable"))?;
+            let _ = resp_rx
+                .await
+                .map_err(|_| runtime_unavailable("runtime control response dropped"))?
+                .map_err(|error| {
+                    anyhow::anyhow!(ServingError::UnloadFailed {
+                        target,
+                        message: error.to_string(),
+                    })
+                })?;
+            Ok(())
+        })
+    }
+
+    fn served_models<'a>(&'a self) -> ServingFuture<'a, Vec<ServedModel>> {
+        Box::pin(async move {
+            Ok(self
+                .runtime_status()
+                .await
+                .models
+                .into_iter()
+                .map(served_model_from_runtime_payload)
+                .collect())
+        })
+    }
+
+    fn status<'a>(&'a self) -> ServingFuture<'a, ServingStatus> {
+        Box::pin(async move {
+            let enabled = self.inner.lock().await.runtime_control.is_some();
+            let models = self
+                .runtime_status()
+                .await
+                .models
+                .into_iter()
+                .map(served_model_from_runtime_payload)
+                .collect();
+            Ok(ServingStatus { enabled, models })
+        })
+    }
+
+    fn set_device_policy<'a>(&'a self, policy: NodeDevicePolicy) -> ServingFuture<'a, ()> {
+        Box::pin(async move {
+            match policy {
+                NodeDevicePolicy::Auto => Ok(()),
+                policy => Err(anyhow::anyhow!(ServingError::UnsupportedDevicePolicy {
+                    policy,
+                })),
+            }
+        })
+    }
+}
+
+fn served_model_from_runtime_payload(model: RuntimeModelPayload) -> ServedModel {
+    let capabilities = infer_served_model_capabilities(&model.name, &model.name);
+    ServedModel {
+        model_ref: model.name.clone(),
+        model_id: model.name,
+        instance_id: model.instance_id,
+        state: serving_model_state_from_runtime_status(&model.status),
+        backend: Some(model.backend),
+        capabilities,
+        context_length: model.context_length,
+        error: None,
+    }
+}
+
+fn runtime_unavailable(message: impl Into<String>) -> anyhow::Error {
+    anyhow::anyhow!(ServingError::RuntimeUnavailable {
+        message: message.into(),
+    })
+}
+
+fn infer_served_model_capabilities(
+    model_ref: &str,
+    model_id: &str,
+) -> mesh_llm_node::models::ModelCapabilities {
+    merge_name_signals(Default::default(), &[model_ref, model_id]).normalize()
+}
+
+fn serving_model_state_from_runtime_status(status: &str) -> ServingModelState {
+    match status.to_ascii_lowercase().as_str() {
+        "loading" | "starting" => ServingModelState::Loading,
+        "ready" | "running" => ServingModelState::Ready,
+        "failed" | "error" => ServingModelState::Failed,
+        "unloading" | "stopping" => ServingModelState::Unloading,
+        "stopped" => ServingModelState::Stopped,
+        other => ServingModelState::Unknown(other.to_string()),
     }
 }
 

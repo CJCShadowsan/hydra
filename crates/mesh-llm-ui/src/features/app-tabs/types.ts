@@ -1,13 +1,16 @@
 import type { ReactNode } from 'react'
 import type { LatencySource } from '@/lib/api/types'
 import type { ChatMessage } from '@/features/chat/lib/chat-types'
+import type { WakeableNode } from '@/features/app-shell/lib/status-types'
+
+export type { WakeableNode }
 
 export type ResolvedTheme = 'light' | 'dark'
 export type Theme = 'auto' | ResolvedTheme
 export type Accent = 'blue' | 'cyan' | 'violet' | 'green' | 'amber' | 'pink'
 export type Density = 'compact' | 'normal' | 'sparse'
 export type PanelStyle = 'solid' | 'soft'
-export type AppTab = 'network' | 'chat' | 'configuration'
+export type AppTab = 'network' | 'reserves' | 'chat' | 'configuration'
 
 export type StatusBadgeTone = 'good' | 'warn' | 'bad' | 'muted' | 'accent'
 export type StatusMetric = {
@@ -46,6 +49,7 @@ export type Peer = {
   latencyAgeMs?: number | null
   latencyObserverId?: string | null
   splitStages?: SplitStageAssignment[]
+  firstJoinedMeshTs?: number
 }
 
 export type SplitStageAssignment = {
@@ -120,6 +124,7 @@ export type MeshNode = {
   latencyMs?: number | null
   hostname?: string
   vramGB?: number
+  firstJoinedMeshTs?: number
 }
 export type ModelSelectStatus = { label: string; tone?: StatusBadgeTone }
 export type ModelSelectOption = { value: string; label: string; meta?: string; status?: ModelSelectStatus }
@@ -209,6 +214,7 @@ export type DashboardHarnessData = {
   meshNodeSeeds: MeshNode[]
   meshId: string
   connect: DashboardConnectData
+  wakeableNodes?: WakeableNode[]
 }
 export type ChatActionMetric = { id: string; icon: 'cpu' | 'hard-drive'; label: string }
 export type ConversationGroup = { title: string; conversationIds: string[] }
@@ -256,12 +262,30 @@ export type ConfigModel = {
   tags: string[]
 }
 export type ConfigAssign = { id: string; modelId: string; nodeId: string; containerIdx: number; ctx: number }
-export type ConfigurationDefaultsCategoryId = 'runtime' | 'memory' | 'speculative-decoding' | 'advanced'
+export type ConfigurationDefaultsCategoryId =
+  | 'runtime'
+  | 'memory'
+  | 'speculative-decoding'
+  | 'advanced'
+  | 'request-defaults'
+  | 'skippy-transport'
+  | 'multimodal'
+  | 'advanced-server'
+export type ConfigurationTomlSectionId =
+  | 'defaults.model_fit'
+  | 'defaults.hardware'
+  | 'defaults.throughput'
+  | 'defaults.skippy'
+  | 'defaults.speculative'
+  | 'defaults.request_defaults'
+  | 'defaults.multimodal'
+  | 'defaults.advanced.server'
 export type ConfigurationDefaultsCategory = {
   id: ConfigurationDefaultsCategoryId
   label: string
   summary: string
   help: string
+  tomlSection?: ConfigurationTomlSectionId
 }
 export type ConfigurationDefaultsChoice = { value: string; label: string; description?: string }
 export type ConfigurationDefaultsControl =
@@ -286,14 +310,22 @@ export type ConfigurationDefaultsSettingIcon =
   | 'shield'
   | 'cog'
   | 'filter'
+  | 'zap'
+  | 'image'
+  | 'server'
 export type ConfigurationDefaultsSetting = {
   id: string
   categoryId: ConfigurationDefaultsCategoryId
+  tomlSection?: ConfigurationTomlSectionId
+  tomlKey?: string
   icon: ConfigurationDefaultsSettingIcon
   label: string
   description: string
   inheritedLabel: string
   control: ConfigurationDefaultsControl
+  visibility?: 'standard' | 'advanced'
+  mutability?: 'runtime' | 'restart-required'
+  dependsOn?: { settingId: string; condition: (value: string) => boolean }
 }
 export type ConfigurationDefaultsPreviewItem = { label: string; value: string; meta?: string }
 export type ConfigurationDefaultsValues = Record<string, string>

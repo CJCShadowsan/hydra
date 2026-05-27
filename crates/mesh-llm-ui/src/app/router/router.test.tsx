@@ -1,16 +1,33 @@
 import { useEffect } from 'react'
 import { QueryClient, useQueryClient } from '@tanstack/react-query'
-import { RouterProvider, createMemoryHistory, createRouter } from '@tanstack/react-router'
-import { render, screen, waitFor } from '@testing-library/react'
+import {
+  HeadContent,
+  Outlet,
+  RouterProvider,
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter
+} from '@tanstack/react-router'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { AppProviders } from '@/app/providers/AppProviders'
 import type { ConfigurationTabId } from '@/features/configuration/components/configuration-tab-ids'
-import { routeTree } from '@/app/router/router'
+import { ConfigurationRoutePage } from '@/features/configuration/pages/ConfigurationRoutePage'
+import { ChatPageContent } from '@/features/chat/pages/ChatPage'
+import { DeveloperPlaygroundPage } from '@/features/developer/pages/DeveloperPlaygroundPage'
+import { DashboardPageSurface } from '@/features/network/pages/DashboardPage'
+import { parseDeveloperPlaygroundSearch } from '@/features/developer/playground/developer-playground-tabs'
+import { ReservesPageContent } from '@/features/reserves/pages/ReservesPage'
 import { statusKeys } from '@/lib/query/query-keys'
 
 const routeCacheProbe = vi.hoisted(() => ({
   dashboardClient: undefined as QueryClient | undefined,
   chatClient: undefined as QueryClient | undefined
+}))
+
+vi.mock('@/features/reserves/pages/ReservesPage', () => ({
+  ReservesPageContent: () => <div>Reserves route</div>
 }))
 
 vi.mock('@/features/developer/pages/DeveloperPlaygroundPage', async () => {
@@ -63,6 +80,62 @@ vi.mock('@/lib/feature-flags', async (importOriginal) => {
   }
 })
 
+function TestRootLayout() {
+  return (
+    <>
+      <HeadContent />
+      <Outlet />
+    </>
+  )
+}
+
+const rootRoute = createRootRoute({ component: TestRootLayout })
+const indexRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/',
+  head: () => ({ meta: [{ title: 'MeshLLM - Dashboard' }] }),
+  component: DashboardPageSurface
+})
+const chatRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/chat',
+  head: () => ({ meta: [{ title: 'MeshLLM - Chat' }] }),
+  component: ChatPageContent
+})
+const reservesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/reserves',
+  head: () => ({ meta: [{ title: 'MeshLLM - Reserves' }] }),
+  component: ReservesPageContent
+})
+const configurationRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/configuration',
+  head: () => ({ meta: [{ title: 'MeshLLM - Configuration' }] }),
+  component: ConfigurationRoutePage
+})
+const configurationTabRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/configuration/$configurationTab',
+  head: () => ({ meta: [{ title: 'MeshLLM - Configuration' }] }),
+  component: ConfigurationRoutePage
+})
+const developerPlaygroundRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/__playground',
+  head: () => ({ meta: [{ title: 'MeshLLM - Developer Playground' }] }),
+  validateSearch: parseDeveloperPlaygroundSearch,
+  component: DeveloperPlaygroundPage
+})
+const testRouteTree = rootRoute.addChildren([
+  indexRoute,
+  reservesRoute,
+  chatRoute,
+  configurationRoute,
+  configurationTabRoute,
+  developerPlaygroundRoute
+])
+
 function renderRouterAt(pathname: string, queryClient = new QueryClient()) {
   return renderRouterWithHistory(createMemoryHistory({ initialEntries: [pathname] }), queryClient)
 }
@@ -70,7 +143,7 @@ function renderRouterAt(pathname: string, queryClient = new QueryClient()) {
 function renderRouterWithHistory(history: ReturnType<typeof createMemoryHistory>, queryClient = new QueryClient()) {
   const testRouter = createRouter({
     history,
-    routeTree
+    routeTree: testRouteTree
   })
 
   render(
@@ -85,6 +158,7 @@ function renderRouterWithHistory(history: ReturnType<typeof createMemoryHistory>
 describe('app router routes', () => {
   it.each([
     ['/', 'MeshLLM - Dashboard', 'Dashboard route'],
+    ['/reserves', 'MeshLLM - Reserves', 'Reserves route'],
     ['/chat', 'MeshLLM - Chat', 'Chat route cache: missing'],
     ['/configuration/defaults', 'MeshLLM - Configuration', 'Active route tab: defaults'],
     ['/__playground?tab=shell-controls', 'MeshLLM - Developer Playground', 'Active developer route tab: shell-controls']
@@ -133,7 +207,9 @@ describe('app router routes', () => {
 
     await screen.findByText('Active route tab: defaults')
 
-    history.back()
+    await act(async () => {
+      history.back()
+    })
 
     await screen.findByText('Active developer route tab: chat-components')
     await waitFor(() => expect(testRouter.state.location.pathname).toBe('/__playground'))
@@ -145,7 +221,9 @@ describe('app router routes', () => {
 
     await screen.findByText('Dashboard route')
 
-    await testRouter.navigate({ to: '/chat' })
+    await act(async () => {
+      await testRouter.navigate({ to: '/chat' })
+    })
 
     await screen.findByText('Chat route cache: dashboard-cache')
     expect(routeCacheProbe.chatClient).toBe(routeCacheProbe.dashboardClient)

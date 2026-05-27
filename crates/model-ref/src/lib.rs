@@ -101,10 +101,10 @@ pub fn quant_selector_from_gguf_file(file: &str) -> Option<String> {
         return None;
     }
 
-    if let Some((prefix, _)) = file.split_once('/') {
-        if is_quant_like_selector(prefix) {
-            return Some(prefix.to_string());
-        }
+    if let Some((prefix, _)) = file.split_once('/')
+        && is_quant_like_selector(prefix)
+    {
+        return Some(prefix.to_string());
     }
 
     let basename = Path::new(file).file_name()?.to_str()?;
@@ -113,10 +113,21 @@ pub fn quant_selector_from_gguf_file(file: &str) -> Option<String> {
         stem = prefix;
     }
 
+    // Markers are matched case-insensitively. Real-world GGUF filenames
+    // are inconsistent: `Qwen3-32B-Q4_K_M.gguf` (uppercase markers) is
+    // common, but so is `qwen2.5-3b-instruct-q4_k_m.gguf` (all
+    // lowercase). We lowercase to find the marker position, but the
+    // returned selector is sliced out of the *original* stem so the
+    // model's preferred display casing survives into the public ID.
+    // The downstream matcher in `gguf_matches_quant_selector` lowercases
+    // both sides at comparison time, so preserving casing here is safe
+    // for matching while keeping IDs round-trippable.
+    let stem_lower = stem.to_ascii_lowercase();
     for marker in [
-        "-UD-", ".UD-", "-IQ", ".IQ", "-Q", ".Q", "-BF16", ".BF16", "-F16", ".F16", "-F32", ".F32",
+        "-ud-", ".ud-", "-iq", ".iq", "-q", ".q", "-bf16", ".bf16", "-f16", ".f16", "-f32", ".f32",
     ] {
-        if let Some(pos) = stem.rfind(marker) {
+        if let Some(pos) = stem_lower.rfind(marker) {
+            // Slice from the original (case-preserving) stem.
             return Some(stem[pos + 1..].to_string());
         }
     }
@@ -436,5 +447,18 @@ mod tests {
             ),
             "unsloth/LTX-2.3-GGUF:distilled-1.1"
         );
+    }
+
+    #[test]
+    fn parses_split_gguf_shard_info() {
+        assert_eq!(
+            split_gguf_shard_info("Qwen3-30B-A3B-Q4_K_M-00001-of-00004.gguf"),
+            Some(SplitGgufShard {
+                prefix: "Qwen3-30B-A3B-Q4_K_M",
+                part: "00001",
+                total: "00004",
+            })
+        );
+        assert_eq!(split_gguf_shard_info("Qwen3-30B-A3B-Q4_K_M.gguf"), None);
     }
 }

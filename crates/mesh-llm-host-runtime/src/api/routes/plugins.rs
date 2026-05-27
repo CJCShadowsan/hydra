@@ -1,6 +1,6 @@
 use super::super::{
-    http::{respond_error, respond_json},
     MeshApi,
+    http::{respond_error, respond_json},
 };
 use crate::plugin::stapler;
 use serde_json::{Map, Value};
@@ -386,11 +386,7 @@ fn rewrite_http_request_path(raw_request: &[u8], path: &str) -> anyhow::Result<V
 }
 
 fn normalized_http_path(path: &str) -> &str {
-    if path.is_empty() {
-        "/"
-    } else {
-        path
-    }
+    if path.is_empty() { "/" } else { path }
 }
 
 fn method_name(value: i32) -> &'static str {
@@ -566,6 +562,7 @@ mod tests {
             model_name: "test-model".into(),
             api_port: 3131,
             model_size_bytes: 0,
+            owner_key_path: None,
             plugin_manager,
             affinity_router: affinity::AffinityRouter::default(),
             runtime_data_collector,

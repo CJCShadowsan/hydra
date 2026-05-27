@@ -17,6 +17,13 @@ $compilerLauncherArgs = @()
 $compilerCacheBin = $null
 $buildProfile = if ($BuildProfile) { $BuildProfile.ToLowerInvariant() } elseif ($env:MESH_LLM_BUILD_PROFILE) { $env:MESH_LLM_BUILD_PROFILE.ToLowerInvariant() } else { "debug" }
 
+switch ($buildProfile) {
+    "debug" { if (-not $env:VITE_MESH_LLM_DEBUG_UI) { $env:VITE_MESH_LLM_DEBUG_UI = "true" } }
+    "dev" { if (-not $env:VITE_MESH_LLM_DEBUG_UI) { $env:VITE_MESH_LLM_DEBUG_UI = "true" } }
+    "release" { $env:VITE_MESH_LLM_DEBUG_UI = "false" }
+    default { throw "Unsupported MESH_LLM_BUILD_PROFILE/BuildProfile '$buildProfile'. Expected debug, dev, or release." }
+}
+
 function Prepare-Llama {
     $pinFile = Join-Path $repoRoot "third_party\llama.cpp\upstream.txt"
     $patchDir = Join-Path $repoRoot "third_party\llama.cpp\patches"
@@ -107,6 +114,16 @@ function Resolve-CommandPath {
     return $null
 }
 
+function ConvertTo-CmakePath {
+    param([string]$Path)
+
+    if (-not $Path) {
+        return $null
+    }
+
+    return $Path.Replace('\', '/')
+}
+
 function Show-LldInstallInstructions {
     throw @"
 LLVM lld was not found for the Windows MSVC target.
@@ -171,9 +188,10 @@ function Configure-CompilerCache {
     }
 
     Write-Host "Using compiler cache: $script:compilerCacheBin"
+    $cmakeCompilerCacheBin = ConvertTo-CmakePath $script:compilerCacheBin
     $script:compilerLauncherArgs = @(
-        "-DCMAKE_C_COMPILER_LAUNCHER=$script:compilerCacheBin",
-        "-DCMAKE_CXX_COMPILER_LAUNCHER=$script:compilerCacheBin"
+        "-DCMAKE_C_COMPILER_LAUNCHER=$cmakeCompilerCacheBin",
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=$cmakeCompilerCacheBin"
     )
 }
 
@@ -322,6 +340,50 @@ function Invoke-NativeCommand {
     }
 }
 
+function Invoke-CmakeBuild {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BuildDir,
+        [Parameter(Mandatory = $true)]
+        [int]$ParallelJobs
+    )
+
+    $arguments = @("--build", $BuildDir, "--config", "Release", "--parallel", "$ParallelJobs", "--target", "llama", "llama-common", "mtmd")
+    try {
+        Invoke-NativeCommand "cmake" $arguments
+    } catch {
+        if ($backendName -ne "cuda" -or -not (Test-Sccache) -or $env:MESH_LLM_RETRY_SCCACHE_CUDA_BUILD -eq "0") {
+            throw
+        }
+
+        Write-Warning "CUDA ABI build failed while using sccache; restarting sccache and retrying once."
+        # `sccache --stop-server` exits non-zero when the server is already dead
+        # (which is precisely the case this retry path exists to handle). Tolerate
+        # that instead of letting $ErrorActionPreference='Stop' turn it into a
+        # terminating error that aborts the retry before cmake runs again.
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            & $compilerCacheBin --stop-server 2>&1 | Out-Null
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        Start-Sleep -Seconds 2
+        Reset-SccacheStats
+        Invoke-NativeCommand "cmake" $arguments
+    }
+}
+
+function Get-UiBuildEnvStampContent {
+    return @(
+        "MESH_LLM_BUILD_PROFILE=$buildProfile",
+        "VITE_MESH_LLM_DEBUG_UI=$($env:VITE_MESH_LLM_DEBUG_UI)",
+        "VITE_BASE_PATH=$($env:VITE_BASE_PATH)",
+        "VITE_ROUTER_BASE_PATH=$($env:VITE_ROUTER_BASE_PATH)",
+        "VITE_STORAGE_NAMESPACE=$($env:VITE_STORAGE_NAMESPACE)"
+    ) -join "`n"
+}
+
 function Test-UiBuildRequired {
     param(
         [Parameter(Mandatory = $true)]
@@ -335,6 +397,17 @@ function Test-UiBuildRequired {
 
     $distFiles = Get-ChildItem -Path $distDir -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $distFiles) {
+        return $true
+    }
+
+    $buildEnvStamp = Join-Path $distDir ".mesh-llm-ui-build-env"
+    if (-not (Test-Path $buildEnvStamp)) {
+        return $true
+    }
+
+    $expectedBuildEnvStamp = Get-UiBuildEnvStampContent
+    $actualBuildEnvStamp = Get-Content -Path $buildEnvStamp -Raw
+    if ($actualBuildEnvStamp.TrimEnd() -ne $expectedBuildEnvStamp.TrimEnd()) {
         return $true
     }
 
@@ -444,10 +517,26 @@ function Normalize-RecipeArgument {
     return $normalized.Trim()
 }
 
+function Get-MissingCommands {
+    param([string[]]$Commands)
+
+    $missing = @()
+    foreach ($command in $Commands) {
+        if (-not (Resolve-CommandPath $command)) {
+            $missing += $command
+        }
+    }
+    return $missing
+}
+
 function Ensure-MsvcToolchain {
-    if ((Resolve-CommandPath "cl") -and (Resolve-CommandPath "link") -and (Resolve-CommandPath "lib")) {
+    $requiredTools = @("cl", "link", "lib", "rc", "mt")
+    $missingTools = @(Get-MissingCommands -Commands $requiredTools)
+    if ($missingTools.Count -eq 0) {
         return
     }
+
+    Write-Host "MSVC/Windows SDK tools missing before vcvars64 import: $($missingTools -join ', ')"
 
     $programFilesX86 = ${env:ProgramFiles(x86)}
     $vswhereCandidates = @()
@@ -494,8 +583,9 @@ function Ensure-MsvcToolchain {
 
     Import-CmdEnvironment "`"$vcvars64`" >nul"
 
-    if (-not (Resolve-CommandPath "cl")) {
-        throw "MSVC toolchain initialization completed, but cl.exe is still not available in PATH."
+    $missingTools = @(Get-MissingCommands -Commands $requiredTools)
+    if ($missingTools.Count -gt 0) {
+        throw "MSVC toolchain initialization completed, but required Visual Studio/Windows SDK tools are still unavailable in PATH: $($missingTools -join ', '). Install the Windows SDK and Visual Studio Build Tools on this runner."
     }
 }
 
@@ -839,6 +929,15 @@ Invoke-InRepo {
         "-DGGML_BUILD_TESTS=OFF"
     )
 
+    $rcPath = Resolve-CommandPath "rc"
+    $mtPath = Resolve-CommandPath "mt"
+    if ($rcPath) {
+        $cmakeArgs += "-DCMAKE_RC_COMPILER=$(ConvertTo-CmakePath $rcPath)"
+    }
+    if ($mtPath) {
+        $cmakeArgs += "-DCMAKE_MT=$(ConvertTo-CmakePath $mtPath)"
+    }
+
     if (Resolve-CommandPath "ninja") {
         $cmakeArgs = @("-G", "Ninja") + $cmakeArgs
     }
@@ -847,7 +946,7 @@ Invoke-InRepo {
         "cuda" {
             $cmakeArgs += "-DGGML_CUDA=ON"
             if (Test-Sccache) {
-                $cmakeArgs += "-DCMAKE_CUDA_COMPILER_LAUNCHER=$compilerCacheBin"
+                $cmakeArgs += "-DCMAKE_CUDA_COMPILER_LAUNCHER=$(ConvertTo-CmakePath $compilerCacheBin)"
             }
             if ($CudaArch) {
                 $cmakeArgs += "-DCMAKE_CUDA_ARCHITECTURES=$CudaArch"
@@ -856,19 +955,19 @@ Invoke-InRepo {
         "rocm" {
             $cmakeArgs += "-DGGML_HIP=ON"
             if ($compilerCacheBin) {
-                $cmakeArgs += "-DCMAKE_HIP_COMPILER_LAUNCHER=$compilerCacheBin"
+                $cmakeArgs += "-DCMAKE_HIP_COMPILER_LAUNCHER=$(ConvertTo-CmakePath $compilerCacheBin)"
             }
             if ($env:HIPCC) {
-                $cmakeArgs += "-DCMAKE_C_COMPILER=$env:HIPCC"
+                $cmakeArgs += "-DCMAKE_C_COMPILER=$(ConvertTo-CmakePath $env:HIPCC)"
             }
             if ($env:HIPCXX) {
-                $cmakeArgs += "-DCMAKE_CXX_COMPILER=$env:HIPCXX"
+                $cmakeArgs += "-DCMAKE_CXX_COMPILER=$(ConvertTo-CmakePath $env:HIPCXX)"
             }
             if ($env:hip_DIR) {
-                $cmakeArgs += "-Dhip_DIR=$env:hip_DIR"
+                $cmakeArgs += "-Dhip_DIR=$(ConvertTo-CmakePath $env:hip_DIR)"
             }
             if ($env:ROCM_PATH) {
-                $cmakeArgs += "-DCMAKE_PREFIX_PATH=$env:ROCM_PATH"
+                $cmakeArgs += "-DCMAKE_PREFIX_PATH=$(ConvertTo-CmakePath $env:ROCM_PATH)"
             }
             if ($RocmArch) {
                 $cmakeArgs += "-DAMDGPU_TARGETS=$RocmArch"
@@ -891,7 +990,7 @@ Invoke-InRepo {
         [Environment]::ProcessorCount
     }
     Invoke-NativeCommand "cmake" $cmakeArgs
-    Invoke-NativeCommand "cmake" @("--build", $buildDir, "--config", "Release", "--parallel", "$parallelJobs", "--target", "llama", "llama-common", "mtmd")
+    Invoke-CmakeBuild -BuildDir $buildDir -ParallelJobs $parallelJobs
     Write-Host "Patched llama.cpp ABI build complete: $buildDir"
     $sccacheStats = Get-SccacheStats
     Show-SccacheStats
@@ -901,34 +1000,40 @@ Invoke-InRepo {
         Write-Host "Skipping mesh-llm UI build because MESH_LLM_SKIP_UI=1."
     } elseif (Test-Path $meshUiDir) {
         if (Test-UiBuildRequired -UiDirectory $meshUiDir) {
-            Write-Host "Building mesh-llm UI..."
+            Write-Host "Building mesh-llm UI (profile: $buildProfile, debug UI: $($env:VITE_MESH_LLM_DEBUG_UI))..."
             Push-Location $meshUiDir
             try {
                 if (Test-PnpmInstallRequired -UiDirectory $meshUiDir) {
                     Invoke-NativeCommand "pnpm" @("install", "--frozen-lockfile")
                 }
                 Invoke-NativeCommand "pnpm" @("run", "build")
+                Set-Content -Path (Join-Path (Join-Path $meshUiDir "dist") ".mesh-llm-ui-build-env") -Value (Get-UiBuildEnvStampContent)
             } finally {
                 Pop-Location
             }
         } else {
-            Write-Host "Skipping mesh-llm UI build; dist is up to date."
+            Write-Host "Skipping mesh-llm UI build; dist is up to date (profile: $buildProfile, debug UI: $($env:VITE_MESH_LLM_DEBUG_UI))."
         }
     }
 
     Write-Host "Building mesh-llm..."
     $env:LLAMA_STAGE_BUILD_DIR = $buildDir
+    $cargoFeatureArgs = @()
+    switch ($backendName) {
+        "cuda" { $cargoFeatureArgs = @("--features", "gpu-bench-cuda") }
+        "rocm" { $cargoFeatureArgs = @("--features", "gpu-bench-hip") }
+    }
     switch ($buildProfile) {
         "dev" {
-            Invoke-NativeCommand "cargo" @("build", "-p", "mesh-llm", "--bin", "mesh-llm")
+            Invoke-NativeCommand "cargo" (@("build", "-p", "mesh-llm", "--bin", "mesh-llm") + $cargoFeatureArgs)
             Write-Host "Mesh binary: target\debug\mesh-llm.exe"
         }
         "debug" {
-            Invoke-NativeCommand "cargo" @("build", "-p", "mesh-llm", "--bin", "mesh-llm")
+            Invoke-NativeCommand "cargo" (@("build", "-p", "mesh-llm", "--bin", "mesh-llm") + $cargoFeatureArgs)
             Write-Host "Mesh binary: target\debug\mesh-llm.exe"
         }
         "release" {
-            Invoke-NativeCommand "cargo" @("build", "--release", "--locked", "-p", "mesh-llm")
+            Invoke-NativeCommand "cargo" (@("build", "--release", "--locked", "-p", "mesh-llm") + $cargoFeatureArgs)
             Write-Host "Mesh binary: target\release\mesh-llm.exe"
         }
         default {

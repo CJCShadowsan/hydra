@@ -36,7 +36,7 @@ function RolePill({ role }: { role: NonNullable<PeerDTO['role']> }) {
   const label = roleLabel(role)
   return (
     <span
-      className="inline-flex items-center rounded-full px-2 py-px text-[length:var(--density-type-caption)] font-medium"
+      className="inline-flex items-center rounded-full px-2 py-px text-[length:var(--density-type-caption-lg)] font-medium"
       style={{
         background: isYou ? 'color-mix(in oklab, var(--color-accent) 16%, var(--color-background))' : 'transparent',
         color: isYou ? 'var(--color-accent)' : 'var(--color-fg-faint)',
@@ -65,7 +65,7 @@ function ShareMeter({ sharePct, compact = false }: { sharePct: number; compact?:
   if (compact) {
     return (
       <div className="flex min-w-0 items-center justify-end gap-1.5">
-        <span className="w-7 shrink-0 text-right font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+        <span className="w-7 shrink-0 text-right font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">
           {sharePct}%
         </span>
         <div
@@ -86,7 +86,7 @@ function ShareMeter({ sharePct, compact = false }: { sharePct: number; compact?:
       >
         <div className="h-full rounded-[3px] bg-accent" style={{ width: `${sharePct}%` }} />
       </div>
-      <span className="w-7 shrink-0 text-right font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+      <span className="w-7 shrink-0 text-right font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">
         {sharePct}%
       </span>
     </div>
@@ -186,7 +186,7 @@ export function PeerRow({ peer, active, isLast, onSelect, onHoverPeerIdChange }:
       onPointerLeave={() => onHoverPeerIdChange?.(undefined)}
       type="button"
       className={cn(
-        'ui-row-action w-full min-w-0 px-3.5 py-[11px] text-left lg:grid lg:min-w-[760px] lg:items-center lg:gap-x-4',
+        'ui-row-action w-full min-w-0 px-4 py-3 text-left lg:grid lg:min-w-[760px] lg:items-center lg:gap-x-4',
         !isLast && 'border-b border-border-soft',
         active ? 'bg-[color-mix(in_oklab,var(--color-accent)_10%,var(--color-panel))]' : 'bg-transparent'
       )}
@@ -199,7 +199,7 @@ export function PeerRow({ peer, active, isLast, onSelect, onHoverPeerIdChange }:
               <span className="min-w-0 truncate font-mono text-[length:var(--density-type-control)] leading-tight">
                 {primaryId}
               </span>
-              <span className="min-w-0 truncate font-mono text-[length:var(--density-type-caption)] leading-tight text-fg-dim">
+              <span className="min-w-0 truncate font-mono text-[length:var(--density-type-caption-lg)] leading-tight text-fg-dim">
                 {hostname ?? '—'}
               </span>
             </div>
@@ -208,11 +208,11 @@ export function PeerRow({ peer, active, isLast, onSelect, onHoverPeerIdChange }:
             <div className="hidden min-w-0 lg:flex lg:items-center lg:gap-1.5">
               {firstModel ? (
                 <>
-                  <span className="min-w-0 truncate font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+                  <span className="min-w-0 truncate font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">
                     {firstModel.name}
                   </span>
                   {extraModelCount > 0 && (
-                    <span className="shrink-0 rounded-full border border-border px-1.5 py-px font-mono text-[10px] text-fg-faint">
+                    <span className="shrink-0 rounded-full border border-border px-1.5 py-px font-mono text-xs text-fg-faint">
                       +{extraModelCount} more
                     </span>
                   )}
@@ -224,7 +224,7 @@ export function PeerRow({ peer, active, isLast, onSelect, onHoverPeerIdChange }:
                 </>
               ) : (
                 <>
-                  <span className="font-mono text-[length:var(--density-type-caption)] text-fg-dim">—</span>
+                  <span className="font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">—</span>
                   {splitStageCount > 0 && (
                     <StatusBadge size="caption" tone="warn">
                       Split
@@ -266,11 +266,11 @@ export function PeerRow({ peer, active, isLast, onSelect, onHoverPeerIdChange }:
           <div className="col-span-2 hidden min-w-0 min-[401px]:flex min-[401px]:items-center min-[401px]:gap-1.5 lg:hidden">
             {firstModel ? (
               <>
-                <span className="min-w-0 truncate font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+                <span className="min-w-0 truncate font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">
                   {firstModel.name}
                 </span>
                 {extraModelCount > 0 && (
-                  <span className="shrink-0 rounded-full border border-border px-1.5 py-px font-mono text-[10px] text-fg-faint">
+                  <span className="shrink-0 rounded-full border border-border px-1.5 py-px font-mono text-xs text-fg-faint">
                     +{extraModelCount} more
                   </span>
                 )}
@@ -278,20 +278,20 @@ export function PeerRow({ peer, active, isLast, onSelect, onHoverPeerIdChange }:
                   <StatusBadge size="caption" tone="warn">
                     Split
                   </StatusBadge>
-                )}
-              </>
-            ) : (
-              <>
-                <span className="font-mono text-[length:var(--density-type-caption)] text-fg-dim">—</span>
-                {splitStageCount > 0 && (
-                  <StatusBadge size="caption" tone="warn">
-                    Split
-                  </StatusBadge>
-                )}
-              </>
-            )}
-          </div>
-        </PeerValueTooltip>
+              )}
+            </>
+          ) : (
+            <>
+              <span className="font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">—</span>
+              {splitStageCount > 0 && (
+                <StatusBadge size="caption" tone="warn">
+                  Split
+                </StatusBadge>
+              )}
+            </>
+          )}
+        </div>
+      </PeerValueTooltip>
         <div className="col-span-2 grid min-w-0 grid-cols-[auto_auto_minmax(92px,1fr)] items-center gap-x-3 gap-y-1 lg:hidden">
           <div className="text-right font-mono text-[length:var(--density-type-caption-lg)] text-fg-dim">
             {formatPeerLatencySummary({

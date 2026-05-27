@@ -97,7 +97,7 @@ just release-build-cuda-windows
 just release-bundle-cuda-windows v0.X.0
 ```
 
-GitHub Actions uses hosted `windows-2022` runners for compile-only Windows CI. The release workflow keeps the Windows release build/publish block commented out for now, so Windows release packaging is currently local-only via the `*-windows` `just` recipes above.
+GitHub Actions uses Blacksmith Windows 2025 runners for compile-only Windows CI and release bundle validation.
 
 Create a portable bundle:
 
@@ -167,70 +167,45 @@ On native Windows, `just check-release` runs the host-safe Rust/doc invariant su
 
 CI uses [`dorny/paths-filter`](https://github.com/dorny/paths-filter) to skip jobs when unchanged areas of the repo are modified. A `changes` detection job runs first on every push and PR, then each build job gates on its output.
 
-For the repo's CI design rules and workflow responsibilities, see [`docs/CI_GUIDANCE.md`](docs/CI_GUIDANCE.md).
+For the current PR build topology, see [`ci/ci.md`](ci/ci.md). For workflow-editing rules agents must follow, see [`.github/AGENTS.md`](.github/AGENTS.md).
 
 ### What triggers what
 
-| Changed paths                                                                                           | `linux` / `macos` | `linux_cuda` / `linux_rocm` / `linux_vulkan` / `windows` |
-| ------------------------------------------------------------------------------------------------------- | ----------------- | -------------------------------------------------------- |
-| `crates/mesh-llm-host-runtime/**`, `crates/mesh-llm-system/**`, `Cargo.*`, `Justfile`, `scripts/**`, `crates/mesh-llm/build.rs`, `crates/mesh-llm-plugin/**`, `crates/mesh-llm/tests/**`, `crates/mesh-llm-protocol/proto/**` | ✅ runs           | ✅ runs                                                  |
-| `crates/mesh-llm-ui/**`                                                                                        | ✅ runs           | ⏭ skipped                                               |
-| `**/*.md`, `docs/**`, anything else                                                                     | ⏭ skipped        | ⏭ skipped                                               |
-| Manual `workflow_dispatch`                                                                              | ✅ runs           | ✅ runs                                                  |
+| Changed paths | `PR Quality Checks` | `PR Builds` CPU rows | Backend target rows |
+| --- | --- | --- | --- |
+| Rust crate or build-script changes | ✅ fmt/clippy | ✅ Linux/macOS/Windows CPU routing as needed | ⏭ skipped unless backend inputs changed |
+| `third_party/llama.cpp/**`, backend build scripts, `.github/workflows/pr_*.yml`, cache-version, `Justfile` | ✅ fmt/clippy | ✅ runs | ✅ CUDA/ROCm/Vulkan rows run where supported |
+| `crates/mesh-llm-ui/**` | ✅ UI quality | ✅ Linux/macOS UI build paths | ⏭ skipped |
+| `**/*.md`, `docs/**`, anything docs-only | ✅ changes summary only | ⏭ skipped | ⏭ skipped |
+| Manual `workflow_dispatch` | ✅ runs | ✅ runs | ✅ runs |
 
 ### Verifying path filtering works
 
 To confirm builds are skipped on a docs-only change, open a PR and push a commit that touches only a `.md` file (e.g. add a blank line to `README.md`). All build jobs should appear as **Skipped** in the Actions tab — only the `changes` job runs.
 
-To confirm UI-only changes skip the GPU backend jobs, push a commit touching only `crates/mesh-llm-ui/**`. The `linux` and `macos` jobs run; `linux_cuda`, `linux_rocm`, `linux_vulkan`, and `windows` are skipped.
+To confirm UI-only changes skip backend jobs, push a commit touching only `crates/mesh-llm-ui/**`. UI quality and the CPU producer rows run, while Linux/Windows CUDA, ROCm, and Vulkan backend rows stay skipped.
 
 ### Adding new paths
 
-If you add a new Rust crate, build script, or test directory, add its path to the `rust` filter in `.github/workflows/ci.yml` under the `changes` job so it correctly triggers the build matrix.
+If you add a new Rust crate, build script, or test directory, update `.github/actions/compute-changes`, `scripts/affected-crates.sh`, and the relevant `pr_*.yml` path filters so PR and main routing agree.
 
-## Benchmark Binaries
+## GPU benchmark execution
 
-Memory bandwidth benchmark source files live in `crates/mesh-llm/benchmarks/`. These are optional — they are **not** compiled by `just build`. Each target platform requires its own toolchain.
-
-### Building
+GPU bandwidth benchmarks are launched through the `mesh-llm` binary itself rather than standalone benchmark executables. The public command remains:
 
 ```bash
-just benchmark-build-apple    # macOS Apple Silicon — requires swiftc (ships with Xcode)
-just benchmark-build-cuda     # NVIDIA GPU — requires CUDA toolkit (nvcc)
-just benchmark-build-hip      # AMD GPU — requires ROCm (hipcc)
-just benchmark-build-intel    # Intel Arc GPU — requires Intel oneAPI (icpx) — UNVALIDATED
+mesh-llm gpus benchmark
 ```
 
-On Windows, use the dedicated recipes:
+Internally, mesh-llm runs a hidden `benchmark` subcommand in a narrow subprocess boundary so native backend hangs and stdout capture stay isolated from the main process.
 
-```powershell
-just benchmark-build-cuda-windows
-just benchmark-build-hip-windows
-just benchmark-build-intel-windows
-```
+Standard builds support benchmark execution only for the backends wired into the normal build flow:
 
-These produce `.exe` binaries next to `mesh-llm.exe`.
+- macOS Apple Silicon: Metal
+- Linux / Windows NVIDIA: CUDA
+- Linux / Windows AMD: HIP / ROCm
 
-> **AMD note:** The AMD benchmark (`crates/mesh-llm/benchmarks/membench-fingerprint.hip`) has not been tested on real AMD hardware. The recipe is provided for reference only.
-
-> **Intel Arc note:** The Intel Arc benchmark (`crates/mesh-llm/benchmarks/membench-fingerprint-intel.cpp`) has not been tested on real Intel Arc hardware. The recipe is provided for reference only.
-
-### Output location
-
-All recipes output to `target/release/`, the same directory as the `mesh-llm` binary. The `detect_bin_dir()` function in `mesh-llm` probes that directory at runtime, so benchmark binaries are discovered automatically.
-
-### Including in release bundles (Apple Silicon)
-
-The `just bundle` recipe automatically includes `membench-fingerprint` if it has been built:
-
-```bash
-just benchmark-build-apple && just bundle
-```
-
-If the binary is not present, `just bundle` prints a note and continues without it — the bundle is still valid.
-
-CUDA, HIP, and Intel binaries are **not** included in the Unix tarball bundle; they must be compiled on the target platform.
-On Windows release packaging, any `membench-fingerprint*.exe` binaries present in `target/release/` are included automatically in the generated `.zip`.
+Intel GPU benchmark execution is not currently supported in standard `just build` flows, so runtime benchmark selection intentionally skips Intel GPUs.
 
 ## Protocol Backward Compatibility
 

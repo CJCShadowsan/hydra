@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react'
 import * as NavigationMenu from '@radix-ui/react-navigation-menu'
 import * as Select from '@radix-ui/react-select'
 import {
+  BatteryCharging,
   BotMessageSquare,
   Check,
   ChevronDown,
@@ -21,6 +22,7 @@ import { CopyInstructionRow } from '@/components/ui/CopyInstructionRow'
 import type { LinkItem, TopNavJoinCommand, Theme, AppTab } from '@/features/app-tabs/types'
 import { cn } from '@/lib/cn'
 import { useDataMode, type DataMode } from '@/lib/data-mode'
+import { env } from '@/lib/env'
 import { useI18n } from '@/lib/i18n'
 
 type TopNavProps = {
@@ -46,8 +48,13 @@ type TopNavProps = {
 
 export type ApiTargetLiveness = 'checking' | 'live' | 'unavailable'
 
-const tabs: { value: AppTab; href: string; labelKey: 'tabs.network' | 'tabs.chat' | 'tabs.configuration' }[] = [
+const tabs: {
+  value: AppTab
+  href: string
+  labelKey: 'tabs.network' | 'tabs.reserves' | 'tabs.chat' | 'tabs.configuration'
+}[] = [
   { value: 'network', href: '/', labelKey: 'tabs.network' },
+  { value: 'reserves', href: '/reserves', labelKey: 'tabs.reserves' },
   { value: 'chat', href: '/chat', labelKey: 'tabs.chat' },
   { value: 'configuration', href: '/configuration', labelKey: 'tabs.configuration' }
 ]
@@ -60,6 +67,7 @@ const themeOptions: { value: Theme; label: string; description: string; Icon: Lu
 
 const tabIcons: Record<AppTab, LucideIcon> = {
   network: Network,
+  reserves: BatteryCharging,
   chat: BotMessageSquare,
   configuration: Settings
 }
@@ -259,7 +267,7 @@ const DEFAULT_API_ACCESS_LINKS: LinkItem[] = [
 function ApiAccessContent({ apiUrl, dataMode, links }: { apiUrl: string; dataMode: DataMode; links?: LinkItem[] }) {
   const listModelsCommand = `curl ${apiUrl}/models`
   const harnessMode = dataMode === 'harness'
-  const showDevelopmentNavControls = import.meta.env.DEV
+  const showDevelopmentNavControls = env.isDevelopment
 
   return (
     <>
@@ -317,8 +325,7 @@ const DEFAULT_JOIN_COMMANDS: TopNavJoinCommand[] = [
     prefix: '$',
     hint: 'Matches the Connect panel flow: join, select a model, and serve the API.'
   },
-  { label: 'Client-only join command', value: 'mesh-llm client --join <mesh-invite-token>', prefix: '$' },
-  { label: 'Blackboard skill command', value: 'mesh-llm blackboard install-skill', prefix: '$' }
+  { label: 'Client-only join command', value: 'mesh-llm client --join <mesh-invite-token>', prefix: '$' }
 ]
 
 const DEFAULT_JOIN_LINKS: LinkItem[] = [
@@ -496,7 +503,7 @@ function CompactActionsMenu({
 >) {
   const { mode } = useDataMode()
   const [activePanel, setActivePanel] = useState<CompactActionPanel>(null)
-  const showDevelopmentNavControls = import.meta.env.DEV
+  const showDevelopmentNavControls = env.isDevelopment
   const actionRow =
     'ui-row-action flex w-full items-center justify-between gap-3 rounded-[var(--radius)] border border-border-soft px-3 py-2 text-left text-[length:var(--density-type-caption-lg)] font-medium text-foreground'
 
@@ -631,7 +638,7 @@ function UtilityActions({
   | 'joinLinks'
 >) {
   const { mode } = useDataMode()
-  const showDevelopmentNavControls = import.meta.env.DEV
+  const showDevelopmentNavControls = env.isDevelopment
   const iconBtn =
     'ui-control inline-flex size-[var(--nav-action-size)] items-center justify-center rounded-[var(--radius)] border'
   const utilityBtn =

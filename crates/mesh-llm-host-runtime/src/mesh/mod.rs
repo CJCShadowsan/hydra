@@ -6,32 +6,42 @@
 //! latency-sensitive `skippy-stage/1` ALPN.
 
 pub use mesh_llm_types::mesh::{
-    infer_available_model_descriptors, infer_local_served_model_descriptor,
-    infer_served_model_descriptors, merge_demand, ModelDemand, ModelRuntimeDescriptor,
-    ModelSourceKind, ServedModelDescriptor, ServedModelIdentity, DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS,
+    DEMAND_TTL_SECS, MAX_SPLIT_RTT_MS, ModelDemand, ModelRuntimeDescriptor, ModelSourceKind,
+    ServedModelDescriptor, ServedModelIdentity, infer_available_model_descriptors,
+    infer_local_served_model_descriptor, infer_served_model_descriptors, merge_demand,
 };
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 use crate::crypto::{
-    default_node_ownership_path, save_node_ownership, sign_node_ownership, verify_node_ownership,
-    OwnershipStatus, OwnershipSummary, SignedNodeOwnership, TrustPolicy, TrustStore,
-    DEFAULT_NODE_CERT_LIFETIME_SECS,
+    DEFAULT_NODE_CERT_LIFETIME_SECS, OwnershipStatus, OwnershipSummary, SignedNodeOwnership,
+    TrustPolicy, TrustStore, default_node_ownership_path, save_node_ownership, sign_node_ownership,
+    verify_control_plane_target_node, verify_node_ownership,
 };
 use crate::protocol::*;
+
+use self::artifact_transfer_io::{
+    PartialArtifactGuard, append_artifact_transfer_body, select_partial_artifact,
+};
+
+#[cfg(test)]
+use self::artifact_transfer_io::read_artifact_transfer_chunk;
 
 use skippy_protocol::proto::stage as skippy_stage_proto;
 
 const PRETTY_LOCAL_REQUEST_WINDOW_SECS: u64 = 24 * 60 * 60;
+const EPHEMERAL_QUIC_PORT: u16 = 0;
 
 fn emit_mesh_info(message: String) {
     let _ = crate::cli::output::emit_event(crate::cli::output::OutputEvent::Info {
@@ -61,21 +71,219 @@ fn current_time_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-const MIN_PINNED_GPU_CONFIG_PEER_VERSION: &str = "0.59.0";
+fn elapsed_ms_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SelectedPathObservation {
+    pub(crate) path_type: &'static str,
+    pub(crate) rtt_ms: Option<u32>,
+    pub(crate) observed_direct_remote_addr: Option<SocketAddr>,
+}
+
+pub(crate) struct ConnectionCaptureEvent<'a> {
+    pub(crate) event: &'a str,
+    pub(crate) remote: EndpointId,
+    pub(crate) direction: &'a str,
+    pub(crate) phase: &'a str,
+    pub(crate) protocol: Option<ControlProtocol>,
+    pub(crate) path_type: Option<&'a str>,
+    pub(crate) rtt_ms: Option<u32>,
+    pub(crate) admitted_peer: Option<bool>,
+    pub(crate) reason: Option<&'a str>,
+}
+
+pub(crate) struct PeerLifecycleCaptureEvent<'a> {
+    pub(crate) event: &'a str,
+    pub(crate) peer: EndpointId,
+    pub(crate) reason: &'a str,
+    pub(crate) reporter: Option<EndpointId>,
+    pub(crate) last_seen_age_ms: Option<u64>,
+    pub(crate) last_mentioned_age_ms: Option<u64>,
+    pub(crate) had_connection: Option<bool>,
+    pub(crate) bridge_id: Option<EndpointId>,
+}
+
+pub(crate) struct HttpCaptureEvent<'a> {
+    pub(crate) event: &'a str,
+    pub(crate) source_addr: Option<SocketAddr>,
+    pub(crate) method: &'a str,
+    pub(crate) path: &'a str,
+    pub(crate) body_len_bytes: usize,
+    pub(crate) model_name: Option<&'a str>,
+    pub(crate) completion_tokens: Option<u32>,
+    pub(crate) stream: Option<bool>,
+}
+
+fn selected_path_observation(conn: &Connection) -> Option<SelectedPathObservation> {
+    let path_list = conn.paths();
+    for path_info in &path_list {
+        if !path_info.is_selected() {
+            continue;
+        }
+
+        let path_type = if path_info.is_ip() { "direct" } else { "relay" };
+        let rtt = path_info.rtt();
+        let rtt_ms = if rtt.is_zero() {
+            None
+        } else {
+            Some(rtt.as_millis().min(u128::from(u32::MAX)) as u32)
+        };
+        let observed_direct_remote_addr = match path_info.remote_addr() {
+            TransportAddr::Ip(addr) => Some(*addr),
+            _ => None,
+        };
+
+        return Some(SelectedPathObservation {
+            path_type,
+            rtt_ms,
+            observed_direct_remote_addr,
+        });
+    }
+
+    None
+}
+
+fn endpoint_id_capture_fields(id: EndpointId) -> serde_json::Value {
+    json!({
+        "short": id.fmt_short().to_string(),
+        "hex": hex::encode(id.as_bytes()),
+    })
+}
+
+fn peer_capture_fields(
+    peer: &PeerInfo,
+    source: &str,
+    bridge_id: Option<EndpointId>,
+) -> serde_json::Value {
+    let direct_rtt_ms = peer
+        .display_rtt
+        .as_ref()
+        .map(|observation| observation.rtt_ms);
+    let propagated_latency = peer.propagated_latency.as_ref().map(|observation| {
+        json!({
+            "latency_ms": observation.latency_ms,
+            "age_ms_at_received": observation.age_ms_at_received,
+            "observer": observation.observer_id.map(endpoint_id_capture_fields),
+        })
+    });
+
+    json!({
+        "peer": endpoint_id_capture_fields(peer.id),
+        "source": source,
+        "bridge": bridge_id.map(endpoint_id_capture_fields),
+        "role": &peer.role,
+        "version": &peer.version,
+        "hostname": &peer.hostname,
+        "models": &peer.models,
+        "serving_models": &peer.serving_models,
+        "hosted_models": &peer.hosted_models,
+        "hosted_models_known": peer.hosted_models_known,
+        "available_models": &peer.available_models,
+        "requested_models": &peer.requested_models,
+        "explicit_model_interests": &peer.explicit_model_interests,
+        "model_source": &peer.model_source,
+        "gpu_name": &peer.gpu_name,
+        "is_soc": peer.is_soc,
+        "vram_bytes": peer.vram_bytes,
+        "gpu_vram": &peer.gpu_vram,
+        "gpu_reserved_bytes": &peer.gpu_reserved_bytes,
+        "gpu_mem_bandwidth_gbps": &peer.gpu_mem_bandwidth_gbps,
+        "gpu_compute_tflops_fp32": &peer.gpu_compute_tflops_fp32,
+        "gpu_compute_tflops_fp16": &peer.gpu_compute_tflops_fp16,
+        "direct_rtt_ms": direct_rtt_ms.or(peer.rtt_ms),
+        "propagated_latency": propagated_latency,
+        "owner": &peer.owner_summary,
+        "artifact_transfer_supported": peer.artifact_transfer_supported,
+        "stage_status_list_supported": peer.stage_status_list_supported,
+        "first_joined_mesh_ts": peer.first_joined_mesh_ts,
+    })
+}
+
 pub(super) const PEER_CONNECT_AND_GOSSIP_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(15);
+    std::time::Duration::from_secs(30);
 const ARTIFACT_TRANSFER_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ARTIFACT_TRANSFER_READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ARTIFACT_TRANSFER_BUFFER_BYTES: usize = 1024 * 1024;
+const ARTIFACT_TRANSFER_INVALID_OFFSET_ERROR: &str = "invalid transfer offset";
 
-fn quic_bind_addr(bind_port: Option<u16>) -> Option<std::net::SocketAddr> {
-    if let Some(port) = bind_port {
-        return Some(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+type MeshBiStream = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
+
+enum StageStreamAccept {
+    Dispatch(MeshBiStream, u8),
+    Continue,
+    Closed,
+}
+
+struct NodeHardwareSnapshot {
+    vram_bytes: u64,
+    gpu_name: Option<String>,
+    hostname: Option<String>,
+    is_soc: Option<bool>,
+    gpu_vram: Option<String>,
+    gpu_reserved_bytes: Option<String>,
+}
+
+struct OwnerRuntimeInit {
+    trust_store: TrustStore,
+    trust_policy: TrustPolicy,
+    owner_attestation: Option<SignedNodeOwnership>,
+}
+
+struct DetectedVramLog {
+    detected_gb: f64,
+    max_gb: Option<f64>,
+    capped_bytes: Option<u64>,
+}
+
+struct AcceptedMeshStream {
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    stream_type: u8,
+}
+
+enum ClosedConnectionRecovery {
+    Reconnect(EndpointAddr),
+    RemovePeer,
+    AlreadyReplaced,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QuicBindSelection {
+    pub ip: Option<IpAddr>,
+    pub port: Option<u16>,
+}
+
+/// Relay map plus per-relay bearer tokens for gated iroh-relays.
+///
+/// `urls` is the relay map; `auths` is a sparse map of relay URL -> bearer
+/// token used when registering with relays running `AccessConfig::Restricted`.
+/// Public relays in the same map continue to register without auth.
+#[derive(Clone, Copy, Debug)]
+pub struct RelayConfig<'a> {
+    pub urls: &'a [String],
+    pub auths: &'a std::collections::HashMap<String, String>,
+}
+
+fn quic_bind_addr(bind: QuicBindSelection) -> Option<SocketAddr> {
+    if let Some(ip) = bind.ip {
+        return Some(SocketAddr::new(
+            ip,
+            bind.port.unwrap_or(EPHEMERAL_QUIC_PORT),
+        ));
+    }
+
+    if let Some(port) = bind.port {
+        return Some(SocketAddr::from(([0, 0, 0, 0], port)));
     }
 
     #[cfg(target_os = "windows")]
     {
-        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        Some(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            EPHEMERAL_QUIC_PORT,
+        )))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -84,92 +292,414 @@ fn quic_bind_addr(bind_port: Option<u16>) -> Option<std::net::SocketAddr> {
     }
 }
 
-fn config_uses_pinned_gpu(config: &crate::plugin::MeshConfig) -> bool {
-    config.gpu.assignment == crate::plugin::GpuAssignment::Pinned
+fn default_control_bind_addr() -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-fn peer_supports_pinned_gpu_config(peer_version: Option<&str>) -> bool {
-    let Ok(min_version) = semver::Version::parse(MIN_PINNED_GPU_CONFIG_PEER_VERSION) else {
-        return false;
-    };
-    let Some(peer_version) = peer_version else {
-        return false;
-    };
-    let Ok(peer_version) = semver::Version::parse(peer_version) else {
-        return false;
-    };
-
-    peer_version >= min_version
-        || (peer_version.major == min_version.major
-            && peer_version.minor == min_version.minor
-            && peer_version.patch == min_version.patch)
-}
-
-fn pinned_gpu_config_peer_error(peer_version: Option<&str>) -> String {
-    let advertised = peer_version.unwrap_or("unknown");
-    format!(
-        "pinned gpu config sync requires mesh-llm >= {MIN_PINNED_GPU_CONFIG_PEER_VERSION}; subscriber advertised {advertised}"
-    )
-}
-
-fn partial_artifact_path(destination: &std::path::Path) -> std::path::PathBuf {
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    destination.with_file_name(format!(
-        ".{file_name}.{}.{}.part",
-        std::process::id(),
-        unique
-    ))
-}
-
-struct PartialArtifactGuard {
-    path: std::path::PathBuf,
-    armed: bool,
-}
-
-impl PartialArtifactGuard {
-    fn new(path: std::path::PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
+fn is_public_ipv4_candidate(socket: &SocketAddr) -> bool {
+    match socket.ip() {
+        IpAddr::V4(ip) => is_global_ipv4_candidate(ip),
+        IpAddr::V6(_) => false,
     }
 }
 
-impl Drop for PartialArtifactGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = std::fs::remove_file(&self.path);
+fn is_global_ipv4_candidate(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 240)
+}
+
+fn build_stun_binding_request() -> [u8; 20] {
+    let mut req = [0u8; 20];
+    req[1] = 0x01;
+    req[4] = 0x21;
+    req[5] = 0x12;
+    req[6] = 0xA4;
+    req[7] = 0x42;
+    rand::fill(&mut req[8..20]);
+    req
+}
+
+async fn resolve_stun_server(server: &str) -> Option<std::net::SocketAddr> {
+    let mut addrs = tokio::net::lookup_host(server).await.ok()?;
+    addrs.next()
+}
+
+fn parse_stun_mapped_ipv4(
+    attr_type: u16,
+    value: &[u8],
+    magic: &[u8],
+    advertised_port: u16,
+) -> Option<std::net::SocketAddr> {
+    use std::net::SocketAddrV4;
+
+    if value.len() < 8 || value[1] != 0x01 {
+        return None;
+    }
+    let ip = match attr_type {
+        0x0020 => Ipv4Addr::new(
+            value[4] ^ magic[0],
+            value[5] ^ magic[1],
+            value[6] ^ magic[2],
+            value[7] ^ magic[3],
+        ),
+        0x0001 => Ipv4Addr::new(value[4], value[5], value[6], value[7]),
+        _ => return None,
+    };
+    Some(std::net::SocketAddr::V4(SocketAddrV4::new(
+        ip,
+        advertised_port,
+    )))
+}
+
+fn parse_stun_public_addr(
+    response: &[u8],
+    len: usize,
+    magic: &[u8],
+    advertised_port: u16,
+) -> Option<std::net::SocketAddr> {
+    let mut i = 20;
+    while i + 4 <= len {
+        let attr_type = u16::from_be_bytes([response[i], response[i + 1]]);
+        let attr_len = u16::from_be_bytes([response[i + 2], response[i + 3]]) as usize;
+        if i + 4 + attr_len > len {
+            break;
         }
+        let value = &response[i + 4..i + 4 + attr_len];
+        if let Some(addr) = parse_stun_mapped_ipv4(attr_type, value, magic, advertised_port) {
+            return Some(addr);
+        }
+        i += (4 + (attr_len + 3)) & !3;
+    }
+    None
+}
+
+fn endpoint_addr_has_public_ipv4(addr: &EndpointAddr) -> bool {
+    addr.addrs.iter().any(|candidate| match candidate {
+        TransportAddr::Ip(socket) => is_public_ipv4_candidate(socket),
+        _ => false,
+    })
+}
+
+// Host-network Docker and CNI bridges commonly reuse the same 172.* addresses
+// on every host. When a node selects a bind IP, only advertise that direct IP
+// while preserving relay and public candidates for non-LAN reachability.
+fn filter_endpoint_addr_for_bind_ip(
+    mut addr: EndpointAddr,
+    bind_ip: Option<IpAddr>,
+) -> EndpointAddr {
+    let Some(bind_ip) = bind_ip else {
+        return addr;
+    };
+    addr.addrs.retain(|candidate| match candidate {
+        TransportAddr::Ip(socket) => socket.ip() == bind_ip || is_public_ipv4_candidate(socket),
+        _ => true,
+    });
+    addr
+}
+
+fn effective_relay_urls(relay_urls: &[String]) -> Vec<String> {
+    if relay_urls.is_empty() {
+        vec![
+            "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
+            "https://aps1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
+        ]
+    } else {
+        relay_urls.to_vec()
     }
 }
 
-async fn read_artifact_transfer_chunk<R>(
-    reader: &mut R,
-    buffer: &mut [u8],
-    idle_timeout: std::time::Duration,
-) -> Result<usize>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let read = tokio::time::timeout(idle_timeout, tokio::io::AsyncReadExt::read(reader, buffer))
+/// Build an [`iroh::RelayMap`] from URLs, attaching per-relay auth tokens
+/// where configured.
+///
+/// `auths` maps relay URLs (as they appear in `urls`) to bearer tokens. Tokens
+/// are passed to `iroh::RelayConfig::with_auth_token` which sends them as
+/// `Authorization: Bearer <token>` on the WebSocket upgrade. Relays not present
+/// in the map register unauthenticated, which is the correct behavior for
+/// public (`AccessConfig::Everyone`) relays.
+///
+/// This is the wire-up that lets a gated iroh-relay (e.g. one running
+/// `AccessConfig::Restricted` with NIP-98 admission) admit this node while
+/// public relays in the same map continue to work normally.
+fn relay_map_from_urls(
+    urls: &[String],
+    auths: &std::collections::HashMap<String, String>,
+) -> iroh::RelayMap {
+    let configs = urls.iter().map(|url| {
+        let parsed = url.parse().expect("invalid relay URL");
+        let cfg = iroh::RelayConfig::new(parsed, None);
+        match auths.get(url) {
+            Some(token) => cfg.with_auth_token(token.clone()),
+            None => cfg,
+        }
+    });
+    iroh::RelayMap::from_iter(configs)
+}
+
+#[cfg(test)]
+mod relay_map_tests {
+    use super::relay_map_from_urls;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn configs(map: &iroh::RelayMap) -> Vec<Arc<iroh::RelayConfig>> {
+        map.relays::<Vec<_>>()
+    }
+
+    #[test]
+    fn builds_map_without_auth_when_empty() {
+        let urls = vec!["https://r1.example/".to_string()];
+        let map = relay_map_from_urls(&urls, &HashMap::new());
+        let cfgs = configs(&map);
+        assert_eq!(cfgs.len(), 1);
+        assert!(
+            cfgs[0].auth_token.is_none(),
+            "no auth supplied → no auth_token set"
+        );
+    }
+
+    #[test]
+    fn attaches_auth_token_for_matching_url() {
+        let urls = vec!["https://gated.example/".to_string()];
+        let mut auths = HashMap::new();
+        auths.insert("https://gated.example/".to_string(), "nip98-bearer".into());
+        let map = relay_map_from_urls(&urls, &auths);
+        let cfgs = configs(&map);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].auth_token.as_deref(), Some("nip98-bearer"));
+    }
+
+    #[test]
+    fn leaves_other_relays_unauthenticated_in_mixed_map() {
+        // The whole point: gated relay gets a token, public relays don't.
+        let urls = vec![
+            "https://gated.example/".to_string(),
+            "https://public.iroh/".to_string(),
+        ];
+        let mut auths = HashMap::new();
+        auths.insert("https://gated.example/".to_string(), "bearer-xyz".into());
+
+        let map = relay_map_from_urls(&urls, &auths);
+        let by_url: HashMap<String, Option<String>> = configs(&map)
+            .into_iter()
+            .map(|cfg| (cfg.url.to_string(), cfg.auth_token.clone()))
+            .collect();
+
+        // Find the entries by matching on host substring, since iroh-relay may
+        // canonicalise the URL form (e.g. trailing dot on the host).
+        let gated = by_url
+            .iter()
+            .find(|(u, _)| u.contains("gated.example"))
+            .expect("gated relay should be in the map");
+        let public = by_url
+            .iter()
+            .find(|(u, _)| u.contains("public.iroh"))
+            .expect("public relay should be in the map");
+
+        assert_eq!(
+            gated.1.as_deref(),
+            Some("bearer-xyz"),
+            "gated relay must carry its token"
+        );
+        assert!(
+            public.1.is_none(),
+            "public relay must register without a token, got {:?}",
+            public.1
+        );
+    }
+}
+
+/// End-to-end regression tests for `--relay-auth` against a real in-process
+/// iroh-relay running [`iroh_relay::server::AccessConfig::Restricted`].
+///
+/// These tests do not go through the full `Node::start` path — they exercise
+/// `relay_map_from_urls` (the new wiring) plus the iroh `Endpoint` builder
+/// the same way `bind_mesh_endpoint` does, with `ca_roots_config` overridden
+/// for the relay's self-signed test cert. The contract being defended is:
+///
+///  1. A token configured for a gated relay URL reaches iroh as
+///     `RelayConfig::with_auth_token`, gets sent as `Authorization: Bearer`
+///     on the WebSocket upgrade, and the relay admits the endpoint.
+///  2. The wrong token (or no token) is rejected with `not authorized` and
+///     the endpoint never reaches `online()`.
+///  3. Mixed maps work: a gated relay with the right token coexists with a
+///     public relay (no token) in the same `RelayMap`.
+#[cfg(test)]
+mod gated_relay_e2e_tests {
+    use super::relay_map_from_urls;
+    use futures_util::StreamExt;
+    use iroh::SecretKey;
+    use iroh::Watcher;
+    use iroh::endpoint::{Endpoint, RelayMode, presets};
+    use iroh::test_utils::run_relay_server_with_access;
+    use iroh_relay::server::{Access, AccessConfig};
+    use iroh_relay::tls::CaRootsConfig;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    /// Spawn an in-process iroh-relay that only admits `expected_token`.
+    /// Returns (relay_url_string, drop-guard server).
+    async fn spawn_gated_relay(
+        expected_token: &'static str,
+    ) -> (String, iroh_relay::server::Server) {
+        let access = AccessConfig::Restricted(Box::new(move |request| {
+            Box::pin(async move {
+                if request.auth_token().as_deref() == Some(expected_token) {
+                    Access::Allow
+                } else {
+                    Access::Deny
+                }
+            })
+        }));
+        let (_relay_map, relay_url, server) = run_relay_server_with_access(false, access)
+            .await
+            .expect("spawn gated relay");
+        (relay_url.to_string(), server)
+    }
+
+    /// Build an `Endpoint` configured the same way `bind_mesh_endpoint` does,
+    /// but using `relay_map_from_urls` for the relay map and accepting the
+    /// relay's self-signed test cert via `insecure_skip_verify`.
+    async fn build_endpoint(
+        relay_urls: &[String],
+        relay_auths: &HashMap<String, String>,
+    ) -> Endpoint {
+        Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .relay_mode(RelayMode::Custom(relay_map_from_urls(
+                relay_urls,
+                relay_auths,
+            )))
+            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .bind()
+            .await
+            .expect("endpoint bind")
+    }
+
+    #[tokio::test]
+    async fn matching_token_admits_endpoint_to_gated_relay() {
+        const TOKEN: &str = "secret-token";
+        let (relay_url, _server) = spawn_gated_relay(TOKEN).await;
+
+        let urls = vec![relay_url.clone()];
+        let mut auths = HashMap::new();
+        auths.insert(relay_url, TOKEN.to_string());
+
+        let ep = build_endpoint(&urls, &auths).await;
+        tokio::time::timeout(Duration::from_secs(5), ep.online())
+            .await
+            .expect("endpoint with matching token should come online");
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_rejected_by_gated_relay() {
+        const TOKEN: &str = "secret-token";
+        let (relay_url, _server) = spawn_gated_relay(TOKEN).await;
+
+        let urls = vec![relay_url.clone()];
+        let mut auths = HashMap::new();
+        auths.insert(relay_url, "wrong-token".to_string());
+
+        let ep = build_endpoint(&urls, &auths).await;
+
+        // Observe the relay-side denial via home_relay_status before falling
+        // back to the timeout. We must see `not authorized` to prove the
+        // token actually reached the relay (rather than e.g. silently being
+        // dropped before the WebSocket upgrade).
+        let mut stream = ep.home_relay_status().stream();
+        let auth_err = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(status) = stream.next().await {
+                if let Some(err) = status.iter().filter_map(|s| s.last_error()).next() {
+                    return Some(format!("{err:#}"));
+                }
+            }
+            None
+        })
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("artifact transfer body read idle timeout after {idle_timeout:?}")
-        })?
-        .context("read artifact transfer bytes")?;
-    anyhow::ensure!(
-        read > 0,
-        "artifact transfer ended before expected byte count"
-    );
-    Ok(read)
+        .expect("home relay status should report an error within 5s")
+        .expect("home relay status should yield an error");
+        assert!(
+            auth_err.contains("not authorized"),
+            "expected 'not authorized' in error, got: {auth_err}"
+        );
+
+        // And the endpoint must NOT come online.
+        let online = tokio::time::timeout(Duration::from_millis(500), ep.online()).await;
+        assert!(
+            online.is_err(),
+            "endpoint with wrong token must not reach online() within 500ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_token_for_gated_relay_is_rejected() {
+        const TOKEN: &str = "secret-token";
+        let (relay_url, _server) = spawn_gated_relay(TOKEN).await;
+
+        // No auth in the map at all → relay must deny.
+        let urls = vec![relay_url];
+        let auths = HashMap::new();
+        let ep = build_endpoint(&urls, &auths).await;
+
+        let online = tokio::time::timeout(Duration::from_millis(500), ep.online()).await;
+        assert!(
+            online.is_err(),
+            "endpoint without a token must not be admitted by a gated relay"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_map_authenticates_only_the_gated_relay() {
+        const TOKEN: &str = "secret-token";
+        let (gated_url, _gated) = spawn_gated_relay(TOKEN).await;
+
+        // Spin up a second, fully-open relay to stand in for a public iroh
+        // relay sharing the same map.
+        let (_public_map, public_url, _public) =
+            run_relay_server_with_access(false, AccessConfig::Everyone)
+                .await
+                .expect("spawn public relay");
+        let public_url = public_url.to_string();
+
+        let urls = vec![gated_url.clone(), public_url.clone()];
+        let mut auths = HashMap::new();
+        auths.insert(gated_url, TOKEN.to_string());
+        // Public relay intentionally absent from `auths`.
+
+        let ep = build_endpoint(&urls, &auths).await;
+        tokio::time::timeout(Duration::from_secs(5), ep.online())
+            .await
+            .expect("endpoint should come online via the mixed relay map");
+    }
+}
+
+fn encode_endpoint_addr_token(addr: &EndpointAddr) -> String {
+    let json = serde_json::to_vec(addr).expect("endpoint addr should serialize");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+fn control_endpoint_addr(
+    endpoint: &Endpoint,
+    advertise_addr: Option<std::net::SocketAddr>,
+) -> EndpointAddr {
+    let mut addr = endpoint.addr();
+    if let Some(advertise_addr) = advertise_addr {
+        addr.addrs
+            .retain(|addr| matches!(addr, TransportAddr::Relay(_)));
+        addr.addrs.insert(TransportAddr::Ip(advertise_addr));
+    }
+    addr
 }
 
 async fn write_artifact_transfer_response(
@@ -180,7 +710,7 @@ async fn write_artifact_transfer_response(
     error: Option<&str>,
 ) -> Result<()> {
     let response = skippy_stage_proto::StageArtifactTransferResponse {
-        gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
         accepted,
         total_size,
         sha256: sha256.map(str::to_string),
@@ -276,7 +806,7 @@ fn preflight_pushed_config_for_current_node_with_gpus(
     }
 
     for model in &config.models {
-        let gpu = crate::system::hardware::resolve_pinned_gpu(model.gpu_id.as_deref(), gpus)
+        let gpu = crate::system::hardware::resolve_pinned_gpu_strict(model.gpu_id.as_deref(), gpus)
             .map_err(anyhow::Error::new)
             .with_context(|| {
                 format!(
@@ -341,6 +871,41 @@ fn node_role_label(role: &NodeRole) -> String {
     }
 }
 
+fn owner_control_error_envelope(
+    code: crate::proto::node::OwnerControlErrorCode,
+    request_id: Option<u64>,
+    current_revision: Option<u64>,
+    message: impl Into<String>,
+) -> crate::proto::node::OwnerControlEnvelope {
+    crate::proto::node::OwnerControlEnvelope {
+        r#gen: NODE_PROTOCOL_GENERATION,
+        handshake: None,
+        request: None,
+        response: None,
+        error: Some(crate::proto::node::OwnerControlError {
+            code: code as i32,
+            message: message.into(),
+            request_id,
+            current_revision,
+        }),
+    }
+}
+
+fn owner_control_rejection_envelope(
+    data: &[u8],
+    request_id: Option<u64>,
+    err: &ControlFrameError,
+) -> crate::proto::node::OwnerControlEnvelope {
+    let code = if matches!(err, ControlFrameError::MissingControlCommand) {
+        crate::proto::node::OwnerControlErrorCode::UnknownCommand
+    } else if serde_json::from_slice::<serde_json::Value>(data).is_ok() {
+        crate::proto::node::OwnerControlErrorCode::LegacyJsonUnsupported
+    } else {
+        crate::proto::node::OwnerControlErrorCode::BadRequest
+    };
+    owner_control_error_envelope(code, request_id, None, err.to_string())
+}
+
 fn infer_remote_served_descriptors(
     primary_model_name: &str,
     serving_models: &[String],
@@ -366,6 +931,7 @@ fn infer_remote_served_descriptors(
             };
             ServedModelDescriptor {
                 identity,
+                capabilities_known: false,
                 capabilities: crate::models::ModelCapabilities::default(),
                 topology: None,
             }
@@ -557,6 +1123,7 @@ fn descriptor_from_identity(
     capabilities.moe = false;
     ServedModelDescriptor {
         identity,
+        capabilities_known: true,
         capabilities,
         topology,
     }
@@ -755,7 +1322,9 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) served_model_runtime: Vec<ModelRuntimeDescriptor>,
     pub(crate) owner_attestation: Option<SignedNodeOwnership>,
     pub(crate) artifact_transfer_supported: bool,
+    pub(crate) stage_protocol_generation_supported: bool,
     pub(crate) stage_status_list_supported: bool,
+    pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     pub(crate) latency_ms: Option<u32>,
     pub(crate) latency_source: Option<crate::proto::node::LatencySource>,
     pub(crate) latency_age_ms: Option<u64>,
@@ -846,7 +1415,9 @@ pub struct PeerInfo {
     pub served_model_runtime: Vec<ModelRuntimeDescriptor>,
     pub owner_attestation: Option<SignedNodeOwnership>,
     pub artifact_transfer_supported: bool,
+    pub stage_protocol_generation_supported: bool,
     pub stage_status_list_supported: bool,
+    pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     /// Most recent direct RTT sample for display purposes (refreshed periodically).
     pub display_rtt: Option<DirectLatencyObservation>,
     /// Latency propagated via transitive gossip.
@@ -857,9 +1428,19 @@ pub struct PeerInfo {
 #[derive(Debug)]
 pub struct OwnerRuntimeConfig {
     pub keypair: Option<crate::crypto::OwnerKeypair>,
+    pub control_bind: Option<std::net::SocketAddr>,
+    pub control_advertise_addr: Option<std::net::SocketAddr>,
     pub node_label: Option<String>,
     pub trust_store: TrustStore,
     pub trust_policy: TrustPolicy,
+}
+
+struct ControlListenerLifecycle {
+    endpoint: Endpoint,
+    token: String,
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
 }
 #[derive(Debug, Clone)]
 pub struct MeshCatalogEntry {
@@ -907,7 +1488,9 @@ impl PeerInfo {
             served_model_runtime: ann.served_model_runtime.clone(),
             owner_attestation: ann.owner_attestation.clone(),
             artifact_transfer_supported: ann.artifact_transfer_supported,
+            stage_protocol_generation_supported: ann.stage_protocol_generation_supported,
             stage_status_list_supported: ann.stage_status_list_supported,
+            advertised_model_throughput: ann.advertised_model_throughput.clone(),
             display_rtt: None,
             propagated_latency: None,
             owner_summary,
@@ -1094,8 +1677,6 @@ pub struct RouteEntry {
 /// We can't send STUN from the bound port (iroh owns it), but we only need
 /// the public IP — the port is known from --bind-port + router forwarding.
 async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> {
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-
     let stun_servers = [
         "stun.l.google.com:19302",
         "stun.cloudflare.com:3478",
@@ -1106,72 +1687,9 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
     let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
 
     for server in &stun_servers {
-        // STUN Binding Request: type=0x0001, len=0, magic=0x2112A442, txn=random
-        let mut req = [0u8; 20];
-        req[0] = 0x00;
-        req[1] = 0x01; // Binding Request
-                       // length = 0
-        req[4] = 0x21;
-        req[5] = 0x12;
-        req[6] = 0xA4;
-        req[7] = 0x42; // Magic Cookie
-        rand::fill(&mut req[8..20]);
-
-        let dest: SocketAddr = match tokio::net::lookup_host(server).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(a) => a,
-                None => continue,
-            },
-            Err(_) => continue,
-        };
-
-        if sock.send_to(&req, dest).await.is_err() {
-            continue;
-        }
-
-        let mut buf = [0u8; 256];
-        match tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
-            .await
-        {
-            Ok(Ok((len, _))) if len >= 20 => {
-                // Parse STUN response for XOR-MAPPED-ADDRESS (0x0020)
-                // or MAPPED-ADDRESS (0x0001)
-                let magic = &req[4..8];
-                let _txn = &req[8..20];
-                let mut i = 20;
-                while i + 4 <= len {
-                    let attr_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
-                    let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
-                    if i + 4 + attr_len > len {
-                        break;
-                    }
-                    let val = &buf[i + 4..i + 4 + attr_len];
-
-                    if attr_type == 0x0020 && attr_len >= 8 && val[1] == 0x01 {
-                        // XOR-MAPPED-ADDRESS, IPv4 — extract IP only
-                        let ip = Ipv4Addr::new(
-                            val[4] ^ magic[0],
-                            val[5] ^ magic[1],
-                            val[6] ^ magic[2],
-                            val[7] ^ magic[3],
-                        );
-                        let addr = SocketAddr::V4(SocketAddrV4::new(ip, advertised_port));
-                        tracing::info!("STUN discovered public address: {addr}");
-                        return Some(addr);
-                    }
-                    if attr_type == 0x0001 && attr_len >= 8 && val[1] == 0x01 {
-                        // MAPPED-ADDRESS, IPv4 — extract IP only
-                        let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
-                        let addr = SocketAddr::V4(SocketAddrV4::new(ip, advertised_port));
-                        tracing::info!("STUN discovered public address: {addr}");
-                        return Some(addr);
-                    }
-
-                    // Attributes are padded to 4-byte boundary
-                    i += (4 + (attr_len + 3)) & !3;
-                }
-            }
-            _ => continue,
+        if let Some(addr) = probe_stun_server(&sock, server, advertised_port).await {
+            tracing::info!("STUN discovered public address: {addr}");
+            return Some(addr);
         }
     }
 
@@ -1179,10 +1697,253 @@ async fn stun_public_addr(advertised_port: u16) -> Option<std::net::SocketAddr> 
     None
 }
 
+async fn probe_stun_server(
+    sock: &tokio::net::UdpSocket,
+    server: &str,
+    advertised_port: u16,
+) -> Option<std::net::SocketAddr> {
+    let req = build_stun_binding_request();
+    let dest = resolve_stun_server(server).await?;
+    sock.send_to(&req, dest).await.ok()?;
+
+    let mut buf = [0u8; 256];
+    let (len, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+    if len < 20 {
+        return None;
+    }
+
+    parse_stun_public_addr(&buf, len, &req[4..8], advertised_port)
+}
+
+async fn startup_secret_key(role: &NodeRole) -> Result<SecretKey> {
+    if matches!(role, NodeRole::Client) || std::env::var("MESH_LLM_EPHEMERAL_KEY").is_ok() {
+        let key = SecretKey::generate();
+        tracing::info!("Using ephemeral key (unique identity)");
+        Ok(key)
+    } else {
+        load_or_create_key().await
+    }
+}
+
+fn startup_transport_config() -> iroh::endpoint::QuicTransportConfig {
+    // Keep QUIC connections alive during long inference calls.
+    //
+    // noq-proto's default `max_idle_timeout` is ~30s and `keep_alive_interval`
+    // is `None`. A non-streaming inference request (e.g. MoA reducer or any
+    // `stream:false` call) sends nothing on the wire while the remote model is
+    // generating tokens. Under concurrent load (multiple in-flight model
+    // requests + gossip + heartbeats) noq's multipath bookkeeping will close
+    // an idle path, and if it is the last open path the whole connection
+    // drops mid-stream. The in-flight stream errors with `connection lost`
+    // and the caller has to retry from scratch.
+    //
+    // A 10s keep-alive sends a small PING every 10s on each path, keeping
+    // paths and the connection healthy during long compute. The 5-minute idle
+    // timeout is defense in depth for truly silent connections (paused
+    // agents, suspended laptops); short-term silence is handled by
+    // keep-alive.
+    let max_idle = iroh::endpoint::IdleTimeout::try_from(std::time::Duration::from_secs(300))
+        .expect("5-minute idle timeout fits in a VarInt");
+    let keep_alive = std::time::Duration::from_secs(10);
+    let path_idle = std::time::Duration::from_secs(300);
+    iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(1024u32.into())
+        .keep_alive_interval(keep_alive)
+        .max_idle_timeout(Some(max_idle))
+        // noq-proto's multipath uses per-path idle timers independent of the
+        // connection-level idle. Without these, a path can be torn down while
+        // the connection idle timer is fine, and when the last path closes the
+        // connection dies with `LastOpenPath`. Mirror connection-level
+        // settings onto the default per-path config.
+        .default_path_max_idle_timeout(path_idle)
+        .default_path_keep_alive_interval(keep_alive)
+        .build()
+}
+
+async fn bind_mesh_endpoint(
+    secret_key: SecretKey,
+    relay_urls: &[String],
+    relay_auths: &std::collections::HashMap<String, String>,
+    quic_bind: QuicBindSelection,
+) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key)
+        .alpns(vec![
+            ALPN_V1.to_vec(),
+            skippy_protocol::STAGE_ALPN_V1.to_vec(),
+        ])
+        .transport_config(startup_transport_config());
+
+    let urls = effective_relay_urls(relay_urls);
+    tracing::info!("Relay: {:?}", urls);
+    builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
+        &urls,
+        relay_auths,
+    )));
+
+    if let Some(addr) = quic_bind_addr(quic_bind) {
+        tracing::info!("Binding QUIC to {addr}");
+        builder = builder.bind_addr(addr)?;
+    }
+
+    builder.bind().await.map_err(Into::into)
+}
+
+async fn wait_for_endpoint_online(endpoint: &Endpoint, connected_log: &str, timeout_log: &str) {
+    match tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online()).await {
+        Ok(()) => tracing::info!("{connected_log}"),
+        Err(_) => tracing::warn!("{timeout_log}"),
+    }
+}
+
+fn hardware_snapshot_for_start(
+    hw: crate::system::hardware::HardwareSurvey,
+    role: &NodeRole,
+    max_vram_gb: Option<f64>,
+) -> NodeHardwareSnapshot {
+    let mut vram_bytes = hw.vram_bytes;
+    let gpu_name = if matches!(role, NodeRole::Client) {
+        None
+    } else {
+        hw.gpu_name
+    };
+    let hostname = hw.hostname;
+    let is_soc = Some(hw.is_soc);
+    let gpu_vram = (!hw.gpu_vram.is_empty()).then(|| {
+        hw.gpu_vram
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let gpu_reserved_bytes = if hw.gpu_reserved.iter().all(Option::is_none) {
+        None
+    } else {
+        Some(
+            hw.gpu_reserved
+                .iter()
+                .map(|value| value.map(|v| v.to_string()).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+
+    log_detected_vram(&mut vram_bytes, max_vram_gb);
+
+    NodeHardwareSnapshot {
+        vram_bytes,
+        gpu_name,
+        hostname,
+        is_soc,
+        gpu_vram,
+        gpu_reserved_bytes,
+    }
+}
+
+fn detected_vram_log(vram_bytes: u64, max_vram_gb: Option<f64>) -> DetectedVramLog {
+    let detected_gb = vram_bytes as f64 / 1e9;
+    let capped_bytes = max_vram_gb
+        .map(|max_gb| ((max_gb * 1e9) as u64, max_gb))
+        .and_then(|(max_bytes, _)| (max_bytes < vram_bytes).then_some(max_bytes));
+    DetectedVramLog {
+        detected_gb,
+        max_gb: max_vram_gb,
+        capped_bytes,
+    }
+}
+
+fn log_detected_vram(vram_bytes: &mut u64, max_vram_gb: Option<f64>) {
+    let log = detected_vram_log(*vram_bytes, max_vram_gb);
+    if let Some(max_gb) = log.max_gb {
+        log_detected_vram_with_cap(vram_bytes, log.detected_gb, max_gb, log.capped_bytes);
+    } else {
+        tracing::info!("Detected VRAM: {:.1} GB", log.detected_gb);
+    }
+}
+
+fn log_detected_vram_with_cap(
+    vram_bytes: &mut u64,
+    detected_gb: f64,
+    max_gb: f64,
+    capped_bytes: Option<u64>,
+) {
+    if let Some(capped_bytes) = capped_bytes {
+        tracing::info!(
+            "Detected VRAM: {:.1} GB, capped to {:.1} GB (--max-vram)",
+            detected_gb,
+            max_gb
+        );
+        *vram_bytes = capped_bytes;
+    } else {
+        tracing::info!(
+            "Detected VRAM: {:.1} GB (--max-vram {:.1} has no effect)",
+            detected_gb,
+            max_gb
+        );
+    }
+}
+
+fn init_owner_runtime(
+    owner_config: Option<&OwnerRuntimeConfig>,
+    endpoint_id: EndpointId,
+    hostname: Option<String>,
+) -> Result<OwnerRuntimeInit> {
+    let trust_store = owner_config
+        .map(|config| config.trust_store.clone())
+        .unwrap_or_default();
+    let trust_policy = owner_config
+        .map(|config| config.trust_policy)
+        .unwrap_or_default();
+    let owner_attestation = match owner_config.and_then(|config| config.keypair.as_ref()) {
+        Some(keypair) => Some(load_or_refresh_owner_attestation(
+            keypair,
+            endpoint_id,
+            owner_config.and_then(|config| config.node_label.clone()),
+            hostname,
+        )?),
+        None => None,
+    };
+
+    Ok(OwnerRuntimeInit {
+        trust_store,
+        trust_policy,
+        owner_attestation,
+    })
+}
+
+fn configure_control_relay(
+    mut builder: iroh::endpoint::Builder,
+    relay_urls: Option<&[String]>,
+    relay_auths: &std::collections::HashMap<String, String>,
+) -> iroh::endpoint::Builder {
+    if let Some(relay_urls) = relay_urls {
+        let urls = effective_relay_urls(relay_urls);
+        tracing::info!("Owner-control relay: {:?}", urls);
+        builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
+            &urls,
+            relay_auths,
+        )));
+    } else {
+        builder = builder.relay_mode(iroh::endpoint::RelayMode::Disabled);
+    }
+    builder
+}
+
+fn default_plugin_event_source(endpoint_id: EndpointId, source_peer_id: &mut String) {
+    if source_peer_id.is_empty() {
+        *source_peer_id = endpoint_id_hex(endpoint_id);
+    }
+}
+
 #[derive(Clone)]
 pub struct Node {
     endpoint: Endpoint,
     public_addr: Option<std::net::SocketAddr>,
+    quic_bind: QuicBindSelection,
     state: Arc<Mutex<MeshState>>,
     role: Arc<Mutex<NodeRole>>,
     models: Arc<Mutex<Vec<String>>>,
@@ -1209,6 +1970,7 @@ pub struct Node {
     routing_metrics: crate::network::metrics::RoutingMetrics,
     routing_telemetry:
         Arc<std::sync::Mutex<Option<Arc<dyn crate::network::metrics::RoutingTelemetrySink>>>>,
+    swarm_capture: Arc<std::sync::Mutex<Option<crate::capture::SwarmCaptureRecorder>>>,
     local_request_metrics: Arc<LocalRequestMetricsSampler>,
     runtime_data_producer: crate::runtime_data::RuntimeDataProducer,
     tunnel_tx: tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
@@ -1232,6 +1994,7 @@ pub struct Node {
     display_name: Arc<Mutex<Option<String>>>,
     owner_attestation: Arc<Mutex<Option<SignedNodeOwnership>>>,
     owner_summary: Arc<Mutex<OwnershipSummary>>,
+    control_listener: Arc<Mutex<Option<ControlListenerLifecycle>>>,
     trust_store: Arc<Mutex<TrustStore>>,
     trust_policy: TrustPolicy,
     pub enumerate_host: bool,
@@ -1264,6 +2027,30 @@ struct LocalRequestMetricsWindow {
     completed_latencies_ms: VecDeque<(u64, u64)>,
 }
 
+struct PeerDownReport {
+    conn_opt: Option<Connection>,
+    peer_addr: Option<EndpointAddr>,
+    recently_seen: bool,
+    reporter_cooled: bool,
+}
+
+fn peer_down_endpoint_id(frame: &crate::proto::node::PeerDown) -> Option<EndpointId> {
+    let peer_id_arr: [u8; 32] = match frame.peer_id.as_slice().try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tracing::warn!("PeerDown: peer_id is not 32 bytes — rejecting");
+            return None;
+        }
+    };
+    match iroh::PublicKey::from_bytes(&peer_id_arr) {
+        Ok(key) => Some(EndpointId::from(key)),
+        Err(_) => {
+            tracing::warn!("PeerDown: peer_id is not a valid public key — rejecting");
+            None
+        }
+    }
+}
+
 impl LocalRequestMetricsSampler {
     fn record_request_accepted(&self) {
         let now_sec = now_secs();
@@ -1272,11 +2059,11 @@ impl LocalRequestMetricsSampler {
             .lock()
             .expect("pretty request metrics mutex poisoned");
         guard.prune(now_sec);
-        if let Some((second, count)) = guard.accepted_by_second.back_mut() {
-            if *second == now_sec {
-                *count += 1;
-                return;
-            }
+        if let Some((second, count)) = guard.accepted_by_second.back_mut()
+            && *second == now_sec
+        {
+            *count += 1;
+            return;
         }
         guard.accepted_by_second.push_back((now_sec, 1));
     }
@@ -1587,14 +2374,13 @@ impl StageTopologyState {
         if !runtime_status.bind_addr.is_empty() && !runtime_status.bind_addr.ends_with(":0") {
             let topology_key =
                 stage_topology_key(&runtime_status.topology_id, &runtime_status.run_id);
-            if let Some(topology) = self.topologies.get_mut(&topology_key) {
-                if let Some(stage) = topology
+            if let Some(topology) = self.topologies.get_mut(&topology_key)
+                && let Some(stage) = topology
                     .stages
                     .iter_mut()
                     .find(|stage| stage.stage_id == runtime_status.stage_id)
-                {
-                    stage.endpoint.bind_addr = runtime_status.bind_addr.clone();
-                }
+            {
+                stage.endpoint.bind_addr = runtime_status.bind_addr.clone();
             }
         }
         self.statuses.insert(
@@ -1669,6 +2455,280 @@ impl crate::inference::skippy::StagePackagePrefetcher for Node {
 }
 
 impl Node {
+    pub(crate) fn set_swarm_capture_recorder(
+        &self,
+        recorder: Option<crate::capture::SwarmCaptureRecorder>,
+    ) {
+        *self
+            .swarm_capture
+            .lock()
+            .expect("swarm capture recorder lock poisoned") = recorder;
+    }
+
+    fn swarm_capture_recorder(&self) -> Option<crate::capture::SwarmCaptureRecorder> {
+        self.swarm_capture
+            .lock()
+            .expect("swarm capture recorder lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn swarm_capture_enabled(&self) -> bool {
+        self.swarm_capture
+            .lock()
+            .expect("swarm capture recorder lock poisoned")
+            .is_some()
+    }
+
+    fn capture_event(&self, event: &str, fields: impl FnOnce() -> serde_json::Value) {
+        if let Some(recorder) = self.swarm_capture_recorder() {
+            recorder.record_event(event, fields());
+        }
+    }
+
+    pub(crate) fn capture_peer_observation(
+        &self,
+        event: &str,
+        peer: &PeerInfo,
+        source: &str,
+        bridge_id: Option<EndpointId>,
+    ) {
+        self.capture_event(event, || peer_capture_fields(peer, source, bridge_id));
+    }
+
+    pub(crate) fn capture_peer_rejected(
+        &self,
+        id: EndpointId,
+        _addr: &EndpointAddr,
+        ann: &PeerAnnouncement,
+        owner_summary: &OwnershipSummary,
+        source: &str,
+        bridge_id: Option<EndpointId>,
+    ) {
+        self.capture_event("peer_rejected", || {
+            json!({
+                "peer": endpoint_id_capture_fields(id),
+                "source": source,
+                "bridge": bridge_id.map(endpoint_id_capture_fields),
+                "role": &ann.role,
+                "version": &ann.version,
+                "hostname": &ann.hostname,
+                "mesh_id": &ann.mesh_id,
+                "models": &ann.models,
+                "serving_models": &ann.serving_models,
+                "hosted_models": &ann.hosted_models,
+                "available_models": &ann.available_models,
+                "requested_models": &ann.requested_models,
+                "gpu_name": &ann.gpu_name,
+                "is_soc": ann.is_soc,
+                "vram_bytes": ann.vram_bytes,
+                "latency_ms": ann.latency_ms,
+                "latency_source": ann.latency_source.map(|value| value.as_str_name()),
+                "owner": owner_summary,
+            })
+        });
+    }
+
+    pub(crate) fn capture_gossip_inbound(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        announcement_count: usize,
+    ) {
+        self.capture_event("gossip_inbound", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "protocol": format!("{protocol:?}"),
+                "announcement_count": announcement_count,
+            })
+        });
+    }
+
+    pub(crate) fn capture_path_observation(
+        &self,
+        remote: EndpointId,
+        path_type: &str,
+        rtt_ms: Option<u32>,
+        observed_direct_remote_addr: Option<SocketAddr>,
+        source: &str,
+    ) {
+        let observed_via_relay = path_type == "relay";
+        self.capture_event("peer_path_observed", || json!({
+            "remote": endpoint_id_capture_fields(remote),
+            "path_type": path_type,
+            "rtt_ms": rtt_ms,
+            "observed_direct_remote_addr": observed_direct_remote_addr.map(|addr| addr.to_string()),
+            "observed_via_relay": observed_via_relay,
+            "direct_addr_available": observed_direct_remote_addr.is_some(),
+            "source": source,
+        }));
+    }
+
+    pub(crate) fn capture_selected_connection_path(
+        &self,
+        remote: EndpointId,
+        conn: &Connection,
+        source: &str,
+    ) -> Option<SelectedPathObservation> {
+        let observation = selected_path_observation(conn)?;
+        self.capture_path_observation(
+            remote,
+            observation.path_type,
+            observation.rtt_ms,
+            observation.observed_direct_remote_addr,
+            source,
+        );
+        Some(observation)
+    }
+
+    pub(crate) fn capture_connection_event(&self, event: ConnectionCaptureEvent<'_>) {
+        self.capture_event(event.event, || {
+            json!({
+                "remote": endpoint_id_capture_fields(event.remote),
+                "direction": event.direction,
+                "phase": event.phase,
+                "protocol": event.protocol.map(|value| format!("{value:?}")),
+                "path_type": event.path_type,
+                "rtt_ms": event.rtt_ms,
+                "admitted_peer": event.admitted_peer,
+                "reason": event.reason,
+            })
+        });
+    }
+
+    pub(crate) fn capture_direct_proof_of_life(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        announcement_count: usize,
+        recovered_from_dead: bool,
+        prior_state: &str,
+    ) {
+        self.capture_event("peer_direct_proof_of_life", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "protocol": format!("{protocol:?}"),
+                "announcement_count": announcement_count,
+                "recovered_from_dead": recovered_from_dead,
+                "prior_state": prior_state,
+            })
+        });
+    }
+
+    pub(crate) fn capture_peer_lifecycle_event(&self, event: PeerLifecycleCaptureEvent<'_>) {
+        self.capture_event(event.event, || {
+            json!({
+                "peer": endpoint_id_capture_fields(event.peer),
+                "reason": event.reason,
+                "reporter": event.reporter.map(endpoint_id_capture_fields),
+                "last_seen_age_ms": event.last_seen_age_ms,
+                "last_mentioned_age_ms": event.last_mentioned_age_ms,
+                "had_connection": event.had_connection,
+                "bridge": event.bridge_id.map(endpoint_id_capture_fields),
+            })
+        });
+    }
+
+    pub(crate) async fn capture_peer_lifecycle_snapshot(
+        &self,
+        event: &str,
+        peer: EndpointId,
+        reason: &str,
+        reporter: Option<EndpointId>,
+    ) {
+        if !self.swarm_capture_enabled() {
+            return;
+        }
+
+        let (last_seen_age_ms, last_mentioned_age_ms, had_connection, bridge_id) = {
+            let state = self.state.lock().await;
+            let peer_info = state.peers.get(&peer);
+            (
+                peer_info.map(|info| elapsed_ms_u64(info.last_seen.elapsed())),
+                peer_info.map(|info| elapsed_ms_u64(info.last_mentioned.elapsed())),
+                Some(state.connections.contains_key(&peer)),
+                peer_info
+                    .and_then(|info| info.propagated_latency.as_ref())
+                    .and_then(|latency| latency.observer_id),
+            )
+        };
+        self.capture_peer_lifecycle_event(PeerLifecycleCaptureEvent {
+            event,
+            peer,
+            reason,
+            reporter,
+            last_seen_age_ms,
+            last_mentioned_age_ms,
+            had_connection,
+            bridge_id,
+        });
+    }
+
+    pub(crate) fn capture_stream_observation(
+        &self,
+        remote: EndpointId,
+        stream_type: u8,
+        protocol: ControlProtocol,
+        admitted: bool,
+    ) {
+        self.capture_event("mesh_stream_observed", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "stream_type": stream_type,
+                "protocol": format!("{protocol:?}"),
+                "admitted": admitted,
+            })
+        });
+    }
+
+    pub(crate) fn capture_stream_rejected(
+        &self,
+        remote: EndpointId,
+        stream_type: u8,
+        protocol: ControlProtocol,
+        reason: &str,
+    ) {
+        self.capture_event("mesh_stream_rejected", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "stream_type": stream_type,
+                "protocol": format!("{protocol:?}"),
+                "reason": reason,
+            })
+        });
+    }
+
+    pub(crate) fn capture_route_request(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        outcome: &str,
+    ) {
+        self.capture_event("route_request", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "protocol": format!("{protocol:?}"),
+                "outcome": outcome,
+            })
+        });
+    }
+
+    pub(crate) fn capture_http_request(&self, event: HttpCaptureEvent<'_>) {
+        self.capture_event(event.event, || {
+            json!({
+                "source_addr": event.source_addr.map(|addr| addr.to_string()),
+                "method": event.method,
+                "path": crate::capture::http_path_without_query(event.path),
+                "query_present": event.path.contains('?'),
+                "body_len_bytes": event.body_len_bytes,
+                "model": event.model_name,
+                "completion_tokens": event.completion_tokens,
+                "stream": event.stream,
+            })
+        });
+    }
+}
+
+impl Node {
     pub(crate) fn set_routing_telemetry_sink(
         &self,
         sink: Option<Arc<dyn crate::network::metrics::RoutingTelemetrySink>>,
@@ -1723,6 +2783,12 @@ impl Node {
     pub fn inflight_requests(&self) -> u64 {
         self.inflight_requests
             .load(std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// Locally observed routing metrics, used by the auto-router to score
+    /// models by their measured throughput from this node's perspective.
+    pub fn routing_metrics(&self) -> &crate::network::metrics::RoutingMetrics {
+        &self.routing_metrics
     }
 
     pub fn inflight_change_rx(&self) -> watch::Receiver<u64> {
@@ -1969,15 +3035,16 @@ impl Node {
         request: &crate::inference::skippy::StageControlRequest,
     ) -> std::time::Duration {
         match request {
-            crate::inference::skippy::StageControlRequest::Load(load) => {
-                crate::inference::skippy::stage_load_timeout(load)
-            }
-            crate::inference::skippy::StageControlRequest::Stop(_)
+            crate::inference::skippy::StageControlRequest::Claim(_)
+            | crate::inference::skippy::StageControlRequest::Stop(_)
             | crate::inference::skippy::StageControlRequest::Status(_)
             | crate::inference::skippy::StageControlRequest::Inventory(_)
             | crate::inference::skippy::StageControlRequest::CancelPrepare(_)
             | crate::inference::skippy::StageControlRequest::StatusUpdate(_) => {
                 std::time::Duration::from_secs(30)
+            }
+            crate::inference::skippy::StageControlRequest::Load(load) => {
+                crate::inference::skippy::stage_load_timeout(load)
             }
             crate::inference::skippy::StageControlRequest::Prepare(prepare) => {
                 crate::inference::skippy::stage_load_timeout(&prepare.load)
@@ -1995,7 +3062,7 @@ impl Node {
         use prost::Message as _;
 
         let open = skippy_protocol::proto::stage::StageTransportOpen {
-            gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+            r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
             requester_id: self.endpoint.id().as_bytes().to_vec(),
             topology_id: topology_id.into(),
             run_id: run_id.into(),
@@ -2166,100 +3233,52 @@ impl Node {
         self.owner_summary.lock().await.clone()
     }
 
+    pub async fn control_endpoint(&self) -> Option<String> {
+        let guard = self.control_listener.lock().await;
+        guard.as_ref().map(|listener| listener.token.clone())
+    }
+
+    pub async fn shutdown_control_listener(&self) {
+        let lifecycle = self.control_listener.lock().await.take();
+        if let Some(lifecycle) = lifecycle {
+            lifecycle
+                .shutdown_requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            lifecycle.shutdown.notify_waiters();
+            let _ = lifecycle.task.await;
+            drop(lifecycle.endpoint);
+        }
+    }
+
     pub async fn start(
         role: NodeRole,
-        relay_urls: &[String],
-        bind_port: Option<u16>,
+        relay: RelayConfig<'_>,
+        quic_bind: QuicBindSelection,
         max_vram_gb: Option<f64>,
         enumerate_host: bool,
         owner_config: Option<OwnerRuntimeConfig>,
         config_path: Option<&std::path::Path>,
     ) -> Result<(Self, TunnelChannels)> {
-        // Clients use an ephemeral key so they get a unique identity even
-        // when running on the same machine as a GPU node.
-        let secret_key = if matches!(role, NodeRole::Client)
-            || std::env::var("MESH_LLM_EPHEMERAL_KEY").is_ok()
-        {
-            let key = SecretKey::generate();
-            tracing::info!("Using ephemeral key (unique identity)");
-            key
-        } else {
-            load_or_create_key().await?
-        };
-        // Configure QUIC transport for heavy RPC traffic:
-        // Use iroh's default transport config — it sets keep_alive, path timeouts,
-        // and multipath correctly. Only override the bidi stream limit.
-        use iroh::endpoint::QuicTransportConfig;
-        let transport_config = QuicTransportConfig::builder()
-            .max_concurrent_bidi_streams(1024u32.into())
-            .build();
-        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(secret_key)
-            .alpns(vec![
-                ALPN_V1.to_vec(),
-                skippy_protocol::STAGE_ALPN_V1.to_vec(),
-            ])
-            .transport_config(transport_config);
-
-        {
-            use iroh::{RelayConfig, RelayMap};
-            let urls: Vec<String> = if relay_urls.is_empty() {
-                vec![
-                    "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
-                    "https://aps1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
-                ]
-            } else {
-                relay_urls.to_vec()
-            };
-            // Two iroh relays: US West (primary) and Asia-Pacific South (fallback).
-            let configs: Vec<RelayConfig> = urls
-                .iter()
-                .map(|url| RelayConfig::new(url.parse().expect("invalid relay URL"), None))
-                .collect();
-            let relay_map = RelayMap::from_iter(configs);
-            tracing::info!("Relay: {:?}", urls);
-            builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map));
-        }
-        if let Some(addr) = quic_bind_addr(bind_port) {
-            tracing::info!("Binding QUIC to {addr}");
-            builder = builder.bind_addr(addr)?;
-        }
-        let endpoint = builder.bind().await?;
+        let relay_urls = relay.urls;
+        let relay_auths = relay.auths;
+        let secret_key = startup_secret_key(&role).await?;
+        let endpoint =
+            bind_mesh_endpoint(secret_key.clone(), relay_urls, relay_auths, quic_bind).await?;
         // Wait briefly for relay connection so the invite token includes the relay URL.
         // On sinkholed networks this times out and we proceed without relay (direct UDP only).
-        //
-        // We avoid `endpoint.online()` because iroh 0.98's implementation has a
-        // double-free in the `Flatten<IntoIter<Option<(RelayUrl, HomeRelayStatus)>>>`
-        // drop path, causing SIGABRT on some hardware (deterministically on Apple
-        // M3 Ultra / macOS 26.3).  Fixed on iroh main by PR #4149 which changed the
-        // type, but not yet released.  Instead we poll `watch_addr()` and wait until
-        // it advertises at least one relay address.
-        {
-            let mut watcher = endpoint.watch_addr();
-            let wait_relay = async {
-                loop {
-                    let addr = iroh::Watcher::get(&mut watcher);
-                    if addr.relay_urls().next().is_some() {
-                        return;
-                    }
-                    if iroh::Watcher::updated(&mut watcher).await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                }
-            };
-            match tokio::time::timeout(std::time::Duration::from_secs(5), wait_relay).await {
-                Ok(()) => tracing::info!("Relay connected"),
-                Err(_) => {
-                    tracing::warn!("Relay connection timed out (5s) — proceeding without relay")
-                }
-            }
-        }
+        wait_for_endpoint_online(
+            &endpoint,
+            "Relay connected",
+            "Relay connection timed out (5s) — proceeding without relay",
+        )
+        .await;
 
         // Discover public IP via STUN so the invite token includes it.
         // With --bind-port, the advertised port is the bound port (for port forwarding).
-        // Without --bind-port, we use port 0 — the IP is still useful for hole-punching.
+        // Without --bind-port, port 0 is intentional: it asks the OS for a conflict-free
+        // ephemeral port. The IP is still useful for hole-punching.
         // Relay STUN may not work on sinkholed networks, so we use raw STUN to Google/Cloudflare.
-        let stun_port = bind_port.unwrap_or(0);
+        let stun_port = quic_bind.port.unwrap_or(EPHEMERAL_QUIC_PORT);
         let public_addr = stun_public_addr(stun_port).await;
 
         let (peer_change_tx, peer_change_rx) = watch::channel(0usize);
@@ -2268,83 +3287,17 @@ impl Node {
         let (tunnel_http_tx, tunnel_http_rx) = tokio::sync::mpsc::channel(256);
         let (stage_transport_tx, stage_transport_rx) = tokio::sync::mpsc::channel(256);
 
-        let hw = crate::system::hardware::survey();
-        let mut vram = hw.vram_bytes;
-        let gpu_name = if matches!(role, NodeRole::Client) {
-            None
-        } else {
-            hw.gpu_name
-        };
-        let hostname = hw.hostname;
-        let is_soc = Some(hw.is_soc);
-        let gpu_vram = if hw.gpu_vram.is_empty() {
-            None
-        } else {
-            Some(
-                hw.gpu_vram
-                    .iter()
-                    .map(|b| b.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )
-        };
-        let gpu_reserved_bytes = if hw.gpu_reserved.iter().all(Option::is_none) {
-            None
-        } else {
-            Some(
-                hw.gpu_reserved
-                    .iter()
-                    .map(|value| value.map(|v| v.to_string()).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            )
-        };
-        if let Some(max_gb) = max_vram_gb {
-            let max_bytes = (max_gb * 1e9) as u64;
-            if max_bytes < vram {
-                tracing::info!(
-                    "Detected VRAM: {:.1} GB, capped to {:.1} GB (--max-vram)",
-                    vram as f64 / 1e9,
-                    max_gb
-                );
-                vram = max_bytes;
-            } else {
-                tracing::info!(
-                    "Detected VRAM: {:.1} GB (--max-vram {:.1} has no effect)",
-                    vram as f64 / 1e9,
-                    max_gb
-                );
-            }
-        } else {
-            tracing::info!("Detected VRAM: {:.1} GB", vram as f64 / 1e9);
-        }
-
-        let trust_store = owner_config
-            .as_ref()
-            .map(|config| config.trust_store.clone())
-            .unwrap_or_default();
-        let trust_policy = owner_config
-            .as_ref()
-            .map(|config| config.trust_policy)
-            .unwrap_or_default();
-        let owner_attestation = match owner_config
-            .as_ref()
-            .and_then(|config| config.keypair.as_ref())
-        {
-            Some(keypair) => Some(load_or_refresh_owner_attestation(
-                keypair,
-                endpoint.id(),
-                owner_config
-                    .as_ref()
-                    .and_then(|config| config.node_label.clone()),
-                hostname.clone(),
-            )?),
-            None => None,
-        };
+        let hardware =
+            hardware_snapshot_for_start(crate::system::hardware::survey(), &role, max_vram_gb);
+        let owner_runtime = init_owner_runtime(
+            owner_config.as_ref(),
+            endpoint.id(),
+            hardware.hostname.clone(),
+        )?;
         let owner_summary = verify_node_ownership(
-            owner_attestation.as_ref(),
+            owner_runtime.owner_attestation.as_ref(),
             endpoint.id().as_bytes(),
-            &trust_store,
+            &owner_runtime.trust_store,
             TrustPolicy::Off,
             current_time_unix_ms(),
         );
@@ -2365,6 +3318,7 @@ impl Node {
         let node = Node {
             endpoint,
             public_addr,
+            quic_bind,
             state: Arc::new(Mutex::new(MeshState {
                 peers: HashMap::new(),
                 connections: HashMap::new(),
@@ -2393,13 +3347,14 @@ impl Node {
                 tokio::sync::Notify::new(),
                 std::sync::atomic::AtomicBool::new(false),
             )),
-            vram_bytes: vram,
+            vram_bytes: hardware.vram_bytes,
             peer_change_tx,
             peer_change_rx,
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
             routing_metrics: crate::network::metrics::RoutingMetrics::default(),
             routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
+            swarm_capture: Arc::new(std::sync::Mutex::new(None)),
             local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
             runtime_data_producer,
             tunnel_tx,
@@ -2410,16 +3365,17 @@ impl Node {
             stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
             plugin_manager: Arc::new(Mutex::new(None)),
             display_name: Arc::new(Mutex::new(None)),
-            owner_attestation: Arc::new(Mutex::new(owner_attestation)),
+            owner_attestation: Arc::new(Mutex::new(owner_runtime.owner_attestation)),
             owner_summary: Arc::new(Mutex::new(owner_summary)),
-            trust_store: Arc::new(Mutex::new(trust_store)),
-            trust_policy,
+            control_listener: Arc::new(Mutex::new(None)),
+            trust_store: Arc::new(Mutex::new(owner_runtime.trust_store)),
+            trust_policy: owner_runtime.trust_policy,
             enumerate_host,
-            gpu_name,
-            hostname,
-            is_soc,
-            gpu_vram,
-            gpu_reserved_bytes,
+            gpu_name: hardware.gpu_name,
+            hostname: hardware.hostname,
+            is_soc: hardware.is_soc,
+            gpu_vram: hardware.gpu_vram,
+            gpu_reserved_bytes: hardware.gpu_reserved_bytes,
             gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
             gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
             gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2429,6 +3385,17 @@ impl Node {
                 Arc::new(tx)
             },
         };
+
+        node.maybe_start_control_listener(
+            secret_key,
+            owner_config.as_ref().and_then(|config| config.control_bind),
+            owner_config
+                .as_ref()
+                .and_then(|config| config.control_advertise_addr),
+            Some(relay_urls),
+            relay_auths,
+        )
+        .await?;
 
         // Accept loop starts but waits for start_accepting() before processing connections.
         // This lets a node exist before it is ready to accept mesh traffic.
@@ -2449,25 +3416,40 @@ impl Node {
 
     #[cfg(test)]
     pub async fn new_for_tests(role: NodeRole) -> Result<Self> {
-        use iroh::endpoint::QuicTransportConfig;
+        let (node, _) = Self::new_for_tests_with_secret(role).await?;
+        Ok(node)
+    }
 
-        let transport_config = QuicTransportConfig::builder()
-            .max_concurrent_bidi_streams(1024u32.into())
-            .build();
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(SecretKey::generate())
-            .alpns(vec![ALPN.to_vec(), skippy_protocol::STAGE_ALPN_V1.to_vec()])
-            .relay_mode(iroh::endpoint::RelayMode::Disabled)
-            .transport_config(transport_config)
-            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
-            .bind()
-            .await?;
+    #[cfg(test)]
+    pub(crate) async fn new_for_tests_with_secret(role: NodeRole) -> Result<(Self, SecretKey)> {
+        let (node, secret_key) = {
+            let secret_key = SecretKey::generate();
+            let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(1024u32.into())
+                .build();
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(secret_key.clone())
+                .alpns(vec![ALPN.to_vec(), skippy_protocol::STAGE_ALPN_V1.to_vec()])
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .transport_config(transport_config)
+                .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+                .bind()
+                .await?;
+            (
+                Self::new_test_node_from_endpoint(role, endpoint),
+                secret_key,
+            )
+        };
+        Ok((node, secret_key))
+    }
 
+    #[cfg(test)]
+    fn new_test_node_from_endpoint(role: NodeRole, endpoint: Endpoint) -> Self {
         let (peer_change_tx, peer_change_rx) = watch::channel(0usize);
         let (inflight_change_tx, _inflight_change_rx) = watch::channel(0u64);
-        let (tunnel_tx, tunnel_rx) = tokio::sync::mpsc::channel(256);
-        let (tunnel_http_tx, tunnel_http_rx) = tokio::sync::mpsc::channel(256);
-        let (stage_transport_tx, stage_transport_rx) = tokio::sync::mpsc::channel(256);
+        let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(256);
+        let (tunnel_http_tx, _tunnel_http_rx) = tokio::sync::mpsc::channel(256);
+        let (stage_transport_tx, _stage_transport_rx) = tokio::sync::mpsc::channel(256);
         let runtime_data_collector = crate::runtime_data::RuntimeDataCollector::new();
         let runtime_data_producer =
             runtime_data_collector.producer(crate::runtime_data::RuntimeDataSource {
@@ -2476,15 +3458,10 @@ impl Node {
                 plugin_endpoint_key: None,
             });
 
-        let _channels = TunnelChannels {
-            rpc: tunnel_rx,
-            http: tunnel_http_rx,
-            stage: stage_transport_rx,
-        };
-
-        Ok(Node {
+        Node {
             endpoint,
             public_addr: None,
+            quic_bind: QuicBindSelection::default(),
             state: Arc::new(Mutex::new(MeshState {
                 peers: HashMap::new(),
                 connections: HashMap::new(),
@@ -2520,6 +3497,7 @@ impl Node {
             inflight_change_tx,
             routing_metrics: crate::network::metrics::RoutingMetrics::default(),
             routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
+            swarm_capture: Arc::new(std::sync::Mutex::new(None)),
             local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
             runtime_data_producer,
             tunnel_tx,
@@ -2532,12 +3510,13 @@ impl Node {
             display_name: Arc::new(Mutex::new(None)),
             owner_attestation: Arc::new(Mutex::new(None)),
             owner_summary: Arc::new(Mutex::new(OwnershipSummary::default())),
+            control_listener: Arc::new(Mutex::new(None)),
             trust_store: Arc::new(Mutex::new(TrustStore::default())),
             trust_policy: TrustPolicy::Off,
-            enumerate_host: true,
+            enumerate_host: false,
             gpu_name: None,
             hostname: None,
-            is_soc: Some(false),
+            is_soc: None,
             gpu_vram: None,
             gpu_reserved_bytes: None,
             gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2547,10 +3526,108 @@ impl Node {
                 crate::runtime::config_state::ConfigState::default(),
             )),
             config_revision_tx: {
-                let (tx, _rx) = tokio::sync::watch::channel(0u64);
+                let (tx, _rx) = tokio::sync::watch::channel(0);
                 Arc::new(tx)
             },
-        })
+        }
+    }
+
+    async fn maybe_start_control_listener(
+        &self,
+        secret_key: SecretKey,
+        bind_addr: Option<std::net::SocketAddr>,
+        advertise_addr: Option<std::net::SocketAddr>,
+        relay_urls: Option<&[String]>,
+        relay_auths: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        if self.local_verified_owner_id().await.is_none() {
+            return Ok(());
+        }
+
+        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(vec![ALPN_CONTROL_V1.to_vec()])
+            .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?;
+        builder = configure_control_relay(builder, relay_urls, relay_auths);
+        let endpoint = builder.bind().await?;
+        if relay_urls.is_some() {
+            wait_for_endpoint_online(
+                &endpoint,
+                "Owner-control relay connected",
+                "Owner-control relay connection timed out (5s) — proceeding with direct endpoint addresses only",
+            )
+            .await;
+        }
+        let token = encode_endpoint_addr_token(&control_endpoint_addr(&endpoint, advertise_addr));
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task_endpoint = endpoint.clone();
+        let task_shutdown_requested = shutdown_requested.clone();
+        let task_shutdown = shutdown.clone();
+        let node = self.clone();
+        let task = tokio::spawn(Box::pin(async move {
+            node.control_accept_loop(task_endpoint, task_shutdown_requested, task_shutdown)
+                .await;
+        }));
+        *self.control_listener.lock().await = Some(ControlListenerLifecycle {
+            endpoint,
+            token,
+            shutdown_requested,
+            shutdown,
+            task,
+        });
+        Ok(())
+    }
+
+    fn plugin_manager_local_kind(&self) -> crate::plugin::proto::mesh_event::Kind {
+        if self.accepting.1.load(std::sync::atomic::Ordering::Acquire) {
+            crate::plugin::proto::mesh_event::Kind::LocalAccepting
+        } else {
+            crate::plugin::proto::mesh_event::Kind::LocalStandby
+        }
+    }
+
+    async fn broadcast_existing_mesh_snapshot(
+        &self,
+        plugin_manager: &crate::plugin::PluginManager,
+        peers: Vec<PeerInfo>,
+    ) {
+        let _ = plugin_manager
+            .broadcast_mesh_event(
+                self.build_mesh_event(self.plugin_manager_local_kind(), None, String::new())
+                    .await,
+            )
+            .await;
+        if self.mesh_id.lock().await.is_some() {
+            let _ = plugin_manager
+                .broadcast_mesh_event(
+                    self.build_mesh_event(
+                        crate::plugin::proto::mesh_event::Kind::MeshIdUpdated,
+                        None,
+                        String::new(),
+                    )
+                    .await,
+                )
+                .await;
+        }
+        for peer in peers {
+            if let Err(err) = plugin_manager
+                .broadcast_mesh_event(
+                    self.build_mesh_event(
+                        crate::plugin::proto::mesh_event::Kind::PeerUp,
+                        Some(peer_info_to_mesh_peer(&peer)),
+                        String::new(),
+                    )
+                    .await,
+                )
+                .await
+            {
+                tracing::debug!(
+                    "Failed to send existing peer snapshot to plugins for {}: {err}",
+                    peer.id.fmt_short()
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2559,23 +3636,24 @@ impl Node {
     }
 
     pub fn invite_token(&self) -> String {
-        let mut addr = self.endpoint.addr();
+        let mut addr = self.endpoint_addr_for_advertisement();
         // Inject STUN-discovered public address if relay STUN didn't provide one.
-        if let Some(pub_addr) = self.public_addr {
-            use iroh::TransportAddr;
-            let has_public = addr.addrs.iter().any(|a| match a {
-                TransportAddr::Ip(sock) => match sock.ip() {
-                    std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback(),
-                    _ => false,
-                },
-                _ => false,
-            });
-            if !has_public {
-                addr.addrs.insert(TransportAddr::Ip(pub_addr));
-            }
+        if let Some(pub_addr) = self.public_addr
+            && !endpoint_addr_has_public_ipv4(&addr)
+        {
+            addr.addrs.insert(TransportAddr::Ip(pub_addr));
         }
+        addr = filter_endpoint_addr_for_bind_ip(addr, self.quic_bind.ip);
         let json = serde_json::to_vec(&addr).expect("serializable");
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json)
+    }
+
+    fn endpoint_addr_for_advertisement(&self) -> EndpointAddr {
+        let mut addr = self.endpoint.addr();
+        if self.quic_bind.ip.is_some() {
+            addr = filter_endpoint_addr_for_bind_ip(addr, self.quic_bind.ip);
+        }
+        addr
     }
 
     /// Decode an invite token into an [`EndpointAddr`] without connecting.
@@ -2666,16 +3744,29 @@ impl Node {
         let addr: EndpointAddr =
             serde_json::from_slice(&json).context("invalid invite token JSON")?;
 
+        // Three attempts with increasing backoff.  Relay-only joins need
+        // WebSocket setup + QUIC handshake at high RTT — two attempts at
+        // 15s were not enough.  Three at 30s with 5s/10s gaps give ~105s
+        // total budget which covers all but the worst relay conditions.
+        let backoffs = [5, 10];
         self.state.lock().await.dead_peers.remove(&addr.id);
-        match self.connect_to_peer(addr.clone()).await {
-            Ok(()) => Ok(()),
-            Err(first_err) => {
-                tracing::info!("First join attempt failed ({first_err:#}), retrying in 5s...");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                self.state.lock().await.dead_peers.remove(&addr.id);
-                self.connect_to_peer(addr).await
+        let mut last_err = match self.connect_to_peer(addr.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        for (attempt, delay_secs) in backoffs.iter().enumerate() {
+            tracing::info!(
+                "Join attempt {} failed ({last_err:#}), retrying in {delay_secs}s...",
+                attempt + 1
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(*delay_secs)).await;
+            self.state.lock().await.dead_peers.remove(&addr.id);
+            match self.connect_to_peer(addr.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = e,
             }
         }
+        Err(last_err)
     }
 
     /// Connect to a peer without gossip exchange — for passive nodes (clients/standby).
@@ -2800,6 +3891,20 @@ impl Node {
             .and_then(|peer| peer.advertised_context_length(model_name))
     }
 
+    pub(crate) async fn peer_model_throughput_hint(
+        &self,
+        peer_id: EndpointId,
+        model_name: &str,
+    ) -> Option<crate::network::metrics::ModelThroughputHint> {
+        let state = self.state.lock().await;
+        state.peers.get(&peer_id).and_then(|peer| {
+            peer.advertised_model_throughput
+                .iter()
+                .find(|hint| hint.model_name == model_name)
+                .cloned()
+        })
+    }
+
     pub async fn served_model_descriptors(&self) -> Vec<ServedModelDescriptor> {
         self.served_model_descriptors.lock().await.clone()
     }
@@ -2818,7 +3923,14 @@ impl Node {
 
     async fn refresh_served_model_descriptors(&self) {
         let serving_models = self.serving_models.lock().await.clone();
-        let descriptors = if let Some(primary_model_name) = serving_models.first() {
+        let existing_by_name: HashMap<_, _> = self
+            .served_model_descriptors
+            .lock()
+            .await
+            .iter()
+            .map(|descriptor| (descriptor.identity.model_name.clone(), descriptor.clone()))
+            .collect();
+        let mut descriptors = if let Some(primary_model_name) = serving_models.first() {
             let model_source = self.model_source.lock().await.clone();
             let primary_model_path = crate::models::find_model_path(primary_model_name);
             infer_served_model_descriptors(
@@ -2830,6 +3942,15 @@ impl Node {
         } else {
             Vec::new()
         };
+        for descriptor in &mut descriptors {
+            if let Some(existing) = existing_by_name.get(&descriptor.identity.model_name) {
+                descriptor.capabilities = existing.capabilities;
+                descriptor.capabilities_known = existing.capabilities_known;
+                if existing.topology.is_some() {
+                    descriptor.topology = existing.topology.clone();
+                }
+            }
+        }
         self.set_served_model_descriptors(descriptors).await;
     }
 
@@ -2844,44 +3965,8 @@ impl Node {
             state.peers.values().cloned().collect::<Vec<_>>()
         };
         *self.plugin_manager.lock().await = Some(plugin_manager.clone());
-        let local_kind = if self.accepting.1.load(std::sync::atomic::Ordering::Acquire) {
-            crate::plugin::proto::mesh_event::Kind::LocalAccepting
-        } else {
-            crate::plugin::proto::mesh_event::Kind::LocalStandby
-        };
-        let _ = plugin_manager
-            .broadcast_mesh_event(self.build_mesh_event(local_kind, None, String::new()).await)
+        self.broadcast_existing_mesh_snapshot(&plugin_manager, peers)
             .await;
-        if self.mesh_id.lock().await.is_some() {
-            let _ = plugin_manager
-                .broadcast_mesh_event(
-                    self.build_mesh_event(
-                        crate::plugin::proto::mesh_event::Kind::MeshIdUpdated,
-                        None,
-                        String::new(),
-                    )
-                    .await,
-                )
-                .await;
-        }
-        for peer in peers {
-            if let Err(err) = plugin_manager
-                .broadcast_mesh_event(
-                    self.build_mesh_event(
-                        crate::plugin::proto::mesh_event::Kind::PeerUp,
-                        Some(peer_info_to_mesh_peer(&peer)),
-                        String::new(),
-                    )
-                    .await,
-                )
-                .await
-            {
-                tracing::debug!(
-                    "Failed to send existing peer snapshot to plugins for {}: {err}",
-                    peer.id.fmt_short()
-                );
-            }
-        }
     }
 
     pub async fn plugin_manager(&self) -> Option<crate::plugin::PluginManager> {
@@ -2909,21 +3994,20 @@ impl Node {
         detail_json: String,
     ) {
         let plugin_manager = self.plugin_manager.lock().await.clone();
-        if let Some(plugin_manager) = plugin_manager {
-            if let Err(err) = plugin_manager
+        if let Some(plugin_manager) = plugin_manager
+            && let Err(err) = plugin_manager
                 .broadcast_mesh_event(
                     self.build_mesh_event(kind, peer.map(peer_info_to_mesh_peer), detail_json)
                         .await,
                 )
                 .await
-            {
-                tracing::debug!(
-                    "Failed to deliver plugin mesh event {:?} for {}: {err}",
-                    kind,
-                    peer.map(|p| p.id.fmt_short().to_string())
-                        .unwrap_or_else(|| self.endpoint.id().fmt_short().to_string())
-                );
-            }
+        {
+            tracing::debug!(
+                "Failed to deliver plugin mesh event {:?} for {}: {err}",
+                kind,
+                peer.map(|p| p.id.fmt_short().to_string())
+                    .unwrap_or_else(|| self.endpoint.id().fmt_short().to_string())
+            );
         }
     }
 
@@ -3188,23 +4272,13 @@ impl Node {
                 plugin_id,
                 mut message,
             } => {
-                let plugin_manager = self.plugin_manager.lock().await.clone();
-                if let Some(plugin_manager) = plugin_manager {
-                    if !plugin_manager
-                        .plugin_declares_mesh_channel(&plugin_id, &message.channel)
-                        .await
-                    {
-                        tracing::debug!(
-                            plugin = %plugin_id,
-                            channel = %message.channel,
-                            "Dropping outbound channel message for undeclared mesh channel"
-                        );
-                        return Ok(());
-                    }
+                if !self
+                    .plugin_event_channel_declared(&plugin_id, &message.channel, "message")
+                    .await
+                {
+                    return Ok(());
                 }
-                if message.source_peer_id.is_empty() {
-                    message.source_peer_id = endpoint_id_hex(self.endpoint.id());
-                }
+                default_plugin_event_source(self.endpoint.id(), &mut message.source_peer_id);
                 let frame = crate::plugin::proto::MeshChannelFrame {
                     plugin_id,
                     message_id: new_plugin_message_id(&message.source_peer_id),
@@ -3219,23 +4293,13 @@ impl Node {
                 plugin_id,
                 mut message,
             } => {
-                let plugin_manager = self.plugin_manager.lock().await.clone();
-                if let Some(plugin_manager) = plugin_manager {
-                    if !plugin_manager
-                        .plugin_declares_mesh_channel(&plugin_id, &message.channel)
-                        .await
-                    {
-                        tracing::debug!(
-                            plugin = %plugin_id,
-                            channel = %message.channel,
-                            "Dropping outbound bulk transfer for undeclared mesh channel"
-                        );
-                        return Ok(());
-                    }
+                if !self
+                    .plugin_event_channel_declared(&plugin_id, &message.channel, "bulk transfer")
+                    .await
+                {
+                    return Ok(());
                 }
-                if message.source_peer_id.is_empty() {
-                    message.source_peer_id = endpoint_id_hex(self.endpoint.id());
-                }
+                default_plugin_event_source(self.endpoint.id(), &mut message.source_peer_id);
                 let frame = crate::plugin::proto::MeshBulkFrame {
                     plugin_id,
                     message_id: new_plugin_message_id(&message.source_peer_id),
@@ -3247,6 +4311,28 @@ impl Node {
                 self.broadcast_plugin_bulk_frame(&frame, None).await
             }
         }
+    }
+
+    async fn plugin_event_channel_declared(
+        &self,
+        plugin_id: &str,
+        channel: &str,
+        noun: &str,
+    ) -> bool {
+        let plugin_manager = self.plugin_manager.lock().await.clone();
+        if let Some(plugin_manager) = plugin_manager
+            && !plugin_manager
+                .plugin_declares_mesh_channel(plugin_id, channel)
+                .await
+        {
+            tracing::debug!(
+                plugin = %plugin_id,
+                channel = %channel,
+                "Dropping outbound {noun} for undeclared mesh channel"
+            );
+            return false;
+        }
+        true
     }
 
     async fn remember_plugin_message(&self, message_id: String) -> bool {
@@ -3769,7 +4855,7 @@ impl Node {
         let (mut send, recv) = conn.open_bi().await?;
         send.write_all(&[STREAM_SUBPROTOCOL]).await?;
         let open = crate::proto::node::MeshSubprotocolOpen {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             name: name.to_string(),
             major,
         };
@@ -3871,125 +4957,583 @@ impl Node {
         }
     }
 
+    async fn control_accept_loop(
+        &self,
+        endpoint: Endpoint,
+        shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+        shutdown: Arc<tokio::sync::Notify>,
+    ) {
+        loop {
+            if shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        break;
+                    };
+                    let node = self.clone();
+                    tokio::spawn(Box::pin(async move {
+                        if let Err(error) = node.handle_control_incoming(incoming).await {
+                            tracing::debug!("Control-plane incoming connection error: {error}");
+                        }
+                    }));
+                }
+            }
+        }
+    }
+
+    async fn remember_incoming_connection(
+        &self,
+        remote: EndpointId,
+        conn: &Connection,
+    ) -> (bool, bool) {
+        let mut state = self.state.lock().await;
+        let was_dead = state.dead_peers.remove(&remote).is_some();
+        let admitted = state.peers.contains_key(&remote);
+        if was_dead {
+            emit_mesh_info(format!(
+                "🔄 Previously dead peer {} reconnected",
+                remote.fmt_short()
+            ));
+        }
+        state.connections.insert(remote, conn.clone());
+        (was_dead, admitted)
+    }
+
+    fn spawn_reconnect_gossip(&self, conn: Connection, remote: EndpointId) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = node.initiate_gossip_inner(conn, remote, false).await {
+                tracing::debug!("Reconnect gossip with {} failed: {e}", remote.fmt_short());
+            }
+        });
+    }
+
     async fn handle_incoming(&self, incoming: iroh::endpoint::Incoming) -> Result<()> {
         let mut accepting = incoming.accept()?;
         let alpn = accepting.alpn().await?;
         let conn = accepting.await?;
         let remote = conn.remote_id();
-        if alpn.as_slice() == skippy_protocol::STAGE_ALPN_V1 {
-            tracing::info!(
-                "Inbound skippy stage connection from {}",
-                remote.fmt_short()
-            );
-            self.dispatch_stage_streams(conn, remote).await;
+        if self.handle_stage_alpn(&alpn, conn.clone(), remote).await {
             return Ok(());
         }
         tracing::info!("Inbound connection from {}", remote.fmt_short());
 
         // Store connection for stream dispatch (tunneling, route requests, etc.)
         // Don't add to peer list yet — only gossip exchange promotes to peer.
-        let was_dead = {
-            let mut state = self.state.lock().await;
-            let was_dead = state.dead_peers.remove(&remote).is_some();
-            if was_dead {
-                emit_mesh_info(format!(
-                    "🔄 Previously dead peer {} reconnected",
-                    remote.fmt_short()
-                ));
-            }
-            state.connections.insert(remote, conn.clone());
-            was_dead
-        };
+        let (was_dead, admitted) = self.remember_incoming_connection(remote, &conn).await;
+        self.capture_connection_event(ConnectionCaptureEvent {
+            event: "peer_connection_accepted",
+            remote,
+            direction: "inbound",
+            phase: "accept",
+            protocol: Some(connection_protocol(&conn)),
+            path_type: None,
+            rtt_ms: None,
+            admitted_peer: Some(admitted),
+            reason: was_dead.then_some("previously_dead"),
+        });
+        self.capture_selected_connection_path(remote, &conn, "inbound_connection_accept_path");
 
         // If this peer was previously dead, immediately gossip to restore their
         // assigned/routable state in our peer list. Without this, models served by the
         // reconnecting peer stay invisible until the next heartbeat (up to 60s).
         if was_dead {
-            let node = self.clone();
-            let gossip_conn = conn.clone();
-            tokio::spawn(async move {
-                if let Err(e) = node.initiate_gossip_inner(gossip_conn, remote, false).await {
-                    tracing::debug!("Reconnect gossip with {} failed: {e}", remote.fmt_short());
-                }
-            });
+            self.spawn_reconnect_gossip(conn.clone(), remote);
         }
 
         self.dispatch_streams(conn, remote).await;
         Ok(())
     }
 
-    async fn dispatch_stage_streams(&self, conn: Connection, remote: EndpointId) {
+    async fn handle_stage_alpn(&self, alpn: &[u8], conn: Connection, remote: EndpointId) -> bool {
+        if alpn != skippy_protocol::STAGE_ALPN_V1 {
+            return false;
+        }
+        tracing::info!(
+            "Inbound skippy stage connection from {}",
+            remote.fmt_short()
+        );
+        self.dispatch_stage_streams(conn, remote).await;
+        true
+    }
+
+    async fn handle_control_incoming(&self, incoming: iroh::endpoint::Incoming) -> Result<()> {
+        let mut accepting = incoming.accept()?;
+        let alpn = accepting.alpn().await?;
+        anyhow::ensure!(
+            alpn.as_slice() == ALPN_CONTROL_V1,
+            "unexpected control-plane ALPN {:?}",
+            String::from_utf8_lossy(&alpn)
+        );
+        let conn = accepting.await?;
+        let remote = conn.remote_id();
         loop {
-            let (send, mut recv) = match conn.accept_bi().await {
+            let (mut send, mut recv) = match conn.accept_bi().await {
                 Ok(streams) => streams,
-                Err(e) => {
-                    tracing::info!(
-                        "Skippy stage connection to {} closed: {e}",
+                Err(error) => {
+                    tracing::debug!(
+                        "Control-plane connection from {} closed: {error}",
                         remote.fmt_short()
                     );
                     break;
                 }
             };
-
-            let admitted = {
-                let state = self.state.lock().await;
-                state.peers.contains_key(&remote)
-            };
-            if !admitted {
-                tracing::warn!(
-                    "Quarantine: skippy stage stream from unadmitted peer {} rejected",
-                    remote.fmt_short()
-                );
-                drop((send, recv));
-                continue;
-            }
-
-            let mut type_buf = [0u8; 1];
-            if recv.read_exact(&mut type_buf).await.is_err() {
-                continue;
-            }
-
-            match type_buf[0] {
-                skippy_protocol::STAGE_STREAM_CONTROL => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_stage_control(remote, send, recv).await {
-                            tracing::warn!("stage control error from {}: {e}", remote.fmt_short());
-                        }
-                    });
-                }
-                skippy_protocol::STAGE_STREAM_TRANSPORT => {
-                    if self
-                        .stage_transport_tx
-                        .send((remote, send, recv))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!("Stage transport channel closed, dropping stream");
-                    }
-                }
-                skippy_protocol::STAGE_STREAM_ARTIFACT_TRANSFER => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node
-                            .handle_artifact_transfer_stream(remote, send, recv)
-                            .await
-                        {
-                            tracing::debug!(
-                                "legacy artifact transfer stream error from {}: {e}",
-                                remote.fmt_short()
-                            );
-                        }
-                    });
-                }
-                other => {
-                    tracing::warn!(
-                        "Unknown skippy stage stream type {other:#04x} from {}",
+            let node = self.clone();
+            tokio::spawn(Box::pin(async move {
+                if let Err(error) = node
+                    .handle_control_stream(remote, &mut send, &mut recv)
+                    .await
+                {
+                    tracing::debug!(
+                        "Control-plane stream from {} failed: {error}",
                         remote.fmt_short()
                     );
                 }
+            }));
+        }
+        Ok(())
+    }
+
+    async fn read_owner_control_handshake(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<Option<crate::proto::node::OwnerControlHandshake>> {
+        let handshake_bytes = match read_len_prefixed(recv).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(
+                    "control handshake read failed from {}: {error}",
+                    remote.fmt_short()
+                );
+                return Ok(None);
+            }
+        };
+
+        let handshake_envelope =
+            match crate::proto::node::OwnerControlEnvelope::decode(handshake_bytes.as_slice()) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    let code =
+                        if serde_json::from_slice::<serde_json::Value>(&handshake_bytes).is_ok() {
+                            crate::proto::node::OwnerControlErrorCode::LegacyJsonUnsupported
+                        } else {
+                            crate::proto::node::OwnerControlErrorCode::InvalidHandshake
+                        };
+                    let _ = self
+                        .send_owner_control_terminal_envelope(
+                            send,
+                            owner_control_error_envelope(code, None, None, error.to_string()),
+                        )
+                        .await;
+                    return Ok(None);
+                }
+            };
+        if let Err(error) = handshake_envelope.validate_frame() {
+            let _ = self
+                .send_owner_control_terminal_envelope(
+                    send,
+                    owner_control_error_envelope(
+                        crate::proto::node::OwnerControlErrorCode::InvalidHandshake,
+                        None,
+                        None,
+                        error.to_string(),
+                    ),
+                )
+                .await;
+            return Ok(None);
+        }
+        let Some(handshake) = handshake_envelope.handshake else {
+            let _ = self
+                .send_owner_control_terminal_envelope(
+                    send,
+                    owner_control_error_envelope(
+                        crate::proto::node::OwnerControlErrorCode::InvalidHandshake,
+                        None,
+                        None,
+                        "first owner-control envelope must be a handshake",
+                    ),
+                )
+                .await;
+            return Ok(None);
+        };
+        Ok(Some(handshake))
+    }
+
+    async fn read_owner_control_request(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<Option<crate::proto::node::OwnerControlRequest>> {
+        let request_bytes = match read_len_prefixed(recv).await {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let envelope =
+            match crate::proto::node::OwnerControlEnvelope::decode(request_bytes.as_slice()) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    let code =
+                        if serde_json::from_slice::<serde_json::Value>(&request_bytes).is_ok() {
+                            crate::proto::node::OwnerControlErrorCode::LegacyJsonUnsupported
+                        } else {
+                            crate::proto::node::OwnerControlErrorCode::BadRequest
+                        };
+                    let _ = self
+                        .send_owner_control_terminal_envelope(
+                            send,
+                            owner_control_error_envelope(code, None, None, error.to_string()),
+                        )
+                        .await;
+                    return Ok(None);
+                }
+            };
+        if let Err(error) = envelope.validate_frame() {
+            let request_id = envelope.request.as_ref().map(|request| request.request_id);
+            let _ = self
+                .send_owner_control_terminal_envelope(
+                    send,
+                    owner_control_rejection_envelope(&request_bytes, request_id, &error),
+                )
+                .await;
+            return Ok(None);
+        }
+        let Some(request) = envelope.request else {
+            let _ = self
+                .send_owner_control_terminal_envelope(
+                    send,
+                    owner_control_error_envelope(
+                        crate::proto::node::OwnerControlErrorCode::BadRequest,
+                        None,
+                        None,
+                        "owner-control envelope must contain a request after handshake",
+                    ),
+                )
+                .await;
+            return Ok(None);
+        };
+        Ok(Some(request))
+    }
+
+    async fn handle_control_stream(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        let Some(handshake) = self
+            .read_owner_control_handshake(remote, send, recv)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let local_owner = self.owner_summary.lock().await.clone();
+        let trust_store = self.trust_store.lock().await.clone();
+        if let Err(error) = crate::crypto::verify_control_plane_peer_ownership(
+            &local_owner,
+            handshake.ownership.as_ref(),
+            remote.as_bytes(),
+            &trust_store,
+            self.trust_policy,
+            current_time_unix_ms(),
+        ) {
+            let _ = self
+                .send_owner_control_terminal_envelope(
+                    send,
+                    self.owner_control_auth_error_envelope(&error),
+                )
+                .await;
+            return Ok(());
+        }
+
+        loop {
+            let Some(request) = self.read_owner_control_request(send, recv).await? else {
+                break;
+            };
+            let watch_request = request.watch_config.is_some();
+            self.handle_owner_control_request(remote, send, recv, request)
+                .await?;
+            if watch_request {
+                break;
             }
         }
+        Ok(())
+    }
+
+    async fn stage_stream_admitted(&self, remote: EndpointId) -> bool {
+        let state = self.state.lock().await;
+        state.peers.contains_key(&remote)
+    }
+
+    async fn dispatch_stage_stream_kind(
+        &self,
+        remote: EndpointId,
+        stream_type: u8,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        match stream_type {
+            skippy_protocol::STAGE_STREAM_CONTROL => {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node.handle_stage_control(remote, send, recv).await {
+                        tracing::warn!("stage control error from {}: {e}", remote.fmt_short());
+                    }
+                });
+            }
+            skippy_protocol::STAGE_STREAM_TRANSPORT => {
+                if self
+                    .stage_transport_tx
+                    .send((remote, send, recv))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Stage transport channel closed, dropping stream");
+                }
+            }
+            skippy_protocol::STAGE_STREAM_ARTIFACT_TRANSFER => {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = node
+                        .handle_artifact_transfer_stream(remote, send, recv)
+                        .await
+                    {
+                        tracing::debug!(
+                            "legacy artifact transfer stream error from {}: {e}",
+                            remote.fmt_short()
+                        );
+                    }
+                });
+            }
+            other => {
+                tracing::warn!(
+                    "Unknown skippy stage stream type {other:#04x} from {}",
+                    remote.fmt_short()
+                );
+            }
+        }
+    }
+
+    async fn dispatch_stage_streams(&self, conn: Connection, remote: EndpointId) {
+        loop {
+            match self.accept_stage_stream(&conn, remote).await {
+                StageStreamAccept::Dispatch((send, recv), stream_type) => {
+                    self.dispatch_stage_stream_kind(remote, stream_type, send, recv)
+                        .await;
+                }
+                StageStreamAccept::Continue => continue,
+                StageStreamAccept::Closed => break,
+            }
+        }
+    }
+
+    async fn accept_stage_stream(
+        &self,
+        conn: &Connection,
+        remote: EndpointId,
+    ) -> StageStreamAccept {
+        let (send, mut recv) = match conn.accept_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                tracing::info!(
+                    "Skippy stage connection to {} closed: {e}",
+                    remote.fmt_short()
+                );
+                return StageStreamAccept::Closed;
+            }
+        };
+        if !self.stage_stream_admitted(remote).await {
+            tracing::warn!(
+                "Quarantine: skippy stage stream from unadmitted peer {} rejected",
+                remote.fmt_short()
+            );
+            drop((send, recv));
+            return StageStreamAccept::Continue;
+        }
+        let mut type_buf = [0u8; 1];
+        if recv.read_exact(&mut type_buf).await.is_err() {
+            return StageStreamAccept::Continue;
+        }
+        StageStreamAccept::Dispatch((send, recv), type_buf[0])
+    }
+
+    async fn accept_mesh_stream(
+        &self,
+        conn: &Connection,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+    ) -> Result<AcceptedMeshStream, ()> {
+        let (send, mut recv) = conn.accept_bi().await.map_err(|error| {
+            tracing::info!("Connection to {} closed: {error}", remote.fmt_short());
+            self.capture_connection_event(ConnectionCaptureEvent {
+                event: "peer_connection_closed",
+                remote,
+                direction: "unknown",
+                phase: "accept_bi",
+                protocol: Some(protocol),
+                path_type: None,
+                rtt_ms: None,
+                admitted_peer: None,
+                reason: Some("accept_bi_error"),
+            });
+        })?;
+        let mut type_buf = [0u8; 1];
+        if recv.read_exact(&mut type_buf).await.is_err() {
+            return Err(());
+        }
+        Ok(AcceptedMeshStream {
+            send,
+            recv,
+            stream_type: type_buf[0],
+        })
+    }
+
+    async fn admitted_mesh_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        stream_type: u8,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) -> Option<MeshBiStream> {
+        let capture_streams = self.swarm_capture_enabled();
+        if stream_allowed_before_admission(stream_type) {
+            if capture_streams {
+                self.capture_stream_observation(remote, stream_type, protocol, true);
+            }
+            return Some((send, recv));
+        }
+        let admitted = {
+            let state = self.state.lock().await;
+            state.peers.contains_key(&remote)
+        };
+        if capture_streams {
+            self.capture_stream_observation(remote, stream_type, protocol, admitted);
+        }
+        if admitted {
+            Some((send, recv))
+        } else {
+            self.capture_stream_rejected(remote, stream_type, protocol, "unadmitted_peer");
+            tracing::warn!(
+                "Quarantine: stream {:#04x} from unadmitted peer {} rejected — peer must complete gossip first",
+                stream_type,
+                remote.fmt_short()
+            );
+            drop((send, recv));
+            None
+        }
+    }
+
+    async fn recover_closed_connection(&self, remote: EndpointId, closing_stable_id: usize) {
+        match self
+            .remove_closed_connection(remote, closing_stable_id)
+            .await
+        {
+            ClosedConnectionRecovery::Reconnect(addr) => {
+                self.reconnect_closed_connection_or_remove(remote, addr)
+                    .await;
+            }
+            ClosedConnectionRecovery::RemovePeer => {
+                self.remove_peer(remote).await;
+            }
+            ClosedConnectionRecovery::AlreadyReplaced => {}
+        }
+    }
+
+    async fn reconnect_closed_connection_or_remove(&self, remote: EndpointId, addr: EndpointAddr) {
+        tracing::info!("Attempting reconnect to {}...", remote.fmt_short());
+        match self.reconnect_closed_peer(remote, addr).await {
+            Some(new_conn) => {
+                self.complete_recovered_connection(remote, new_conn).await;
+            }
+            _ => {
+                tracing::info!("Reconnect to {} failed — removing peer", remote.fmt_short());
+                self.remove_peer(remote).await;
+            }
+        }
+    }
+
+    async fn remove_closed_connection(
+        &self,
+        remote: EndpointId,
+        closing_stable_id: usize,
+    ) -> ClosedConnectionRecovery {
+        let mut state = self.state.lock().await;
+        if !heartbeat::should_remove_connection(
+            state.connections.get(&remote).map(|conn| conn.stable_id()),
+            closing_stable_id,
+        ) {
+            tracing::debug!(
+                "Connection dispatcher for {} closed after the tracked connection was replaced",
+                remote.fmt_short()
+            );
+            return ClosedConnectionRecovery::AlreadyReplaced;
+        }
+        state.connections.remove(&remote);
+        match state.peers.get(&remote).map(|peer| peer.addr.clone()) {
+            Some(addr) => ClosedConnectionRecovery::Reconnect(addr),
+            None => ClosedConnectionRecovery::RemovePeer,
+        }
+    }
+
+    async fn reconnect_closed_peer(
+        &self,
+        remote: EndpointId,
+        addr: EndpointAddr,
+    ) -> Option<Connection> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_mesh(&self.endpoint, addr),
+        )
+        .await
+        {
+            Ok(Ok(new_conn)) => {
+                tracing::info!("Reconnected to {}", remote.fmt_short());
+                Some(new_conn)
+            }
+            _ => None,
+        }
+    }
+
+    async fn complete_recovered_connection(&self, remote: EndpointId, new_conn: Connection) {
+        {
+            let mut state = self.state.lock().await;
+            state.connections.insert(remote, new_conn.clone());
+        }
+        if self
+            .recovered_connection_gossip_ok(remote, new_conn.clone())
+            .await
+        {
+            let node = self.clone();
+            tokio::spawn(async move {
+                node.dispatch_streams(new_conn, remote).await;
+            });
+        } else {
+            tracing::info!(
+                "Reconnect gossip to {} failed — peer is dead, removing",
+                remote.fmt_short()
+            );
+            self.remove_peer(remote).await;
+        }
+    }
+
+    async fn recovered_connection_gossip_ok(
+        &self,
+        remote: EndpointId,
+        new_conn: Connection,
+    ) -> bool {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.initiate_gossip(new_conn, remote),
+        )
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false)
     }
 
     /// Dispatch bi-streams on a connection by type byte
@@ -4001,468 +5545,518 @@ impl Node {
         Box::pin(self._dispatch_streams(conn, remote))
     }
 
+    fn spawn_gossip_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = node
+                .handle_gossip_stream(remote, protocol, send, recv)
+                .await
+            {
+                tracing::warn!("Gossip stream error from {}: {error}", remote.fmt_short());
+            }
+        });
+    }
+
+    fn spawn_tunnel_map_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = node.handle_tunnel_map_stream(remote, protocol, recv).await {
+                tracing::warn!(
+                    "Tunnel map stream error from {}: {error}",
+                    remote.fmt_short()
+                );
+            }
+        });
+    }
+
+    fn spawn_route_request_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if protocol == ControlProtocol::ProtoV1 {
+                let proto_buf = match read_len_prefixed(&mut recv).await {
+                    Ok(buf) => buf,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Route request: failed to read proto body — rejecting: {error}"
+                        );
+                        node.capture_route_request(remote, protocol, "read_error");
+                        return;
+                    }
+                };
+                let req = match crate::proto::node::RouteTableRequest::decode(proto_buf.as_slice())
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::warn!("Route request: invalid protobuf — rejecting: {error}");
+                        node.capture_route_request(remote, protocol, "decode_error");
+                        return;
+                    }
+                };
+                if let Err(error) = req.validate_frame() {
+                    tracing::warn!("Route request: frame validation failed — rejecting: {error}");
+                    node.capture_route_request(remote, protocol, "validation_error");
+                    return;
+                }
+            }
+            use prost::Message as _;
+            let mut send = send;
+            let table = node.routing_table().await;
+            let proto_table = routing_table_to_proto(&table);
+            if write_len_prefixed(&mut send, &proto_table.encode_to_vec())
+                .await
+                .is_err()
+            {
+                node.capture_route_request(remote, protocol, "write_error");
+                return;
+            }
+            node.capture_route_request(remote, protocol, "served");
+            let _ = send.finish();
+        });
+    }
+
+    fn spawn_plugin_channel_stream(
+        &self,
+        remote: EndpointId,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = node.handle_plugin_channel_stream(remote, send, recv).await {
+                tracing::debug!(
+                    "Plugin channel stream error from {}: {error}",
+                    remote.fmt_short()
+                );
+            }
+        });
+    }
+
+    fn spawn_plugin_bulk_stream(
+        &self,
+        remote: EndpointId,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = node.handle_plugin_bulk_stream(remote, send, recv).await {
+                tracing::debug!(
+                    "Plugin bulk stream error from {}: {error}",
+                    remote.fmt_short()
+                );
+            }
+        });
+    }
+
+    fn spawn_subprotocol_stream(
+        &self,
+        remote: EndpointId,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = node
+                .handle_mesh_subprotocol_stream(remote, send, recv)
+                .await
+            {
+                tracing::debug!(
+                    "subprotocol stream error from {}: {error}",
+                    remote.fmt_short()
+                );
+            }
+        });
+    }
+
+    fn spawn_peer_down_stream(&self, remote: EndpointId, recv: iroh::endpoint::RecvStream) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.handle_peer_down_stream(remote, recv).await;
+        });
+    }
+
+    async fn handle_peer_down_stream(
+        &self,
+        remote: EndpointId,
+        mut recv: iroh::endpoint::RecvStream,
+    ) {
+        let Some(dead_id) = self.decode_peer_down_frame(&mut recv).await else {
+            return;
+        };
+        let report = self.peer_down_report(remote, dead_id).await;
+        self.apply_peer_down_report(remote, dead_id, report).await;
+    }
+
+    async fn decode_peer_down_frame(
+        &self,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Option<EndpointId> {
+        let frame = self.read_peer_down_frame(recv).await?;
+        peer_down_endpoint_id(&frame)
+    }
+
+    async fn read_peer_down_frame(
+        &self,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Option<crate::proto::node::PeerDown> {
+        let proto_buf = match read_len_prefixed(recv).await {
+            Ok(buf) => buf,
+            Err(e) => {
+                tracing::warn!("PeerDown: failed to read proto body — rejecting: {e}");
+                return None;
+            }
+        };
+        self.decode_peer_down_proto(&proto_buf)
+    }
+
+    fn decode_peer_down_proto(&self, proto_buf: &[u8]) -> Option<crate::proto::node::PeerDown> {
+        let frame = match crate::proto::node::PeerDown::decode(proto_buf) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("PeerDown: invalid protobuf — rejecting: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = frame.validate_frame() {
+            tracing::warn!("PeerDown: frame validation failed — rejecting: {e}");
+            return None;
+        }
+        Some(frame)
+    }
+
+    async fn peer_down_report(&self, remote: EndpointId, dead_id: EndpointId) -> PeerDownReport {
+        let state = self.state.lock().await;
+        let conn_opt = state.connections.get(&dead_id).cloned();
+        let peer = state.peers.get(&dead_id);
+        let peer_addr = peer.map(|p| p.addr.clone());
+        let recently_seen = peer
+            .map(|p| p.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
+            .unwrap_or(false);
+        let reporter_cooled = state
+            .peer_down_rejections
+            .get(&(remote, dead_id))
+            .is_some_and(|t| t.elapsed().as_secs() < PEER_DOWN_REPORTER_COOLDOWN_SECS);
+        PeerDownReport {
+            conn_opt,
+            peer_addr,
+            recently_seen,
+            reporter_cooled,
+        }
+    }
+
+    async fn apply_peer_down_report(
+        &self,
+        remote: EndpointId,
+        dead_id: EndpointId,
+        report: PeerDownReport,
+    ) {
+        match peer_down_report_disposition(report.reporter_cooled, report.recently_seen) {
+            PeerDownReportDisposition::SuppressReporterCooldown => tracing::debug!(
+                "PeerDown: {} reported {} dead but reporter is in cooldown, ignoring",
+                remote.fmt_short(),
+                dead_id.fmt_short()
+            ),
+            PeerDownReportDisposition::RejectRecentlySeen => {
+                self.reject_recent_peer_down_report(remote, dead_id).await;
+            }
+            PeerDownReportDisposition::ProbeReachability => {
+                self.probe_and_apply_peer_down(remote, dead_id, report)
+                    .await;
+            }
+        }
+    }
+
+    async fn reject_recent_peer_down_report(&self, remote: EndpointId, dead_id: EndpointId) {
+        emit_mesh_info(format!(
+            "ℹ️  Peer {} reported dead by {} but seen recently (direct alive), ignoring",
+            dead_id.fmt_short(),
+            remote.fmt_short()
+        ));
+        self.record_peer_down_rejection(remote, dead_id).await;
+    }
+
+    async fn probe_and_apply_peer_down(
+        &self,
+        remote: EndpointId,
+        dead_id: EndpointId,
+        report: PeerDownReport,
+    ) {
+        let should_remove = self
+            .peer_down_probe_should_remove(dead_id, report.conn_opt, report.peer_addr)
+            .await;
+        if let Some(id) = resolve_peer_down(self.endpoint.id(), dead_id, should_remove) {
+            self.remove_confirmed_peer_down(remote, id).await;
+        } else if dead_id != self.endpoint.id() {
+            emit_mesh_info(format!(
+                "ℹ️  Peer {} reported dead by {} but still reachable, ignoring",
+                dead_id.fmt_short(),
+                remote.fmt_short()
+            ));
+            self.record_peer_down_rejection(remote, dead_id).await;
+        }
+    }
+
+    async fn peer_down_probe_should_remove(
+        &self,
+        dead_id: EndpointId,
+        conn_opt: Option<Connection>,
+        peer_addr: Option<EndpointAddr>,
+    ) -> bool {
+        if let Some(conn) = conn_opt {
+            return !matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), conn.open_bi()).await,
+                Ok(Ok(_))
+            );
+        }
+        let Some(addr) = peer_addr else {
+            return true;
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            connect_mesh(&self.endpoint, addr),
+        )
+        .await
+        {
+            Ok(Ok(new_conn)) => {
+                self.keep_reachable_peer_down_connection(dead_id, new_conn)
+                    .await;
+                false
+            }
+            _ => true,
+        }
+    }
+
+    async fn keep_reachable_peer_down_connection(&self, dead_id: EndpointId, new_conn: Connection) {
+        emit_mesh_info(format!(
+            "ℹ️  Peer {} reported dead but we reached them, keeping",
+            dead_id.fmt_short()
+        ));
+        let mut state = self.state.lock().await;
+        if state.connections.contains_key(&dead_id) {
+            return;
+        }
+        state.connections.insert(dead_id, new_conn.clone());
+        drop(state);
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.dispatch_streams(new_conn, dead_id).await;
+        });
+    }
+
+    async fn remove_confirmed_peer_down(&self, remote: EndpointId, id: EndpointId) {
+        emit_mesh_warning(format!(
+            "⚠️  Peer {} reported dead by {}, confirmed, removing",
+            id.fmt_short(),
+            remote.fmt_short()
+        ));
+        let mut state = self.state.lock().await;
+        state.dead_peers.insert(id, std::time::Instant::now());
+        state.connections.remove(&id);
+        drop(state);
+        self.remove_peer(id).await;
+    }
+
+    async fn record_peer_down_rejection(&self, remote: EndpointId, dead_id: EndpointId) {
+        self.state
+            .lock()
+            .await
+            .peer_down_rejections
+            .insert((remote, dead_id), std::time::Instant::now());
+    }
+
+    async fn dispatch_mesh_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        stream_type: u8,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) -> bool {
+        if stream_type == STREAM_TUNNEL {
+            return self.forward_tunnel_stream(send, recv).await;
+        }
+        if stream_type == STREAM_TUNNEL_HTTP {
+            return self.forward_tunnel_http_stream(send, recv).await;
+        }
+
+        self.spawn_non_tunnel_mesh_stream(remote, protocol, stream_type, send, recv);
+        true
+    }
+
+    async fn forward_tunnel_stream(
+        &self,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) -> bool {
+        if self.tunnel_tx.send((send, recv)).await.is_err() {
+            tracing::warn!("Tunnel receiver dropped");
+            return false;
+        }
+        true
+    }
+
+    async fn forward_tunnel_http_stream(
+        &self,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) -> bool {
+        if self.tunnel_http_tx.send((send, recv)).await.is_err() {
+            tracing::warn!("HTTP tunnel receiver dropped");
+            return false;
+        }
+        true
+    }
+
+    fn spawn_non_tunnel_mesh_stream(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        stream_type: u8,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        match stream_type {
+            STREAM_GOSSIP => self.spawn_gossip_stream(remote, protocol, send, recv),
+            STREAM_TUNNEL_MAP => self.spawn_tunnel_map_stream(remote, protocol, recv),
+            STREAM_ROUTE_REQUEST => self.spawn_route_request_stream(remote, protocol, send, recv),
+            STREAM_PEER_DOWN => self.spawn_peer_down_stream(remote, recv),
+            STREAM_PEER_LEAVING => self.spawn_peer_leaving_stream(remote, recv),
+            STREAM_PLUGIN_CHANNEL => self.spawn_plugin_channel_stream(remote, send, recv),
+            STREAM_PLUGIN_BULK_TRANSFER => self.spawn_plugin_bulk_stream(remote, send, recv),
+            STREAM_SUBPROTOCOL => self.spawn_subprotocol_stream(remote, send, recv),
+            other => tracing::warn!("Unknown stream type {other} from {}", remote.fmt_short()),
+        }
+    }
+
+    fn spawn_peer_leaving_stream(&self, remote: EndpointId, recv: iroh::endpoint::RecvStream) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.handle_peer_leaving_stream(remote, recv).await;
+        });
+    }
+
+    async fn handle_peer_leaving_stream(
+        &self,
+        remote: EndpointId,
+        mut recv: iroh::endpoint::RecvStream,
+    ) {
+        let Some(leaving_id) = self.decode_peer_leaving(remote, &mut recv).await else {
+            return;
+        };
+        emit_mesh_info(format!(
+            "👋 Peer {} announced clean shutdown",
+            leaving_id.fmt_short()
+        ));
+        let mut state = self.state.lock().await;
+        state
+            .dead_peers
+            .insert(leaving_id, std::time::Instant::now());
+        state.connections.remove(&leaving_id);
+        drop(state);
+        self.remove_peer(leaving_id).await;
+    }
+
+    async fn decode_peer_leaving(
+        &self,
+        remote: EndpointId,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Option<EndpointId> {
+        let frame = self.read_peer_leaving_frame(recv).await?;
+        self.resolve_peer_leaving_frame(remote, &frame)
+    }
+
+    async fn read_peer_leaving_frame(
+        &self,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> Option<crate::proto::node::PeerLeaving> {
+        let proto_buf = match read_len_prefixed(recv).await {
+            Ok(buf) => buf,
+            Err(e) => {
+                tracing::warn!("PeerLeaving: failed to read proto body — rejecting: {e}");
+                return None;
+            }
+        };
+        self.decode_peer_leaving_proto(&proto_buf)
+    }
+
+    fn decode_peer_leaving_proto(
+        &self,
+        proto_buf: &[u8],
+    ) -> Option<crate::proto::node::PeerLeaving> {
+        let frame = match crate::proto::node::PeerLeaving::decode(proto_buf) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("PeerLeaving: invalid protobuf — rejecting: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = frame.validate_frame() {
+            tracing::warn!("PeerLeaving: frame validation failed — rejecting: {e}");
+            return None;
+        }
+        Some(frame)
+    }
+
+    fn resolve_peer_leaving_frame(
+        &self,
+        remote: EndpointId,
+        frame: &crate::proto::node::PeerLeaving,
+    ) -> Option<EndpointId> {
+        match resolve_peer_leaving(remote, frame) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("PeerLeaving from {}: rejected ({})", remote.fmt_short(), e);
+                None
+            }
+        }
+    }
+
     async fn _dispatch_streams(&self, conn: Connection, remote: EndpointId) {
         let protocol = connection_protocol(&conn);
+        let dispatcher_stable_id = conn.stable_id();
         loop {
-            let (send, mut recv) = match conn.accept_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::info!("Connection to {} closed: {e}", remote.fmt_short());
-                    // Remove the stale connection
-                    {
-                        let mut state = self.state.lock().await;
-                        state.connections.remove(&remote);
-                    }
-                    // Try to reconnect — if the peer is still alive, re-learn their role
-                    let addr = {
-                        let state = self.state.lock().await;
-                        state.peers.get(&remote).map(|p| p.addr.clone())
-                    };
-                    if let Some(addr) = addr {
-                        tracing::info!("Attempting reconnect to {}...", remote.fmt_short());
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            connect_mesh(&self.endpoint, addr),
-                        )
-                        .await
-                        {
-                            Ok(Ok(new_conn)) => {
-                                tracing::info!("Reconnected to {}", remote.fmt_short());
-                                {
-                                    let mut state = self.state.lock().await;
-                                    state.connections.insert(remote, new_conn.clone());
-                                }
-                                // Verify the peer is actually reachable by waiting for gossip.
-                                // A relay-level reconnect can appear to succeed even when the
-                                // remote process is dead; fire-and-forget gossip would leave the
-                                // peer in state.peers indefinitely. Await the result and remove
-                                // the peer immediately if gossip cannot complete.
-                                let gossip_ok = tokio::time::timeout(
-                                    std::time::Duration::from_secs(10),
-                                    self.initiate_gossip(new_conn.clone(), remote),
-                                )
-                                .await
-                                .map(|r| r.is_ok())
-                                .unwrap_or(false);
-
-                                if gossip_ok {
-                                    let node = self.clone();
-                                    tokio::spawn(async move {
-                                        node.dispatch_streams(new_conn, remote).await;
-                                    });
-                                } else {
-                                    tracing::info!(
-                                        "Reconnect gossip to {} failed — peer is dead, removing",
-                                        remote.fmt_short()
-                                    );
-                                    self.remove_peer(remote).await;
-                                }
-                            }
-                            _ => {
-                                tracing::info!(
-                                    "Reconnect to {} failed — removing peer",
-                                    remote.fmt_short()
-                                );
-                                self.remove_peer(remote).await;
-                            }
-                        }
-                    } else {
-                        // No address on file, can't reconnect
-                        self.remove_peer(remote).await;
-                    }
+            let accepted = match self.accept_mesh_stream(&conn, remote, protocol).await {
+                Ok(accepted) => accepted,
+                Err(()) => {
+                    self.recover_closed_connection(remote, dispatcher_stable_id)
+                        .await;
                     break;
                 }
             };
-
-            let mut type_buf = [0u8; 1];
-            if recv.read_exact(&mut type_buf).await.is_err() {
+            let Some((send, recv)) = self
+                .admitted_mesh_stream(
+                    remote,
+                    protocol,
+                    accepted.stream_type,
+                    accepted.send,
+                    accepted.recv,
+                )
+                .await
+            else {
                 continue;
-            }
-
-            let stream_type = type_buf[0];
-            if !stream_allowed_before_admission(stream_type) {
-                let admitted = {
-                    let state = self.state.lock().await;
-                    state.peers.contains_key(&remote)
-                };
-                if !admitted {
-                    tracing::warn!(
-                        "Quarantine: stream {:#04x} from unadmitted peer {} rejected — peer must complete gossip first",
-                        stream_type,
-                        remote.fmt_short()
-                    );
-                    drop((send, recv));
-                    continue;
-                }
-            }
-
-            match stream_type {
-                STREAM_GOSSIP => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node
-                            .handle_gossip_stream(remote, protocol, send, recv)
-                            .await
-                        {
-                            tracing::warn!("Gossip stream error from {}: {e}", remote.fmt_short());
-                        }
-                    });
-                }
-                STREAM_TUNNEL => {
-                    if self.tunnel_tx.send((send, recv)).await.is_err() {
-                        tracing::warn!("Tunnel receiver dropped");
-                        break;
-                    }
-                }
-                STREAM_TUNNEL_MAP => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_tunnel_map_stream(remote, protocol, recv).await
-                        {
-                            tracing::warn!(
-                                "Tunnel map stream error from {}: {e}",
-                                remote.fmt_short()
-                            );
-                        }
-                    });
-                }
-                STREAM_TUNNEL_HTTP => {
-                    if self.tunnel_http_tx.send((send, recv)).await.is_err() {
-                        tracing::warn!("HTTP tunnel receiver dropped");
-                        break;
-                    }
-                }
-                STREAM_ROUTE_REQUEST => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if protocol == ControlProtocol::ProtoV1 {
-                            let proto_buf = match read_len_prefixed(&mut recv).await {
-                                Ok(buf) => buf,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Route request: failed to read proto body — rejecting: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-                            let req = match crate::proto::node::RouteTableRequest::decode(
-                                proto_buf.as_slice(),
-                            ) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Route request: invalid protobuf — rejecting: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-                            if let Err(e) = req.validate_frame() {
-                                tracing::warn!(
-                                    "Route request: frame validation failed — rejecting: {e}"
-                                );
-                                return;
-                            }
-                        }
-                        use prost::Message as _;
-                        let mut send = send;
-                        let table = node.routing_table().await;
-                        let proto_table = routing_table_to_proto(&table);
-                        let _ = write_len_prefixed(&mut send, &proto_table.encode_to_vec()).await;
-                        let _ = send.finish();
-                    });
-                }
-                STREAM_PEER_DOWN => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        let proto_buf = match read_len_prefixed(&mut recv).await {
-                            Ok(buf) => buf,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "PeerDown: failed to read proto body — rejecting: {e}"
-                                );
-                                return;
-                            }
-                        };
-                        let frame = match crate::proto::node::PeerDown::decode(proto_buf.as_slice())
-                        {
-                            Ok(f) => f,
-                            Err(e) => {
-                                tracing::warn!("PeerDown: invalid protobuf — rejecting: {e}");
-                                return;
-                            }
-                        };
-                        if let Err(e) = frame.validate_frame() {
-                            tracing::warn!("PeerDown: frame validation failed — rejecting: {e}");
-                            return;
-                        }
-                        let peer_id_arr: [u8; 32] = match frame.peer_id.as_slice().try_into() {
-                            Ok(b) => b,
-                            Err(_) => {
-                                tracing::warn!("PeerDown: peer_id is not 32 bytes — rejecting");
-                                return;
-                            }
-                        };
-                        let pk = match iroh::PublicKey::from_bytes(&peer_id_arr) {
-                            Ok(k) => k,
-                            Err(_) => {
-                                tracing::warn!(
-                                    "PeerDown: peer_id is not a valid public key — rejecting"
-                                );
-                                return;
-                            }
-                        };
-                        let dead_id = EndpointId::from(pk);
-
-                        // Check existing state before deciding.
-                        let (conn_opt, peer_addr, recently_seen, reporter_cooled) = {
-                            let state = node.state.lock().await;
-                            let conn = state.connections.get(&dead_id).cloned();
-                            let peer = state.peers.get(&dead_id);
-                            let addr = peer.map(|p| p.addr.clone());
-                            let seen = peer
-                                .map(|p| p.last_seen.elapsed().as_secs() < PEER_STALE_SECS)
-                                .unwrap_or(false);
-                            // Check if this reporter recently had a false report
-                            // for this same target rejected.
-                            let cooled = state
-                                .peer_down_rejections
-                                .get(&(remote, dead_id))
-                                .is_some_and(|t| {
-                                    t.elapsed().as_secs() < PEER_DOWN_REPORTER_COOLDOWN_SECS
-                                });
-                            (conn, addr, seen, cooled)
-                        };
-
-                        match peer_down_report_disposition(reporter_cooled, recently_seen) {
-                            PeerDownReportDisposition::SuppressReporterCooldown => {
-                                // This reporter recently had a false claim about
-                                // this target rejected. Suppress repeated handling
-                                // before probing so false reports do not keep
-                                // triggering open_bi()/connect_mesh() work and logs.
-                                tracing::debug!(
-                                    "PeerDown: {} reported {} dead but reporter is in cooldown, ignoring",
-                                    remote.fmt_short(),
-                                    dead_id.fmt_short()
-                                );
-                            }
-                            PeerDownReportDisposition::RejectRecentlySeen => {
-                                // If we've heard from this peer recently via direct gossip,
-                                // they're alive from our perspective — ignore the death report
-                                // regardless of whether we have a connection (the connection
-                                // may be broken/stale while the peer is genuinely alive on
-                                // a different path).
-                                emit_mesh_info(format!(
-                                    "ℹ️  Peer {} reported dead by {} but seen recently (direct alive), ignoring",
-                                    dead_id.fmt_short(),
-                                    remote.fmt_short()
-                                ));
-                                // Record rejection so repeated false reports from
-                                // this reporter about this target are suppressed
-                                // while we still have recent proof-of-life.
-                                node.state
-                                    .lock()
-                                    .await
-                                    .peer_down_rejections
-                                    .insert((remote, dead_id), std::time::Instant::now());
-                            }
-                            PeerDownReportDisposition::ProbeReachability => {
-                                let should_remove = if let Some(conn) = conn_opt {
-                                    // Have a connection — probe it. Treat both
-                                    // timeout and open_bi() error as unreachable.
-                                    // 5s allows relay-only peers (400ms+ RTT) to
-                                    // respond without false-confirming death.
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        conn.open_bi(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(_)) => false, // stream opened — peer is alive
-                                        _ => true,          // timeout or error — unreachable
-                                    }
-                                } else if let Some(addr) = peer_addr {
-                                    // No connection but we know the peer — try to reach them
-                                    // before trusting the reporter's claim.
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(8),
-                                        connect_mesh(&node.endpoint, addr),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(new_conn)) => {
-                                            // Peer is reachable — restore connection.
-                                            emit_mesh_info(format!(
-                                                "ℹ️  Peer {} reported dead by {} but we reached them, keeping",
-                                                dead_id.fmt_short(),
-                                                remote.fmt_short()
-                                            ));
-                                            let mut state = node.state.lock().await;
-                                            // Only insert if no other task raced and
-                                            // established a connection while we were probing.
-                                            #[allow(clippy::map_entry)]
-                                            // manual drop(state) before async spawn
-                                            if !state.connections.contains_key(&dead_id) {
-                                                state.connections.insert(dead_id, new_conn.clone());
-                                                drop(state);
-                                                let n2 = node.clone();
-                                                tokio::spawn(async move {
-                                                    n2.dispatch_streams(new_conn, dead_id).await;
-                                                });
-                                            } else {
-                                                drop(state);
-                                            }
-                                            false
-                                        }
-                                        _ => true, // genuinely unreachable
-                                    }
-                                } else {
-                                    // Unknown peer — trust the reporter.
-                                    true
-                                };
-                                if let Some(id) =
-                                    resolve_peer_down(node.endpoint.id(), dead_id, should_remove)
-                                {
-                                    emit_mesh_warning(format!(
-                                        "⚠️  Peer {} reported dead by {}, confirmed, removing",
-                                        id.fmt_short(),
-                                        remote.fmt_short()
-                                    ));
-                                    let mut state = node.state.lock().await;
-                                    // Quarantine so transitive gossip doesn't
-                                    // immediately re-introduce this peer.
-                                    state.dead_peers.insert(id, std::time::Instant::now());
-                                    state.connections.remove(&id);
-                                    drop(state);
-                                    node.remove_peer(id).await;
-                                } else if dead_id != node.endpoint.id() {
-                                    emit_mesh_info(format!(
-                                        "ℹ️  Peer {} reported dead by {} but still reachable, ignoring",
-                                        dead_id.fmt_short(),
-                                        remote.fmt_short()
-                                    ));
-                                    // Record rejection so repeated false reports from
-                                    // this reporter about this target are suppressed.
-                                    node.state
-                                        .lock()
-                                        .await
-                                        .peer_down_rejections
-                                        .insert((remote, dead_id), std::time::Instant::now());
-                                }
-                            }
-                        }
-                    });
-                }
-                STREAM_PEER_LEAVING => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        let proto_buf = match read_len_prefixed(&mut recv).await {
-                            Ok(buf) => buf,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "PeerLeaving: failed to read proto body — rejecting: {e}"
-                                );
-                                return;
-                            }
-                        };
-                        let frame =
-                            match crate::proto::node::PeerLeaving::decode(proto_buf.as_slice()) {
-                                Ok(f) => f,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "PeerLeaving: invalid protobuf — rejecting: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-                        if let Err(e) = frame.validate_frame() {
-                            tracing::warn!("PeerLeaving: frame validation failed — rejecting: {e}");
-                            return;
-                        }
-                        let leaving_id = match resolve_peer_leaving(remote, &frame) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "PeerLeaving from {}: rejected ({})",
-                                    remote.fmt_short(),
-                                    e
-                                );
-                                return;
-                            }
-                        };
-                        emit_mesh_info(format!(
-                            "👋 Peer {} announced clean shutdown",
-                            leaving_id.fmt_short()
-                        ));
-                        let mut state = node.state.lock().await;
-                        // Quarantine so stale transitive gossip doesn't
-                        // re-introduce a peer that gracefully left.
-                        state
-                            .dead_peers
-                            .insert(leaving_id, std::time::Instant::now());
-                        state.connections.remove(&leaving_id);
-                        drop(state);
-                        node.remove_peer(leaving_id).await;
-                    });
-                }
-                STREAM_PLUGIN_CHANNEL => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_plugin_channel_stream(remote, send, recv).await
-                        {
-                            tracing::debug!(
-                                "Plugin channel stream error from {}: {e}",
-                                remote.fmt_short()
-                            );
-                        }
-                    });
-                }
-                STREAM_PLUGIN_BULK_TRANSFER => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_plugin_bulk_stream(remote, send, recv).await {
-                            tracing::debug!(
-                                "Plugin bulk stream error from {}: {e}",
-                                remote.fmt_short()
-                            );
-                        }
-                    });
-                }
-                STREAM_CONFIG_SUBSCRIBE => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_config_subscribe(remote, send, recv).await {
-                            tracing::warn!(
-                                "config subscribe error from {}: {e}",
-                                remote.fmt_short()
-                            );
-                        }
-                    });
-                }
-                STREAM_CONFIG_PUSH => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node.handle_config_push(remote, send, recv).await {
-                            tracing::warn!("config push error from {}: {e}", remote.fmt_short());
-                        }
-                    });
-                }
-                STREAM_SUBPROTOCOL => {
-                    let node = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = node
-                            .handle_mesh_subprotocol_stream(remote, send, recv)
-                            .await
-                        {
-                            tracing::debug!(
-                                "subprotocol stream error from {}: {e}",
-                                remote.fmt_short()
-                            );
-                        }
-                    });
-                }
-                other => {
-                    tracing::warn!("Unknown stream type {other} from {}", remote.fmt_short());
-                }
+            };
+            if !self
+                .dispatch_mesh_stream(remote, protocol, accepted.stream_type, send, recv)
+                .await
+            {
+                break;
             }
         }
     }
@@ -4517,45 +6111,57 @@ impl Node {
         }
     }
 
-    async fn handle_stage_control(
+    async fn decode_stage_control_request(
         &self,
         remote: EndpointId,
-        mut send: iroh::endpoint::SendStream,
-        mut recv: iroh::endpoint::RecvStream,
-    ) -> anyhow::Result<()> {
-        use prost::Message as _;
-
-        let buf = read_len_prefixed(&mut recv).await?;
+        recv: &mut iroh::endpoint::RecvStream,
+    ) -> anyhow::Result<skippy_stage_proto::StageControlRequest> {
+        let buf = read_len_prefixed(recv).await.map_err(|e| {
+            tracing::warn!(
+                "handle_stage_control: read_len_prefixed failed from {}: {e}",
+                remote.fmt_short()
+            );
+            e
+        })?;
         let frame = skippy_protocol::proto::stage::StageControlRequest::decode(buf.as_slice())
-            .map_err(|e| anyhow::anyhow!("StageControlRequest decode error: {e}"))?;
-        skippy_protocol::validate_stage_control_request(&frame)
-            .map_err(|e| anyhow::anyhow!("StageControlRequest validation error: {e}"))?;
-        if frame.requester_id.as_slice() != remote.as_bytes() {
-            anyhow::bail!("stage control requester_id does not match QUIC peer identity");
-        }
+            .map_err(|e| {
+                tracing::warn!(
+                    "handle_stage_control: decode failed from {}: {e}",
+                    remote.fmt_short()
+                );
+                anyhow::anyhow!("StageControlRequest decode error: {e}")
+            })?;
+        skippy_protocol::validate_stage_control_request(&frame).map_err(|e| {
+            tracing::warn!(
+                "handle_stage_control: validation failed from {}: {e}",
+                remote.fmt_short()
+            );
+            anyhow::anyhow!("StageControlRequest validation error: {e}")
+        })?;
+        anyhow::ensure!(
+            frame.requester_id.as_slice() == remote.as_bytes(),
+            "stage control requester_id does not match QUIC peer identity"
+        );
+        Ok(frame)
+    }
 
-        let mut request = stage_control_request_from_proto(frame)?;
-        self.prepare_stage_control_request(&mut request).await?;
-        if let crate::inference::skippy::StageControlRequest::Load(load) = &request {
-            self.record_stage_topology(stage_topology_from_load(self.endpoint.id(), load))
-                .await;
-        }
-        let control_tx = self.stage_control_tx.lock().await.clone();
-        let response = match control_tx {
-            Some(tx) => {
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                tx.send(crate::inference::skippy::StageControlCommand {
-                    request,
-                    resp: resp_tx,
-                })
-                .map_err(|_| anyhow::anyhow!("stage control loop is unavailable"))?;
-                resp_rx
-                    .await
-                    .map_err(|_| anyhow::anyhow!("stage control response dropped"))??
+    fn stage_control_request_kind(frame: &skippy_stage_proto::StageControlRequest) -> &'static str {
+        match &frame.command {
+            Some(skippy_stage_proto::stage_control_request::Command::ClaimCoordinator(_)) => {
+                "claim"
             }
-            None => stage_control_unavailable_response(request),
-        };
-        match &response {
+            Some(skippy_stage_proto::stage_control_request::Command::LoadStage(_)) => "load",
+            Some(skippy_stage_proto::stage_control_request::Command::StopStage(_)) => "stop",
+            Some(skippy_stage_proto::stage_control_request::Command::PrepareStage(_)) => "prepare",
+            _ => "other",
+        }
+    }
+
+    async fn record_stage_control_response(
+        &self,
+        response: &crate::inference::skippy::StageControlResponse,
+    ) {
+        match response {
             crate::inference::skippy::StageControlResponse::Ready(ready) => {
                 self.record_stage_status(Some(self.endpoint.id()), ready.status.clone())
                     .await;
@@ -4568,6 +6174,99 @@ impl Node {
             }
             _ => {}
         }
+    }
+
+    async fn execute_stage_control_request(
+        &self,
+        request: crate::inference::skippy::StageControlRequest,
+    ) -> anyhow::Result<crate::inference::skippy::StageControlResponse> {
+        let control_tx = self.stage_control_tx.lock().await.clone();
+        match control_tx {
+            Some(tx) => {
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                tx.send(crate::inference::skippy::StageControlCommand {
+                    request,
+                    resp: resp_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("stage control loop is unavailable"))?;
+                resp_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("stage control response dropped"))?
+            }
+            None => Ok(stage_control_unavailable_response(request)),
+        }
+    }
+
+    async fn execute_stage_control_request_for_peer(
+        &self,
+        remote: EndpointId,
+        request: crate::inference::skippy::StageControlRequest,
+    ) -> anyhow::Result<crate::inference::skippy::StageControlResponse> {
+        match self.execute_stage_control_request(request.clone()).await {
+            Ok(response) => Ok(response),
+            Err(error) => Self::stage_control_load_failure_response(remote, request, error),
+        }
+    }
+
+    fn stage_control_load_failure_response(
+        remote: EndpointId,
+        request: crate::inference::skippy::StageControlRequest,
+        error: anyhow::Error,
+    ) -> anyhow::Result<crate::inference::skippy::StageControlResponse> {
+        let crate::inference::skippy::StageControlRequest::Load(load) = request else {
+            return Err(error);
+        };
+        let error_message = format!("{error:#}");
+        tracing::warn!(
+            peer = %remote.fmt_short(),
+            stage_id = %load.stage_id,
+            "stage load failed: {error_message}"
+        );
+        let mut status =
+            stage_status_from_load(&load, crate::inference::skippy::StageRuntimeState::Failed);
+        status.error = Some(error_message.clone());
+        Ok(crate::inference::skippy::StageControlResponse::Ready(
+            crate::inference::skippy::StageReadyResponse {
+                accepted: false,
+                status,
+                error: Some(error_message),
+            },
+        ))
+    }
+
+    async fn handle_stage_control(
+        &self,
+        remote: EndpointId,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> anyhow::Result<()> {
+        use prost::Message as _;
+
+        let frame = self.decode_stage_control_request(remote, &mut recv).await?;
+        let request_kind = Self::stage_control_request_kind(&frame);
+        tracing::debug!(
+            "handle_stage_control: received {request_kind} from {}",
+            remote.fmt_short()
+        );
+
+        let mut request = stage_control_request_from_proto(frame)?;
+        self.prepare_stage_control_request(&mut request)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "handle_stage_control: prepare failed for {request_kind} from {}: {e}",
+                    remote.fmt_short()
+                );
+                e
+            })?;
+        if let crate::inference::skippy::StageControlRequest::Load(load) = &request {
+            self.record_stage_topology(stage_topology_from_load(self.endpoint.id(), load))
+                .await;
+        }
+        let response = self
+            .execute_stage_control_request_for_peer(remote, request)
+            .await?;
+        self.record_stage_control_response(&response).await;
         let status_list_supported = self
             .peer_supports_skippy_subprotocol_feature(
                 remote,
@@ -4585,6 +6284,7 @@ impl Node {
         request: &mut crate::inference::skippy::StageControlRequest,
     ) -> anyhow::Result<()> {
         match request {
+            crate::inference::skippy::StageControlRequest::Claim(_) => {}
             crate::inference::skippy::StageControlRequest::Load(load) => {
                 if load.load_mode == skippy_protocol::LoadMode::RuntimeSlice
                     && load
@@ -4601,11 +6301,10 @@ impl Node {
                     {
                         if let Ok(path) =
                             crate::models::resolve_model_spec(std::path::Path::new(candidate)).await
+                            && path.exists()
                         {
-                            if path.exists() {
-                                load.model_path = Some(path.to_string_lossy().to_string());
-                                break;
-                            }
+                            load.model_path = Some(path.to_string_lossy().to_string());
+                            break;
                         }
                     }
                 }
@@ -4684,11 +6383,8 @@ impl Node {
             return false;
         };
         match feature {
-            // Current PR peers advertise `stage-control` together with the
-            // artifact-transfer feature. Older peers fall back to the legacy
-            // skippy-stage ALPN control path.
             skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL => {
-                peer.artifact_transfer_supported
+                peer.stage_protocol_generation_supported
             }
             skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_ARTIFACT_TRANSFER => {
                 self.artifact_transfer_allowed_for_peer(&peer).await
@@ -4764,8 +6460,6 @@ impl Node {
         artifact: &crate::models::artifact_transfer::PackageArtifactRequest,
         destination: &std::path::Path,
     ) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -4775,12 +6469,14 @@ impl Node {
             &artifact.package_ref,
             destination,
         )?;
-        let temp_path = partial_artifact_path(destination);
-        let mut partial_guard = PartialArtifactGuard::new(temp_path.clone());
-        let offset = 0;
+        let resume_limit = Self::artifact_transfer_resume_limit(artifact)?;
+        let partial = select_partial_artifact(destination, resume_limit)?;
+        let temp_path = partial.path;
+        let offset = partial.offset;
+        let mut partial_guard = PartialArtifactGuard::preserve_on_error(temp_path.clone());
 
         let frame = skippy_stage_proto::StageArtifactTransferRequest {
-            gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+            r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
             requester_id: self.endpoint.id().as_bytes().to_vec(),
             topology_id: load.topology_id.clone(),
             run_id: load.run_id.clone(),
@@ -4818,6 +6514,7 @@ impl Node {
         .await
         .map_err(|_| anyhow::anyhow!("timeout opening artifact transfer stream"))??;
         let (mut recv, response) = response;
+        Self::remove_invalid_resume_partial(&mut partial_guard, offset, &response);
         if !response.accepted {
             anyhow::bail!(
                 "peer artifact transfer rejected: {}",
@@ -4856,29 +6553,15 @@ impl Node {
         );
 
         let transfer_result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temp_path)
-                .await
-                .context("open partial artifact")?;
-            let mut remaining = response.total_size.saturating_sub(offset);
-            let mut buffer = vec![0u8; ARTIFACT_TRANSFER_BUFFER_BYTES];
-            while remaining > 0 {
-                let limit = buffer.len().min(remaining as usize);
-                let read = read_artifact_transfer_chunk(
-                    &mut recv,
-                    &mut buffer[..limit],
-                    ARTIFACT_TRANSFER_READ_IDLE_TIMEOUT,
-                )
-                .await?;
-                file.write_all(&buffer[..read])
-                    .await
-                    .context("write partial artifact")?;
-                remaining -= read as u64;
-            }
-            file.flush().await.context("flush partial artifact")?;
-            drop(file);
+            append_artifact_transfer_body(
+                &mut recv,
+                &temp_path,
+                offset,
+                response.total_size,
+                ARTIFACT_TRANSFER_BUFFER_BYTES,
+                ARTIFACT_TRANSFER_READ_IDLE_TIMEOUT,
+            )
+            .await?;
 
             let actual_size = tokio::fs::metadata(&temp_path)
                 .await
@@ -4913,11 +6596,189 @@ impl Node {
         }
         .await;
         if let Err(error) = transfer_result {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            let error_message = error.to_string();
+            if error_message.contains("transferred artifact sha256 mismatch")
+                || error_message.contains("partial artifact size mismatch after transfer")
+            {
+                partial_guard.remove_now();
+            }
             return Err(error);
         }
         partial_guard.disarm();
         Ok(())
+    }
+
+    fn remove_invalid_resume_partial(
+        partial_guard: &mut PartialArtifactGuard,
+        offset: u64,
+        response: &skippy_stage_proto::StageArtifactTransferResponse,
+    ) {
+        if Self::artifact_transfer_response_invalidates_resume_offset(offset, response) {
+            partial_guard.remove_now();
+        }
+    }
+
+    fn artifact_transfer_response_invalidates_resume_offset(
+        offset: u64,
+        response: &skippy_stage_proto::StageArtifactTransferResponse,
+    ) -> bool {
+        if offset == 0 {
+            return false;
+        }
+        if response.accepted {
+            return offset > response.total_size;
+        }
+        response.error.as_deref() == Some(ARTIFACT_TRANSFER_INVALID_OFFSET_ERROR)
+    }
+
+    fn artifact_transfer_resume_limit(
+        artifact: &crate::models::artifact_transfer::PackageArtifactRequest,
+    ) -> Result<u64> {
+        if let Some(expected_size) = artifact.expected_size {
+            return Ok(expected_size);
+        }
+        if artifact.relative_path.as_path()
+            == std::path::Path::new(crate::models::artifact_transfer::PACKAGE_MANIFEST_FILE)
+        {
+            return Ok(crate::models::artifact_transfer::MAX_PACKAGE_MANIFEST_BYTES);
+        }
+        anyhow::bail!("artifact transfer resume requires an expected artifact size")
+    }
+
+    async fn artifact_transfer_rejected(
+        send: &mut iroh::endpoint::SendStream,
+        total_size: u64,
+        sha256: Option<&str>,
+        error: &'static str,
+    ) -> anyhow::Result<()> {
+        write_artifact_transfer_response(send, false, total_size, sha256, Some(error)).await
+    }
+
+    async fn authorize_artifact_transfer_request(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request: &skippy_stage_proto::StageArtifactTransferRequest,
+    ) -> anyhow::Result<Option<std::path::PathBuf>> {
+        if !self
+            .artifact_transfer_serving_allowed_for_remote(remote)
+            .await
+        {
+            Self::artifact_transfer_rejected(send, 0, None, "artifact transfer disabled").await?;
+            return Ok(None);
+        }
+        let Some(package_dir) = Self::artifact_transfer_package_dir(remote, send, request).await?
+        else {
+            return Ok(None);
+        };
+        let topologies = self
+            .stage_topologies
+            .lock()
+            .await
+            .topologies
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if !Self::artifact_transfer_topology_allows(
+            remote,
+            send,
+            request,
+            &package_dir,
+            &topologies,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(package_dir))
+    }
+
+    async fn artifact_transfer_package_dir(
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request: &skippy_stage_proto::StageArtifactTransferRequest,
+    ) -> anyhow::Result<Option<std::path::PathBuf>> {
+        match crate::models::artifact_transfer::package_cache_dir_for_ref(&request.package_ref) {
+            Ok(path) => Ok(Some(path)),
+            Err(error) => {
+                tracing::debug!(
+                    peer = %remote.fmt_short(),
+                    "artifact transfer request has unsupported package ref: {error}"
+                );
+                Self::artifact_transfer_rejected(send, 0, None, "artifact unavailable").await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn artifact_transfer_topology_allows(
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request: &skippy_stage_proto::StageArtifactTransferRequest,
+        package_dir: &std::path::Path,
+        topologies: &[StageTopologyInstance],
+    ) -> anyhow::Result<bool> {
+        let allowed =
+            match artifact_transfer_allowed_by_topology(topologies, remote, package_dir, request) {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    tracing::debug!(
+                        peer = %remote.fmt_short(),
+                        path = %request.relative_path,
+                        "artifact transfer authorization failed: {error}"
+                    );
+                    Self::artifact_transfer_rejected(send, 0, None, "artifact unavailable").await?;
+                    return Ok(false);
+                }
+            };
+        if !allowed {
+            tracing::debug!(
+                peer = %remote.fmt_short(),
+                path = %request.relative_path,
+                "artifact transfer request is not authorized for this stage assignment"
+            );
+            Self::artifact_transfer_rejected(send, 0, None, "artifact unavailable").await?;
+        }
+        Ok(allowed)
+    }
+
+    async fn resolve_artifact_transfer_request(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request: &skippy_stage_proto::StageArtifactTransferRequest,
+    ) -> anyhow::Result<Option<crate::models::artifact_transfer::ServableArtifact>> {
+        let request_for_resolution = request.clone();
+        let artifact = match tokio::task::spawn_blocking(move || {
+            crate::models::artifact_transfer::servable_artifact_from_request(
+                &request_for_resolution,
+            )
+        })
+        .await
+        .context("join artifact transfer resolution task")?
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                tracing::debug!(
+                    peer = %remote.fmt_short(),
+                    path = %request.relative_path,
+                    "artifact transfer request cannot be served: {error}"
+                );
+                Self::artifact_transfer_rejected(send, 0, None, "artifact unavailable").await?;
+                return Ok(None);
+            }
+        };
+        if request.offset > artifact.size {
+            Self::artifact_transfer_rejected(
+                send,
+                artifact.size,
+                Some(&artifact.sha256),
+                ARTIFACT_TRANSFER_INVALID_OFFSET_ERROR,
+            )
+            .await?;
+            return Ok(None);
+        }
+        Ok(Some(artifact))
     }
 
     async fn handle_artifact_transfer_stream(
@@ -4939,109 +6800,18 @@ impl Node {
         if request.requester_id.as_slice() != remote.as_bytes() {
             anyhow::bail!("artifact transfer requester_id does not match QUIC peer identity");
         }
-        if !self
-            .artifact_transfer_serving_allowed_for_remote(remote)
-            .await
-        {
-            return write_artifact_transfer_response(
-                &mut send,
-                false,
-                0,
-                None,
-                Some("artifact transfer disabled"),
-            )
-            .await;
-        }
-        let package_dir =
-            match crate::models::artifact_transfer::package_cache_dir_for_ref(&request.package_ref)
-            {
-                Ok(path) => path,
-                Err(error) => {
-                    tracing::debug!(
-                        peer = %remote.fmt_short(),
-                        "artifact transfer request has unsupported package ref: {error}"
-                    );
-                    return write_artifact_transfer_response(
-                        &mut send,
-                        false,
-                        0,
-                        None,
-                        Some("artifact unavailable"),
-                    )
-                    .await;
-                }
-            };
-        let topologies = self
-            .stage_topologies
-            .lock()
-            .await
-            .topologies
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        match artifact_transfer_allowed_by_topology(&topologies, remote, &package_dir, &request) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(
-                    peer = %remote.fmt_short(),
-                    path = %request.relative_path,
-                    "artifact transfer request is not authorized for this stage assignment"
-                );
-                return write_artifact_transfer_response(
-                    &mut send,
-                    false,
-                    0,
-                    None,
-                    Some("artifact unavailable"),
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::debug!(
-                    peer = %remote.fmt_short(),
-                    path = %request.relative_path,
-                    "artifact transfer authorization failed: {error}"
-                );
-                return write_artifact_transfer_response(
-                    &mut send,
-                    false,
-                    0,
-                    None,
-                    Some("artifact unavailable"),
-                )
-                .await;
-            }
-        }
-
-        let artifact =
-            match crate::models::artifact_transfer::servable_artifact_from_request(&request) {
-                Ok(artifact) => artifact,
-                Err(error) => {
-                    tracing::debug!(
-                        peer = %remote.fmt_short(),
-                        path = %request.relative_path,
-                        "artifact transfer request cannot be served: {error}"
-                    );
-                    return write_artifact_transfer_response(
-                        &mut send,
-                        false,
-                        0,
-                        None,
-                        Some("artifact unavailable"),
-                    )
-                    .await;
-                }
-            };
-        if request.offset > artifact.size {
-            return write_artifact_transfer_response(
-                &mut send,
-                false,
-                artifact.size,
-                Some(&artifact.sha256),
-                Some("invalid transfer offset"),
-            )
-            .await;
-        }
+        let Some(_package_dir) = self
+            .authorize_artifact_transfer_request(remote, &mut send, &request)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(artifact) = self
+            .resolve_artifact_transfer_request(remote, &mut send, &request)
+            .await?
+        else {
+            return Ok(());
+        };
 
         write_artifact_transfer_response(
             &mut send,
@@ -5072,189 +6842,6 @@ impl Node {
             remaining -= read as u64;
         }
         let _ = send.finish();
-        Ok(())
-    }
-
-    // --- Config Subscribe ---
-
-    async fn handle_config_subscribe(
-        &self,
-        remote: EndpointId,
-        mut send: iroh::endpoint::SendStream,
-        mut recv: iroh::endpoint::RecvStream,
-    ) -> anyhow::Result<()> {
-        use crate::proto::node::{ConfigSnapshotResponse, ConfigUpdateNotification};
-        use crate::protocol::convert::mesh_config_to_proto;
-        use prost::Message as _;
-
-        let buf = read_len_prefixed(&mut recv).await?;
-        let frame = crate::proto::node::ConfigSubscribe::decode(buf.as_slice())
-            .map_err(|e| anyhow::anyhow!("ConfigSubscribe decode error: {e}"))?;
-        frame
-            .validate_frame()
-            .map_err(|e| anyhow::anyhow!("ConfigSubscribe validation error: {e}"))?;
-
-        let local_owner_id = match self.local_verified_owner_id().await {
-            Some(id) => id,
-            None => {
-                let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    node_id: vec![],
-                    owner_id: String::new(),
-                    revision: 0,
-                    config_hash: vec![],
-                    config: None,
-                    hostname: None,
-                    error: Some(self.local_owner_status_error().await),
-                };
-                write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
-                return Ok(());
-            }
-        };
-
-        if frame.subscriber_id.as_slice() != remote.as_bytes() {
-            tracing::warn!(
-                "config subscribe from {}: subscriber_id does not match connection identity",
-                remote.fmt_short()
-            );
-            let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
-                gen: NODE_PROTOCOL_GENERATION,
-                node_id: vec![],
-                owner_id: String::new(),
-                revision: 0,
-                config_hash: vec![],
-                config: None,
-                hostname: None,
-                error: Some("subscriber_id does not match connection identity".to_string()),
-            };
-            write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
-            return Ok(());
-        }
-
-        let (subscriber_owner_id, _) = match self.peer_verified_owner(remote).await {
-            Some(owner) => owner,
-            None => {
-                let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    node_id: vec![],
-                    owner_id: String::new(),
-                    revision: 0,
-                    config_hash: vec![],
-                    config: None,
-                    hostname: None,
-                    error: Some("subscriber is not owner-attested".to_string()),
-                };
-                write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
-                return Ok(());
-            }
-        };
-
-        if subscriber_owner_id != local_owner_id {
-            tracing::warn!(
-                "config subscribe from {}: owner_id mismatch (want {}, subscriber {})",
-                remote.fmt_short(),
-                local_owner_id,
-                subscriber_owner_id
-            );
-            let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
-                gen: NODE_PROTOCOL_GENERATION,
-                node_id: vec![],
-                owner_id: String::new(),
-                revision: 0,
-                config_hash: vec![],
-                config: None,
-                hostname: None,
-                error: Some("owner_id mismatch".to_string()),
-            };
-            write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
-            return Ok(());
-        }
-
-        let subscriber_version = {
-            let state = self.state.lock().await;
-            state
-                .peers
-                .get(&remote)
-                .and_then(|peer| peer.version.clone())
-        };
-
-        let snapshot = {
-            let state = self.config_state.lock().await;
-            if config_uses_pinned_gpu(state.config())
-                && !peer_supports_pinned_gpu_config(subscriber_version.as_deref())
-            {
-                let error_snapshot = crate::proto::node::ConfigSnapshotResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    node_id: vec![],
-                    owner_id: String::new(),
-                    revision: 0,
-                    config_hash: vec![],
-                    config: None,
-                    hostname: None,
-                    error: Some(pinned_gpu_config_peer_error(subscriber_version.as_deref())),
-                };
-                write_len_prefixed(&mut send, &error_snapshot.encode_to_vec()).await?;
-                return Ok(());
-            }
-            let proto_cfg = mesh_config_to_proto(state.config());
-            ConfigSnapshotResponse {
-                gen: NODE_PROTOCOL_GENERATION,
-                node_id: self.endpoint.id().as_bytes().to_vec(),
-                owner_id: local_owner_id.clone(),
-                revision: state.revision(),
-                config_hash: state.config_hash().to_vec(),
-                config: Some(proto_cfg),
-                hostname: self.hostname.clone(),
-                error: None,
-            }
-        };
-        write_len_prefixed(&mut send, &snapshot.encode_to_vec()).await?;
-
-        let mut rev_rx = self.config_revision_tx.subscribe();
-        loop {
-            tokio::select! {
-                changed = rev_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    let notification = {
-                        let state = self.config_state.lock().await;
-                        if config_uses_pinned_gpu(state.config())
-                            && !peer_supports_pinned_gpu_config(subscriber_version.as_deref())
-                        {
-                            tracing::warn!(
-                                "closing config subscribe stream to {}: {}",
-                                remote.fmt_short(),
-                                pinned_gpu_config_peer_error(subscriber_version.as_deref())
-                            );
-                            break;
-                        }
-                        let proto_cfg = mesh_config_to_proto(state.config());
-                        ConfigUpdateNotification {
-                            gen: NODE_PROTOCOL_GENERATION,
-                            node_id: self.endpoint.id().as_bytes().to_vec(),
-                            owner_id: local_owner_id.clone(),
-                            revision: state.revision(),
-                            config_hash: state.config_hash().to_vec(),
-                            config: Some(proto_cfg),
-                        }
-                    };
-                    if write_len_prefixed(&mut send, &notification.encode_to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                inbound = read_len_prefixed(&mut recv) => {
-                    if inbound.is_ok() {
-                        tracing::debug!(
-                            "config subscribe from {} sent unexpected extra frame; closing stream",
-                            remote.fmt_short()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -5302,145 +6889,384 @@ impl Node {
         )
     }
 
-    async fn local_owner_status_error(&self) -> String {
-        let summary = self.owner_summary.lock().await.clone();
-        match summary.status {
-            OwnershipStatus::Verified => "node owner is verified".to_string(),
-            OwnershipStatus::Unsigned => "node has no local owner attestation".to_string(),
-            OwnershipStatus::Expired => "node owner attestation is expired".to_string(),
-            OwnershipStatus::InvalidSignature => {
-                "node owner attestation has invalid signature".to_string()
-            }
-            OwnershipStatus::MismatchedNodeId => {
-                "node owner attestation does not match local node id".to_string()
-            }
-            OwnershipStatus::RevokedOwner => "node owner is revoked".to_string(),
-            OwnershipStatus::RevokedCert => "node owner certificate is revoked".to_string(),
-            OwnershipStatus::RevokedNodeId => "node endpoint id is revoked".to_string(),
-            OwnershipStatus::UnsupportedProtocol => {
-                "node owner attestation uses unsupported protocol version".to_string()
-            }
-            OwnershipStatus::UntrustedOwner => {
-                "node owner is not trusted by local policy".to_string()
-            }
-        }
-    }
-
-    async fn peer_verified_owner(
+    fn owner_control_snapshot_from_state(
         &self,
-        peer_id: EndpointId,
-    ) -> Option<(String, SignedNodeOwnership)> {
-        let state = self.state.lock().await;
-        let peer = state.peers.get(&peer_id)?;
-        if peer.owner_summary.status != OwnershipStatus::Verified {
-            return None;
+        state: &crate::runtime::config_state::ConfigState,
+    ) -> crate::proto::node::OwnerControlConfigSnapshot {
+        crate::proto::node::OwnerControlConfigSnapshot {
+            node_id: self.endpoint.id().as_bytes().to_vec(),
+            revision: state.revision(),
+            config_hash: state.config_hash().to_vec(),
+            config: Some(crate::protocol::convert::mesh_config_to_proto(
+                state.config(),
+            )),
+            hostname: self.hostname.clone(),
         }
-        let owner_id = peer.owner_summary.owner_id.clone()?;
-        let attestation = peer.owner_attestation.clone()?;
-        Some((owner_id, attestation))
     }
 
-    // --- Config Push ---
+    fn owner_control_update_from_state(
+        &self,
+        state: &crate::runtime::config_state::ConfigState,
+    ) -> crate::proto::node::OwnerControlConfigUpdate {
+        crate::proto::node::OwnerControlConfigUpdate {
+            node_id: self.endpoint.id().as_bytes().to_vec(),
+            revision: state.revision(),
+            config_hash: state.config_hash().to_vec(),
+            config: Some(crate::protocol::convert::mesh_config_to_proto(
+                state.config(),
+            )),
+        }
+    }
 
-    async fn handle_config_push(
+    async fn send_owner_control_envelope(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        envelope: crate::proto::node::OwnerControlEnvelope,
+    ) -> anyhow::Result<()> {
+        write_len_prefixed(send, &envelope.encode_to_vec()).await?;
+        Ok(())
+    }
+
+    async fn send_owner_control_terminal_envelope(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        envelope: crate::proto::node::OwnerControlEnvelope,
+    ) -> anyhow::Result<()> {
+        self.send_owner_control_envelope(send, envelope).await?;
+        let _ = send.finish();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        Ok(())
+    }
+
+    async fn refresh_local_inventory_snapshot(&self) -> crate::models::LocalModelInventorySnapshot {
+        let collector = self.runtime_data_collector();
+        let snapshot = collector
+            .coalesce_local_inventory_scan(|| {
+                crate::models::scan_local_inventory_snapshot_with_progress(|_| {})
+            })
+            .await;
+        self.set_available_models(crate::models::scan_local_models())
+            .await;
+        snapshot
+    }
+
+    fn owner_control_auth_error_envelope(
+        &self,
+        err: &crate::crypto::ControlPlaneAuthError,
+    ) -> crate::proto::node::OwnerControlEnvelope {
+        let code = match err {
+            crate::crypto::ControlPlaneAuthError::MissingRemoteOwnerAttestation
+            | crate::crypto::ControlPlaneAuthError::RemoteOwnershipInvalid { .. } => {
+                crate::proto::node::OwnerControlErrorCode::InvalidHandshake
+            }
+            crate::crypto::ControlPlaneAuthError::TargetNodeMismatch { .. } => {
+                crate::proto::node::OwnerControlErrorCode::TargetNodeMismatch
+            }
+            crate::crypto::ControlPlaneAuthError::MissingLocalOwnerIdentity { .. }
+            | crate::crypto::ControlPlaneAuthError::RemoteOwnerMismatch { .. }
+            | crate::crypto::ControlPlaneAuthError::UnsupportedTrustPolicy { .. } => {
+                crate::proto::node::OwnerControlErrorCode::Unauthorized
+            }
+        };
+        owner_control_error_envelope(code, None, None, err.to_string())
+    }
+
+    fn verify_owner_control_request_ids(
         &self,
         remote: EndpointId,
-        mut send: iroh::endpoint::SendStream,
-        mut recv: iroh::endpoint::RecvStream,
+        requester_node_id: &[u8],
+        target_node_id: &[u8],
+        request_id: u64,
+    ) -> Result<(), Box<crate::proto::node::OwnerControlEnvelope>> {
+        if requester_node_id != remote.as_bytes() {
+            return Err(Box::new(owner_control_error_envelope(
+                crate::proto::node::OwnerControlErrorCode::BadRequest,
+                Some(request_id),
+                None,
+                "requester_node_id does not match connection identity",
+            )));
+        }
+        if let Err(err) =
+            verify_control_plane_target_node(target_node_id, self.endpoint.id().as_bytes())
+        {
+            return Err(Box::new(owner_control_error_envelope(
+                crate::proto::node::OwnerControlErrorCode::TargetNodeMismatch,
+                Some(request_id),
+                None,
+                err.to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn send_owner_control_request_id_error(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        verification: Result<(), Box<crate::proto::node::OwnerControlEnvelope>>,
+    ) -> Option<anyhow::Result<()>> {
+        match verification {
+            Ok(()) => None,
+            Err(envelope) => Some(self.send_owner_control_envelope(send, *envelope).await),
+        }
+    }
+
+    async fn current_owner_control_snapshot(
+        &self,
+    ) -> crate::proto::node::OwnerControlConfigSnapshot {
+        let state = self.config_state.lock().await;
+        self.owner_control_snapshot_from_state(&state)
+    }
+
+    async fn current_owner_control_update(&self) -> crate::proto::node::OwnerControlConfigUpdate {
+        let state = self.config_state.lock().await;
+        self.owner_control_update_from_state(&state)
+    }
+
+    fn owner_control_watch_response(
+        &self,
+        include_snapshot: bool,
+        snapshot: Option<crate::proto::node::OwnerControlConfigSnapshot>,
+        update: Option<crate::proto::node::OwnerControlConfigUpdate>,
+    ) -> crate::proto::node::OwnerControlWatchConfigResponse {
+        crate::proto::node::OwnerControlWatchConfigResponse {
+            accepted: (!include_snapshot && update.is_none()).then(|| {
+                crate::proto::node::OwnerControlWatchAccepted {
+                    target_node_id: self.endpoint.id().as_bytes().to_vec(),
+                }
+            }),
+            snapshot,
+            update,
+        }
+    }
+
+    fn owner_control_watch_envelope(
+        &self,
+        request_id: u64,
+        watch_response: crate::proto::node::OwnerControlWatchConfigResponse,
+    ) -> crate::proto::node::OwnerControlEnvelope {
+        crate::proto::node::OwnerControlEnvelope {
+            r#gen: NODE_PROTOCOL_GENERATION,
+            handshake: None,
+            request: None,
+            response: Some(crate::proto::node::OwnerControlResponse {
+                request_id,
+                get_config: None,
+                watch_config: Some(watch_response),
+                apply_config: None,
+                refresh_inventory: None,
+            }),
+            error: None,
+        }
+    }
+
+    async fn send_owner_control_watch_update(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        request_id: u64,
+        update: crate::proto::node::OwnerControlConfigUpdate,
     ) -> anyhow::Result<()> {
-        use crate::protocol::convert::proto_config_to_mesh;
-        use prost::Message as _;
+        self.send_owner_control_envelope(
+            send,
+            self.owner_control_watch_envelope(
+                request_id,
+                self.owner_control_watch_response(false, None, Some(update)),
+            ),
+        )
+        .await
+    }
 
-        // 1. Read + decode + validate ConfigPush
-        let buf = read_len_prefixed(&mut recv).await?;
-        let push = crate::proto::node::ConfigPush::decode(buf.as_slice())?;
-        push.validate_frame()
-            .map_err(|e| anyhow::anyhow!("invalid push frame: {e}"))?;
-
-        if push.target_node_id.as_slice() != self.endpoint.id().as_bytes() {
-            send_push_error(&mut send, "target_node_id does not match this node").await?;
-            return Ok(());
-        }
-        if push.requester_id.as_slice() != remote.as_bytes() {
-            send_push_error(&mut send, "requester_id does not match connection identity").await?;
-            return Ok(());
-        }
-
-        let local_id = match self.local_verified_owner_id().await {
-            Some(id) => id,
-            None => {
-                let msg = self.local_owner_status_error().await;
-                send_push_error(&mut send, &msg).await?;
-                return Ok(());
-            }
-        };
-
-        let (requester_owner_id, requester_attestation) =
-            match self.peer_verified_owner(remote).await {
-                Some(owner) => owner,
-                None => {
-                    send_push_error(&mut send, "requester is not owner-attested").await?;
-                    return Ok(());
-                }
-            };
-
-        if requester_owner_id != local_id {
-            send_push_error(&mut send, "not the owner of this node").await?;
-            return Ok(());
-        }
-
-        let expected_public_key =
-            match hex::decode(&requester_attestation.claim.owner_sign_public_key) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    send_push_error(&mut send, "requester attestation has invalid public key")
-                        .await?;
-                    return Ok(());
-                }
-            };
-        if push.owner_signing_public_key != expected_public_key {
-            send_push_error(
-                &mut send,
-                "push signing key does not match requester attestation",
+    async fn handle_owner_control_get_config(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request_id: u64,
+        get: crate::proto::node::OwnerControlGetConfigRequest,
+    ) -> anyhow::Result<()> {
+        if let Some(result) = self
+            .send_owner_control_request_id_error(
+                send,
+                self.verify_owner_control_request_ids(
+                    remote,
+                    &get.requester_node_id,
+                    &get.target_node_id,
+                    request_id,
+                ),
             )
+            .await
+        {
+            return result;
+        }
+        let snapshot = self.current_owner_control_snapshot().await;
+        self.send_owner_control_envelope(
+            send,
+            crate::proto::node::OwnerControlEnvelope {
+                r#gen: NODE_PROTOCOL_GENERATION,
+                handshake: None,
+                request: None,
+                response: Some(crate::proto::node::OwnerControlResponse {
+                    request_id,
+                    get_config: Some(crate::proto::node::OwnerControlGetConfigResponse {
+                        snapshot: Some(snapshot),
+                    }),
+                    watch_config: None,
+                    apply_config: None,
+                    refresh_inventory: None,
+                }),
+                error: None,
+            },
+        )
+        .await
+    }
+
+    async fn handle_owner_control_watch_config(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+        request_id: u64,
+        watch: crate::proto::node::OwnerControlWatchConfigRequest,
+    ) -> anyhow::Result<()> {
+        let mut rev_rx = self.config_revision_tx.subscribe();
+        if let Some(result) = self
+            .send_owner_control_request_id_error(
+                send,
+                self.verify_owner_control_request_ids(
+                    remote,
+                    &watch.requester_node_id,
+                    &watch.target_node_id,
+                    request_id,
+                ),
+            )
+            .await
+        {
+            return result;
+        }
+
+        self.send_owner_control_watch_start(send, request_id, watch.include_snapshot)
             .await?;
-            return Ok(());
-        }
 
-        let pk_bytes: [u8; 32] = match expected_public_key.as_slice().try_into() {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                send_push_error(&mut send, "invalid public key length").await?;
-                return Ok(());
+        self.stream_owner_control_watch_updates(send, recv, remote, request_id, &mut rev_rx)
+            .await;
+
+        Ok(())
+    }
+
+    async fn send_owner_control_watch_start(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        request_id: u64,
+        include_snapshot: bool,
+    ) -> anyhow::Result<()> {
+        let watch_response = self.owner_control_watch_response(
+            include_snapshot,
+            if include_snapshot {
+                Some(self.current_owner_control_snapshot().await)
+            } else {
+                None
+            },
+            None,
+        );
+        self.send_owner_control_envelope(
+            send,
+            self.owner_control_watch_envelope(request_id, watch_response),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn stream_owner_control_watch_updates(
+        &self,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+        remote: EndpointId,
+        request_id: u64,
+        rev_rx: &mut tokio::sync::watch::Receiver<u64>,
+    ) {
+        loop {
+            tokio::select! {
+                changed = rev_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let update = self.current_owner_control_update().await;
+                    if self
+                        .send_owner_control_watch_update(send, request_id, update)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                inbound = read_len_prefixed(recv) => {
+                    if inbound.is_ok() {
+                        tracing::debug!(
+                            "owner-control watch from {} sent unexpected extra frame; closing stream",
+                            remote.fmt_short()
+                        );
+                    }
+                    break;
+                }
             }
-        };
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)?;
-
-        let payload = config_push_signature_payload(&push);
-        let sig_bytes: [u8; 64] = match push.signature.as_slice().try_into() {
-            Ok(b) => b,
-            Err(_) => {
-                send_push_error(&mut send, "invalid signature length").await?;
-                return Ok(());
-            }
-        };
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        if vk.verify_strict(&payload, &sig).is_err() {
-            send_push_error(&mut send, "signature verification failed").await?;
-            return Ok(());
         }
+    }
 
-        // 5. Convert NodeConfigSnapshot → MeshConfig
-        let Some(ref config_snapshot) = push.config else {
-            send_push_error(&mut send, "missing config payload").await?;
-            return Ok(());
+    async fn handle_owner_control_apply_config(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request_id: u64,
+        apply: crate::proto::node::OwnerControlApplyConfigRequest,
+    ) -> anyhow::Result<()> {
+        use crate::runtime::config_state::{ApplyResult, ConfigApplyMode};
+
+        if let Some(result) = self
+            .send_owner_control_request_id_error(
+                send,
+                self.verify_owner_control_request_ids(
+                    remote,
+                    &apply.requester_node_id,
+                    &apply.target_node_id,
+                    request_id,
+                ),
+            )
+            .await
+        {
+            return result;
+        }
+        let Some(config_snapshot) = apply.config.clone() else {
+            return self
+                .send_owner_control_envelope(
+                    send,
+                    owner_control_error_envelope(
+                        crate::proto::node::OwnerControlErrorCode::BadRequest,
+                        Some(request_id),
+                        None,
+                        "missing config payload",
+                    ),
+                )
+                .await;
         };
-        let mesh_config = proto_config_to_mesh(config_snapshot);
 
-        // 6. Preflight + apply via CAS — use spawn_blocking so blocking hardware
-        //    probes and synchronous disk I/O do not run on the Tokio async runtime.
+        let mesh_config =
+            match crate::protocol::convert::proto_config_to_mesh_strict(&config_snapshot) {
+                Ok(config) => config,
+                Err(error) => {
+                    return self
+                        .send_owner_control_envelope(
+                            send,
+                            owner_control_error_envelope(
+                                crate::proto::node::OwnerControlErrorCode::BadRequest,
+                                Some(request_id),
+                                None,
+                                error.to_string(),
+                            ),
+                        )
+                        .await;
+                }
+            };
         let config_state = Arc::clone(&self.config_state);
-        let expected_revision = push.expected_revision;
+        let expected_revision = apply.expected_revision;
         let apply_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             preflight_pushed_config_for_current_node(&mesh_config)?;
             let mut state = config_state.blocking_lock();
@@ -5451,18 +7277,25 @@ impl Node {
         })
         .await
         .map_err(|e| anyhow::anyhow!("config apply task panicked: {e}"))?;
+
         let (result, current_revision, current_hash) = match apply_result {
             Ok(values) => values,
-            Err(err) => {
-                send_push_error(&mut send, &err.to_string()).await?;
-                return Ok(());
+            Err(error) => {
+                return self
+                    .send_owner_control_envelope(
+                        send,
+                        owner_control_error_envelope(
+                            crate::proto::node::OwnerControlErrorCode::BadRequest,
+                            Some(request_id),
+                            None,
+                            error.to_string(),
+                        ),
+                    )
+                    .await;
             }
         };
 
-        // 7. Build + send response
-        use crate::proto::node::ConfigApplyMode as ProtoApplyMode;
-        use crate::runtime::config_state::{ApplyResult, ConfigApplyMode};
-        let response = match result {
+        let envelope = match result {
             ApplyResult::Applied {
                 revision,
                 hash,
@@ -5471,134 +7304,179 @@ impl Node {
                 if apply_mode == ConfigApplyMode::Staged {
                     let _ = self.config_revision_tx.send(revision);
                 }
-                crate::proto::node::ConfigPushResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    success: true,
-                    current_revision: revision,
-                    config_hash: hash.to_vec(),
+                crate::proto::node::OwnerControlEnvelope {
+                    r#gen: NODE_PROTOCOL_GENERATION,
+                    handshake: None,
+                    request: None,
+                    response: Some(crate::proto::node::OwnerControlResponse {
+                        request_id,
+                        get_config: None,
+                        watch_config: None,
+                        apply_config: Some(crate::proto::node::OwnerControlApplyConfigResponse {
+                            success: true,
+                            current_revision: revision,
+                            config_hash: hash.to_vec(),
+                            error: None,
+                            apply_mode: match apply_mode {
+                                ConfigApplyMode::Staged => {
+                                    crate::proto::node::ConfigApplyMode::Staged as i32
+                                }
+                                ConfigApplyMode::Noop => {
+                                    crate::proto::node::ConfigApplyMode::Noop as i32
+                                }
+                            },
+                        }),
+                        refresh_inventory: None,
+                    }),
                     error: None,
-                    apply_mode: match apply_mode {
-                        ConfigApplyMode::Staged => ProtoApplyMode::Staged as i32,
-                        ConfigApplyMode::Noop => ProtoApplyMode::Noop as i32,
-                    },
                 }
             }
-            ApplyResult::RevisionConflict { current_revision } => {
-                crate::proto::node::ConfigPushResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    success: false,
-                    current_revision,
-                    config_hash: vec![],
-                    error: Some(
-                        "revision conflict: expected_revision does not match current".to_string(),
-                    ),
-                    apply_mode: ProtoApplyMode::Unspecified as i32,
-                }
-            }
+            ApplyResult::RevisionConflict { current_revision } => owner_control_error_envelope(
+                crate::proto::node::OwnerControlErrorCode::RevisionConflict,
+                Some(request_id),
+                Some(current_revision),
+                "revision conflict: expected_revision does not match current",
+            ),
             ApplyResult::PersistedWithRevisionTrackingError {
                 revision,
                 hash,
                 error,
             } => {
                 let _ = self.config_revision_tx.send(revision);
-                crate::proto::node::ConfigPushResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    success: false,
-                    current_revision: revision,
-                    config_hash: hash.to_vec(),
-                    error: Some(error),
-                    apply_mode: ProtoApplyMode::Staged as i32,
+                crate::proto::node::OwnerControlEnvelope {
+                    r#gen: NODE_PROTOCOL_GENERATION,
+                    handshake: None,
+                    request: None,
+                    response: Some(crate::proto::node::OwnerControlResponse {
+                        request_id,
+                        get_config: None,
+                        watch_config: None,
+                        apply_config: Some(crate::proto::node::OwnerControlApplyConfigResponse {
+                            success: false,
+                            current_revision: revision,
+                            config_hash: hash.to_vec(),
+                            error: Some(error),
+                            apply_mode: crate::proto::node::ConfigApplyMode::Staged as i32,
+                        }),
+                        refresh_inventory: None,
+                    }),
+                    error: None,
                 }
             }
-            ApplyResult::ValidationError(msg) | ApplyResult::PersistError(msg) => {
-                crate::proto::node::ConfigPushResponse {
-                    gen: NODE_PROTOCOL_GENERATION,
-                    success: false,
-                    current_revision,
-                    config_hash: current_hash.to_vec(),
-                    error: Some(msg),
-                    apply_mode: ProtoApplyMode::Unspecified as i32,
+            ApplyResult::ValidationError(error) | ApplyResult::PersistError(error) => {
+                crate::proto::node::OwnerControlEnvelope {
+                    r#gen: NODE_PROTOCOL_GENERATION,
+                    handshake: None,
+                    request: None,
+                    response: Some(crate::proto::node::OwnerControlResponse {
+                        request_id,
+                        get_config: None,
+                        watch_config: None,
+                        apply_config: Some(crate::proto::node::OwnerControlApplyConfigResponse {
+                            success: false,
+                            current_revision,
+                            config_hash: current_hash.to_vec(),
+                            error: Some(error),
+                            apply_mode: crate::proto::node::ConfigApplyMode::Unspecified as i32,
+                        }),
+                        refresh_inventory: None,
+                    }),
+                    error: None,
                 }
             }
         };
-        write_len_prefixed(&mut send, &response.encode_to_vec()).await?;
-        Ok(())
+        self.send_owner_control_envelope(send, envelope).await
     }
 
-    /// Outbound config subscription helper — opens a bi-stream to the target peer,
-    /// sends a `ConfigSubscribe` message, and reads back the initial snapshot.
-    ///
-    /// This is an intentional API stub for the future UI/API layer that will
-    /// materialize a mesh-wide config view from per-node subscriptions.
-    /// Not yet called from production code.
-    #[allow(dead_code)]
-    pub(crate) async fn subscribe_to_config(
+    async fn handle_owner_control_refresh_inventory(
         &self,
-        conn: &iroh::endpoint::Connection,
-    ) -> anyhow::Result<(
-        crate::proto::node::ConfigSnapshotResponse,
-        tokio::sync::watch::Receiver<crate::proto::node::ConfigUpdateNotification>,
-    )> {
-        use crate::proto::node::{
-            ConfigSnapshotResponse, ConfigSubscribe, ConfigUpdateNotification,
-        };
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        request_id: u64,
+        refresh: crate::proto::node::OwnerControlRefreshInventoryRequest,
+    ) -> anyhow::Result<()> {
+        if let Some(result) = self
+            .send_owner_control_request_id_error(
+                send,
+                self.verify_owner_control_request_ids(
+                    remote,
+                    &refresh.requester_node_id,
+                    &refresh.target_node_id,
+                    request_id,
+                ),
+            )
+            .await
+        {
+            return result;
+        }
+        let _ = self.refresh_local_inventory_snapshot().await;
+        let snapshot = self.current_owner_control_snapshot().await;
+        self.send_owner_control_envelope(
+            send,
+            crate::proto::node::OwnerControlEnvelope {
+                r#gen: NODE_PROTOCOL_GENERATION,
+                handshake: None,
+                request: None,
+                response: Some(crate::proto::node::OwnerControlResponse {
+                    request_id,
+                    get_config: None,
+                    watch_config: None,
+                    apply_config: None,
+                    refresh_inventory: Some(
+                        crate::proto::node::OwnerControlRefreshInventoryResponse {
+                            snapshot: Some(snapshot),
+                        },
+                    ),
+                }),
+                error: None,
+            },
+        )
+        .await
+    }
 
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&[STREAM_CONFIG_SUBSCRIBE]).await?;
+    async fn handle_owner_control_request(
+        &self,
+        remote: EndpointId,
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+        request: crate::proto::node::OwnerControlRequest,
+    ) -> anyhow::Result<()> {
+        let request_id = request.request_id;
 
-        let req = ConfigSubscribe {
-            gen: NODE_PROTOCOL_GENERATION,
-            subscriber_id: self.endpoint.id().as_bytes().to_vec(),
-            // Owner-id filtering is an embedded-client concept; mesh-llm does
-            // not currently filter snapshots, so we leave this empty for
-            // backward compatibility with older peers.
-            owner_id: String::new(),
-        };
-        write_len_prefixed(&mut send, &req.encode_to_vec()).await?;
-
-        let buf = read_len_prefixed(&mut recv).await?;
-        let snapshot = ConfigSnapshotResponse::decode(buf.as_slice())
-            .map_err(|e| anyhow::anyhow!("ConfigSnapshotResponse decode error: {e}"))?;
-        snapshot
-            .validate_frame()
-            .map_err(|e| anyhow::anyhow!("ConfigSnapshotResponse validation error: {e}"))?;
-        if let Some(err_msg) = snapshot.error.as_deref().filter(|e| !e.is_empty()) {
-            return Err(anyhow::anyhow!("config subscribe rejected: {err_msg}"));
+        if let Some(get) = request.get_config {
+            return self
+                .handle_owner_control_get_config(remote, send, request_id, get)
+                .await;
         }
 
-        let empty_notif = ConfigUpdateNotification {
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: snapshot.node_id.clone(),
-            owner_id: snapshot.owner_id.clone(),
-            revision: snapshot.revision,
-            config_hash: snapshot.config_hash.clone(),
-            config: snapshot.config.clone(),
-        };
-        let (notif_tx, notif_rx) = tokio::sync::watch::channel(empty_notif);
-        tokio::spawn(async move {
-            // Keep the request stream's send half alive while subscribed so the
-            // remote side does not treat immediate EOF as an unsubscribe.
-            let _send = send;
-            while let Ok(buf) = read_len_prefixed(&mut recv).await {
-                match ConfigUpdateNotification::decode(buf.as_slice()) {
-                    Ok(notif) => {
-                        if let Err(e) = notif.validate_frame() {
-                            tracing::warn!("ConfigUpdateNotification validation error: {e}");
-                            break;
-                        }
-                        if notif_tx.send(notif).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("ConfigUpdateNotification decode error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
+        if let Some(watch) = request.watch_config {
+            return self
+                .handle_owner_control_watch_config(remote, send, recv, request_id, watch)
+                .await;
+        }
 
-        Ok((snapshot, notif_rx))
+        if let Some(apply) = request.apply_config {
+            return self
+                .handle_owner_control_apply_config(remote, send, request_id, apply)
+                .await;
+        }
+
+        if let Some(refresh) = request.refresh_inventory {
+            return self
+                .handle_owner_control_refresh_inventory(remote, send, request_id, refresh)
+                .await;
+        }
+
+        self.send_owner_control_envelope(
+            send,
+            owner_control_error_envelope(
+                crate::proto::node::OwnerControlErrorCode::UnknownCommand,
+                Some(request_id),
+                None,
+                "unknown owner-control command",
+            ),
+        )
+        .await
     }
 
     // --- Gossip ---
@@ -5675,14 +7553,13 @@ impl Node {
                 .get(&peer_id)
                 .cloned();
             if let Some(conn) = conn {
-                let mut paths = conn.paths();
-                let path_list = iroh::Watcher::get(&mut paths);
-                for path_info in path_list {
+                let path_list = conn.paths();
+                for path_info in &path_list {
                     if path_info.is_selected() {
-                        let rtt_ms = match path_info.rtt() {
-                            Some(rtt) => rtt.as_millis() as u32,
-                            None => continue,
-                        };
+                        let rtt_ms = path_info.rtt().as_millis() as u32;
+                        if rtt_ms == 0 {
+                            continue;
+                        }
                         let path_type = if path_info.is_ip() { "direct" } else { "relay" };
                         if rtt_ms > 0 {
                             emit_mesh_info(format!(
@@ -5732,13 +7609,6 @@ impl Node {
 
         Ok(())
     }
-}
-
-pub(crate) fn config_push_signature_payload(push: &crate::proto::node::ConfigPush) -> Vec<u8> {
-    use prost::Message as _;
-    let mut unsigned = push.clone();
-    unsigned.signature.clear();
-    unsigned.encode_to_vec()
 }
 
 fn stage_topology_key(topology_id: &str, run_id: &str) -> String {
@@ -5832,6 +7702,9 @@ fn stage_snapshot_from_runtime_status(
         flash_attn_type: status.flash_attn_type,
         error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
     }
 }
 
@@ -5865,6 +7738,9 @@ fn stage_control_request_to_proto(
     use skippy_stage_proto::stage_control_request::Command;
 
     let command = match request {
+        crate::inference::skippy::StageControlRequest::Claim(claim) => {
+            Command::ClaimCoordinator(stage_coordinator_claim_to_proto(claim))
+        }
         crate::inference::skippy::StageControlRequest::Load(load) => {
             Command::LoadStage(stage_load_to_proto(load))
         }
@@ -5874,6 +7750,7 @@ fn stage_control_request_to_proto(
                 run_id: stop.run_id,
                 stage_id: stop.stage_id,
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
             })
         }
         crate::inference::skippy::StageControlRequest::Status(status) => {
@@ -5912,7 +7789,7 @@ fn stage_control_request_to_proto(
     };
 
     skippy_stage_proto::StageControlRequest {
-        gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
         requester_id: requester_id.as_bytes().to_vec(),
         command: Some(command),
     }
@@ -5948,6 +7825,9 @@ fn stage_load_to_proto(
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_to_proto(load.flash_attn_type) as i32,
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: load.lease_until_unix_ms,
         load_mode: match load.load_mode {
             skippy_protocol::LoadMode::RuntimeSlice => {
                 skippy_stage_proto::StageLoadMode::RuntimeSlice as i32
@@ -5961,6 +7841,23 @@ fn stage_load_to_proto(
         },
         upstream: load.upstream.map(stage_peer_to_proto),
         downstream: load.downstream.map(stage_peer_to_proto),
+    }
+}
+
+fn stage_coordinator_claim_to_proto(
+    claim: crate::inference::skippy::StageCoordinatorClaim,
+) -> skippy_stage_proto::ClaimCoordinator {
+    skippy_stage_proto::ClaimCoordinator {
+        model_id: claim.model_id,
+        package_ref: claim.package_ref,
+        manifest_sha256: claim.manifest_sha256,
+        topology_id: claim.topology_id,
+        run_id: claim.run_id,
+        coordinator_id: claim.coordinator_id,
+        coordinator_term: claim.coordinator_term,
+        participant_set_hash: claim.participant_set_hash,
+        topology_hash: claim.topology_hash,
+        lease_until_unix_ms: claim.lease_until_unix_ms,
     }
 }
 
@@ -5993,6 +7890,11 @@ fn stage_control_request_from_proto(
         .command
         .ok_or_else(|| anyhow::anyhow!("missing stage control command"))?
     {
+        Command::ClaimCoordinator(claim) => {
+            Ok(crate::inference::skippy::StageControlRequest::Claim(
+                stage_coordinator_claim_from_proto(claim)?,
+            ))
+        }
         Command::LoadStage(load) => Ok(crate::inference::skippy::StageControlRequest::Load(
             stage_load_from_proto(load)?,
         )),
@@ -6002,6 +7904,7 @@ fn stage_control_request_from_proto(
                 run_id: stop.run_id,
                 stage_id: stop.stage_id,
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
             },
         )),
         Command::GetStageStatus(status) => {
@@ -6096,9 +7999,33 @@ fn stage_load_from_proto(
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_from_proto(load.flash_attn_type),
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load
+            .coordinator_id
+            .map(|id| id.parse())
+            .transpose()
+            .context("invalid stage load coordinator_id")?,
+        lease_until_unix_ms: load.lease_until_unix_ms,
         load_mode: stage_load_mode_from_proto(load.load_mode),
         upstream: load.upstream.map(stage_peer_from_proto).transpose()?,
         downstream: load.downstream.map(stage_peer_from_proto).transpose()?,
+    })
+}
+
+fn stage_coordinator_claim_from_proto(
+    claim: skippy_stage_proto::ClaimCoordinator,
+) -> anyhow::Result<crate::inference::skippy::StageCoordinatorClaim> {
+    Ok(crate::inference::skippy::StageCoordinatorClaim {
+        model_id: claim.model_id,
+        package_ref: claim.package_ref,
+        manifest_sha256: claim.manifest_sha256,
+        topology_id: claim.topology_id,
+        run_id: claim.run_id,
+        coordinator_id: claim.coordinator_id,
+        coordinator_term: claim.coordinator_term,
+        participant_set_hash: claim.participant_set_hash,
+        topology_hash: claim.topology_hash,
+        lease_until_unix_ms: claim.lease_until_unix_ms,
     })
 }
 
@@ -6168,6 +8095,15 @@ fn stage_control_unavailable_response(
     request: crate::inference::skippy::StageControlRequest,
 ) -> crate::inference::skippy::StageControlResponse {
     let status = match request {
+        crate::inference::skippy::StageControlRequest::Claim(claim) => {
+            return crate::inference::skippy::StageControlResponse::ClaimAccepted(
+                crate::inference::skippy::StageCoordinatorClaimAck {
+                    accepted: false,
+                    claim,
+                    error: Some("stage control is not available".to_string()),
+                },
+            );
+        }
         crate::inference::skippy::StageControlRequest::Load(load) => {
             stage_status_from_load(&load, crate::inference::skippy::StageRuntimeState::Failed)
         }
@@ -6201,6 +8137,9 @@ fn stage_control_unavailable_response(
                 flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
                 error: Some("stage control is not available".to_string()),
                 shutdown_generation: stop.shutdown_generation,
+                coordinator_term: stop.coordinator_term,
+                coordinator_id: None,
+                lease_until_unix_ms: 0,
             }
         }
         crate::inference::skippy::StageControlRequest::Status(_) => {
@@ -6296,6 +8235,9 @@ fn stage_status_from_load(
         flash_attn_type: load.flash_attn_type,
         error: Some("stage control is not available".to_string()),
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
     }
 }
 
@@ -6321,6 +8263,9 @@ fn stage_preparation_status_from_load(
         bind_addr: None,
         error,
         shutdown_generation: load.shutdown_generation,
+        coordinator_term: load.coordinator_term,
+        coordinator_id: load.coordinator_id,
+        lease_until_unix_ms: load.lease_until_unix_ms,
     }
 }
 
@@ -6346,6 +8291,9 @@ fn stage_preparation_status_from_cancel(
         bind_addr: None,
         error,
         shutdown_generation: cancel.shutdown_generation,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
     }
 }
 
@@ -6356,6 +8304,13 @@ fn stage_control_response_to_proto(
     use skippy_stage_proto::stage_control_response::Response;
 
     let response = match response {
+        crate::inference::skippy::StageControlResponse::ClaimAccepted(accepted) => {
+            Response::CoordinatorClaimAccepted(skippy_stage_proto::CoordinatorClaimAccepted {
+                accepted: accepted.accepted,
+                claim: Some(stage_coordinator_claim_to_proto(accepted.claim)),
+                error: accepted.error,
+            })
+        }
         crate::inference::skippy::StageControlResponse::Ready(ready) => {
             Response::StageReady(skippy_stage_proto::StageReady {
                 accepted: ready.accepted,
@@ -6400,7 +8355,7 @@ fn stage_control_response_to_proto(
     };
 
     skippy_stage_proto::StageControlResponse {
-        gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
+        r#gen: skippy_protocol::STAGE_PROTOCOL_GENERATION,
         response: Some(response),
     }
 }
@@ -6414,6 +8369,20 @@ fn stage_control_response_from_proto(
         .response
         .ok_or_else(|| anyhow::anyhow!("missing stage control response"))?
     {
+        Response::CoordinatorClaimAccepted(accepted) => {
+            let claim = accepted
+                .claim
+                .ok_or_else(|| anyhow::anyhow!("coordinator claim accepted missing claim"))?;
+            Ok(
+                crate::inference::skippy::StageControlResponse::ClaimAccepted(
+                    crate::inference::skippy::StageCoordinatorClaimAck {
+                        accepted: accepted.accepted,
+                        claim: stage_coordinator_claim_from_proto(claim)?,
+                        error: accepted.error,
+                    },
+                ),
+            )
+        }
         Response::StageReady(ready) => {
             let status = ready
                 .status
@@ -6619,12 +8588,26 @@ fn stage_preparation_status_to_proto(
         bind_addr: status.bind_addr,
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
 fn stage_preparation_status_from_proto(
     status: skippy_stage_proto::StagePreparationStatus,
 ) -> crate::inference::skippy::StagePreparationStatus {
+    let coordinator_id = status.coordinator_id.and_then(|id| match id.parse() {
+        Ok(id) => Some(id),
+        Err(error) => {
+            tracing::warn!(
+                coordinator_id = %id,
+                error = %error,
+                "invalid stage preparation coordinator_id"
+            );
+            None
+        }
+    });
     crate::inference::skippy::StagePreparationStatus {
         topology_id: status.topology_id,
         run_id: status.run_id,
@@ -6642,6 +8625,9 @@ fn stage_preparation_status_from_proto(
         bind_addr: status.bind_addr,
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id,
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6677,6 +8663,9 @@ fn stage_status_to_proto(
         materialized_pinned: Some(status.materialized_pinned),
         projector_path: status.projector_path,
         flash_attn_type: stage_flash_attn_type_to_proto(status.flash_attn_type) as i32,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status.coordinator_id.map(|id| id.to_string()),
+        lease_until_unix_ms: status.lease_until_unix_ms,
     }
 }
 
@@ -6719,6 +8708,13 @@ fn stage_status_from_proto(
         flash_attn_type: stage_flash_attn_type_from_proto(status.flash_attn_type),
         error: status.error,
         shutdown_generation: status.shutdown_generation,
+        coordinator_term: status.coordinator_term,
+        coordinator_id: status
+            .coordinator_id
+            .map(|id| id.parse())
+            .transpose()
+            .context("invalid stage status coordinator_id")?,
+        lease_until_unix_ms: status.lease_until_unix_ms,
     })
 }
 
@@ -6877,21 +8873,6 @@ fn stage_wire_dtype_to_proto(
     }
 }
 
-async fn send_push_error(send: &mut iroh::endpoint::SendStream, msg: &str) -> anyhow::Result<()> {
-    use crate::protocol::write_len_prefixed;
-    use prost::Message as _;
-    let response = crate::proto::node::ConfigPushResponse {
-        gen: NODE_PROTOCOL_GENERATION,
-        success: false,
-        current_revision: 0,
-        config_hash: vec![],
-        error: Some(msg.to_string()),
-        apply_mode: crate::proto::node::ConfigApplyMode::Unspecified as i32,
-    };
-    write_len_prefixed(send, &response.encode_to_vec()).await?;
-    Ok(())
-}
-
 /// Generate a mesh ID for a new mesh.
 /// Named meshes: `sha256("mesh-llm:" + name + ":" + nostr_pubkey)` — deterministic, unique per creator.
 /// Unnamed meshes: random UUID, persisted to `~/.mesh-llm/mesh-id`.
@@ -6970,6 +8951,22 @@ fn was_public_path() -> std::path::PathBuf {
         .join("was-public")
 }
 
+fn clear_public_identity_file(path: &std::path::Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!("Cleared {}", path.display());
+            true
+        }
+        Err(_) => {
+            tracing::warn!("Failed to clear {}", path.display());
+            false
+        }
+    }
+}
+
 /// Record that this node was started in public mode (--auto / --publish / --mesh-name).
 /// Called at startup so we can detect a public→private transition next time.
 pub fn mark_was_public() {
@@ -6993,15 +8990,7 @@ pub fn clear_public_identity() {
     let dir = home.join(".mesh-llm");
     let mut ok = true;
     for name in &["key", "nostr.nsec", "mesh-id", "last-mesh"] {
-        let p = dir.join(name);
-        if p.exists() {
-            if std::fs::remove_file(&p).is_ok() {
-                tracing::info!("Cleared {}", p.display());
-            } else {
-                tracing::warn!("Failed to clear {}", p.display());
-                ok = false;
-            }
-        }
+        ok &= clear_public_identity_file(&dir.join(name));
     }
     // Only remove the marker after identity files are gone, so a failed
     // cleanup is retried on the next private start.
@@ -7112,15 +9101,16 @@ fn ensure_private_node_key_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+mod artifact_transfer_io;
 mod gossip;
 mod heartbeat;
 pub use gossip::backfill_legacy_descriptors;
 #[allow(unused_imports)]
 use gossip::{apply_transitive_ann, peer_meaningfully_changed};
 #[allow(unused_imports)]
-use heartbeat::{heartbeat_failure_policy_for_peer, HeartbeatFailurePolicy};
+use heartbeat::{HeartbeatFailurePolicy, heartbeat_failure_policy_for_peer};
 pub(crate) use heartbeat::{
-    peer_down_report_disposition, resolve_peer_down, PeerDownReportDisposition,
+    PeerDownReportDisposition, peer_down_report_disposition, resolve_peer_down,
 };
 
 #[cfg(test)]

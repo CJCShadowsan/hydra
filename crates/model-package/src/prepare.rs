@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use hf_hub::types::{RepoListTreeParams, RepoTreeEntry};
 use hf_hub::HFClient;
+use hf_hub::repository::RepoTreeEntry;
 use model_ref::{
     gguf_matches_quant_selector, normalize_gguf_distribution_id, quant_selector_from_gguf_file,
     split_gguf_shard_info,
@@ -55,9 +55,11 @@ pub async fn list_quants(client: &HFClient, repo: &str) -> Result<Vec<Discovered
     let (owner, name) = parse_repo(repo)?;
     let hf_repo = client.model(&owner, &name);
 
-    let params = RepoListTreeParams::builder().recursive(true).build();
-
-    let stream = hf_repo.list_tree(&params).context("list repo tree")?;
+    let stream = hf_repo
+        .list_tree()
+        .recursive(true)
+        .send()
+        .context("list repo tree")?;
 
     futures::pin_mut!(stream);
 
@@ -65,10 +67,10 @@ pub async fn list_quants(client: &HFClient, repo: &str) -> Result<Vec<Discovered
     let mut gguf_files: Vec<(String, u64)> = Vec::new();
     while let Some(entry) = stream.next().await {
         let entry = entry.context("read repo tree entry")?;
-        if let RepoTreeEntry::File { path, size, .. } = entry {
-            if path.ends_with(".gguf") {
-                gguf_files.push((path, size));
-            }
+        if let RepoTreeEntry::File { path, size, .. } = entry
+            && path.ends_with(".gguf")
+        {
+            gguf_files.push((path, size));
         }
     }
 
@@ -151,10 +153,9 @@ pub async fn resolve(
         // Verify it's shard 00001.
         if shard.part != "00001" {
             // Reconstruct the -00001- path.
-            let first = matched
+            matched
                 .first_file
-                .replace(&format!("-{}-of-", shard.part), "-00001-of-");
-            first
+                .replace(&format!("-{}-of-", shard.part), "-00001-of-")
         } else {
             matched.first_file.clone()
         }
