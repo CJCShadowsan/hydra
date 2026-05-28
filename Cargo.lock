@@ -4033,10 +4033,12 @@ dependencies = [
  "futures-util",
  "mesh-llm-skills",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
+ "toml 0.9.12+spec-1.1.0",
  "zip",
 ]
 

@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 
-use crate::target::ArchiveExt;
+use crate::{
+    manifest::{CURRENT_MESH_LLM_VERSION, validate_plugin_compatibility},
+    target::ArchiveExt,
+};
 
 pub fn extract_plugin_archive(
     archive_path: &Path,
@@ -118,6 +121,7 @@ fn validate_plugin_root(plugin_dir: &Path, plugin_name: &str) -> Result<()> {
     if !plugin_dir.join("plugin.toml").exists() {
         bail!("installed plugin is missing plugin.toml");
     }
+    validate_plugin_compatibility(plugin_dir, CURRENT_MESH_LLM_VERSION)?;
     let executable = plugin_dir.join(format!("{plugin_name}{}", std::env::consts::EXE_SUFFIX));
     if !executable.exists() {
         bail!(
@@ -209,6 +213,31 @@ mod tests {
         assert_eq!(
             fs::read_to_string(existing.join("old-version.txt")).unwrap(),
             "keep me"
+        );
+    }
+
+    #[test]
+    fn archive_requiring_newer_mesh_llm_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let install_dir = temp.path().join("installed");
+        let archive_path = temp.path().join("demo.tar.gz");
+        let executable = format!("demo{}", std::env::consts::EXE_SUFFIX);
+        write_tar_gz(
+            &archive_path,
+            "demo",
+            &[
+                ("plugin.toml", b"min_mesh_llm_version = \"999.0.0\""),
+                (&executable, b""),
+            ],
+        )
+        .unwrap();
+
+        let err = extract_plugin_archive(&archive_path, ArchiveExt::TarGz, "demo", &install_dir)
+            .expect_err("archive requiring a newer host should fail validation");
+
+        assert!(
+            err.to_string()
+                .contains("🚫 Plugin requires mesh-llm >= 999.0.0")
         );
     }
 }

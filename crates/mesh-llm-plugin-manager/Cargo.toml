@@ -18,10 +18,12 @@ flate2 = "1"
 futures-util = "0.3"
 mesh-llm-skills = { path = "../mesh-llm-skills", version = "0.68.0" }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+semver = "1"
 serde.workspace = true
 serde_json.workspace = true
 tar = "0.4"
 tempfile = "3"
+toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

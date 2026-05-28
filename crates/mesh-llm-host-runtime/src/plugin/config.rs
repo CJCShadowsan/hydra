@@ -15,7 +15,9 @@ pub use mesh_llm_config::{
     ThroughputConfig, config_path, config_to_toml, load_config, parse_config_toml, validate_config,
 };
 use mesh_llm_plugin::MeshVisibility;
-use mesh_llm_plugin_manager::{InstalledPluginMetadata, PluginStore, default_store_root};
+use mesh_llm_plugin_manager::{
+    InstalledPluginMetadata, PluginStore, default_store_root, validate_plugin_compatibility,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -178,6 +180,10 @@ fn append_installed_plugins(
             inactive.push(disabled_installed_plugin_summary(&metadata));
             continue;
         }
+        if let Err(error) = validate_plugin_compatibility(&metadata.install_path, crate::VERSION) {
+            inactive.push(incompatible_installed_plugin_summary(&metadata, error));
+            continue;
+        }
         let command = installed_plugin_command(&metadata);
         if !command.exists() {
             inactive.push(missing_installed_plugin_summary(&metadata, &command));
@@ -214,6 +220,13 @@ fn missing_installed_plugin_summary(
             command.display()
         )),
     )
+}
+
+fn incompatible_installed_plugin_summary(
+    metadata: &InstalledPluginMetadata,
+    error: anyhow::Error,
+) -> PluginSummary {
+    installed_plugin_summary(metadata, "incompatible", Some(error.to_string()))
 }
 
 fn installed_store_error_summary(error: anyhow::Error) -> PluginSummary {

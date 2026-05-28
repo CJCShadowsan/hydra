@@ -160,9 +160,18 @@ cool-plugin/
   cool-plugin.exe
 ```
 
-Only `plugin.toml` and the native executable are required. Documentation,
-license files, and skill folders are optional but recommended when the plugin
-has agent-facing workflows.
+Only `plugin.toml` and the native executable are required. `plugin.toml` should
+declare the minimum compatible host version:
+
+```toml
+min_mesh_llm_version = "0.68.0"
+```
+
+The installer rejects a plugin whose `min_mesh_llm_version` is newer than the
+current `mesh-llm` binary, and installed plugins are checked again at runtime so
+a downgraded host does not launch an incompatible plugin. Documentation, license
+files, and skill folders are optional but recommended when the plugin has
+agent-facing workflows.
 
 ## Plugin Skills
 

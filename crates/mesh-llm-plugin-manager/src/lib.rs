@@ -3,6 +3,7 @@ pub mod asset;
 pub mod catalog;
 pub mod github;
 pub mod install;
+pub mod manifest;
 pub mod skills;
 pub mod source_ref;
 pub mod store;
@@ -14,6 +15,10 @@ pub use github::{GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient};
 pub use install::{
     InstallOutcome, PluginInstallOptions, PluginProgressEvent, PluginProgressReporter,
     install_plugin, update_plugin,
+};
+pub use manifest::{
+    CURRENT_MESH_LLM_VERSION, PluginTomlManifest, load_plugin_toml, validate_plugin_compatibility,
+    validate_plugin_manifest_compatibility,
 };
 pub use mesh_llm_skills::{
     SkillAgent, SkillInstallAction, SkillInstallReport, SkillInstallStatus, SkillPackage,

@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
-use mesh_llm_plugin_manager::{PluginStore, default_store_root};
+use mesh_llm_plugin_manager::{PluginStore, default_store_root, validate_plugin_compatibility};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -139,6 +139,8 @@ fn resolve_installed_cli_plugin(command: &str) -> Result<Option<plugin::External
     if !metadata.enabled {
         return Ok(None);
     }
+    validate_plugin_compatibility(&metadata.install_path, crate::VERSION)
+        .with_context(|| format!("🚫 Plugin command '{}' is not compatible", metadata.name))?;
     let executable = metadata.executable_path();
     if !executable.exists() {
         bail!(
@@ -272,6 +274,14 @@ mod tests {
         }
     }
 
+    fn write_plugin_toml(install_path: &std::path::Path) {
+        std::fs::write(
+            install_path.join("plugin.toml"),
+            "min_mesh_llm_version = \"0.0.0\"",
+        )
+        .unwrap();
+    }
+
     #[test]
     #[serial]
     fn resolves_installed_cli_plugin_when_not_configured() {
@@ -279,6 +289,7 @@ mod tests {
         let _plugin_dir = EnvGuard::set("MESH_LLM_PLUGIN_DIR", temp.path());
         let install_path = temp.path().join("installed").join("demo");
         std::fs::create_dir_all(&install_path).unwrap();
+        write_plugin_toml(&install_path);
         let executable = install_path.join(format!("demo{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&executable, "").unwrap();
         PluginStore::new(temp.path())
@@ -300,6 +311,7 @@ mod tests {
         let _plugin_dir = EnvGuard::set("MESH_LLM_PLUGIN_DIR", temp.path());
         let install_path = temp.path().join("installed").join("demo");
         std::fs::create_dir_all(&install_path).unwrap();
+        write_plugin_toml(&install_path);
         PluginStore::new(temp.path())
             .save(&installed_metadata("demo", install_path))
             .unwrap();
