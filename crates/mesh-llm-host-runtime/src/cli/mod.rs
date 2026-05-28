@@ -742,6 +742,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    /// Install agent skills exposed by installed plugins.
+    Skills {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Benchmark and compare model/runtime strategies.
     #[command(hide = true)]
     Benchmark {
@@ -868,6 +873,46 @@ pub(crate) enum PluginCommand {
     },
     /// List installed, auto-registered, and configured plugins.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SkillCommand {
+    /// Install skills exposed by installed plugins into supported agent skill folders.
+    Install {
+        /// Agent to install for. Repeat to install to several agents.
+        #[arg(long, value_enum, conflicts_with = "all")]
+        agent: Vec<SkillAgentArg>,
+        /// Install to all supported agent locations, even if the agent is not detected.
+        #[arg(long)]
+        all: bool,
+        /// Show what would be installed without writing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace an existing non-mesh-managed skill with the same directory name.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum SkillAgentArg {
+    Goose,
+    Pi,
+    Codex,
+    Opencode,
+    Claude,
+}
+
+impl From<SkillAgentArg> for mesh_llm_plugin_manager::SkillAgent {
+    fn from(value: SkillAgentArg) -> Self {
+        match value {
+            SkillAgentArg::Goose => Self::Goose,
+            SkillAgentArg::Pi => Self::Pi,
+            SkillAgentArg::Codex => Self::Codex,
+            SkillAgentArg::Opencode => Self::Opencode,
+            SkillAgentArg::Claude => Self::Claude,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
