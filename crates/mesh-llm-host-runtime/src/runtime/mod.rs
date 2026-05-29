@@ -42,7 +42,7 @@ use crate::cli::output::{
     DashboardSnapshotFuture, DashboardSnapshotProvider, OutputEvent, RuntimeStatus, emit_event,
     flush_output, sort_dashboard_endpoint_rows,
 };
-use crate::cli::{Cli, Command, RuntimeSurface};
+use crate::cli::{Cli, Command, LogFormat, RuntimeSurface};
 use crate::crypto::{
     OwnerKeychainLoadError, default_keystore_path, default_trust_store_path, keystore_exists,
     keystore_metadata, load_keystore, load_owner_keypair_from_keychain, load_trust_store,
@@ -61,6 +61,7 @@ use skippy_protocol::FlashAttentionType;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, IsTerminal, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -139,6 +140,53 @@ struct RuntimeUnloadCandidate {
     owner: RuntimeUnloadOwner,
     instance_id: String,
     model_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmbeddedRuntimeMode {
+    Serve,
+    Client,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmbeddedRuntimeDiscoveryMode {
+    Nostr,
+    Mdns,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EmbeddedRuntimeOptions {
+    pub(crate) mode: EmbeddedRuntimeMode,
+    pub(crate) models: Vec<String>,
+    pub(crate) join: Vec<String>,
+    pub(crate) auto: bool,
+    pub(crate) api_port: u16,
+    pub(crate) console_port: u16,
+    pub(crate) mesh_name: Option<String>,
+    pub(crate) max_vram_gb: Option<f64>,
+    pub(crate) publish: bool,
+    pub(crate) discovery_mode: EmbeddedRuntimeDiscoveryMode,
+    pub(crate) relay: Vec<String>,
+    pub(crate) relay_auth: Vec<(String, String)>,
+    pub(crate) nostr_relay: Vec<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) node_name: Option<String>,
+    pub(crate) bind_ip: Option<IpAddr>,
+    pub(crate) bind_port: Option<u16>,
+    pub(crate) listen_all: bool,
+    pub(crate) enumerate_host: bool,
+    pub(crate) config_path: Option<PathBuf>,
+    pub(crate) log_format: LogFormat,
+    pub(crate) headless: bool,
+}
+
+impl EmbeddedRuntimeOptions {
+    fn runtime_surface(&self) -> RuntimeSurface {
+        match self.mode {
+            EmbeddedRuntimeMode::Serve => RuntimeSurface::Serve,
+            EmbeddedRuntimeMode::Client => RuntimeSurface::Client,
+        }
+    }
 }
 
 thread_local! {
@@ -3186,18 +3234,71 @@ pub(crate) async fn run() -> Result<()> {
     initialize_runtime_entrypoint()?;
 
     let normalized_args = crate::cli::normalize_runtime_surface_args(std::env::args_os());
-    let mut cli = Cli::parse_from(normalized_args.normalized.clone());
-    crate::cli::validate_discovery_mode_args(&cli)?;
-    crate::cli::output::OutputManager::init_global(
-        cli.log_format,
-        initial_console_session_mode(normalized_args.explicit_surface),
-    );
+    run_normalized_runtime_args(normalized_args).await
+}
 
-    if let Some(warning) = crate::cli::legacy_runtime_surface_warning(
+pub(crate) async fn run_embedded_runtime(options: EmbeddedRuntimeOptions) -> Result<()> {
+    initialize_runtime_entrypoint()?;
+
+    let surface = options.runtime_surface();
+    let cli = cli_from_embedded_options(options);
+    run_runtime_cli(cli, Some(surface), None).await
+}
+
+async fn run_normalized_runtime_args(
+    normalized_args: crate::cli::NormalizedRuntimeArgs,
+) -> Result<()> {
+    let cli = Cli::parse_from(normalized_args.normalized.clone());
+    let warning = crate::cli::legacy_runtime_surface_warning(
         &cli,
         &normalized_args.original,
         normalized_args.explicit_surface,
-    ) {
+    );
+    run_runtime_cli(cli, normalized_args.explicit_surface, warning).await
+}
+
+fn cli_from_embedded_options(options: EmbeddedRuntimeOptions) -> Cli {
+    let mut cli = Cli::parse_from(["mesh-llm"]);
+    cli.log_format = options.log_format;
+    cli.client = matches!(options.mode, EmbeddedRuntimeMode::Client);
+    cli.model = options.models.into_iter().map(PathBuf::from).collect();
+    cli.join = options.join;
+    cli.auto = options.auto;
+    cli.port = options.api_port;
+    cli.console = options.console_port;
+    cli.headless = options.headless;
+    cli.publish = options.publish;
+    cli.mesh_name = options.mesh_name;
+    cli.max_vram = options.max_vram_gb;
+    cli.mesh_discovery_mode = match options.discovery_mode {
+        EmbeddedRuntimeDiscoveryMode::Nostr => mesh_discovery::MeshDiscoveryMode::Nostr,
+        EmbeddedRuntimeDiscoveryMode::Mdns => mesh_discovery::MeshDiscoveryMode::Mdns,
+    };
+    cli.relay = options.relay;
+    cli.relay_auth = options.relay_auth;
+    cli.nostr_relay = options.nostr_relay;
+    cli.region = options.region;
+    cli.name = options.node_name;
+    cli.bind_ip = options.bind_ip;
+    cli.bind_port = options.bind_port;
+    cli.listen_all = options.listen_all;
+    cli.no_enumerate_host = !options.enumerate_host;
+    cli.config = options.config_path;
+    cli
+}
+
+async fn run_runtime_cli(
+    mut cli: Cli,
+    explicit_surface: Option<RuntimeSurface>,
+    legacy_warning: Option<String>,
+) -> Result<()> {
+    crate::cli::validate_discovery_mode_args(&cli)?;
+    crate::cli::output::OutputManager::init_global(
+        cli.log_format,
+        initial_console_session_mode(explicit_surface),
+    );
+
+    if let Some(warning) = legacy_warning {
         let _ = emit_event(OutputEvent::Warning {
             message: warning,
             context: None,
@@ -3260,7 +3361,7 @@ pub(crate) async fn run() -> Result<()> {
         startup_models,
         requested_model_names,
         bin_dir,
-    }) = prepare_runtime_startup(&cli, &config, normalized_args.explicit_surface).await?
+    }) = prepare_runtime_startup(&cli, &config, explicit_surface).await?
     else {
         return Ok(());
     };
@@ -7518,6 +7619,7 @@ async fn setup_passive_console_runtime(
         runtime_data_collector,
         runtime_data_producer,
     });
+    console_state.set_runtime_control(control_tx.clone()).await;
     console_state
         .set_control_bootstrap(api::ControlBootstrapPayload::from_control_endpoint(
             node.control_endpoint().await,

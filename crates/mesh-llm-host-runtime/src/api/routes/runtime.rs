@@ -68,6 +68,7 @@ async fn handle_post(
         "/api/runtime/control/apply-config" => {
             handle_control_apply_config(stream, state, body).await
         }
+        "/api/runtime/shutdown" => handle_shutdown(stream, state).await,
         "/api/runtime/mesh-guardrails" => handle_set_mesh_guardrails(stream, state, body).await,
         "/api/runtime/models" => handle_load_model(stream, state, body).await,
         _ => Ok(()),
@@ -93,6 +94,19 @@ async fn handle_control_bootstrap(stream: &mut TcpStream, state: &MeshApi) -> an
         return Ok(());
     }
     respond_json(stream, 200, &state.control_bootstrap().await).await
+}
+
+async fn handle_shutdown(stream: &mut TcpStream, state: &MeshApi) -> anyhow::Result<()> {
+    if !ensure_loopback_control_caller(stream).await? {
+        return Ok(());
+    }
+    let Some(control_tx) = state.inner.lock().await.runtime_control.clone() else {
+        return respond_error(stream, 503, "Runtime control unavailable").await;
+    };
+    control_tx
+        .send(RuntimeControlRequest::Shutdown)
+        .map_err(|_| anyhow::anyhow!("runtime control unavailable"))?;
+    respond_json(stream, 202, &serde_json::json!({ "shutdown": "requested" })).await
 }
 
 #[derive(Debug, Deserialize)]

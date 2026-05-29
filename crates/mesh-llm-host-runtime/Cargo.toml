@@ -94,12 +94,12 @@ toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hf_hub = { package = "hf-hub", version = "1.0.0-rc.1", default-features = false, features = ["blocking"] }
 tabwriter = "1"
+tempfile = "3"
 
 [dev-dependencies]
 axum = "0.8"
 serial_test = "3"
 mesh-client = { package = "mesh-llm-client", path = "../mesh-client" }
-tempfile = "3"
 # Used by the gated-relay regression test to spawn an in-process iroh-relay
 # with AccessConfig::Restricted, then build a real iroh::Endpoint from our
 # relay_map_from_urls output and verify --relay-auth tokens reach the relay

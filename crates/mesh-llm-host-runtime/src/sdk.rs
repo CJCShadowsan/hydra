@@ -8,8 +8,12 @@ use mesh_llm_node::serving::{
 use mesh_llm_system::hardware::{self, Metric};
 use openai_frontend::{ChatCompletionRequest, ChatMessage, MessageContent, OpenAiBackend};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 
 pub mod config {
@@ -24,6 +28,633 @@ pub mod config {
         TelemetryMetricsConfig, TensorSplitConfig, ThroughputConfig, config_path, config_to_toml,
         load_config, parse_config_toml, validate_config,
     };
+}
+
+const DEFAULT_EMBEDDED_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EmbeddedMeshNodeMode {
+    Serve,
+    Client,
+}
+
+pub type EmbeddedServeMode = EmbeddedMeshNodeMode;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EmbeddedMeshDiscoveryMode {
+    #[default]
+    Nostr,
+    Mdns,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedMeshHttpConfig {
+    pub api_port: u16,
+    pub console_port: u16,
+    pub console_ui: bool,
+}
+
+impl Default for EmbeddedMeshHttpConfig {
+    fn default() -> Self {
+        Self {
+            api_port: 9337,
+            console_port: 3131,
+            console_ui: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddedMeshServingConfig {
+    pub models: Vec<String>,
+    pub max_vram_gb: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedMeshNetworkConfig {
+    pub join_tokens: Vec<String>,
+    pub auto_join: bool,
+    pub discovery_mode: EmbeddedMeshDiscoveryMode,
+    pub publish: bool,
+    pub mesh_name: Option<String>,
+    pub region: Option<String>,
+    pub node_name: Option<String>,
+    pub iroh_relays: Vec<String>,
+    pub iroh_relay_auth: BTreeMap<String, String>,
+    pub nostr_relays: Vec<String>,
+    pub bind_ip: Option<IpAddr>,
+    pub bind_port: Option<u16>,
+    pub listen_all: bool,
+    pub enumerate_host: bool,
+}
+
+impl Default for EmbeddedMeshNetworkConfig {
+    fn default() -> Self {
+        Self {
+            join_tokens: Vec::new(),
+            auto_join: false,
+            discovery_mode: EmbeddedMeshDiscoveryMode::Nostr,
+            publish: false,
+            mesh_name: None,
+            region: None,
+            node_name: None,
+            iroh_relays: Vec::new(),
+            iroh_relay_auth: BTreeMap::new(),
+            nostr_relays: Vec::new(),
+            bind_ip: None,
+            bind_port: None,
+            listen_all: false,
+            enumerate_host: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedMeshStorageConfig {
+    pub config_path: Option<PathBuf>,
+    pub isolated_config: bool,
+}
+
+impl Default for EmbeddedMeshStorageConfig {
+    fn default() -> Self {
+        Self {
+            config_path: None,
+            isolated_config: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedMeshNodeConfig {
+    pub mode: EmbeddedMeshNodeMode,
+    pub http: EmbeddedMeshHttpConfig,
+    pub serving: EmbeddedMeshServingConfig,
+    pub network: EmbeddedMeshNetworkConfig,
+    pub storage: EmbeddedMeshStorageConfig,
+    pub startup_timeout: Duration,
+}
+
+impl Default for EmbeddedMeshNodeConfig {
+    fn default() -> Self {
+        Self {
+            mode: EmbeddedMeshNodeMode::Serve,
+            http: EmbeddedMeshHttpConfig::default(),
+            serving: EmbeddedMeshServingConfig::default(),
+            network: EmbeddedMeshNetworkConfig::default(),
+            storage: EmbeddedMeshStorageConfig::default(),
+            startup_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl EmbeddedMeshNodeConfig {
+    pub fn builder() -> EmbeddedMeshNodeBuilder {
+        EmbeddedMeshNodeBuilder::default()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddedMeshNodeBuilder {
+    config: EmbeddedMeshNodeConfig,
+}
+
+impl EmbeddedMeshNodeBuilder {
+    pub fn mode(mut self, mode: EmbeddedMeshNodeMode) -> Self {
+        self.config.mode = mode;
+        self
+    }
+
+    pub fn serve(mut self) -> Self {
+        self.config.mode = EmbeddedMeshNodeMode::Serve;
+        self
+    }
+
+    pub fn client(mut self) -> Self {
+        self.config.mode = EmbeddedMeshNodeMode::Client;
+        self
+    }
+
+    pub fn model(mut self, model_ref: impl Into<String>) -> Self {
+        self.config.serving.models.push(model_ref.into());
+        self
+    }
+
+    pub fn models<I, S>(mut self, model_refs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.serving.models = model_refs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn max_vram_gb(mut self, max_vram_gb: f64) -> Self {
+        self.config.serving.max_vram_gb = Some(max_vram_gb);
+        self
+    }
+
+    pub fn api_port(mut self, port: u16) -> Self {
+        self.config.http.api_port = port;
+        self
+    }
+
+    pub fn console_port(mut self, port: u16) -> Self {
+        self.config.http.console_port = port;
+        self
+    }
+
+    pub fn console_ui(mut self, enabled: bool) -> Self {
+        self.config.http.console_ui = enabled;
+        self
+    }
+
+    pub fn join_token(mut self, token: impl Into<String>) -> Self {
+        self.config.network.join_tokens.push(token.into());
+        self
+    }
+
+    pub fn join_tokens<I, S>(mut self, tokens: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.network.join_tokens = tokens.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn auto_join(mut self, enabled: bool) -> Self {
+        self.config.network.auto_join = enabled;
+        self
+    }
+
+    pub fn discovery_mode(mut self, mode: EmbeddedMeshDiscoveryMode) -> Self {
+        self.config.network.discovery_mode = mode;
+        self
+    }
+
+    pub fn publish(mut self, enabled: bool) -> Self {
+        self.config.network.publish = enabled;
+        self
+    }
+
+    pub fn mesh_name(mut self, name: impl Into<String>) -> Self {
+        self.config.network.mesh_name = Some(name.into());
+        self
+    }
+
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.config.network.region = Some(region.into());
+        self
+    }
+
+    pub fn node_name(mut self, name: impl Into<String>) -> Self {
+        self.config.network.node_name = Some(name.into());
+        self
+    }
+
+    pub fn iroh_relay(mut self, url: impl Into<String>) -> Self {
+        self.config.network.iroh_relays.push(url.into());
+        self
+    }
+
+    pub fn iroh_relays<I, S>(mut self, urls: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.network.iroh_relays = urls.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn iroh_relay_auth(
+        mut self,
+        relay_url: impl Into<String>,
+        bearer_token: impl Into<String>,
+    ) -> Self {
+        self.config
+            .network
+            .iroh_relay_auth
+            .insert(relay_url.into(), bearer_token.into());
+        self
+    }
+
+    pub fn nostr_relay(mut self, url: impl Into<String>) -> Self {
+        self.config.network.nostr_relays.push(url.into());
+        self
+    }
+
+    pub fn nostr_relays<I, S>(mut self, urls: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.network.nostr_relays = urls.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn bind_ip(mut self, ip: IpAddr) -> Self {
+        self.config.network.bind_ip = Some(ip);
+        self
+    }
+
+    pub fn bind_port(mut self, port: u16) -> Self {
+        self.config.network.bind_port = Some(port);
+        self
+    }
+
+    pub fn listen_all(mut self, enabled: bool) -> Self {
+        self.config.network.listen_all = enabled;
+        self
+    }
+
+    pub fn enumerate_host(mut self, enabled: bool) -> Self {
+        self.config.network.enumerate_host = enabled;
+        self
+    }
+
+    pub fn config_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.storage.config_path = Some(path.into());
+        self
+    }
+
+    pub fn isolated_config(mut self, enabled: bool) -> Self {
+        self.config.storage.isolated_config = enabled;
+        self
+    }
+
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.config.startup_timeout = timeout;
+        self
+    }
+
+    pub fn build(self) -> EmbeddedMeshNodeConfig {
+        self.config
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedServeConfig {
+    pub mode: EmbeddedMeshNodeMode,
+    pub models: Vec<String>,
+    pub join: Vec<String>,
+    pub auto: bool,
+    pub api_port: u16,
+    pub console_port: u16,
+    pub mesh_name: Option<String>,
+    pub max_vram_gb: Option<f64>,
+    pub publish: bool,
+    pub discovery_mode: EmbeddedMeshDiscoveryMode,
+    pub relay: Vec<String>,
+    pub relay_auth: BTreeMap<String, String>,
+    pub nostr_relay: Vec<String>,
+    pub region: Option<String>,
+    pub node_name: Option<String>,
+    pub bind_ip: Option<IpAddr>,
+    pub bind_port: Option<u16>,
+    pub listen_all: bool,
+    pub enumerate_host: bool,
+    pub console_ui: bool,
+    pub config_path: Option<PathBuf>,
+    pub isolated_config: bool,
+    pub startup_timeout: Duration,
+}
+
+impl Default for EmbeddedServeConfig {
+    fn default() -> Self {
+        Self {
+            mode: EmbeddedMeshNodeMode::Serve,
+            models: Vec::new(),
+            join: Vec::new(),
+            auto: false,
+            api_port: 9337,
+            console_port: 3131,
+            mesh_name: None,
+            max_vram_gb: None,
+            publish: false,
+            discovery_mode: EmbeddedMeshDiscoveryMode::Nostr,
+            relay: Vec::new(),
+            relay_auth: BTreeMap::new(),
+            nostr_relay: Vec::new(),
+            region: None,
+            node_name: None,
+            bind_ip: None,
+            bind_port: None,
+            listen_all: false,
+            enumerate_host: true,
+            console_ui: false,
+            config_path: None,
+            isolated_config: true,
+            startup_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl From<EmbeddedServeConfig> for EmbeddedMeshNodeConfig {
+    fn from(config: EmbeddedServeConfig) -> Self {
+        Self {
+            mode: config.mode,
+            http: EmbeddedMeshHttpConfig {
+                api_port: config.api_port,
+                console_port: config.console_port,
+                console_ui: config.console_ui,
+            },
+            serving: EmbeddedMeshServingConfig {
+                models: config.models,
+                max_vram_gb: config.max_vram_gb,
+            },
+            network: EmbeddedMeshNetworkConfig {
+                join_tokens: config.join,
+                auto_join: config.auto,
+                discovery_mode: config.discovery_mode,
+                publish: config.publish,
+                mesh_name: config.mesh_name,
+                region: config.region,
+                node_name: config.node_name,
+                iroh_relays: config.relay,
+                iroh_relay_auth: config.relay_auth,
+                nostr_relays: config.nostr_relay,
+                bind_ip: config.bind_ip,
+                bind_port: config.bind_port,
+                listen_all: config.listen_all,
+                enumerate_host: config.enumerate_host,
+            },
+            storage: EmbeddedMeshStorageConfig {
+                config_path: config.config_path,
+                isolated_config: config.isolated_config,
+            },
+            startup_timeout: config.startup_timeout,
+        }
+    }
+}
+
+impl From<EmbeddedMeshNodeConfig> for EmbeddedServeConfig {
+    fn from(config: EmbeddedMeshNodeConfig) -> Self {
+        Self {
+            mode: config.mode,
+            models: config.serving.models,
+            join: config.network.join_tokens,
+            auto: config.network.auto_join,
+            api_port: config.http.api_port,
+            console_port: config.http.console_port,
+            mesh_name: config.network.mesh_name,
+            max_vram_gb: config.serving.max_vram_gb,
+            publish: config.network.publish,
+            discovery_mode: config.network.discovery_mode,
+            relay: config.network.iroh_relays,
+            relay_auth: config.network.iroh_relay_auth,
+            nostr_relay: config.network.nostr_relays,
+            region: config.network.region,
+            node_name: config.network.node_name,
+            bind_ip: config.network.bind_ip,
+            bind_port: config.network.bind_port,
+            listen_all: config.network.listen_all,
+            enumerate_host: config.network.enumerate_host,
+            console_ui: config.http.console_ui,
+            config_path: config.storage.config_path,
+            isolated_config: config.storage.isolated_config,
+            startup_timeout: config.startup_timeout,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddedServeStatus {
+    pub api_base_url: String,
+    pub console_url: String,
+    pub invite_token: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+pub type EmbeddedMeshNodeStatus = EmbeddedServeStatus;
+
+pub struct EmbeddedServeHandle {
+    api_base_url: String,
+    console_url: String,
+    invite_token: Option<String>,
+    task: std::thread::JoinHandle<Result<()>>,
+    _isolated_config: Option<NamedTempFile>,
+}
+
+pub type EmbeddedMeshNodeHandle = EmbeddedServeHandle;
+
+impl EmbeddedServeHandle {
+    pub fn api_base_url(&self) -> &str {
+        &self.api_base_url
+    }
+
+    pub fn console_url(&self) -> &str {
+        &self.console_url
+    }
+
+    pub fn invite_token(&self) -> Option<&str> {
+        self.invite_token.as_deref()
+    }
+
+    pub async fn status(&self) -> Result<EmbeddedServeStatus> {
+        let payload = fetch_json(&format!("{}/api/status", self.console_url)).await?;
+        Ok(EmbeddedServeStatus {
+            api_base_url: self.api_base_url.clone(),
+            console_url: self.console_url.clone(),
+            invite_token: token_from_status(&payload),
+            payload,
+        })
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        let shutdown_url = format!("{}/api/runtime/shutdown", self.console_url);
+        reqwest::Client::new()
+            .post(shutdown_url)
+            .send()
+            .await
+            .context("request embedded mesh shutdown")?
+            .error_for_status()
+            .context("embedded mesh shutdown returned an error status")?;
+        tokio::task::spawn_blocking(move || {
+            self.task
+                .join()
+                .map_err(|_| anyhow::anyhow!("embedded mesh runtime thread panicked"))?
+        })
+        .await
+        .context("join embedded mesh runtime thread")??;
+        Ok(())
+    }
+}
+
+pub async fn start_embedded_node(
+    mut config: EmbeddedMeshNodeConfig,
+) -> Result<EmbeddedServeHandle> {
+    let isolated_config = prepare_isolated_config(&mut config)?;
+    let runtime_options = embedded_runtime_options(&config);
+    let api_base_url = format!("http://127.0.0.1:{}/v1", config.http.api_port);
+    let console_url = format!("http://127.0.0.1:{}", config.http.console_port);
+    let startup_timeout = config.startup_timeout;
+    let stack_size = embedded_worker_stack_size();
+    let task = std::thread::Builder::new()
+        .name("mesh-llm-embedded-serve".to_string())
+        .stack_size(stack_size)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("mesh-llm-embedded-worker")
+                .thread_stack_size(stack_size)
+                .build()
+                .context("build embedded mesh runtime")?;
+            runtime.block_on(crate::runtime::run_embedded_runtime(runtime_options))
+        })
+        .context("spawn embedded mesh runtime thread")?;
+    let status = wait_for_embedded_status(&console_url, startup_timeout, &task).await?;
+    Ok(EmbeddedServeHandle {
+        api_base_url,
+        console_url,
+        invite_token: token_from_status(&status),
+        task,
+        _isolated_config: isolated_config,
+    })
+}
+
+pub async fn start_embedded_serve(config: EmbeddedServeConfig) -> Result<EmbeddedServeHandle> {
+    start_embedded_node(config.into()).await
+}
+
+fn prepare_isolated_config(config: &mut EmbeddedMeshNodeConfig) -> Result<Option<NamedTempFile>> {
+    if config.storage.config_path.is_some() || !config.storage.isolated_config {
+        return Ok(None);
+    }
+    let mut file = NamedTempFile::new().context("create isolated embedded mesh config")?;
+    file.write_all(
+        b"[[plugin]]\nname = \"telemetry\"\nenabled = false\n\n[[plugin]]\nname = \"blobstore\"\nenabled = false\n",
+    )
+        .context("write isolated embedded mesh config")?;
+    config.storage.config_path = Some(file.path().to_path_buf());
+    Ok(Some(file))
+}
+
+fn embedded_runtime_options(
+    config: &EmbeddedMeshNodeConfig,
+) -> crate::runtime::EmbeddedRuntimeOptions {
+    crate::runtime::EmbeddedRuntimeOptions {
+        mode: match config.mode {
+            EmbeddedMeshNodeMode::Serve => crate::runtime::EmbeddedRuntimeMode::Serve,
+            EmbeddedMeshNodeMode::Client => crate::runtime::EmbeddedRuntimeMode::Client,
+        },
+        models: config.serving.models.clone(),
+        join: config.network.join_tokens.clone(),
+        auto: config.network.auto_join,
+        api_port: config.http.api_port,
+        console_port: config.http.console_port,
+        mesh_name: config.network.mesh_name.clone(),
+        max_vram_gb: config.serving.max_vram_gb,
+        publish: config.network.publish,
+        discovery_mode: match config.network.discovery_mode {
+            EmbeddedMeshDiscoveryMode::Nostr => crate::runtime::EmbeddedRuntimeDiscoveryMode::Nostr,
+            EmbeddedMeshDiscoveryMode::Mdns => crate::runtime::EmbeddedRuntimeDiscoveryMode::Mdns,
+        },
+        relay: config.network.iroh_relays.clone(),
+        relay_auth: config
+            .network
+            .iroh_relay_auth
+            .iter()
+            .map(|(relay, token)| (relay.clone(), token.clone()))
+            .collect(),
+        nostr_relay: config.network.nostr_relays.clone(),
+        region: config.network.region.clone(),
+        node_name: config.network.node_name.clone(),
+        bind_ip: config.network.bind_ip,
+        bind_port: config.network.bind_port,
+        listen_all: config.network.listen_all,
+        enumerate_host: config.network.enumerate_host,
+        config_path: config.storage.config_path.clone(),
+        log_format: crate::cli::LogFormat::Json,
+        headless: !config.http.console_ui,
+    }
+}
+
+async fn wait_for_embedded_status(
+    console_url: &str,
+    timeout: Duration,
+    task: &std::thread::JoinHandle<Result<()>>,
+) -> Result<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if task.is_finished() {
+            anyhow::bail!("embedded mesh runtime exited before the console became ready");
+        }
+        if let Ok(status) = fetch_json(&format!("{console_url}/api/status")).await {
+            return Ok(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for embedded mesh console at {console_url}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn fetch_json(url: &str) -> Result<serde_json::Value> {
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url} returned an error status"))?;
+    response
+        .json::<serde_json::Value>()
+        .await
+        .with_context(|| format!("decode JSON from {url}"))
+}
+
+fn token_from_status(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn embedded_worker_stack_size() -> usize {
+    std::env::var("MESH_TOKIO_STACK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_EMBEDDED_WORKER_STACK_SIZE)
 }
 
 #[derive(Clone, Debug)]
@@ -395,7 +1026,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedded_serve_config_maps_to_runtime_surface() {
+        let config = EmbeddedMeshNodeConfig::builder()
+            .model("Qwen3-8B-Q4_K_M")
+            .mesh_name("sprout")
+            .api_port(19337)
+            .console_port(13131)
+            .max_vram_gb(3.0)
+            .iroh_relay("https://relay.example")
+            .iroh_relay_auth("https://relay.example", "token")
+            .nostr_relay("wss://nostr.example")
+            .bind_port(17777)
+            .build();
+        let options = embedded_runtime_options(&config);
+
+        assert_eq!(options.mode, crate::runtime::EmbeddedRuntimeMode::Serve);
+        assert_eq!(options.models, vec!["Qwen3-8B-Q4_K_M".to_string()]);
+        assert_eq!(options.api_port, 19337);
+        assert_eq!(options.console_port, 13131);
+        assert_eq!(options.mesh_name.as_deref(), Some("sprout"));
+        assert_eq!(options.max_vram_gb, Some(3.0));
+        assert_eq!(options.relay, vec!["https://relay.example".to_string()]);
+        assert_eq!(
+            options.relay_auth,
+            vec![("https://relay.example".to_string(), "token".to_string())]
+        );
+        assert_eq!(options.nostr_relay, vec!["wss://nostr.example".to_string()]);
+        assert_eq!(options.bind_port, Some(17777));
+        assert_eq!(options.log_format, crate::cli::LogFormat::Json);
+        assert!(options.headless);
+    }
+
+    #[test]
+    fn embedded_client_config_maps_to_auto_join_runtime_surface() {
+        let config = EmbeddedMeshNodeConfig::builder()
+            .client()
+            .join_token("mesh-test-token")
+            .auto_join(true)
+            .api_port(29337)
+            .console_port(23131)
+            .discovery_mode(EmbeddedMeshDiscoveryMode::Mdns)
+            .listen_all(true)
+            .enumerate_host(false)
+            .console_ui(true)
+            .build();
+        let options = embedded_runtime_options(&config);
+
+        assert_eq!(options.mode, crate::runtime::EmbeddedRuntimeMode::Client);
+        assert_eq!(options.join, vec!["mesh-test-token".to_string()]);
+        assert!(options.auto);
+        assert!(options.models.is_empty());
+        assert_eq!(options.api_port, 29337);
+        assert_eq!(options.console_port, 23131);
+        assert_eq!(
+            options.discovery_mode,
+            crate::runtime::EmbeddedRuntimeDiscoveryMode::Mdns
+        );
+        assert!(options.listen_all);
+        assert!(!options.enumerate_host);
+        assert!(!options.headless);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "opens localhost mesh runtime sockets"]
+    async fn embedded_client_start_stop_exposes_local_status() {
+        let api_port = free_local_port();
+        let console_port = free_local_port();
+        let handle = start_embedded_serve(EmbeddedServeConfig {
+            mode: EmbeddedMeshNodeMode::Client,
+            api_port,
+            console_port,
+            startup_timeout: Duration::from_secs(15),
+            ..EmbeddedServeConfig::default()
+        })
+        .await
+        .expect("start embedded mesh client");
+
+        let status = handle.status().await.expect("embedded status");
+        assert_eq!(
+            status.api_base_url,
+            format!("http://127.0.0.1:{api_port}/v1")
+        );
+        assert_eq!(
+            status.console_url,
+            format!("http://127.0.0.1:{console_port}")
+        );
+        assert!(status.payload.is_object());
+
+        handle.stop().await.expect("stop embedded mesh client");
+    }
+
     fn test_load_options() -> SkippyModelLoadOptions {
         SkippyModelLoadOptions::for_direct_gguf("test-model", PathBuf::from("/tmp/test.gguf"))
+    }
+
+    fn free_local_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind local port")
+            .local_addr()
+            .expect("local addr")
+            .port()
     }
 }
