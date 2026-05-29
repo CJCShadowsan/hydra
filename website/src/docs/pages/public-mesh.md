@@ -1,23 +1,29 @@
 # Public Mesh
 
-The public mesh is available at:
+Use the public mesh when you want to try discovery without naming your own private mesh.
 
-[public.meshllm.cloud](https://public.meshllm.cloud)
-
-Join as a serving node if this machine can contribute compute:
+Join as a serving node:
 
 ```sh
 mesh-llm serve --auto
 ```
 
-Join as an API-only client if this machine should only send requests:
+Join as an API-only client:
 
 ```sh
 mesh-llm client --auto
 ```
 
-Point OpenAI-compatible tools at the local Mesh API:
+Open the console:
 
-```sh
-export OPENAI_BASE_URL=http://localhost:3131/v1
+```text
+http://localhost:3131
 ```
+
+Point OpenAI-compatible tools at:
+
+```text
+http://localhost:9337/v1
+```
+
+For predictable first-run behavior on your own hardware, use the [Quickstart](/docs/pages/quickstart/) private mesh flow instead.

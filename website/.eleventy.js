@@ -5,6 +5,8 @@ export default function(eleventyConfig) {
   eleventyConfig.addPassthroughCopy("src/mesh.png");
   eleventyConfig.addPassthroughCopy("src/CNAME");
   eleventyConfig.addPassthroughCopy("src/assets");
+  eleventyConfig.addPassthroughCopy({ "../install.sh": "install.sh" });
+  eleventyConfig.addPassthroughCopy({ "../install.ps1": "install.ps1" });
 
   eleventyConfig.amendLibrary("md", (md) => {
     md.use(markdownItAnchor, {

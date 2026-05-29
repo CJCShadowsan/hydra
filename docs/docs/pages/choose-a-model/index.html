@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Openai Compatible Api - Mesh LLM</title>
+  <title>Choose A Model - Mesh LLM</title>
   <meta name="description" content="Mesh serves large local models across multiple machines through one OpenAI-compatible endpoint.">
   <link rel="icon" href="/mesh-llm-logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/site.css">
@@ -60,7 +60,7 @@
 
           <a href="/docs/pages/agents/">Coding agents</a>
 
-          <a href="/docs/pages/openai-compatible-api/" aria-current="page">OpenAI-compatible API</a>
+          <a href="/docs/pages/openai-compatible-api/">OpenAI-compatible API</a>
 
           <a href="/docs/pages/private-meshes/">Private meshes</a>
 
@@ -71,7 +71,7 @@
       <section class="docs-nav-group">
         <h2>Models</h2>
 
-          <a href="/docs/pages/choose-a-model/">Choose a model</a>
+          <a href="/docs/pages/choose-a-model/" aria-current="page">Choose a model</a>
 
           <a href="/catalog/">Catalog</a>
 
@@ -134,7 +134,7 @@
 
           <a href="/docs/pages/agents/">Coding agents</a>
 
-          <a href="/docs/pages/openai-compatible-api/" aria-current="page">OpenAI-compatible API</a>
+          <a href="/docs/pages/openai-compatible-api/">OpenAI-compatible API</a>
 
           <a href="/docs/pages/private-meshes/">Private meshes</a>
 
@@ -145,7 +145,7 @@
       <section class="docs-nav-group">
         <h2>Models</h2>
 
-          <a href="/docs/pages/choose-a-model/">Choose a model</a>
+          <a href="/docs/pages/choose-a-model/" aria-current="page">Choose a model</a>
 
           <a href="/catalog/">Catalog</a>
 
@@ -185,37 +185,64 @@
 </details>
 
   <article class="doc">
-    <div class="crumb"><a href="/docs/">Docs</a> / Openai Compatible Api</div>
-    <h1 id="openai-compatible-api" tabindex="-1">OpenAI-Compatible API</h1>
-<p>Mesh exposes one local OpenAI-compatible API. Clients call the local API; Mesh decides which local or peer model handles the request.</p>
-<h2 id="base-url" tabindex="-1">Base URL</h2>
-<pre><code class="language-text">http://localhost:9337/v1
+    <div class="crumb"><a href="/docs/">Docs</a> / Choose A Model</div>
+    <h1 id="choose-a-model" tabindex="-1">Choose a Model</h1>
+<p>Start with a model that fits comfortably. After you see console chat working, move up to larger models or add more machines.</p>
+<h2 id="gemma-4-starting-points" tabindex="-1">Gemma 4 starting points</h2>
+<p>These Unsloth Gemma 4 GGUF refs are starting points, not guarantees. Fit depends on context size, runtime overhead, platform, other GPU memory use, and concurrency.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:right">Available VRAM</th>
+<th>Try first</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:right">8GB</td>
+<td><code>unsloth/gemma-4-E2B-it-GGUF:UD-Q4_K_XL</code></td>
+</tr>
+<tr>
+<td style="text-align:right">12GB</td>
+<td><code>unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL</code></td>
+</tr>
+<tr>
+<td style="text-align:right">16GB</td>
+<td><code>unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q3_K_XL</code></td>
+</tr>
+<tr>
+<td style="text-align:right">24GB</td>
+<td><code>unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M</code></td>
+</tr>
+<tr>
+<td style="text-align:right">64GB+</td>
+<td><code>unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL</code></td>
+</tr>
+</tbody>
+</table>
+<p>If loading fails, try the next smaller row or a smaller quant.</p>
+<h2 id="inspect-before-serving" tabindex="-1">Inspect before serving</h2>
+<pre><code class="language-sh">mesh-llm models show unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 </code></pre>
-<p>Environment variables:</p>
-<pre><code class="language-sh">export OPENAI_BASE_URL=http://localhost:9337/v1
-export OPENAI_API_KEY=dummy
+<p>Search the catalog:</p>
+<pre><code class="language-sh">mesh-llm models search gemma
 </code></pre>
-<h2 id="list-models" tabindex="-1">List models</h2>
-<pre><code class="language-sh">curl -s http://localhost:9337/v1/models | jq '.data[].id'
+<h2 id="serve-the-selected-model" tabindex="-1">Serve the selected model</h2>
+<pre><code class="language-sh">mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 </code></pre>
-<h2 id="chat-completion" tabindex="-1">Chat completion</h2>
-<pre><code class="language-sh">MODEL_ID=$(curl -s http://localhost:9337/v1/models | jq -r '.data[0].id')
-
-curl http://localhost:9337/v1/chat/completions \
-  -H &quot;Content-Type: application/json&quot; \
-  -d &quot;{\&quot;model\&quot;:\&quot;$MODEL_ID\&quot;,\&quot;messages\&quot;:[{\&quot;role\&quot;:\&quot;user\&quot;,\&quot;content\&quot;:\&quot;Say hello in one sentence.\&quot;}]}&quot;
-</code></pre>
-<h2 id="streaming" tabindex="-1">Streaming</h2>
-<p>Clients that support streamed OpenAI-compatible responses can use the same base URL.</p>
-<h2 id="tool-calling" tabindex="-1">Tool calling</h2>
-<p>Tool-calling support depends on the selected model and the agent client. Start with console chat, then test the specific agent workflow you plan to use.</p>
-<h2 id="structured-outputs" tabindex="-1">Structured outputs</h2>
-<p>Structured output support depends on the model and client behavior. Treat schema enforcement as model- and tool-specific unless the catalog marks stronger guarantees.</p>
+<h2 id="when-to-add-machines" tabindex="-1">When to add machines</h2>
+<p>Add another machine when:</p>
+<ul>
+<li>the model does not fit on one device</li>
+<li>you want another machine to serve a different model</li>
+<li>you want an API-only laptop to route to a workstation</li>
+</ul>
+<p>For multi-machine large-model serving, use catalog entries with layer packages. Layer packages let Mesh place parts of a supported model across available machines while requests still go through <code>http://localhost:9337/v1</code>.</p>
 
   </article>
   <aside class="docs-toc" aria-label="On this page">
     <h2>☰ On this page</h2>
-    <a href="#openai-compatible-api">Openai Compatible Api</a>
+    <a href="#choose-a-model">Choose A Model</a>
   </aside>
 </main>
 

@@ -1,42 +1,105 @@
 # Quickstart
 
-Install Mesh, join a mesh, and point clients at the local OpenAI-compatible endpoint.
+The easiest way to try Mesh is to create your own private mesh. Start one node on this machine first, open the console, send a chat message, then try an agent. Later, you can add more machines or invite other people to join the same private mesh if you choose.
 
-## Install
+## 1. Install Mesh
 
-```sh
-curl -fsSL https://mesh-llm.cloud/install.sh | sh
-```
-
-## Join the public mesh
-
-Serve from this machine if it has useful capacity:
+macOS or Linux:
 
 ```sh
-mesh-llm serve --auto
+curl -fsSL https://mesh-llm.cloud/install.sh | bash
 ```
 
-Join as an API-only client:
+Windows PowerShell:
+
+```powershell
+irm https://mesh-llm.cloud/install.ps1 | iex
+```
+
+Open a new terminal if the installer added Mesh to your `PATH`.
+
+## 2. Start one private node
+
+Use this model first on a 12GB+ machine:
 
 ```sh
-mesh-llm client --auto
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 ```
 
-## Serve a model
+On Windows PowerShell:
 
-Use a catalog model that fits on common 8GB VRAM machines:
+```powershell
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
+```
+
+Keep this terminal open. A ready node exposes:
+
+| Surface | URL |
+|---|---|
+| Console | `http://localhost:3131` |
+| OpenAI-compatible API | `http://localhost:9337/v1` |
+
+If the model does not load, stop Mesh and use the [model picker](/docs/pages/choose-a-model/) to choose a smaller starting point.
 
 ```sh
-mesh-llm serve --model gemma-4-26B-A4B-it-UD-Q4_K_M
+mesh-llm stop
 ```
 
-## Use the API
+## 3. Chat in the console
 
-Mesh exposes a local OpenAI-compatible endpoint:
+Open:
+
+```text
+http://localhost:3131
+```
+
+Send a short prompt in the chat view:
+
+```text
+Say hello in one sentence.
+```
+
+This proves the node is running, the model loaded, and the local routing path works.
+
+## 4. Check the API
+
+List the models your local node can route to:
 
 ```sh
-export OPENAI_BASE_URL=http://localhost:3131/v1
+curl -s http://localhost:9337/v1/models | jq '.data[].id'
 ```
 
-Use the same endpoint from agent tools, SDKs, or curl.
+You should see at least one model id. Use that id for direct API calls or agents.
 
+## 5. Try an agent
+
+After console chat works, run one agent launcher:
+
+```sh
+mesh-llm goose
+```
+
+Other launchers use the same local endpoint:
+
+```sh
+mesh-llm claude
+mesh-llm opencode --host 127.0.0.1:9337
+mesh-llm pi --host 127.0.0.1:9337
+```
+
+For tools that read OpenAI environment variables:
+
+```sh
+export OPENAI_BASE_URL=http://localhost:9337/v1
+export OPENAI_API_KEY=dummy
+```
+
+## Add another machine
+
+Install Mesh on another machine and run the same command with the same mesh name:
+
+```sh
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
+```
+
+Mesh nodes using the same private mesh name find each other and advertise their models to the same local API.

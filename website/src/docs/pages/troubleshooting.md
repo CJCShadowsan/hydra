@@ -1,26 +1,65 @@
 # Troubleshooting
 
-## Check Mesh status
+Start with these checks before changing configuration.
+
+## Is Mesh running?
 
 ```sh
-curl http://localhost:3131/api/status
+curl -s http://localhost:3131/api/status | jq .
 ```
 
-## Verify the local API endpoint
+If this fails, start a node:
 
 ```sh
-curl http://localhost:3131/v1/models
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E2B-it-GGUF:UD-Q4_K_XL
 ```
 
-## Stop stale processes
+## Is a model available?
+
+```sh
+curl -s http://localhost:9337/v1/models | jq '.data[].id'
+```
+
+If no models are listed, the model did not load or no serving peer is available. Try a smaller model:
+
+```sh
+mesh-llm stop
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E2B-it-GGUF:UD-Q4_K_XL
+```
+
+## Is the console reachable?
+
+Open:
+
+```text
+http://localhost:3131
+```
+
+If the console is not reachable, another process may be using the port or the node may not be running.
+
+## Stop stale local processes
 
 ```sh
 mesh-llm stop
 ```
 
-If a development instance is wedged, use the project cleanup commands from the testing docs.
+If you are developing from source, use the repository cleanup commands in the testing docs.
+
+## Agent fails but console works
+
+List models and pass one explicitly:
+
+```sh
+MODEL_ID=$(curl -s http://localhost:9337/v1/models | jq -r '.data[0].id')
+mesh-llm goose --model "$MODEL_ID"
+```
 
 ## Public mesh connection issues
 
-If this machine cannot join the public mesh, verify network access, relay connectivity, and that only one local Mesh instance is running.
+For first-run testing, prefer a private mesh:
 
+```sh
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E2B-it-GGUF:UD-Q4_K_XL
+```
+
+Then move back to `mesh-llm serve --auto` once the local install and model path work.

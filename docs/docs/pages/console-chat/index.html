@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Openai Compatible Api - Mesh LLM</title>
+  <title>Console Chat - Mesh LLM</title>
   <meta name="description" content="Mesh serves large local models across multiple machines through one OpenAI-compatible endpoint.">
   <link rel="icon" href="/mesh-llm-logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/site.css">
@@ -56,11 +56,11 @@
       <section class="docs-nav-group">
         <h2>Use Mesh</h2>
 
-          <a href="/docs/pages/console-chat/">Console chat</a>
+          <a href="/docs/pages/console-chat/" aria-current="page">Console chat</a>
 
           <a href="/docs/pages/agents/">Coding agents</a>
 
-          <a href="/docs/pages/openai-compatible-api/" aria-current="page">OpenAI-compatible API</a>
+          <a href="/docs/pages/openai-compatible-api/">OpenAI-compatible API</a>
 
           <a href="/docs/pages/private-meshes/">Private meshes</a>
 
@@ -130,11 +130,11 @@
       <section class="docs-nav-group">
         <h2>Use Mesh</h2>
 
-          <a href="/docs/pages/console-chat/">Console chat</a>
+          <a href="/docs/pages/console-chat/" aria-current="page">Console chat</a>
 
           <a href="/docs/pages/agents/">Coding agents</a>
 
-          <a href="/docs/pages/openai-compatible-api/" aria-current="page">OpenAI-compatible API</a>
+          <a href="/docs/pages/openai-compatible-api/">OpenAI-compatible API</a>
 
           <a href="/docs/pages/private-meshes/">Private meshes</a>
 
@@ -185,37 +185,60 @@
 </details>
 
   <article class="doc">
-    <div class="crumb"><a href="/docs/">Docs</a> / Openai Compatible Api</div>
-    <h1 id="openai-compatible-api" tabindex="-1">OpenAI-Compatible API</h1>
-<p>Mesh exposes one local OpenAI-compatible API. Clients call the local API; Mesh decides which local or peer model handles the request.</p>
-<h2 id="base-url" tabindex="-1">Base URL</h2>
-<pre><code class="language-text">http://localhost:9337/v1
+    <div class="crumb"><a href="/docs/">Docs</a> / Console Chat</div>
+    <h1 id="console-chat" tabindex="-1">Console Chat</h1>
+<p>Use the console before configuring agents or SDKs. It gives the fastest feedback that Mesh is actually serving a model.</p>
+<h2 id="open-the-console" tabindex="-1">Open the console</h2>
+<p>Start a node, then open:</p>
+<pre><code class="language-text">http://localhost:3131
 </code></pre>
-<p>Environment variables:</p>
-<pre><code class="language-sh">export OPENAI_BASE_URL=http://localhost:9337/v1
-export OPENAI_API_KEY=dummy
+<p>The console is local to the machine running Mesh. It shows node status, visible peers, loaded models, and chat.</p>
+<h2 id="send-a-first-prompt" tabindex="-1">Send a first prompt</h2>
+<p>Use a short prompt first:</p>
+<pre><code class="language-text">Say hello in one sentence.
 </code></pre>
-<h2 id="list-models" tabindex="-1">List models</h2>
+<p>If this works, the model is loaded and the local routing path is healthy.</p>
+<h2 id="what-to-check" tabindex="-1">What to check</h2>
+<p>The console should show:</p>
+<table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A local node</td>
+<td>Mesh is running on this machine.</td>
+</tr>
+<tr>
+<td>At least one model</td>
+<td>The API has something to route to.</td>
+</tr>
+<tr>
+<td>Chat response</td>
+<td>Inference is working end to end.</td>
+</tr>
+<tr>
+<td>Peer count</td>
+<td>Other machines in the same mesh are visible.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="if-chat-does-not-respond" tabindex="-1">If chat does not respond</h2>
+<p>Check the API from a terminal:</p>
 <pre><code class="language-sh">curl -s http://localhost:9337/v1/models | jq '.data[].id'
 </code></pre>
-<h2 id="chat-completion" tabindex="-1">Chat completion</h2>
-<pre><code class="language-sh">MODEL_ID=$(curl -s http://localhost:9337/v1/models | jq -r '.data[0].id')
-
-curl http://localhost:9337/v1/chat/completions \
-  -H &quot;Content-Type: application/json&quot; \
-  -d &quot;{\&quot;model\&quot;:\&quot;$MODEL_ID\&quot;,\&quot;messages\&quot;:[{\&quot;role\&quot;:\&quot;user\&quot;,\&quot;content\&quot;:\&quot;Say hello in one sentence.\&quot;}]}&quot;
+<p>If no models are listed, the model did not load or no serving peer is available. Try a smaller model, then restart:</p>
+<pre><code class="language-sh">mesh-llm stop
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E2B-it-GGUF:UD-Q4_K_XL
 </code></pre>
-<h2 id="streaming" tabindex="-1">Streaming</h2>
-<p>Clients that support streamed OpenAI-compatible responses can use the same base URL.</p>
-<h2 id="tool-calling" tabindex="-1">Tool calling</h2>
-<p>Tool-calling support depends on the selected model and the agent client. Start with console chat, then test the specific agent workflow you plan to use.</p>
-<h2 id="structured-outputs" tabindex="-1">Structured outputs</h2>
-<p>Structured output support depends on the model and client behavior. Treat schema enforcement as model- and tool-specific unless the catalog marks stronger guarantees.</p>
 
   </article>
   <aside class="docs-toc" aria-label="On this page">
     <h2>☰ On this page</h2>
-    <a href="#openai-compatible-api">Openai Compatible Api</a>
+    <a href="#console-chat">Console Chat</a>
   </aside>
 </main>
 

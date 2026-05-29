@@ -1,25 +1,43 @@
-# Running Large Models Across Machines
+# Running Large Models
 
-Mesh can serve models that are too large for one device by placing different parts of the model on different machines. Requests still go through one local OpenAI-compatible endpoint.
+Start with one working node first. After console chat works, use additional machines or catalog layer packages for larger models.
 
-Start every machine that can contribute compute:
+## Add serving machines
 
-```sh
-mesh-llm serve --auto
-```
-
-Then serve a model from the catalog:
+Run the same private mesh name on each machine:
 
 ```sh
-mesh-llm serve --model unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M
+mesh-llm serve --discover my-private-mesh --model <model-ref>
 ```
 
-When a model has layer packages, Mesh can place the required layers across available machines instead of requiring the full model on every node.
+Each serving node advertises its available models. Your local API stays:
 
-Use the catalog to find models with layer packages:
+```text
+http://localhost:9337/v1
+```
+
+## Use a catalog model
+
+Search for a model:
 
 ```sh
 mesh-llm models search gemma
 ```
 
-The website catalog shows package availability and copyable model refs in `org/repo:quant` form.
+Serve a selected ref:
+
+```sh
+mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M
+```
+
+## Layer packages
+
+Some catalog entries include layer packages. A layer package is a prepared artifact Mesh can use to place parts of a supported model across machines. You still send requests to one local endpoint.
+
+Use layer packages when:
+
+- the model is too large for one device
+- the catalog marks a package as available
+- the machines are on a low-latency network
+
+If you are just trying Mesh for the first time, do not start here. Run the [Quickstart](/docs/pages/quickstart/) first.

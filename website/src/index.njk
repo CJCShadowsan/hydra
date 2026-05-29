@@ -24,19 +24,20 @@ description: Mesh serves large local models across multiple machines through one
         <span class="mono">quickstart</span>
       </div>
       <pre><code><span class="comment"># Install Mesh</span>
-<span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="value">https://mesh-llm.cloud/install.sh</span> | <span class="cmd">sh</span>
+<span class="cmd">curl</span> <span class="flag">-fsSL</span> <span class="value">https://mesh-llm.cloud/install.sh</span> | <span class="cmd">bash</span>
 
-<span class="comment"># Join the public mesh and serve if this machine can</span>
-<span class="cmd">mesh-llm</span> <span class="value">serve</span> <span class="flag">--auto</span>
+<span class="comment"># Start a private mesh node with Unsloth Gemma 4</span>
+<span class="cmd">MODEL</span>=<span class="value">unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL</span>
+<span class="cmd">mesh-llm</span> <span class="value">serve</span> <span class="flag">--discover</span> <span class="value">my-private-mesh</span> <span class="flag">--model</span> <span class="value">$MODEL</span>
 
-<span class="comment"># Or join as an API-only client</span>
-<span class="cmd">mesh-llm</span> <span class="value">client</span> <span class="flag">--auto</span>
+<span class="comment"># Open the console and chat first</span>
+<span class="cmd">open</span> <span class="value">http://localhost:3131</span>
 
-<span class="comment"># Or serve an 8GB VRAM-friendly catalog model</span>
-<span class="cmd">mesh-llm</span> <span class="value">serve</span> <span class="flag">--model</span> <span class="value">gemma-4-26B-A4B-it-UD-Q4_K_M</span>
+<span class="comment"># API endpoint for tools</span>
+<span class="cmd">export</span> <span class="value">OPENAI_BASE_URL=http://localhost:9337/v1</span>
 
-<span class="comment"># Point agents at Mesh</span>
-<span class="cmd">export</span> <span class="value">OPENAI_BASE_URL=http://localhost:3131/v1</span></code></pre>
+<span class="comment"># Then try an agent</span>
+<span class="cmd">mesh-llm</span> <span class="value">goose</span></code></pre>
     </div>
   </section>
 
