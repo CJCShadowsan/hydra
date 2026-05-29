@@ -154,6 +154,46 @@ function Require-File {
     }
 }
 
+function Resolve-VulkanRuntimeDll {
+    $candidates = @()
+
+    if ($env:VULKAN_SDK) {
+        $candidates += (Join-Path $env:VULKAN_SDK "Bin\vulkan-1.dll")
+    }
+
+    $vulkanSdkRoot = "C:\VulkanSDK"
+    if (Test-Path $vulkanSdkRoot) {
+        $candidates += Get-ChildItem -Path $vulkanSdkRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "Bin\vulkan-1.dll" }
+    }
+
+    $candidates += (Join-Path $env:WINDIR "System32\vulkan-1.dll")
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if ($candidate -and (Test-Path $candidate)) {
+            return $candidate
+        }
+    }
+
+    throw "Vulkan runtime DLL not found. Install the Vulkan SDK/runtime so vulkan-1.dll is available before packaging."
+}
+
+function Copy-RuntimeDependencies {
+    param(
+        [string]$BundleDir,
+        [string]$BinaryFlavor
+    )
+
+    if ($BinaryFlavor -ne "vulkan") {
+        return
+    }
+
+    $vulkanDll = Resolve-VulkanRuntimeDll
+    Copy-Item $vulkanDll -Destination (Join-Path $BundleDir "vulkan-1.dll") -Force
+    Write-Host "Bundled Vulkan runtime dependency: $vulkanDll"
+}
+
 function Assert-MeshBinaryVersion {
     param(
         [string]$Path,
@@ -204,6 +244,7 @@ New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
 try {
     $bundleBinary = Join-Path $bundleDir (Get-BundleBinaryName "mesh-llm" $binaryFlavor)
     Copy-Item $meshBinary -Destination $bundleBinary -Force
+    Copy-RuntimeDependencies -BundleDir $bundleDir -BinaryFlavor $binaryFlavor
     Assert-MeshBinaryVersion -Path $bundleBinary -ExpectedVersion $Version
 
     $versionedPath = Join-Path $resolvedOutputDir $versionedAsset
