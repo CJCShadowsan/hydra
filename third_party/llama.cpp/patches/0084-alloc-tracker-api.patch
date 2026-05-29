@@ -5,8 +5,8 @@ Subject: [PATCH] Add GPU allocation tracker C API for dynamic VRAM headroom
 
 ---
  include/skippy.h |  5 +++++
- src/skippy.cpp   | 50 ++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 55 insertions(+)
+ src/skippy.cpp   | 41 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+)
 
 diff --git a/include/skippy.h b/include/skippy.h
 index 84173c028..7c4da4f03 100644
@@ -25,10 +25,10 @@ index 84173c028..7c4da4f03 100644
  }
  #endif
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 5f619a586..428ba87f2 100644
+index dd858fbd2..bfc062f1e 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -42,6 +42,38 @@
+@@ -42,6 +42,46 @@
  
  using json = nlohmann::ordered_json;
  
@@ -64,41 +64,36 @@ index 5f619a586..428ba87f2 100644
 +    return true; /* always proceed — caller handles OOM */
 +}
 +
++#ifdef GGML_USE_CUDA
++extern "C" {
++typedef bool (*ggml_cuda_alloc_hook_t)(size_t device, size_t alloc_size, size_t pool_used, void *user_data);
++void ggml_backend_cuda_set_alloc_hook(ggml_cuda_alloc_hook_t hook, void *user_data);
++void ggml_backend_cuda_clear_alloc_hook(void);
++}
++#endif
++
  struct skippy_model {
      llama_model * model = nullptr;
      llama_context * ctx = nullptr;
-@@ -2242,6 +2274,15 @@ enum skippy_status skippy_session_create(
+@@ -2242,6 +2282,9 @@ enum skippy_status skippy_session_create(
      if (llama_memory_t memory = model->ctx->get_memory()) {
          llama_memory_seq_rm(memory, seq_id, -1, -1);
      }
 +#ifdef GGML_USE_CUDA
-+    {
-+        extern "C" {
-+            void ggml_backend_cuda_set_alloc_hook(ggml_cuda_alloc_hook_t hook, void *user_data);
-+        }
-+        ggml_backend_cuda_set_alloc_hook(skippy_alloc_hook_callback, nullptr);
-+    }
++    ggml_backend_cuda_set_alloc_hook(skippy_alloc_hook_callback, nullptr);
 +#endif
-+
      return skippy_success(out_error);
  }
  
-@@ -2449,6 +2490,15 @@ enum skippy_status skippy_session_free(
+@@ -2447,6 +2490,9 @@ enum skippy_status skippy_session_free(
                  session->stage_model->lane_in_use[lane] = false;
              }
          }
 +#ifdef GGML_USE_CUDA
-+        {
-+            extern "C" {
-+                void ggml_backend_cuda_clear_alloc_hook(void);
-+            }
-+            ggml_backend_cuda_clear_alloc_hook();
-+        }
++        ggml_backend_cuda_clear_alloc_hook();
 +#endif
-+
          delete session;
      }
      return skippy_success(out_error);
 -- 
 2.50.1 (Apple Git-155)
-
