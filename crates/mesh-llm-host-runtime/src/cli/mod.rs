@@ -297,8 +297,8 @@ pub(crate) enum AuthCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum GpuCommand {
-    /// Force a fresh local GPU benchmark and rewrite the cached fingerprint.
-    Benchmark {
+    /// Detect and benchmark local GPUs, rewriting the cached fingerprint.
+    Detect {
         /// Print machine-readable JSON output.
         #[arg(long)]
         json: bool,
@@ -352,7 +352,7 @@ impl MeshGuardrailCliMode {
     name = "mesh-llm",
     version = crate::VERSION,
     about = "Pool GPUs over the internet for LLM inference",
-    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)\n\nFlash-MoE SSD backend:\n  Add [[plugin]] name = \"flash-moe\" with either command/args or url.\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)"
+    after_help = "Preferred runtime entrypoints:\n  mesh-llm serve\n  mesh-llm serve --model Qwen3-8B-Q4_K_M\n  mesh-llm client --auto\n  mesh-llm gpus\n\n`mesh-llm serve` loads startup models from ~/.mesh-llm/config.toml.\nRun with --help-advanced for all options.\n\nExternal backends (vLLM, TGI, Ollama):\n  Install the plugin:\n    mesh-llm plugins install openai-endpoint\n  Add to ~/.mesh-llm/config.toml:\n    [[plugin]]\n    name = \"openai-endpoint\"\n    url = \"http://gpu-box:8000/v1\"\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)\n\nFlash-MoE SSD backend:\n  Install the plugin:\n    mesh-llm plugins install flash-moe\n  Add [[plugin]] name = \"flash-moe\" with url or plugin-owned args.\n  Then: mesh-llm serve     (or: mesh-llm client  for client-only mode)"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -439,6 +439,30 @@ pub(crate) struct Cli {
     /// Region tag, e.g. "US", "EU", "AU" (shown in discovery).
     #[arg(long)]
     pub(crate) region: Option<String>,
+
+    /// Minimum mesh-llm node version required when creating a new mesh.
+    #[arg(long)]
+    pub(crate) min_node_version: Option<String>,
+
+    /// Maximum mesh-llm node version allowed when creating a new mesh.
+    #[arg(long)]
+    pub(crate) max_node_version: Option<String>,
+
+    /// Minimum protocol generation required when creating a new mesh.
+    #[arg(long)]
+    pub(crate) min_protocol_version: Option<u32>,
+
+    /// Maximum protocol generation allowed when creating a new mesh.
+    #[arg(long)]
+    pub(crate) max_protocol_version: Option<u32>,
+
+    /// Require release attestation when creating a new mesh.
+    #[arg(long)]
+    pub(crate) require_release_attestation: bool,
+
+    /// Allowed release signer key for mesh creation-time attestation policy (repeatable).
+    #[arg(long = "release-signer-key")]
+    pub(crate) release_signer_key: Vec<String>,
 
     /// Display name for this node.
     #[arg(long)]
@@ -632,6 +656,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: Option<RuntimeCommand>,
     },
+    /// Diagnose local mesh, runtime, and split-readiness problems.
+    Doctor {
+        #[command(subcommand)]
+        command: DoctorCommand,
+    },
     /// Load a local model into a running mesh-llm instance.
     Load {
         /// Model name/path/url to load
@@ -741,6 +770,11 @@ pub(crate) enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+    /// Install agent skills exposed by installed plugins.
+    Skills {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     /// Benchmark and compare model/runtime strategies.
     #[command(hide = true)]
@@ -868,6 +902,67 @@ pub(crate) enum PluginCommand {
     },
     /// List installed, auto-registered, and configured plugins.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SkillCommand {
+    /// Install skills exposed by installed plugins into supported agent skill folders.
+    Install {
+        /// Agent to install for. Repeat to install to several agents.
+        #[arg(long, value_enum, conflicts_with = "all")]
+        agent: Vec<SkillAgentArg>,
+        /// Install to all supported agent locations, even if the agent is not detected.
+        #[arg(long)]
+        all: bool,
+        /// Show what would be installed without writing files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace an existing non-mesh-managed skill with the same directory name.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum SkillAgentArg {
+    Global,
+    Goose,
+    Pi,
+    Codex,
+    Opencode,
+    Claude,
+}
+
+impl From<SkillAgentArg> for mesh_llm_plugin_manager::SkillAgent {
+    fn from(value: SkillAgentArg) -> Self {
+        match value {
+            SkillAgentArg::Global => Self::Global,
+            SkillAgentArg::Goose => Self::Goose,
+            SkillAgentArg::Pi => Self::Pi,
+            SkillAgentArg::Codex => Self::Codex,
+            SkillAgentArg::Opencode => Self::Opencode,
+            SkillAgentArg::Claude => Self::Claude,
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum DoctorCommand {
+    /// Diagnose split-readiness for a model on a running local mesh node.
+    Split {
+        /// Model ref/name to diagnose.
+        #[arg(long, visible_alias = "model")]
+        model_ref: String,
+        /// Console/API port of the running mesh-llm instance.
+        #[arg(long, default_value = "3131")]
+        port: u16,
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Write a split and Skippy diagnostic bundle to this directory.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1092,6 +1187,9 @@ pub(crate) fn assert_mesh_requirements_docs_examples_parse() {
         "--model",
         "Qwen3-8B-Q4_K_M",
         "--publish",
+        "--require-release-attestation",
+        "--release-signer-key",
+        "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "--owner-key",
         "~/.mesh-llm/owner-keystore.json",
         "--owner-required",
@@ -1104,6 +1202,13 @@ pub(crate) fn assert_mesh_requirements_docs_examples_parse() {
     assert!(signed_public.command.is_none());
     assert_eq!(signed_public.model, vec![PathBuf::from("Qwen3-8B-Q4_K_M")]);
     assert!(signed_public.publish);
+    assert!(signed_public.require_release_attestation);
+    assert_eq!(
+        signed_public.release_signer_key,
+        vec![
+            "ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
+        ]
+    );
     assert_eq!(
         signed_public.owner_key,
         Some(PathBuf::from("~/.mesh-llm/owner-keystore.json"))
@@ -1372,29 +1477,27 @@ mod tests {
     }
 
     #[test]
-    fn gpu_benchmark_subcommand_parses() {
-        let cli = Cli::parse_from(["mesh-llm", "gpu", "benchmark"]);
-
-        match cli.command.expect("gpu command expected") {
-            Command::Gpus {
+    fn gpu_detect_subcommand_parses() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu", "detect"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Gpus {
                 json: false,
-                command: Some(GpuCommand::Benchmark { json: false }),
-            } => {}
-            other => panic!("unexpected command: {other:?}"),
-        }
+                command: Some(GpuCommand::Detect { json: false }),
+            })
+        ));
     }
 
     #[test]
-    fn gpu_benchmark_subcommand_accepts_json_flag() {
-        let cli = Cli::parse_from(["mesh-llm", "gpu", "benchmark", "--json"]);
-
-        match cli.command.expect("gpu command expected") {
-            Command::Gpus {
+    fn gpu_detect_subcommand_accepts_json_flag() {
+        let cli = Cli::parse_from(["mesh-llm", "gpu", "detect", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Gpus {
                 json: false,
-                command: Some(GpuCommand::Benchmark { json: true }),
-            } => {}
-            other => panic!("unexpected command: {other:?}"),
-        }
+                command: Some(GpuCommand::Detect { json: true }),
+            })
+        ));
     }
 
     #[test]
@@ -1528,6 +1631,23 @@ mod tests {
         let cli = Cli::parse_from(normalized.normalized);
 
         assert_eq!(cli.log_format, LogFormat::Pretty);
+    }
+
+    #[test]
+    fn skills_install_accepts_global_agent_target() {
+        let cli = Cli::parse_from(["mesh-llm", "skills", "install", "--agent", "global"]);
+
+        match cli.command.expect("skills command expected") {
+            Command::Skills {
+                command:
+                    SkillCommand::Install {
+                        agent, all: false, ..
+                    },
+            } => {
+                assert_eq!(agent, vec![SkillAgentArg::Global]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

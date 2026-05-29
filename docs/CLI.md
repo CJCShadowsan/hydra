@@ -81,6 +81,10 @@ Runtime switches:
   diagnostics as JSONL. See [SWARM_CAPTURE.md](SWARM_CAPTURE.md) for the full
   debug-capture workflow.
 - `--publish`: publish your mesh for discovery.
+- `--require-release-attestation`: when creating a requirement-aware mesh,
+  require peers to present a trusted release attestation.
+- `--release-signer-key <KEY>`: allow a release signer key in the creation-time
+  attestation policy (repeatable). Use with `--require-release-attestation`.
 - `--mesh-name <MESH_NAME>`: friendly mesh name in discovery.
 - `--region <REGION>`: region hint for discovery.
 - `--name <NAME>`: display name for this node.
@@ -328,6 +332,32 @@ Switches:
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
 
 
+### `release-attestation inspect`
+
+Use this to inspect the embedded release attestation on the packaged `mesh-llm` executable.
+
+Usage:
+
+```bash
+cargo run -p xtask -- release-attestation inspect --binary /path/to/mesh-bundle/mesh-llm --public-key-file /path/to/release-signing-public-key.json
+```
+
+Switches:
+
+- `--binary <PATH>`: packaged `mesh-llm` executable to inspect.
+- `--public-key-file <PATH>`: release-signing trust root required to validate an embedded stamped binary.
+- `--json`: machine-readable output.
+
+The command reports `missing`, `valid`, or `invalid`. It applies only to the
+shipped executable, not SDK, XCFramework, or other native artifacts. Local and
+dev builds are unstamped by default, so `missing` is normal there. A
+post-download mutation can turn a stamped binary `invalid`, but the default
+startup path still allows it because this is provenance and admission
+hardening, not runtime integrity proof. Bare `inspect --binary ...` is only
+enough to classify an unstamped binary as `missing`; if an embedded attestation
+is present, the command requires `--public-key-file` and otherwise reports
+`invalid` with an explicit error.
+
 ### `gpus`
 
 Use this to inspect local GPU identity and capacity, including per-device VRAM, unified-memory state, and cached benchmark-derived bandwidth when present.
@@ -428,6 +458,16 @@ Switches:
 - `--model <MODEL>`: model id from `/v1/models`.
 - `--port <PORT>`: mesh-llm API port (default `9337`).
 
+### `pi`
+
+Use this to launch Pi already wired to mesh-llm’s OpenAI-compatible endpoint.
+
+Switches:
+
+- `--model <MODEL>`: model id from `/v1/models`.
+- `--host <HOST|HOST:PORT|URL>`: Pi target host or URL (default `127.0.0.1:9337`).
+- `--write`: write the mesh provider config without launching Pi.
+
 ### `opencode`
 
 Use this to launch OpenCode already wired to mesh-llm’s OpenAI-compatible endpoint.
@@ -439,6 +479,30 @@ Switches:
 - `--model <MODEL>`: model id from `/v1/models`.
 - `--host <HOST|HOST:PORT|URL>`: OpenCode target host or URL (default `127.0.0.1:9337`). Bare host forms assume `http`, default inference port `9337`, and default management port `3131`.
 - `--write`: write a merged `~/.config/opencode/opencode.json` that preserves unrelated root keys and sibling providers. If only `opencode.jsonc` exists, mesh-llm errors and tells you to rename or migrate it to `opencode.json` first.
+
+### `skills`
+
+Use this to install Agent Skills exposed by installed mesh plugins.
+
+Usage:
+
+```bash
+mesh-llm skills install
+mesh-llm skills install --agent goose --agent codex
+mesh-llm skills install --all --dry-run
+```
+
+By default, the installer writes only to detected agents. Plugin packages expose
+skills by shipping `skills/<name>/SKILL.md` under the plugin archive root.
+Agent launch commands (`goose`, `pi`, `opencode`, and `claude`) install
+available plugin skills for that agent before starting the session.
+
+Switches:
+
+- `--agent <AGENT>`: install to a specific agent (`goose`, `pi`, `codex`, `opencode`, `claude`); repeatable.
+- `--all`: install to every supported target location even if the agent is not detected.
+- `--dry-run`: print planned writes without changing files.
+- `--force`: overwrite an existing user-owned skill directory with the same name.
 
 ### `stop`
 

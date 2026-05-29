@@ -8,8 +8,8 @@ As implementation lands, this document should be updated to match the intended e
 
 Plugin-specific documentation:
 
-- [Flash-MoE](flash-moe.md) - built-in OpenAI-compatible backend adapter for single-node SSD expert streaming
-- [Telemetry](telemetry.md) - built-in OTLP metrics-only runtime and routing telemetry
+- [Flash-MoE](flash-moe.md) - external OpenAI-compatible backend adapter for single-node SSD expert streaming
+- [Telemetry](telemetry.md) - OTLP metrics-only runtime telemetry and external metrics plugin notes
 
 The main goals are:
 
@@ -51,6 +51,22 @@ A plugin owns:
 Plugins do not need to implement raw MCP or raw HTTP servers.
 
 The `stapler` is the host projection layer that turns plugin manifests into exposed MCP and HTTP surfaces.
+
+## Launch Contract
+
+When `mesh-llm` launches an external plugin, it provides the host connection
+details through environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `MESH_LLM_PLUGIN_ENDPOINT` | Local IPC endpoint the plugin connects to |
+| `MESH_LLM_PLUGIN_TRANSPORT` | Transport kind, such as `unix` or `pipe` |
+| `MESH_LLM_PLUGIN_NAME` | Configured plugin name |
+| `MESH_LLM_PLUGIN_URL` | Optional `[[plugin]].url` value from config |
+
+Plugin-specific configuration should live in the plugin process or use generic
+plugin config fields. The host should not special-case behavior for a plugin by
+repository or package name.
 
 ## High-Level Model
 
@@ -147,6 +163,9 @@ cool-plugin/
   cool-plugin
   README.md
   LICENSE
+  skills/
+    cool-workflow/
+      SKILL.md
 ```
 
 On Windows, the executable should use `.exe`:
@@ -157,8 +176,47 @@ cool-plugin/
   cool-plugin.exe
 ```
 
-Only `plugin.toml` and the native executable are required. Documentation and
-license files are optional but recommended.
+Only `plugin.toml` and the native executable are required. Documentation,
+license files, and skill folders are optional but recommended when the plugin
+has agent-facing workflows.
+
+## Plugin Skills
+
+Installed plugins may expose Agent Skills by shipping skill directories under
+their extracted plugin root:
+
+```text
+cool-plugin/
+  skills/
+    cool-workflow/
+      SKILL.md
+      references/
+      scripts/
+      assets/
+```
+
+Each skill directory name must use the portable Agent Skills naming convention:
+lowercase ASCII letters, numbers, and single hyphen separators. `SKILL.md`
+should include `name` and `description` YAML frontmatter and should refer to
+supporting files with paths relative to the skill directory. Avoid hard-coded
+home directories, OS-specific absolute paths, and shell-specific commands unless
+the skill documents the required platform in its `compatibility` field.
+
+`mesh-llm skills install` copies plugin skills into detected agent skill
+directories. `mesh-llm goose`, `mesh-llm pi`, `mesh-llm opencode`, and
+`mesh-llm claude` also install available plugin skills for that launched agent
+before starting the session. Existing user-owned skill directories are not
+overwritten unless `--force` is passed to the explicit installer.
+
+Current install targets:
+
+| Agent | Target |
+|---|---|
+| Goose | `~/.agents/skills` |
+| Codex | `~/.agents/skills` |
+| Pi | `~/.pi/agent/skills` |
+| OpenCode | `~/.config/opencode/skills` |
+| Claude Code | `~/.claude/skills` |
 
 Install selection should follow this order:
 
