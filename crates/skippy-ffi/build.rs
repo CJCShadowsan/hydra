@@ -299,8 +299,8 @@ fn native_auto_build_enabled() -> bool {
     for key in ["SKIPPY_LLAMA_AUTO_BUILD", "MESH_LLM_AUTO_BUILD_LLAMA"] {
         if let Ok(value) = std::env::var(key) {
             return !matches!(
-                value.as_str(),
-                "0" | "false" | "False" | "FALSE" | "no" | "No"
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
             );
         }
     }

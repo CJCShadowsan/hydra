@@ -225,13 +225,14 @@ choose a native backend.
 
 ### Embedded full node from a Rust app
 
-Rust apps that want to run a full mesh node in-process can depend on the host
-runtime directly. This is the shape used by Sprout-style integrations that want
-the local OpenAI-compatible `/v1` endpoint without spawning a sidecar process.
+Rust apps that want to run a full mesh node in-process should depend on the
+dedicated Rust SDK crate. This is the shape used by Sprout-style integrations
+that want the local OpenAI-compatible `/v1` endpoint without spawning a sidecar
+process.
 
 ```toml
 [dependencies]
-mesh-llm-host-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "<commit>", default-features = false }
+mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "<commit>", default-features = false, features = ["client"] }
 ```
 
 `default-features = false` keeps the embedded web console assets out of the
@@ -239,17 +240,16 @@ consumer binary. The local management API still runs for status and lifecycle
 checks.
 
 ```rust
-use mesh_llm_host_runtime::sdk::{EmbeddedMeshNodeConfig, start_embedded_node};
+use mesh_llm_sdk::client::{self, EmbeddedClientConfig};
 
-let config = EmbeddedMeshNodeConfig::builder()
-    .client()
+let config = EmbeddedClientConfig::builder()
     .auto_join(true)
     .api_port(9337)
     .console_port(3131)
     .console_ui(false)
     .build();
 
-let node = start_embedded_node(config).await?;
+let node = client::start(config).await?;
 let api_base = node.api_base_url(); // http://127.0.0.1:9337/v1
 let status = node.status().await?;
 
@@ -260,8 +260,9 @@ To serve local models from the same process, use serve mode and add one or more
 model refs:
 
 ```rust
-let config = EmbeddedMeshNodeConfig::builder()
-    .serve()
+use mesh_llm_sdk::serve::{self, EmbeddedServeConfig};
+
+let config = EmbeddedServeConfig::builder()
     .model("unsloth/Qwen3-0.6B-GGUF:Q4_K_M")
     .mesh_name("sprout")
     .max_vram_gb(6.0)
@@ -269,6 +270,8 @@ let config = EmbeddedMeshNodeConfig::builder()
     .console_port(3131)
     .console_ui(false)
     .build();
+
+let node = serve::start(config).await?;
 ```
 
 ## Swift Usage

@@ -4059,6 +4059,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mesh-llm-sdk"
+version = "0.68.0"
+dependencies = [
+ "anyhow",
+ "mesh-llm-host-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "mesh-llm-system"
 version = "0.68.0"
 dependencies = [

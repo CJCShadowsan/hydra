@@ -2857,7 +2857,7 @@ async fn wait_shutdown_signal() -> &'static str {
 }
 
 fn init_runtime_tracing() -> Result<()> {
-    tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("mesh_inference=info".parse()?)
@@ -2866,7 +2866,8 @@ fn init_runtime_tracing() -> Result<()> {
                 .add_directive("noq_proto::connection=warn".parse()?),
         )
         .with_writer(MeshTracingStderr)
-        .init();
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
     Ok(())
 }
 
@@ -2907,6 +2908,11 @@ fn initialize_runtime_entrypoint() -> Result<()> {
     maybe_print_advanced_help_and_exit();
     maybe_print_usage_and_exit();
     Ok(())
+}
+
+fn initialize_embedded_runtime_entrypoint() -> Result<()> {
+    crate::system::backend::clear_runtime_shutting_down();
+    init_runtime_tracing()
 }
 
 fn acquire_instance_runtime(cli: &Cli) -> Option<Arc<crate::runtime::instance::InstanceRuntime>> {
@@ -3238,7 +3244,7 @@ pub(crate) async fn run() -> Result<()> {
 }
 
 pub(crate) async fn run_embedded_runtime(mut options: EmbeddedRuntimeOptions) -> Result<()> {
-    initialize_runtime_entrypoint()?;
+    initialize_embedded_runtime_entrypoint()?;
 
     let surface = options.runtime_surface();
     let control_rx = options.control_rx.take();

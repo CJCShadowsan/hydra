@@ -18,6 +18,7 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-identity"
   "mesh-llm-protocol"
   "mesh-llm-routing"
+  "mesh-llm-sdk"
   "mesh-llm-guardrails"
   "mesh-llm-system"
   "mesh-llm-types"
@@ -140,6 +141,7 @@ weights = {
     "skippy-prompt": 3,
     "mesh-llm-system": 3,
     "mesh-llm-routing": 2,
+    "mesh-llm-sdk": 2,
     "mesh-llm-protocol": 2,
     "mesh-llm-types": 2,
     "mesh-llm-console-server": 2,
