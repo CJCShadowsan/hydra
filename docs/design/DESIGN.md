@@ -231,8 +231,11 @@ without the HTML via curl/scripts.
 Runtime reconciliation is opt-in. When `[runtime] reconcile_model_targets = true`
 is set, the local runtime may load an already-present local GGUF for a locally
 registered explicit interest, but only when `/api/model-targets` says the target
-is wanted, unserved, and a single-node capacity fit for the current node. It
-does not download models, start split serving, or act on peer-only interest.
+is wanted, unserved, and a single-node capacity fit for the current node. A
+host that is already serving a less-demanded local model may also replace it
+with a locally present, higher-ranked unserved target once active request demand
+crosses the reconciliation threshold. It does not download models, start split
+serving, or act on requested-only seed interest.
 
 `/api/model-targets` keeps raw inputs and computed hints separate. Each target
 reports `signals` from observed mesh state (`explicit_interest_count`,

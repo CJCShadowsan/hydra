@@ -51,7 +51,7 @@ MTP work with llama.cpp ongoing, but should be part of this to accelerate infere
 
 ## Demand-based rebalancing
 
-Partially done. Unified demand map via gossip, standby nodes promote to serve. Next: large-VRAM hosts auto-upgrade models when demand warrants it.
+Partially done. Unified demand map via gossip, standby nodes promote to serve, and large-VRAM hosts can opt into local-artifact model upgrades when active request demand warrants it. Next: download-backed upgrades, split-aware upgrades, and replica-count balancing.
 
 ## Blackboard ✅
 
