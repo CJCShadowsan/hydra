@@ -223,6 +223,54 @@ If no controller is attached, `serving.load()` returns an unsupported error.
 This is intentional: `mesh-llm-api-server` is platform-neutral and does not silently
 choose a native backend.
 
+### Embedded full node from a Rust app
+
+Rust apps that want to run a full mesh node in-process can depend on the host
+runtime directly. This is the shape used by Sprout-style integrations that want
+the local OpenAI-compatible `/v1` endpoint without spawning a sidecar process.
+
+```toml
+[dependencies]
+mesh-llm-host-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "<commit>", default-features = false }
+```
+
+`default-features = false` keeps the embedded web console assets out of the
+consumer binary. The local management API still runs for status and lifecycle
+checks.
+
+```rust
+use mesh_llm_host_runtime::sdk::{EmbeddedMeshNodeConfig, start_embedded_node};
+
+let config = EmbeddedMeshNodeConfig::builder()
+    .client()
+    .auto_join(true)
+    .api_port(9337)
+    .console_port(3131)
+    .console_ui(false)
+    .build();
+
+let node = start_embedded_node(config).await?;
+let api_base = node.api_base_url(); // http://127.0.0.1:9337/v1
+let status = node.status().await?;
+
+node.stop().await?;
+```
+
+To serve local models from the same process, use serve mode and add one or more
+model refs:
+
+```rust
+let config = EmbeddedMeshNodeConfig::builder()
+    .serve()
+    .model("unsloth/Qwen3-0.6B-GGUF:Q4_K_M")
+    .mesh_name("sprout")
+    .max_vram_gb(6.0)
+    .api_port(9337)
+    .console_port(3131)
+    .console_ui(false)
+    .build();
+```
+
 ## Swift Usage
 
 Configure a native runtime before local serving:
