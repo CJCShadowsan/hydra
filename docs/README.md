@@ -1,29 +1,47 @@
 # Documentation
 
-This directory holds project documentation that is not owned by a single Rust crate.
+Use this hub to find project guides that are not owned by a single Rust crate.
 
-## Start Here
+## Start here
+
+| Need | Doc |
+|---|---|
+| Install, run, service mode, model storage | [USAGE.md](USAGE.md) |
+| Private meshes, published meshes, public joining | [MESHES.md](MESHES.md) |
+| SDK usage, examples, errors, lifecycle, platform support | [SDK.md](SDK.md) |
+| Run big models with Skippy layer splits | [SKIPPY_SPLITS.md](SKIPPY_SPLITS.md) |
+| Contribute or publish layer package repositories | [LAYER_PACKAGE_REPOS.md](LAYER_PACKAGE_REPOS.md) |
+| Goose, Claude Code, OpenCode, Pi, curl, blackboard | [AGENTS.md](AGENTS.md) |
+| Command-by-command CLI reference | [CLI.md](CLI.md) |
+| Exo comparison | [EXO_COMPARISON.md](EXO_COMPARISON.md) |
+
+## Skippy and model-package docs
 
 | Doc | What it covers |
 |---|---|
-| [USAGE.md](USAGE.md) | Service installs, model commands, storage, and runtime control |
-| [AGENTS.md](AGENTS.md) | Goose, Claude Code, pi, OpenCode, curl, and blackboard usage |
-| [BENCHMARKS.md](BENCHMARKS.md) | Current benchmark numbers and performance context |
-| [SKIPPY.md](SKIPPY.md) | Plan for replacing llama-server/rpc-server serving with skippy |
-| [SKIPPY_RUNTIME_README.md](SKIPPY_RUNTIME_README.md) | Imported standalone skippy runtime README for background context |
-| [CLI.md](CLI.md) | CLI reference |
-| [CI_GUIDANCE.md](CI_GUIDANCE.md) | CI workflow responsibilities and path filtering guidance |
-| [WEBSITE_PLAN.md](WEBSITE_PLAN.md) | Public website plan for meshllm.cloud, including landing page, Catalog, docs IA, and terminology |
-| [specs/layer-package-repos.md](specs/layer-package-repos.md) | Layer package repository layout, manifest, publishing, and validation spec |
+| [skippy/FAMILY_STATUS.md](skippy/FAMILY_STATUS.md) | Certified family/split/wire-dtype status |
+| [skippy/NEW_MODEL_ONBOARDING.md](skippy/NEW_MODEL_ONBOARDING.md) | New-model split/certification intake checklist |
+| [skippy/FAMILY_CERTIFY.md](skippy/FAMILY_CERTIFY.md) | Certification workflow for new families |
+| [skippy/TOPOLOGY_PLANNER.md](skippy/TOPOLOGY_PLANNER.md) | Stage topology planning behavior |
+| [skippy/CONFIGURATION.md](skippy/CONFIGURATION.md) | Authoritative operator matrix for Skippy config keys and rejection boundaries |
+| [skippy/DATA_FLOW.md](skippy/DATA_FLOW.md) | Stage data flow and transport details |
+| [skippy/LLAMA_PARITY.md](skippy/LLAMA_PARITY.md) | Remaining llama.cpp parity queue |
+| [specs/layer-package-repos.md](specs/layer-package-repos.md) | Manifest schema and package artifact rules |
+| [SKIPPY.md](SKIPPY.md) | Skippy integration readiness and parity notes |
 
-## Topic Areas
+Use [SKIPPY_SPLITS.md](SKIPPY_SPLITS.md) for Skippy split-serving workflows.
 
-| Directory | What belongs there |
+## Other references
+
+| Doc or directory | What belongs there |
 |---|---|
-| [design/](design/) | Architecture notes, protocol design, testing playbooks, and carried llama.cpp patch documentation |
+| [BENCHMARKS.md](BENCHMARKS.md) | Current benchmark numbers and performance context |
+| [SWARM_CAPTURE.md](SWARM_CAPTURE.md) | Opt-in local debug capture for mesh membership and connection diagnostics |
+| [design/](design/) | Architecture notes, protocol design, testing playbooks, carried llama.cpp patch documentation |
 | [plugins/](plugins/) | Plugin architecture and implementation planning |
 | [plans/](plans/) | Narrow implementation plans that are not yet general design docs |
 | [specs/](specs/) | Focused behavior specs for individual features |
+| [design/OPENAI_GUARDRAILS.md](design/OPENAI_GUARDRAILS.md) | OpenAI guardrail rollout defaults, v1 limits, telemetry privacy, and evidence scaffolding |
 
 Per-crate docs stay with their crates. The main binary crate overview lives at
 [../crates/mesh-llm/README.md](../crates/mesh-llm/README.md), and the web

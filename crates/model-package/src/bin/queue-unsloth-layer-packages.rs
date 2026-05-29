@@ -1,16 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use hf_hub::error::HFError;
-use hf_hub::types::commit::AddSource;
-use hf_hub::types::{
-    CreateRepoParams, ListModelsParams, RepoDownloadFileToBytesParams, RepoInfo, RepoInfoParams,
-    RepoType, RepoUploadFileParams,
+use hf_hub::{
+    HFClient, HFError, HFRepository, RepoTypeModel,
+    repository::{AddSource, ModelInfo},
 };
-use hf_hub::{HFClient, HFRepository};
 use model_package::jobs::{CpuJobPlan, HfJobsClient, JobInfo, JobSpec, JobStage, JobVolume};
 use model_package::prepare::{self, DiscoveredQuant};
 use model_package::script;
@@ -59,6 +56,7 @@ struct Candidate {
     model: RankedModel,
     quant: DiscoveredQuant,
     target_repo: String,
+    model_layer_repos: Vec<String>,
     model_id: String,
     family: String,
 }
@@ -69,12 +67,12 @@ struct SubmittedJob {
     info: JobInfo,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum QueueStatus {
     Missing,
-    Published,
-    Cataloged,
-    Queued,
+    Published { repo: String },
+    Cataloged { repo: String },
+    Queued { repo: String },
     StaleQueued,
 }
 
@@ -195,19 +193,27 @@ async fn main() -> Result<()> {
             );
             continue;
         }
-
         let status = candidate_status(&hf_client, &candidate, args.retry_queued_after).await?;
         match status {
-            QueueStatus::Published => {
-                println!("skip {}: already published", candidate.target_repo);
+            QueueStatus::Published { repo } => {
+                println!(
+                    "skip {}: already has published layer package {}",
+                    candidate.model.repo_id, repo
+                );
                 continue;
             }
-            QueueStatus::Cataloged => {
-                println!("skip {}: already in meshllm/catalog", candidate.target_repo);
+            QueueStatus::Cataloged { repo } => {
+                println!(
+                    "skip {}: already has layer package {} in meshllm/catalog",
+                    candidate.model.repo_id, repo
+                );
                 continue;
             }
-            QueueStatus::Queued => {
-                println!("skip {}: recently queued", candidate.target_repo);
+            QueueStatus::Queued { repo } => {
+                println!(
+                    "skip {}: already recently queued layer package {}",
+                    candidate.model.repo_id, repo
+                );
                 continue;
             }
             QueueStatus::Missing | QueueStatus::StaleQueued => {}
@@ -227,12 +233,15 @@ async fn main() -> Result<()> {
             "would queue"
         };
         println!(
-            "{} {} -> {} ({}, {}, {}, {}, family={}, target={}, hardware={} {}, timeout={}, max_cost={})",
+            "{} {} -> {} ({}, source={}, bucket_estimate={}, {}, {}, family={}, target={}, hardware={} {}, timeout={}, max_cost={})",
             action,
             candidate.model_id,
             candidate.target_repo,
             candidate.quant.name,
             prepare::format_size(candidate.quant.total_bytes),
+            prepare::format_size(estimated_bucket_workspace_bytes(
+                candidate.quant.total_bytes
+            )),
             shard_label(candidate.quant.shard_count),
             rank_label(&candidate.model),
             candidate.family,
@@ -411,7 +420,9 @@ where
 fn print_help() {
     println!(
         "queue-unsloth-layer-packages\n\n\
-         Options:\n\
+           Options:\n\
+           --author HF_AUTHOR_OR_ORG\n\
+           --search QUERY\n\
            --max-jobs N\n\
            --max-per-family N\n\
            --confirm\n\
@@ -539,15 +550,14 @@ async fn list_ranked_models(
     sort: &str,
     limit: usize,
 ) -> Result<Vec<RankedModel>> {
-    let params = ListModelsParams::builder()
+    let stream = client
+        .list_models()
         .author(author.to_string())
         .search(search.to_string())
         .sort(sort.to_string())
         .full(false)
         .limit(limit)
-        .build();
-    let stream = client
-        .list_models(&params)
+        .send()
         .with_context(|| format!("list {author} models sorted by {sort}"))?;
     tokio::pin!(stream);
 
@@ -658,9 +668,8 @@ async fn build_candidate(
         return Ok(None);
     }
 
-    let distribution_id =
-        model_ref::normalize_gguf_distribution_id(&quant.first_file).unwrap_or(quant.name.clone());
-    let target_repo = format!("{}/{distribution_id}-layers", args.target_namespace);
+    let target_repo = layer_target_repo(&quant, &args.target_namespace);
+    let model_layer_repos = model_layer_repos(&quants, &args.target_namespace);
     let model_id =
         model_ref::format_gguf_selection_ref(&model.repo_id, &quant.first_file, &quant.name);
 
@@ -670,9 +679,25 @@ async fn build_candidate(
         model,
         quant,
         target_repo,
+        model_layer_repos,
         model_id,
         family,
     }))
+}
+
+fn model_layer_repos(quants: &[DiscoveredQuant], target_namespace: &str) -> Vec<String> {
+    quants
+        .iter()
+        .map(|quant| layer_target_repo(quant, target_namespace))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn layer_target_repo(quant: &DiscoveredQuant, target_namespace: &str) -> String {
+    let distribution_id =
+        model_ref::normalize_gguf_distribution_id(&quant.first_file).unwrap_or(quant.name.clone());
+    format!("{target_namespace}/{distribution_id}-layers")
 }
 
 fn select_preferred_quant(
@@ -692,125 +717,123 @@ async fn candidate_status(
     candidate: &Candidate,
     retry_queued_after: Duration,
 ) -> Result<QueueStatus> {
-    if catalog_has_package(client, candidate).await? {
-        return Ok(QueueStatus::Cataloged);
+    if let Some(repo) = catalog_layer_package_repo(client, candidate).await? {
+        return Ok(QueueStatus::Cataloged { repo });
     }
 
-    let Some(repo_info) = model_repo_info(client, &candidate.target_repo).await? else {
-        return Ok(QueueStatus::Missing);
-    };
+    let mut exact_status = QueueStatus::Missing;
+    for repo in &candidate.model_layer_repos {
+        let Some(repo_info) = model_repo_info(client, repo).await? else {
+            continue;
+        };
 
-    let siblings = repo_info.siblings.unwrap_or_default();
-    if siblings
-        .iter()
-        .any(|sibling| sibling.rfilename == "model-package.json")
-    {
-        return Ok(QueueStatus::Published);
-    }
-
-    let has_queue_marker = siblings
-        .iter()
-        .any(|sibling| sibling.rfilename == "automation/queue.json");
-    if has_queue_marker {
-        let queued_recently = repo_info
-            .last_modified
-            .as_deref()
-            .and_then(parse_hf_datetime)
-            .map(|last_modified| {
-                Utc::now()
-                    .signed_duration_since(last_modified)
-                    .to_std()
-                    .unwrap_or_default()
-                    < retry_queued_after
-            })
-            .unwrap_or(true);
-        if queued_recently {
-            return Ok(QueueStatus::Queued);
+        let siblings = repo_info.siblings.unwrap_or_default();
+        if siblings
+            .iter()
+            .any(|sibling| sibling.rfilename == "model-package.json")
+        {
+            return Ok(QueueStatus::Published { repo: repo.clone() });
         }
-        return Ok(QueueStatus::StaleQueued);
+
+        let has_queue_marker = siblings
+            .iter()
+            .any(|sibling| sibling.rfilename == "automation/queue.json");
+        if has_queue_marker {
+            let queued_recently = repo_info
+                .last_modified
+                .as_deref()
+                .and_then(parse_hf_datetime)
+                .map(|last_modified| {
+                    Utc::now()
+                        .signed_duration_since(last_modified)
+                        .to_std()
+                        .unwrap_or_default()
+                        < retry_queued_after
+                })
+                .unwrap_or(true);
+            if queued_recently {
+                return Ok(QueueStatus::Queued { repo: repo.clone() });
+            }
+            if repo == &candidate.target_repo {
+                exact_status = QueueStatus::StaleQueued;
+            }
+        }
     }
 
-    Ok(QueueStatus::Missing)
+    Ok(exact_status)
 }
 
-async fn model_repo_info(
-    client: &HFClient,
-    repo_id: &str,
-) -> Result<Option<hf_hub::types::repo::ModelInfo>> {
+async fn model_repo_info(client: &HFClient, repo_id: &str) -> Result<Option<ModelInfo>> {
     let (owner, name) = parse_repo(repo_id)?;
     let repo = client.model(owner, name);
-    match repo
-        .info(
-            &RepoInfoParams::builder()
-                .revision("main".to_string())
-                .build(),
-        )
-        .await
-    {
-        Ok(RepoInfo::Model(info)) => Ok(Some(info)),
-        Ok(_) => bail!("{repo_id} is not a model repo"),
+    match repo.info().revision("main".to_string()).send().await {
+        Ok(info) => Ok(Some(info)),
         Err(HFError::RepoNotFound { .. }) | Err(HFError::RevisionNotFound { .. }) => Ok(None),
-        Err(HFError::Http { status, .. }) if status.as_u16() == 404 => Ok(None),
+        Err(HFError::Http { context }) if context.status.as_u16() == 404 => Ok(None),
         Err(err) => Err(err).with_context(|| format!("fetch target repo info for {repo_id}")),
     }
 }
 
-async fn catalog_has_package(client: &HFClient, candidate: &Candidate) -> Result<bool> {
+async fn catalog_layer_package_repo(
+    client: &HFClient,
+    candidate: &Candidate,
+) -> Result<Option<String>> {
     let entry_path = catalog_entry_path(&candidate.model.repo_id)?;
     let dataset = client.dataset("meshllm", "catalog");
     let bytes = match dataset
-        .download_file_to_bytes(
-            &RepoDownloadFileToBytesParams::builder()
-                .filename(entry_path.clone())
-                .revision("main".to_string())
-                .build(),
-        )
+        .download_file_to_bytes()
+        .filename(entry_path.clone())
+        .revision("main".to_string())
+        .send()
         .await
     {
         Ok(bytes) => bytes,
         Err(HFError::EntryNotFound { .. }) | Err(HFError::RepoNotFound { .. }) => {
-            return Ok(false);
+            return Ok(None);
         }
-        Err(HFError::Http { status, .. }) if status.as_u16() == 404 => return Ok(false),
+        Err(HFError::Http { context }) if context.status.as_u16() == 404 => return Ok(None),
         Err(err) => {
-            return Err(err).with_context(|| format!("download catalog entry {entry_path}"))
+            return Err(err).with_context(|| format!("download catalog entry {entry_path}"));
         }
     };
 
     let value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse catalog entry {entry_path}"))?;
-    Ok(json_contains_package_repo(&value, &candidate.target_repo))
+    let target_namespace = candidate
+        .target_repo
+        .split_once('/')
+        .map(|(namespace, _)| namespace)
+        .unwrap_or_default();
+    Ok(json_layer_package_repo(&value, target_namespace))
 }
 
-fn json_contains_package_repo(value: &Value, target_repo: &str) -> bool {
+fn json_layer_package_repo(value: &Value, target_namespace: &str) -> Option<String> {
     match value {
         Value::Object(map) => {
-            if map
-                .get("repo")
-                .and_then(Value::as_str)
-                .is_some_and(|repo| repo == target_repo)
-            {
-                return true;
+            if let Some(repo) = map.get("repo").and_then(Value::as_str).filter(|repo| {
+                repo.strip_prefix(target_namespace)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                    && repo.ends_with("-layers")
+            }) {
+                return Some(repo.to_string());
             }
             map.values()
-                .any(|value| json_contains_package_repo(value, target_repo))
+                .find_map(|value| json_layer_package_repo(value, target_namespace))
         }
         Value::Array(items) => items
             .iter()
-            .any(|value| json_contains_package_repo(value, target_repo)),
-        _ => false,
+            .find_map(|value| json_layer_package_repo(value, target_namespace)),
+        _ => None,
     }
 }
 
 async fn write_queue_marker(client: &HFClient, candidate: &Candidate, args: &Args) -> Result<()> {
     client
-        .create_repo(
-            &CreateRepoParams::builder()
-                .repo_id(candidate.target_repo.clone())
-                .repo_type(RepoType::Model)
-                .exist_ok(true)
-                .build(),
-        )
+        .create_repository()
+        .repo_id(candidate.target_repo.clone())
+        .repo_type(RepoTypeModel)
+        .exist_ok(true)
+        .send()
         .await
         .with_context(|| format!("create target repo {}", candidate.target_repo))?;
 
@@ -829,15 +852,13 @@ async fn write_queue_marker(client: &HFClient, candidate: &Candidate, args: &Arg
     };
     let bytes = serde_json::to_vec_pretty(&marker)?;
     let repo = model_repo(client, &candidate.target_repo)?;
-    repo.upload_file(
-        &RepoUploadFileParams::builder()
-            .source(AddSource::Bytes(bytes))
-            .path_in_repo("automation/queue.json")
-            .commit_message(format!("Queue layer package for {}", candidate.model_id))
-            .build(),
-    )
-    .await
-    .with_context(|| format!("upload queue marker to {}", candidate.target_repo))?;
+    repo.upload_file()
+        .source(AddSource::bytes(bytes))
+        .path_in_repo("automation/queue.json")
+        .commit_message(format!("Queue layer package for {}", candidate.model_id))
+        .send()
+        .await
+        .with_context(|| format!("upload queue marker to {}", candidate.target_repo))?;
     Ok(())
 }
 
@@ -847,9 +868,23 @@ fn job_spec(
     jobs_client: &HfJobsClient,
     job_plan: &CpuJobPlan,
 ) -> Result<JobSpec> {
+    job_spec_with_token(candidate, args, jobs_client.token(), job_plan)
+}
+
+fn job_spec_with_token(
+    candidate: &Candidate,
+    args: &Args,
+    hf_token: &str,
+    job_plan: &CpuJobPlan,
+) -> Result<JobSpec> {
     let mut environment = HashMap::new();
     environment.insert("SOURCE_REPO".into(), candidate.model.repo_id.clone());
     environment.insert("SOURCE_FILE".into(), candidate.quant.first_file.clone());
+    environment.insert("SOURCE_QUANT".into(), candidate.quant.name.clone());
+    environment.insert(
+        "SOURCE_TOTAL_BYTES".into(),
+        candidate.quant.total_bytes.to_string(),
+    );
     environment.insert("TARGET_REPO".into(), candidate.target_repo.clone());
     environment.insert("MODEL_ID".into(), candidate.model_id.clone());
     environment.insert("SOURCE_REVISION".into(), "main".into());
@@ -860,7 +895,7 @@ fn job_spec(
     );
 
     let mut secrets = HashMap::new();
-    secrets.insert("HF_TOKEN".into(), jobs_client.token().to_string());
+    secrets.insert("HF_TOKEN".into(), hf_token.to_string());
 
     Ok(JobSpec {
         docker_image: "ubuntu:22.04".into(),
@@ -872,16 +907,16 @@ fn job_spec(
         timeout_seconds: job_plan.timeout_seconds,
         volumes: vec![
             JobVolume {
-                volume_type: "model".into(),
-                source: candidate.model.repo_id.clone(),
-                mount_path: "/source".into(),
-                read_only: Some(true),
-            },
-            JobVolume {
                 volume_type: "bucket".into(),
                 source: "meshllm/layer-split-output".into(),
                 mount_path: "/bucket".into(),
                 read_only: None,
+            },
+            JobVolume {
+                volume_type: "model".into(),
+                source: candidate.model.repo_id.clone(),
+                mount_path: "/source".into(),
+                read_only: Some(true),
             },
         ],
     })
@@ -919,7 +954,7 @@ fn parse_repo(repo_id: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("invalid Hugging Face repo id: {repo_id}"))
 }
 
-fn model_repo(client: &HFClient, repo_id: &str) -> Result<HFRepository> {
+fn model_repo(client: &HFClient, repo_id: &str) -> Result<HFRepository<RepoTypeModel>> {
     let (owner, name) = parse_repo(repo_id)?;
     Ok(client.model(owner, name))
 }
@@ -956,12 +991,10 @@ fn model_family_key(repo_id: &str) -> String {
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
 
-    if tokens.iter().any(|token| *token == "kimi") {
+    if tokens.contains(&"kimi") {
         return "kimi".to_string();
     }
-    if tokens.iter().any(|token| *token == "deepseek")
-        || tokens.windows(2).any(|window| window == ["deep", "seek"])
-    {
+    if tokens.contains(&"deepseek") || tokens.windows(2).any(|window| window == ["deep", "seek"]) {
         return "deepseek".to_string();
     }
     if tokens
@@ -970,7 +1003,7 @@ fn model_family_key(repo_id: &str) -> String {
     {
         return "qwen".to_string();
     }
-    if tokens.iter().any(|token| *token == "llama") {
+    if tokens.contains(&"llama") {
         return "llama".to_string();
     }
     if tokens.iter().any(|token| token.starts_with("gemma")) {
@@ -982,13 +1015,13 @@ fn model_family_key(repo_id: &str) -> String {
     if tokens.iter().any(|token| token.starts_with("mixtral")) {
         return "mixtral".to_string();
     }
-    if tokens.iter().any(|token| *token == "glm") {
+    if tokens.contains(&"glm") {
         return "glm".to_string();
     }
-    if tokens.iter().any(|token| *token == "phi") {
+    if tokens.contains(&"phi") {
         return "phi".to_string();
     }
-    if tokens.iter().any(|token| *token == "nemotron") {
+    if tokens.contains(&"nemotron") {
         return "nemotron".to_string();
     }
     if tokens.windows(2).any(|window| window == ["gpt", "oss"]) {
@@ -1026,12 +1059,19 @@ fn runtime_model_required_bytes(model_bytes: u64) -> u64 {
         .div_ceil(RUNTIME_MODEL_FIT_HEADROOM_DENOMINATOR)
 }
 
+fn estimated_bucket_workspace_bytes(source_bytes: u64) -> u64 {
+    source_bytes
+        .saturating_mul(9)
+        .div_ceil(4)
+        .saturating_add(32 * 1024 * 1024 * 1024)
+}
+
 fn status_label(status: QueueStatus) -> &'static str {
     match status {
         QueueStatus::Missing => "missing",
-        QueueStatus::Published => "published",
-        QueueStatus::Cataloged => "cataloged",
-        QueueStatus::Queued => "queued",
+        QueueStatus::Published { .. } => "published",
+        QueueStatus::Cataloged { .. } => "cataloged",
+        QueueStatus::Queued { .. } => "queued",
         QueueStatus::StaleQueued => "stale-queued",
     }
 }
@@ -1081,7 +1121,14 @@ fn parse_duration_seconds(input: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::model_family_key;
+    use std::time::Duration;
+
+    use model_package::jobs::CpuJobPlan;
+
+    use super::{
+        Args, Candidate, DiscoveredQuant, RankedModel, estimated_bucket_workspace_bytes,
+        job_spec_with_token, json_layer_package_repo, model_family_key, model_layer_repos,
+    };
 
     #[test]
     fn model_family_key_collapses_common_unsloth_families() {
@@ -1106,6 +1153,143 @@ mod tests {
         assert_eq!(
             model_family_key("unsloth/NVIDIA-Nemotron-3-Super-120B-GGUF"),
             "nemotron"
+        );
+    }
+
+    #[test]
+    fn job_spec_uses_bucket_cache_without_model_volume() {
+        let candidate = Candidate {
+            model: RankedModel {
+                repo_id: "unsloth/GLM-5-GGUF".to_string(),
+                downloads: 0,
+                likes: 0,
+                recent_rank: None,
+                popular_rank: None,
+            },
+            quant: DiscoveredQuant {
+                name: "UD-Q4_K_XL".to_string(),
+                shard_count: 10,
+                total_bytes: 401,
+                first_file: "UD-Q4_K_XL/GLM-5-UD-Q4_K_XL-00001-of-00010.gguf".to_string(),
+            },
+            target_repo: "meshllm/GLM-5-UD-Q4_K_XL-layers".to_string(),
+            model_layer_repos: vec!["meshllm/GLM-5-UD-Q4_K_XL-layers".to_string()],
+            model_id: "unsloth/GLM-5-GGUF:UD-Q4_K_XL".to_string(),
+            family: "glm".to_string(),
+        };
+        let args = Args {
+            author: "unsloth".to_string(),
+            search: "GGUF".to_string(),
+            recent_limit: 1,
+            popular_limit: 1,
+            max_jobs: 1,
+            max_per_family: 1,
+            target_namespace: "meshllm".to_string(),
+            job_namespace: "meshllm".to_string(),
+            flavor: "cpu-upgrade".to_string(),
+            timeout_seconds: 43_200,
+            mesh_llm_ref: "main".to_string(),
+            retry_queued_after: Duration::from_secs(1),
+            split_candidate_vram_bytes: 8,
+            quant_preference: vec!["UD-Q4_K_XL".to_string()],
+            wait_for_jobs: true,
+            job_poll_interval: Duration::from_secs(60),
+            catalog_direct: true,
+            confirm: true,
+            dry_run: false,
+        };
+        let job_plan = CpuJobPlan {
+            flavor: "cpu-upgrade".to_string(),
+            pretty_name: "cpu-upgrade".to_string(),
+            cpu: Some("8 vCPU".to_string()),
+            ram: Some("32 GB".to_string()),
+            unit_cost_usd: 0.0005,
+            unit_label: "minute".to_string(),
+            max_cost_usd: 0.36,
+            timeout_seconds: 43_200,
+            minimum_timeout_seconds: 43_200,
+            requested_timeout_seconds: 43_200,
+            timeout_bumped_to_minimum: false,
+            auto_selected_hardware: true,
+            selection_reason: "test".to_string(),
+            model_size_bytes: 401,
+        };
+
+        let spec = job_spec_with_token(&candidate, &args, "hf_test", &job_plan).unwrap();
+
+        assert_eq!(
+            spec.environment.get("SOURCE_QUANT").map(String::as_str),
+            Some("UD-Q4_K_XL")
+        );
+        assert_eq!(
+            spec.environment
+                .get("SOURCE_TOTAL_BYTES")
+                .map(String::as_str),
+            Some("401")
+        );
+        assert_eq!(spec.volumes.len(), 2);
+        assert_eq!(spec.volumes[0].volume_type, "bucket");
+        assert_eq!(spec.volumes[0].mount_path, "/bucket");
+        assert_eq!(spec.volumes[1].volume_type, "model");
+        assert_eq!(spec.volumes[1].source, candidate.model.repo_id);
+        assert_eq!(spec.volumes[1].mount_path, "/source");
+        assert_eq!(spec.volumes[1].read_only, Some(true));
+    }
+
+    #[test]
+    fn bucket_workspace_estimate_scales_with_source_size() {
+        assert_eq!(
+            estimated_bucket_workspace_bytes(600 * 1024 * 1024 * 1024),
+            1382 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn model_layer_repos_include_every_quant_distribution() {
+        let repos = model_layer_repos(
+            &[
+                DiscoveredQuant {
+                    name: "UD-Q4_K_XL".to_string(),
+                    shard_count: 2,
+                    total_bytes: 200,
+                    first_file: "UD-Q4_K_XL/Kimi-K2-Instruct-UD-Q4_K_XL-00001-of-00002.gguf"
+                        .to_string(),
+                },
+                DiscoveredQuant {
+                    name: "Q4_K_M".to_string(),
+                    shard_count: 1,
+                    total_bytes: 100,
+                    first_file: "Kimi-K2-Instruct-Q4_K_M.gguf".to_string(),
+                },
+            ],
+            "meshllm",
+        );
+
+        assert_eq!(
+            repos,
+            vec![
+                "meshllm/Kimi-K2-Instruct-Q4_K_M-layers",
+                "meshllm/Kimi-K2-Instruct-UD-Q4_K_XL-layers"
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_lookup_treats_any_layer_repo_as_model_coverage() {
+        let catalog = serde_json::json!({
+            "models": [{
+                "variants": [{
+                    "packages": [{
+                        "type": "layer-package",
+                        "repo": "meshllm/Kimi-K2-Instruct-Q4_K_M-layers"
+                    }]
+                }]
+            }]
+        });
+
+        assert_eq!(
+            json_layer_package_repo(&catalog, "meshllm"),
+            Some("meshllm/Kimi-K2-Instruct-Q4_K_M-layers".to_string())
         );
     }
 }

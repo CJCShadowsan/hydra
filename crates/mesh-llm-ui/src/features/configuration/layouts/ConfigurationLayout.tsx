@@ -2,13 +2,15 @@ import type { ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 
 type ConfigurationLayoutProps = {
+  banner?: ReactNode
   header: ReactNode
   children: ReactNode
 }
 
-export function ConfigurationLayout({ header, children }: ConfigurationLayoutProps) {
+export function ConfigurationLayout({ banner, header, children }: ConfigurationLayoutProps) {
   return (
     <div className="-mt-[18px] md:-mx-5">
+      {banner ? <div className="px-5 pt-3">{banner}</div> : null}
       {header}
       {children}
     </div>
@@ -17,9 +19,9 @@ export function ConfigurationLayout({ header, children }: ConfigurationLayoutPro
 
 export function ConfigurationDeploymentLayout({ rail, children }: { rail: ReactNode; children: ReactNode }) {
   return (
-    <div className="grid min-w-0 gap-3.5 lg:grid-cols-[220px_minmax(0,1fr)]">
+    <div className="grid min-w-0 gap-[14px] lg:grid-cols-[250px_minmax(0,1fr)]">
       {rail}
-      <div className="min-w-0 space-y-3">{children}</div>
+      <div className="min-w-0 space-y-[14px]">{children}</div>
     </div>
   )
 }

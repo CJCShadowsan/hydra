@@ -26,6 +26,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "docs/skippy/llama-parity-candidates.json"
 DEFAULT_UPSTREAM_PIN = ROOT / "third_party/llama.cpp/upstream.txt"
+SHARDED_GGUF_RE = re.compile(r"-0*(\d+)-of-0*\d+\.gguf$", re.IGNORECASE)
 
 
 def repo_cache_dir(repo: str) -> Path:
@@ -137,6 +138,16 @@ def filter_priority(
     return [row for row in rows if str(row.get("priority", "p2")).lower() in requested]
 
 
+def candidate_file_rank(path: Path) -> int:
+    name = path.name.lower()
+    if "mmproj" in name:
+        return 3
+    shard = SHARDED_GGUF_RE.search(name)
+    if shard:
+        return 0 if int(shard.group(1)) == 1 else 2
+    return 1
+
+
 def resolve_candidate_file(candidate: dict[str, Any]) -> Path | None:
     repo = candidate.get("repo")
     include = candidate.get("include", "*.gguf")
@@ -152,7 +163,7 @@ def resolve_candidate_file(candidate: dict[str, Any]) -> Path | None:
         return None
     matches.sort(
         key=lambda path: (
-            "mmproj" in path.name.lower(),
+            candidate_file_rank(path),
             path.stat().st_size,
             str(path),
         )
@@ -291,7 +302,10 @@ def split_args(layer_count: int) -> tuple[int, str]:
 def default_stage_build_dir() -> str | None:
     if os.environ.get("LLAMA_STAGE_BUILD_DIR"):
         return os.environ["LLAMA_STAGE_BUILD_DIR"]
-    llama_root = ROOT / ".deps/llama.cpp"
+    llama_build_roots = (
+        ROOT / ".deps/llama-build",
+        ROOT / ".deps/llama.cpp",
+    )
     for name in (
         "build-stage-abi-metal",
         "build-stage-abi-static",
@@ -299,9 +313,10 @@ def default_stage_build_dir() -> str | None:
         "build-stage-abi-vulkan",
         "build-stage-abi-rocm",
     ):
-        candidate = llama_root / name
-        if candidate.is_dir():
-            return str(candidate)
+        for llama_root in llama_build_roots:
+            candidate = llama_root / name
+            if candidate.is_dir():
+                return str(candidate)
     return None
 
 
@@ -463,6 +478,7 @@ def validate_stage_abi_allowlist() -> int:
             "glm-dsa",
             "lfm2moe",
             "minicpm",
+            "mistral4",
             "nemotron_h_moe",
         }
     )

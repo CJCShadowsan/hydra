@@ -14,13 +14,11 @@ use std::{
 
 #[cfg(test)]
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, LazyLock,
+    atomic::{AtomicBool, Ordering},
 };
 
-use hf_hub::{RepoDownloadFileParams, RepoInfo, RepoInfoParams};
-
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use model_resolver::{
     CatalogProvider, CatalogSidecarAsset, CatalogSidecarRef,
     CatalogVariant as ResolverCatalogVariant, HfCatalogProvider, ModelArtifactCandidate,
@@ -144,22 +142,21 @@ pub fn is_catalog_stale() -> bool {
 /// every `entries/**/*.json` file. No hardcoded file list — new models added to the
 /// catalog are discovered automatically.
 pub fn refresh_catalog() -> Result<()> {
+    super::run_hf_sync(refresh_catalog_sync)
+}
+
+fn refresh_catalog_sync() -> Result<()> {
     let api = super::build_hf_api(false)?;
     let dataset = api.dataset("meshllm", "catalog");
 
     // List all files in the dataset repo
     let info = dataset
-        .info(
-            &RepoInfoParams::builder()
-                .revision("main".to_string())
-                .build(),
-        )
+        .info()
+        .revision("main".to_string())
+        .send()
         .context("fetch meshllm/catalog dataset info")?;
 
-    let siblings = match info {
-        RepoInfo::Dataset(ref d) => d.siblings.as_ref(),
-        _ => None,
-    };
+    let siblings = info.siblings.as_ref();
     let Some(siblings) = siblings else {
         bail!("meshllm/catalog dataset info has no file listing");
     };
@@ -186,12 +183,10 @@ pub fn refresh_catalog() -> Result<()> {
     // Download each entry file
     for entry_file in &entry_files {
         let downloaded = dataset
-            .download_file(
-                &RepoDownloadFileParams::builder()
-                    .filename(entry_file.clone())
-                    .revision("main".to_string())
-                    .build(),
-            )
+            .download_file()
+            .filename(entry_file.clone())
+            .revision("main".to_string())
+            .send()
             .with_context(|| format!("download catalog entry {entry_file}"))?;
 
         // Copy to our cache dir structure if needed
@@ -360,24 +355,24 @@ fn hf_model_repo_has_file(repo: &str, revision: &str, file: &str) -> Result<bool
         }
     }
 
-    let api = super::build_hf_api(false)?;
-    let (owner, name) = repo.split_once('/').unwrap_or(("", repo));
-    let info = api
-        .model(owner, name)
-        .info(
-            &RepoInfoParams::builder()
-                .revision(revision.to_string())
-                .build(),
-        )
-        .with_context(|| format!("fetch Hugging Face model repo {repo}@{revision}"))?;
-    let RepoInfo::Model(detail) = info else {
-        bail!("expected Hugging Face model repo info for {repo}@{revision}");
-    };
-    Ok(detail
-        .siblings
-        .unwrap_or_default()
-        .iter()
-        .any(|sibling| sibling.rfilename == file))
+    let repo = repo.to_string();
+    let revision = revision.to_string();
+    let file = file.to_string();
+    super::run_hf_sync(move || {
+        let api = super::build_hf_api(false)?;
+        let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
+        let info = api
+            .model(owner, name)
+            .info()
+            .revision(revision.clone())
+            .send()
+            .with_context(|| format!("fetch Hugging Face model repo {repo}@{revision}"))?;
+        Ok(info
+            .siblings
+            .unwrap_or_default()
+            .iter()
+            .any(|sibling| sibling.rfilename == file))
+    })
 }
 
 /// A resolved model download reference from the remote catalog.
@@ -832,7 +827,14 @@ mod tests {
             variant.curated.draft.as_deref(),
             Some("Qwen3-Coder-Draft-Q4_K_M")
         );
-        assert_eq!(variant.curated.moe.as_deref(), Some("480B/35B"));
+        assert_eq!(
+            variant
+                .curated
+                .moe
+                .as_ref()
+                .and_then(|value| value.as_str()),
+            Some("480B/35B")
+        );
         assert!(matches!(
             variant.curated.mmproj.as_ref(),
             Some(CatalogSidecar::Asset(asset))
@@ -1139,11 +1141,14 @@ mod tests {
     #[serial]
     fn stale_check_returns_true_for_nonexistent() {
         let prev = std::env::var_os("HF_HOME");
-        std::env::set_var("HF_HOME", "/tmp/meshllm-test-nonexistent-dir-xyz");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", "/tmp/meshllm-test-nonexistent-dir-xyz") };
         let result = is_catalog_stale();
         match prev {
-            Some(val) => std::env::set_var("HF_HOME", val),
-            None => std::env::remove_var("HF_HOME"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(val) => unsafe { std::env::set_var("HF_HOME", val) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("HF_HOME") },
         }
         assert!(result);
     }
@@ -1159,7 +1164,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::env::set_var("HF_HOME", &temp);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HOME", &temp) };
 
         let entries_dir = catalog_cache_dir().join("entries");
         fs::create_dir_all(&entries_dir).unwrap();
@@ -1170,8 +1176,10 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp);
         match prev {
-            Some(val) => std::env::set_var("HF_HOME", val),
-            None => std::env::remove_var("HF_HOME"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(val) => unsafe { std::env::set_var("HF_HOME", val) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("HF_HOME") },
         }
     }
 }

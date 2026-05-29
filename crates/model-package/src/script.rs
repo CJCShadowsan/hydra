@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use hf_hub::{BucketTreeEntry, HFClient};
+use hf_hub::{
+    HFClient,
+    buckets::{BucketDownload, BucketTreeEntry, BucketUpload},
+};
 use sha2::{Digest, Sha256};
 
 /// The embedded canonical job script.
@@ -29,7 +32,9 @@ pub async fn check_bucket_script(client: &HFClient) -> Result<ScriptFreshness> {
     let paths = vec!["split-model-job.sh".to_string()];
 
     let entries = bucket
-        .get_paths_info(&paths)
+        .get_paths_info()
+        .paths(paths)
+        .send()
         .await
         .context("check bucket script metadata")?;
 
@@ -57,12 +62,13 @@ pub async fn check_bucket_script(client: &HFClient) -> Result<ScriptFreshness> {
     let tmp_dir = tempfile::tempdir().context("create bucket script check temp dir")?;
     let tmp_path = tmp_dir.path().join("split-model-job.sh");
 
-    let download_params = hf_hub::BucketDownloadFilesParams {
-        files: vec![("split-model-job.sh".to_string(), tmp_path.clone())],
-    };
-
     bucket
-        .download_files(&download_params, &Default::default())
+        .download_files()
+        .files(vec![BucketDownload::new(
+            "split-model-job.sh",
+            tmp_path.clone(),
+        )])
+        .send()
         .await
         .context("download bucket script for hash verification")?;
 
@@ -96,9 +102,13 @@ pub async fn update_bucket_script(client: &HFClient) -> Result<()> {
     let tmp_path = tmp_dir.path().join("split-model-job.sh");
     std::fs::write(&tmp_path, EMBEDDED_SCRIPT)?;
 
-    let files = vec![(tmp_path.clone(), "split-model-job.sh".to_string())];
     bucket
-        .upload_files(&files, &Default::default())
+        .upload_files()
+        .files(vec![BucketUpload::new(
+            tmp_path.clone(),
+            "split-model-job.sh",
+        )])
+        .send()
         .await
         .context("upload script to meshllm/layer-split-output bucket")?;
 
@@ -137,6 +147,56 @@ mod tests {
             "For upstream architecture details, chat template guidance, sampling recommendations"
         ));
         assert!(EMBEDDED_SCRIPT.contains("Package manifest SHA-256"));
-        assert!(EMBEDDED_SCRIPT.contains("skippy-model-package validate-package"));
+        assert!(EMBEDDED_SCRIPT.contains("uploaded to this repository"));
+    }
+
+    #[test]
+    fn embedded_script_streams_package_artifacts_to_hub() {
+        assert!(EMBEDDED_SCRIPT.contains("SOURCE_QUANT"));
+        assert!(EMBEDDED_SCRIPT.contains("SOURCE_TOTAL_BYTES"));
+        assert!(EMBEDDED_SCRIPT.contains("Estimated fallback /bucket cache needed"));
+        assert!(EMBEDDED_SCRIPT.contains("estimate_bucket_workspace_bytes"));
+        assert!(EMBEDDED_SCRIPT.contains(r#"HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}""#));
+        assert!(EMBEDDED_SCRIPT.contains(r#"HF_XET_CACHE="${HF_XET_CACHE:-${HF_HOME}/xet}""#));
+        assert!(
+            EMBEDDED_SCRIPT.contains(r#"PACKAGE_DIR="${PACKAGE_DIR:-${LOCAL_WORK_DIR}/package}""#)
+        );
+        assert!(EMBEDDED_SCRIPT.contains(r#"JOB_TMP_DIR="${JOB_TMP_DIR:-${LOCAL_WORK_DIR}/tmp}""#));
+        assert!(EMBEDDED_SCRIPT.contains(r#"LOCAL_WORK_DIR="${LOCAL_WORK_DIR:-/tmp/"#));
+        assert!(
+            EMBEDDED_SCRIPT.contains(r#"BUILD_TMP_DIR="${BUILD_TMP_DIR:-${LOCAL_WORK_DIR}/tmp}""#)
+        );
+        assert!(EMBEDDED_SCRIPT.contains(r#"TMPDIR="$BUILD_TMP_DIR""#));
+        assert!(EMBEDDED_SCRIPT.contains(r#"TMPDIR="$JOB_TMP_DIR""#));
+        assert!(EMBEDDED_SCRIPT.contains("export TMPDIR TEMP TMP"));
+        assert!(
+            EMBEDDED_SCRIPT.contains(
+                r#"CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${LOCAL_WORK_DIR}/cargo-target}""#
+            )
+        );
+        assert!(
+            EMBEDDED_SCRIPT.contains(
+                r#"rm -rf "$BUILD_DIR" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$RUSTUP_HOME""#
+            )
+        );
+        assert!(EMBEDDED_SCRIPT.contains(r#"SOURCE_REF="${SOURCE_REPO}:${SOURCE_QUANT}""#));
+        assert!(
+            EMBEDDED_SCRIPT
+                .contains(r#"SOURCE_REF="${SOURCE_REPO}@${SOURCE_REVISION}:${SOURCE_QUANT}""#)
+        );
+        assert!(EMBEDDED_SCRIPT.contains("log_storage_snapshot"));
+        assert!(EMBEDDED_SCRIPT.contains("start_heartbeat"));
+        assert!(EMBEDDED_SCRIPT.contains("Starting write-package"));
+        assert!(EMBEDDED_SCRIPT.contains("upload-package-artifact.py"));
+        assert!(EMBEDDED_SCRIPT.contains("SKIPPY_PACKAGE_ARTIFACT_PATH"));
+        assert!(EMBEDDED_SCRIPT.contains("SKIPPY_PACKAGE_ARTIFACT_RELATIVE_PATH"));
+        assert!(EMBEDDED_SCRIPT.contains(r#"--after-artifact-command "$ARTIFACT_UPLOAD_HOOK""#));
+        assert!(EMBEDDED_SCRIPT.contains("Uploaded and removed"));
+        assert!(!EMBEDDED_SCRIPT.contains("api.upload_folder"));
+        assert!(EMBEDDED_SCRIPT.contains(r#"MOUNTED_SOURCE_PATH="/source/${SOURCE_FILE}""#));
+        assert!(EMBEDDED_SCRIPT.contains(r#"WRITE_PACKAGE_INPUT="$MOUNTED_SOURCE_PATH""#));
+        assert!(EMBEDDED_SCRIPT.contains(r#"--source-file "$SOURCE_FILE""#));
+        assert!(EMBEDDED_SCRIPT.contains(r#"time "$SLICER" write-package "$WRITE_PACKAGE_INPUT""#));
+        assert!(!EMBEDDED_SCRIPT.contains(r#"time $SLICER write-package "$SOURCE_PATH""#));
     }
 }

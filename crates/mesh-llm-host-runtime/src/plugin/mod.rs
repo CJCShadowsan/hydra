@@ -8,7 +8,7 @@ mod transport;
 use crate::runtime_data::{
     PluginDataKey, PluginEndpointKey, RuntimeDataCollector, RuntimeDataSource,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 pub use mesh_llm_plugin::proto;
 use rmcp::model::ServerInfo;
 use rmcp::model::{
@@ -16,25 +16,33 @@ use rmcp::model::{
     ReadResourceRequestParams, ReadResourceResult,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use url::Url;
 
 #[allow(unused_imports)]
 pub use self::config::ExternalPluginSpec;
 #[allow(unused_imports)]
+pub(crate) use self::config::{
+    BoolOrAuto, HardwareConfig, IntegerOrString, ModelConfigDefaults, ModelFitConfig,
+    MultimodalConfig, ReasoningBudget, ReasoningEnabled, RequestDefaultsConfig, SkippyConfig,
+    SpeculativeConfig, StringOrStringList, ThroughputConfig,
+};
+#[allow(unused_imports)]
 pub use self::config::{
-    config_path, load_config, resolve_plugins, GpuAssignment, GpuConfig, MeshConfig,
-    ModelConfigEntry, PluginConfigEntry, PluginHostMode, ResolvedPlugins, TelemetryConfig,
-    TelemetryMetricsConfig,
+    ConfigEditor, ConfigStore, GpuAssignment, GpuConfig, LocalServingNodeConfig, MeshConfig,
+    ModelConfigEditor, ModelConfigEntry, ModelDefaultsEditor, ModelRuntimeKind, PluginConfigEditor,
+    PluginConfigEntry, PluginHostMode, ResolvedPlugins, TelemetryConfig, TelemetryMetricsConfig,
+    bundled_cli_plugin_spec, config_path, config_to_toml, load_config, parse_config_toml,
+    resolve_plugins,
 };
 pub(crate) use self::config::{telemetry_plugin_enabled, validate_config};
 use self::runtime::ExternalPlugin;
@@ -44,17 +52,18 @@ use self::support::{format_args_for_log, format_slice_for_log, format_tool_names
 use self::transport::unix_socket_path;
 #[cfg(all(test, windows))]
 use self::transport::windows_pipe_name;
-use self::transport::{connect_side_stream, make_instance_id, LocalStream};
+pub(crate) use self::transport::{
+    LocalListener, LocalStream, bind_local_listener, connect_side_stream, make_instance_id,
+};
 #[cfg(test)]
 use mesh_llm_plugin::MeshVisibility;
+use tokio::sync::oneshot;
 
-pub const BLACKBOARD_PLUGIN_ID: &str = "blackboard";
 pub const BLOBSTORE_PLUGIN_ID: &str = "blobstore";
+pub const FLASH_MOE_PLUGIN_ID: &str = "flash-moe";
 pub const OPENAI_ENDPOINT_PLUGIN_ID: &str = "openai-endpoint";
 pub const TELEMETRY_PLUGIN_ID: &str = "telemetry";
 pub const TELEMETRY_CAPABILITY: &str = "telemetry.metrics.v1";
-#[allow(dead_code)]
-pub const BLACKBOARD_CAPABILITY: &str = "blackboard.v1";
 pub(crate) const PROTOCOL_VERSION: u32 = mesh_llm_plugin::PROTOCOL_VERSION;
 const CONNECT_TIMEOUT_SECS: u64 = 10;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -62,7 +71,7 @@ const HEALTH_CHECK_INTERVAL_SECS: u64 = 15;
 const ENDPOINT_STARTUP_GRACE_SECS: u64 = 30;
 const ENDPOINT_FAILURE_THRESHOLD: u32 = 2;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum PluginMeshEvent {
     Channel {
         plugin_id: String,
@@ -71,6 +80,11 @@ pub enum PluginMeshEvent {
     BulkTransfer {
         plugin_id: String,
         message: proto::BulkTransferMessage,
+    },
+    OpenStream {
+        plugin_id: String,
+        request: proto::OpenMeshStreamRequest,
+        response_tx: oneshot::Sender<Result<proto::OpenMeshStreamResponse, proto::ErrorResponse>>,
     },
 }
 
@@ -243,79 +257,24 @@ impl PluginManager {
         host_mode: PluginHostMode,
         mesh_tx: mpsc::Sender<PluginMeshEvent>,
     ) -> Result<Self> {
-        if specs.externals.is_empty() {
-            tracing::info!("Plugin manager: no plugins enabled");
-        } else {
-            let names = specs
-                .externals
-                .iter()
-                .map(|spec| spec.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::info!(
-                "Plugin manager: loading {} plugin(s): {}",
-                specs.externals.len(),
-                names
-            );
-        }
+        Self::log_startup_plan(specs);
 
         let rpc_bridge = Arc::new(Mutex::new(None));
         let runtime_data = RuntimeDataCollector::new();
         let instance_id = make_instance_id();
-        let mut plugins = BTreeMap::new();
-        for spec in &specs.externals {
-            tracing::info!(
-                plugin = %spec.name,
-                command = %spec.command,
-                args = %format_args_for_log(&spec.args),
-                "Loading plugin"
-            );
-            let plugin = match ExternalPlugin::spawn(
-                spec,
-                instance_id.clone(),
-                host_mode,
-                mesh_tx.clone(),
-                rpc_bridge.clone(),
-                runtime_data.producer(RuntimeDataSource {
-                    scope: "plugin",
-                    plugin_data_key: Some(PluginDataKey {
-                        plugin_name: spec.name.clone(),
-                        data_key: "summary".into(),
-                    }),
-                    plugin_endpoint_key: None,
-                }),
-            )
-            .await
-            {
-                Ok(plugin) => plugin,
-                Err(err) => {
-                    tracing::error!(
-                        plugin = %spec.name,
-                        error = %err,
-                        "Plugin failed to load"
-                    );
-                    return Err(err);
-                }
-            };
-            let summary = plugin.summary().await;
-            tracing::info!(
-                plugin = %summary.name,
-                version = %summary.version.as_deref().unwrap_or("unknown"),
-                capabilities = %format_slice_for_log(&summary.capabilities),
-                tools = %format_tool_names_for_log(&summary.tools),
-                "Plugin loaded successfully"
-            );
-            plugins.insert(spec.name.clone(), plugin);
-        }
+        let (plugins, failed_plugins) = Self::load_external_plugins(
+            specs,
+            host_mode,
+            mesh_tx,
+            instance_id,
+            rpc_bridge.clone(),
+            &runtime_data,
+        )
+        .await;
         let manager = Self {
             inner: Arc::new(PluginManagerInner {
                 plugins,
-                inactive: specs
-                    .inactive
-                    .iter()
-                    .cloned()
-                    .map(|summary| (summary.name.clone(), summary))
-                    .collect(),
+                inactive: Self::inactive_plugins(specs, failed_plugins),
                 endpoint_health: Arc::new(Mutex::new(BTreeMap::new())),
                 runtime_data,
                 rpc_bridge,
@@ -343,6 +302,166 @@ impl PluginManager {
         }
         manager.start_supervisor();
         Ok(manager)
+    }
+
+    fn log_startup_plan(specs: &ResolvedPlugins) {
+        Self::log_inactive_plugins(&specs.inactive);
+        if specs.externals.is_empty() {
+            tracing::info!("Plugin manager: no plugins enabled");
+            return;
+        }
+
+        Self::log_enabled_plugins(&specs.externals);
+    }
+
+    fn log_inactive_plugins(inactive: &[PluginSummary]) {
+        for summary in inactive {
+            tracing::warn!(
+                plugin = %summary.name,
+                status = %summary.status,
+                error = %summary.error.as_deref().unwrap_or(""),
+                "Plugin inactive at startup"
+            );
+        }
+    }
+
+    fn log_enabled_plugins(externals: &[ExternalPluginSpec]) {
+        let names = externals
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            "Plugin manager: loading {} plugin(s): {}",
+            externals.len(),
+            names
+        );
+    }
+
+    fn summary_runtime_source(plugin_name: String) -> RuntimeDataSource {
+        RuntimeDataSource {
+            scope: "plugin",
+            plugin_data_key: Some(PluginDataKey {
+                plugin_name,
+                data_key: "summary".into(),
+            }),
+            plugin_endpoint_key: None,
+        }
+    }
+
+    async fn load_external_plugins(
+        specs: &ResolvedPlugins,
+        host_mode: PluginHostMode,
+        mesh_tx: mpsc::Sender<PluginMeshEvent>,
+        instance_id: String,
+        rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+        runtime_data: &RuntimeDataCollector,
+    ) -> (BTreeMap<String, ExternalPlugin>, Vec<PluginSummary>) {
+        let mut plugins = BTreeMap::new();
+        let mut failed = Vec::new();
+        for spec in &specs.externals {
+            match Self::load_external_plugin(
+                spec,
+                host_mode,
+                mesh_tx.clone(),
+                instance_id.clone(),
+                rpc_bridge.clone(),
+                runtime_data,
+            )
+            .await
+            {
+                Ok(plugin) => {
+                    plugins.insert(spec.name.clone(), plugin);
+                }
+                Err(error) => {
+                    failed.push(Self::plugin_load_failure_summary(spec, &error));
+                }
+            }
+        }
+        (plugins, failed)
+    }
+
+    async fn load_external_plugin(
+        spec: &ExternalPluginSpec,
+        host_mode: PluginHostMode,
+        mesh_tx: mpsc::Sender<PluginMeshEvent>,
+        instance_id: String,
+        rpc_bridge: Arc<Mutex<Option<Arc<dyn PluginRpcBridge>>>>,
+        runtime_data: &RuntimeDataCollector,
+    ) -> Result<ExternalPlugin> {
+        tracing::info!(
+            plugin = %spec.name,
+            command = %spec.command,
+            args = %format_args_for_log(&spec.args),
+            "Loading plugin"
+        );
+        let plugin = ExternalPlugin::spawn(
+            spec,
+            instance_id,
+            host_mode,
+            mesh_tx,
+            rpc_bridge,
+            runtime_data.producer(Self::summary_runtime_source(spec.name.clone())),
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                plugin = %spec.name,
+                error = %err,
+                "Plugin failed to load"
+            );
+            err
+        })?;
+
+        let summary = plugin.summary().await;
+        tracing::info!(
+            plugin = %summary.name,
+            version = %summary.version.as_deref().unwrap_or("unknown"),
+            capabilities = %format_slice_for_log(&summary.capabilities),
+            tools = %format_tool_names_for_log(&summary.tools),
+            "Plugin loaded successfully"
+        );
+        Ok(plugin)
+    }
+
+    fn plugin_load_failure_summary(
+        spec: &ExternalPluginSpec,
+        error: &anyhow::Error,
+    ) -> PluginSummary {
+        tracing::warn!(
+            plugin = %spec.name,
+            command = %spec.command,
+            args = %format_args_for_log(&spec.args),
+            error = %error,
+            "Plugin disabled after load failure"
+        );
+        PluginSummary {
+            name: spec.name.clone(),
+            kind: "external".to_string(),
+            enabled: false,
+            status: "error".to_string(),
+            pid: None,
+            version: None,
+            capabilities: Vec::new(),
+            command: Some(spec.command.clone()),
+            args: spec.args.clone(),
+            tools: Vec::new(),
+            manifest: None,
+            error: Some(error.to_string()),
+        }
+    }
+
+    fn inactive_plugins(
+        specs: &ResolvedPlugins,
+        failed_plugins: Vec<PluginSummary>,
+    ) -> BTreeMap<String, PluginSummary> {
+        specs
+            .inactive
+            .iter()
+            .cloned()
+            .chain(failed_plugins)
+            .map(|summary| (summary.name.clone(), summary))
+            .collect()
     }
 
     #[cfg(test)]
@@ -645,6 +764,32 @@ impl PluginManager {
         plugin.call_tool(tool_name, arguments_json).await
     }
 
+    pub async fn call_tool_without_timeout(
+        &self,
+        plugin_name: &str,
+        tool_name: &str,
+        arguments_json: &str,
+    ) -> Result<ToolCallResult> {
+        if self.is_test_bridge_enabled(plugin_name) {
+            return self.call_tool(plugin_name, tool_name, arguments_json).await;
+        }
+        if let Some(summary) = self.inner.inactive.get(plugin_name) {
+            bail!(
+                "Plugin '{}' is disabled: {}",
+                plugin_name,
+                summary.error.as_deref().unwrap_or("unavailable")
+            );
+        }
+        let plugin = self
+            .inner
+            .plugins
+            .get(plugin_name)
+            .with_context(|| format!("Unknown plugin '{plugin_name}'"))?;
+        plugin
+            .call_tool_without_timeout(tool_name, arguments_json)
+            .await
+    }
+
     pub async fn invoke_operation(
         &self,
         plugin_name: &str,
@@ -652,6 +797,16 @@ impl PluginManager {
         input_json: &str,
     ) -> Result<ToolCallResult> {
         self.call_tool(plugin_name, operation_name, input_json)
+            .await
+    }
+
+    pub async fn invoke_operation_without_timeout(
+        &self,
+        plugin_name: &str,
+        operation_name: &str,
+        input_json: &str,
+    ) -> Result<ToolCallResult> {
+        self.call_tool_without_timeout(plugin_name, operation_name, input_json)
             .await
     }
 
@@ -901,7 +1056,12 @@ impl PluginManager {
         let input_json = serde_json::to_string(params)
             .with_context(|| format!("Serialize service params for plugin '{plugin_name}'"))?;
         let response = plugin
-            .invoke_service(kind, service_name, &input_json)
+            .invoke_service(
+                kind,
+                service_name,
+                &input_json,
+                Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS)),
+            )
             .await?;
         serde_json::from_str(&response.output_json).with_context(|| {
             format!(
@@ -1716,8 +1876,8 @@ fn endpoint_models_url(address: &str) -> Option<Url> {
 
 pub async fn run_plugin_process(name: String) -> Result<()> {
     match name.as_str() {
-        BLACKBOARD_PLUGIN_ID => crate::plugins::blackboard::run_plugin(name).await,
         BLOBSTORE_PLUGIN_ID => crate::plugins::blobstore::run_plugin(name).await,
+        FLASH_MOE_PLUGIN_ID => crate::plugins::flash_moe::run_plugin(name).await,
         OPENAI_ENDPOINT_PLUGIN_ID => crate::plugins::openai_endpoint::run_plugin(name).await,
         TELEMETRY_PLUGIN_ID => crate::plugins::telemetry::run_plugin(name).await,
         _ => bail!("Unknown built-in plugin '{}'", name),
@@ -1729,8 +1889,8 @@ mod tests {
     use super::config::{MeshConfig, PluginConfigEntry};
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1766,31 +1926,34 @@ mod tests {
     }
 
     #[test]
-    fn resolves_default_blackboard_plugin() {
+    fn resolves_default_builtin_plugins() {
         let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
     #[test]
-    fn blackboard_can_be_disabled() {
+    fn external_plugin_can_be_configured() {
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
-                name: BLACKBOARD_PLUGIN_ID.into(),
-                enabled: Some(false),
-                command: None,
-                args: Vec::new(),
+                name: "demo".into(),
+                enabled: Some(true),
+                command: Some("mesh-llm-plugin-demo".into()),
+                args: vec!["--stdio".into()],
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals.len(), 3);
         assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, "demo");
+        assert_eq!(resolved.externals[1].command, "mesh-llm-plugin-demo");
+        assert_eq!(resolved.externals[1].args, ["--stdio"]);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -1804,26 +1967,27 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
     #[test]
     fn telemetry_plugin_is_opt_out_builtin() {
         let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
-        assert!(resolved.externals[1].args.contains(&"--plugin".to_string()));
-        assert!(resolved.externals[1]
-            .args
-            .contains(&TELEMETRY_PLUGIN_ID.to_string()));
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert!(resolved.externals[0].args.contains(&"--plugin".to_string()));
+        assert!(
+            resolved.externals[0]
+                .args
+                .contains(&TELEMETRY_PLUGIN_ID.to_string())
+        );
 
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
@@ -1833,13 +1997,13 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
 
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 2);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 1);
+        assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
     }
 
     #[test]
@@ -1852,6 +2016,7 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
 
@@ -1869,15 +2034,15 @@ mod tests {
                 args: Vec::new(),
                 url: Some("http://gpu-box:8000/v1".into()),
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, OPENAI_ENDPOINT_PLUGIN_ID);
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
-        let spec = &resolved.externals[2];
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, OPENAI_ENDPOINT_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[1];
         assert!(spec.args.contains(&"openai-endpoint".to_string()));
         assert_eq!(spec.url.as_deref(), Some("http://gpu-box:8000/v1"));
     }
@@ -1892,16 +2057,16 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, OPENAI_ENDPOINT_PLUGIN_ID);
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, OPENAI_ENDPOINT_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
         // Verify the spec args dispatch to the right plugin binary
-        let spec = &resolved.externals[2];
+        let spec = &resolved.externals[1];
         assert!(spec.args.contains(&"--plugin".to_string()));
         assert!(spec.args.contains(&"openai-endpoint".to_string()));
     }
@@ -1916,6 +2081,7 @@ mod tests {
                 args: Vec::new(),
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let result = resolve_plugins(&config, private_host_mode());
@@ -1923,7 +2089,112 @@ mod tests {
     }
 
     #[test]
-    fn blackboard_is_resolved_on_public_meshes() {
+    fn flash_moe_can_be_enabled_with_managed_command() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: Some(" /opt/flash-moe/infer ".into()),
+                args: vec![
+                    "--model".into(),
+                    "/models/qwen3.5".into(),
+                    "--weights".into(),
+                    "/models/experts.bin".into(),
+                ],
+                url: None,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, FLASH_MOE_PLUGIN_ID);
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        let spec = &resolved.externals[1];
+        assert!(spec.args.contains(&"--plugin".to_string()));
+        assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
+        assert_eq!(
+            spec.env
+                .get("MESH_LLM_FLASH_MOE_COMMAND")
+                .map(String::as_str),
+            Some("/opt/flash-moe/infer")
+        );
+        assert_eq!(
+            spec.env
+                .get("MESH_LLM_FLASH_MOE_ARGS_JSON")
+                .map(String::as_str),
+            Some(r#"["--model","/models/qwen3.5","--weights","/models/experts.bin"]"#)
+        );
+        assert!(!spec.env.contains_key("MESH_LLM_FLASH_MOE_URL"));
+        assert_eq!(spec.url, None);
+    }
+
+    #[test]
+    fn flash_moe_can_attach_existing_endpoint() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: None,
+                args: Vec::new(),
+                url: Some(" http://127.0.0.1:8000/v1/ ".into()),
+            }],
+            ..MeshConfig::default()
+        };
+
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        let spec = resolved
+            .externals
+            .iter()
+            .find(|spec| spec.name == FLASH_MOE_PLUGIN_ID)
+            .expect("flash-moe spec");
+
+        assert_eq!(
+            spec.env.get("MESH_LLM_FLASH_MOE_URL").map(String::as_str),
+            Some("http://127.0.0.1:8000/v1/")
+        );
+        assert!(!spec.env.contains_key("MESH_LLM_FLASH_MOE_COMMAND"));
+        assert!(spec.args.contains(&FLASH_MOE_PLUGIN_ID.to_string()));
+    }
+
+    #[test]
+    fn flash_moe_rejects_missing_command_or_url() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: None,
+                args: Vec::new(),
+                url: None,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let err = resolve_plugins(&config, private_host_mode()).unwrap_err();
+        assert!(err.to_string().contains("requires `command` or `url`"));
+    }
+
+    #[test]
+    fn flash_moe_rejects_user_supplied_serve_arg() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: FLASH_MOE_PLUGIN_ID.into(),
+                enabled: Some(true),
+                command: Some("/opt/flash-moe/infer".into()),
+                args: vec!["--serve".into(), "9000".into()],
+                url: None,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let err = resolve_plugins(&config, private_host_mode()).unwrap_err();
+        assert!(err.to_string().contains("owns the flash-moe `--serve`"));
+    }
+
+    #[test]
+    fn default_builtins_are_resolved_on_public_meshes() {
         let resolved = resolve_plugins(
             &MeshConfig::default(),
             PluginHostMode {
@@ -1931,10 +2202,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resolved.externals.len(), 3);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 2);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
     }
 
@@ -1948,15 +2218,41 @@ mod tests {
                 args: vec!["--flag".into()],
                 url: None,
             }],
+            defaults: None,
             ..MeshConfig::default()
         };
         let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
-        assert_eq!(resolved.externals.len(), 4);
-        assert_eq!(resolved.externals[0].name, BLACKBOARD_PLUGIN_ID);
-        assert_eq!(resolved.externals[1].name, TELEMETRY_PLUGIN_ID);
-        assert_eq!(resolved.externals[2].name, "demo");
-        assert_eq!(resolved.externals[3].name, BLOBSTORE_PLUGIN_ID);
+        assert_eq!(resolved.externals.len(), 3);
+        assert_eq!(resolved.externals[0].name, TELEMETRY_PLUGIN_ID);
+        assert_eq!(resolved.externals[1].name, "demo");
+        assert_eq!(resolved.externals[2].name, BLOBSTORE_PLUGIN_ID);
         assert!(resolved.inactive.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plugin_load_failure_becomes_inactive_summary() {
+        let specs = ResolvedPlugins {
+            externals: vec![ExternalPluginSpec {
+                name: "broken".into(),
+                command: "mesh-llm-definitely-missing-plugin-binary".into(),
+                args: vec!["--stdio".into()],
+                url: None,
+                env: BTreeMap::new(),
+            }],
+            inactive: Vec::new(),
+        };
+        let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+
+        let manager = PluginManager::start(&specs, private_host_mode(), mesh_tx)
+            .await
+            .expect("broken plugin should not stop manager startup");
+        let summaries = manager.list().await;
+        manager.shutdown().await;
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "broken");
+        assert_eq!(summaries[0].status, "error");
+        assert!(!summaries[0].error.as_deref().unwrap_or_default().is_empty());
     }
 
     #[test]
@@ -1965,9 +2261,11 @@ mod tests {
         let prefix = format!("p{}-", std::process::id());
         assert!(instance_id.starts_with(&prefix));
         assert_eq!(instance_id.len(), prefix.len() + 8);
-        assert!(instance_id[prefix.len()..]
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit()));
+        assert!(
+            instance_id[prefix.len()..]
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit())
+        );
     }
 
     #[cfg(unix)]
@@ -2171,11 +2469,13 @@ mod tests {
         assert!(!health.available);
         assert_eq!(health.state, "unhealthy");
         assert!(health.models.is_empty());
-        assert!(health
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("503 Service Unavailable"));
+        assert!(
+            health
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("503 Service Unavailable")
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
         handle.await.unwrap();

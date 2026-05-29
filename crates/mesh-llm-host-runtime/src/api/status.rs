@@ -8,6 +8,7 @@ use crate::network::{affinity, metrics};
 use crate::runtime_data;
 use crate::system::hardware::expand_gpu_names;
 use serde::Serialize;
+use skippy_server::OpenAiGuardrailsStatus;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -42,9 +43,38 @@ pub(crate) enum WakeableNodeState {
 pub(crate) struct RuntimeStatusPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) openai_guardrails: Option<OpenAiGuardrailsPayload>,
     pub(crate) models: Vec<RuntimeModelPayload>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) stages: Vec<RuntimeStagePayload>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct OpenAiGuardrailsPayload {
+    pub(crate) mode: &'static str,
+    pub(crate) target: &'static str,
+    pub(crate) streaming: &'static str,
+    pub(crate) retry_exhaustion: &'static str,
+    pub(crate) small_model_policy: &'static str,
+    pub(crate) small_param_threshold_b: f32,
+    pub(crate) max_tool_retries: u8,
+    pub(crate) max_structured_retries: u8,
+}
+
+impl From<OpenAiGuardrailsStatus> for OpenAiGuardrailsPayload {
+    fn from(value: OpenAiGuardrailsStatus) -> Self {
+        Self {
+            mode: value.mode,
+            target: value.target,
+            streaming: value.streaming,
+            retry_exhaustion: value.retry_exhaustion,
+            small_model_policy: value.small_model_policy,
+            small_param_threshold_b: value.small_param_threshold_b,
+            max_tool_retries: value.max_tool_retries,
+            max_structured_retries: value.max_structured_retries,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -380,11 +410,28 @@ pub(crate) struct PeerPayload {
     pub(crate) hosted_models_known: bool,
     pub(crate) version: Option<String>,
     pub(crate) rtt_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latency_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latency_source: Option<LatencySource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latency_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latency_observer_id: Option<String>,
     pub(crate) hostname: Option<String>,
     pub(crate) is_soc: Option<bool>,
     pub(crate) gpus: Vec<GpuEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) first_joined_mesh_ts: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LatencySource {
+    #[default]
+    Direct,
+    Estimated,
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -517,11 +564,42 @@ pub(crate) struct ModelTargetPayload {
     pub(crate) wanted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) wanted_reason: Option<&'static str>,
+    pub(crate) capacity_advice: ModelTargetCapacityAdvicePayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ModelTargetCapacityAdvicePayload {
+    pub(crate) state: ModelTargetCapacityAdviceState,
+    pub(crate) reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) required_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) best_single_node_capacity_bytes: Option<u64>,
+    pub(crate) aggregate_capacity_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shortfall_bytes: Option<u64>,
+    pub(crate) eligible_node_count: usize,
+    pub(crate) missing_capacity_node_count: usize,
+    pub(crate) excluded_client_node_count: usize,
+    pub(crate) split_capable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelTargetCapacityAdviceState {
+    AlreadyServing,
+    SingleNodeFit,
+    SplitCandidate,
+    InsufficientCapacity,
+    UnknownModelSize,
+    UnknownCapacity,
+    NoEligibleHosts,
 }
 
 pub(crate) fn build_runtime_status_payload(
     model_name: &str,
     primary_backend: Option<String>,
+    openai_guardrails: Option<OpenAiGuardrailsPayload>,
     is_host: bool,
     llama_ready: bool,
     llama_port: Option<u16>,
@@ -549,6 +627,7 @@ pub(crate) fn build_runtime_status_payload(
             backend: process.backend,
             status: process.status,
             port: Some(process.port),
+            context_length: process.context_length,
         })
         .collect();
 
@@ -562,12 +641,14 @@ pub(crate) fn build_runtime_status_payload(
                 backend: primary_backend.unwrap_or_else(|| "unknown".into()),
                 status: "starting".into(),
                 port: llama_port,
+                context_length: None,
             },
         );
     }
 
     RuntimeStatusPayload {
         backend,
+        openai_guardrails,
         models,
         stages: vec![],
     }
@@ -802,7 +883,10 @@ pub(crate) fn classify_runtime_error(msg: &str) -> u16 {
         404
     } else if msg.contains("already loaded") || msg.contains("multiple loaded instances") {
         409
-    } else if msg.contains("fit locally") || msg.contains("runtime load only supports") {
+    } else if msg.contains("fit locally")
+        || msg.contains("runtime load only supports")
+        || msg.contains("runtime capacity")
+    {
         422
     } else {
         400
@@ -889,6 +973,10 @@ mod tests {
             hosted_models_known: false,
             version: Some("0.56.0".to_string()),
             rtt_ms: None,
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
             hostname: None,
             is_soc: None,
             gpus: vec![],
@@ -915,6 +1003,10 @@ mod tests {
             hosted_models_known: false,
             version: None,
             rtt_ms: None,
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
             hostname: None,
             is_soc: None,
             gpus: vec![],
@@ -947,6 +1039,7 @@ mod tests {
             llama_ready: false,
             runtime: RuntimeStatusPayload {
                 backend: None,
+                openai_guardrails: None,
                 models: vec![],
                 stages: vec![],
             },
@@ -999,6 +1092,7 @@ mod tests {
             llama_ready: true,
             runtime: RuntimeStatusPayload {
                 backend: None,
+                openai_guardrails: None,
                 models: vec![],
                 stages: vec![],
             },
@@ -1051,6 +1145,7 @@ mod tests {
             llama_ready: false,
             runtime: RuntimeStatusPayload {
                 backend: None,
+                openai_guardrails: None,
                 models: vec![],
                 stages: vec![],
             },
@@ -1112,6 +1207,7 @@ mod tests {
             llama_ready: false,
             runtime: RuntimeStatusPayload {
                 backend: None,
+                openai_guardrails: None,
                 models: vec![],
                 stages: vec![],
             },
@@ -1165,6 +1261,10 @@ mod tests {
             hosted_models_known: true,
             version: Some("0.60.2".to_string()),
             rtt_ms: Some(12),
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
             hostname: Some("peer.local".to_string()),
             is_soc: Some(false),
             gpus: vec![],
@@ -1174,6 +1274,102 @@ mod tests {
         let json = serde_json::to_string(&peer).expect("serialization failed");
         assert!(json.contains("\"role\":\"Host\""));
         assert!(json.contains("\"state\":\"serving\""));
+    }
+
+    #[test]
+    fn runtime_status_payload_serializes_privacy_safe_openai_guardrails() {
+        let payload = build_runtime_status_payload(
+            "Qwen-Test",
+            Some("skippy".to_string()),
+            Some(OpenAiGuardrailsPayload::from(OpenAiGuardrailsStatus {
+                mode: "metrics",
+                target: "skippy",
+                streaming: "pass_through",
+                retry_exhaustion: "error",
+                small_model_policy: "small_models_only",
+                small_param_threshold_b: 9.0,
+                max_tool_retries: 1,
+                max_structured_retries: 2,
+            })),
+            true,
+            true,
+            Some(9337),
+            vec![],
+        );
+
+        let json = serde_json::to_value(payload).expect("serialization failed");
+        let guardrails = json["openai_guardrails"]
+            .as_object()
+            .expect("guardrails should be an object");
+        assert_eq!(guardrails.get("mode"), Some(&serde_json::json!("metrics")));
+        assert_eq!(guardrails.get("target"), Some(&serde_json::json!("skippy")));
+        assert_eq!(
+            guardrails.get("streaming"),
+            Some(&serde_json::json!("pass_through"))
+        );
+        assert_eq!(
+            guardrails.get("retry_exhaustion"),
+            Some(&serde_json::json!("error"))
+        );
+        assert_eq!(
+            guardrails.get("small_model_policy"),
+            Some(&serde_json::json!("small_models_only"))
+        );
+        assert_eq!(
+            guardrails.get("small_param_threshold_b"),
+            Some(&serde_json::json!(9.0))
+        );
+        assert_eq!(
+            guardrails.get("max_tool_retries"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            guardrails.get("max_structured_retries"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(guardrails.len(), 8);
+        for forbidden in [
+            "prompt",
+            "schema",
+            "tool_args",
+            "tool_names",
+            "reserved_tool_prefix",
+            "sentinels",
+        ] {
+            assert!(
+                guardrails.get(forbidden).is_none(),
+                "privacy-safe status should omit {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_status_payload_uses_disabled_guardrail_mode_label() {
+        let payload = build_runtime_status_payload(
+            "Qwen-Test",
+            Some("skippy".to_string()),
+            Some(OpenAiGuardrailsPayload::from(OpenAiGuardrailsStatus {
+                mode: "disabled",
+                target: "skippy",
+                streaming: "pass_through",
+                retry_exhaustion: "error",
+                small_model_policy: "small_models_only",
+                small_param_threshold_b: 9.0,
+                max_tool_retries: 1,
+                max_structured_retries: 2,
+            })),
+            true,
+            true,
+            Some(9337),
+            vec![],
+        );
+
+        let json = serde_json::to_value(payload).expect("serialization failed");
+        assert_eq!(
+            json["openai_guardrails"]["mode"],
+            serde_json::json!("disabled")
+        );
+        assert_ne!(json["openai_guardrails"]["mode"], serde_json::json!("off"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import { Network, RotateCcw, Save, Undo2, Redo2, UserRound } from 'lucide-react'
+import { LoaderCircle, Network, RotateCcw, Save, Undo2, Redo2, UserRound } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { ConfigNode } from '@/features/app-tabs/types'
 import { cn } from '@/lib/cn'
@@ -11,6 +11,8 @@ type ConfigurationHeaderProps = {
   canRedo: boolean
   hasUnsavedChanges: boolean
   hasInvalidNode: boolean
+  isSaving?: boolean
+  saveDisabledReason?: string
   onUndo: () => void
   onRedo: () => void
   onRevert: () => void
@@ -27,7 +29,7 @@ function InlineMeta({ children, className, icon }: { children: ReactNode; classN
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1.5 whitespace-nowrap text-[12px] leading-none text-fg-dim',
+        'inline-flex items-center gap-1.5 whitespace-nowrap text-[length:var(--density-type-caption)] leading-none text-fg-dim',
         className
       )}
     >
@@ -47,13 +49,26 @@ export function ConfigurationHistoryActions({
   canRedo,
   hasUnsavedChanges,
   hasInvalidNode,
+  isSaving = false,
+  saveDisabledReason,
   onUndo,
   onRedo,
   onRevert,
   onSave
 }: Omit<ConfigurationHeaderProps, 'title' | 'description' | 'nodes'>) {
+  const saveDisabled = isSaving || hasInvalidNode || !hasUnsavedChanges || Boolean(saveDisabledReason)
+  const saveTitle = saveDisabledReason
+    ? saveDisabledReason
+    : isSaving
+      ? 'Saving config'
+      : hasInvalidNode
+        ? 'Resolve invalid model allocations before saving'
+        : hasUnsavedChanges
+          ? 'Save config'
+          : 'No changes to save'
+
   return (
-    <fieldset aria-label="Configuration history actions" className="mt-[11px] flex items-center gap-1.5 border-0 p-0">
+    <fieldset aria-label="Configuration history actions" className="flex items-center gap-1.5 border-0 p-0">
       <button
         className={iconActionClass}
         disabled={!canUndo}
@@ -84,20 +99,19 @@ export function ConfigurationHistoryActions({
           'inline-flex h-[30px] items-center gap-1.5 rounded-[var(--radius)] border px-4 text-[length:var(--density-type-control)] font-semibold leading-none',
           hasInvalidNode ? 'ui-control-destructive' : 'ui-control-primary'
         )}
-        disabled={hasInvalidNode || !hasUnsavedChanges}
+        aria-busy={isSaving || undefined}
+        disabled={saveDisabled}
         onClick={onSave}
-        title={
-          hasInvalidNode
-            ? 'Resolve invalid model allocations before saving'
-            : hasUnsavedChanges
-              ? 'Save config'
-              : 'No changes to save'
-        }
+        title={saveTitle}
         type="button"
         aria-keyshortcuts="Control+S"
       >
-        <Save aria-hidden="true" className="size-3.5" />
-        Save config
+        {isSaving ? (
+          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+        ) : (
+          <Save aria-hidden="true" className="size-3.5" />
+        )}
+        {isSaving ? 'Saving config' : 'Save config'}
       </button>
     </fieldset>
   )
@@ -110,12 +124,15 @@ export function ConfigurationHeader(props: ConfigurationHeaderProps) {
 
   return (
     <header className="relative z-20 bg-transparent">
-      <div className="flex min-h-[76px] flex-wrap items-center justify-between gap-3 px-5 py-3">
+      <div className="flex min-h-[58px] flex-wrap items-center justify-between gap-x-4 gap-y-2 py-0">
         <div className="min-w-0">
-          <h1 className="text-[20px] font-bold leading-none tracking-[-0.4px] text-foreground">{props.title}</h1>
-          <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-[12px] text-fg-dim">
+          <h1 className="type-headline text-foreground">{props.title}</h1>
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-fg-dim">
             <InlineMeta icon={<UserRound aria-hidden="true" className="size-[11px]" strokeWidth={1.6} />}>
-              Editing <strong className="font-mono text-[11.5px] font-semibold text-foreground">{localHostname}</strong>
+              Editing{' '}
+              <strong className="font-mono text-[length:var(--density-type-caption-lg)] font-semibold text-foreground">
+                {localHostname}
+              </strong>
               <span className="hidden text-fg-faint md:inline">· local node only</span>
             </InlineMeta>
             <InlineMeta

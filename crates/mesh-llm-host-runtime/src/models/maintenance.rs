@@ -1,7 +1,7 @@
-use super::{build_hf_api, huggingface_hub_cache_dir, short_revision};
-use crate::cli::terminal_progress::{clear_stderr_line, DeterminateProgressLine};
+use super::{build_hf_api, huggingface_hub_cache_dir, run_hf_sync, short_revision};
+use crate::cli::terminal_progress::{DeterminateProgressLine, clear_stderr_line};
 use anyhow::{Context, Result};
-use hf_hub::{RepoDownloadFileParams, RepoInfo, RepoInfoParams, RepoType};
+use hf_hub::{RepoTypeModel, repository::ModelInfo};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,11 @@ struct UpdateCounts {
 }
 
 pub fn run_update(repo: Option<&str>, all: bool, check: bool) -> Result<()> {
+    let repo = repo.map(ToOwned::to_owned);
+    run_hf_sync(move || run_update_sync(repo.as_deref(), all, check))
+}
+
+fn run_update_sync(repo: Option<&str>, all: bool, check: bool) -> Result<()> {
     let api = build_hf_api(!check)?;
     let repos = cached_repos()?;
     if repos.is_empty() {
@@ -42,7 +47,9 @@ pub fn run_update(repo: Option<&str>, all: bool, check: bool) -> Result<()> {
         repos
     } else {
         let Some(repo_id) = repo else {
-            anyhow::bail!("Pass a repo id or --all. Use `mesh-llm models updates --check` to inspect updates without downloading.");
+            anyhow::bail!(
+                "Pass a repo id or --all. Use `mesh-llm models updates --check` to inspect updates without downloading."
+            );
         };
         let repo_id = repo_id.trim();
         let Some(found) = repos.into_iter().find(|entry| entry.repo_id == repo_id) else {
@@ -124,30 +131,30 @@ pub fn warn_about_updates_for_paths(paths: &[PathBuf]) {
         return;
     }
 
-    let api = match build_hf_api(false) {
-        Ok(api) => api,
-        Err(err) => {
-            eprintln!("Warning: could not initialize Hugging Face update checks: {err}");
-            return;
-        }
-    };
-    for repo in cache_models {
-        match check_repo_update(&api, &repo) {
-            Ok(Some(remote_revision)) => {
-                eprintln!("🆕 Update available for {}", repo.repo_id);
-                eprintln!("   local: {}", short_revision(&repo.local_revision));
-                eprintln!("   latest: {}", short_revision(&remote_revision));
-                eprintln!("   continuing with pinned local snapshot");
-                eprintln!("   update: mesh-llm models updates {}", repo.repo_id);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!(
-                    "Warning: could not check for updates for {}: {err}",
-                    repo.repo_id
-                );
+    let result = run_hf_sync(move || {
+        let api = build_hf_api(false)?;
+        for repo in cache_models {
+            match check_repo_update(&api, &repo) {
+                Ok(Some(remote_revision)) => {
+                    eprintln!("🆕 Update available for {}", repo.repo_id);
+                    eprintln!("   local: {}", short_revision(&repo.local_revision));
+                    eprintln!("   latest: {}", short_revision(&remote_revision));
+                    eprintln!("   continuing with pinned local snapshot");
+                    eprintln!("   update: mesh-llm models updates {}", repo.repo_id);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!(
+                        "Warning: could not check for updates for {}: {err}",
+                        repo.repo_id
+                    );
+                }
             }
         }
+        Ok(())
+    });
+    if let Err(err) = result {
+        eprintln!("Warning: could not initialize Hugging Face update checks: {err}");
     }
 }
 
@@ -305,23 +312,21 @@ fn collect_ref_files(root: &Path, dir: &Path, refs: &mut Vec<(String, String)>) 
     Ok(())
 }
 
-fn remote_repo_info(api: &hf_hub::HFClientSync, repo_id: &str, ref_name: &str) -> Result<RepoInfo> {
+fn remote_repo_info(
+    api: &hf_hub::HFClientSync,
+    repo_id: &str,
+    ref_name: &str,
+) -> Result<ModelInfo> {
     let (owner, name) = repo_id.split_once('/').unwrap_or(("", repo_id));
     api.model(owner, name)
-        .info(
-            &RepoInfoParams::builder()
-                .revision(ref_name.to_string())
-                .build(),
-        )
+        .info()
+        .revision(ref_name.to_string())
+        .send()
         .with_context(|| format!("Fetch repo info for {repo_id}@{ref_name}"))
 }
 
-fn repo_info_sha(info: &RepoInfo) -> String {
-    match info {
-        RepoInfo::Model(info) => info.sha.clone().unwrap_or_default(),
-        RepoInfo::Dataset(info) => info.sha.clone().unwrap_or_default(),
-        RepoInfo::Space(info) => info.sha.clone().unwrap_or_default(),
-    }
+fn repo_info_sha(info: &ModelInfo) -> String {
+    info.sha.clone().unwrap_or_default()
 }
 
 fn check_repo_update(api: &hf_hub::HFClientSync, repo: &CachedRepo) -> Result<Option<String>> {
@@ -361,12 +366,12 @@ fn update_cached_repo(api: &hf_hub::HFClientSync, repo: &CachedRepo) -> Result<U
         }
         position += 1;
         eprintln!("   ↻ [{}/{}] {}", position, total_files, file);
-        match api_repo.download_file(
-            &RepoDownloadFileParams::builder()
-                .filename(file.clone())
-                .revision(repo.ref_name.clone())
-                .build(),
-        ) {
+        match api_repo
+            .download_file()
+            .filename(file.clone())
+            .revision(repo.ref_name.clone())
+            .send()
+        {
             Ok(path) => {
                 eprintln!("   ✅ {}", path.display());
                 counts.refreshed += 1;
@@ -380,7 +385,7 @@ fn update_cached_repo(api: &hf_hub::HFClientSync, repo: &CachedRepo) -> Result<U
                 counts.missing_meta += 1;
             }
             Err(err) => {
-                return Err(err).with_context(|| format!("Download {}/{}", repo.repo_id, file))
+                return Err(err).with_context(|| format!("Download {}/{}", repo.repo_id, file));
             }
         }
     }
@@ -397,7 +402,7 @@ fn cached_repo_files(repo: &CachedRepo) -> Result<Vec<String>> {
     let snapshots_dir = huggingface_hub_cache_dir()
         .join(super::local::huggingface_repo_folder_name(
             &repo.repo_id,
-            RepoType::Model,
+            RepoTypeModel,
         ))
         .join("snapshots");
     if !snapshots_dir.is_dir() {
@@ -480,9 +485,11 @@ mod tests {
 
     fn restore_env(key: &str, value: Option<OsString>) {
         if let Some(value) = value {
-            std::env::set_var(key, value);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(key, value) };
         } else {
-            std::env::remove_var(key);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -507,9 +514,12 @@ mod tests {
         std::fs::create_dir_all(snapshot.join("BF16")).unwrap();
         std::fs::write(snapshot.join("BF16/model.gguf"), b"gguf").unwrap();
 
-        std::env::set_var("HF_HUB_CACHE", &base);
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", &base) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let repo = CachedRepo {
             repo_id: "unsloth/Qwen3.6-35B-A3B-GGUF".to_string(),

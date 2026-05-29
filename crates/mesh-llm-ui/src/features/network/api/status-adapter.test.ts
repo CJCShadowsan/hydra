@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { LatencySource } from '@/lib/api/types'
 import { adaptStatusToDashboard } from '@/features/network/api/status-adapter'
 import { buildDashboardMeshNodes } from '@/features/network/lib/dashboard-mesh-nodes'
 import type { StatusPayload } from '@/lib/api/types'
@@ -7,6 +8,7 @@ const PUBLIC_STATUS_PAYLOAD: StatusPayload = {
   node_id: '16ce0bb4de',
   node_state: 'serving',
   model_name: 'Hermes-2-Pro-Mistral-7B-Q4_K_M',
+  first_joined_mesh_ts: 1_700_000_000_000,
   peers: [
     {
       id: 'aeac0d8e53',
@@ -17,9 +19,10 @@ const PUBLIC_STATUS_PAYLOAD: StatusPayload = {
       vram_gb: 0,
       serving_models: [],
       hosted_models: [],
-      version: '0.65.0',
+      version: '0.68.0',
       rtt_ms: 7,
-      hostname: '1266a345aeb9'
+      hostname: '1266a345aeb9',
+      first_joined_mesh_ts: 1_700_000_600_000
     }
   ],
   models: [],
@@ -27,7 +30,7 @@ const PUBLIC_STATUS_PAYLOAD: StatusPayload = {
   gpus: [],
   serving_models: [{ name: 'Hermes-2-Pro-Mistral-7B-Q4_K_M', node_id: '16ce0bb4de', status: 'warm' }],
   my_hostname: 'public-host',
-  version: '0.65.0-rc2'
+  version: '0.68.0'
 }
 
 describe('adaptStatusToDashboard', () => {
@@ -52,10 +55,21 @@ describe('adaptStatusToDashboard', () => {
     )
   })
 
-  it('keeps publication_state precedence over nostr_discovery fallback', () => {
+  it('treats auto-discovery clients as public even before publication_state reports public', () => {
     const dashboard = adaptStatusToDashboard({
       ...PUBLIC_STATUS_PAYLOAD,
       publication_state: 'private',
+      nostr_discovery: true
+    })
+
+    expect(dashboard.hero.title).toBe('Welcome to the public mesh')
+    expect(dashboard.connect.runCommand).toBe('mesh-llm --auto')
+  })
+
+  it('keeps publish failures private even when nostr_discovery is enabled', () => {
+    const dashboard = adaptStatusToDashboard({
+      ...PUBLIC_STATUS_PAYLOAD,
+      publication_state: 'publish_failed',
       nostr_discovery: true
     })
 
@@ -81,7 +95,8 @@ describe('adaptStatusToDashboard', () => {
         id: '16ce0bb4de',
         hostname: 'public-host',
         shortId: '16ce0bb4',
-        role: 'you'
+        role: 'you',
+        firstJoinedMeshTs: 1_700_000_000_000
       }),
       expect.objectContaining({
         id: 'aeac0d8e53',
@@ -92,9 +107,13 @@ describe('adaptStatusToDashboard', () => {
         nodeState: 'client',
         latencyMs: 7,
         vramGB: 0,
-        owner: 'unsigned'
+        owner: 'unsigned',
+        firstJoinedMeshTs: 1_700_000_600_000
       })
     ])
+    expect(dashboard.meshNodeSeeds[0]).toEqual(
+      expect.objectContaining({ id: '16ce0bb4de', firstJoinedMeshTs: 1_700_000_000_000 })
+    )
   })
 
   it('adapts live status into the six-cell dashboard metrics bar', () => {
@@ -203,7 +222,8 @@ describe('adaptStatusToDashboard', () => {
           serving_models: ['Hermes-2-Pro-Mistral-7B-Q4_K_M'],
           hosted_models: ['Hermes-2-Pro-Mistral-7B-Q4_K_M'],
           vram_gb: 24,
-          hostname: 'worker-a'
+          hostname: 'worker-a',
+          first_joined_mesh_ts: 1_700_001_000_000
         },
         {
           id: 'peer-b',
@@ -244,8 +264,16 @@ describe('adaptStatusToDashboard', () => {
     expect(selfNode).toEqual(expect.objectContaining({ id: '16ce0bb4de', x: 50, y: 50 }))
     expect(remoteNodes).toHaveLength(3)
     expect(remoteNodes.map((node) => node.peerId)).toEqual(['peer-a', 'peer-b', 'peer-c'])
+    expect(dashboard.peers.find((peer) => peer.id === 'peer-a')).toEqual(
+      expect.objectContaining({ firstJoinedMeshTs: 1_700_001_000_000 })
+    )
     expect(remoteNodes.find((node) => node.peerId === 'peer-a')).toEqual(
-      expect.objectContaining({ host: true, renderKind: 'serving', meshState: 'serving' })
+      expect.objectContaining({
+        host: true,
+        renderKind: 'serving',
+        meshState: 'serving',
+        firstJoinedMeshTs: 1_700_001_000_000
+      })
     )
     expect(remoteNodes.find((node) => node.peerId === 'peer-b')).toEqual(
       expect.objectContaining({ client: false, host: false, renderKind: 'serving', meshState: 'serving' })
@@ -391,5 +419,64 @@ describe('adaptStatusToDashboard', () => {
       expect.objectContaining({ sharePct: 0 })
     )
     expect(dashboard.peers.find((peer) => peer.id === 'api-client')).toEqual(expect.objectContaining({ sharePct: 0 }))
+  })
+
+  it('maps snake_case latency fields from API to camelCase Peer properties', () => {
+    const dashboard = adaptStatusToDashboard({
+      ...PUBLIC_STATUS_PAYLOAD,
+      peers: [
+        {
+          id: 'latency-peer',
+          role: 'Host',
+          state: 'serving',
+          models: ['Test-Model'],
+          vram_gb: 16,
+          hostname: 'latency-host',
+          latency_ms: 7.2,
+          latency_source: LatencySource.DIRECT,
+          latency_age_ms: 500,
+          latency_observer_id: 'observer-node-id'
+        }
+      ]
+    })
+
+    const peer = dashboard.peers.find((p) => p.id === 'latency-peer')
+    expect(peer).toBeDefined()
+    expect(peer!.latencyMs).toBe(7.2)
+    expect(peer!.latencySource).toBe(LatencySource.DIRECT)
+    expect(peer!.latencyAgeMs).toBe(500)
+    expect(peer!.latencyObserverId).toBe('observer-node-id')
+  })
+
+  it('defaults self peer latency fields to null', () => {
+    const dashboard = adaptStatusToDashboard(PUBLIC_STATUS_PAYLOAD)
+
+    const selfPeer = dashboard.peers.find((p) => p.id === '16ce0bb4de')
+    expect(selfPeer).toBeDefined()
+    expect(selfPeer!.latencyMs).toBe(0)
+    expect(selfPeer!.latencySource).toBeNull()
+    expect(selfPeer!.latencyAgeMs).toBeNull()
+    expect(selfPeer!.latencyObserverId).toBeNull()
+  })
+
+  it('falls back to rtt_ms when latency_ms is absent', () => {
+    const dashboard = adaptStatusToDashboard({
+      ...PUBLIC_STATUS_PAYLOAD,
+      peers: [
+        {
+          id: 'rtt-peer',
+          role: 'Client',
+          state: 'client',
+          models: [],
+          vram_gb: 0,
+          hostname: 'rtt-host',
+          rtt_ms: 12.5
+        }
+      ]
+    })
+
+    const peer = dashboard.peers.find((p) => p.id === 'rtt-peer')
+    expect(peer).toBeDefined()
+    expect(peer!.latencyMs).toBe(12.5)
   })
 })

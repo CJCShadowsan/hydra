@@ -156,7 +156,10 @@ function adaptPeer(peer: PeerInfo, fallbackIndex: number): Peer {
     status: mapNodeState(resolvePeerState(peer)),
     hostedModels: resolveHostedModels(peer),
     sharePct: normalizeSharePct(peer.share_pct),
-    latencyMs: peer.latency_ms ?? peer.rtt_ms ?? 0,
+    latencyMs: peer.latency_ms ?? peer.rtt_ms ?? null,
+    latencySource: peer.latency_source ?? null,
+    latencyAgeMs: peer.latency_age_ms ?? null,
+    latencyObserverId: peer.latency_observer_id ?? null,
     loadPct: peer.load_pct ?? 0,
     shortId: id.slice(0, 8),
     version: peer.version,
@@ -165,31 +168,45 @@ function adaptPeer(peer: PeerInfo, fallbackIndex: number): Peer {
     nodeState,
     toksPerSec: peer.tok_per_sec,
     hardwareLabel: peer.hardware_label,
-    owner: resolveOwner(peer.owner)
+    owner: resolveOwner(peer.owner),
+    firstJoinedMeshTs: peer.first_joined_mesh_ts
   }
 }
 
+function isSplitParticipant(payload: StatusPayload): boolean {
+  const stages = payload.runtime?.stages ?? []
+  return stages.some((s) => s.node_id === payload.node_id)
+}
+
 function adaptSelfPeer(payload: StatusPayload): Peer {
+  const splitParticipant = isSplitParticipant(payload)
   const servingModels = normalizeModelList([
     ...payload.serving_models.map(servingModelName),
     payload.node_state === 'serving' ? payload.model_name : undefined
   ])
 
+  // A split worker is in standby but actively participating — treat it as serving
+  const effectiveState = splitParticipant && payload.node_state === 'standby' ? 'serving' : payload.node_state
+
   return {
     id: payload.node_id,
     hostname: payload.hostname ?? payload.my_hostname ?? 'localhost',
     region: payload.region ?? '',
-    status: mapNodeState(payload.node_state),
+    status: mapNodeState(effectiveState),
     hostedModels: servingModels,
     sharePct: 0,
     latencyMs: 0,
+    latencySource: null,
+    latencyAgeMs: null,
+    latencyObserverId: null,
     loadPct: payload.load_pct ?? 0,
     shortId: payload.node_id.slice(0, 8),
     role: 'you' as const,
-    nodeState: payload.node_state,
+    nodeState: effectiveState,
     version: payload.version,
     vramGB: payload.my_vram_gb,
-    toksPerSec: payload.tok_per_sec
+    toksPerSec: payload.tok_per_sec,
+    firstJoinedMeshTs: payload.first_joined_mesh_ts
   }
 }
 
@@ -287,7 +304,8 @@ function adaptMeshNodeSeeds(payload: StatusPayload): MeshNode[] {
     meshState: payload.node_state,
     servingModels: payload.serving_models.map(servingModelName),
     hostname: payload.hostname,
-    vramGB: payload.my_vram_gb
+    vramGB: payload.my_vram_gb,
+    firstJoinedMeshTs: payload.first_joined_mesh_ts
   }
 
   return [selfNode]
@@ -306,6 +324,7 @@ export function adaptStatusToDashboard(payload: StatusPayload, models: ModelSumm
     meshNodeSeeds: adaptMeshNodeSeeds(payload),
     meshId: payload.mesh_id ?? '',
     models,
-    connect: adaptConnect(payload)
+    connect: adaptConnect(payload),
+    wakeableNodes: payload.wakeable_nodes
   }
 }

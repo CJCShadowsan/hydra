@@ -1,0 +1,768 @@
+//! Mixture-of-Agents (MoA) gateway.
+//!
+//! Fan out to N heterogeneous LLM backends in parallel, arbitrate their
+//! outputs with deterministic logic, and return one coherent OpenAI-
+//! compatible response.  The client thinks it talks to one model.
+//!
+//! Transport is abstracted behind the [`ModelBackend`] trait (see
+//! [`backend`]). The default [`HttpBackend`] talks to any
+//! OpenAI-compatible HTTP endpoint and is suitable for standalone/test
+//! use. The mesh host-runtime provides mesh-native backends that
+//! dispatch local models via direct HTTP and remote models via QUIC
+//! tunnel.
+//!
+//! ```text
+//! Agent / Goose / pi
+//!     │
+//!     │  POST /v1/chat/completions { "model": "mesh" }
+//!     ▼
+//!  MoA Gateway  (handle_turn)
+//!   ├─ session / context packing (role-shaped)        — context::*
+//!   ├─ parallel fan-out via ModelBackend              — fanout::gather_workers_incremental
+//!   ├─ incremental gathering with early-exit          — arbiter::try_early_decision
+//!   ├─ deterministic arbiter (code, not models)       — arbiter::arbitrate
+//!   └─ reducer escalation only on genuine conflict    — reducer::hedged_reducer_call
+//! ```
+//!
+//! Modules:
+//! - [`backend`] — `ModelBackend` trait, `HttpBackend`, `SamplingParams`,
+//!   `ModelEntry`
+//! - [`reducer`] — reducer candidate ordering, hedged ladder
+//! - [`fanout`] — incremental worker gathering with early-exit
+//! - [`arbiter`] — deterministic arbitration + early-exit consensus
+//! - [`normalize`] — 3-tier dirty-output parsing
+//! - [`session`] — canonical transcript + turn classification
+//! - [`context`] — role-shaped context packing
+//! - [`worker`] — role assignment, think-tag stripping
+
+pub mod arbiter;
+pub mod backend;
+pub mod context;
+mod fanout;
+pub mod normalize;
+mod reducer;
+pub mod session;
+mod tool_guard;
+pub mod worker;
+
+pub use backend::{HttpBackend, ModelBackend, ModelEntry, SamplingParams, apply_enable_thinking};
+
+use backend::call_backend;
+use fanout::gather_workers_incremental;
+use mesh_llm_guardrails::tool_arguments_wire_string;
+use normalize::WorkerOutput;
+use reducer::{hedged_reducer_call, reducer_candidates};
+use serde_json::{Value, json};
+use session::Session;
+use std::time::{Duration, Instant};
+use tool_guard::enforce_allowed_tools;
+use worker::WorkerRole;
+pub use worker::{strip_thinking, truncate_chars};
+
+/// The virtual model name that triggers MoA routing.
+pub const VIRTUAL_MODEL_NAME: &str = "mesh";
+
+// ─── Configuration ───────────────────────────────────────────────────
+
+/// Gateway configuration.
+pub struct GatewayConfig {
+    /// Available backends.  Models reference these by index.
+    pub backends: Vec<std::sync::Arc<dyn ModelBackend>>,
+    /// Available models for fan-out.
+    pub models: Vec<ModelEntry>,
+    /// Per-worker timeout.
+    pub worker_timeout: Duration,
+    /// Per-candidate wait before hedging a second reducer candidate. When the
+    /// primary candidate is slow (e.g. cold KV) we don't want to wait the full
+    /// reducer_timeout before kicking off candidate 2 — start the next one
+    /// after hedge_delay and race them. Cost: up to 2× tokens for the rare
+    /// slow case; zero cost on the happy path (candidate 1 returns first).
+    pub hedge_delay: Duration,
+    /// Reducer timeout.
+    pub reducer_timeout: Duration,
+    /// Chat-only grace: after this long since dispatch, if a single answer
+    /// (conf >= 0.5) is in, accept it instead of waiting for consensus.
+    /// Disabled for tool turns. Zero disables entirely.
+    pub first_answer_grace: Duration,
+    /// Override for whether reasoning workers should think. Propagated to
+    /// every worker and the reducer as `chat_template_kwargs.enable_thinking`
+    /// (and `reasoning_effort: "none"` when disabled).
+    ///
+    /// `None` (the default) leaves each model's default behavior alone —
+    /// existing callers see no behavior change. The MoA HTTP gateway
+    /// populates this from the caller's `reasoning_effort` / `enable_thinking`
+    /// / `reasoning.enabled` knobs so MoA users get a single switch.
+    pub enable_thinking: Option<bool>,
+}
+
+// ─── Turn result ─────────────────────────────────────────────────────
+
+/// Which gateway path produced this turn's response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnKind {
+    /// Fan-out path: arbiter decided from full worker outputs.
+    Fanout,
+    /// Fan-out path with early-exit consensus before all workers returned.
+    EarlyExit,
+    /// Tool-result turn: skipped fan-out, went straight to reducer.
+    ToolResult,
+    /// All workers failed and no reducer recovery happened.
+    Failed,
+}
+
+impl TurnKind {
+    /// Lowercase header-friendly label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fanout => "fanout",
+            Self::EarlyExit => "early-exit",
+            Self::ToolResult => "tool-result",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What the gateway returns for a single turn.
+#[derive(Debug)]
+pub struct TurnResult {
+    /// OpenAI chat.completion response body.
+    pub response_body: Value,
+    /// Per-worker details for observability.
+    pub worker_summaries: Vec<WorkerSummary>,
+    /// Whether the reducer was invoked.
+    pub reducer_used: bool,
+    /// How many reducer candidates were spawned (0 if reducer didn't run,
+    /// 1 on the happy reducer path, ≥2 if the hedge fired or a fast-fail
+    /// cascaded to the next candidate).
+    pub reducer_attempts: u32,
+    /// Which gateway path produced this response.
+    pub turn_kind: TurnKind,
+    /// Wall-clock time for this turn.
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug)]
+pub struct WorkerSummary {
+    pub model: String,
+    pub role: WorkerRole,
+    pub succeeded: bool,
+    pub elapsed_ms: u64,
+    pub output_kind: Option<normalize::OutputKind>,
+    pub confidence: Option<f32>,
+}
+
+// ─── Gateway entry point ─────────────────────────────────────────────
+
+/// Process one MoA turn.
+///
+/// Stateless per request.  Multi-turn state is managed by the agent client
+/// which sends the full conversation on each request.
+pub async fn handle_turn(config: &GatewayConfig, body: &Value) -> TurnResult {
+    let start = Instant::now();
+
+    let mut session = Session::new();
+    let incoming_messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tools = body.get("tools").cloned();
+    let has_tools = tools
+        .as_ref()
+        .and_then(|t| t.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    session.ingest(&incoming_messages, &tools);
+
+    let turn_type = session.classify_turn();
+    tracing::info!(
+        "moa: turn={:?}, {} models, tools={}",
+        turn_type,
+        config.models.len(),
+        has_tools,
+    );
+
+    let allowed_tools = session.tool_names();
+
+    match turn_type {
+        session::TurnType::ToolResult => {
+            handle_tool_result(config, &session, has_tools, &allowed_tools, start).await
+        }
+        session::TurnType::Fresh => {
+            handle_query(config, &session, has_tools, &allowed_tools, start).await
+        }
+    }
+}
+
+// ─── Query handling ──────────────────────────────────────────────────
+
+async fn handle_query(
+    config: &GatewayConfig,
+    session: &Session,
+    has_tools: bool,
+    allowed_tools: &[String],
+    start: Instant,
+) -> TurnResult {
+    let assignments = worker::assign_roles(&config.models);
+
+    tracing::info!(
+        "moa: dispatching to {} workers: [{}]",
+        assignments.len(),
+        assignments
+            .iter()
+            .map(|a| format!("{}({})", a.model_name, a.role.label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut dispatched: Vec<fanout::DispatchedWorker> = Vec::with_capacity(assignments.len());
+
+    let enable_thinking = config.enable_thinking;
+    for assignment in &assignments {
+        let packed = context::pack_for_worker(session, assignment.role, has_tools);
+        let model_name = assignment.model_name.clone();
+        let role = assignment.role;
+        let backend = config.backends[assignment.backend_index].clone();
+        let timeout = config.worker_timeout;
+
+        dispatched.push(fanout::DispatchedWorker {
+            model: model_name.clone(),
+            role,
+        });
+
+        join_set.spawn(async move {
+            let t0 = Instant::now();
+            let result = call_backend(
+                &*backend,
+                &model_name,
+                &packed.messages,
+                packed.tools.as_ref(),
+                packed.max_tokens,
+                timeout,
+                SamplingParams::worker().with_thinking(enable_thinking),
+            )
+            .await;
+            let elapsed = t0.elapsed().as_millis() as u64;
+            (model_name, role, result, elapsed)
+        });
+    }
+
+    let (outputs, summaries, early_decision) = gather_workers_incremental(
+        &mut join_set,
+        &dispatched,
+        has_tools,
+        allowed_tools,
+        config.first_answer_grace,
+    )
+    .await;
+
+    if outputs.is_empty() {
+        return TurnResult {
+            response_body: error_response("All MoA workers failed", MOA_ERR_ALL_WORKERS_FAILED),
+            worker_summaries: summaries,
+            reducer_used: false,
+            reducer_attempts: 0,
+            turn_kind: TurnKind::Failed,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+
+    // Capture whether we took the early-exit path BEFORE we resolve the
+    // decision: the arbiter never runs when early_decision is Some.
+    let took_early_exit = early_decision.is_some();
+    let decision = early_decision.unwrap_or_else(|| arbiter::arbitrate(&outputs, has_tools));
+    let (response_body, reducer_used, reducer_attempts) = resolve_decision(
+        config,
+        session,
+        decision,
+        &outputs,
+        has_tools,
+        allowed_tools,
+    )
+    .await;
+
+    // turn_kind is "early-exit" only when we genuinely short-circuited via
+    // consensus AND didn't need to escalate to the reducer. A reducer-
+    // escalated turn is "fanout" even if early_decision was set, because
+    // we still did the expensive serial call.
+    let turn_kind = if took_early_exit && !reducer_used {
+        TurnKind::EarlyExit
+    } else {
+        TurnKind::Fanout
+    };
+
+    TurnResult {
+        response_body,
+        worker_summaries: summaries,
+        reducer_used,
+        reducer_attempts,
+        turn_kind,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+// ─── Tool result handling ────────────────────────────────────────────
+
+async fn handle_tool_result(
+    config: &GatewayConfig,
+    session: &Session,
+    has_tools: bool,
+    allowed_tools: &[String],
+    start: Instant,
+) -> TurnResult {
+    let candidates = reducer_candidates(config);
+    let candidate_count = candidates.len();
+    let (messages, tools) = context::pack_for_tool_result_turn(session, has_tools);
+
+    // Hedged ladder: start candidate 0, hedge to candidate 1 after hedge_delay
+    // (or immediately on candidate 0 error), race for the first OK. Rescues
+    // tool-result turns when the first strong peer is broken (e.g. stale
+    // binary that 502s on tool grammars) without paying N×timeout serially.
+    tracing::info!("moa: tool result → hedged reducer over {candidate_count} candidate(s)");
+    let hedge_result = hedged_reducer_call(
+        &config.backends,
+        candidates.clone(),
+        messages,
+        tools,
+        config.reducer_timeout,
+        config.hedge_delay,
+        config.enable_thinking,
+    )
+    .await;
+
+    let mut last_err: Option<String> = None;
+    let (attempts, chosen): (u32, Option<(String, normalize::WorkerOutput)>) = match hedge_result {
+        Ok(reducer::HedgedReducerOk {
+            winner,
+            text,
+            attempts: spawned,
+        }) => {
+            let mut reduced =
+                normalize::normalize_worker_output(&text, &winner, WorkerRole::Reducer, 0);
+            enforce_allowed_tools(&mut reduced, allowed_tools, &winner);
+            (spawned, Some((winner, reduced)))
+        }
+        Err(reducer::HedgedReducerErr {
+            err,
+            attempts: spawned,
+        }) => {
+            last_err = Some(err);
+            (spawned, None)
+        }
+    };
+
+    let (reducer_name, succeeded, response_body) = match chosen {
+        Some((name, reduced)) => {
+            // Be consistent with the fanout/arbiter path: emit a real
+            // `tool_calls` response whenever the reducer named a tool,
+            // even if `arguments` is missing. The fanout path emits `{}`
+            // for empty arguments; this path used to fall back to a
+            // chat_response carrying the reducer's prose, which broke
+            // agent harnesses (Goose, OpenCode) that only act on
+            // `tool_calls`. `tool_call_response` already collapses
+            // missing / non-object arguments to `"{}"`.
+            let body = match reduced.kind {
+                normalize::OutputKind::ToolProposal => {
+                    if let Some(tname) = reduced.tool_name.as_ref() {
+                        let args = reduced.tool_arguments.as_ref().unwrap_or(&Value::Null);
+                        tool_call_response(tname, args)
+                    } else {
+                        chat_response(&reduced.payload)
+                    }
+                }
+                _ => chat_response(&reduced.payload),
+            };
+            (name, true, body)
+        }
+        None => {
+            let err = last_err.unwrap_or_else(|| "no reducer candidates".into());
+            tracing::warn!("moa: all {attempts} reducer candidates failed");
+            (
+                candidates.first().map(|c| c.0.clone()).unwrap_or_default(),
+                false,
+                error_response(
+                    &format!("Reducer failed (tried {attempts}): {err}"),
+                    MOA_ERR_ALL_REDUCERS_FAILED,
+                ),
+            )
+        }
+    };
+
+    TurnResult {
+        response_body,
+        worker_summaries: vec![WorkerSummary {
+            model: reducer_name,
+            role: WorkerRole::Reducer,
+            succeeded,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            output_kind: None,
+            confidence: None,
+        }],
+        reducer_used: true,
+        reducer_attempts: attempts,
+        turn_kind: TurnKind::ToolResult,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+// ─── Decision resolution ─────────────────────────────────────────────
+
+/// Returns (response body, reducer_used, reducer_attempts).
+async fn resolve_decision(
+    config: &GatewayConfig,
+    session: &Session,
+    decision: arbiter::Decision,
+    outputs: &[WorkerOutput],
+    has_tools: bool,
+    allowed_tools: &[String],
+) -> (Value, bool, u32) {
+    match decision {
+        arbiter::Decision::Answer(text) => (chat_response(&text), false, 0),
+        arbiter::Decision::ToolCall { name, arguments } => {
+            (tool_call_response(&name, &arguments), false, 0)
+        }
+        arbiter::Decision::NeedsReducer { reason } => {
+            tracing::info!("moa: reducer — {reason}");
+            let candidates = reducer_candidates(config);
+            let (messages, tools) = context::pack_for_reducer(session, outputs, &reason, has_tools);
+
+            // Hedged ladder over the ordered candidates (see hedged_reducer_call).
+            let hedge_result = hedged_reducer_call(
+                &config.backends,
+                candidates,
+                messages,
+                tools,
+                config.reducer_timeout,
+                config.hedge_delay,
+                config.enable_thinking,
+            )
+            .await;
+
+            let (attempts, chosen): (u32, Option<normalize::WorkerOutput>) = match hedge_result {
+                Ok(reducer::HedgedReducerOk {
+                    winner,
+                    text,
+                    attempts: spawned,
+                }) => {
+                    let mut reduced =
+                        normalize::normalize_worker_output(&text, &winner, WorkerRole::Reducer, 0);
+                    enforce_allowed_tools(&mut reduced, allowed_tools, &winner);
+                    (spawned, Some(reduced))
+                }
+                Err(reducer::HedgedReducerErr {
+                    err: _,
+                    attempts: spawned,
+                }) => (spawned, None),
+            };
+
+            match chosen {
+                Some(reduced) => match reduced.kind {
+                    normalize::OutputKind::ToolProposal => {
+                        // See the matching block in `handle_tool_result`:
+                        // emit `tool_calls` whenever `tool_name` is present,
+                        // defaulting `arguments` to `{}` via
+                        // `tool_call_response`. Agent harnesses key on
+                        // `tool_calls` rather than scanning prose, so the
+                        // previous "both name AND args required" gate would
+                        // silently fall back to a chat_response and break
+                        // the calling agent's tool loop.
+                        if let Some(name) = reduced.tool_name.as_ref() {
+                            let args = reduced.tool_arguments.as_ref().unwrap_or(&Value::Null);
+                            (tool_call_response(name, args), true, attempts)
+                        } else {
+                            (chat_response(&reduced.payload), true, attempts)
+                        }
+                    }
+                    _ => (chat_response(&reduced.payload), true, attempts),
+                },
+                None => {
+                    tracing::warn!("moa: all reducer candidates failed, using best worker");
+                    // reducer_used=false here because the reducer did NOT
+                    // produce the output we're returning — we fell back to
+                    // a worker. attempts still reflects what was spawned so
+                    // observability can see "we tried N times and all failed".
+                    (chat_response(&best_answer(outputs)), false, attempts)
+                }
+            }
+        }
+    }
+}
+
+// ─── Response builders ───────────────────────────────────────────────
+
+fn best_answer(outputs: &[WorkerOutput]) -> String {
+    outputs
+        .iter()
+        .filter(|o| matches!(o.kind, normalize::OutputKind::Answer))
+        // `total_cmp` is total over all f32 (including NaN/Inf); `partial_cmp`
+        // can return `None` on NaN, which would panic on `unwrap`.
+        // `normalize_worker_output` now sanitizes non-finite confidences
+        // before they reach here, but using `total_cmp` keeps this site
+        // panic-free even if a future caller skips the normalizer.
+        .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+        .or(outputs.first())
+        .map(|o| o.payload.clone())
+        .unwrap_or_default()
+}
+
+/// Build a response body that signals MoA-level failure to the client.
+///
+/// Distinguishable from a successful `chat.completion` in three ways:
+///
+///   * Top-level `error` object (OpenAI error-shape) so SDKs that read
+///     `response.error` see the failure without parsing `choices`.
+///   * `choices[0].finish_reason == "error"` (instead of `"stop"`) so
+///     SDKs that branch on `finish_reason` see the failure too.
+///   * The error text is still placed in `choices[0].message.content`
+///     so unstructured clients still surface a useful string to the
+///     human, just not as a successful assistant reply.
+///
+/// `code` is the machine-parseable failure mode that clients can branch
+/// on. Callers pass one of the [`MOA_ERR_*`] constants so distinct
+/// failure modes (all-workers-failed vs all-reducers-failed vs future
+/// kinds) surface accurately to the caller rather than being collapsed
+/// to a single string.
+///
+/// The ingress layer is responsible for choosing the HTTP status; this
+/// body is the in-band signal.
+fn error_response(message: &str, code: &str) -> Value {
+    json!({
+        "id": format!("chatcmpl-moa-{}", short_id()),
+        "object": "chat.completion",
+        "model": VIRTUAL_MODEL_NAME,
+        "error": {
+            "message": message,
+            "type": "moa_failure",
+            "code": code,
+        },
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": message },
+            "finish_reason": "error"
+        }],
+        "usage": usage_for_content(message)
+    })
+}
+
+/// Estimate `completion_tokens` from output chars (OpenAI's ~chars/4 rule).
+/// Returns at least 1 for non-empty so UI tok/s never divides by zero.
+fn estimate_completion_tokens(content: &str) -> u64 {
+    if content.is_empty() {
+        return 0;
+    }
+    let chars = content.chars().count() as u64;
+    chars.div_ceil(4).max(1)
+}
+
+fn usage_for_content(content: &str) -> Value {
+    let completion = estimate_completion_tokens(content);
+    json!({
+        "prompt_tokens": 0,
+        "completion_tokens": completion,
+        "total_tokens": completion,
+    })
+}
+
+/// All fanned-out workers failed before the arbiter could pick a winner.
+pub const MOA_ERR_ALL_WORKERS_FAILED: &str = "all_workers_failed";
+/// Every reducer candidate failed (in both the tool-result and the
+/// arbiter-escalated paths).
+pub const MOA_ERR_ALL_REDUCERS_FAILED: &str = "all_reducers_failed";
+
+fn chat_response(content: &str) -> Value {
+    json!({
+        "id": format!("chatcmpl-moa-{}", short_id()),
+        "object": "chat.completion",
+        "model": VIRTUAL_MODEL_NAME,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": "stop"
+        }],
+        "usage": usage_for_content(content)
+    })
+}
+
+fn tool_call_response(name: &str, arguments: &Value) -> Value {
+    // OpenAI tool-call `arguments` is a JSON-object *string*. Three input
+    // shapes have to collapse to a valid object string here:
+    //
+    //   * String form: trust the caller's JSON (worker already passed
+    //     through `extract_tool_arguments` so the inner shape is sane).
+    //   * Null / non-object: emit `"{}"` rather than `"null"` or
+    //     `"\"foo\""`. The previous shape would serialize `Value::Null`
+    //     to the literal four-char string `"null"`, which downstream
+    //     OpenAI tool-call consumers reject.
+    //   * Object: serialize as JSON.
+    let args_str = tool_arguments_wire_string(arguments);
+
+    // For tool-call responses, the user-visible output is the
+    // arguments JSON, not free-form text. Use it as the basis of the
+    // token estimate so callers still see a non-zero count.
+    json!({
+        "id": format!("chatcmpl-moa-{}", short_id()),
+        "object": "chat.completion",
+        "model": VIRTUAL_MODEL_NAME,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{}", short_id()),
+                    "type": "function",
+                    "function": { "name": name, "arguments": args_str }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": usage_for_content(&args_str)
+    })
+}
+
+fn short_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}", t)
+}
+
+#[cfg(test)]
+mod response_builder_tests {
+    use super::*;
+    use crate::normalize::{OutputKind, WorkerOutput};
+    use crate::worker::WorkerRole;
+
+    fn answer(model: &str, confidence: f32, payload: &str) -> WorkerOutput {
+        WorkerOutput {
+            kind: OutputKind::Answer,
+            confidence,
+            tool_name: None,
+            tool_arguments: None,
+            payload: payload.to_string(),
+            model: model.to_string(),
+            role: WorkerRole::Fast,
+            elapsed_ms: 1,
+        }
+    }
+
+    #[test]
+    fn best_answer_does_not_panic_on_nan_confidence() {
+        // Regression for PR #566 review: `partial_cmp(...).unwrap()` could
+        // panic if any confidence reached this site as NaN. After switching
+        // to `total_cmp`, this is safe even if normalize is bypassed.
+        let outputs = vec![
+            answer("a", f32::NAN, "nan-answer"),
+            answer("b", 0.7, "good-answer"),
+            answer("c", f32::NAN, "another-nan"),
+        ];
+        let picked = best_answer(&outputs);
+        // `total_cmp` treats NaN as greater than any finite; the assertion
+        // here is *not* about which specific answer wins, only that we do
+        // not panic and we return *some* answer.
+        assert!(!picked.is_empty());
+    }
+
+    #[test]
+    fn tool_call_response_emits_object_args_for_null() {
+        // Regression: `Value::Null` previously serialized to the literal
+        // string "null", which downstream OpenAI tool-call consumers reject.
+        let resp = tool_call_response("list", &Value::Null);
+        let args_str = resp
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+            .expect("arguments is string");
+        assert_eq!(args_str, "{}");
+    }
+
+    #[test]
+    fn tool_call_response_emits_object_args_for_primitive() {
+        let resp = tool_call_response("list", &Value::from(42));
+        let args_str = resp
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+            .expect("arguments is string");
+        assert_eq!(args_str, "{}");
+    }
+
+    #[test]
+    fn tool_call_response_passes_through_string_form_when_valid() {
+        let resp = tool_call_response(
+            "read_file",
+            &Value::String("{\"path\":\"README.md\"}".to_string()),
+        );
+        let args_str = resp
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+            .expect("arguments is string");
+        let parsed: Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(parsed["path"], "README.md");
+    }
+
+    #[test]
+    fn tool_call_response_rejects_invalid_string_form() {
+        // If the caller hands us a bare non-JSON string, fall back to `{}`.
+        let resp = tool_call_response("x", &Value::String("not json at all".to_string()));
+        let args_str = resp
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+            .expect("arguments is string");
+        assert_eq!(args_str, "{}");
+    }
+
+    // Regression for #637.
+
+    #[test]
+    fn estimate_completion_tokens_returns_zero_for_empty_content() {
+        assert_eq!(estimate_completion_tokens(""), 0);
+    }
+
+    #[test]
+    fn estimate_completion_tokens_returns_at_least_one_for_non_empty() {
+        assert_eq!(estimate_completion_tokens("a"), 1);
+    }
+
+    #[test]
+    fn estimate_completion_tokens_is_roughly_chars_over_four() {
+        assert_eq!(estimate_completion_tokens("sixteen chars!!!"), 4);
+        assert_eq!(estimate_completion_tokens(&"x".repeat(40)), 10);
+    }
+
+    #[test]
+    fn chat_response_reports_non_zero_completion_tokens() {
+        let resp = chat_response("Hi there! How can I help you today?");
+        let tokens = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("completion_tokens is u64");
+        assert!(tokens > 0);
+        assert_eq!(
+            resp.pointer("/usage/total_tokens").and_then(|v| v.as_u64()),
+            Some(tokens),
+        );
+    }
+
+    #[test]
+    fn tool_call_response_reports_non_zero_completion_tokens() {
+        let resp = tool_call_response("read_file", &serde_json::json!({"path": "/etc/hostname"}));
+        let tokens = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("completion_tokens is u64");
+        assert!(tokens > 0);
+    }
+
+    #[test]
+    fn error_response_reports_message_based_completion_tokens() {
+        let resp = error_response("All MoA workers failed", MOA_ERR_ALL_WORKERS_FAILED);
+        let tokens = resp
+            .pointer("/usage/completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .expect("completion_tokens is u64");
+        assert!(tokens > 0);
+    }
+}

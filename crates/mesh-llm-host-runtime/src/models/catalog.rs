@@ -1,10 +1,12 @@
 //! Managed model acquisition helpers.
 
 use super::track_managed_model_usage;
-use crate::cli::output::{emit_event, interactive_tui_active, ModelProgressStatus, OutputEvent};
-use crate::cli::terminal_progress::{start_spinner, SpinnerHandle};
+use crate::cli::output::{ModelProgressStatus, OutputEvent, emit_event, interactive_tui_active};
+use crate::cli::terminal_progress::{SpinnerHandle, start_spinner};
 use anyhow::{Context, Result};
-use hf_hub::{DownloadEvent, Progress, ProgressEvent, ProgressHandler, RepoDownloadFileParams};
+use hf_hub::progress::{DownloadEvent, Progress, ProgressEvent, ProgressHandler};
+#[cfg(test)]
+use hf_hub::progress::{FileProgress, FileStatus};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::io::Write;
@@ -148,12 +150,10 @@ fn parse_safetensors_index_shards(index: &serde_json::Value) -> Result<Vec<Strin
 fn ensure_cached_hf_asset(api: &hf_hub::HFClientSync, asset: &HfAsset) -> Result<PathBuf> {
     let (owner, name) = asset.repo_parts();
     api.model(owner, name)
-        .download_file(
-            &RepoDownloadFileParams::builder()
-                .filename(asset.file.clone())
-                .revision(asset.revision.clone())
-                .build(),
-        )
+        .download_file()
+        .filename(asset.file.clone())
+        .revision(asset.revision.clone())
+        .send()
         .with_context(|| {
             format!(
                 "Cache Hugging Face asset {}/{}@{}",
@@ -374,10 +374,10 @@ impl MeshDownloadProgress {
                 }
             }
             DownloadEvent::Progress { files } => {
-                if let Some(first) = files.first() {
-                    if !first.filename.is_empty() {
-                        state.filename = first.filename.clone();
-                    }
+                if let Some(first) = files.first()
+                    && !first.filename.is_empty()
+                {
+                    state.filename = first.filename.clone();
                 }
                 if !files.is_empty() {
                     let reported_downloaded: u64 =
@@ -433,10 +433,10 @@ impl ProgressHandler for MeshDownloadProgress {
                 spinner.take();
             }
             Self::draw(&mut state, force);
-        } else if matches!(event, DownloadEvent::Complete) {
-            if let Ok(mut spinner) = self.preflight_spinner.lock() {
-                spinner.take();
-            }
+        } else if matches!(event, DownloadEvent::Complete)
+            && let Ok(mut spinner) = self.preflight_spinner.lock()
+        {
+            spinner.take();
         }
     }
 }
@@ -489,6 +489,15 @@ fn emit_or_print_model_progress(
 }
 
 fn download_hf_assets_blocking(
+    label: &str,
+    assets: Vec<HfAsset>,
+    progress: bool,
+) -> Result<Vec<PathBuf>> {
+    let label = label.to_string();
+    super::run_hf_sync(move || download_hf_assets_sync(&label, assets, progress))
+}
+
+fn download_hf_assets_sync(
     label: &str,
     assets: Vec<HfAsset>,
     progress: bool,
@@ -555,18 +564,16 @@ fn download_hf_assets_blocking(
         } else {
             None
         };
-        let progress_handler: Progress = if let Some(tracker) = &progress_tracker {
-            Some(tracker.clone())
-        } else {
-            None
-        };
-        let path = match api_repo.download_file(
-            &RepoDownloadFileParams::builder()
-                .filename(asset.file.clone())
-                .revision(asset.revision.clone())
-                .progress(progress_handler)
-                .build(),
-        ) {
+        let progress_handler: Option<Progress> = progress_tracker
+            .as_ref()
+            .map(|tracker| tracker.clone().into());
+        let path = match api_repo
+            .download_file()
+            .filename(asset.file.clone())
+            .revision(asset.revision.clone())
+            .maybe_progress(progress_handler)
+            .send()
+        {
             Ok(path) => {
                 if progress {
                     if required {
@@ -833,12 +840,16 @@ mod tests {
         assert_eq!(sidecars.len(), 4);
         assert!(sidecars[0].0);
         assert_eq!(sidecars[0].1.file, "tokenizer.json");
-        assert!(sidecars
-            .iter()
-            .any(|(_, a)| a.file == "tokenizer_config.json"));
-        assert!(sidecars
-            .iter()
-            .any(|(_, a)| a.file == "chat_template.jinja"));
+        assert!(
+            sidecars
+                .iter()
+                .any(|(_, a)| a.file == "tokenizer_config.json")
+        );
+        assert!(
+            sidecars
+                .iter()
+                .any(|(_, a)| a.file == "chat_template.jinja")
+        );
         assert!(sidecars.iter().any(|(_, a)| a.file == "chat_template.json"));
     }
 
@@ -899,13 +910,15 @@ mod tests {
                 "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf@main"
                     .to_string();
             let _guard = DownloadHfAssetsOverrideGuard::set(label, Arc::new(|_, _| Ok(Vec::new())));
-            assert!(download_hf_repo_file(
-                "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-                Some("main"),
-                "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
-            )
-            .await
-            .is_err());
+            assert!(
+                download_hf_repo_file(
+                    "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                    Some("main"),
+                    "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+                )
+                .await
+                .is_err()
+            );
         }
     }
 
@@ -963,22 +976,22 @@ mod tests {
         MeshDownloadProgress::apply_download_event(
             &mut state,
             &DownloadEvent::Progress {
-                files: vec![hf_hub::FileProgress {
+                files: vec![FileProgress {
                     filename: "model.gguf".to_string(),
                     bytes_completed: 250,
                     total_bytes: 1_000,
-                    status: hf_hub::FileStatus::InProgress,
+                    status: FileStatus::InProgress,
                 }],
             },
         );
         MeshDownloadProgress::apply_download_event(
             &mut state,
             &DownloadEvent::Progress {
-                files: vec![hf_hub::FileProgress {
+                files: vec![FileProgress {
                     filename: "model.gguf".to_string(),
                     bytes_completed: 700,
                     total_bytes: 1_000,
-                    status: hf_hub::FileStatus::InProgress,
+                    status: FileStatus::InProgress,
                 }],
             },
         );
@@ -1010,11 +1023,11 @@ mod tests {
         MeshDownloadProgress::apply_download_event(
             &mut state,
             &DownloadEvent::Progress {
-                files: vec![hf_hub::FileProgress {
+                files: vec![FileProgress {
                     filename: "gemma-4-31B-it-Q4_0.gguf".to_string(),
                     bytes_completed: 4_000_000,
                     total_bytes: 17_300_000_000,
-                    status: hf_hub::FileStatus::InProgress,
+                    status: FileStatus::InProgress,
                 }],
             },
         );

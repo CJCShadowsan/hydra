@@ -281,6 +281,14 @@ impl GgufKvCacheType {
         }
     }
 
+    pub const fn as_llama_arg(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+        }
+    }
+
     fn block_shape(self) -> (u64, u64) {
         match self {
             Self::F16 => (1, 2),
@@ -305,14 +313,47 @@ pub struct GgufKvCacheQuant {
 }
 
 impl GgufKvCacheQuant {
+    /// f16 K + f16 V — highest quality, largest KV cache.
+    pub const F16: Self = Self {
+        k: GgufKvCacheType::F16,
+        v: GgufKvCacheType::F16,
+    };
+
+    /// q8_0 K + q8_0 V — moderate compression.
+    pub const Q8_0: Self = Self {
+        k: GgufKvCacheType::Q8_0,
+        v: GgufKvCacheType::Q8_0,
+    };
+
+    /// q4_0 K + q4_0 V — most aggressive compression, smallest KV cache.
+    pub const Q4_0: Self = Self {
+        k: GgufKvCacheType::Q4_0,
+        v: GgufKvCacheType::Q4_0,
+    };
+
     pub const fn new(k: GgufKvCacheType, v: GgufKvCacheType) -> Self {
         Self { k, v }
     }
 
     pub const fn f16() -> Self {
-        Self {
-            k: GgufKvCacheType::F16,
-            v: GgufKvCacheType::F16,
+        Self::F16
+    }
+
+    /// Returns `true` if `self` uses more aggressive (smaller) quantisation
+    /// than `other`.
+    pub const fn is_more_aggressive_than(self, other: Self) -> bool {
+        Self::aggressiveness(self) > Self::aggressiveness(other)
+    }
+
+    const fn aggressiveness(q: Self) -> u8 {
+        Self::type_aggressiveness(q.k) + Self::type_aggressiveness(q.v)
+    }
+
+    const fn type_aggressiveness(t: GgufKvCacheType) -> u8 {
+        match t {
+            GgufKvCacheType::F16 => 0,
+            GgufKvCacheType::Q8_0 => 1,
+            GgufKvCacheType::Q4_0 => 2,
         }
     }
 
@@ -450,17 +491,17 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
         }
     }
 
-    if meta.key_length == 0 && meta.head_count > 0 {
-        if let Some(key_length) = meta.embedding_size.checked_div(meta.head_count) {
-            meta.key_length = key_length;
-        }
+    if meta.key_length == 0
+        && meta.head_count > 0
+        && let Some(key_length) = meta.embedding_size.checked_div(meta.head_count)
+    {
+        meta.key_length = key_length;
     }
-    if meta.value_length == 0 {
-        if let Some(effective_kv) = meta.effective_kv_head_count() {
-            if let Some(value_length) = meta.embedding_size.checked_div(effective_kv) {
-                meta.value_length = value_length;
-            }
-        }
+    if meta.value_length == 0
+        && let Some(effective_kv) = meta.effective_kv_head_count()
+        && let Some(value_length) = meta.embedding_size.checked_div(effective_kv)
+    {
+        meta.value_length = value_length;
     }
 
     Some(meta)
@@ -776,6 +817,23 @@ mod tests {
     }
 
     #[test]
+    fn kv_cache_quant_prices_key_and_value_widths_independently() {
+        let meta = GgufCompactMeta {
+            head_count: 32,
+            kv_head_count: 8,
+            layer_count: 24,
+            key_length: 64,
+            value_length: 256,
+            ..Default::default()
+        };
+        let quant = GgufKvCacheQuant::new(GgufKvCacheType::Q8_0, GgufKvCacheType::Q4_0);
+
+        assert_eq!(quant.k_cache_bytes_per_token(&meta), Some(13_056));
+        assert_eq!(quant.v_cache_bytes_per_token(&meta), Some(27_648));
+        assert_eq!(quant.kv_cache_bytes_per_token(&meta), Some(40_704));
+    }
+
+    #[test]
     fn kv_cache_bytes_per_token_returns_none_when_required_fields_are_missing() {
         let meta = GgufCompactMeta {
             head_count: 32,
@@ -824,9 +882,10 @@ mod tests {
         let mut file = std::fs::File::open(&path).unwrap();
         let err = read_gguf_value_as_u32(&mut file, GgufType::Int32).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("negative Int32 where unsigned GGUF value was expected"));
+        assert!(
+            err.to_string()
+                .contains("negative Int32 where unsigned GGUF value was expected")
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TopNav } from '@/features/shell/components/TopNav'
 import { DataModeProvider } from '@/lib/data-mode'
+import { env } from '@/lib/env'
 import type { DataMode } from '@/lib/data-mode'
 
 function installClipboard(writeText: (text: string) => Promise<void>) {
@@ -65,6 +66,7 @@ async function waitForHoverDelay() {
 
 describe('TopNav', () => {
   beforeEach(() => {
+    env.isDevelopment = true
     installPointerCaptureShim()
   })
 
@@ -205,8 +207,7 @@ describe('TopNav', () => {
           label: 'Client-only join command',
           value: 'mesh-llm client --join invite-token-123',
           prefix: '$'
-        },
-        { label: 'Blackboard skill command', value: 'mesh-llm blackboard install-skill', prefix: '$' }
+        }
       ],
       joinLinks: [
         { href: 'https://docs.meshllm.cloud/', label: 'Setup' },
@@ -252,8 +253,7 @@ describe('TopNav', () => {
           prefix: '$',
           hint: 'This command becomes available after the backend issues a live invite token.',
           disabled: true
-        },
-        { label: 'Blackboard skill command', value: 'mesh-llm blackboard install-skill', prefix: '$' }
+        }
       ]
     })
 
@@ -267,7 +267,7 @@ describe('TopNav', () => {
     expect(screen.getByRole('button', { name: 'Copy Invite token' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Copy Auto join and serve command' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Copy Client-only join command' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Copy Blackboard skill command' })).not.toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Copy Blackboard skill command' })).not.toBeInTheDocument()
   })
 
   it('shows the playground trigger only when the dev flag is enabled', async () => {
@@ -300,7 +300,7 @@ describe('TopNav', () => {
   })
 
   it('hides development-only navigation controls outside dev mode', async () => {
-    vi.stubEnv('DEV', false)
+    env.isDevelopment = false
     const user = userEvent.setup()
 
     renderTopNav({ onOpenDeveloperPlayground: vi.fn(), showDeveloperPlayground: true })
@@ -321,7 +321,10 @@ describe('TopNav', () => {
     const user = userEvent.setup()
     const onTabChange = vi.fn()
 
-    renderTopNav({ onTabChange, tabHrefs: { configuration: '/configuration/toml-review' } })
+    renderTopNav({ onTabChange, tabHrefs: { reserves: '/reserves', configuration: '/configuration/toml-review' } })
+
+    const reservesTab = screen.getByRole('link', { name: 'Reserves' })
+    expect(reservesTab).toHaveAttribute('href', '/reserves')
 
     const configurationTab = screen.getByRole('link', { name: 'Configuration' })
     expect(configurationTab).toHaveAttribute('href', '/configuration/toml-review')
@@ -350,14 +353,16 @@ describe('TopNav', () => {
     renderTopNav({ onTabChange })
 
     const networkButton = screen.getByRole('button', { name: 'Network' })
+    const reservesButton = screen.getByRole('button', { name: 'Reserves' })
     const chatButton = screen.getByRole('button', { name: 'Chat' })
 
     expect(networkButton).toHaveClass('ui-control-primary')
+    expect(reservesButton).toHaveClass('ui-control-primary')
     expect(chatButton).toHaveClass('ui-control-primary')
 
-    await user.click(chatButton)
+    await user.click(reservesButton)
 
-    expect(onTabChange).toHaveBeenCalledWith('chat')
+    expect(onTabChange).toHaveBeenCalledWith('reserves')
   })
 
   it('opens compact navigation actions without a heading and dismisses terminal actions', async () => {
@@ -390,10 +395,11 @@ describe('TopNav', () => {
   })
 
   it('hides disabled primary tabs while keeping enabled tabs available', () => {
-    renderTopNav({ enabledTabs: { configuration: false } })
+    renderTopNav({ enabledTabs: { reserves: false, configuration: false } })
 
     expect(screen.getByRole('link', { name: 'Network' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Chat' })).toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Reserves' })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: 'Configuration' })).not.toBeInTheDocument()
   })
 
@@ -404,18 +410,21 @@ describe('TopNav', () => {
       onTabChange,
       tabHrefs: {
         network: '/mesh/llm/ui-preview/',
+        reserves: '/mesh/llm/ui-preview/reserves',
         chat: '/mesh/llm/ui-preview/chat',
         configuration: '/mesh/llm/ui-preview/configuration/toml-review'
       }
     })
 
     expect(screen.getByRole('link', { name: 'Network' })).toHaveAttribute('href', '/mesh/llm/ui-preview/')
+    expect(screen.getByRole('link', { name: 'Reserves' })).toHaveAttribute('href', '/mesh/llm/ui-preview/reserves')
     expect(screen.getByRole('link', { name: 'Chat' })).toHaveAttribute('href', '/mesh/llm/ui-preview/chat')
     expect(screen.getByRole('link', { name: 'Configuration' })).toHaveAttribute(
       'href',
       '/mesh/llm/ui-preview/configuration/toml-review'
     )
 
+    window.addEventListener('click', (event) => event.preventDefault(), { once: true })
     fireEvent.click(screen.getByRole('link', { name: 'Chat' }), { button: 0, metaKey: true })
 
     expect(onTabChange).not.toHaveBeenCalled()

@@ -19,8 +19,11 @@ mod usage;
 use anyhow::{Context, Result};
 use hf_hub::{HFClient, HFClientBuilder, HFClientSync};
 
-pub use capabilities::{CapabilityLevel, ModelCapabilities};
-pub use inventory::{scan_local_inventory_snapshot_with_progress, LocalModelInventorySnapshot};
+pub use capabilities::{
+    CapabilityLevel, ModelCapabilities, RuntimeMediaCapabilityEvidence,
+    runtime_verified_model_capabilities,
+};
+pub use inventory::{LocalModelInventorySnapshot, scan_local_inventory_snapshot_with_progress};
 pub use local::{
     find_mmproj_path, find_model_path, huggingface_hub_cache_dir, huggingface_identity_for_path,
     layered_package_layer_count_for_path, layered_package_total_bytes_for_path, mesh_llm_cache_dir,
@@ -28,22 +31,21 @@ pub use local::{
 };
 pub use maintenance::{run_update, warn_about_updates_for_paths};
 pub use resolve::{
-    canonicalize_interest_model_ref, download_model_ref_with_progress_details,
-    find_loaded_remote_catalog_model_exact, find_remote_catalog_model_exact,
-    installed_model_capabilities, installed_model_display_name, installed_model_huggingface_ref,
-    remote_catalog_model_draft_ref, remote_catalog_model_ref, resolve_model_spec,
-    resolve_model_spec_with_progress, show_exact_model, show_model_variants_with_progress,
-    ModelDetails, ShowVariantsProgress,
+    ModelDetails, ShowVariantsProgress, canonicalize_interest_model_ref,
+    download_model_ref_with_progress_details, find_loaded_remote_catalog_model_exact,
+    find_remote_catalog_model_exact, installed_model_capabilities, installed_model_display_name,
+    installed_model_huggingface_ref, remote_catalog_model_draft_ref, remote_catalog_model_ref,
+    resolve_model_spec, resolve_model_spec_with_progress, show_exact_model,
+    show_model_variants_with_progress,
 };
 pub use search::{
-    search_catalog_json_payload, search_catalog_models, search_huggingface,
-    search_huggingface_json_payload, SearchArtifactFilter, SearchHit, SearchProgress, SearchSort,
+    SearchArtifactFilter, SearchHit, SearchProgress, SearchSort, search_catalog_json_payload,
+    search_catalog_models, search_huggingface, search_huggingface_json_payload,
 };
-pub use topology::{infer_local_model_topology, ModelMoeInfo, ModelTopology};
+pub use topology::{ModelMoeInfo, ModelTopology, infer_local_model_topology};
 pub use usage::{
-    execute_model_cleanup, load_model_usage_record_for_path, model_usage_cache_dir,
-    plan_model_cleanup, track_managed_model_usage, track_model_usage, ModelCleanupPlan,
-    ModelCleanupResult,
+    ModelCleanupPlan, ModelCleanupResult, execute_model_cleanup, load_model_usage_record_for_path,
+    model_usage_cache_dir, plan_model_cleanup, track_managed_model_usage, track_model_usage,
 };
 
 pub(crate) fn build_hf_api(_progress: bool) -> Result<HFClientSync> {
@@ -57,8 +59,28 @@ pub(crate) fn build_hf_api(_progress: bool) -> Result<HFClientSync> {
     if let Some(token) = hf_token_override() {
         builder = builder.token(token);
     }
-    HFClientSync::from_api(builder.build().context("Build Hugging Face API client")?)
+    HFClientSync::from_inner(builder.build().context("Build Hugging Face API client")?)
         .context("Build Hugging Face sync API client")
+}
+
+pub(crate) fn run_hf_sync<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(operation).join().map_err(|panic| {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                anyhow::anyhow!("Hugging Face sync task panicked: {message}")
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                anyhow::anyhow!("Hugging Face sync task panicked: {message}")
+            } else {
+                anyhow::anyhow!("Hugging Face sync task panicked")
+            }
+        })?
+    } else {
+        operation()
+    }
 }
 
 pub(crate) fn build_hf_tokio_api(_progress: bool) -> Result<HFClient> {
@@ -136,5 +158,12 @@ mod tests {
         assert_eq!(repo, "Qwen/Qwen3-8B-GGUF");
         assert_eq!(revision.as_deref(), Some("main"));
         assert_eq!(file, "Qwen3-8B-Q4_K_M.gguf");
+    }
+
+    #[tokio::test]
+    async fn run_hf_sync_leaves_tokio_runtime_context() {
+        let saw_runtime = super::run_hf_sync(|| Ok(tokio::runtime::Handle::try_current().is_ok()))
+            .expect("sync operation should run");
+        assert!(!saw_runtime);
     }
 }

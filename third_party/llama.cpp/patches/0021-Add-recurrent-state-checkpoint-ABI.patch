@@ -1,7 +1,7 @@
-From 44b4073f208d072df0af83268e543aa7836034be Mon Sep 17 00:00:00 2001
+From ca2f3abd4cfbe87c35db9f4b9da7030241f6e9a6 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Mon, 27 Apr 2026 14:07:00 +1000
-Subject: [PATCH 21/45] Add recurrent state checkpoint ABI
+Subject: [PATCH 21/81] Add recurrent state checkpoint ABI
 
 ---
  include/skippy.h |  16 +++++-

@@ -5,40 +5,173 @@ set -euo pipefail
 # It clones mesh-llm, builds the splitter, splits the model, validates, and publishes.
 #
 # Environment variables (set by mesh-llm model-package job spec):
-#   SOURCE_REPO, SOURCE_FILE, TARGET_REPO, MODEL_ID, SOURCE_REVISION
+#   SOURCE_REPO, SOURCE_FILE, SOURCE_QUANT, TARGET_REPO, MODEL_ID, SOURCE_REVISION
 #   MESH_LLM_REF — git ref to build from (default: main)
 #   CATALOG_CREATE_PR — "true" to open a PR for catalog updates (non-org members)
 #   HF_TOKEN — injected as a secret by HF Jobs
 #
 # Volumes:
-#   /source  — source GGUF repo (read-only mount)
-#   /bucket  — writable storage bucket for script + large package workspace
+#   /bucket  — writable storage bucket for script and fallback source cache
 
 MESH_LLM_REF="${MESH_LLM_REF:-main}"
+SOURCE_REVISION="${SOURCE_REVISION:-main}"
+SOURCE_QUANT="${SOURCE_QUANT:-}"
+if [ -z "$SOURCE_QUANT" ] && [[ "${MODEL_ID:-}" == *:* ]]; then
+    SOURCE_QUANT="${MODEL_ID##*:}"
+fi
+if [ -z "$SOURCE_QUANT" ]; then
+    echo "ERROR: SOURCE_QUANT is required to resolve the source GGUF without a model volume" >&2
+    exit 1
+fi
 
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Layer Package Split Job                                 ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Source: ${SOURCE_REPO}/${SOURCE_FILE}"
+echo "║  Quant:  ${SOURCE_QUANT}"
 echo "║  Target: ${TARGET_REPO}"
 echo "║  Model:  ${MODEL_ID}"
 echo "║  Build:  mesh-llm @ ${MESH_LLM_REF}"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
+# Keep executable toolchains/build products on local ephemeral storage:
+# HF bucket mounts can be unsuitable for dynamic loader/toolchain execution.
+# Package artifacts are also written locally, uploaded one at a time, and
+# removed immediately so the job never accumulates a full 400GB+ package.
+JOB_WORK_ROOT="${JOB_WORK_ROOT:-/bucket/job-work}"
+SAFE_TARGET_REPO="$(printf '%s' "$TARGET_REPO" | tr -c '[:alnum:]._-' '_')"
+LOCAL_WORK_DIR="${LOCAL_WORK_DIR:-/tmp/meshllm-layer-job-${SAFE_TARGET_REPO}-$$}"
+if [ -z "${JOB_WORK_DIR:-}" ]; then
+    JOB_WORK_DIR="${JOB_WORK_ROOT}/${SAFE_TARGET_REPO}-$(date +%Y%m%d%H%M%S)-$$"
+    CLEANUP_JOB_WORK_DIR="${CLEANUP_JOB_WORK_DIR:-true}"
+else
+    CLEANUP_JOB_WORK_DIR="${CLEANUP_JOB_WORK_DIR:-false}"
+fi
+PACKAGE_DIR="${PACKAGE_DIR:-${LOCAL_WORK_DIR}/package}"
+HF_HOME="${HF_HOME:-${JOB_WORK_DIR}/hf-home}"
+HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+HF_XET_CACHE="${HF_XET_CACHE:-${HF_HOME}/xet}"
+JOB_TMP_DIR="${JOB_TMP_DIR:-${LOCAL_WORK_DIR}/tmp}"
+BUILD_DIR="${BUILD_DIR:-${LOCAL_WORK_DIR}/build}"
+TOOL_DIR="${TOOL_DIR:-${LOCAL_WORK_DIR}/tools}"
+VENV_DIR="${VENV_DIR:-${LOCAL_WORK_DIR}/venv}"
+ARTIFACT_UPLOAD_SCRIPT="${ARTIFACT_UPLOAD_SCRIPT:-${LOCAL_WORK_DIR}/upload-package-artifact.py}"
+ARTIFACT_UPLOAD_HOOK="${ARTIFACT_UPLOAD_HOOK:-${LOCAL_WORK_DIR}/upload-package-artifact.sh}"
+CARGO_HOME="${CARGO_HOME:-${LOCAL_WORK_DIR}/cargo-home}"
+RUSTUP_HOME="${RUSTUP_HOME:-${LOCAL_WORK_DIR}/rustup-home}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${LOCAL_WORK_DIR}/cargo-target}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-${LOCAL_WORK_DIR}/xdg-cache}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-${LOCAL_WORK_DIR}/pip-cache}"
+BUILD_TMP_DIR="${BUILD_TMP_DIR:-${LOCAL_WORK_DIR}/tmp}"
+TMPDIR="$BUILD_TMP_DIR"
+TEMP="$BUILD_TMP_DIR"
+TMP="$BUILD_TMP_DIR"
+export JOB_WORK_DIR PACKAGE_DIR HF_HOME HF_HUB_CACHE HF_XET_CACHE VENV_DIR ARTIFACT_UPLOAD_SCRIPT
+export TMPDIR TEMP TMP CARGO_HOME RUSTUP_HOME CARGO_TARGET_DIR XDG_CACHE_HOME PIP_CACHE_DIR
+
+cleanup_job_work_dir() {
+    if [ -n "${LOCAL_WORK_DIR:-}" ]; then
+        echo "Cleaning local work dir: ${LOCAL_WORK_DIR}"
+        rm -rf "$LOCAL_WORK_DIR" || true
+    fi
+    if [ "${CLEANUP_JOB_WORK_DIR}" = "true" ] && [ -n "${JOB_WORK_DIR:-}" ]; then
+        echo "Cleaning job work dir: ${JOB_WORK_DIR}"
+        rm -rf "$JOB_WORK_DIR" || true
+    fi
+}
+trap cleanup_job_work_dir EXIT
+
+log_storage_snapshot() {
+    local label="$1"
+    echo "  Storage snapshot (${label}):"
+    df -h / /bucket "$PACKAGE_DIR" "$TMPDIR" 2>/dev/null || true
+    echo "  Mounts (${label}):"
+    mount | grep -E ' on / | on /bucket ' || true
+}
+
+on_error() {
+    local status=$?
+    local line=${BASH_LINENO[0]:-unknown}
+    local command=${BASH_COMMAND:-unknown}
+    echo "ERROR: split job command failed at line ${line} with status ${status}: ${command}" >&2
+    log_storage_snapshot "error" >&2 || true
+    exit "$status"
+}
+trap on_error ERR
+
+start_heartbeat() {
+    local label="$1"
+    (
+        while true; do
+            sleep "${JOB_HEARTBEAT_SECONDS:-60}"
+            echo "  Heartbeat (${label}) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            df -h / /bucket "$PACKAGE_DIR" "$TMPDIR" 2>/dev/null || true
+            if [ -d "$PACKAGE_DIR" ]; then
+                du -sh "$PACKAGE_DIR" 2>/dev/null || true
+            fi
+            if [ -d "$HF_HUB_CACHE" ]; then
+                du -sh "$HF_HUB_CACHE" 2>/dev/null || true
+            fi
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+    if [ -n "${HEARTBEAT_PID:-}" ]; then
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+        HEARTBEAT_PID=""
+    fi
+}
+
+mkdir -p "$PACKAGE_DIR" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$JOB_TMP_DIR" "$TOOL_DIR" \
+    "$CARGO_HOME" "$RUSTUP_HOME" "$CARGO_TARGET_DIR" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" \
+    "$BUILD_TMP_DIR"
+
+format_bytes() {
+    python3 - "$1" <<'PYTHON'
+import sys
+value = float(int(sys.argv[1]))
+for unit in ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]:
+    if value < 1024 or unit == "PiB":
+        if unit == "B":
+            print(f"{int(value)} {unit}")
+        else:
+            print(f"{value:.1f} {unit}")
+        break
+    value /= 1024
+PYTHON
+}
+
+estimate_bucket_workspace_bytes() {
+    python3 - "$1" <<'PYTHON'
+import sys
+source = int(sys.argv[1])
+# Source and package artifacts are not meant to accumulate in the bucket. This
+# estimate is retained only as a fallback-source-cache warning when /source is
+# unavailable.
+headroom = 32 * 1024 ** 3
+print(source + headroom)
+PYTHON
+}
+
 # ─── Build tools ──────────────────────────────────────────────────────────
 echo "=== [1/9] Installing build dependencies ==="
 apt-get update -qq && apt-get install -y -qq \
     cmake git curl build-essential pkg-config libssl-dev \
     python3-pip python3-venv > /dev/null 2>&1
+apt-get clean
+rm -rf /var/lib/apt/lists/*
 
 echo "=== [2/9] Installing Rust ==="
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y > /dev/null 2>&1
-source /root/.cargo/env
+source "${CARGO_HOME}/env"
 
 echo "=== [3/9] Cloning mesh-llm and building skippy-model-package ==="
-git clone --filter=blob:none https://github.com/Mesh-LLM/mesh-llm.git /tmp/build
-cd /tmp/build
+git clone --filter=blob:none https://github.com/Mesh-LLM/mesh-llm.git "$BUILD_DIR"
+cd "$BUILD_DIR"
 if git ls-remote --exit-code --heads origin "$MESH_LLM_REF" >/dev/null 2>&1 || \
    git ls-remote --exit-code --tags origin "$MESH_LLM_REF" >/dev/null 2>&1; then
     git fetch --depth 1 origin "$MESH_LLM_REF"
@@ -66,7 +199,7 @@ find "$LLAMA_BUILD_DIR" -name "*.a" 2>/dev/null | head -10 || echo "  WARNING: n
 echo "  Building skippy-model-package..."
 SKIPPY_LLAMA_BUILD_DIR="$LLAMA_BUILD_DIR" \
     cargo build --release -p skippy-model-package 2>&1 | tail -20
-SLICER=/tmp/build/target/release/skippy-model-package
+SLICER="${CARGO_TARGET_DIR}/release/skippy-model-package"
 if [ ! -f "$SLICER" ]; then
     echo "ERROR: Build failed — binary not found at $SLICER"
     echo "Retrying with full output..."
@@ -74,87 +207,175 @@ if [ ! -f "$SLICER" ]; then
         cargo build --release -p skippy-model-package 2>&1
     exit 1
 fi
+cp "$SLICER" "${TOOL_DIR}/skippy-model-package"
+SLICER="${TOOL_DIR}/skippy-model-package"
+chmod +x "$SLICER"
+cd /
+rm -rf "$BUILD_DIR" "$CARGO_TARGET_DIR" "$CARGO_HOME" "$RUSTUP_HOME"
+TMPDIR="$JOB_TMP_DIR"
+TEMP="$JOB_TMP_DIR"
+TMP="$JOB_TMP_DIR"
+export TMPDIR TEMP TMP
 echo "  ✓ Built: $SLICER"
+echo "  Root filesystem after build cleanup:"
+df -h / || true
+
+echo "  Preparing Hugging Face uploader..."
+python3 -m venv "$VENV_DIR" > /dev/null
+"$VENV_DIR/bin/pip" install -q huggingface_hub
+"$VENV_DIR/bin/python3" << 'PYTHON'
+from huggingface_hub import HfApi
+import os
+
+api = HfApi(token=os.environ["HF_TOKEN"])
+api.create_repo(os.environ["TARGET_REPO"], exist_ok=True)
+PYTHON
+cat > "$ARTIFACT_UPLOAD_SCRIPT" <<'PYTHON'
+from huggingface_hub import HfApi
+from pathlib import Path
+import os
+
+path = Path(os.environ["SKIPPY_PACKAGE_ARTIFACT_PATH"])
+relative = os.environ["SKIPPY_PACKAGE_ARTIFACT_RELATIVE_PATH"]
+target_repo = os.environ["TARGET_REPO"]
+
+api = HfApi(token=os.environ["HF_TOKEN"])
+api.upload_file(
+    repo_id=target_repo,
+    path_or_fileobj=str(path),
+    path_in_repo=relative,
+    repo_type="model",
+    commit_message=f"Add package artifact {relative}",
+)
+size = path.stat().st_size
+path.unlink()
+print(f"  Uploaded and removed {relative} ({size} bytes)")
+PYTHON
+cat > "$ARTIFACT_UPLOAD_HOOK" <<'BASH'
+#!/bin/bash
+set -euo pipefail
+"${VENV_DIR}/bin/python3" "${ARTIFACT_UPLOAD_SCRIPT}"
+BASH
+chmod +x "$ARTIFACT_UPLOAD_HOOK"
 
 # ─── Split ────────────────────────────────────────────────────────────────
 echo ""
 echo "=== [4/9] Splitting model ==="
-SOURCE_PATH="/source/${SOURCE_FILE}"
-JOB_WORK_ROOT="${JOB_WORK_ROOT:-/bucket/job-work}"
-if [ -z "${JOB_WORK_DIR:-}" ]; then
-    SAFE_TARGET_REPO="$(printf '%s' "$TARGET_REPO" | tr -c '[:alnum:]._-' '_')"
-    JOB_WORK_DIR="${JOB_WORK_ROOT}/${SAFE_TARGET_REPO}-$(date +%Y%m%d%H%M%S)-$$"
-    CLEANUP_JOB_WORK_DIR="${CLEANUP_JOB_WORK_DIR:-true}"
+if [ "$SOURCE_REVISION" = "main" ]; then
+    SOURCE_REF="${SOURCE_REPO}:${SOURCE_QUANT}"
 else
-    CLEANUP_JOB_WORK_DIR="${CLEANUP_JOB_WORK_DIR:-false}"
+    SOURCE_REF="${SOURCE_REPO}@${SOURCE_REVISION}:${SOURCE_QUANT}"
 fi
-PACKAGE_DIR="${PACKAGE_DIR:-${JOB_WORK_DIR}/package}"
-export JOB_WORK_DIR PACKAGE_DIR
-
-cleanup_job_work_dir() {
-    if [ "${CLEANUP_JOB_WORK_DIR}" = "true" ] && [ -n "${JOB_WORK_DIR:-}" ]; then
-        echo "Cleaning job work dir: ${JOB_WORK_DIR}"
-        rm -rf "$JOB_WORK_DIR"
-    fi
-}
-trap cleanup_job_work_dir EXIT
-
-mkdir -p "$PACKAGE_DIR"
-
-if [ ! -f "$SOURCE_PATH" ]; then
-    echo "ERROR: Source file not found at $SOURCE_PATH"
-    echo ""
-    echo "Available GGUF files in /source:"
-    find /source -name "*.gguf" -type f | sort | head -30
-    exit 1
+echo "  Source ref: $SOURCE_REF"
+if [ -n "${SOURCE_TOTAL_BYTES:-}" ]; then
+    echo "  Source bytes: $SOURCE_TOTAL_BYTES"
+    ESTIMATED_BUCKET_BYTES="$(estimate_bucket_workspace_bytes "$SOURCE_TOTAL_BYTES")"
+    echo "  Estimated fallback /bucket cache needed: $(format_bytes "$ESTIMATED_BUCKET_BYTES")"
 fi
-
-echo "  Source: $SOURCE_PATH ($(du -h "$SOURCE_PATH" | cut -f1))"
+MOUNTED_SOURCE_PATH="/source/${SOURCE_FILE}"
+if [ -f "$MOUNTED_SOURCE_PATH" ]; then
+    WRITE_PACKAGE_INPUT="$MOUNTED_SOURCE_PATH"
+    WRITE_PACKAGE_IDENTITY_ARGS=(
+        --model-id "$MODEL_ID"
+        --source-repo "$SOURCE_REPO"
+        --source-revision "$SOURCE_REVISION"
+        --source-file "$SOURCE_FILE"
+    )
+    echo "  Source mount: $MOUNTED_SOURCE_PATH"
+else
+    WRITE_PACKAGE_INPUT="$SOURCE_REF"
+    WRITE_PACKAGE_IDENTITY_ARGS=()
+    echo "  Source mount: not available; falling back to Hugging Face cache download"
+fi
+echo "  Hugging Face cache: $HF_HUB_CACHE"
 echo "  Package workspace: $PACKAGE_DIR"
-time $SLICER write-package "$SOURCE_PATH" \
+echo "  Temporary workspace: $TMPDIR"
+log_storage_snapshot "before write-package"
+ROOT_FS="$(df -P / | awk 'NR==2 {print $1}')"
+PACKAGE_FS="$(df -P "$PACKAGE_DIR" | awk 'NR==2 {print $1}')"
+if [ -n "$ROOT_FS" ] && [ "$ROOT_FS" = "$PACKAGE_FS" ]; then
+    echo "WARNING: package workspace is on the container root filesystem; very large splits may hit the HF Jobs 50G ephemeral storage limit." >&2
+fi
+if [ -n "${ESTIMATED_BUCKET_BYTES:-}" ]; then
+    PACKAGE_AVAILABLE_BYTES="$(df -Pk "$PACKAGE_DIR" | awk 'NR==2 {printf "%.0f", $4 * 1024}')"
+    if [ -n "$PACKAGE_AVAILABLE_BYTES" ] && [ "$PACKAGE_AVAILABLE_BYTES" -gt 0 ] && \
+        [ "$PACKAGE_AVAILABLE_BYTES" -lt "$ESTIMATED_BUCKET_BYTES" ]; then
+        echo "WARNING: package workspace has $(format_bytes "$PACKAGE_AVAILABLE_BYTES") available, below estimated need $(format_bytes "$ESTIMATED_BUCKET_BYTES")." >&2
+    fi
+fi
+echo "  Starting write-package at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+start_heartbeat "write-package"
+set +e
+time "$SLICER" write-package "$WRITE_PACKAGE_INPUT" \
     --out-dir "$PACKAGE_DIR" \
-    --model-id "$MODEL_ID" \
-    --source-repo "$SOURCE_REPO" \
-    --source-revision "${SOURCE_REVISION:-main}" \
-    --source-file "$SOURCE_FILE"
+    --after-artifact-command "$ARTIFACT_UPLOAD_HOOK" \
+    "${WRITE_PACKAGE_IDENTITY_ARGS[@]}"
+WRITE_PACKAGE_STATUS=$?
+set -e
+stop_heartbeat
+if [ "$WRITE_PACKAGE_STATUS" -ne 0 ]; then
+    echo "ERROR: write-package failed with status $WRITE_PACKAGE_STATUS" >&2
+    log_storage_snapshot "write-package failed" >&2 || true
+    exit "$WRITE_PACKAGE_STATUS"
+fi
+echo "  Finished write-package at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+log_storage_snapshot "after write-package"
 
-LAYER_COUNT=$(ls "$PACKAGE_DIR"/layers/ | wc -l)
-TOTAL_SIZE=$(du -sh "$PACKAGE_DIR" | cut -f1)
-echo "  ✓ Split into $LAYER_COUNT layers ($TOTAL_SIZE total)"
+SOURCE_PATH="$(python3 -c "import json, os; m=json.load(open(os.path.join(os.environ['PACKAGE_DIR'], 'model-package.json'))); print(m['source_model']['path'])")"
+echo "  Cached source: $SOURCE_PATH ($(du -h "$SOURCE_PATH" | cut -f1))"
 
-# ─── Validate ─────────────────────────────────────────────────────────────
+LAYER_COUNT="$(python3 -c "import json, os; m=json.load(open(os.path.join(os.environ['PACKAGE_DIR'], 'model-package.json'))); print(m['layer_count'])")"
+TOTAL_SIZE="$(python3 -c "import json, os; m=json.load(open(os.path.join(os.environ['PACKAGE_DIR'], 'model-package.json'))); print(sum(int(a.get('artifact_bytes') or 0) for a in list(m['shared'].values()) + m.get('layers', []) + m.get('projectors', [])))")"
+TOTAL_SIZE_LABEL="$(format_bytes "$TOTAL_SIZE")"
+echo "  ✓ Split into $LAYER_COUNT layers; artifacts uploaded incrementally (${TOTAL_SIZE_LABEL} total)"
+
+# ─── Verify manifest ──────────────────────────────────────────────────────
 echo ""
-echo "=== [5/9] Validating package ==="
-time $SLICER validate-package "$SOURCE_PATH" "$PACKAGE_DIR"
-echo "  ✓ Validation passed — all tensors accounted for"
+echo "=== [5/9] Verifying package manifest ==="
+"$VENV_DIR/bin/python3" << 'PYTHON'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["PACKAGE_DIR"]) / "model-package.json"
+manifest = json.loads(manifest_path.read_text())
+required = [
+    manifest["shared"]["metadata"],
+    manifest["shared"]["embeddings"],
+    manifest["shared"]["output"],
+    *manifest.get("layers", []),
+    *manifest.get("projectors", []),
+]
+missing = [artifact for artifact in required if not artifact.get("path") or not artifact.get("sha256")]
+if missing:
+    raise SystemExit(f"manifest contains {len(missing)} artifacts without path/checksum")
+print(f"  ✓ Manifest records {len(required)} uploaded artifacts")
+PYTHON
 
 # ─── Publish ──────────────────────────────────────────────────────────────
 echo ""
 echo "=== [6/9] Publishing to HuggingFace ==="
-python3 -m venv /tmp/venv > /dev/null
-/tmp/venv/bin/pip install -q huggingface_hub
-
-/tmp/venv/bin/python3 << PYTHON
+"$VENV_DIR/bin/python3" << PYTHON
 from huggingface_hub import HfApi
 import os, json
+from pathlib import Path
 
 api = HfApi(token=os.environ['HF_TOKEN'])
 target_repo = os.environ['TARGET_REPO']
 source_repo = os.environ['SOURCE_REPO']
 model_id = os.environ.get('MODEL_ID', '')
+manifest_path = Path(os.environ['PACKAGE_DIR']) / 'model-package.json'
 
-# Create repo (idempotent)
-api.create_repo(target_repo, exist_ok=True)
-
-# Upload the entire package
-api.upload_folder(
+api.upload_file(
     repo_id=target_repo,
-    folder_path=os.environ['PACKAGE_DIR'],
-    commit_message=f'Layer package from {source_repo} ({model_id})',
+    path_or_fileobj=str(manifest_path),
+    path_in_repo='model-package.json',
+    repo_type='model',
+    commit_message=f'Add layer package manifest from {source_repo} ({model_id})',
 )
 
 # Print summary
-manifest = json.load(open(os.path.join(os.environ['PACKAGE_DIR'], 'model-package.json')))
+manifest = json.load(open(manifest_path))
 print(f'  ✓ Published: https://huggingface.co/{target_repo}')
 print(f'    Model:  {manifest["model_id"]}')
 print(f'    Layers: {manifest["layer_count"]}')
@@ -164,7 +385,7 @@ PYTHON
 # ─── Update catalog ───────────────────────────────────────────────────────
 echo ""
 echo "=== [7/9] Updating meshllm/catalog ==="
-/tmp/venv/bin/python3 << 'PYTHON'
+"$VENV_DIR/bin/python3" << 'PYTHON'
 from huggingface_hub import HfApi
 import os, json, tempfile
 
@@ -348,7 +569,7 @@ PYTHON
 # ─── Model Card ────────────────────────────────────────────────────────────
 echo ""
 echo "=== [8/9] Uploading model card ==="
-/tmp/venv/bin/python3 << 'PYTHON'
+"$VENV_DIR/bin/python3" << 'PYTHON'
 from huggingface_hub import HfApi
 from pathlib import Path
 import hashlib
@@ -439,6 +660,7 @@ display_name = source_model.get("distribution_id") or model_id
 model_family = infer_model_family(display_name)
 parameter_scale = infer_parameter_scale(display_name)
 quantization = infer_quantization(display_name, source_file)
+source_path = source_model.get("path") or f"/hf-cache/{source_file}"
 activation_width = manifest.get("activation_width") or "not recorded"
 skippy_abi = manifest.get("skippy_abi_version") or "not recorded"
 source_sha = source_model.get("sha256") or "not recorded"
@@ -604,10 +826,11 @@ for label, path, contents, checksum in file_rows:
 readme += f"""
 ## Validation
 
-Generated by the Mesh LLM HF Jobs splitter from `mesh-llm` ref `{mesh_llm_ref}` and validated before upload:
+Generated by the Mesh LLM HF Jobs splitter from `mesh-llm` ref `{mesh_llm_ref}`.
+Each artifact is checksummed as it is written, uploaded to this repository, and removed from the job workspace before the next artifact is produced.
 
 ```bash
-skippy-model-package validate-package "/source/{source_file}" "{package_dir}"
+skippy-model-package write-package "{source_path}" --out-dir "{package_dir}"
 ```
 
 ## Links
@@ -638,7 +861,7 @@ echo "=== [9/9] Done ==="
 echo ""
 echo "  Published:  https://huggingface.co/${TARGET_REPO}"
 echo "  Layers:     ${LAYER_COUNT}"
-echo "  Total size: ${TOTAL_SIZE}"
+echo "  Total size: ${TOTAL_SIZE_LABEL}"
 echo ""
 echo "  Use with mesh-llm:"
 echo "    mesh-llm serve --model ${TARGET_REPO} --split"

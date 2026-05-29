@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use super::local::{
     direct_hf_cache_root_gguf_paths, gguf_metadata_cache_path, huggingface_hub_cache,
-    huggingface_hub_cache_dir, scan_hf_cache_info,
+    huggingface_hub_cache_dir, scan_hf_cache_fast, scan_hf_cache_info,
 };
+use hf_hub::{RepoType, RepoTypeModel};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LocalModelInventorySnapshot {
@@ -112,24 +113,32 @@ fn local_gguf_paths() -> Vec<PathBuf> {
             }
         }
 
-        let cache = huggingface_hub_cache();
-        let cache_info = scan_hf_cache_info(&cache);
-        if let Some(cache_info) = cache_info {
-            for repo in &cache_info.repos {
-                if repo.repo_type != hf_hub::RepoType::Model {
-                    continue;
-                }
-                for revision in &repo.revisions {
-                    for file in &revision.files {
-                        if !file.file_name.ends_with(".gguf") {
-                            continue;
-                        }
-                        let path = file.file_path.clone();
-                        let normalized = path.canonicalize().unwrap_or_else(|_| path.clone());
-                        if seen.insert(normalized) {
-                            out.push(path);
+        if std::env::var("MESH_LLM_ALLOW_FULL_HF_CACHE_SCAN").unwrap_or_default() == "1" {
+            let cache = huggingface_hub_cache();
+            if let Some(cache_info) = scan_hf_cache_info(&cache) {
+                for repo in &cache_info.repos {
+                    if repo.repo_type != RepoTypeModel.singular() {
+                        continue;
+                    }
+                    for revision in &repo.revisions {
+                        for file in &revision.files {
+                            if !file.file_name.ends_with(".gguf") {
+                                continue;
+                            }
+                            let path = file.file_path.clone();
+                            let normalized = path.canonicalize().unwrap_or_else(|_| path.clone());
+                            if seen.insert(normalized) {
+                                out.push(path);
+                            }
                         }
                     }
+                }
+            }
+        } else {
+            for path in scan_hf_cache_fast(&hf_cache_dir) {
+                let normalized = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if seen.insert(normalized) {
+                    out.push(path);
                 }
             }
         }
@@ -223,10 +232,10 @@ fn cached_compact_metadata_for_path(
     let Some(cache_path) = gguf_metadata_cache_path(path) else {
         return computed();
     };
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        if let Ok(cached) = serde_json::from_slice::<CachedCompactModelMetadata>(&bytes) {
-            return cached.into_proto();
-        }
+    if let Ok(bytes) = std::fs::read(&cache_path)
+        && let Ok(cached) = serde_json::from_slice::<CachedCompactModelMetadata>(&bytes)
+    {
+        return cached.into_proto();
     }
     let meta = computed();
     if let Some(parent) = cache_path.parent() {
@@ -329,9 +338,11 @@ mod tests {
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
         if let Some(value) = value {
-            std::env::set_var(key, value);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(key, value) };
         } else {
-            std::env::remove_var(key);
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(key) };
         }
     }
 
@@ -353,9 +364,12 @@ mod tests {
         let model = temp.join("Inventory-Root-Q4_K_M.gguf");
         std::fs::write(&model, b"gguf").unwrap();
 
-        std::env::set_var("HF_HUB_CACHE", &temp);
-        std::env::remove_var("HF_HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let paths = local_gguf_paths();
         assert!(paths.iter().any(|path| path == &model));
@@ -364,5 +378,47 @@ mod tests {
         restore_env("HF_HUB_CACHE", prev_hub_cache);
         restore_env("HF_HOME", prev_hf_home);
         restore_env("XDG_CACHE_HOME", prev_xdg);
+    }
+
+    #[test]
+    #[serial]
+    fn local_gguf_paths_includes_snapshot_hf_cache_files() {
+        let prev_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        let prev_hf_home = std::env::var_os("HF_HOME");
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prev_full_scan = std::env::var_os("MESH_LLM_ALLOW_FULL_HF_CACHE_SCAN");
+
+        let temp = std::env::temp_dir().join(format!(
+            "mesh-llm-inventory-snapshot-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let snapshot_dir = temp
+            .join("models--org--repo")
+            .join("snapshots")
+            .join("deadbeef");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        let model = snapshot_dir.join("Inventory-Snapshot-Q4_K_M.gguf");
+        std::fs::write(&model, b"gguf").unwrap();
+
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("HF_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("XDG_CACHE_HOME") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("MESH_LLM_ALLOW_FULL_HF_CACHE_SCAN") };
+
+        let paths = local_gguf_paths();
+        assert!(paths.iter().any(|path| path == &model));
+
+        let _ = std::fs::remove_dir_all(&temp);
+        restore_env("HF_HUB_CACHE", prev_hub_cache);
+        restore_env("HF_HOME", prev_hf_home);
+        restore_env("XDG_CACHE_HOME", prev_xdg);
+        restore_env("MESH_LLM_ALLOW_FULL_HF_CACHE_SCAN", prev_full_scan);
     }
 }

@@ -23,8 +23,8 @@ pub(crate) use self::metrics::{
     RuntimeLlamaSlotSnapshot, RuntimeLlamaSlotsSnapshot,
 };
 pub(crate) use self::processes::{
-    remove_runtime_process_snapshot, runtime_process_payloads, upsert_runtime_process_snapshot,
-    RuntimeProcessSnapshot,
+    RuntimeProcessSnapshot, remove_runtime_process_snapshot, runtime_process_payloads,
+    upsert_runtime_process_snapshot,
 };
 pub(crate) use self::producers::{RuntimeDataProducer, RuntimeDataSource};
 pub(crate) use self::snapshots::{
@@ -35,18 +35,18 @@ pub(crate) use self::subscriptions::RuntimeDataDirty;
 #[cfg(test)]
 mod tests {
     use super::api_views::{collect_views, mesh_models, status_payload};
-    use super::processes::{runtime_process_payloads, RuntimeProcessSnapshot};
+    use super::processes::{RuntimeProcessSnapshot, runtime_process_payloads};
     use super::snapshots::{
         HardwareViewInput, ModelViewInput, PluginDataKey, PluginEndpointKey, StatusViewInput,
     };
     use super::subscriptions::{RuntimeDataDirty, RuntimeDataVersion};
     use super::{RuntimeDataCollector, RuntimeDataSource};
     use super::{RuntimeLlamaEndpointStatus, RuntimeLlamaSlotSnapshot, RuntimeLlamaSlotsSnapshot};
-    use crate::api::status::{
-        build_gpus, build_ownership_payload, LocalInstance, NodeState, RuntimeStatusPayload,
-        StatusPayload,
-    };
     use crate::api::RuntimeProcessPayload;
+    use crate::api::status::{
+        LocalInstance, NodeState, RuntimeStatusPayload, StatusPayload, build_gpus,
+        build_ownership_payload,
+    };
     use crate::inference::election;
     use crate::mesh::MeshCatalogEntry;
     use crate::models::LocalModelInventorySnapshot;
@@ -58,8 +58,8 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::{collections::HashMap, collections::HashSet};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -107,17 +107,21 @@ mod tests {
                 .as_ref(),
             Some(&plugin_endpoint_key)
         );
-        assert!(producer
-            .snapshots()
-            .runtime_status
-            .local_processes
-            .is_empty());
+        assert!(
+            producer
+                .snapshots()
+                .runtime_status
+                .local_processes
+                .is_empty()
+        );
         assert!(clone.snapshots().local_instances.instances.is_empty());
-        assert!(producer
-            .collector()
-            .plugin_data_snapshot()
-            .entries
-            .is_empty());
+        assert!(
+            producer
+                .collector()
+                .plugin_data_snapshot()
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]
@@ -125,10 +129,12 @@ mod tests {
         let collector = RuntimeDataCollector::new();
         let views = collect_views(&collector);
 
-        assert!(collector
-            .runtime_status_snapshot()
-            .local_processes
-            .is_empty());
+        assert!(
+            collector
+                .runtime_status_snapshot()
+                .local_processes
+                .is_empty()
+        );
         assert!(collector.local_instances_snapshot().instances.is_empty());
         assert!(collector.plugin_data_snapshot().entries.is_empty());
         assert!(collector.plugin_endpoints_snapshot().entries.is_empty());
@@ -154,11 +160,10 @@ mod tests {
         });
 
         let initial = collector.subscription_state();
-        assert_eq!(initial.version, RuntimeDataVersion::default());
-        assert!(initial.dirty.is_empty());
+        assert_runtime_data_state_contains_dirty(&initial, 0, &[]);
 
         let status_state = producer.mark_status_dirty();
-        assert_eq!(status_state.version.get(), 1);
+        assert_runtime_data_state_contains_dirty(&status_state, 1, &[RuntimeDataDirty::STATUS]);
         assert_eq!(status_state.dirty, RuntimeDataDirty::STATUS);
 
         let processes_changed = producer.publish_local_processes(|local_processes| {
@@ -180,35 +185,46 @@ mod tests {
         assert!(processes_changed);
 
         let processes_state = collector.subscription_state();
-        assert_eq!(processes_state.version.get(), 2);
-        assert!(processes_state.dirty.contains(RuntimeDataDirty::STATUS));
-        assert!(processes_state.dirty.contains(RuntimeDataDirty::PROCESSES));
+        assert_runtime_data_state_contains_dirty(
+            &processes_state,
+            2,
+            &[RuntimeDataDirty::STATUS, RuntimeDataDirty::PROCESSES],
+        );
 
         let no_change = producer.publish_local_processes(|_| false);
         assert!(!no_change);
         assert_eq!(collector.subscription_state(), processes_state);
 
         let models_state = producer.mark_models_dirty();
-        assert_eq!(models_state.version.get(), 3);
-        assert!(models_state.dirty.contains(RuntimeDataDirty::STATUS));
-        assert!(models_state.dirty.contains(RuntimeDataDirty::PROCESSES));
-        assert!(models_state.dirty.contains(RuntimeDataDirty::MODELS));
+        assert_runtime_data_state_contains_dirty(
+            &models_state,
+            3,
+            &[
+                RuntimeDataDirty::STATUS,
+                RuntimeDataDirty::PROCESSES,
+                RuntimeDataDirty::MODELS,
+            ],
+        );
 
         let routing_state = producer.mark_routing_dirty();
-        assert_eq!(routing_state.version.get(), 4);
-        assert!(routing_state.dirty.contains(RuntimeDataDirty::ROUTING));
+        assert_runtime_data_state_contains_dirty(&routing_state, 4, &[RuntimeDataDirty::ROUTING]);
 
         let processes_state = producer.mark_processes_dirty();
-        assert_eq!(processes_state.version.get(), 5);
-        assert!(processes_state.dirty.contains(RuntimeDataDirty::PROCESSES));
+        assert_runtime_data_state_contains_dirty(
+            &processes_state,
+            5,
+            &[RuntimeDataDirty::PROCESSES],
+        );
 
         let inventory_state = producer.mark_inventory_dirty();
-        assert_eq!(inventory_state.version.get(), 6);
-        assert!(inventory_state.dirty.contains(RuntimeDataDirty::INVENTORY));
+        assert_runtime_data_state_contains_dirty(
+            &inventory_state,
+            6,
+            &[RuntimeDataDirty::INVENTORY],
+        );
 
         let plugins_state = producer.mark_plugins_dirty();
-        assert_eq!(plugins_state.version.get(), 7);
-        assert!(plugins_state.dirty.contains(RuntimeDataDirty::PLUGINS));
+        assert_runtime_data_state_contains_dirty(&plugins_state, 7, &[RuntimeDataDirty::PLUGINS]);
 
         let runtime_status_changed = producer.publish_runtime_status(|runtime_status| {
             runtime_status.primary_backend = Some("metal".into());
@@ -217,8 +233,28 @@ mod tests {
         assert!(runtime_status_changed);
 
         let final_state = collector.subscription_state();
-        assert_eq!(final_state.version.get(), 8);
-        assert!(final_state.dirty.contains(RuntimeDataDirty::STATUS));
+        assert_runtime_data_state_contains_dirty(&final_state, 8, &[RuntimeDataDirty::STATUS]);
+    }
+
+    fn assert_runtime_data_state_contains_dirty(
+        state: &super::subscriptions::RuntimeDataSubscriptionState,
+        expected_version: u64,
+        expected_dirty: &[RuntimeDataDirty],
+    ) {
+        if expected_version == 0 {
+            assert_eq!(state.version, RuntimeDataVersion::default());
+        } else {
+            assert_eq!(state.version.get(), expected_version);
+        }
+
+        if expected_dirty.is_empty() {
+            assert!(state.dirty.is_empty());
+            return;
+        }
+
+        for dirty in expected_dirty {
+            assert!(state.dirty.contains(*dirty));
+        }
     }
 
     #[tokio::test]
@@ -307,7 +343,7 @@ mod tests {
         collector.replace_local_instances_snapshot(vec![LocalInstanceSnapshot {
             pid: 111,
             api_port: Some(3131),
-            version: Some("0.65.0-test".into()),
+            version: Some("0.68.0".into()),
             started_at_unix: 456,
             runtime_dir: PathBuf::from("/tmp/runtime-1"),
             is_self: true,
@@ -326,8 +362,8 @@ mod tests {
             first_joined_mesh_ts: Some(123),
         });
         let snapshot = collector.build_status_view(StatusViewInput {
-            version: "0.65.0-test".into(),
-            latest_version: Some("0.66.0".into()),
+            version: "0.68.0".into(),
+            latest_version: Some("0.68.0".into()),
             node_id: "node-1".into(),
             owner: crate::crypto::OwnershipSummary::default(),
             token: "invite-token".into(),
@@ -356,8 +392,8 @@ mod tests {
 
         let payload = status_payload(snapshot);
         let expected = StatusPayload {
-            version: "0.65.0-test".into(),
-            latest_version: Some("0.66.0".into()),
+            version: "0.68.0".into(),
+            latest_version: Some("0.68.0".into()),
             node_id: "node-1".into(),
             owner: build_ownership_payload(&crate::crypto::OwnershipSummary::default()),
             token: "invite-token".into(),
@@ -368,6 +404,7 @@ mod tests {
             llama_ready: false,
             runtime: RuntimeStatusPayload {
                 backend: None,
+                openai_guardrails: None,
                 models: vec![],
                 stages: vec![],
             },
@@ -387,7 +424,7 @@ mod tests {
             local_instances: vec![LocalInstance {
                 pid: 111,
                 api_port: Some(3131),
-                version: Some("0.65.0-test".into()),
+                version: Some("0.68.0".into()),
                 started_at_unix: 456,
                 runtime_dir: "/tmp/runtime-1".into(),
                 is_self: true,
@@ -496,6 +533,152 @@ mod tests {
         assert_eq!(model.size_gb, 22.0);
     }
 
+    #[test]
+    fn runtime_data_model_snapshot_keeps_known_text_only_descriptor_authoritative() {
+        let collector = RuntimeDataCollector::new();
+        let model_name = "Qwen3VL-2B-Instruct-Q4_K_M".to_string();
+        let descriptor = crate::mesh::ServedModelDescriptor {
+            identity: crate::mesh::ServedModelIdentity {
+                model_name: model_name.clone(),
+                source_kind: crate::mesh::ModelSourceKind::LocalGguf,
+                local_file_name: Some(format!("{model_name}.gguf")),
+                ..Default::default()
+            },
+            capabilities_known: true,
+            capabilities: crate::models::ModelCapabilities::default(),
+            topology: None,
+        };
+
+        let snapshot = collector.build_model_view(ModelViewInput {
+            peers: vec![],
+            catalog: vec![MeshCatalogEntry {
+                model_name: model_name.clone(),
+                descriptor: Some(descriptor),
+            }],
+            served_models: vec![model_name.clone()],
+            active_demand: HashMap::new(),
+            my_serving_models: vec![model_name.clone()],
+            my_hosted_models: vec![model_name.clone()],
+            local_inventory: LocalModelInventorySnapshot {
+                model_names: HashSet::from([model_name.clone()]),
+                size_by_name: HashMap::new(),
+                metadata_by_name: HashMap::new(),
+            },
+            node_hostname: Some("node.local".into()),
+            my_vram_gb: 24.0,
+            model_name: model_name.clone(),
+            model_size_bytes: 0,
+            now_unix_secs: 1_700_000_000,
+        });
+
+        let payload = mesh_models(snapshot);
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0].name, model_name);
+        assert_eq!(payload[0].status, "warm");
+        assert!(!payload[0].multimodal);
+        assert_eq!(payload[0].multimodal_status, None);
+        assert!(!payload[0].vision);
+        assert_eq!(payload[0].vision_status, None);
+    }
+
+    #[test]
+    fn runtime_data_model_snapshot_uses_static_media_for_unknown_descriptor() {
+        let collector = RuntimeDataCollector::new();
+        let model_name = "Qwen3VL-2B-Instruct-Q4_K_M".to_string();
+        let descriptor = crate::mesh::ServedModelDescriptor {
+            identity: crate::mesh::ServedModelIdentity {
+                model_name: model_name.clone(),
+                source_kind: crate::mesh::ModelSourceKind::LocalGguf,
+                local_file_name: Some(format!("{model_name}.gguf")),
+                ..Default::default()
+            },
+            capabilities_known: false,
+            capabilities: crate::models::ModelCapabilities::default(),
+            topology: None,
+        };
+
+        let snapshot = collector.build_model_view(ModelViewInput {
+            peers: vec![],
+            catalog: vec![MeshCatalogEntry {
+                model_name: model_name.clone(),
+                descriptor: Some(descriptor),
+            }],
+            served_models: vec![model_name.clone()],
+            active_demand: HashMap::new(),
+            my_serving_models: vec![model_name.clone()],
+            my_hosted_models: vec![model_name.clone()],
+            local_inventory: LocalModelInventorySnapshot {
+                model_names: HashSet::from([model_name.clone()]),
+                size_by_name: HashMap::new(),
+                metadata_by_name: HashMap::new(),
+            },
+            node_hostname: Some("node.local".into()),
+            my_vram_gb: 24.0,
+            model_name: model_name.clone(),
+            model_size_bytes: 0,
+            now_unix_secs: 1_700_000_000,
+        });
+
+        let payload = mesh_models(snapshot);
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0].name, model_name);
+        assert!(payload[0].multimodal);
+        assert_eq!(payload[0].multimodal_status, Some("supported"));
+        assert!(payload[0].vision);
+        assert_eq!(payload[0].vision_status, Some("supported"));
+    }
+
+    #[test]
+    fn runtime_data_model_snapshot_reports_known_verified_vision_descriptor() {
+        let collector = RuntimeDataCollector::new();
+        let model_name = "Qwen3VL-2B-Instruct-Q4_K_M".to_string();
+        let descriptor = crate::mesh::ServedModelDescriptor {
+            identity: crate::mesh::ServedModelIdentity {
+                model_name: model_name.clone(),
+                source_kind: crate::mesh::ModelSourceKind::LocalGguf,
+                local_file_name: Some(format!("{model_name}.gguf")),
+                ..Default::default()
+            },
+            capabilities_known: true,
+            capabilities: crate::models::ModelCapabilities {
+                multimodal: true,
+                vision: crate::models::CapabilityLevel::Supported,
+                ..Default::default()
+            },
+            topology: None,
+        };
+
+        let snapshot = collector.build_model_view(ModelViewInput {
+            peers: vec![],
+            catalog: vec![MeshCatalogEntry {
+                model_name: model_name.clone(),
+                descriptor: Some(descriptor),
+            }],
+            served_models: vec![model_name.clone()],
+            active_demand: HashMap::new(),
+            my_serving_models: vec![model_name.clone()],
+            my_hosted_models: vec![model_name.clone()],
+            local_inventory: LocalModelInventorySnapshot {
+                model_names: HashSet::from([model_name.clone()]),
+                size_by_name: HashMap::new(),
+                metadata_by_name: HashMap::new(),
+            },
+            node_hostname: Some("node.local".into()),
+            my_vram_gb: 24.0,
+            model_name: model_name.clone(),
+            model_size_bytes: 0,
+            now_unix_secs: 1_700_000_000,
+        });
+
+        let payload = mesh_models(snapshot);
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0].name, model_name);
+        assert!(payload[0].multimodal);
+        assert_eq!(payload[0].multimodal_status, Some("supported"));
+        assert!(payload[0].vision);
+        assert_eq!(payload[0].vision_status, Some("supported"));
+    }
+
     #[tokio::test]
     async fn runtime_data_inventory_single_flight_scan_coalesces() {
         let collector = RuntimeDataCollector::new();
@@ -539,10 +722,12 @@ mod tests {
         assert_eq!(scan_count.load(Ordering::SeqCst), 1);
         assert_eq!(first_snapshot, second_snapshot);
         assert_eq!(collector.local_inventory_snapshot(), first_snapshot);
-        assert!(collector
-            .local_inventory_snapshot()
-            .model_names
-            .contains("Qwen3-8B"));
+        assert!(
+            collector
+                .local_inventory_snapshot()
+                .model_names
+                .contains("Qwen3-8B")
+        );
     }
 
     #[test]
@@ -961,9 +1146,11 @@ mod tests {
                 .map(|endpoint| endpoint.address.as_deref()),
             Some(Some("http://127.0.0.1:9000/mcp"))
         );
-        assert!(collector
-            .plugin_endpoint_snapshot("alpha", "embed")
-            .is_none());
+        assert!(
+            collector
+                .plugin_endpoint_snapshot("alpha", "embed")
+                .is_none()
+        );
         assert!(collector.plugin_endpoint_snapshot("beta", "chat").is_none());
     }
 
@@ -1075,9 +1262,11 @@ mod tests {
         assert!(alpha_snapshot.providers.is_empty());
         assert!(alpha_snapshot.payloads.is_empty());
         assert!(alpha_snapshot.endpoints.is_empty());
-        assert!(collector
-            .plugin_endpoint_snapshot("alpha", "chat")
-            .is_none());
+        assert!(
+            collector
+                .plugin_endpoint_snapshot("alpha", "chat")
+                .is_none()
+        );
 
         let beta_snapshot = collector.plugin_snapshot("beta");
         assert_eq!(
@@ -1093,9 +1282,11 @@ mod tests {
         );
         assert_eq!(beta_snapshot.endpoints.len(), 1);
         assert_eq!(beta_snapshot.endpoints[0].endpoint_id, "embed");
-        assert!(collector
-            .plugin_endpoint_snapshot("beta", "embed")
-            .is_some());
+        assert!(
+            collector
+                .plugin_endpoint_snapshot("beta", "embed")
+                .is_some()
+        );
 
         let all = collector.plugins_snapshot();
         assert_eq!(

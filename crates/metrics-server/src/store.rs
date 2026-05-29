@@ -5,16 +5,16 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use duckdb::{params, Connection};
 use opentelemetry_proto::tonic::{
     collector::{
         logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
         trace::v1::ExportTraceServiceRequest,
     },
     common::v1::InstrumentationScope,
-    metrics::v1::{metric as otlp_metric, number_data_point, Metric, NumberDataPoint},
+    metrics::v1::{Metric, NumberDataPoint, metric as otlp_metric, number_data_point},
     trace::v1::{ResourceSpans, Span},
 };
+use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
 use skippy_metrics::{attr, metric};
 
@@ -726,7 +726,7 @@ fn max_span_i64_attribute(conn: &Connection, run_id: &str, key: &str) -> Result<
 }
 
 fn collect_rows<T>(
-    rows: duckdb::MappedRows<'_, impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<T>>,
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
 ) -> Result<Vec<T>> {
     let mut out = Vec::new();
     for row in rows {

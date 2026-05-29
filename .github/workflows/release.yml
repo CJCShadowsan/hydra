@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       skip_gpu_bundles:
-        description: Skip Linux CUDA, ROCm, and Vulkan release bundles
+        description: Skip CUDA, CUDA Blackwell, ROCm, and Vulkan release bundles
         required: true
         default: false
         type: boolean
@@ -30,7 +30,7 @@ env:
 jobs:
   metadata:
     name: Resolve release metadata
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -74,13 +74,13 @@ jobs:
       matrix:
         include:
           - name: macOS aarch64 Metal
-            os: macos-14
+            os: blacksmith-6vcpu-macos-15
             artifact_name: release-macos
             build_recipe: release-build
             bundle_recipe: release-bundle
             backend: metal
           - name: Linux x86_64 CPU
-            os: ubuntu-latest
+            os: blacksmith-4vcpu-ubuntu-2404
             artifact_name: release-linux
             build_recipe: release-build
             bundle_recipe: release-bundle
@@ -92,7 +92,7 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10
 
       - uses: actions/setup-node@v5
         with:
@@ -110,18 +110,18 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl lld
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
-        run: brew install cmake ninja
+        run: brew install cmake ninja lld
 
       - name: Build release bundle
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          just --shell bash --shell-arg -lc ${{ matrix.build_recipe }}
-          just --shell bash --shell-arg -lc ${{ matrix.bundle_recipe }} "$RELEASE_TAG" dist
+          just --shell bash --shell-arg -c ${{ matrix.build_recipe }}
+          just --shell bash --shell-arg -c ${{ matrix.bundle_recipe }} "$RELEASE_TAG" dist
 
       - name: Upload release bundle
         uses: actions/upload-artifact@v6
@@ -146,12 +146,125 @@ jobs:
       artifact_name: release-linux-inference-binary
       mesh_binary_target: target/release/mesh-llm
       cache_key_prefix: release-
-      workflow_cache_file: .github/workflows/release.yml
+
+  build_native_sdk_runtime:
+    name: Build native SDK runtime ${{ matrix.name }}
+    needs: metadata
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS aarch64 Metal
+            os: blacksmith-6vcpu-macos-15
+            backend: metal
+            target: aarch64-apple-darwin
+            artifact_suffix: darwin-aarch64-metal
+          - name: Linux x86_64 CPU
+            os: blacksmith-4vcpu-ubuntu-2404
+            backend: cpu
+            target: x86_64-unknown-linux-gnu
+            artifact_suffix: linux-x86_64-cpu
+    env:
+      LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
+      MESH_NATIVE_SDK_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl lld
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja lld
+
+      - name: Package native SDK runtime
+        run: |
+          scripts/package-native-sdk.sh \
+            --build \
+            --backend "${{ matrix.backend }}" \
+            --target "${{ matrix.target }}" \
+            --out dist/native-sdk
+
+      - name: Verify native SDK runtime artifact
+        run: scripts/verify-native-sdk-package.sh dist/native-sdk/*.tar.gz
+
+      - name: Package native SDK runtime crate
+        run: scripts/package-native-sdk-crate.sh --out dist/native-sdk-crates dist/native-sdk/*.tar.gz
+
+      - name: Upload native SDK runtime
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-native-sdk-${{ matrix.artifact_suffix }}
+          path: |
+            dist/native-sdk/*.tar.gz
+            dist/native-sdk/*.sha256
+            dist/native-sdk-crates/*/target/package/*.crate
+          if-no-files-found: error
+
+  build_swift_sdk_artifact:
+    name: Build Swift SDK XCFramework
+    needs: metadata
+    runs-on: blacksmith-6vcpu-macos-15
+    env:
+      LLAMA_STAGE_BACKEND: metal
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install macOS dependencies
+        run: brew install cmake ninja lld
+
+      - name: Build SwiftPM binary artifact
+        run: |
+          sdk/swift/scripts/build-xcframework.sh
+          mkdir -p dist
+          rm -f dist/MeshLLMFFI.xcframework.zip
+          ditto -c -k --sequesterRsrc --keepParent \
+            sdk/swift/Generated/MeshLLMFFI.xcframework \
+            dist/MeshLLMFFI.xcframework.zip
+
+      - name: Prepare SwiftPM manifest for dispatched release
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          scripts/update-swift-package-manifest.sh \
+            "${{ needs.metadata.outputs.tag }}" \
+            dist/MeshLLMFFI.xcframework.zip
+
+      - name: Verify SwiftPM binary artifact
+        run: |
+          scripts/verify-swift-release-artifact.sh dist/MeshLLMFFI.xcframework.zip
+          scripts/verify-swift-package-manifest.sh \
+            "${{ needs.metadata.outputs.tag }}" \
+            dist/MeshLLMFFI.xcframework.zip
+
+      - name: Upload generated SwiftPM manifest
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v6
+        with:
+          name: swift-package-manifest
+          path: Package.swift
+          if-no-files-found: error
+
+      - name: Upload SwiftPM binary artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-swift-sdk
+          path: dist/MeshLLMFFI.xcframework.zip
+          if-no-files-found: error
 
   build_linux_arm64:
     name: Build Linux ARM64 CPU
     needs: metadata
-    runs-on: ubuntu-24.04-arm
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
     env:
       LLAMA_STAGE_BACKEND: cpu
       MESH_RELEASE_ARCH: aarch64
@@ -159,7 +272,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -170,13 +283,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@just
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl lld
       - name: Build ARM64 CPU release bundle
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          just --shell bash --shell-arg -lc release-build-arm64
-          just --shell bash --shell-arg -lc release-bundle-arm64 "$RELEASE_TAG" dist
+          just --shell bash --shell-arg -c release-build-arm64
+          just --shell bash --shell-arg -c release-bundle-arm64 "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-arm64
@@ -187,7 +300,7 @@ jobs:
     name: Build Linux CUDA
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: nvidia/cuda:${{ vars.CUDA_VERSION || '12.6.3' }}-devel-ubuntu22.04
     env:
@@ -197,7 +310,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential &&
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
               break
             if [ "$attempt" -eq 3 ]; then
               exit 1
@@ -208,7 +321,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -222,8 +335,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          just --shell bash --shell-arg -lc release-build-cuda
-          just --shell bash --shell-arg -lc release-bundle-cuda "$RELEASE_TAG" dist
+          just --shell bash --shell-arg -c release-build-cuda
+          just --shell bash --shell-arg -c release-bundle-cuda "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-cuda
@@ -234,7 +347,7 @@ jobs:
     name: Build Linux CUDA (Blackwell)
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: nvidia/cuda:${{ vars.CUDA_BLACKWELL_VERSION || '12.8.0' }}-devel-ubuntu22.04
     env:
@@ -244,7 +357,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential &&
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
               break
             if [ "$attempt" -eq 3 ]; then
               exit 1
@@ -255,7 +368,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -269,8 +382,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          just --shell bash --shell-arg -lc release-build-cuda-blackwell
-          just --shell bash --shell-arg -lc release-bundle-cuda-blackwell "$RELEASE_TAG" dist
+          just --shell bash --shell-arg -c release-build-cuda-blackwell
+          just --shell bash --shell-arg -c release-bundle-cuda-blackwell "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-cuda-blackwell
@@ -281,7 +394,7 @@ jobs:
     name: Build Linux ROCm
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: rocm/dev-ubuntu-24.04:7.0-complete
     env:
@@ -291,7 +404,7 @@ jobs:
         run: |
           for attempt in 1 2 3; do
             apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential &&
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
               break
             if [ "$attempt" -eq 3 ]; then
               exit 1
@@ -302,7 +415,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -316,8 +429,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          just --shell bash --shell-arg -lc release-build-rocm
-          just --shell bash --shell-arg -lc release-bundle-rocm "$RELEASE_TAG" dist
+          just --shell bash --shell-arg -c release-build-rocm
+          just --shell bash --shell-arg -c release-bundle-rocm "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-rocm
@@ -328,14 +441,14 @@ jobs:
     name: Build Linux Vulkan
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       LLAMA_STAGE_BACKEND: vulkan
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v4
         with:
-          version: latest
+          version: 10
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -346,16 +459,145 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@just
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl glslc libvulkan-dev spirv-headers
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl glslc libvulkan-dev spirv-headers lld
       - name: Build Vulkan release bundle
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          just --shell bash --shell-arg -lc release-build-vulkan
-          just --shell bash --shell-arg -lc release-bundle-vulkan "$RELEASE_TAG" dist
+          just --shell bash --shell-arg -c release-build-vulkan
+          just --shell bash --shell-arg -c release-bundle-vulkan "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-vulkan
+          path: dist/*
+          if-no-files-found: error
+
+  build_windows_cpu:
+    name: Build Windows CPU
+    needs: metadata
+    runs-on: blacksmith-8vcpu-windows-2025
+    env:
+      LLAMA_STAGE_BACKEND: cpu
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            .github/cache-version.txt
+            crates/mesh-llm-ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build Windows CPU release bundle
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_LLM_REQUIRE_SCCACHE: "1"
+        run: |
+          just release-build-windows
+          just release-bundle-windows "$env:RELEASE_TAG" dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  build_windows_gpu:
+    name: Build Windows ${{ matrix.name }}
+    needs: metadata
+    if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
+    runs-on: blacksmith-8vcpu-windows-2025
+    env:
+      ROCM_HIP_SDK_FILENAME: AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe
+      # Pin Windows CUDA to a version sccache 0.15.0 supports.
+      # `choco install cuda` (used previously via install-windows-sdk.ps1)
+      # pulls latest = CUDA 13.2, which deterministically crashes sccache
+      # on nvcc output (see mozilla/sccache#2470). CI pins to the same
+      # version via Jimver/cuda-toolkit; mirror that here.
+      WINDOWS_CUDA_VERSION: ${{ vars.CUDA_VERSION || '12.6.3' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: CUDA
+            backend: cuda
+            build_recipe: release-build-cuda-windows
+            bundle_recipe: release-bundle-cuda-windows
+            artifact_name: release-windows-cuda
+          - name: ROCm
+            backend: rocm
+            build_recipe: release-build-rocm-windows
+            bundle_recipe: release-bundle-rocm-windows
+            artifact_name: release-windows-rocm
+          - name: Vulkan
+            backend: vulkan
+            build_recipe: release-build-vulkan-windows
+            bundle_recipe: release-bundle-vulkan-windows
+            artifact_name: release-windows-vulkan
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            .github/cache-version.txt
+            crates/mesh-llm-ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Windows SDK installers
+        if: ${{ matrix.backend != 'cuda' }}
+        uses: actions/cache@v5
+        with:
+          path: ~/sdk-installer-cache/${{ matrix.backend }}
+          key: windows-sdk-installers-${{ matrix.backend }}-${{ env.ROCM_HIP_SDK_FILENAME }}-${{ hashFiles('scripts/install-windows-sdk.ps1') }}
+      - name: Install CUDA toolkit
+        if: ${{ matrix.backend == 'cuda' }}
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.WINDOWS_CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
+          use-github-cache: true
+          use-local-cache: true
+          log-file-suffix: windows-cuda-release
+      - name: Verify CUDA toolkit
+        if: ${{ matrix.backend == 'cuda' }}
+        shell: pwsh
+        run: |
+          if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
+            throw "CUDA_PATH was not configured by Jimver/cuda-toolkit."
+          }
+          & nvcc --version
+      - name: Install backend SDK
+        if: ${{ matrix.backend != 'cuda' }}
+        shell: pwsh
+        run: |
+          .\scripts\install-windows-sdk.ps1 `
+            -Backend "${{ matrix.backend }}" `
+            -RocmHipSdkFilename "$env:ROCM_HIP_SDK_FILENAME" `
+            -InstallerCacheDir "$HOME\sdk-installer-cache"
+      - name: Build Windows GPU release bundle
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_LLM_REQUIRE_SCCACHE: "1"
+          MESH_LLM_WINDOWS_BUILD_JOBS: ${{ matrix.backend == 'cuda' && '1' || '' }}
+        run: |
+          just ${{ matrix.build_recipe }}
+          just ${{ matrix.bundle_recipe }} "$env:RELEASE_TAG" dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
           path: dist/*
           if-no-files-found: error
 
@@ -365,16 +607,23 @@ jobs:
       - metadata
       - build
       - inference_smoke_tests
+      - build_native_sdk_runtime
+      - build_swift_sdk_artifact
       - build_linux_arm64
       - build_linux_cuda
       - build_linux_cuda_blackwell
       - build_linux_rocm
       - build_linux_vulkan
-      # build_windows:
-      # - build_windows  # disabled until llama.cpp CUDA fix
-    if: ${{ always() && needs.metadata.result == 'success' && needs.build.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.build_linux_arm64.result == 'success' && (needs.build_linux_cuda.result == 'success' || needs.build_linux_cuda.result == 'skipped') && (needs.build_linux_cuda_blackwell.result == 'success' || needs.build_linux_cuda_blackwell.result == 'skipped') && (needs.build_linux_rocm.result == 'success' || needs.build_linux_rocm.result == 'skipped') && (needs.build_linux_vulkan.result == 'success' || needs.build_linux_vulkan.result == 'skipped') }}
-    runs-on: ubuntu-latest
+      - build_windows_cpu
+      - build_windows_gpu
+    if: ${{ always() && needs.metadata.result == 'success' && needs.build.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.build_native_sdk_runtime.result == 'success' && needs.build_swift_sdk_artifact.result == 'success' && needs.build_linux_arm64.result == 'success' && (needs.build_linux_cuda.result == 'success' || needs.build_linux_cuda.result == 'skipped') && (needs.build_linux_cuda_blackwell.result == 'success' || needs.build_linux_cuda_blackwell.result == 'skipped') && (needs.build_linux_rocm.result == 'success' || needs.build_linux_rocm.result == 'skipped') && (needs.build_linux_vulkan.result == 'success' || needs.build_linux_vulkan.result == 'skipped') && needs.build_windows_cpu.result == 'success' && (needs.build_windows_gpu.result == 'success' || needs.build_windows_gpu.result == 'skipped') }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          fetch-depth: 0
+
       - name: Download release artifacts
         uses: actions/download-artifact@v7
         with:
@@ -384,6 +633,35 @@ jobs:
 
       - name: Remove smoke-only binary
         run: rm -f release-artifacts/mesh-llm
+
+      - name: Download generated SwiftPM manifest
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@v7
+        with:
+          name: swift-package-manifest
+          path: generated-swift-manifest
+
+      - name: Create dispatched release tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          cp generated-swift-manifest/Package.swift Package.swift
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          if git diff --cached --quiet -- Package.swift; then
+            echo "Package.swift already matches generated SwiftPM manifest"
+          else
+            git commit -m "$RELEASE_TAG: prepare Swift package manifest"
+          fi
+          git tag "$RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -396,15 +674,11 @@ jobs:
     name: Publish crates.io packages
     needs: [metadata, publish]
     if: ${{ needs.metadata.outputs.prerelease != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish mesh-llm-client
+      - name: Publish crates.io package chain
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked -p mesh-llm-client
-      - name: Publish mesh-api
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked -p mesh-api
+        run: scripts/publish-crates.sh

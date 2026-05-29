@@ -7,13 +7,20 @@
 # syntax=docker/dockerfile:1.7
 
 FROM node:24-alpine AS ui-builder
+ARG VITE_API_URL=https://meshllm.cloud
+ARG VITE_APP_VERSION=
+ARG VITE_STORAGE_NAMESPACE=mesh-llm-ui-production
+ARG NODE_ENV=production
+ENV NODE_ENV=$NODE_ENV
+ENV VITE_API_URL=$VITE_API_URL
+ENV VITE_STORAGE_NAMESPACE=$VITE_STORAGE_NAMESPACE
 RUN npm install -g pnpm
 WORKDIR /app
 COPY crates/mesh-llm-ui/package.json crates/mesh-llm-ui/pnpm-lock.yaml crates/mesh-llm-ui/pnpm-workspace.yaml ./
 RUN --mount=type=cache,id=pnpm-store,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 COPY crates/mesh-llm-ui/ ./
-RUN pnpm run build
+RUN VITE_APP_VERSION="${VITE_APP_VERSION:-$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')}" pnpm run build
 
 FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,11 +31,15 @@ ENV PATH="/root/.cargo/bin:$PATH"
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/mesh-llm-ui/ crates/mesh-llm-ui/
+COPY crates/mesh-llm-gpu-bench/ crates/mesh-llm-gpu-bench/
 COPY crates/mesh-llm-identity/ crates/mesh-llm-identity/
 COPY crates/mesh-llm-protocol/ crates/mesh-llm-protocol/
 COPY crates/mesh-llm-routing/ crates/mesh-llm-routing/
+COPY crates/mesh-llm-guardrails/ crates/mesh-llm-guardrails/
 COPY crates/mesh-llm-system/ crates/mesh-llm-system/
 COPY crates/mesh-llm-types/ crates/mesh-llm-types/
+COPY crates/mesh-llm-config/ crates/mesh-llm-config/
+COPY crates/mesh-llm-console-server/ crates/mesh-llm-console-server/
 COPY crates/mesh-llm-host-runtime/Cargo.toml crates/mesh-llm-host-runtime/Cargo.toml
 COPY crates/mesh-llm/Cargo.toml crates/mesh-llm/Cargo.toml
 COPY crates/mesh-llm/build.rs crates/mesh-llm/build.rs
@@ -38,9 +49,11 @@ COPY crates/mesh-llm-host-runtime/ crates/mesh-llm-host-runtime/
 COPY crates/mesh-llm/ crates/mesh-llm/
 COPY crates/mesh-llm-plugin/ crates/mesh-llm-plugin/
 COPY crates/mesh-client/ crates/mesh-client/
-COPY crates/mesh-api/ crates/mesh-api/
-COPY crates/mesh-host-core/ crates/mesh-host-core/
-COPY crates/mesh-api-ffi/ crates/mesh-api-ffi/
+COPY crates/mesh-llm-api-client/ crates/mesh-llm-api-client/
+COPY crates/mesh-llm-api-server/ crates/mesh-llm-api-server/
+COPY crates/mesh-llm-node/ crates/mesh-llm-node/
+COPY crates/mesh-llm-ffi/ crates/mesh-llm-ffi/
+COPY crates/mesh-llm-nodejs/ crates/mesh-llm-nodejs/
 COPY crates/mesh-llm-test-harness/ crates/mesh-llm-test-harness/
 COPY crates/model-ref/ crates/model-ref/
 COPY crates/model-artifact/ crates/model-artifact/
@@ -57,10 +70,12 @@ COPY crates/skippy-runtime/ crates/skippy-runtime/
 COPY crates/skippy-server/ crates/skippy-server/
 COPY crates/metrics-server/ crates/metrics-server/
 COPY crates/skippy-model-package/ crates/skippy-model-package/
+COPY crates/skippy-coordinator/ crates/skippy-coordinator/
 COPY crates/skippy-correctness/ crates/skippy-correctness/
 COPY crates/llama-spec-bench/ crates/llama-spec-bench/
 COPY crates/skippy-bench/ crates/skippy-bench/
 COPY crates/skippy-prompt/ crates/skippy-prompt/
+COPY crates/mesh-mixture-of-agents/ crates/mesh-mixture-of-agents/
 COPY tools/xtask/ tools/xtask/
 COPY scripts/prepare-llama.sh scripts/build-llama.sh scripts/
 COPY third_party/llama.cpp/upstream.txt third_party/llama.cpp/upstream.txt
@@ -82,5 +97,6 @@ COPY --from=builder /usr/local/bin/mesh-llm /usr/local/bin/mesh-llm
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENV APP_MODE=console
+ENV NODE_ENV=production
 EXPOSE 3131 9337
 ENTRYPOINT ["/entrypoint.sh"]

@@ -58,6 +58,9 @@ pub(crate) fn remote_stage_load_request(
         cache_type_v: context.kv_cache.cache_type_v().to_string(),
         flash_attn_type: context.flash_attn_type,
         shutdown_generation: 1,
+        coordinator_term: 0,
+        coordinator_id: None,
+        lease_until_unix_ms: 0,
         load_mode: LoadMode::LayerPackage,
         upstream: None,
         downstream,
@@ -127,6 +130,7 @@ pub(crate) fn stage_stop_request(
         run_id: context.run_id.to_string(),
         stage_id: stage.stage_id.clone(),
         shutdown_generation,
+        coordinator_term: 0,
     }
 }
 
@@ -223,7 +227,7 @@ mod tests {
             lane_count: 2,
             n_batch: None,
             n_ubatch: None,
-            kv_cache: KvCachePolicy::for_model_size(100),
+            kv_cache: KvCachePolicy::for_model_size(0),
             flash_attn_type: FlashAttentionType::Auto,
             projector_path: Some("/models/mmproj.gguf".to_string()),
         };

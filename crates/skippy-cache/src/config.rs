@@ -6,6 +6,23 @@ pub struct ResidentCacheConfig {
     pub max_bytes: u64,
     pub min_tokens: u64,
     pub reserved_seq_count: i32,
+    /// Maximum number of native KV cell positions the cache may hold
+    /// at one time, in tokens. Under `kv_unified = true` (skippy patch
+    /// 0034) the resident prefix cache shares one `n_ctx` cell pool
+    /// with the active execution lanes. Without this cap the cache
+    /// budget is bounded only by `max_entries` and `max_bytes`, both
+    /// of which can easily allow more pinned tokens than the cell
+    /// pool has cells — the lanes then can't find a free slot and
+    /// the embedded runtime surfaces HTTP 502
+    /// `RuntimeError: llama_decode failed`
+    /// (`decode: failed to find a memory slot`).
+    ///
+    /// Set this to a fraction of the model's `n_ctx` (typically
+    /// `n_ctx / 2` or similar). A value of 0 disables the cap and
+    /// behaves like the legacy unbounded-by-tokens cache. The cap is
+    /// only useful when `n_ctx` is comfortably larger than
+    /// `min_tokens`; see [`derive_max_resident_tokens`] for the floor.
+    pub max_resident_tokens: u64,
 }
 
 impl ResidentCacheConfig {
@@ -13,12 +30,73 @@ impl ResidentCacheConfig {
         let reserved_seq_count = i32::try_from(config.lane_count.saturating_mul(2))
             .unwrap_or(i32::MAX)
             .max(2);
+        let max_resident_tokens = derive_max_resident_tokens(u64::from(config.ctx_size));
         Self {
             max_entries: cache.max_entries.clamp(1, 512),
             max_bytes: cache.max_bytes,
             min_tokens: cache.min_tokens,
             reserved_seq_count,
+            max_resident_tokens,
         }
+    }
+}
+
+/// Derive `max_resident_tokens` from the model's `n_ctx` cell pool.
+///
+/// The cache shares the `n_ctx` cell pool with the active lanes under
+/// `kv_unified = true`. The cap reserves half of the pool for in-flight
+/// lane prefills and lets the cache use at most the other half.
+///
+/// For small contexts (smoke-test / tiny-model configs) the half-pool
+/// can be smaller than a single typical prompt; applying the cap then
+/// rejects the very first record and degrades the cache without
+/// preventing any real wedge. The cap is therefore disabled when the
+/// model's `n_ctx` is below `MIN_CTX_FOR_CELL_CAP` cells. The original
+/// failure mode this cap fixes is large-context unified-KV serving
+/// (e.g. `n_ctx = 131072`), which comfortably clears this floor.
+///
+/// Picking `min_tokens` as the floor would be tempting but does not
+/// match the actual wedge: callers can configure `min_tokens` as low
+/// as 64 while still using a small `n_ctx`, and the cap would still
+/// be smaller than typical prompts. A hard cell-count floor is easier
+/// to reason about and matches the real-world contexts the cap is
+/// designed for (long-context unified-KV serving).
+const MIN_CTX_FOR_CELL_CAP: u64 = 8192;
+
+fn derive_max_resident_tokens(ctx_size: u64) -> u64 {
+    if ctx_size < MIN_CTX_FOR_CELL_CAP {
+        return 0;
+    }
+    ctx_size.saturating_div(2)
+}
+
+#[cfg(test)]
+mod resident_cache_config_tests {
+    use super::*;
+
+    #[test]
+    fn cap_disabled_for_smoke_test_ctx_size() {
+        // Smoke-test / SmolLM2 scenario: ctx_size=768. Half=384 would
+        // be smaller than a typical 533-token smoke prompt; cap stays
+        // disabled.
+        assert_eq!(derive_max_resident_tokens(768), 0);
+    }
+
+    #[test]
+    fn cap_enabled_for_production_ctx_size() {
+        // Production failure mode the cap is designed for.
+        assert_eq!(derive_max_resident_tokens(131072), 65536);
+        // Exactly at the floor.
+        assert_eq!(derive_max_resident_tokens(8192), 4096);
+        // Just above the floor.
+        assert_eq!(derive_max_resident_tokens(16384), 8192);
+    }
+
+    #[test]
+    fn cap_disabled_just_below_floor() {
+        // Below the hard floor.
+        assert_eq!(derive_max_resident_tokens(8191), 0);
+        assert_eq!(derive_max_resident_tokens(4096), 0);
     }
 }
 
@@ -49,7 +127,13 @@ impl PrefixCandidatePolicy {
             return counts;
         }
         let stride = self.stride_tokens.max(1).min(self.page_size_tokens.max(1));
-        let mut candidate = token_count.saturating_sub(1);
+        let mut candidate = stable_grid_floor(token_count, stride);
+        if candidate == token_count {
+            candidate = candidate.saturating_sub(stride);
+        }
+        if candidate < self.min_tokens {
+            candidate = self.min_tokens;
+        }
         while candidate >= self.min_tokens {
             counts.push(candidate);
             if candidate == self.min_tokens {
@@ -73,32 +157,15 @@ impl PrefixCandidatePolicy {
         let mut selected = Vec::with_capacity(limit);
         selected.push(token_count);
 
-        let lower_bound = candidates
-            .iter()
-            .copied()
-            .filter(|candidate| *candidate != token_count)
-            .min()
-            .unwrap_or(token_count);
         let shared_slots = limit.saturating_sub(1);
         if shared_slots == 0 {
             return selected;
         }
-        for slot in 0..shared_slots {
-            let target = if shared_slots == 1 {
-                lower_bound
-            } else {
-                let span = token_count.saturating_sub(lower_bound);
-                token_count
-                    .saturating_sub(span.saturating_mul((slot + 1) as u64) / shared_slots as u64)
+        for candidate in candidates.iter().copied() {
+            if selected.len() >= limit {
+                break;
             }
-            .max(self.min_tokens)
-            .min(token_count);
-            if let Some(candidate) = candidates
-                .iter()
-                .copied()
-                .filter(|candidate| *candidate <= target && *candidate != token_count)
-                .max()
-            {
+            if candidate != token_count {
                 selected.push(candidate);
             }
         }
@@ -118,6 +185,10 @@ impl PrefixCandidatePolicy {
     }
 }
 
+fn stable_grid_floor(token_count: u64, stride: u64) -> u64 {
+    token_count.saturating_sub(token_count % stride.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,10 +202,7 @@ mod tests {
             page_size_tokens: 64,
         };
 
-        assert_eq!(
-            policy.candidate_token_counts(160),
-            vec![160, 159, 127, 95, 64]
-        );
+        assert_eq!(policy.candidate_token_counts(160), vec![160, 128, 96, 64]);
     }
 
     #[test]
@@ -146,7 +214,7 @@ mod tests {
             page_size_tokens: 64,
         };
 
-        assert_eq!(policy.record_candidate_token_counts(160), vec![160, 64]);
+        assert_eq!(policy.record_candidate_token_counts(160), vec![160, 128]);
     }
 
     #[test]
@@ -173,7 +241,40 @@ mod tests {
 
         assert_eq!(
             policy.record_candidate_token_counts(160),
-            vec![160, 159, 127, 95, 64]
+            vec![160, 128, 96, 64]
         );
+    }
+
+    #[test]
+    fn same_prefix_different_tail_prompts_share_near_tail_candidate() {
+        let policy = PrefixCandidatePolicy {
+            min_tokens: 256,
+            stride_tokens: 128,
+            record_limit: 2,
+            page_size_tokens: 256,
+        };
+
+        let recorded = policy.record_candidate_token_counts(2214);
+        let lookup = policy.candidate_token_counts(2231);
+        let shared = recorded
+            .iter()
+            .copied()
+            .find(|candidate| lookup.contains(candidate));
+
+        assert_eq!(recorded, vec![2214, 2176]);
+        assert_eq!(shared, Some(2176));
+    }
+
+    #[test]
+    fn non_aligned_min_tokens_still_provides_shared_floor_candidate() {
+        let policy = PrefixCandidatePolicy {
+            min_tokens: 300,
+            stride_tokens: 128,
+            record_limit: 2,
+            page_size_tokens: 300,
+        };
+
+        assert_eq!(policy.candidate_token_counts(350), vec![350, 300]);
+        assert_eq!(policy.record_candidate_token_counts(350), vec![350, 300]);
     }
 }

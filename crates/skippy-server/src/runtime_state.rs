@@ -4,23 +4,43 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use skippy_protocol::{FlashAttentionType, LoadMode, StageConfig};
 use skippy_runtime::{
-    parse_cache_type, ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType,
-    GenerationSignalWindow, MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig,
-    RuntimeKvPage, RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
-    StageSessionCheckpoint, TokenSignal,
+    ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow,
+    MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig, RuntimeKvPage, RuntimeKvPageDesc,
+    RuntimeLoadMode, SamplingConfig, StageModel, StageSession, StageSessionCheckpoint, TokenSignal,
+    parse_cache_type,
 };
 
 use crate::package::select_package_parts;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeLaunchOverrides {
+    pub n_threads: Option<usize>,
+    pub n_threads_batch: Option<usize>,
+}
 
 pub struct RuntimeState {
     pub model: StageModel,
     layer_start: u32,
     layer_end: u32,
     lane_count: u32,
+    /// High-water mark of lane indices ever handed out. Combined with
+    /// [`Self::free_lane_indices`], the count of live lanes equals
+    /// `next_lane_index - free_lane_indices.len()`.
     next_lane_index: usize,
+    /// Lane indices that were previously handed out but are now free
+    /// to reuse. An index lands here only when the lane's underlying
+    /// StageSession has been dropped (which calls skippy_session_free
+    /// on the C side, clearing that seq_id's KV cells).
+    ///
+    /// Without this list, a discarded lane (see
+    /// [`Self::drop_session_timed`]) would permanently consume one of
+    /// the slots represented by [`Self::next_lane_index`], leading to
+    /// "all execution lanes are busy" errors long before the runtime
+    /// has actually run out of capacity.
+    free_lane_indices: Vec<usize>,
     sessions: BTreeMap<String, RuntimeLaneSession>,
     idle_sessions: Vec<RuntimeLaneSession>,
     session_token_counts: BTreeMap<String, u64>,
@@ -60,6 +80,13 @@ pub struct RuntimeSessionDropStats {
     pub reset_session: bool,
     pub reset_ms: f64,
     pub preserved_resident_prefix: bool,
+    /// True when the lane could not be returned to the idle pool because
+    /// the underlying StageSession failed to reset cleanly. The lane is
+    /// dropped (which invokes the C-side skippy_session_free) and the
+    /// pool capacity is restored on the next prewarm/admission cycle.
+    pub lane_discarded: bool,
+    /// Reset-error detail, when [`Self::lane_discarded`] is true.
+    pub lane_discard_reason: Option<String>,
     pub stats_after: RuntimeSessionStats,
 }
 
@@ -134,6 +161,10 @@ impl RuntimeState {
         let token = session.decode_step_sampled(token_id, sampling)?;
         self.add_session_tokens(session_id, 1);
         Ok(token)
+    }
+
+    pub fn session_batch_size(&mut self, session_id: &str) -> Result<usize> {
+        self.active_session(session_id)?.batch_size()
     }
 
     pub fn configure_chat_sampling(
@@ -282,6 +313,13 @@ impl RuntimeState {
             .session)
     }
 
+    fn active_session(&mut self, session_id: &str) -> Result<&mut StageSession> {
+        self.sessions
+            .get_mut(session_id)
+            .map(|lane_session| &mut lane_session.session)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} is not active"))
+    }
+
     pub fn prewarm_idle_sessions(
         &mut self,
         target_idle_sessions: usize,
@@ -296,38 +334,97 @@ impl RuntimeState {
         Ok(self.session_stats())
     }
 
+    /// Release the session slot identified by `session_id`.
+    ///
+    /// This is the cleanup path called at the end of every chat
+    /// completion (success, cancellation, or backend error). It must
+    /// leave [`Self`] in a self-consistent state regardless of whether
+    /// the underlying StageSession can be reset cleanly:
+    ///
+    ///  - The lane is either returned to `idle_sessions` (reset OK) or
+    ///    dropped entirely (reset failed). Dropping the lane triggers
+    ///    `StageSession::drop`, which calls `skippy_session_free` on
+    ///    the C side — the authoritative path for releasing native KV
+    ///    cells held by that sequence id.
+    ///  - `session_token_counts`, `session_checkpoints`, and
+    ///    `session_resident_prefixes` for `session_id` are always
+    ///    removed.
+    ///  - The function always returns `Ok` so per-request cleanup at
+    ///    callsites never propagates a reset failure as a request
+    ///    error. The outcome is reported via [`RuntimeSessionDropStats`]
+    ///    fields (`lane_discarded`, `lane_discard_reason`) for
+    ///    telemetry.
+    ///
+    /// Previously a reset error propagated `?` through this function,
+    /// which left `session_token_counts` and `session_checkpoints`
+    /// holding stale entries and dropped the lane on the floor without
+    /// any record. That accumulated bookkeeping drift over time and
+    /// could leave the native KV cache reporting "all slots in use"
+    /// long after the owning sessions were gone, producing
+    /// `failed to find a memory slot` errors on subsequent admissions.
     pub fn drop_session_timed(&mut self, session_id: &str) -> Result<RuntimeSessionDropStats> {
         let reset_started = Instant::now();
         let mut reset_session = false;
-        let mut preserved_resident_prefix = false;
+        let preserved_resident_prefix = false;
+        let mut lane_discarded = false;
+        let mut lane_discard_reason: Option<String> = None;
+
         if let Some(mut lane_session) = self.sessions.remove(session_id) {
-            if let Some(prefix) = self.session_resident_prefixes.remove(session_id) {
-                match lane_session.session.trim_session(prefix.token_count) {
-                    Ok(()) => {
-                        preserved_resident_prefix = true;
-                        lane_session.resident_prefix = Some(prefix);
-                        self.idle_sessions.push(lane_session);
-                    }
-                    Err(_) => {
-                        reset_session = true;
-                        lane_session.session.reset()?;
-                        lane_session.resident_prefix = None;
-                        self.idle_sessions.push(lane_session);
-                    }
+            let lane_index = lane_session.index;
+            // Always release the lane's native KV cells back to the
+            // unified pool. The trim+preserve path kept the lane's cells
+            // pinned to a specific (`page_id`, `token_count`) pair so a
+            // future request whose content prefix hashed to the *exact*
+            // same `page_id` AND same `token_count` could acquire the
+            // warm lane via `acquire_resident_prefix_lane`. Real chat /
+            // agent workloads vary the conversation tail every turn, so
+            // both the hash and the length change request-to-request and
+            // that exact-match acquisition almost never fires. Meanwhile
+            // the pinned cells remain claimed in the unified pool, in
+            // parallel with the cells the cache layer itself pins, and
+            // the pool runs out of contiguous space — producing
+            // `decode: failed to find a memory slot` under repeated
+            // tool-using agent traffic (#652). Cross-request prefix
+            // reuse is still done by the cache layer (by `page_id`); we
+            // just stop double-claiming cells on the lane side.
+            self.session_resident_prefixes.remove(session_id);
+            reset_session = true;
+            match lane_session.session.reset() {
+                Ok(()) => {
+                    lane_session.resident_prefix = None;
+                    self.idle_sessions.push(lane_session);
                 }
-            } else {
-                reset_session = true;
-                lane_session.session.reset()?;
-                lane_session.resident_prefix = None;
-                self.idle_sessions.push(lane_session);
+                Err(reset_err) => {
+                    lane_discarded = true;
+                    let reason = format!("reset() failed ({reset_err:#})");
+                    eprintln!(
+                        "skippy::runtime_state: drop_session_timed: discarding lane {lane_index} for session {session_id}: {reason}"
+                    );
+                    lane_discard_reason = Some(reason);
+                    drop(lane_session);
+                    self.free_lane_indices.push(lane_index);
+                }
             }
         }
+
+        // Always clear per-session bookkeeping. The previous version
+        // skipped these when reset returned Err, which leaked entries.
+        //
+        // session_resident_prefixes is also cleared here defensively:
+        // it's already removed above on the active-session path, but
+        // calling drop_session_timed for an id that's no longer in
+        // `sessions` (idempotent cleanup, stale callers) must still
+        // clear any stray resident-prefix entry under that id.
         self.session_token_counts.remove(session_id);
         self.session_checkpoints.remove(session_id);
+        self.session_resident_prefixes.remove(session_id);
+
         Ok(RuntimeSessionDropStats {
             reset_session,
             reset_ms: reset_started.elapsed().as_secs_f64() * 1000.0,
             preserved_resident_prefix,
+            lane_discarded,
+            lane_discard_reason,
             stats_after: self.session_stats(),
         })
     }
@@ -614,10 +711,12 @@ impl RuntimeState {
             bail!("session {session_id} already exists");
         }
         let model = &self.model;
-        let (index, session) =
-            create_indexed_lane_resource(&mut self.next_lane_index, self.lane_count, || {
-                model.create_session_from_resident_prefix(cache_seq_id, token_ids)
-            })?;
+        let (index, session) = create_indexed_lane_resource(
+            &mut self.next_lane_index,
+            &mut self.free_lane_indices,
+            self.lane_count,
+            || model.create_session_from_resident_prefix(cache_seq_id, token_ids),
+        )?;
         let lane_session = RuntimeLaneSession {
             index,
             session,
@@ -634,7 +733,7 @@ impl RuntimeState {
         session_id: &str,
         cache_seq_id: i32,
     ) -> Result<()> {
-        self.session(session_id)?.drop_sequence(cache_seq_id)
+        self.active_session(session_id)?.drop_sequence(cache_seq_id)
     }
 
     fn add_session_tokens(&mut self, session_id: &str, count: u64) {
@@ -676,10 +775,12 @@ impl RuntimeState {
 
     fn create_lane_session(&mut self) -> Result<RuntimeLaneSession> {
         let model = &self.model;
-        let (index, session) =
-            create_indexed_lane_resource(&mut self.next_lane_index, self.lane_count, || {
-                model.create_session()
-            })?;
+        let (index, session) = create_indexed_lane_resource(
+            &mut self.next_lane_index,
+            &mut self.free_lane_indices,
+            self.lane_count,
+            || model.create_session(),
+        )?;
         Ok(RuntimeLaneSession {
             index,
             session,
@@ -688,11 +789,35 @@ impl RuntimeState {
     }
 }
 
+/// Allocate the next lane slot.
+///
+/// Prefers indices in `free_lane_indices` (lanes previously discarded
+/// via [`RuntimeState::drop_session_timed`]) so they can be reused
+/// without growing `next_lane_index` past `lane_count`. If the free
+/// list is empty, falls through to bumping `next_lane_index`. If both
+/// are exhausted, returns "all execution lanes are busy".
+///
+/// If `create()` fails after popping from the free list, the index is
+/// pushed back so a retry can reuse it. The high-water counter is only
+/// bumped on success, matching the prior behavior.
 fn create_indexed_lane_resource<T>(
     next_lane_index: &mut usize,
+    free_lane_indices: &mut Vec<usize>,
     lane_count: u32,
     create: impl FnOnce() -> Result<T>,
 ) -> Result<(usize, T)> {
+    if let Some(index) = free_lane_indices.pop() {
+        let resource = match create() {
+            Ok(resource) => resource,
+            Err(err) => {
+                // Return the freed index so the next allocation can
+                // still reuse it.
+                free_lane_indices.push(index);
+                return Err(err);
+            }
+        };
+        return Ok((index, resource));
+    }
     if *next_lane_index >= lane_count as usize {
         bail!("all execution lanes are busy");
     }
@@ -710,9 +835,19 @@ impl Drop for RuntimeState {
 }
 
 pub fn load_runtime(config: &StageConfig) -> Result<Option<Arc<Mutex<RuntimeState>>>> {
-    let mut runtime_config = runtime_config_from_stage_config(config)?;
+    load_runtime_with_overrides(config, &RuntimeLaunchOverrides::default())
+}
+
+pub fn load_runtime_with_overrides(
+    config: &StageConfig,
+    overrides: &RuntimeLaunchOverrides,
+) -> Result<Option<Arc<Mutex<RuntimeState>>>> {
+    let mut runtime_config = runtime_config_from_stage_config(config, overrides)?;
 
     let model = match config.load_mode {
+        _ if std::env::var("MESH_LLM_BYPASS_SKIPPY_MODEL_LOAD").is_ok() => {
+            skippy_runtime::StageModel::new_dummy()
+        }
         LoadMode::LayerPackage => {
             let selected =
                 select_package_parts(config).context("select layer package parts for stage")?;
@@ -738,6 +873,7 @@ pub fn load_runtime(config: &StageConfig) -> Result<Option<Arc<Mutex<RuntimeStat
         layer_end: config.layer_end,
         lane_count: config.lane_count,
         next_lane_index: 0,
+        free_lane_indices: Vec::new(),
         sessions: BTreeMap::new(),
         idle_sessions: Vec::new(),
         session_token_counts: BTreeMap::new(),
@@ -750,11 +886,24 @@ fn should_attach_package_projector(config: &StageConfig) -> bool {
     config.stage_index == 0 && config.layer_start == 0
 }
 
-fn runtime_config_from_stage_config(config: &StageConfig) -> Result<RuntimeConfig> {
+fn runtime_config_from_stage_config(
+    config: &StageConfig,
+    overrides: &RuntimeLaunchOverrides,
+) -> Result<RuntimeConfig> {
     let cache_type_k = parse_cache_type(&config.cache_type_k)
         .with_context(|| format!("parse cache_type_k for {}", config.stage_id))?;
     let cache_type_v = parse_cache_type(&config.cache_type_v)
         .with_context(|| format!("parse cache_type_v for {}", config.stage_id))?;
+    let n_threads = overrides
+        .n_threads
+        .map(u32::try_from)
+        .transpose()
+        .with_context(|| format!("n_threads exceeds u32 for {}", config.stage_id))?;
+    let n_threads_batch = overrides
+        .n_threads_batch
+        .map(u32::try_from)
+        .transpose()
+        .with_context(|| format!("n_threads_batch exceeds u32 for {}", config.stage_id))?;
     Ok(RuntimeConfig {
         stage_index: config.stage_index,
         layer_start: config.layer_start,
@@ -763,8 +912,8 @@ fn runtime_config_from_stage_config(config: &StageConfig) -> Result<RuntimeConfi
         lane_count: config.lane_count,
         n_batch: config.n_batch,
         n_ubatch: config.n_ubatch,
-        n_threads: None,
-        n_threads_batch: None,
+        n_threads,
+        n_threads_batch,
         n_gpu_layers: config.n_gpu_layers,
         selected_backend_device: config
             .selected_device
@@ -802,30 +951,37 @@ fn open_stage_model_from_parts(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{bail, Result};
+    use anyhow::{Result, bail};
     use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig, StageDevice};
     use skippy_runtime::FlashAttentionType as RuntimeFlashAttentionType;
 
     use super::{
-        create_indexed_lane_resource, runtime_config_from_stage_config,
+        RuntimeLaunchOverrides, create_indexed_lane_resource, runtime_config_from_stage_config,
         should_attach_package_projector,
     };
 
     #[test]
     fn create_indexed_lane_resource_keeps_index_available_when_creation_fails() {
         let mut next_lane_index = 0;
+        let mut free_lane_indices: Vec<usize> = Vec::new();
 
-        let error = create_indexed_lane_resource(&mut next_lane_index, 2, || -> Result<()> {
-            bail!("transient session creation failure")
-        })
+        let error = create_indexed_lane_resource(
+            &mut next_lane_index,
+            &mut free_lane_indices,
+            2,
+            || -> Result<()> { bail!("transient session creation failure") },
+        )
         .expect_err("failed creation should propagate the original error");
 
         assert_eq!(error.to_string(), "transient session creation failure");
         assert_eq!(next_lane_index, 0);
+        assert!(free_lane_indices.is_empty());
 
         let (index, resource) =
-            create_indexed_lane_resource(&mut next_lane_index, 2, || Ok("lane"))
-                .expect("successful retry should reuse the unconsumed lane index");
+            create_indexed_lane_resource(&mut next_lane_index, &mut free_lane_indices, 2, || {
+                Ok("lane")
+            })
+            .expect("successful retry should reuse the unconsumed lane index");
 
         assert_eq!(index, 0);
         assert_eq!(resource, "lane");
@@ -833,7 +989,97 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_preserves_selected_backend_device() {
+    fn create_indexed_lane_resource_reuses_freed_indices_before_growing() {
+        // Simulate the wedge scenario: all lanes allocated, one lane
+        // freed via the discard path, next allocation must reuse the
+        // freed index rather than bailing with "all execution lanes
+        // are busy".
+        let mut next_lane_index = 0;
+        let mut free_lane_indices: Vec<usize> = Vec::new();
+        let lane_count = 2;
+
+        // Allocate both lanes.
+        let (a_idx, _) = create_indexed_lane_resource(
+            &mut next_lane_index,
+            &mut free_lane_indices,
+            lane_count,
+            || Ok("a"),
+        )
+        .expect("first allocation should succeed");
+        let (b_idx, _) = create_indexed_lane_resource(
+            &mut next_lane_index,
+            &mut free_lane_indices,
+            lane_count,
+            || Ok("b"),
+        )
+        .expect("second allocation should succeed");
+        assert_eq!(a_idx, 0);
+        assert_eq!(b_idx, 1);
+        assert_eq!(next_lane_index, 2);
+
+        // Pool is full at the high-water mark. A third allocation must
+        // fail.
+        let error = create_indexed_lane_resource(
+            &mut next_lane_index,
+            &mut free_lane_indices,
+            lane_count,
+            || Ok("c"),
+        )
+        .expect_err("allocating past lane_count should fail when no slots are free");
+        assert!(error.to_string().contains("all execution lanes are busy"));
+
+        // Discard one lane: the caller pushes its freed index onto the
+        // free list (this is what drop_session_timed does on the
+        // discard branch).
+        free_lane_indices.push(a_idx);
+
+        // The next allocation MUST reuse the freed index instead of
+        // bailing. This is the wedge regression: previously
+        // next_lane_index stayed at lane_count and every allocation
+        // failed forever.
+        let (reused_idx, _) = create_indexed_lane_resource(
+            &mut next_lane_index,
+            &mut free_lane_indices,
+            lane_count,
+            || Ok("c"),
+        )
+        .expect("allocation must reuse a freed index, not stay wedged");
+        assert_eq!(reused_idx, 0);
+        assert_eq!(next_lane_index, 2);
+        assert!(free_lane_indices.is_empty());
+    }
+
+    #[test]
+    fn create_indexed_lane_resource_returns_freed_index_on_create_failure() {
+        // If create() fails while consuming a freed index, the index
+        // must go back onto the free list so a retry can use it.
+        let mut next_lane_index = 1;
+        let mut free_lane_indices: Vec<usize> = vec![0];
+
+        let error = create_indexed_lane_resource(
+            &mut next_lane_index,
+            &mut free_lane_indices,
+            2,
+            || -> Result<()> { bail!("create failed mid-reuse") },
+        )
+        .expect_err("failed creation should propagate");
+        assert_eq!(error.to_string(), "create failed mid-reuse");
+        assert_eq!(next_lane_index, 1);
+        assert_eq!(free_lane_indices, vec![0]);
+
+        // A retry should now succeed using the same freed index.
+        let (idx, _) =
+            create_indexed_lane_resource(&mut next_lane_index, &mut free_lane_indices, 2, || {
+                Ok("retry")
+            })
+            .expect("retry should succeed");
+        assert_eq!(idx, 0);
+        assert_eq!(next_lane_index, 1);
+        assert!(free_lane_indices.is_empty());
+    }
+
+    #[test]
+    fn runtime_config_preserves_selected_backend_device_and_thread_overrides() {
         let config = StageConfig {
             run_id: "run-a".to_string(),
             topology_id: "topology-a".to_string(),
@@ -873,7 +1119,12 @@ mod tests {
             downstream: None,
         };
 
-        let runtime_config = runtime_config_from_stage_config(&config).unwrap();
+        let overrides = RuntimeLaunchOverrides {
+            n_threads: Some(8),
+            n_threads_batch: Some(4),
+        };
+
+        let runtime_config = runtime_config_from_stage_config(&config, &overrides).unwrap();
 
         assert_eq!(
             runtime_config.selected_backend_device.as_deref(),
@@ -882,6 +1133,8 @@ mod tests {
         assert_eq!(runtime_config.lane_count, 2);
         assert_eq!(runtime_config.n_batch, Some(1024));
         assert_eq!(runtime_config.n_ubatch, Some(256));
+        assert_eq!(runtime_config.n_threads, Some(8));
+        assert_eq!(runtime_config.n_threads_batch, Some(4));
         assert_eq!(
             runtime_config.flash_attn_type,
             RuntimeFlashAttentionType::Enabled
@@ -928,10 +1181,101 @@ mod tests {
             downstream: None,
         };
 
-        let runtime_config = runtime_config_from_stage_config(&config).unwrap();
+        let runtime_config =
+            runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
 
         assert!(!runtime_config.include_embeddings);
         assert!(runtime_config.include_output);
+    }
+
+    #[test]
+    fn runtime_config_preserves_default_runtime_threads_when_omitted() {
+        let config = StageConfig {
+            run_id: "run-a".to_string(),
+            topology_id: "topology-a".to_string(),
+            model_id: "model-a".to_string(),
+            package_ref: None,
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some("/tmp/model.gguf".to_string()),
+            projector_path: None,
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 24,
+            ctx_size: 512,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: -1,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Auto,
+            filter_tensors_on_load: false,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::RuntimeSlice,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: None,
+        };
+
+        let runtime_config =
+            runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
+
+        assert_eq!(runtime_config.n_threads, None);
+        assert_eq!(runtime_config.n_threads_batch, None);
+        assert_eq!(runtime_config.n_batch, None);
+        assert_eq!(runtime_config.n_ubatch, None);
+    }
+
+    #[test]
+    fn runtime_config_rejects_unsupported_cache_type_before_launch() {
+        let config = StageConfig {
+            run_id: "run-a".to_string(),
+            topology_id: "topology-a".to_string(),
+            model_id: "model-a".to_string(),
+            package_ref: None,
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some("/tmp/model.gguf".to_string()),
+            projector_path: None,
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 24,
+            ctx_size: 512,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: -1,
+            cache_type_k: "auto".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Auto,
+            filter_tensors_on_load: false,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::RuntimeSlice,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: None,
+        };
+
+        let error = runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default())
+            .expect_err("unsupported cache types should fail during runtime config construction");
+
+        assert!(
+            error.to_string().contains("parse cache_type_k for stage-0"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

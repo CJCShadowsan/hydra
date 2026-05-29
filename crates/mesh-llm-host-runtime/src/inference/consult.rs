@@ -8,12 +8,14 @@
 //! Three consultation patterns:
 //!
 //! - **Caption** — send an image to a vision-capable peer, get a text description
+//! - **Audio rescue** — send audio to an audio-capable peer, get concise text context
 //! - **Summarize** — send conversation history, get a condensed summary
 //! - **Second opinion** — send the same question to a different model, get its answer
 
 use crate::mesh;
 use anyhow::Result;
 use iroh::EndpointId;
+use mesh_llm_guardrails::{parse_tool_call_value, strip_thinking_blocks};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -24,6 +26,7 @@ use serde_json::Value;
 /// Returns None if no vision-capable peer exists in the mesh.
 pub async fn find_vision_peer(node: &mesh::Node, exclude_model: &str) -> Option<EndpointId> {
     let peers = node.peers().await;
+    // rtt_ms is the best-seen (minimum) RTT, stable for routing decisions.
     peers
         .iter()
         .filter(|p| {
@@ -39,6 +42,7 @@ pub async fn find_vision_peer(node: &mesh::Node, exclude_model: &str) -> Option<
 /// Returns None if no audio-capable peer exists in the mesh.
 pub async fn find_audio_peer(node: &mesh::Node, exclude_model: &str) -> Option<EndpointId> {
     let peers = node.peers().await;
+    // rtt_ms is the best-seen (minimum) RTT, stable for routing decisions.
     peers
         .iter()
         .filter(|p| {
@@ -72,6 +76,7 @@ pub async fn find_different_model_peers(
                 d.identity.model_name != current_model && !d.identity.model_name.is_empty()
             });
             different.map(|d| {
+                // rtt_ms is the best-seen (minimum) RTT, stable for routing decisions.
                 let rtt = p.rtt_ms.unwrap_or(500);
                 let has_reasoning = d.capabilities.reasoning != CapabilityLevel::None;
                 // Sort key: reasoning models first (0), then non-reasoning (1), then RTT
@@ -193,17 +198,24 @@ fn parse_chat_completion_response(response: &[u8]) -> Result<String> {
         )
     })?;
 
-    // Extract the assistant message content
-    let content = parsed["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let message = &parsed["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or("");
+    let content = strip_thinking_blocks(content);
 
     if content.is_empty() {
-        anyhow::bail!("peer returned empty response");
+        return tool_calls_as_consultation_text(message)
+            .ok_or_else(|| anyhow::anyhow!("peer returned empty response"));
     }
 
     Ok(content)
+}
+
+fn tool_calls_as_consultation_text(message: &Value) -> Option<String> {
+    let allowed_tools = Vec::new();
+    let calls = parse_tool_call_value(&message["tool_calls"], &allowed_tools).ok()?;
+    let first = calls.first()?;
+    let arguments = serde_json::to_string(&first.arguments).ok()?;
+    Some(format!("{}({arguments})", first.name))
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +234,9 @@ pub async fn caption_image(
     let prompt = if user_text.is_empty() {
         "Describe this image concisely in one paragraph.".to_string()
     } else {
-        format!("The user asked: \"{user_text}\"\n\nDescribe this image concisely, focusing on details relevant to the user's question.")
+        format!(
+            "The user asked: \"{user_text}\"\n\nDescribe this image concisely, focusing on details relevant to the user's question."
+        )
     };
 
     let messages = vec![serde_json::json!({
@@ -234,6 +248,46 @@ pub async fn caption_image(
     })];
 
     chat_completion(node, peer_id, model, messages, 256, TIMEOUT_CONSULTATION).await
+}
+
+/// Ask an audio-capable peer to extract useful text context from audio.
+/// `audio_url` should be a URL or a data URL accepted by the peer's OpenAI
+/// chat surface.
+pub async fn transcribe_audio(
+    node: &mesh::Node,
+    peer_id: EndpointId,
+    model: &str,
+    audio_url: &str,
+    user_text: &str,
+) -> Result<String> {
+    chat_completion(
+        node,
+        peer_id,
+        model,
+        audio_rescue_messages(audio_url, user_text),
+        512,
+        TIMEOUT_CONSULTATION,
+    )
+    .await
+}
+
+fn audio_rescue_messages(audio_url: &str, user_text: &str) -> Vec<Value> {
+    let prompt = if user_text.is_empty() {
+        "Extract concise text context from this audio. If it contains speech, transcribe the speech. If it contains non-speech audio, describe the audible events. Return only the useful context."
+            .to_string()
+    } else {
+        format!(
+            "The user asked: \"{user_text}\"\n\nExtract concise text context from this audio for a text-only model. If it contains speech, transcribe the relevant speech. If it contains non-speech audio, describe the audible events relevant to the user's request. Return only the useful context."
+        )
+    };
+
+    vec![serde_json::json!({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "input_audio", "input_audio": {"url": audio_url}}
+        ]
+    })]
 }
 
 /// Ask a peer for a second opinion on the user's question.
@@ -309,48 +363,71 @@ pub async fn race_second_opinion(
     }
 
     if peers.len() == 1 {
-        let (id, model) = &peers[0];
-        return match second_opinion(node, *id, model, messages, timeout).await {
-            Ok(text) => Some((text, *id, model.clone())),
-            Err(e) => {
-                tracing::warn!(
-                    "virtual: second opinion from {} failed: {e}",
-                    id.fmt_short()
-                );
-                None
-            }
-        };
+        return single_second_opinion(node, &peers[0], messages, timeout).await;
     }
 
+    let mut set = spawn_second_opinion_race(node, peers, messages, timeout);
+    await_first_second_opinion(&mut set).await
+}
+
+async fn single_second_opinion(
+    node: &mesh::Node,
+    peer: &(EndpointId, String),
+    messages: &[Value],
+    timeout: std::time::Duration,
+) -> Option<(String, EndpointId, String)> {
+    let (id, model) = peer;
+    match second_opinion(node, *id, model, messages, timeout).await {
+        Ok(text) => Some((text, *id, model.clone())),
+        Err(e) => {
+            tracing::warn!(
+                "virtual: second opinion from {} failed: {e}",
+                id.fmt_short()
+            );
+            None
+        }
+    }
+}
+
+fn spawn_second_opinion_race(
+    node: &mesh::Node,
+    peers: &[(EndpointId, String)],
+    messages: &[Value],
+    timeout: std::time::Duration,
+) -> tokio::task::JoinSet<anyhow::Result<(String, EndpointId, String)>> {
     // Race two peers — fire both via JoinSet, take first Ok, abort the rest.
     let mut set = tokio::task::JoinSet::new();
 
-    for (id, model) in peers.iter().skip(1).take(1) {
-        let node = node.clone();
-        let msgs = messages.to_vec();
-        let id = *id;
-        let model = model.clone();
-        let t = timeout;
-        set.spawn(async move {
-            second_opinion(&node, id, &model, &msgs, t)
-                .await
-                .map(|text| (text, id, model))
-        });
-    }
-    // Spawn the best peer last so it appears in the set too
-    {
-        let node = node.clone();
-        let msgs = messages.to_vec();
-        let id = peers[0].0;
-        let model = peers[0].1.clone();
-        let t = timeout;
-        set.spawn(async move {
-            second_opinion(&node, id, &model, &msgs, t)
-                .await
-                .map(|text| (text, id, model))
-        });
+    for peer in peers.iter().skip(1).take(1) {
+        spawn_second_opinion_call(&mut set, node, peer, messages, timeout);
     }
 
+    // Spawn the best peer last so it appears in the set too.
+    spawn_second_opinion_call(&mut set, node, &peers[0], messages, timeout);
+    set
+}
+
+fn spawn_second_opinion_call(
+    set: &mut tokio::task::JoinSet<anyhow::Result<(String, EndpointId, String)>>,
+    node: &mesh::Node,
+    peer: &(EndpointId, String),
+    messages: &[Value],
+    timeout: std::time::Duration,
+) {
+    let node = node.clone();
+    let msgs = messages.to_vec();
+    let id = peer.0;
+    let model = peer.1.clone();
+    set.spawn(async move {
+        second_opinion(&node, id, &model, &msgs, timeout)
+            .await
+            .map(|text| (text, id, model))
+    });
+}
+
+async fn await_first_second_opinion(
+    set: &mut tokio::task::JoinSet<anyhow::Result<(String, EndpointId, String)>>,
+) -> Option<(String, EndpointId, String)> {
     while let Some(result) = set.join_next().await {
         if let Ok(Ok((text, id, model))) = result {
             tracing::info!("virtual: peer {} ({model}) won the race", id.fmt_short());
@@ -383,11 +460,69 @@ mod tests {
     }
 
     #[test]
+    fn audio_rescue_messages_attach_audio_and_user_prompt() {
+        let messages = audio_rescue_messages("data:audio/wav;base64,abc", "please transcribe this");
+        let body = consultation_request_body("audio-model", messages, 512);
+
+        assert_eq!(body["mesh_hooks"], false);
+        assert_eq!(body["model"], "audio-model");
+        assert_eq!(
+            body["messages"][0]["content"][1]["input_audio"]["url"],
+            "data:audio/wav;base64,abc"
+        );
+        assert!(
+            body["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("please transcribe this")
+        );
+    }
+
+    #[test]
     fn parse_chat_completion_response_extracts_assistant_content() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"hello\"}}]}";
 
         let content = parse_chat_completion_response(response).unwrap();
 
         assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn parse_chat_completion_response_strips_thinking_blocks() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"<think>scratch</think>hello\"}}]}";
+
+        let content = parse_chat_completion_response(response).unwrap();
+
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn parse_chat_completion_response_falls_back_to_tool_calls() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+            "{\"choices\":[{\"message\":{\"content\":\"\",\"tool_calls\":[",
+            "{\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}",
+            "]}}]}"
+        )
+        .as_bytes();
+
+        let content = parse_chat_completion_response(response).unwrap();
+
+        assert_eq!(content, "read_file({\"path\":\"README.md\"})");
+    }
+
+    #[test]
+    fn parse_chat_completion_response_falls_back_to_tool_calls_after_thinking_stripping() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+            "{\"choices\":[{\"message\":{\"content\":\"<think>scratch</think>\",\"tool_calls\":[",
+            "{\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}",
+            "]}}]}"
+        )
+        .as_bytes();
+
+        let content = parse_chat_completion_response(response).unwrap();
+
+        assert_eq!(content, "read_file({\"path\":\"README.md\"})");
     }
 }

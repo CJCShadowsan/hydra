@@ -1,9 +1,14 @@
 # mesh-llm Design
 
-A Rust sidecar that turns llama.cpp RPC into a peer-to-peer mesh. Nodes find
-each other over QUIC (via [iroh](https://iroh.computer)), form a mesh of
-tunnels, and llama.cpp runs unmodified on top — rpc-server and llama-server
-just see local TCP sockets.
+> Current serving note: mesh serving embeds the Skippy/llama.cpp stage runtime
+> in `mesh-llm`. Operator runbooks are available in
+> [`../MESHES.md`](../MESHES.md) and
+> [`../SKIPPY_SPLITS.md`](../SKIPPY_SPLITS.md).
+
+mesh-llm connects nodes over QUIC (via [iroh](https://iroh.computer)), gossips
+capabilities and model state, routes OpenAI-compatible requests through the
+mesh, and can coordinate package-backed Skippy stage execution for models that
+need to be split across peers.
 
 ## Architecture
 
@@ -11,12 +16,12 @@ just see local TCP sockets.
 src/
 ├── main.rs                  CLI args, orchestration (auto, idle, passive)
 ├── lib.rs                   Crate root re-exports
-├── api/                     Management API (:3131): status, models, search, events, discover, join
+├── api/                     Management API (:3131): status, models, search, events, discover
 ├── cli/                     Clap types, command parsing, command handlers
 ├── crypto/                  Key management, envelope encryption, keychain
 ├── inference/
-│   ├── election.rs          Per-model host election, tensor split, llama-server lifecycle
-│   ├── launch.rs            rpc-server and llama-server process management
+│   ├── election.rs          Per-model host election and split planning
+│   ├── skippy/              Embedded staged runtime integration
 │   └── pipeline.rs          Inference pipeline coordination
 ├── mesh/mod.rs              Node struct, QUIC endpoint, gossip, peer management, mesh identity
 ├── models/
@@ -208,7 +213,6 @@ and the embedded web dashboard.
 | `/api/model-targets` | GET | Ranked model targets from explicit interest, active demand, and serving visibility |
 | `/api/events` | GET | SSE stream of status updates (2s interval + on change) |
 | `/api/discover` | GET | Browse Nostr-published meshes |
-| `/api/join` | POST | Join a mesh by invite token `{"token":"..."}` |
 | `/api/chat` | POST | Proxy to inference API (`/v1/chat/completions`) |
 | `/` | GET | Embedded web dashboard |
 
@@ -224,18 +228,31 @@ visibility; it does not launch, unload, or auto-assign models by itself. Entries
 should use canonical refs such as `org/repo@rev:variant`. Mesh management works
 without the HTML via curl/scripts.
 
+Runtime reconciliation is opt-in. When `[runtime] reconcile_model_targets = true`
+is set, the local runtime may load an already-present local GGUF for a locally
+registered explicit interest, but only when `/api/model-targets` says the target
+is wanted, unserved, and a single-node capacity fit for the current node. It
+does not download models, start split serving, or act on peer-only interest.
+
 `/api/model-targets` keeps raw inputs and computed hints separate. Each target
 reports `signals` from observed mesh state (`explicit_interest_count`,
 `request_count`, `last_active_secs_ago`, `serving_node_count`, and `requested`)
 alongside `derived` hints (`target_rank`, `wanted`, and optional
-`wanted_reason`). Ranking is advisory and deterministic: explicit interest is
-ordered first, active request demand second, requested-only unserved models
-third, then recent activity, display name, and canonical ref. A `requested`
-signal does not add a second rank boost when request demand is already present;
-it only breaks into the ranking as its own requested-only signal. `wanted` means
-the model is currently unserved and has at least one explicit-interest, active
-demand, or requested-model signal. It is not a desired replica count, a capacity
-decision, or an unload/load command.
+`wanted_reason`) plus `capacity_advice`. Capacity advice is also advisory: it
+uses existing catalog size and node VRAM signals to report whether a target is
+already served, has a single-node fit, is a split-capable aggregate candidate,
+has a known shortfall, or cannot be judged because model size or node capacity
+is unknown. Client-role exclusions and missing VRAM are reported separately so
+operators can distinguish "this node cannot host" from "this node did not
+advertise usable capacity." Ranking is advisory and deterministic: explicit
+interest is ordered first, active request demand second, requested-only unserved
+models third, then recent activity, display name, and canonical ref. A
+`requested` signal does not add a second rank boost when request demand is
+already present; it only breaks into the ranking as its own requested-only
+signal. `wanted` means the model is currently unserved and has at least one
+explicit-interest, active demand, or requested-model signal. It is not a
+desired replica count, an unload/load command, or proof that a split package is
+ready on every participant.
 
 Always enabled on port 3131 (configurable with `--console <port>`).
 
@@ -287,6 +304,13 @@ trait Collector {
 | `DefaultCollector` | Linux NVIDIA | `/proc/driver/nvidia`, `nvidia-smi` |
 | `DefaultCollector` | Linux AMD | `/sys/class/drm`, `rocm-smi` |
 | `TegraCollector` | Jetson / Tegra | sysfs + `tegrastats` |
+
+The shipped `mesh-llm` binary builds `mesh-llm-system` with `skippy-devices`.
+In that mode, runtime-selectable GPU inventory is authoritative from the
+embedded Skippy/llama backend device API. Platform collectors remain legacy
+fallbacks for non-Skippy builds and diagnostic surfaces, but they must not
+invent GPU count, backend identity, or usable runtime capacity when the embedded
+backend reports no selectable GPU.
 
 `survey()` calls all applicable collectors and returns a `HardwareSurvey` with `gpu_name`, `gpu_vram` (per-GPU bytes), `gpu_reserved` (per-GPU reserved or unavailable bytes when the platform reports a true reserved/unavailable metric), `vram_bytes` (total), `hostname`, `is_soc`, and per-device `GpuFacts` entries. Benchmark-derived memory-bandwidth and compute-throughput hints are attached later when cached or freshly measured results are available. ROCm `rocm-smi --showmeminfo` and Intel `xpu-smi` discovery expose live used-memory counters, so mesh-llm intentionally omits `gpu_reserved` for those backends instead of reinterpreting used bytes as reserved memory.
 

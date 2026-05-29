@@ -2,7 +2,6 @@
 
 llama_dir := env("MESH_LLM_LLAMA_DIR", ".deps/llama.cpp")
 llama_build_root := env("MESH_LLM_LLAMA_BUILD_ROOT", ".deps/llama-build")
-build_dir := env("LLAMA_STAGE_BUILD_DIR", llama_build_root / "build-stage-abi-cpu")
 mesh_dir := "crates/mesh-llm"
 ui_dir := "crates/mesh-llm-ui"
 ui_legacy_dir := "crates/mesh-llm/ui-legacy"
@@ -14,9 +13,90 @@ hf_home := env("HF_HOME", xdg_cache_dir / "huggingface")
 models_dir := env("HF_HUB_CACHE", hf_home / "hub")
 model := models_dir / "GLM-4.7-Flash-Q4_K_M.gguf"
 
+# Build for the current platform.
+default: build
+
+[private]
+[unix]
+with-lld *COMMAND:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lld=""
+    case "$(uname -s)" in
+        Linux)
+            if ! command -v ld.lld >/dev/null 2>&1; then
+                cat >&2 <<'EOF'
+    Error: LLVM ld.lld was not found.
+
+    lld is required for faster Rust builds (measured up to 26% faster locally).
+
+    Install lld, then rerun the just command. Common Linux packages:
+      Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y lld
+      Fedora:        sudo dnf install lld
+      Arch Linux:    sudo pacman -S lld
+      openSUSE:      sudo zypper install lld
+
+    The build requires ld.lld to be available on PATH.
+    EOF
+                exit 1
+            fi
+            lld="lld"
+            ;;
+        Darwin)
+            if command -v ld64.lld >/dev/null 2>&1; then
+                lld="$(command -v ld64.lld)"
+            elif command -v brew >/dev/null 2>&1; then
+                lld_prefix="$(brew --prefix lld 2>/dev/null || true)"
+                if [[ -n "$lld_prefix" && -x "$lld_prefix/bin/ld64.lld" ]]; then
+                    lld="$lld_prefix/bin/ld64.lld"
+                fi
+            fi
+            if [[ -z "$lld" ]]; then
+                for candidate in /opt/homebrew/opt/lld/bin/ld64.lld /usr/local/opt/lld/bin/ld64.lld; do
+                    if [[ -x "$candidate" ]]; then
+                        lld="$candidate"
+                        break
+                    fi
+                done
+            fi
+            if [[ -z "$lld" ]]; then
+                cat >&2 <<'EOF'
+    Error: LLVM ld64.lld was not found.
+
+    lld is required for faster Rust builds (measured up to 26% faster locally).
+
+    Install lld, then rerun the just command:
+      brew install lld
+
+    If Homebrew installed lld but it is not on PATH, Mesh-LLM also checks:
+      $(brew --prefix lld)/bin/ld64.lld
+      /opt/homebrew/opt/lld/bin/ld64.lld
+      /usr/local/opt/lld/bin/ld64.lld
+    EOF
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Unsupported OS for lld linker setup: $(uname -s)" >&2
+            exit 1
+            ;;
+    esac
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-fuse-ld=$lld"
+    exec {{ COMMAND }}
+
+[private]
+[windows]
+with-lld *COMMAND:
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = 'Stop'; $$linker = $$null; try { $$sysroot = (& rustc --print sysroot).Trim(); foreach ($$target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) { $$candidate = Join-Path $$sysroot \"lib\rustlib\$$target\bin\rust-lld.exe\"; if (Test-Path $$candidate) { $$linker = $$candidate; break } } } catch {}; if (-not $$linker) { foreach ($$name in @('rust-lld.exe', 'lld-link.exe')) { $$command = Get-Command $$name -ErrorAction SilentlyContinue; if ($$command) { $$linker = $$command.Source; break } } }; if (-not $$linker) { Write-Error \"LLVM lld was not found for the Windows MSVC target.`n`nlld is required for faster Rust builds (measured up to 26% faster locally).`n`nInstall one of these, then rerun the just command:`n  rustup component add llvm-tools-preview`n`nOr install LLVM lld-link:`n  winget install LLVM.LLVM`n  choco install llvm`n`nThe build requires lld. It looks for rust-lld.exe in the active Rust sysroot first, then falls back to rust-lld.exe or lld-link.exe on PATH.\"; exit 1 }; $$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $$linker; $$env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $$linker; Invoke-Expression '{{ COMMAND }}'"
+
 # Build for the current platform (macOS Metal ABI, Linux/Windows auto ABI backend)
 [macos]
 build: build-mac
+
+# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+[macos]
+build-dev:
+    @MESH_LLM_BUILD_PROFILE=dev scripts/build-mac.sh
 
 # Linux overrides:
 #   just build backend=cpu
@@ -27,6 +107,11 @@ build: build-mac
 build backend="" cuda_arch="" rocm_arch="":
     @scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
+# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+[linux]
+build-dev backend="" cuda_arch="" rocm_arch="":
+    @MESH_LLM_BUILD_PROFILE=dev scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+
 # Windows overrides:
 #   just build backend=cpu
 #   just build backend=cuda cuda_arch='120;86'
@@ -35,6 +120,11 @@ build backend="" cuda_arch="" rocm_arch="":
 [windows]
 build backend="" cuda_arch="" rocm_arch="":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend "{{backend}}" -CudaArch "{{cuda_arch}}" -RocmArch "{{rocm_arch}}"
+
+# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+[windows]
+build-dev backend="" cuda_arch="" rocm_arch="":
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:MESH_LLM_BUILD_PROFILE='dev'; & './scripts/build-windows.ps1' -Backend '{{backend}}' -CudaArch '{{cuda_arch}}' -RocmArch '{{rocm_arch}}'"
 
 # Build on macOS Apple Silicon (Metal ABI)
 build-mac:
@@ -72,58 +162,68 @@ llama-build: llama-prepare
     @scripts/build-llama.sh
 
 release-build-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu -BuildProfile release
 
 # Build a Linux CUDA release artifact (primary / R535-compatible lane).
 release-build-cuda cuda_arch="75;80;86;87;89;90":
-    @scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
+    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
 
 release-build-cuda-blackwell cuda_arch="75;80;86;87;89;90;100;120":
-    @scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
+    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend cuda --cuda-arch "{{ cuda_arch }}"
 
 release-build-cuda-windows cuda_arch="75;80;86;87;89;90":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}" -BuildProfile release
 
 release-build-cuda-blackwell-windows cuda_arch="75;80;86;87;89;90;100;120":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}" -BuildProfile release
 
 # Build a Linux ROCm ABI release artifact with an explicit architecture list.
 release-build-rocm rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @scripts/build-linux-rocm.sh "{{ rocm_arch }}"
+    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux-rocm.sh "{{ rocm_arch }}"
 
 release-build-rocm-windows rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{rocm_arch}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{rocm_arch}}" -BuildProfile release
 
 # Build a Linux Vulkan ABI release artifact.
 release-build-vulkan:
-    @scripts/build-linux.sh --backend vulkan
+    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend vulkan
 
 release-build-vulkan-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend vulkan
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend vulkan -BuildProfile release
 
 # Build the skippy benchmark/debug telemetry collector.
+[unix]
 metrics-server-build:
-    cargo build -p metrics-server
+    just with-lld cargo build -p metrics-server
+
+[windows]
+metrics-server-build:
+    @just with-lld cargo build -p metrics-server
+
+# Build the binaries copied into the Skippy WAN Docker lab image.
+[linux]
+skippy-wan-lab-build-bins:
+    cargo build --release --locked -p skippy-server -p skippy-prompt -p metrics-server -p skippy-model-package
 
 # Generate a reproducible benchmark corpus for skippy bench tooling.
-bench-corpus tier="smoke" *ARGS:
+bench-corpus tier="smoke" *ARGS="":
     scripts/generate-bench-corpus.py "{{ tier }}" {{ ARGS }}
 
 # Run skippy family certification checks.
 family-certify *ARGS:
-    scripts/family-certify.sh {{ ARGS }}
+    just with-lld scripts/family-certify.sh {{ ARGS }}
 
 # Run target/draft speculative compatibility checks.
 spec-bench target draft *ARGS:
-    LLAMA_STAGE_BUILD_DIR=".deps/llama.cpp/build-stage-abi-static" cargo build -p llama-spec-bench
-    LLAMA_STAGE_BUILD_DIR=".deps/llama.cpp/build-stage-abi-static" target/debug/llama-spec-bench --target-model-path "{{ target }}" --draft-model-path "{{ draft }}" {{ ARGS }}
+    just with-lld env LLAMA_STAGE_BUILD_DIR=".deps/llama-build/build-stage-abi-static" cargo build -p llama-spec-bench
+    LLAMA_STAGE_BUILD_DIR=".deps/llama-build/build-stage-abi-static" target/debug/llama-spec-bench --target-model-path "{{ target }}" --draft-model-path "{{ draft }}" {{ ARGS }}
 
 # Smoke a standalone skippy OpenAI frontend stage.
 skippy-openai-smoke *ARGS:
-    scripts/skippy-openai-smoke.sh {{ ARGS }}
+    just with-lld scripts/skippy-openai-smoke.sh {{ ARGS }}
 
 # Run the skippy benchmark/debug telemetry collector.
-metrics-server db="/tmp/mesh-metrics.duckdb" http_addr="127.0.0.1:18080" otlp_addr="127.0.0.1:14317" *ARGS: metrics-server-build
+metrics-server db="/tmp/mesh-metrics.duckdb" http_addr="127.0.0.1:18080" otlp_addr="127.0.0.1:14317" *ARGS="": metrics-server-build
     target/debug/metrics-server serve --db "{{ db }}" --http-addr "{{ http_addr }}" --otlp-grpc-addr "{{ otlp_addr }}" {{ ARGS }}
 
 # Download the default model (GLM-4.7-Flash Q4_K_M, 17GB)
@@ -173,14 +273,6 @@ bundle output="/tmp/mesh-bundle.tar.gz":
         [ -f "$bin" ] || continue
         install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
     done
-    # Include Apple Silicon benchmark binary if built
-    BENCH="target/release/membench-fingerprint"
-    if [ -f "$BENCH" ]; then
-        cp "$BENCH" "$BUNDLE/"
-        echo "Included: membench-fingerprint"
-    else
-        echo "Note: membench-fingerprint not found — run 'just benchmark-build-apple' to include it"
-    fi
     tar czf {{ output }} -C "$DIR" mesh-bundle/
     rm -rf "$DIR"
     echo "Bundle: {{ output }} ($(du -sh {{ output }} | cut -f1))"
@@ -198,11 +290,11 @@ release-bundle-arm64 version output="dist":
 # Run repo-level release-target consistency checks.
 [unix]
 check-release:
-    cargo run -p xtask -- repo-consistency release-targets
+    just with-lld cargo run -p xtask -- repo-consistency release-targets
 
 [windows]
 check-release:
-    cargo run -p xtask -- repo-consistency release-targets
+    @just with-lld cargo run -p xtask -- repo-consistency release-targets
 
 release-bundle-windows version output="dist":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}"
@@ -233,43 +325,6 @@ release-bundle-vulkan version output="dist":
 
 release-bundle-vulkan-windows version output="dist":
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor vulkan
-
-# ── Benchmark Binaries ────────────────────────────────────────────────────────
-
-# Build Apple Silicon memory bandwidth benchmark (macOS only)
-[macos]
-benchmark-build-apple:
-    swiftc -O {{ benchmark_src_dir }}/membench-fingerprint.swift -o target/release/membench-fingerprint
-    echo "Built: target/release/membench-fingerprint"
-
-# Build NVIDIA CUDA memory bandwidth benchmark (requires CUDA toolkit)
-benchmark-build-cuda:
-    nvcc -O3 -o target/release/membench-fingerprint-cuda {{ benchmark_src_dir }}/membench-fingerprint.cu
-    echo "Built: target/release/membench-fingerprint-cuda"
-
-[windows]
-benchmark-build-cuda-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "nvcc -O3 -o 'target/release/membench-fingerprint-cuda.exe' '{{ benchmark_src_dir }}/membench-fingerprint.cu'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: target/release/membench-fingerprint-cuda.exe'"
-
-# Build AMD ROCm/HIP memory bandwidth benchmark (requires ROCm)
-benchmark-build-hip:
-    hipcc -O3 -std=c++17 -o target/release/membench-fingerprint-hip {{ benchmark_src_dir }}/membench-fingerprint.hip
-    echo "Built: target/release/membench-fingerprint-hip"
-
-[windows]
-benchmark-build-hip-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "hipcc -O3 -std=c++17 -o 'target/release/membench-fingerprint-hip.exe' '{{ benchmark_src_dir }}/membench-fingerprint.hip'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: target/release/membench-fingerprint-hip.exe'"
-
-# Build Intel Arc SYCL memory bandwidth benchmark (requires Intel oneAPI) — UNVALIDATED
-benchmark-build-intel:
-    @echo "WARNING: Intel Arc benchmark is unvalidated — no Intel Arc hardware has been tested"
-    icpx -O3 -fsycl -o target/release/membench-fingerprint-intel {{ benchmark_src_dir }}/membench-fingerprint-intel.cpp
-    echo "Built: target/release/membench-fingerprint-intel"
-
-[windows]
-benchmark-build-intel-windows:
-    @echo "WARNING: Intel Arc benchmark is unvalidated — no Intel Arc hardware has been tested"
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "icpx -O3 -fsycl -o 'target/release/membench-fingerprint-intel.exe' '{{ benchmark_src_dir }}/membench-fingerprint-intel.cpp'; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Host 'Built: target/release/membench-fingerprint-intel.exe'"
 
 # Run the UI dev server with Vite HMR, proxying /api to mesh-llm (default: http://127.0.0.1:3131)
 ui-dev api="http://127.0.0.1:3131" port="5173":
@@ -305,47 +360,77 @@ ui-test:
 
 # ── Full Validation Gate ───────────────────────────────────────
 
-# Run all checks: Rust tests, fmt, clippy, ESLint, Prettier, E2E smoke.
+# Run all checks: repo consistency, Rust tests, fmt, clippy, ESLint, Prettier, E2E smoke.
 test-all:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # Ensure native llama.cpp libraries exist (required by skippy-ffi → cargo test linking)
-    if [ ! -f "{{ build_dir }}/common/libllama-common.a" ]; then
-        echo "ERROR: Native llama.cpp libraries not found at {{ build_dir }}/"
-        echo "Run 'just llama-build' first to prepare them, then retry."
-        exit 1
+    native_backend="${LLAMA_STAGE_BACKEND:-${SKIPPY_LLAMA_BACKEND:-${LLAMA_BACKEND:-}}}"
+    if [[ -z "$native_backend" ]]; then
+        case "$(uname -s)" in
+            Darwin) native_backend="metal" ;;
+            *) native_backend="cpu" ;;
+        esac
+    fi
+    export LLAMA_STAGE_BACKEND="$native_backend"
+
+    if [[ -z "${LLAMA_STAGE_BUILD_DIR:-}" ]]; then
+        LLAMA_STAGE_BUILD_DIR="$(scripts/build-llama.sh --print-build-dir)"
+        export LLAMA_STAGE_BUILD_DIR
     fi
 
-    export LLAMA_STAGE_BUILD_DIR="{{ build_dir }}"
+    echo "=== Native llama.cpp ABI ($LLAMA_STAGE_BACKEND) ==="
+    echo "Build dir: $LLAMA_STAGE_BUILD_DIR"
+    scripts/prepare-llama.sh
+    scripts/build-llama.sh
+    echo ""
 
     # Each UI step runs in a subshell so cd doesn't leak between steps.
-    echo "=== 1/7 Rust format check ==="
-    cargo fmt --all -- --check
+    echo "=== 1/8 Repo consistency ==="
+    just with-lld cargo run -p xtask -- repo-consistency ci-crate-lists
     echo ""
-    echo "=== 2/7 Clippy ==="
-    cargo clippy -p mesh-llm -- -D warnings
+    echo "=== 2/8 Rust format check ==="
+    just with-lld cargo fmt --all -- --check
     echo ""
-    echo "=== 3/7 Rust tests ==="
-    cargo test -p mesh-llm
+    echo "=== GPU bench Rust feature check ==="
+    MESH_LLM_GPU_BENCH_RUST_ONLY=1 just with-lld cargo check -p mesh-llm-gpu-bench --features cuda,hip,intel
     echo ""
-    echo "=== 4/7 ESLint + Prettier ==="
+    echo "=== 3/8 Clippy ==="
+    mapfile -t clippy_crates < <(bash scripts/plan-clippy-batches.sh --all --bins 1 | jq -r '.[].crates[]')
+    for crate in "${clippy_crates[@]}"; do
+        echo "--- $crate ---"
+        just with-lld cargo clippy -p "$crate" --all-targets -- -D warnings
+    done
+    echo ""
+    echo "=== 4/8 Rust tests ==="
+    echo "--- mesh-llm-host-runtime lib ---"
+    just with-lld cargo test -p mesh-llm-host-runtime --lib
+    echo "--- mesh-llm ---"
+    just with-lld cargo test -p mesh-llm
+    echo "--- mesh-llm-protocol ---"
+    just with-lld cargo test -p mesh-llm-protocol
+    echo "--- mesh-llm-client ---"
+    just with-lld cargo test -p mesh-llm-client
+    echo "--- skippy-runtime lib ---"
+    just with-lld cargo test -p skippy-runtime --lib
+    echo ""
+    echo "=== 5/8 ESLint + Prettier ==="
     (cd "{{ ui_dir }}" && pnpm run lint)
     echo ""
-    echo "=== 5/7 UI type check (tsc) ==="
+    echo "=== 6/8 UI type check (tsc) ==="
     (cd "{{ ui_dir }}" && pnpm run typecheck)
     echo ""
-    echo "=== 6/7 UI unit tests (vitest) ==="
+    echo "=== 7/8 UI unit tests (vitest) ==="
     (cd "{{ ui_dir }}" && pnpm test)
     echo ""
-    echo "=== 7/7 E2E smoke tests (Playwright) ==="
+    echo "=== 8/8 E2E smoke tests (Playwright) ==="
     if curl -sf http://127.0.0.1:3131/health >/dev/null 2>&1; then
         (cd "{{ ui_dir }}" && pnpm run test:e2e)
     else
         echo "No server on port 3131 — starting UI dev server with public mesh..."
 
         # Start dev server in background, capture PID tree for cleanup
-        MESH_UI_API_ORIGIN="https://meshllm.cloud" VITE_API_URL="https://meshllm.cloud" bash -c 'cd "{{ ui_dir }}" && pnpm run dev -- --host 0.0.0.0 --port 5173' &
+        MESH_UI_API_ORIGIN="https://meshllm.cloud" VITE_API_URL="https://meshllm.cloud" bash -c 'cd "{{ ui_dir }}" && pnpm exec vite --host 0.0.0.0 --port 5173' &
         DEV_PID=$!
 
         # Wait for dev server to be ready (up to 30s)
@@ -400,6 +485,24 @@ llama-update-pin:
 # Render a Markdown summary for a llama.cpp upstream pin change.
 llama-summary old new:
     scripts/summarize-llama-upstream.sh "{{ old }}" "{{ new }}"
+
+# Clean Rust, llama.cpp, and UI build artifacts.
+[unix]
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf \
+        target \
+        .deps/llama.cpp/build-stage-abi-* \
+        .deps/llama-build/build-stage-abi-* \
+        "{{ ui_dir }}/node_modules" \
+        "{{ ui_dir }}/dist"
+    echo "Cleaned Rust target, llama.cpp build dirs, and UI artifacts"
+
+[windows]
+clean:
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force target,'.deps/llama.cpp/build-stage-abi-*','.deps/llama-build/build-stage-abi-*','{{ ui_dir }}/node_modules','{{ ui_dir }}/dist' -ErrorAction SilentlyContinue"
+    echo "Cleaned Rust target, llama.cpp build dirs, and UI artifacts"
 
 # Clean UI build artifacts (node_modules, dist). Fixes stale pnpm state.
 [unix]

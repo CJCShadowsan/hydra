@@ -16,6 +16,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { TooltipContent, TooltipRoot, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { env } from '@/lib/env'
 import type { TopSection } from '@/features/app-shell/lib/routes'
 
 const DOCS_URL = 'https://docs.anarchai.org'
@@ -119,7 +120,7 @@ export function AppHeader({
 
   return (
     <header className="shrink-0 border-b bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
-      <div className="mx-auto flex h-14 w-full max-w-7xl items-center gap-2 px-3 md:h-16 md:gap-4 md:px-4">
+      <div className="mx-auto flex h-14 w-full max-w-screen-2xl items-center gap-2 px-3 md:h-16 md:gap-4 md:px-4">
         <div className="flex min-w-0 items-center gap-0">
           <div className="flex h-10 w-7 shrink-0 items-center justify-start">
             <BrandIcon className="h-6 w-6 text-primary" />
@@ -154,7 +155,7 @@ export function AppHeader({
           </NavigationMenuList>
         </NavigationMenu>
         <div className="ml-auto flex items-center gap-2">
-          {import.meta.env.DEV && (
+          {env.isDevelopment && (
             <Button
               variant="secondary"
               size="sm"
@@ -280,7 +281,7 @@ export function AppHeader({
                 </a>
               </div>
               <div className="text-xs text-muted-foreground pt-1">
-                Agents can gossip too — <code className="text-[0.9em]">mesh-llm blackboard install-skill</code>{' '}
+                Blackboard now ships as an external plugin.{' '}
                 <a
                   href={`${DOCS_URL}/#blackboard`}
                   target="_blank"
@@ -457,7 +458,7 @@ export function AppHeader({
         </div>
       </div>
       {statusError ? (
-        <div className="mx-auto w-full max-w-7xl px-4 pb-3">
+        <div className="mx-auto w-full max-w-screen-2xl px-4 pb-3">
           <Alert variant="destructive">
             <Loader2 className="h-4 w-4 animate-spin" />
             <AlertTitle>Connection Interrupted</AlertTitle>

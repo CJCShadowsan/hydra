@@ -10,6 +10,7 @@ pub(crate) use convert::*;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use prost::Message;
+pub const ALPN_CONTROL_V1: &[u8] = b"mesh-llm-control/1";
 pub const ALPN_V1: &[u8] = b"mesh-llm/1";
 #[cfg(test)]
 pub const ALPN: &[u8] = ALPN_V1;
@@ -25,10 +26,20 @@ pub(crate) const STREAM_PEER_DOWN: u8 = 0x06;
 pub(crate) const STREAM_PEER_LEAVING: u8 = 0x07;
 pub(crate) const STREAM_PLUGIN_CHANNEL: u8 = 0x08;
 pub(crate) const STREAM_PLUGIN_BULK_TRANSFER: u8 = 0x09;
+pub(crate) const STREAM_PLUGIN_MESH_STREAM: u8 = 0x0a;
+/// Reserved legacy mesh-plane config subscription stream ID.
+///
+/// Config and inventory control now live exclusively on `mesh-llm-control/1`;
+/// keep 0x0b reserved so old wire values are not accidentally reused.
 pub(crate) const STREAM_CONFIG_SUBSCRIBE: u8 = 0x0b;
+/// Reserved legacy mesh-plane config push stream ID.
+///
+/// Config and inventory control now live exclusively on `mesh-llm-control/1`;
+/// keep 0x0c reserved so old wire values are not accidentally reused.
 pub(crate) const STREAM_CONFIG_PUSH: u8 = 0x0c;
 pub(crate) const STREAM_SUBPROTOCOL: u8 = 0x0d;
 const _: () = {
+    let _ = ALPN_CONTROL_V1;
     let _ = STREAM_CONFIG_SUBSCRIBE;
     let _ = STREAM_CONFIG_PUSH;
     let _ = STREAM_SUBPROTOCOL;
@@ -55,6 +66,7 @@ pub(crate) enum ControlFrameError {
         got: usize,
     },
     MissingHttpPort,
+    MissingControlOwnerId,
     InvalidConfigHashLength {
         got: usize,
     },
@@ -67,6 +79,14 @@ pub(crate) enum ControlFrameError {
         got: usize,
     },
     MissingConfig,
+    MissingControlEnvelope,
+    MissingControlCommand,
+    MissingControlResult,
+    MissingControlOwnership,
+    MissingRequestId,
+    InvalidOwnerControlErrorCode {
+        got: i32,
+    },
     #[cfg(test)]
     DecodeError(String),
     #[cfg(test)]
@@ -100,6 +120,9 @@ impl std::fmt::Display for ControlFrameError {
             ControlFrameError::MissingHttpPort => {
                 write!(f, "HOST-role peer annotation missing http_port")
             }
+            ControlFrameError::MissingControlOwnerId => {
+                write!(f, "owner control handshake missing owner_id")
+            }
             ControlFrameError::InvalidConfigHashLength { got } => {
                 write!(f, "invalid config_hash length: expected 32, got {}", got)
             }
@@ -115,6 +138,30 @@ impl std::fmt::Display for ControlFrameError {
             }
             ControlFrameError::MissingConfig => {
                 write!(f, "config field is required but missing")
+            }
+            ControlFrameError::MissingControlEnvelope => {
+                write!(f, "owner control envelope requires exactly one payload")
+            }
+            ControlFrameError::MissingControlCommand => {
+                write!(
+                    f,
+                    "owner control request requires exactly one command variant"
+                )
+            }
+            ControlFrameError::MissingControlResult => {
+                write!(
+                    f,
+                    "owner control response requires exactly one result variant"
+                )
+            }
+            ControlFrameError::MissingControlOwnership => {
+                write!(f, "owner control handshake missing ownership attestation")
+            }
+            ControlFrameError::MissingRequestId => {
+                write!(f, "owner control request_id must be non-zero")
+            }
+            ControlFrameError::InvalidOwnerControlErrorCode { got } => {
+                write!(f, "invalid owner control error code: {got}")
             }
             #[cfg(test)]
             ControlFrameError::DecodeError(msg) => write!(f, "protobuf decode error: {}", msg),
@@ -141,8 +188,8 @@ pub(crate) trait ValidateControlFrame: prost::Message + Default + Sized {
 
 impl ValidateControlFrame for crate::proto::node::GossipFrame {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
         if self.sender_id.len() != 32 {
             return Err(ControlFrameError::InvalidSenderId {
@@ -175,8 +222,8 @@ impl ValidateControlFrame for crate::proto::node::TunnelMap {
 }
 impl ValidateControlFrame for crate::proto::node::RouteTableRequest {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
         if !self.requester_id.is_empty() && self.requester_id.len() != 32 {
             return Err(ControlFrameError::InvalidEndpointId {
@@ -188,8 +235,8 @@ impl ValidateControlFrame for crate::proto::node::RouteTableRequest {
 }
 impl ValidateControlFrame for crate::proto::node::RouteTable {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
         for entry in &self.entries {
             if entry.endpoint_id.len() != 32 {
@@ -203,8 +250,8 @@ impl ValidateControlFrame for crate::proto::node::RouteTable {
 }
 impl ValidateControlFrame for crate::proto::node::PeerDown {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
         if self.peer_id.len() != 32 {
             return Err(ControlFrameError::InvalidEndpointId {
@@ -216,8 +263,8 @@ impl ValidateControlFrame for crate::proto::node::PeerDown {
 }
 impl ValidateControlFrame for crate::proto::node::PeerLeaving {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
         if self.peer_id.len() != 32 {
             return Err(ControlFrameError::InvalidEndpointId {
@@ -228,38 +275,225 @@ impl ValidateControlFrame for crate::proto::node::PeerLeaving {
     }
 }
 
-impl ValidateControlFrame for crate::proto::node::ConfigSubscribe {
+impl ValidateControlFrame for crate::proto::node::OwnerControlEnvelope {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
-        validate_endpoint_id_length(self.subscriber_id.len())?;
+        let payloads = [
+            self.handshake.is_some(),
+            self.request.is_some(),
+            self.response.is_some(),
+            self.error.is_some(),
+        ];
+        if payloads.into_iter().filter(|present| *present).count() != 1 {
+            return Err(ControlFrameError::MissingControlEnvelope);
+        }
+        if let Some(handshake) = &self.handshake {
+            handshake.validate_frame()?;
+        }
+        if let Some(request) = &self.request {
+            request.validate_frame()?;
+        }
+        if let Some(response) = &self.response {
+            response.validate_frame()?;
+        }
+        if let Some(error) = &self.error {
+            error.validate_frame()?;
+        }
         Ok(())
     }
 }
 
-impl ValidateControlFrame for crate::proto::node::ConfigSnapshotResponse {
+impl ValidateControlFrame for crate::proto::node::OwnerControlHandshake {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        let ownership = self
+            .ownership
+            .as_ref()
+            .ok_or(ControlFrameError::MissingControlOwnership)?;
+        if ownership.owner_id.trim().is_empty() {
+            return Err(ControlFrameError::MissingControlOwnerId);
         }
-        let is_error = matches!(self.error.as_deref(), Some(s) if !s.is_empty());
-        if !is_error {
-            validate_endpoint_id_length(self.node_id.len())?;
+        validate_public_key_length(ownership.owner_sign_public_key.len())?;
+        validate_endpoint_id_length(ownership.node_endpoint_id.len())?;
+        if ownership.signature.is_empty() {
+            return Err(ControlFrameError::MissingSignature);
+        }
+        if ownership.signature.len() != 64 {
+            return Err(ControlFrameError::InvalidSignatureLength {
+                got: ownership.signature.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlRequest {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.request_id == 0 {
+            return Err(ControlFrameError::MissingRequestId);
+        }
+        let commands = [
+            self.get_config.is_some(),
+            self.watch_config.is_some(),
+            self.apply_config.is_some(),
+            self.refresh_inventory.is_some(),
+        ];
+        if commands.into_iter().filter(|present| *present).count() != 1 {
+            return Err(ControlFrameError::MissingControlCommand);
+        }
+        if let Some(request) = &self.get_config {
+            request.validate_frame()?;
+        }
+        if let Some(request) = &self.watch_config {
+            request.validate_frame()?;
+        }
+        if let Some(request) = &self.apply_config {
+            request.validate_frame()?;
+        }
+        if let Some(request) = &self.refresh_inventory {
+            request.validate_frame()?;
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.request_id == 0 {
+            return Err(ControlFrameError::MissingRequestId);
+        }
+        let results = [
+            self.get_config.is_some(),
+            self.watch_config.is_some(),
+            self.apply_config.is_some(),
+            self.refresh_inventory.is_some(),
+        ];
+        if results.into_iter().filter(|present| *present).count() != 1 {
+            return Err(ControlFrameError::MissingControlResult);
+        }
+        if let Some(response) = &self.get_config {
+            response.validate_frame()?;
+        }
+        if let Some(response) = &self.watch_config {
+            response.validate_frame()?;
+        }
+        if let Some(response) = &self.apply_config {
+            response.validate_frame()?;
+        }
+        if let Some(response) = &self.refresh_inventory {
+            response.validate_frame()?;
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlError {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if matches!(
+            crate::proto::node::OwnerControlErrorCode::try_from(self.code),
+            Err(_) | Ok(crate::proto::node::OwnerControlErrorCode::Unspecified)
+        ) {
+            return Err(ControlFrameError::InvalidOwnerControlErrorCode { got: self.code });
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlGetConfigRequest {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        validate_endpoint_id_length(self.requester_node_id.len())?;
+        validate_endpoint_id_length(self.target_node_id.len())?;
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlGetConfigResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        self.snapshot
+            .as_ref()
+            .ok_or(ControlFrameError::MissingConfig)?
+            .validate_frame()
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlWatchConfigRequest {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        validate_endpoint_id_length(self.requester_node_id.len())?;
+        validate_endpoint_id_length(self.target_node_id.len())?;
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlWatchConfigResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        let results = [
+            self.accepted.is_some(),
+            self.snapshot.is_some(),
+            self.update.is_some(),
+        ];
+        if results.into_iter().filter(|present| *present).count() != 1 {
+            return Err(ControlFrameError::MissingControlResult);
+        }
+        if let Some(accepted) = &self.accepted {
+            accepted.validate_frame()?;
+        }
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.validate_frame()?;
+        }
+        if let Some(update) = &self.update {
+            update.validate_frame()?;
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlWatchAccepted {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        validate_endpoint_id_length(self.target_node_id.len())?;
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlApplyConfigRequest {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        validate_endpoint_id_length(self.requester_node_id.len())?;
+        validate_endpoint_id_length(self.target_node_id.len())?;
+        if self.config.is_none() {
+            return Err(ControlFrameError::MissingConfig);
+        }
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlApplyConfigResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        if self.success || !self.config_hash.is_empty() {
             validate_config_hash_length(self.config_hash.len())?;
-            if self.config.is_none() {
-                return Err(ControlFrameError::MissingConfig);
-            }
         }
         Ok(())
     }
 }
 
-impl ValidateControlFrame for crate::proto::node::ConfigUpdateNotification {
+impl ValidateControlFrame for crate::proto::node::OwnerControlRefreshInventoryRequest {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
+        validate_endpoint_id_length(self.requester_node_id.len())?;
+        validate_endpoint_id_length(self.target_node_id.len())?;
+        Ok(())
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlRefreshInventoryResponse {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
+        self.snapshot
+            .as_ref()
+            .ok_or(ControlFrameError::MissingConfig)?
+            .validate_frame()
+    }
+}
+
+impl ValidateControlFrame for crate::proto::node::OwnerControlConfigSnapshot {
+    fn validate_frame(&self) -> Result<(), ControlFrameError> {
         validate_endpoint_id_length(self.node_id.len())?;
         validate_config_hash_length(self.config_hash.len())?;
         if self.config.is_none() {
@@ -269,22 +503,10 @@ impl ValidateControlFrame for crate::proto::node::ConfigUpdateNotification {
     }
 }
 
-impl ValidateControlFrame for crate::proto::node::ConfigPush {
+impl ValidateControlFrame for crate::proto::node::OwnerControlConfigUpdate {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        validate_endpoint_id_length(self.requester_id.len())?;
-        validate_endpoint_id_length(self.target_node_id.len())?;
-        validate_public_key_length(self.owner_signing_public_key.len())?;
-        if self.signature.is_empty() {
-            return Err(ControlFrameError::MissingSignature);
-        }
-        if self.signature.len() != 64 {
-            return Err(ControlFrameError::InvalidSignatureLength {
-                got: self.signature.len(),
-            });
-        }
+        validate_endpoint_id_length(self.node_id.len())?;
+        validate_config_hash_length(self.config_hash.len())?;
         if self.config.is_none() {
             return Err(ControlFrameError::MissingConfig);
         }
@@ -292,22 +514,10 @@ impl ValidateControlFrame for crate::proto::node::ConfigPush {
     }
 }
 
-impl ValidateControlFrame for crate::proto::node::ConfigPushResponse {
-    fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
-        }
-        if self.success || !self.config_hash.is_empty() {
-            validate_config_hash_length(self.config_hash.len())?;
-        }
-        Ok(())
-    }
-}
-
 impl ValidateControlFrame for crate::proto::node::MeshSubprotocolOpen {
     fn validate_frame(&self) -> Result<(), ControlFrameError> {
-        if self.gen != NODE_PROTOCOL_GENERATION {
-            return Err(ControlFrameError::BadGeneration { got: self.gen });
+        if self.r#gen != NODE_PROTOCOL_GENERATION {
+            return Err(ControlFrameError::BadGeneration { got: self.r#gen });
         }
         if self.name.trim().is_empty() || self.major == 0 {
             return Err(ControlFrameError::InvalidSubprotocol);
@@ -478,19 +688,21 @@ pub(crate) fn decode_control_frame<T: ValidateControlFrame>(
 mod tests {
     use super::*;
     use crate::crypto::OwnershipSummary;
-    use crate::mesh::{resolve_peer_down, resolve_peer_leaving, PeerInfo};
+    use crate::mesh::{PeerInfo, resolve_peer_down, resolve_peer_leaving};
     use crate::proto::node::{
-        ConfigPush, ConfigPushResponse, ConfigSnapshotResponse, ConfigSubscribe,
-        ConfigUpdateNotification, ConfiguredModelRef, GossipFrame, MeshSubprotocolOpen,
-        NodeConfigSnapshot, NodeGpuConfig, NodeModelEntry, NodePluginEntry, NodeRole,
-        PeerAnnouncement, RouteTableRequest,
+        ConfiguredModelRef, GossipFrame, MeshSubprotocolOpen, NodeConfigSnapshot, NodeGpuConfig,
+        NodeModelEntry, NodePluginEntry, NodeRole, OwnerControlError, OwnerControlErrorCode,
+        OwnerControlHandshake, PeerAnnouncement, RouteTableRequest, SignedNodeOwnership,
     };
     use iroh::{EndpointAddr, EndpointId, SecretKey};
     use std::collections::{HashMap, HashSet};
 
+    const FULL_SURFACE_VALID_FIXTURE: &str =
+        include_str!("../../tests/fixtures/skippy_full_surface_valid.toml");
+
     fn make_valid_gossip_frame() -> GossipFrame {
         GossipFrame {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             sender_id: vec![0u8; 32],
             peers: vec![PeerAnnouncement {
                 endpoint_id: vec![0u8; 32],
@@ -523,19 +735,131 @@ mod tests {
                 }),
             }],
             plugins: vec![NodePluginEntry {
-                name: "blackboard".to_string(),
+                name: "demo".to_string(),
                 enabled: Some(true),
                 command: Some("mesh-llm".to_string()),
-                args: vec!["--plugin".to_string(), "blackboard".to_string()],
+                args: vec!["--plugin".to_string(), "demo".to_string()],
             }],
+            config_toml: None,
         }
     }
 
-    fn make_valid_config_subscribe() -> ConfigSubscribe {
-        ConfigSubscribe {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            subscriber_id: vec![0xAA; 32],
+    fn make_nested_mesh_config() -> crate::plugin::MeshConfig {
+        toml::from_str(
+            r#"version = 1
+
+[gpu]
+assignment = "auto"
+parallel = 2
+
+[defaults.model_fit]
+kv_unified = "auto"
+
+[defaults.hardware]
+gpu_layers = "auto"
+tensor_split = []
+
+[defaults.throughput]
+parallel = 3
+
+[defaults.skippy]
+activation_wire_dtype = "auto"
+
+[defaults.speculative]
+mode = "auto"
+
+[defaults.request_defaults]
+reasoning_budget = "auto"
+
+[defaults.multimodal]
+mmproj = "defaults-projector.gguf"
+
+[defaults.advanced.server]
+alias = "defaults-alias"
+
+[[models]]
+model = "Qwen3-8B.gguf"
+
+[models.model_fit]
+ctx_size = 16384
+
+[models.hardware]
+gpu_layers = 99
+
+[models.throughput]
+parallel = 4
+
+[models.skippy]
+binary_stage_transport = "auto"
+
+[models.speculative]
+draft_selection_policy = "auto"
+
+[models.request_defaults]
+top_p = 0.95
+
+[models.multimodal]
+mmproj = "model-projector.gguf"
+
+[models.advanced.server]
+alias = "model-alias"
+"#,
+        )
+        .expect("nested mesh config should parse")
+    }
+
+    fn make_valid_owner_control_handshake() -> OwnerControlHandshake {
+        OwnerControlHandshake {
+            ownership: Some(SignedNodeOwnership {
+                version: 1,
+                cert_id: "cert-1".to_string(),
+                owner_id: "owner-1".to_string(),
+                owner_sign_public_key: vec![0x11; 32],
+                node_endpoint_id: vec![0x22; 32],
+                issued_at_unix_ms: 1,
+                expires_at_unix_ms: 2,
+                node_label: Some("node-01".to_string()),
+                hostname_hint: Some("node-01".to_string()),
+                signature: vec![0x33; 64],
+            }),
+        }
+    }
+
+    #[test]
+    fn owner_control_handshake_empty_owner_id_uses_handshake_error() {
+        let mut handshake = make_valid_owner_control_handshake();
+        handshake
+            .ownership
+            .as_mut()
+            .expect("test handshake must include ownership")
+            .owner_id = "   ".to_string();
+
+        let err = handshake
+            .validate_frame()
+            .expect_err("handshake with blank owner_id must be rejected");
+        assert!(matches!(err, ControlFrameError::MissingControlOwnerId));
+        assert_eq!(err.to_string(), "owner control handshake missing owner_id");
+    }
+
+    #[test]
+    fn owner_control_error_rejects_invalid_error_code() {
+        for code in [OwnerControlErrorCode::Unspecified as i32, 9999] {
+            let err = OwnerControlError {
+                code,
+                message: "invalid".to_string(),
+                request_id: Some(1),
+                current_revision: None,
+            }
+            .validate_frame()
+            .expect_err("invalid owner-control error code must be rejected");
+            assert!(matches!(
+                err,
+                ControlFrameError::InvalidOwnerControlErrorCode { got } if got == code
+            ));
+            assert_eq!(
+                err.to_string(),
+                format!("invalid owner control error code: {code}")
+            );
         }
     }
 
@@ -576,8 +900,13 @@ mod tests {
             served_model_runtime: vec![],
             owner_attestation: None,
             artifact_transfer_supported: false,
+            stage_protocol_generation_supported: false,
             stage_status_list_supported: false,
             owner_summary: OwnershipSummary::default(),
+            advertised_model_throughput: vec![],
+
+            display_rtt: None,
+            propagated_latency: None,
         }
     }
 
@@ -595,7 +924,7 @@ mod tests {
         let encoded = encode_control_frame(STREAM_GOSSIP, &frame);
         let decoded: GossipFrame = decode_control_frame(STREAM_GOSSIP, &encoded)
             .expect("valid gossip frame must decode successfully");
-        assert_eq!(decoded.gen, NODE_PROTOCOL_GENERATION);
+        assert_eq!(decoded.r#gen, NODE_PROTOCOL_GENERATION);
         assert_eq!(decoded.peers.len(), 1);
         assert_eq!(decoded.peers[0].endpoint_id, vec![0u8; 32]);
         assert_eq!(decoded.peers[0].role, NodeRole::Worker as i32);
@@ -604,7 +933,7 @@ mod tests {
     #[test]
     fn mesh_subprotocol_open_roundtrips_and_validates() {
         let open = MeshSubprotocolOpen {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             name: skippy_protocol::STAGE_SUBPROTOCOL_NAME.to_string(),
             major: skippy_protocol::STAGE_SUBPROTOCOL_MAJOR,
         };
@@ -615,7 +944,7 @@ mod tests {
         assert_eq!(decoded.major, skippy_protocol::STAGE_SUBPROTOCOL_MAJOR);
 
         let bad = MeshSubprotocolOpen {
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
             name: String::new(),
             major: skippy_protocol::STAGE_SUBPROTOCOL_MAJOR,
         };
@@ -626,286 +955,12 @@ mod tests {
     }
 
     #[test]
-    fn config_frames_roundtrip_and_validation() {
-        let snapshot = make_config_snapshot();
-        let config_hash = vec![0xA5; 32];
-        let node_id = vec![0x42; 32];
-
-        let subscribe = make_valid_config_subscribe();
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
-        let _decoded: ConfigSubscribe = decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect("valid config subscribe must decode");
-
-        let snapshot_response = ConfigSnapshotResponse {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: node_id.clone(),
-            revision: 7,
-            config_hash: config_hash.clone(),
-            config: Some(snapshot.clone()),
-            hostname: Some("node-01".to_string()),
-            error: None,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
-        let decoded: ConfigSnapshotResponse =
-            decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
-                .expect("valid snapshot response must decode");
-        assert_eq!(decoded.revision, 7);
-        assert_eq!(decoded.config_hash, config_hash);
-        assert_eq!(decoded.hostname.as_deref(), Some("node-01"));
-
-        let update = ConfigUpdateNotification {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: node_id.clone(),
-            revision: 8,
-            config_hash: config_hash.clone(),
-            config: Some(snapshot.clone()),
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &update);
-        let decoded: ConfigUpdateNotification =
-            decode_control_frame(STREAM_CONFIG_SUBSCRIBE, &encoded)
-                .expect("valid update notification must decode");
-        assert_eq!(decoded.revision, 8);
-
-        let push = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x10; 32],
-            target_node_id: node_id.clone(),
-            expected_revision: 8,
-            config: Some(snapshot.clone()),
-            owner_signing_public_key: vec![0x02; 32],
-            signature: vec![0x03; 64],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
-        let decoded: ConfigPush = decode_control_frame(STREAM_CONFIG_PUSH, &encoded)
-            .expect("valid config push must decode");
-        assert_eq!(decoded.expected_revision, 8);
-
-        let push_response = ConfigPushResponse {
-            gen: NODE_PROTOCOL_GENERATION,
-            success: true,
-            current_revision: 9,
-            config_hash: config_hash.clone(),
-            error: None,
-            apply_mode: 1,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_response);
-        let decoded: ConfigPushResponse = decode_control_frame(STREAM_CONFIG_PUSH, &encoded)
-            .expect("valid push response must decode");
-        assert!(decoded.success);
-        assert_eq!(decoded.current_revision, 9);
-    }
-
-    #[test]
-    fn config_frames_validation_rejects_bad_data() {
-        let mut subscribe = make_valid_config_subscribe();
-        subscribe.gen = 0;
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
-        let err = decode_control_frame::<ConfigSubscribe>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect_err("bad generation must be rejected");
-        assert!(matches!(err, ControlFrameError::BadGeneration { got: 0 }));
-
-        let mut subscribe = make_valid_config_subscribe();
-        subscribe.subscriber_id = vec![0x01; 16];
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &subscribe);
-        let err = decode_control_frame::<ConfigSubscribe>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect_err("invalid subscriber id length must be rejected");
-        assert!(matches!(err, ControlFrameError::InvalidEndpointId { .. }));
-
-        let snapshot_response = ConfigSnapshotResponse {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: vec![0x01; 16],
-            revision: 1,
-            config_hash: vec![0x02; 32],
-            config: Some(make_config_snapshot()),
-            hostname: None,
-            error: None,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
-        let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect_err("invalid node id must be rejected");
-        assert!(matches!(err, ControlFrameError::InvalidEndpointId { .. }));
-
-        let snapshot_response = ConfigSnapshotResponse {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: vec![0xAA; 32],
-            revision: 1,
-            config_hash: vec![0x02; 16],
-            config: Some(make_config_snapshot()),
-            hostname: None,
-            error: None,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &snapshot_response);
-        let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect_err("invalid config hash length must be rejected");
-        assert!(matches!(
-            err,
-            ControlFrameError::InvalidConfigHashLength { .. }
-        ));
-
-        let update = ConfigUpdateNotification {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: vec![0xBB; 32],
-            revision: 2,
-            config_hash: vec![0xCC; 16],
-            config: Some(make_config_snapshot()),
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &update);
-        let err =
-            decode_control_frame::<ConfigUpdateNotification>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-                .expect_err("invalid config hash for update must be rejected");
-        assert!(matches!(
-            err,
-            ControlFrameError::InvalidConfigHashLength { .. }
-        ));
-
-        let mut push = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 2,
-            config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 16],
-            signature: vec![0x04],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("short public key must be rejected");
-        assert!(matches!(
-            err,
-            ControlFrameError::InvalidPublicKeyLength { .. }
-        ));
-
-        push.owner_signing_public_key = vec![0x06; 32];
-        push.signature = vec![];
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("empty signature must be rejected");
-        assert!(matches!(err, ControlFrameError::MissingSignature));
-
-        let push_response = ConfigPushResponse {
-            gen: 0,
-            success: false,
-            current_revision: 2,
-            config_hash: vec![0x07; 32],
-            error: Some("fail".to_string()),
-            apply_mode: 0,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_response);
-        let err = decode_control_frame::<ConfigPushResponse>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("bad gen must be rejected");
-        assert!(matches!(err, ControlFrameError::BadGeneration { got: 0 }));
-    }
-
-    #[test]
-    fn config_snapshot_response_error_shape_passes_validation() {
-        // Error responses from handle_config_subscribe have empty node_id / config_hash
-        // and no config payload. Validation must pass so callers can surface the error.
-        let error_snapshot = ConfigSnapshotResponse {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: vec![],
-            revision: 0,
-            config_hash: vec![],
-            config: None,
-            hostname: None,
-            error: Some("node has no local owner".to_string()),
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &error_snapshot);
-        decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect("error-shaped snapshot must pass validation");
-    }
-
-    #[test]
-    fn config_push_response_error_shape_passes_validation() {
-        // Error responses from send_push_error have an empty config_hash.
-        let error_response = crate::proto::node::ConfigPushResponse {
-            gen: NODE_PROTOCOL_GENERATION,
-            success: false,
-            current_revision: 0,
-            config_hash: vec![],
-            error: Some("not the owner of this node".to_string()),
-            apply_mode: 0,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &error_response);
-        decode_control_frame::<crate::proto::node::ConfigPushResponse>(
-            STREAM_CONFIG_PUSH,
-            &encoded,
-        )
-        .expect("error-shaped push response must pass validation");
-    }
-
-    #[test]
-    fn config_push_valid_64_byte_signature_passes_validation() {
-        let push_with_64_bytes = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 32],
-            signature: vec![0x04; 64],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_with_64_bytes);
-        decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect("push with 64-byte signature must pass validation");
-    }
-
-    #[test]
-    fn config_push_wrong_length_signature_rejected() {
-        // 32-byte signature must be rejected
-        let push_32 = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 32],
-            signature: vec![0x04; 32],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_32);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("32-byte signature must be rejected");
-        assert!(
-            matches!(err, ControlFrameError::InvalidSignatureLength { got: 32 }),
-            "expected InvalidSignatureLength {{got: 32}}, got {err:?}"
-        );
-
-        // 1-byte signature must also be rejected
-        let push_1 = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 32],
-            signature: vec![0x04; 1],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push_1);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("1-byte signature must be rejected");
-        assert!(
-            matches!(err, ControlFrameError::InvalidSignatureLength { got: 1 }),
-            "expected InvalidSignatureLength {{got: 1}}, got {err:?}"
-        );
-    }
-
-    #[test]
     fn proto_v1_route_table_rejects_bad_generation_or_legacy_payload() {
         use crate::proto::node::RouteTable;
 
         let zero_gen_req = RouteTableRequest {
             requester_id: vec![0u8; 32],
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &zero_gen_req);
         let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded)
@@ -918,7 +973,7 @@ mod tests {
 
         let wrong_gen_req = RouteTableRequest {
             requester_id: vec![0u8; 32],
-            gen: 99,
+            r#gen: 99,
         };
         let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &wrong_gen_req);
         let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded)
@@ -932,7 +987,7 @@ mod tests {
         let bad_gen_response = RouteTable {
             entries: vec![],
             mesh_id: None,
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &bad_gen_response);
         let err = decode_control_frame::<RouteTable>(STREAM_ROUTE_REQUEST, &encoded)
@@ -946,7 +1001,7 @@ mod tests {
         let wrong_gen_response = RouteTable {
             entries: vec![],
             mesh_id: None,
-            gen: 42,
+            r#gen: 42,
         };
         let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &wrong_gen_response);
         let err = decode_control_frame::<RouteTable>(STREAM_ROUTE_REQUEST, &encoded)
@@ -983,7 +1038,7 @@ mod tests {
 
         let leaving_msg = PeerLeaving {
             peer_id: leaving_id.as_bytes().to_vec(),
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
         };
         let encoded = encode_control_frame(STREAM_PEER_LEAVING, &leaving_msg);
         let decoded_leaving: PeerLeaving = decode_control_frame(STREAM_PEER_LEAVING, &encoded)
@@ -1014,7 +1069,7 @@ mod tests {
 
         let down_msg = PeerDown {
             peer_id: dead_id.as_bytes().to_vec(),
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
         };
         let encoded = encode_control_frame(STREAM_PEER_DOWN, &down_msg);
         let decoded_down: PeerDown =
@@ -1041,7 +1096,7 @@ mod tests {
             "dead peer must be removed from connections when confirmed unreachable"
         );
 
-        assert_eq!(decoded_down.gen, NODE_PROTOCOL_GENERATION);
+        assert_eq!(decoded_down.r#gen, NODE_PROTOCOL_GENERATION);
     }
 
     #[test]
@@ -1054,7 +1109,7 @@ mod tests {
 
         let bad_gen_down = PeerDown {
             peer_id: valid_peer_bytes.clone(),
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_PEER_DOWN, &bad_gen_down);
         let err = decode_control_frame::<PeerDown>(STREAM_PEER_DOWN, &encoded)
@@ -1067,7 +1122,7 @@ mod tests {
 
         let bad_gen_leaving = PeerLeaving {
             peer_id: valid_peer_bytes.clone(),
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_PEER_LEAVING, &bad_gen_leaving);
         let err = decode_control_frame::<PeerLeaving>(STREAM_PEER_LEAVING, &encoded)
@@ -1086,7 +1141,7 @@ mod tests {
 
         let forged = PeerLeaving {
             peer_id: victim_id.as_bytes().to_vec(),
-            gen: NODE_PROTOCOL_GENERATION,
+            r#gen: NODE_PROTOCOL_GENERATION,
         };
         let encoded = encode_control_frame(STREAM_PEER_LEAVING, &forged);
         let decoded: PeerLeaving = decode_control_frame(STREAM_PEER_LEAVING, &encoded)
@@ -1176,7 +1231,7 @@ mod tests {
 
         // All migrated streams must also reject gen=0 and gen=99 where gen is checked
         let bad_gen_gossip = GossipFrame {
-            gen: 0,
+            r#gen: 0,
             sender_id: vec![],
             peers: vec![PeerAnnouncement {
                 endpoint_id: vec![0u8; 32],
@@ -1191,7 +1246,7 @@ mod tests {
 
         let bad_gen_req = RouteTableRequest {
             requester_id: vec![0u8; 32],
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_ROUTE_REQUEST, &bad_gen_req);
         let err = decode_control_frame::<RouteTableRequest>(STREAM_ROUTE_REQUEST, &encoded)
@@ -1200,7 +1255,7 @@ mod tests {
 
         let bad_gen_down = PeerDown {
             peer_id: vec![0u8; 32],
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_PEER_DOWN, &bad_gen_down);
         let err = decode_control_frame::<PeerDown>(STREAM_PEER_DOWN, &encoded)
@@ -1209,7 +1264,7 @@ mod tests {
 
         let bad_gen_leaving = PeerLeaving {
             peer_id: vec![0u8; 32],
-            gen: 0,
+            r#gen: 0,
         };
         let encoded = encode_control_frame(STREAM_PEER_LEAVING, &bad_gen_leaving);
         let err = decode_control_frame::<PeerLeaving>(STREAM_PEER_LEAVING, &encoded)
@@ -1218,7 +1273,7 @@ mod tests {
 
         // Wrong gen (e.g. 2) also rejected
         let wrong_gen_gossip = GossipFrame {
-            gen: 2,
+            r#gen: 2,
             sender_id: vec![0u8; 32],
             peers: vec![PeerAnnouncement {
                 endpoint_id: vec![0u8; 32],
@@ -1281,7 +1336,13 @@ mod tests {
                 signature: "33".repeat(64),
             }),
             artifact_transfer_supported: true,
+            stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
         };
         let proto_pa = local_ann_to_proto_ann(&ann);
         let skippy = proto_pa
@@ -1297,10 +1358,14 @@ mod tests {
                 .any(|feature| feature
                     == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_ARTIFACT_TRANSFER)
         );
-        assert!(skippy
-            .features
-            .iter()
-            .any(|feature| feature == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST));
+        assert!(
+            skippy
+                .features
+                .iter()
+                .any(|feature| feature == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST)
+        );
+        assert!(skippy.features.iter().any(|feature| feature
+            == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2));
         assert_eq!(
             proto_pa
                 .owner_attestation
@@ -1313,12 +1378,139 @@ mod tests {
             proto_ann_to_local(&proto_pa).expect("proto_ann_to_local must succeed");
         assert!(roundtripped.artifact_transfer_supported);
         assert!(roundtripped.stage_status_list_supported);
+        assert!(roundtripped.stage_protocol_generation_supported);
         let roundtripped = roundtripped
             .owner_attestation
             .expect("owner attestation must round-trip");
         assert_eq!(roundtripped.claim.owner_id, "owner-abc");
         assert_eq!(roundtripped.claim.cert_id, "cert-123");
         assert_eq!(roundtripped.claim.node_label.as_deref(), Some("studio"));
+    }
+
+    #[test]
+    fn advertised_model_throughput_roundtrips_through_proto_announcement() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xAC; 32]).public());
+        let expected_hints = vec![crate::network::metrics::ModelThroughputHint {
+            model_name: "qwen".to_string(),
+            avg_tokens_per_second_milli: 42_000,
+            throughput_samples: 7,
+        }];
+        let ann = super::PeerAnnouncement {
+            addr: iroh::EndpointAddr {
+                id: peer_id,
+                addrs: Default::default(),
+            },
+            role: super::NodeRole::Host { http_port: 9337 },
+            first_joined_mesh_ts: None,
+            models: vec![],
+            vram_bytes: 0,
+            model_source: None,
+            serving_models: vec!["qwen".to_string()],
+            hosted_models: Some(vec!["qwen".to_string()]),
+            available_models: vec![],
+            requested_models: vec![],
+            explicit_model_interests: vec![],
+            version: None,
+            model_demand: HashMap::new(),
+            mesh_id: None,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: None,
+            gpu_compute_tflops_fp32: None,
+            gpu_compute_tflops_fp16: None,
+            available_model_metadata: vec![],
+            experts_summary: None,
+            available_model_sizes: HashMap::new(),
+            served_model_descriptors: vec![],
+            served_model_runtime: vec![],
+            owner_attestation: None,
+            artifact_transfer_supported: false,
+            stage_protocol_generation_supported: false,
+            stage_status_list_supported: false,
+            advertised_model_throughput: vec![
+                expected_hints[0].clone(),
+                crate::network::metrics::ModelThroughputHint {
+                    model_name: "ghost".to_string(),
+                    avg_tokens_per_second_milli: 250_000,
+                    throughput_samples: 99,
+                },
+            ],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
+        };
+
+        let mut proto_pa = local_ann_to_proto_ann(&ann);
+        assert_eq!(proto_pa.advertised_model_throughput.len(), 1);
+        assert_eq!(proto_pa.advertised_model_throughput[0].model_name, "qwen");
+        assert_eq!(
+            proto_pa.advertised_model_throughput[0].avg_tokens_per_second_milli,
+            42_000
+        );
+        assert_eq!(
+            proto_pa.advertised_model_throughput[0].throughput_samples,
+            7
+        );
+        proto_pa
+            .advertised_model_throughput
+            .push(crate::proto::node::AdvertisedModelThroughput {
+                model_name: "ghost".to_string(),
+                avg_tokens_per_second_milli: 250_000,
+                throughput_samples: 99,
+            });
+
+        let (_, roundtripped) =
+            proto_ann_to_local(&proto_pa).expect("proto_ann_to_local must succeed");
+        assert_eq!(roundtripped.advertised_model_throughput, expected_hints);
+    }
+
+    #[test]
+    fn proto_announcement_without_current_stage_generation_is_not_stage_compatible() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xCD; 32]).public());
+        let proto_pa = crate::proto::node::PeerAnnouncement {
+            endpoint_id: peer_id.as_bytes().to_vec(),
+            role: crate::proto::node::NodeRole::Worker as i32,
+            subprotocols: vec![crate::proto::node::MeshSubprotocol {
+                name: skippy_protocol::STAGE_SUBPROTOCOL_NAME.to_string(),
+                major: skippy_protocol::STAGE_SUBPROTOCOL_MAJOR,
+                features: vec![
+                    skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL.to_string(),
+                    skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST.to_string(),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let (_, ann) = proto_ann_to_local(&proto_pa).expect("proto announcement should decode");
+
+        assert!(!ann.stage_protocol_generation_supported);
+        assert!(ann.stage_status_list_supported);
+    }
+
+    #[test]
+    fn proto_announcement_without_stage_control_is_not_stage_compatible() {
+        let peer_id = EndpointId::from(SecretKey::from_bytes(&[0xCE; 32]).public());
+        let proto_pa = crate::proto::node::PeerAnnouncement {
+            endpoint_id: peer_id.as_bytes().to_vec(),
+            role: crate::proto::node::NodeRole::Worker as i32,
+            subprotocols: vec![crate::proto::node::MeshSubprotocol {
+                name: skippy_protocol::STAGE_SUBPROTOCOL_NAME.to_string(),
+                major: skippy_protocol::STAGE_SUBPROTOCOL_MAJOR,
+                features: vec![
+                    skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V2
+                        .to_string(),
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let (_, ann) = proto_ann_to_local(&proto_pa).expect("proto announcement should decode");
+
+        assert!(!ann.stage_protocol_generation_supported);
     }
 
     #[test]
@@ -1357,7 +1549,13 @@ mod tests {
             served_model_runtime: vec![],
             owner_attestation: None,
             artifact_transfer_supported: true,
+            stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&ann);
@@ -1507,6 +1705,13 @@ mod tests {
     fn mesh_config_proto_roundtrip() {
         let snapshot = make_config_snapshot();
         let config = proto_config_to_mesh(&snapshot);
+        assert_mesh_config_from_proto(&config);
+
+        let roundtripped = mesh_config_to_proto(&config);
+        assert_proto_config_roundtrip_matches(&roundtripped, &snapshot);
+    }
+
+    fn assert_mesh_config_from_proto(config: &crate::plugin::MeshConfig) {
         assert_eq!(config.version, Some(1));
         assert_eq!(config.gpu.assignment, crate::plugin::GpuAssignment::Auto);
         assert_eq!(config.models.len(), 1);
@@ -1515,9 +1720,13 @@ mod tests {
         assert_eq!(config.models[0].ctx_size, Some(8192));
         assert_eq!(config.models[0].gpu_id.as_deref(), Some("pci:0000:65:00.0"));
         assert_eq!(config.plugins.len(), 1);
-        assert_eq!(config.plugins[0].name, "blackboard");
+        assert_eq!(config.plugins[0].name, "demo");
+    }
 
-        let roundtripped = mesh_config_to_proto(&config);
+    fn assert_proto_config_roundtrip_matches(
+        roundtripped: &NodeConfigSnapshot,
+        snapshot: &NodeConfigSnapshot,
+    ) {
         assert_eq!(roundtripped.version, snapshot.version);
         assert_eq!(
             roundtripped.gpu.as_ref().map(|g| g.assignment),
@@ -1538,6 +1747,94 @@ mod tests {
         );
         assert_eq!(roundtripped.plugins.len(), snapshot.plugins.len());
         assert_eq!(roundtripped.plugins[0].name, snapshot.plugins[0].name);
+        assert!(
+            roundtripped
+                .config_toml
+                .as_deref()
+                .is_some_and(|toml| toml.contains("model = \"Qwen3-8B\"")),
+            "re-encoded snapshots should include canonical config_toml payload"
+        );
+    }
+
+    #[test]
+    fn mesh_config_proto_roundtrip_preserves_nested_sections() {
+        let config = make_nested_mesh_config();
+
+        let snapshot = mesh_config_to_proto(&config);
+        let restored = proto_config_to_mesh(&snapshot);
+
+        let json = serde_json::to_value(&restored).expect("restored config should serialize");
+        assert_eq!(json["defaults"]["model_fit"]["kv_unified"], "auto");
+        assert_eq!(json["defaults"]["hardware"]["gpu_layers"], "auto");
+        assert_eq!(json["defaults"]["throughput"]["parallel"], 3);
+        assert_eq!(json["defaults"]["skippy"]["activation_wire_dtype"], "auto");
+        assert_eq!(json["defaults"]["speculative"]["mode"], "auto");
+        assert_eq!(
+            json["defaults"]["request_defaults"]["reasoning_budget"],
+            "auto"
+        );
+        assert_eq!(
+            json["defaults"]["multimodal"]["mmproj"],
+            "defaults-projector.gguf"
+        );
+        assert_eq!(
+            json["defaults"]["advanced"]["server"]["alias"],
+            "defaults-alias"
+        );
+
+        assert_eq!(json["models"][0]["model_fit"]["ctx_size"], 16384);
+        assert_eq!(json["models"][0]["hardware"]["gpu_layers"], 99);
+        assert_eq!(json["models"][0]["throughput"]["parallel"], 4);
+        assert_eq!(
+            json["models"][0]["skippy"]["binary_stage_transport"],
+            "auto"
+        );
+        assert_eq!(
+            json["models"][0]["speculative"]["draft_selection_policy"],
+            "auto"
+        );
+        assert_eq!(json["models"][0]["request_defaults"]["top_p"], 0.95);
+        assert_eq!(
+            json["models"][0]["multimodal"]["mmproj"],
+            "model-projector.gguf"
+        );
+        assert_eq!(
+            json["models"][0]["advanced"]["server"]["alias"],
+            "model-alias"
+        );
+    }
+
+    #[test]
+    fn mesh_config_proto_invalid_full_payload_falls_back_to_legacy_fields() {
+        let mut snapshot = make_config_snapshot();
+        snapshot.config_toml = Some("not valid toml = [".to_string());
+
+        let restored = proto_config_to_mesh(&snapshot);
+
+        assert_eq!(restored.models[0].model, "Qwen3-8B");
+        assert_eq!(restored.models[0].ctx_size, Some(8192));
+        assert!(restored.defaults.is_none());
+    }
+
+    #[test]
+    fn mesh_config_proto_strict_invalid_full_payload_is_rejected() {
+        let mut snapshot = make_config_snapshot();
+        snapshot.config_toml = Some("not valid toml = [".to_string());
+
+        let err = proto_config_to_mesh_strict(&snapshot).unwrap_err();
+
+        assert!(err.to_string().contains("invalid full config_toml payload"));
+    }
+
+    #[test]
+    fn mesh_config_proto_strict_legacy_payload_still_restores_fields() {
+        let mut snapshot = make_config_snapshot();
+        snapshot.config_toml = None;
+
+        let restored = proto_config_to_mesh_strict(&snapshot).unwrap();
+
+        assert_eq!(restored.models[0].model, "Qwen3-8B");
+        assert_eq!(restored.models[0].ctx_size, Some(8192));
     }
 
     #[test]
@@ -1564,6 +1861,7 @@ mod tests {
                 }),
             }],
             plugins: vec![],
+            config_toml: None,
         };
 
         let restored = proto_config_to_mesh(&snapshot);
@@ -1599,6 +1897,7 @@ mod tests {
                 }),
             }],
             plugins: vec![],
+            config_toml: None,
         };
 
         let restored = proto_config_to_mesh(&snapshot);
@@ -1640,33 +1939,44 @@ mod tests {
     }
     #[test]
     fn config_sync_full_config_roundtrip() {
-        use crate::plugin::{GpuAssignment, GpuConfig, ModelConfigEntry, PluginConfigEntry};
+        use crate::plugin::{
+            GpuAssignment, GpuConfig, HardwareConfig, ModelConfigEntry, PluginConfigEntry,
+        };
         let config = crate::plugin::MeshConfig {
             version: Some(1),
             gpu: GpuConfig {
                 assignment: GpuAssignment::Auto,
                 parallel: None,
             },
+            owner_control: Default::default(),
             telemetry: Default::default(),
+            defaults: None,
+            runtime: Default::default(),
             models: vec![ModelConfigEntry {
                 model: "Qwen3-8B.gguf".to_string(),
                 mmproj: Some("mm.gguf".to_string()),
                 ctx_size: Some(8192),
-                gpu_id: Some("pci:0000:65:00.0".to_string()),
+                gpu_id: None,
                 parallel: None,
                 cache_type_k: None,
                 cache_type_v: None,
                 batch: None,
                 ubatch: None,
                 flash_attention: None,
+                hardware: Some(HardwareConfig {
+                    device: Some("pci:0000:65:00.0".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
             }],
             plugins: vec![PluginConfigEntry {
-                name: "blackboard".to_string(),
+                name: "demo".to_string(),
                 enabled: Some(true),
                 command: Some("mesh-llm".to_string()),
                 args: vec!["--plugin".to_string()],
                 url: None,
             }],
+            extra: Default::default(),
         };
         let snapshot = mesh_config_to_proto(&config);
         let restored = proto_config_to_mesh(&snapshot);
@@ -1679,8 +1989,15 @@ mod tests {
             restored.models[0].gpu_id.as_deref(),
             Some("pci:0000:65:00.0")
         );
+        assert_eq!(
+            restored.models[0]
+                .hardware
+                .as_ref()
+                .and_then(|hardware| hardware.device.as_deref()),
+            Some("pci:0000:65:00.0")
+        );
         assert_eq!(restored.plugins.len(), 1);
-        assert_eq!(restored.plugins[0].name, "blackboard");
+        assert_eq!(restored.plugins[0].name, "demo");
         assert_eq!(restored.plugins[0].enabled, Some(true));
         assert_eq!(restored.plugins[0].command.as_deref(), Some("mesh-llm"));
         assert_eq!(restored.plugins[0].args, vec!["--plugin"]);
@@ -1696,6 +2013,77 @@ mod tests {
     }
 
     #[test]
+    fn config_sync_config_toml_roundtrips_additive_defaults_sections() {
+        use crate::plugin::{
+            ModelConfigDefaults, ModelFitConfig, RequestDefaultsConfig, ThroughputConfig,
+        };
+        let config = crate::plugin::MeshConfig {
+            version: Some(1),
+            defaults: Some(ModelConfigDefaults {
+                throughput: Some(ThroughputConfig {
+                    parallel: Some(6),
+                    ..Default::default()
+                }),
+                model_fit: Some(ModelFitConfig {
+                    flash_attention: Some(skippy_protocol::FlashAttentionType::Disabled),
+                    ..Default::default()
+                }),
+                request_defaults: Some(RequestDefaultsConfig {
+                    reasoning_format: Some("deepseek".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let snapshot = mesh_config_to_proto(&config);
+        let config_toml = snapshot
+            .config_toml
+            .as_deref()
+            .expect("config TOML should serialize");
+        assert!(
+            config_toml.contains("parallel") && config_toml.contains("reasoning_format"),
+            "config TOML should carry additive defaults values: {config_toml}"
+        );
+
+        let restored = proto_config_to_mesh(&snapshot);
+        assert_eq!(
+            restored
+                .extra
+                .get("defaults")
+                .and_then(|defaults| defaults.get("throughput"))
+                .and_then(|throughput| throughput.get("parallel"))
+                .and_then(toml::Value::as_integer)
+                .or_else(|| {
+                    restored
+                        .defaults
+                        .as_ref()
+                        .and_then(|defaults| defaults.throughput.as_ref())
+                        .and_then(|throughput| throughput.parallel)
+                        .map(|parallel| parallel as i64)
+                }),
+            Some(6)
+        );
+        assert_eq!(
+            restored
+                .extra
+                .get("defaults")
+                .and_then(|defaults| defaults.get("request_defaults"))
+                .and_then(|request_defaults| request_defaults.get("reasoning_format"))
+                .and_then(toml::Value::as_str)
+                .or_else(|| {
+                    restored
+                        .defaults
+                        .as_ref()
+                        .and_then(|defaults| defaults.request_defaults.as_ref())
+                        .and_then(|request_defaults| request_defaults.reasoning_format.as_deref())
+                }),
+            Some("deepseek")
+        );
+    }
+
+    #[test]
     fn config_sync_config_hash_determinism() {
         use crate::plugin::{GpuAssignment, GpuConfig, ModelConfigEntry};
         let config = crate::plugin::MeshConfig {
@@ -1704,7 +2092,10 @@ mod tests {
                 assignment: GpuAssignment::Auto,
                 parallel: None,
             },
+            owner_control: Default::default(),
             telemetry: Default::default(),
+            defaults: None,
+            runtime: Default::default(),
             models: vec![ModelConfigEntry {
                 model: "test.gguf".to_string(),
                 mmproj: None,
@@ -1716,8 +2107,10 @@ mod tests {
                 batch: None,
                 ubatch: None,
                 flash_attention: None,
+                ..Default::default()
             }],
             plugins: vec![],
+            extra: Default::default(),
         };
         let snap1 = mesh_config_to_proto(&config);
         let snap2 = mesh_config_to_proto(&config);
@@ -1731,7 +2124,10 @@ mod tests {
                 assignment: GpuAssignment::Auto,
                 parallel: None,
             },
+            owner_control: Default::default(),
             telemetry: Default::default(),
+            defaults: None,
+            runtime: Default::default(),
             models: vec![ModelConfigEntry {
                 model: "other.gguf".to_string(),
                 mmproj: None,
@@ -1743,12 +2139,45 @@ mod tests {
                 batch: None,
                 ubatch: None,
                 flash_attention: None,
+                ..Default::default()
             }],
             plugins: vec![],
+            extra: Default::default(),
         };
         let snap3 = mesh_config_to_proto(&config2);
         let h3 = canonical_config_hash(&snap3);
         assert_ne!(h1, h3, "different config must produce different hash");
+    }
+
+    #[test]
+    fn mesh_config_proto_roundtrip_preserves_integrated_fixture_and_owner_control_toml() {
+        let config: crate::plugin::MeshConfig = toml::from_str(FULL_SURFACE_VALID_FIXTURE).unwrap();
+        let snapshot = mesh_config_to_proto(&config);
+
+        assert!(
+            snapshot
+                .config_toml
+                .as_deref()
+                .is_some_and(|toml| toml.contains("prefill_chunk_schedule = \"128,256,384\""))
+        );
+
+        let restored = proto_config_to_mesh(&snapshot);
+        let json = serde_json::to_value(&restored).expect("restored config serializes");
+        assert_eq!(json["owner_control"]["bind"], "127.0.0.1:7447");
+        assert_eq!(
+            json["defaults"]["request_defaults"]["reasoning_budget"],
+            256
+        );
+        assert_eq!(json["models"][0]["hardware"]["stage_layer_start"], 12);
+        assert_eq!(
+            json["models"][0]["skippy"]["prefill_chunk_schedule"],
+            "128,256,384"
+        );
+        assert_eq!(json["models"][0]["speculative"]["draft_gpu_layers"], 12);
+        assert_eq!(
+            json["models"][1]["hardware"]["model_path"],
+            "/models/gemma.gguf"
+        );
     }
 
     #[test]
@@ -1761,7 +2190,10 @@ mod tests {
                 assignment: GpuAssignment::Pinned,
                 parallel: None,
             },
+            owner_control: Default::default(),
             telemetry: Default::default(),
+            defaults: None,
+            runtime: Default::default(),
             models: vec![ModelConfigEntry {
                 model: "Qwen3-8B-Q4_K_M".to_string(),
                 mmproj: Some("mmproj-f16.gguf".to_string()),
@@ -1773,8 +2205,10 @@ mod tests {
                 batch: None,
                 ubatch: None,
                 flash_attention: None,
+                ..Default::default()
             }],
             plugins: vec![],
+            extra: Default::default(),
         };
 
         let snapshot = mesh_config_to_proto(&config);
@@ -1844,6 +2278,7 @@ mod tests {
                 mmproj_ref: None,
             }],
             plugins: vec![],
+            config_toml: None,
         };
 
         let encoded = snapshot.encode_to_vec();
@@ -1858,187 +2293,6 @@ mod tests {
         assert_eq!(restored.models.len(), 1);
         assert_eq!(restored.models[0].gpu_id, None);
         assert_eq!(restored.models[0].ctx_size, Some(4096));
-    }
-
-    #[test]
-    fn config_sync_push_signature_roundtrip() {
-        use ed25519_dalek::{Signer, SigningKey};
-
-        let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-
-        let push = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(NodeConfigSnapshot {
-                version: 1,
-                ..Default::default()
-            }),
-            owner_signing_public_key: verifying_key.to_bytes().to_vec(),
-            signature: vec![0u8; 64],
-        };
-
-        let payload = crate::mesh::config_push_signature_payload(&push);
-        let sig = signing_key.sign(&payload);
-        let mut push_signed = push.clone();
-        push_signed.signature = sig.to_bytes().to_vec();
-
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(
-            &push_signed
-                .owner_signing_public_key
-                .as_slice()
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap();
-        let payload2 = crate::mesh::config_push_signature_payload(&push_signed);
-        let sig2 = ed25519_dalek::Signature::from_bytes(
-            &push_signed.signature.as_slice().try_into().unwrap(),
-        );
-        assert!(
-            vk.verify_strict(&payload2, &sig2).is_ok(),
-            "valid signature must verify"
-        );
-    }
-
-    #[test]
-    fn config_sync_push_tampered_payload_rejected() {
-        use ed25519_dalek::{Signer, SigningKey};
-
-        let signing_key = SigningKey::from_bytes(&[0x43u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-
-        let push = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(NodeConfigSnapshot {
-                version: 1,
-                ..Default::default()
-            }),
-            owner_signing_public_key: verifying_key.to_bytes().to_vec(),
-            signature: vec![0u8; 64],
-        };
-
-        let payload = crate::mesh::config_push_signature_payload(&push);
-        let sig = signing_key.sign(&payload);
-        let mut push_signed = push.clone();
-        push_signed.signature = sig.to_bytes().to_vec();
-
-        let mut push_tampered = push_signed.clone();
-        push_tampered.expected_revision += 1;
-
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(
-            &push_tampered
-                .owner_signing_public_key
-                .as_slice()
-                .try_into()
-                .unwrap(),
-        )
-        .unwrap();
-        let payload_tampered = crate::mesh::config_push_signature_payload(&push_tampered);
-        let sig2 = ed25519_dalek::Signature::from_bytes(
-            &push_signed.signature.as_slice().try_into().unwrap(),
-        );
-        assert!(
-            vk.verify_strict(&payload_tampered, &sig2).is_err(),
-            "tampered payload must fail verification"
-        );
-    }
-    #[test]
-    fn config_sync_push_validates_signature_length_too_short() {
-        use crate::proto::node::ConfigPush;
-        let push = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 32],
-            signature: vec![0x04; 10],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("short signature must be rejected");
-        assert!(
-            matches!(err, ControlFrameError::InvalidSignatureLength { got: 10 }),
-            "expected InvalidSignatureLength{{got:10}}, got {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn config_sync_push_validates_signature_length_empty() {
-        use crate::proto::node::ConfigPush;
-        let push = ConfigPush {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            requester_id: vec![0x01; 32],
-            target_node_id: vec![0x02; 32],
-            expected_revision: 0,
-            config: Some(make_config_snapshot()),
-            owner_signing_public_key: vec![0x03; 32],
-            signature: vec![],
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_PUSH, &push);
-        let err = decode_control_frame::<ConfigPush>(STREAM_CONFIG_PUSH, &encoded)
-            .expect_err("empty signature must be rejected");
-        assert!(
-            matches!(err, ControlFrameError::MissingSignature),
-            "expected MissingSignature, got {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn config_sync_snapshot_response_validates_config_present() {
-        use crate::proto::node::ConfigSnapshotResponse;
-        let response = ConfigSnapshotResponse {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: vec![0x01; 32],
-            revision: 1,
-            config_hash: vec![0x02; 32],
-            config: None,
-            hostname: None,
-            error: None,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &response);
-        let err = decode_control_frame::<ConfigSnapshotResponse>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-            .expect_err("snapshot response with config=None must be rejected");
-        assert!(
-            matches!(err, ControlFrameError::MissingConfig),
-            "expected MissingConfig, got {:?}",
-            err
-        );
-    }
-
-    #[test]
-    fn config_sync_update_notification_validates_config_present() {
-        use crate::proto::node::ConfigUpdateNotification;
-        let notification = ConfigUpdateNotification {
-            owner_id: String::new(),
-            gen: NODE_PROTOCOL_GENERATION,
-            node_id: vec![0x01; 32],
-            revision: 1,
-            config_hash: vec![0x02; 32],
-            config: None,
-        };
-        let encoded = encode_control_frame(STREAM_CONFIG_SUBSCRIBE, &notification);
-        let err =
-            decode_control_frame::<ConfigUpdateNotification>(STREAM_CONFIG_SUBSCRIBE, &encoded)
-                .expect_err("update notification with config=None must be rejected");
-        assert!(
-            matches!(err, ControlFrameError::MissingConfig),
-            "expected MissingConfig, got {:?}",
-            err
-        );
     }
 
     #[test]
@@ -2081,7 +2335,13 @@ mod tests {
             served_model_runtime: vec![],
             owner_attestation: None,
             artifact_transfer_supported: true,
+            stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&ann_with_timestamp);
@@ -2127,7 +2387,13 @@ mod tests {
             served_model_runtime: vec![],
             owner_attestation: None,
             artifact_transfer_supported: false,
+            stage_protocol_generation_supported: false,
             stage_status_list_supported: false,
+            advertised_model_throughput: vec![],
+            latency_ms: None,
+            latency_source: None,
+            latency_age_ms: None,
+            latency_observer_id: None,
         };
 
         let proto_pa = local_ann_to_proto_ann(&ann_without_timestamp);
