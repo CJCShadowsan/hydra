@@ -1,0 +1,69 @@
+From 449cf7edefc85b4007c594ae55c6decbb75ef28f Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 28 May 2026 01:18:56 -0400
+Subject: [PATCH] Expose skippy backend device memory check ABI
+
+Add skippy_backend_device_check_memory() - a public C function that queries a
+backend device's free memory via ggml_backend_dev_memory() and returns whether
+free >= headroom_bytes. This lets the Rust runtime pre-check GPU free memory
+before inference to avoid the cuMemCreate OOM path that leads to GGML_ABORT.
+
+---
+ src/skippy.cpp | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index f9e657181..5f619a586 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1859,11 +1859,45 @@ enum skippy_status skippy_backend_device_at(
+     return skippy_success(out_error);
+ }
+ 
+-static enum skippy_status skippy_finish_model_open(
+-        llama_model * model,
+-        const struct skippy_runtime_config * config,
+-        struct skippy_model ** out_model,
++enum skippy_status skippy_backend_device_check_memory(
++        size_t device_index,
++        size_t headroom_bytes,
++        bool * out_sufficient,
+         struct skippy_error ** out_error) {
++    if (out_sufficient == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "out_sufficient is required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    skippy_load_backends_for_device_query();
++    const size_t device_count = ggml_backend_dev_count();
++    if (device_index >= device_count) {
++        *out_sufficient = false;
++        return skippy_success(out_error);
++    }
++
++    // NOTE: ggml_backend_dev_memory delegates to the backend's get_memory().
++    //   - CUDA (NVIDIA):  cuMemGetInfo          - accurate live query
++    //   - ROCm (AMD):     hipMemGetInfo          - accurate live query
++    //   - Intel GPU:      depends on Level Zero  - may return 0/stale
++    //   - Vulkan:         shared memory model    - no unified free pool
++    //   - Metal:          unified memory         - no separate GPU pool
++    //
++    // If extending to a backend where ggml_backend_dev_memory() returns 0
++    // for free/total, add a backend-specific fallback query here.
++    ggml_backend_dev_t device = ggml_backend_dev_get(device_index);
++    size_t free = 0, total = 0;
++    ggml_backend_dev_memory(device, &free, &total);
++
++    *out_sufficient = (free >= headroom_bytes);
++    return skippy_success(out_error);
++}
++
++ static enum skippy_status skippy_finish_model_open(
++         llama_model * model,
++         const struct skippy_runtime_config * config,
++         struct skippy_model ** out_model,
++         struct skippy_error ** out_error) {
+     if (config != nullptr && config->filter_tensors_on_load) {
+         const int32_t n_layer = llama_model_n_layer(model);
+         if (model->arch != LLM_ARCH_LLAMA &&

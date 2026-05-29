@@ -1,0 +1,104 @@
+From 342611c041f20525bbb1571b27c6c82e3e8827a0 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 28 May 2026 21:51:05 -0400
+Subject: [PATCH] Add GPU allocation tracker C API for dynamic VRAM headroom
+
+---
+ include/skippy.h |  5 +++++
+ src/skippy.cpp   | 50 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 55 insertions(+)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 84173c028..7c4da4f03 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -573,6 +573,11 @@ LLAMA_API enum skippy_status skippy_write_gguf_from_parts(
+         const char * output_path,
+         struct skippy_error ** out_error);
+ 
++/* GPU allocation tracker — replaces static VRAM headroom with max-seen tracking. */
++LLAMA_API void skippy_alloc_tracker_init(void);
++LLAMA_API void skippy_alloc_tracker_reset(void);
++LLAMA_API uint64_t skippy_alloc_tracker_get_max_seen(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 5f619a586..428ba87f2 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -42,6 +42,38 @@
+ 
+ using json = nlohmann::ordered_json;
+ 
++/* GPU allocation tracker — atomic max-seen for dynamic VRAM headroom. */
++#include <atomic>
++static std::atomic<uint64_t> g_skippy_alloc_max_seen{0};
++
++void skippy_alloc_tracker_init(void) {
++    g_skippy_alloc_max_seen.store(0, std::memory_order_relaxed);
++}
++
++void skippy_alloc_tracker_reset(void) {
++    g_skippy_alloc_max_seen.store(0, std::memory_order_relaxed);
++}
++
++uint64_t skippy_alloc_tracker_get_max_seen(void) {
++    return g_skippy_alloc_max_seen.load(std::memory_order_relaxed);
++}
++
++/* CUDA alloc hook callback — updates max-seen before cuMemCreate. */
++static bool skippy_alloc_hook_callback(
++        size_t /*device*/,
++        size_t alloc_size,
++        size_t /*pool_used*/,
++        void * /*user_data*/) {
++    uint64_t current = g_skippy_alloc_max_seen.load(std::memory_order_relaxed);
++    while (alloc_size > current) {
++        if (g_skippy_alloc_max_seen.compare_exchange_weak(current, static_cast<uint64_t>(alloc_size),
++                std::memory_order_relaxed, std::memory_order_relaxed)) {
++            break;
++        }
++    }
++    return true; /* always proceed — caller handles OOM */
++}
++
+ struct skippy_model {
+     llama_model * model = nullptr;
+     llama_context * ctx = nullptr;
+@@ -2242,6 +2274,15 @@ enum skippy_status skippy_session_create(
+     if (llama_memory_t memory = model->ctx->get_memory()) {
+         llama_memory_seq_rm(memory, seq_id, -1, -1);
+     }
++#ifdef GGML_USE_CUDA
++    {
++        extern "C" {
++            void ggml_backend_cuda_set_alloc_hook(ggml_cuda_alloc_hook_t hook, void *user_data);
++        }
++        ggml_backend_cuda_set_alloc_hook(skippy_alloc_hook_callback, nullptr);
++    }
++#endif
++
+     return skippy_success(out_error);
+ }
+ 
+@@ -2449,6 +2490,15 @@ enum skippy_status skippy_session_free(
+                 session->stage_model->lane_in_use[lane] = false;
+             }
+         }
++#ifdef GGML_USE_CUDA
++        {
++            extern "C" {
++                void ggml_backend_cuda_clear_alloc_hook(void);
++            }
++            ggml_backend_cuda_clear_alloc_hook();
++        }
++#endif
++
+         delete session;
+     }
+     return skippy_success(out_error);
+-- 
+2.50.1 (Apple Git-155)
+

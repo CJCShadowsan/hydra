@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(has_cuda)");
     println!("cargo:rerun-if-env-changed=LLAMA_STAGE_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=LLAMA_STAGE_LIB_DIR");
     println!("cargo:rerun-if-env-changed=LLAMA_STAGE_LINK_MODE");
@@ -134,6 +135,7 @@ fn main() {
     );
     if has_cuda {
         println!("cargo:rustc-link-lib=static=ggml-cuda");
+        println!("cargo:rustc-cfg=has_cuda");
     }
     let has_hip = static_archive_exists(
         &build_dir,

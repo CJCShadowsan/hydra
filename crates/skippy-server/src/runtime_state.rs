@@ -10,7 +10,7 @@ use skippy_runtime::{
     ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow,
     MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig, RuntimeKvPage, RuntimeKvPageDesc,
     RuntimeLoadMode, SamplingConfig, StageModel, StageSession, StageSessionCheckpoint, TokenSignal,
-    parse_cache_type,
+    alloc_tracker, parse_cache_type,
 };
 
 use crate::package::select_package_parts;
@@ -23,6 +23,8 @@ pub struct RuntimeLaunchOverrides {
 
 pub struct RuntimeState {
     pub model: StageModel,
+    device_index: usize,
+    total_vram: Option<u64>,
     layer_start: u32,
     layer_end: u32,
     lane_count: u32,
@@ -97,7 +99,31 @@ struct ResidentLanePrefix {
 }
 
 impl RuntimeState {
+    /// Check that the backend device has sufficient free memory for
+    /// inference.  Returns an error when free memory has dropped below
+    /// the configured headroom, which prevents a hard `abort()` in the
+    /// CUDA VMM pool (`cuMemCreate` OOM inside ggml).
+    /// Pre-inference memory check. For backends where `ggml_backend_dev_memory()`
+    /// doesn't report accurate free memory (Intel, Vulkan, Metal), either:
+    ///   - Bypass this check by returning `Ok(())` early based on device type, or
+    ///   - Add a backend-specific query in `skippy_backend_device_check_memory` (see skippy.cpp).
+    fn check_memory(&self) -> Result<()> {
+        if let Some(total_vram) = self.total_vram {
+            let sufficient =
+                alloc_tracker::check_device_memory_with_tracker(self.device_index, total_vram)
+                    .context("failed to query backend device memory")?;
+            if !sufficient {
+                bail!(
+                    "backend device {} has insufficient free memory",
+                    self.device_index,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn prefill(&mut self, session_id: &str, token_ids: &[i32]) -> Result<()> {
+        self.check_memory()?;
         let session = self.session(session_id)?;
         session.prefill_chunked(token_ids)?;
         self.add_session_tokens(session_id, token_ids.len() as u64);
@@ -119,6 +145,7 @@ impl RuntimeState {
         media: &[MediaInput],
         sampling: Option<&SamplingConfig>,
     ) -> Result<MediaPrefill> {
+        self.check_memory()?;
         let model = &self.model as *const StageModel;
         let session = self.session(session_id)?;
         // `session()` mutably borrows the session map, while the projector lives
@@ -136,6 +163,7 @@ impl RuntimeState {
         prompt: &str,
         media: &[MediaInput],
     ) -> Result<MediaPrefillFrame> {
+        self.check_memory()?;
         let model = &self.model as *const StageModel;
         let session = self.session(session_id)?;
         // `session()` mutably borrows the session map, while the projector lives
@@ -867,8 +895,23 @@ pub fn load_runtime_with_overrides(
         }
     };
 
+    let device_index = config
+        .selected_device
+        .as_ref()
+        .and_then(|d| d.index)
+        .unwrap_or(0);
+    let total_vram = config.selected_device.as_ref().and_then(|d| d.vram_bytes);
+
+    // Reset max-seen counter before model load so stale values from a previous
+    // runtime instance don't inflate headroom computation on reload. Then init
+    // the tracker fresh for this lifecycle.
+    alloc_tracker::reset();
+    alloc_tracker::init();
+
     Ok(Some(Arc::new(Mutex::new(RuntimeState {
         model,
+        device_index,
+        total_vram,
         layer_start: config.layer_start,
         layer_end: config.layer_end,
         lane_count: config.lane_count,

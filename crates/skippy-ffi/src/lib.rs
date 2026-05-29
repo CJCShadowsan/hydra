@@ -576,6 +576,13 @@ unsafe extern "C" {
         out_error: *mut *mut Error,
     ) -> Status;
 
+    pub fn skippy_backend_device_check_memory(
+        device_index: usize,
+        headroom_bytes: usize,
+        out_sufficient: *mut bool,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
     pub fn skippy_model_open(
         path: *const c_char,
         config: *const RuntimeConfig,
@@ -1138,6 +1145,26 @@ unsafe extern "C" {
         logits_last: bool,
         new_n_past: *mut i32,
     ) -> c_int;
+
+    pub fn skippy_alloc_tracker_init();
+    pub fn skippy_alloc_tracker_reset();
+    pub fn skippy_alloc_tracker_get_max_seen() -> u64;
+}
+
+#[cfg(has_cuda)]
+extern "C" {
+    pub fn ggml_backend_cuda_set_alloc_hook(
+        hook: Option<
+            unsafe extern "C" fn(
+                device: usize,
+                alloc_size: usize,
+                pool_used: usize,
+                user_data: *mut c_void,
+            ) -> bool,
+        >,
+        user_data: *mut c_void,
+    );
+    pub fn ggml_backend_cuda_clear_alloc_hook();
 }
 
 pub type Opaque = c_void;

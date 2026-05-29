@@ -22,3 +22,6 @@ tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(has_cuda)'] }

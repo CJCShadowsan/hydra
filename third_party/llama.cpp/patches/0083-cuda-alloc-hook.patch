@@ -1,0 +1,75 @@
+From 72168ff4c19cf17b49a0090d4bd9c10a2825716c Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 28 May 2026 20:13:24 -0400
+Subject: [PATCH] Add CUDA VMM pool allocation hook
+
+Add an allocation hook callback to ggml-cuda.cu VMM pool that fires before cuMemCreate, allowing callers to decide whether to allow or abort the allocation.
+---
+ ggml/include/ggml-cuda.h        |  5 +++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 27 +++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 5436c7ef5..dbfe4ddae 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -45,6 +45,11 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
++typedef bool (*ggml_cuda_alloc_hook_t)(size_t device, size_t alloc_size, size_t pool_used, void *user_data);
++
++GGML_BACKEND_API void ggml_backend_cuda_set_alloc_hook(ggml_cuda_alloc_hook_t hook, void *user_data);
++GGML_BACKEND_API void ggml_backend_cuda_clear_alloc_hook(void);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 23d1c0692..c14e28f54 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -86,6 +86,25 @@
+ #include <string>
+ #include <vector>
+ 
++// Allocation hook callback — returns true to proceed, false to abort (return nullptr)
++typedef bool (*ggml_cuda_alloc_hook_t)(size_t device, size_t alloc_size, size_t pool_used, void *user_data);
++static ggml_cuda_alloc_hook_t g_ggml_cuda_alloc_hook = nullptr;
++static void * g_ggml_cuda_alloc_hook_user_data = nullptr;
++
++static std::mutex g_ggml_cuda_alloc_hook_mutex;
++
++GGML_API void ggml_backend_cuda_set_alloc_hook(ggml_cuda_alloc_hook_t hook, void *user_data) {
++    std::lock_guard<std::mutex> lock(g_ggml_cuda_alloc_hook_mutex);
++    g_ggml_cuda_alloc_hook = hook;
++    g_ggml_cuda_alloc_hook_user_data = user_data;
++}
++
++GGML_API void ggml_backend_cuda_clear_alloc_hook(void) {
++    std::lock_guard<std::mutex> lock(g_ggml_cuda_alloc_hook_mutex);
++    g_ggml_cuda_alloc_hook = nullptr;
++    g_ggml_cuda_alloc_hook_user_data = nullptr;
++}
++
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+ #define GGML_LOG_WARN_ONCE(str) \
+@@ -512,6 +531,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ 
+         size_t avail = pool_size - pool_used;
+ 
++        // Call allocation hook before attempting cuMemCreate
++        if (g_ggml_cuda_alloc_hook != nullptr) {
++            bool proceed = g_ggml_cuda_alloc_hook(static_cast<size_t>(device), size, pool_used, g_ggml_cuda_alloc_hook_user_data);
++            if (!proceed) {
++                return nullptr;
++            }
++        }
++
+         if (size > avail) {
+             // round up to the next multiple of the granularity
+             size_t reserve_size = size - avail;
+-- 
+2.50.1 (Apple Git-155)
+

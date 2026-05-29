@@ -53,7 +53,9 @@ pub enum FlashAttentionType {
     Enabled = 1,
 }
 
-pub use devices::{BackendDevice, BackendDeviceType, backend_devices};
+pub use devices::{
+    BackendDevice, BackendDeviceType, alloc_tracker, backend_devices, check_device_memory,
+};
 pub use skippy_ffi::LoadMode as RuntimeLoadMode;
 pub use skippy_ffi::{
     ActivationDType as RuntimeActivationDType, ActivationLayout as RuntimeActivationLayout,
