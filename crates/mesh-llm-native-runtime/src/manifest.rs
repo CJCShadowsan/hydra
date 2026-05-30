@@ -1,6 +1,7 @@
 use crate::NativeRuntimeFlavor;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{fs, path::Path};
 
 pub const NATIVE_RUNTIME_MANIFEST_FILE: &str = "manifest.json";
@@ -47,13 +48,6 @@ pub struct NativeRuntimeManifest {
     pub artifact: NativeRuntimeArtifact,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum NativeRuntimeManifestWire {
-    Wrapped { artifact: NativeRuntimeArtifact },
-    Direct(NativeRuntimeArtifact),
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeRuntimeReleaseManifest {
     pub mesh_version: String,
@@ -66,12 +60,18 @@ impl NativeRuntimeManifest {
         let path = dir.join(NATIVE_RUNTIME_MANIFEST_FILE);
         let text = fs::read_to_string(&path)
             .with_context(|| format!("read native runtime manifest {}", path.display()))?;
-        let wire: NativeRuntimeManifestWire = serde_json::from_str(&text)
+        let mut value: Value = serde_json::from_str(&text)
             .with_context(|| format!("parse native runtime manifest {}", path.display()))?;
-        Ok(match wire {
-            NativeRuntimeManifestWire::Wrapped { artifact } => Self { artifact },
-            NativeRuntimeManifestWire::Direct(artifact) => Self { artifact },
-        })
+        if let Some(artifact) = value.get_mut("artifact") {
+            normalize_legacy_aliases(artifact)?;
+            let artifact = serde_json::from_value(artifact.take())
+                .with_context(|| format!("parse native runtime artifact {}", path.display()))?;
+            return Ok(Self { artifact });
+        }
+        normalize_legacy_aliases(&mut value)?;
+        let artifact = serde_json::from_value(value)
+            .with_context(|| format!("parse native runtime artifact {}", path.display()))?;
+        Ok(Self { artifact })
     }
 
     pub fn write_to_dir(&self, dir: &Path) -> Result<()> {
@@ -88,11 +88,49 @@ impl NativeRuntimeManifest {
     }
 }
 
+fn normalize_legacy_aliases(value: &mut Value) -> Result<()> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    normalize_alias_pair(object, "native_runtime_id", "artifact_id")?;
+    normalize_alias_pair(object, "mesh_version", "sdk_version")?;
+    Ok(())
+}
+
+fn normalize_alias_pair(
+    object: &mut serde_json::Map<String, Value>,
+    canonical: &str,
+    alias: &str,
+) -> Result<()> {
+    match (object.get(canonical), object.get(alias)) {
+        (Some(left), Some(right)) if left != right => {
+            bail!("{canonical} and {alias} disagree in native runtime manifest")
+        }
+        (Some(_), Some(_)) => {
+            object.remove(alias);
+        }
+        (None, Some(_)) => {
+            if let Some(value) = object.remove(alias) {
+                object.insert(canonical.to_string(), value);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl NativeRuntimeReleaseManifest {
     pub fn read_from_path(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("read native runtime release manifest {}", path.display()))?;
-        let manifest: Self = serde_json::from_str(&text)
+        let mut value: Value = serde_json::from_str(&text)
+            .with_context(|| format!("parse native runtime release manifest {}", path.display()))?;
+        if let Some(artifacts) = value.get_mut("artifacts").and_then(Value::as_array_mut) {
+            for artifact in artifacts {
+                normalize_legacy_aliases(artifact)?;
+            }
+        }
+        let manifest: Self = serde_json::from_value(value)
             .with_context(|| format!("parse native runtime release manifest {}", path.display()))?;
         manifest.validate()?;
         Ok(manifest)
@@ -164,6 +202,67 @@ mod tests {
             "meshllm-native-linux-x86_64-cpu"
         );
         assert_eq!(manifest.artifact.mesh_version, "0.68.0");
+    }
+
+    #[test]
+    fn reads_manifests_with_canonical_and_legacy_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(NATIVE_RUNTIME_MANIFEST_FILE),
+            r#"{
+  "artifact_id": "meshllm-native-runtime-linux-x86_64-cpu",
+  "native_runtime_id": "meshllm-native-runtime-linux-x86_64-cpu",
+  "sdk_version": "0.68.0",
+  "mesh_version": "0.68.0",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "os": "linux",
+  "arch": "x86_64",
+  "flavor": "cpu",
+  "library_paths": ["lib/libllama.so"]
+}"#,
+        )
+        .unwrap();
+
+        let manifest = NativeRuntimeManifest::read_from_dir(temp.path()).unwrap();
+
+        assert_eq!(
+            manifest.artifact.native_runtime_id,
+            "meshllm-native-runtime-linux-x86_64-cpu"
+        );
+        assert_eq!(manifest.artifact.mesh_version, "0.68.0");
+    }
+
+    #[test]
+    fn reads_release_manifest_with_canonical_and_legacy_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("native-runtimes.json");
+        fs::write(
+            &path,
+            r#"{
+  "mesh_version": "0.68.0",
+  "artifacts": [
+    {
+      "artifact_id": "meshllm-native-runtime-linux-x86_64-cpu",
+      "native_runtime_id": "meshllm-native-runtime-linux-x86_64-cpu",
+      "mesh_version": "0.68.0",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "os": "linux",
+      "arch": "x86_64",
+      "flavor": "cpu",
+      "library_paths": ["lib/libllama.so"]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let manifest = NativeRuntimeReleaseManifest::read_from_path(&path).unwrap();
+
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(
+            manifest.artifacts[0].native_runtime_id,
+            "meshllm-native-runtime-linux-x86_64-cpu"
+        );
     }
 
     #[test]

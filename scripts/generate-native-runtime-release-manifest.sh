@@ -11,9 +11,9 @@ usage() {
     cat >&2 <<'EOF'
 Usage: scripts/generate-native-runtime-release-manifest.sh --tag TAG --out FILE [--repo OWNER/REPO] <native-runtime.tar.gz> [...]
 
-Generates native-runtimes.json for a GitHub release from packaged native SDK
+Generates native-runtimes.json for a GitHub release from packaged native
 runtime artifacts. Each artifact archive must contain a manifest.json with the
-native runtime resolver fields emitted by package-native-sdk.sh.
+native runtime resolver fields emitted by package-native-runtime.sh.
 EOF
 }
 

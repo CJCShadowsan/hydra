@@ -11,8 +11,8 @@ entry points.
 ## Concepts
 
 A **native runtime** is a version-matched release artifact that contains the
-platform-specific native library needed by MeshLLM, such as a CPU, Metal, CUDA,
-CUDA Blackwell, ROCm, or Vulkan runtime.
+platform-specific patched llama.cpp/Skippy shared libraries needed by MeshLLM,
+such as a CPU, Metal, CUDA, CUDA Blackwell, ROCm, or Vulkan runtime.
 
 Native runtimes are separate from the `mesh-llm` binary:
 
@@ -34,25 +34,24 @@ equivalent shapes:
 ```json
 {
   "artifact": {
-    "native_runtime_id": "meshllm-native-linux-x86_64-cuda",
+    "native_runtime_id": "meshllm-native-runtime-linux-x86_64-cuda",
     "mesh_version": "0.68.0",
     "target_triple": "x86_64-unknown-linux-gnu",
     "os": "linux",
     "arch": "x86_64",
     "flavor": "cuda",
-    "library_paths": ["lib/libmeshllm_ffi.so"]
+    "library_paths": ["lib/libggml.so", "lib/libllama-common.so", "lib/libmtmd.so", "lib/libllama.so"]
   }
 }
 ```
 
-Release-packaged native SDK artifacts use the direct shape:
+Release-packaged native runtime artifacts use the direct shape:
 
 ```json
 {
   "schema_version": 1,
-  "artifact_id": "meshllm-native-linux-x86_64-cuda",
-  "native_runtime_id": "meshllm-native-linux-x86_64-cuda",
-  "sdk_version": "0.68.0",
+  "artifact_id": "meshllm-native-runtime-linux-x86_64-cuda",
+  "native_runtime_id": "meshllm-native-runtime-linux-x86_64-cuda",
   "mesh_version": "0.68.0",
   "target_triple": "x86_64-unknown-linux-gnu",
   "platform": "linux-x86_64",
@@ -60,9 +59,10 @@ Release-packaged native SDK artifacts use the direct shape:
   "arch": "x86_64",
   "backend": "cuda",
   "flavor": "cuda",
-  "library": "lib/libmeshllm_ffi.so",
-  "library_paths": ["lib/libmeshllm_ffi.so"],
+  "library": "lib/libllama.so",
+  "library_paths": ["lib/libggml.so", "lib/libllama-common.so", "lib/libmtmd.so", "lib/libllama.so"],
   "library_sha256": "7c2b...",
+  "skippy_abi_version": "0.1.24",
   "requirements": []
 }
 ```
@@ -99,15 +99,15 @@ Release manifests list the runtime artifacts available for a MeshLLM release:
   "mesh_version": "0.68.0",
   "artifacts": [
     {
-      "native_runtime_id": "meshllm-native-linux-x86_64-cpu",
+      "native_runtime_id": "meshllm-native-runtime-linux-x86_64-cpu",
       "mesh_version": "0.68.0",
       "target_triple": "x86_64-unknown-linux-gnu",
       "os": "linux",
       "arch": "x86_64",
       "flavor": "cpu",
-      "url": "https://github.com/Mesh-LLM/mesh-llm/releases/download/v0.68.0/meshllm-native-linux-x86_64-cpu.tar.gz",
+      "url": "https://github.com/Mesh-LLM/mesh-llm/releases/download/v0.68.0/meshllm-native-runtime-linux-x86_64-cpu.tar.gz",
       "sha256": "2f1c...",
-      "library_paths": ["lib/libmeshllm_ffi.so"]
+      "library_paths": ["lib/libggml.so", "lib/libllama-common.so", "lib/libmtmd.so", "lib/libllama.so"]
     }
   ]
 }
@@ -164,7 +164,7 @@ use std::path::PathBuf;
 # ) -> anyhow::Result<()> {
 let cache = NativeRuntimeCache::new("/tmp/mesh-llm/native-runtimes");
 let resolution = NativeRuntimeResolver::new(mesh_version, profile, manifest, cache)
-    .with_bundle_dirs(vec![PathBuf::from("./dist/native-sdk/meshllm-native-linux-x86_64-cpu")])
+    .with_bundle_dirs(vec![PathBuf::from("./dist/native-runtimes/meshllm-native-runtime-linux-x86_64-cpu")])
     .resolve(&RuntimeSelection::Recommended)?;
 
 match resolution.source {
@@ -193,7 +193,7 @@ Selection modes:
 - `RuntimeSelection::Recommended`: choose the highest-ranked compatible runtime.
 - `RuntimeSelection::Flavor(NativeRuntimeFlavor::Cuda)`: require a specific
   flavor.
-- `RuntimeSelection::Id("meshllm-native-linux-x86_64-cuda".to_string())`:
+- `RuntimeSelection::Id("meshllm-native-runtime-linux-x86_64-cuda".to_string())`:
   require a specific artifact ID.
 
 Compatibility checks:
@@ -248,9 +248,10 @@ successful runtime install for the upgraded MeshLLM version.
 
 ## Load Plan Boundary
 
-This crate does not load dynamic libraries. It exposes `InstalledNativeRuntime`
-as a cache record and `InstalledNativeRuntime::load_plan()` as the boundary that
-future runtime loaders should consume.
+This crate does not load dynamic libraries itself. It exposes
+`InstalledNativeRuntime` as a cache record and
+`InstalledNativeRuntime::load_plan()` as the boundary consumed by the Skippy FFI
+dynamic loader in the host runtime.
 
 ```rust
 # fn example(installed: mesh_llm_native_runtime::InstalledNativeRuntime) -> anyhow::Result<()> {
@@ -275,7 +276,7 @@ mesh-llm runtime list --installed
 mesh-llm runtime list --available --manifest native-runtimes.json
 mesh-llm runtime install
 mesh-llm runtime install cuda
-mesh-llm runtime remove meshllm-native-linux-x86_64-cuda
+mesh-llm runtime remove meshllm-native-runtime-linux-x86_64-cuda
 mesh-llm runtime prune --active-only
 mesh-llm doctor --json
 ```
@@ -292,4 +293,6 @@ load-plan semantics those commands use.
   version.
 - The crate preserves unknown flavors so new platform-specific flavor names can
   be added without changing the manifest schema.
-- Dynamic loading is intentionally outside this crate for now.
+- Dynamic loading is intentionally outside this crate; the shipped host runtime
+  consumes `load_plan()` and loads the declared libraries through `skippy-ffi`
+  when built with `dynamic-native-runtime`.

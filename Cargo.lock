@@ -7276,6 +7276,9 @@ dependencies = [
 [[package]]
 name = "skippy-ffi"
 version = "0.68.0"
+dependencies = [
+ "libloading",
+]
 
 [[package]]
 name = "skippy-metrics"

@@ -154,7 +154,14 @@ pub trait Collector {
 
 struct DefaultCollector;
 
-#[cfg(all(target_os = "linux", any(not(feature = "skippy-devices"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    )
+))]
 struct TegraCollector;
 
 fn detect_hostname() -> Option<String> {
@@ -187,7 +194,14 @@ fn apply_cpu_only_runtime_budget(survey: &mut HardwareSurvey, metrics: &[Metric]
     }
 }
 
-#[cfg(all(target_os = "linux", any(not(feature = "skippy-devices"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    )
+))]
 fn try_tegrastats_ram() -> Option<u64> {
     use std::io::BufRead;
     let mut child = std::process::Command::new("tegrastats")
@@ -271,6 +285,10 @@ fn apply_skippy_backend_devices_to_survey(survey: &mut HardwareSurvey, metrics: 
     if !wants_gpu_data {
         return false;
     }
+    #[cfg(feature = "dynamic-native-runtime")]
+    if !skippy_runtime::native_runtime_loaded() {
+        return false;
+    }
 
     let gpus = match skippy_devices::gpu_facts() {
         Ok(gpus) => gpus,
@@ -328,7 +346,10 @@ impl Collector for DefaultCollector {
             return survey;
         }
 
-        #[cfg(all(target_os = "macos", not(feature = "skippy-devices")))]
+        #[cfg(all(
+            target_os = "macos",
+            any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+        ))]
         {
             if metrics.contains(&Metric::IsSoc) {
                 survey.is_soc = true;
@@ -357,7 +378,10 @@ impl Collector for DefaultCollector {
             }
         }
 
-        #[cfg(all(target_os = "linux", not(feature = "skippy-devices")))]
+        #[cfg(all(
+            target_os = "linux",
+            any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+        ))]
         {
             let system_ram = read_system_ram_bytes();
 
@@ -580,7 +604,10 @@ impl Collector for DefaultCollector {
             }
         }
 
-        #[cfg(all(target_os = "windows", not(feature = "skippy-devices")))]
+        #[cfg(all(
+            target_os = "windows",
+            any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+        ))]
         {
             let system_ram = read_windows_total_ram_bytes().unwrap_or(0);
             let want_gpu_info =
@@ -681,7 +708,14 @@ impl Collector for DefaultCollector {
     }
 }
 
-#[cfg(all(target_os = "linux", any(not(feature = "skippy-devices"), test)))]
+#[cfg(all(
+    target_os = "linux",
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    )
+))]
 impl Collector for TegraCollector {
     fn collect(&self, metrics: &[Metric]) -> HardwareSurvey {
         let mut survey = HardwareSurvey::default();
@@ -727,12 +761,19 @@ fn detect_collector_impl() -> Box<dyn Collector> {
     Box::new(DefaultCollector)
 }
 
-#[cfg(all(target_os = "linux", feature = "skippy-devices"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "skippy-devices",
+    not(feature = "dynamic-native-runtime")
+))]
 fn detect_collector_impl() -> Box<dyn Collector> {
     Box::new(DefaultCollector)
 }
 
-#[cfg(all(target_os = "linux", not(feature = "skippy-devices")))]
+#[cfg(all(
+    target_os = "linux",
+    any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime")
+))]
 fn detect_collector_impl() -> Box<dyn Collector> {
     if cfg!(target_arch = "aarch64")
         && let Ok(compat) = std::fs::read_to_string("/proc/device-tree/compatible")
@@ -752,12 +793,20 @@ fn detect_collector() -> Box<dyn Collector> {
     detect_collector_impl()
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn backend_device_for_name(name: &str, index: usize, is_soc: bool) -> Option<String> {
     backend_device_for_name_for_platform(name, index, is_soc, cfg!(target_os = "macos"))
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn backend_device_for_name_for_platform(
     name: &str,
     index: usize,
@@ -788,7 +837,11 @@ fn backend_device_for_name_for_platform(
 }
 
 #[cfg(all(
-    any(not(feature = "skippy-devices"), test),
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    ),
     any(target_os = "linux", target_os = "windows")
 ))]
 fn detect_nvidia_identities() -> Vec<(Option<String>, Option<String>)> {
@@ -806,14 +859,22 @@ fn detect_nvidia_identities() -> Vec<(Option<String>, Option<String>)> {
 }
 
 #[cfg(all(
-    any(not(feature = "skippy-devices"), test),
+    any(
+        not(feature = "skippy-devices"),
+        feature = "dynamic-native-runtime",
+        test
+    ),
     not(any(target_os = "linux", target_os = "windows"))
 ))]
 fn detect_nvidia_identities() -> Vec<(Option<String>, Option<String>)> {
     Vec::new()
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn inferred_gpu_name_count(name: Option<&str>) -> usize {
     let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
         return 0;
@@ -952,7 +1013,11 @@ fn resolve_pinned_gpu_with_compatibility<'a>(
     }
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn hydrate_gpu_facts(survey: &mut HardwareSurvey, metrics: &[Metric]) {
     let expected_count = survey
         .gpu_vram
@@ -982,7 +1047,11 @@ fn hydrate_gpu_facts(survey: &mut HardwareSurvey, metrics: &[Metric]) {
     );
 }
 
-#[cfg(any(not(feature = "skippy-devices"), test))]
+#[cfg(any(
+    not(feature = "skippy-devices"),
+    feature = "dynamic-native-runtime",
+    test
+))]
 fn hydrate_gpu_facts_with_identities(
     survey: &mut HardwareSurvey,
     metrics: &[Metric],
@@ -1070,7 +1139,7 @@ pub fn query(metrics: &[Metric]) -> HardwareSurvey {
     if metrics.contains(&Metric::Hostname) {
         survey.hostname = detect_hostname();
     }
-    #[cfg(not(feature = "skippy-devices"))]
+    #[cfg(any(not(feature = "skippy-devices"), feature = "dynamic-native-runtime"))]
     if metrics.contains(&Metric::GpuFacts) && survey.gpus.is_empty() {
         hydrate_gpu_facts(&mut survey, metrics);
     }
