@@ -298,6 +298,7 @@ pub(crate) enum AuthCommand {
 #[derive(Subcommand, Debug)]
 pub(crate) enum GpuCommand {
     /// Detect and benchmark local GPUs, rewriting the cached fingerprint.
+    #[command(alias = "benchmark")]
     Detect {
         /// Print machine-readable JSON output.
         #[arg(long)]
@@ -1497,6 +1498,18 @@ mod tests {
     #[test]
     fn gpu_detect_subcommand_accepts_json_flag() {
         let cli = Cli::parse_from(["mesh-llm", "gpu", "detect", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Gpus {
+                json: false,
+                command: Some(GpuCommand::Detect { json: true }),
+            })
+        ));
+    }
+
+    #[test]
+    fn gpu_benchmark_alias_parses() {
+        let cli = Cli::parse_from(["mesh-llm", "gpus", "benchmark", "--json"]);
         assert!(matches!(
             cli.command,
             Some(Command::Gpus {

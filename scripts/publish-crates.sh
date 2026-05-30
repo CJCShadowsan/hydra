@@ -329,6 +329,10 @@ unpublished_registry_deps() {
         model-artifact)
             printf '%s\n' model-ref
             ;;
+        model-fit)
+            printf '%s\n' \
+                model-artifact
+            ;;
         model-hf)
             printf '%s\n' \
                 model-artifact \
@@ -381,6 +385,7 @@ publish_crates=(
     mesh-llm-routing
     mesh-llm-types
     model-artifact
+    model-fit
     model-hf
     mesh-llm-client
     mesh-llm-api-client

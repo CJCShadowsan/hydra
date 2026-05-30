@@ -1,0 +1,17 @@
+[package]
+name = "model-fit"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Explainable hardware fit scoring for GGUF model artifacts"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+
+[dependencies]
+anyhow.workspace = true
+mesh-llm-gpu-bench = { path = "../mesh-llm-gpu-bench", version = "0.68.0" }
+model-artifact = { path = "../model-artifact", version = "0.68.0" }
+model-ref = { path = "../model-ref", version = "0.68.0" }
+model-resolver = { path = "../model-resolver", version = "0.68.0" }
+serde.workspace = true
+serde_json.workspace = true

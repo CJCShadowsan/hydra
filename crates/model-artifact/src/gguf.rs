@@ -208,12 +208,62 @@ fn read_gguf_value_as_f32(f: &mut std::fs::File, typ: GgufType) -> std::io::Resu
     }
 }
 
+fn read_gguf_value_as_bool(f: &mut std::fs::File, typ: GgufType) -> std::io::Result<Option<bool>> {
+    match typ {
+        GgufType::Bool => {
+            let mut buf = [0u8; 1];
+            f.read_exact(&mut buf)?;
+            Ok(Some(buf[0] != 0))
+        }
+        _ => {
+            skip_gguf_value(f, typ)?;
+            Ok(None)
+        }
+    }
+}
+
 fn read_gguf_value_as_string_opt(
     f: &mut std::fs::File,
     typ: GgufType,
 ) -> std::io::Result<Option<String>> {
     match typ {
         GgufType::String => Ok(Some(read_gguf_string(f)?)),
+        _ => {
+            skip_gguf_value(f, typ)?;
+            Ok(None)
+        }
+    }
+}
+
+fn read_gguf_value_as_string_array(
+    f: &mut std::fs::File,
+    typ: GgufType,
+) -> std::io::Result<Option<Vec<String>>> {
+    match typ {
+        GgufType::String => Ok(Some(vec![read_gguf_string(f)?])),
+        GgufType::Array => {
+            let elem_type = GgufType::from_u32(read_u32(f)?).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad array type")
+            })?;
+            let count = read_bounded_len(f, MAX_GGUF_ARRAY_ELEMENTS, "array")?;
+            if elem_type != GgufType::String {
+                for _ in 0..count {
+                    skip_gguf_value_with_depth(f, elem_type, 1)?;
+                }
+                return Ok(None);
+            }
+            let mut values = Vec::new();
+            values.try_reserve(count).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "GGUF string array requires too much memory",
+                )
+            })?;
+            for _ in 0..count {
+                values.push(read_gguf_string(f)?);
+            }
+            Ok(Some(values))
+        }
         _ => {
             skip_gguf_value(f, typ)?;
             Ok(None)
@@ -239,6 +289,59 @@ pub struct GgufCompactMeta {
     pub rope_freq_base: f32,
     pub expert_count: u32,
     pub expert_used_count: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GgufFitMeta {
+    pub general_name: Option<String>,
+    pub general_type: Option<String>,
+    pub general_tags: Vec<String>,
+    pub file_type: Option<u32>,
+    pub chat_template: Option<String>,
+    pub chat_templates: Vec<String>,
+    pub fim_pre_token_id: Option<u32>,
+    pub fim_suf_token_id: Option<u32>,
+    pub fim_mid_token_id: Option<u32>,
+    pub pooling_type: Option<u32>,
+    pub classifier_output_labels: Vec<String>,
+    pub rope_scaling_type: Option<String>,
+    pub rope_scaling_factor: Option<f32>,
+    pub rope_scaling_original_context_length: Option<u32>,
+    pub rope_scaling_finetuned: Option<bool>,
+    pub clip_projector_type: Option<String>,
+    pub clip_has_vision_encoder: Option<bool>,
+    pub clip_has_audio_encoder: Option<bool>,
+}
+
+impl GgufFitMeta {
+    pub fn has_chat_template(&self) -> bool {
+        self.chat_template
+            .as_deref()
+            .is_some_and(|template| !template.trim().is_empty())
+            || self
+                .chat_templates
+                .iter()
+                .any(|template| !template.trim().is_empty())
+    }
+
+    pub fn chat_template_text(&self) -> String {
+        let mut text = String::new();
+        if let Some(template) = &self.chat_template {
+            text.push_str(template);
+            text.push('\n');
+        }
+        for template in &self.chat_templates {
+            text.push_str(template);
+            text.push('\n');
+        }
+        text
+    }
+
+    pub fn has_fill_in_middle_tokens(&self) -> bool {
+        self.fim_pre_token_id.is_some()
+            && self.fim_suf_token_id.is_some()
+            && self.fim_mid_token_id.is_some()
+    }
 }
 
 impl GgufCompactMeta {
@@ -395,6 +498,12 @@ fn cache_bytes_per_token(
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GgufTensorByteProfile {
+    pub tensor_count: u64,
+    pub block_tensor_count: u64,
+    pub distinct_block_count: u32,
+    pub has_token_embedding_tensor: bool,
+    pub has_output_tensor: bool,
+    pub has_output_norm_tensor: bool,
     pub expert_count: u32,
     pub expert_used_count: u32,
     pub full_model_bytes: u64,
@@ -510,6 +619,98 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
     Some(meta)
 }
 
+/// Scan GGUF metadata used by model-fit capability and workload scoring.
+/// Reads only scalar and small string-array header values, never tensor data.
+pub fn scan_gguf_fit_meta(path: &Path) -> Option<GgufFitMeta> {
+    let mut f = std::fs::File::open(path).ok()?;
+
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+    let version = read_u32(&mut f).ok()?;
+    if version < 2 {
+        return None;
+    }
+    let _n_tensors = read_gguf_header_count(&mut f, MAX_GGUF_TENSOR_COUNT, "tensor count").ok()?;
+    let n_kv = read_gguf_header_count(&mut f, MAX_GGUF_HEADER_KV_COUNT, "KV count").ok()?;
+
+    let mut meta = GgufFitMeta::default();
+    for _ in 0..n_kv {
+        let key = read_gguf_string(&mut f).ok()?;
+        let vtype = GgufType::from_u32(read_u32(&mut f).ok()?)?;
+        match key.as_str() {
+            "general.name" => {
+                meta.general_name = read_gguf_value_as_string_opt(&mut f, vtype).ok()?;
+            }
+            "general.type" => {
+                meta.general_type = read_gguf_value_as_string_opt(&mut f, vtype).ok()?;
+            }
+            "general.tags" => {
+                meta.general_tags = read_gguf_value_as_string_array(&mut f, vtype)
+                    .ok()?
+                    .unwrap_or_default();
+            }
+            "general.file_type" => {
+                meta.file_type = read_gguf_value_as_u32(&mut f, vtype).ok()?;
+            }
+            "tokenizer.chat_template" => {
+                meta.chat_template = read_gguf_value_as_string_opt(&mut f, vtype).ok()?;
+            }
+            "tokenizer.chat_templates" => {
+                meta.chat_templates = read_gguf_value_as_string_array(&mut f, vtype)
+                    .ok()?
+                    .unwrap_or_default();
+            }
+            "tokenizer.ggml.fim_pre_token_id" | "tokenizer.ggml.prefix_token_id" => {
+                meta.fim_pre_token_id = read_gguf_value_as_u32(&mut f, vtype).ok()?;
+            }
+            "tokenizer.ggml.fim_suf_token_id" | "tokenizer.ggml.suffix_token_id" => {
+                meta.fim_suf_token_id = read_gguf_value_as_u32(&mut f, vtype).ok()?;
+            }
+            "tokenizer.ggml.fim_mid_token_id" | "tokenizer.ggml.middle_token_id" => {
+                meta.fim_mid_token_id = read_gguf_value_as_u32(&mut f, vtype).ok()?;
+            }
+            "clip.projector_type" => {
+                meta.clip_projector_type = read_gguf_value_as_string_opt(&mut f, vtype).ok()?;
+            }
+            "clip.has_vision_encoder" => {
+                meta.clip_has_vision_encoder = read_gguf_value_as_bool(&mut f, vtype).ok()?;
+            }
+            "clip.has_audio_encoder" => {
+                meta.clip_has_audio_encoder = read_gguf_value_as_bool(&mut f, vtype).ok()?;
+            }
+            _ if key.ends_with(".pooling_type") => {
+                meta.pooling_type = read_gguf_value_as_u32(&mut f, vtype).ok()?;
+            }
+            _ if key.ends_with(".classifier.output_labels") => {
+                meta.classifier_output_labels = read_gguf_value_as_string_array(&mut f, vtype)
+                    .ok()?
+                    .unwrap_or_default();
+            }
+            _ if key.ends_with(".rope.scaling.type") => {
+                meta.rope_scaling_type = read_gguf_value_as_string_opt(&mut f, vtype).ok()?;
+            }
+            _ if key.ends_with(".rope.scaling.factor") => {
+                meta.rope_scaling_factor = read_gguf_value_as_f32(&mut f, vtype).ok()?;
+            }
+            _ if key.ends_with(".rope.scaling.original_context_length") => {
+                meta.rope_scaling_original_context_length =
+                    read_gguf_value_as_u32(&mut f, vtype).ok()?;
+            }
+            _ if key.ends_with(".rope.scaling.finetuned") => {
+                meta.rope_scaling_finetuned = read_gguf_value_as_bool(&mut f, vtype).ok()?;
+            }
+            _ => {
+                skip_gguf_value(&mut f, vtype).ok()?;
+            }
+        }
+    }
+
+    Some(meta)
+}
+
 fn align_offset(value: u64, alignment: u32) -> u64 {
     let alignment = u64::from(alignment.max(1));
     let remainder = value % alignment;
@@ -565,6 +766,30 @@ fn is_expert_partitioned_tensor(name: &str) -> bool {
         || lower.contains("_expert")
 }
 
+fn tensor_block_index(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("blk.")?;
+    let digits = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn is_token_embedding_tensor(name: &str) -> bool {
+    matches!(name, "token_embd.weight" | "token_embd")
+}
+
+fn is_output_tensor(name: &str) -> bool {
+    matches!(name, "output.weight" | "output")
+}
+
+fn is_output_norm_tensor(name: &str) -> bool {
+    matches!(name, "output_norm.weight" | "output_norm")
+}
+
 /// Scan GGUF tensor metadata and estimate which bytes are always resident versus
 /// expert-partitioned. Reads only the header and tensor-info tables.
 pub fn scan_gguf_tensor_byte_profile(path: &Path) -> Option<GgufTensorByteProfile> {
@@ -612,6 +837,12 @@ pub fn scan_gguf_tensor_byte_profile(path: &Path) -> Option<GgufTensorByteProfil
     let mut tensors = read_tensor_infos(&mut f, n_tensors).ok()?;
     if tensors.is_empty() {
         return Some(GgufTensorByteProfile {
+            tensor_count: 0,
+            block_tensor_count: 0,
+            distinct_block_count: 0,
+            has_token_embedding_tensor: false,
+            has_output_tensor: false,
+            has_output_norm_tensor: false,
             expert_count,
             expert_used_count,
             full_model_bytes: file_len,
@@ -635,6 +866,11 @@ pub fn scan_gguf_tensor_byte_profile(path: &Path) -> Option<GgufTensorByteProfil
 
     let mut base_resident_bytes = 0u64;
     let mut expert_tensor_bytes = 0u64;
+    let mut block_indices = std::collections::BTreeSet::new();
+    let mut block_tensor_count = 0u64;
+    let mut has_token_embedding_tensor = false;
+    let mut has_output_tensor = false;
+    let mut has_output_norm_tensor = false;
     for (index, tensor) in tensors.iter().enumerate() {
         let next_offset = tensors
             .get(index + 1)
@@ -649,10 +885,23 @@ pub fn scan_gguf_tensor_byte_profile(path: &Path) -> Option<GgufTensorByteProfil
         } else {
             base_resident_bytes = base_resident_bytes.saturating_add(tensor_bytes);
         }
+        if let Some(block_index) = tensor_block_index(&tensor.name) {
+            block_indices.insert(block_index);
+            block_tensor_count = block_tensor_count.saturating_add(1);
+        }
+        has_token_embedding_tensor |= is_token_embedding_tensor(&tensor.name);
+        has_output_tensor |= is_output_tensor(&tensor.name);
+        has_output_norm_tensor |= is_output_norm_tensor(&tensor.name);
     }
 
     let file_overhead_bytes = file_len.saturating_sub(base_resident_bytes + expert_tensor_bytes);
     Some(GgufTensorByteProfile {
+        tensor_count: n_tensors.try_into().unwrap_or(u64::MAX),
+        block_tensor_count,
+        distinct_block_count: block_indices.len().try_into().unwrap_or(u32::MAX),
+        has_token_embedding_tensor,
+        has_output_tensor,
+        has_output_norm_tensor,
         expert_count,
         expert_used_count,
         full_model_bytes: file_len,

@@ -33,6 +33,7 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-test-harness"
   "model-ref"
   "model-artifact"
+  "model-fit"
   "model-hf"
   "model-resolver"
   "skippy-protocol"

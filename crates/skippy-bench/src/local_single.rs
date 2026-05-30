@@ -2,7 +2,7 @@ use std::{
     fs,
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -152,12 +152,29 @@ pub fn local_single(args: LocalSingleArgs) -> Result<()> {
     })
     .context("stage server did not become ready")?;
 
+    if args.warmup_new_tokens > 0 {
+        let warmup_request = TextRequest {
+            request_id: "local-single-warmup-1",
+            session_id: "local-single-warmup-session-1",
+            prompt: &args.prompt,
+            max_new_tokens: args.warmup_new_tokens,
+        };
+        client
+            .post(format!("{stage_http}/v1/text"))
+            .json(&warmup_request)
+            .send()
+            .context("failed to send warmup text request")?
+            .error_for_status()
+            .context("warmup text request failed")?;
+    }
+
     let request = TextRequest {
         request_id: "local-single-request-1",
         session_id: "local-single-session-1",
         prompt: &args.prompt,
         max_new_tokens: args.max_new_tokens,
     };
+    let text_request_start = Instant::now();
     let text_response: Value = client
         .post(format!("{stage_http}/v1/text"))
         .json(&request)
@@ -167,6 +184,16 @@ pub fn local_single(args: LocalSingleArgs) -> Result<()> {
         .context("text request failed")?
         .json()
         .context("failed to parse text response")?;
+    let text_request_elapsed = text_request_start.elapsed();
+    let generated_token_count = text_response
+        .get("generated_token_ids")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let generated_tokens_per_sec = if text_request_elapsed.as_secs_f64() > 0.0 {
+        Some(generated_token_count as f64 / text_request_elapsed.as_secs_f64())
+    } else {
+        None
+    };
 
     thread::sleep(Duration::from_secs(1));
     client
@@ -195,6 +222,10 @@ pub fn local_single(args: LocalSingleArgs) -> Result<()> {
             "run_id": run_id,
             "model_identity": run_config["model_identity"],
             "text_response": text_response,
+            "text_request_elapsed_ms": text_request_elapsed.as_secs_f64() * 1000.0,
+            "generated_token_count": generated_token_count,
+            "generated_tokens_per_sec": generated_tokens_per_sec,
+            "warmup_new_tokens": args.warmup_new_tokens,
             "report_counts": report["counts"],
         }))?
     );
