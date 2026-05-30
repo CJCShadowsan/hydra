@@ -30,6 +30,7 @@ pub fn validate_config(config: &MeshConfig) -> Result<()> {
     }
     validate_mesh_requirements_config(&config.mesh_requirements)?;
     validate_telemetry_config(&config.telemetry)?;
+    validate_agents(&config.agents)?;
     let defaults_hardware = config
         .defaults
         .as_ref()
@@ -47,6 +48,50 @@ pub fn validate_config(config: &MeshConfig) -> Result<()> {
             config.gpu.assignment,
             defaults_hardware,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_agents(agents: &[AgentConfigEntry]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, agent) in agents.iter().enumerate() {
+        let base_path = format!("agent[{index}]");
+        validate_agent_id(&agent.id, &format!("{base_path}.id"))?;
+        if !seen.insert(agent.id.trim()) {
+            bail!("{base_path}.id duplicates another configured agent");
+        }
+        validate_non_empty(&agent.name, &format!("{base_path}.name"))?;
+        validate_non_empty(&agent.description, &format!("{base_path}.description"))?;
+        validate_string_list(&agent.skills, &format!("{base_path}.skills"))?;
+        validate_string_list(&agent.input_modes, &format!("{base_path}.input_modes"))?;
+        validate_string_list(&agent.output_modes, &format!("{base_path}.output_modes"))?;
+        validate_agent_protocol(agent, &base_path)?;
+    }
+    Ok(())
+}
+
+fn validate_agent_id(value: &str, path: &str) -> Result<()> {
+    validate_non_empty(value, path)?;
+    let value = value.trim();
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        Ok(())
+    } else {
+        bail!("{path} must contain only ASCII letters, numbers, '.', '_' or '-'");
+    }
+}
+
+fn validate_agent_protocol(agent: &AgentConfigEntry, base_path: &str) -> Result<()> {
+    match agent.protocol {
+        AgentProtocol::A2a => {
+            validate_required_string(agent.endpoint.as_deref(), &format!("{base_path}.endpoint"))?;
+            validate_http_url(agent.endpoint.as_deref(), &format!("{base_path}.endpoint"))?;
+        }
+        AgentProtocol::Acp => {
+            validate_required_string(agent.command.as_deref(), &format!("{base_path}.command"))?;
+        }
     }
     Ok(())
 }
@@ -827,6 +872,26 @@ fn validate_non_empty(value: &str, path: &str) -> Result<()> {
         bail!("{path} must not be empty when set");
     }
     Ok(())
+}
+
+fn validate_required_string(value: Option<&str>, path: &str) -> Result<()> {
+    match value {
+        Some(value) => validate_non_empty(value, path),
+        None => bail!("{path} must be set"),
+    }
+}
+
+fn validate_http_url(value: Option<&str>, path: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_non_empty(value, path)?;
+    let parsed =
+        url::Url::parse(value).map_err(|err| anyhow::anyhow!("{path} is invalid: {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => bail!("{path} must use http or https, got {scheme}"),
+    }
 }
 
 fn validate_optional_enum(value: Option<&str>, allowed: &[&str], path: &str) -> Result<()> {

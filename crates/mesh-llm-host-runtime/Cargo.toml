@@ -20,6 +20,8 @@ workspace = true
 ansi-to-tui = "8"
 bytes = "1"
 mesh-mixture-of-agents = { path = "../mesh-mixture-of-agents" }
+mesh-llm-a2a = { path = "../mesh-llm-a2a" }
+mesh-llm-acp-bridge = { path = "../mesh-llm-acp-bridge" }
 mesh-llm-config = { path = "../mesh-llm-config" }
 mesh-llm-plugin = { path = "../mesh-llm-plugin" }
 mesh-llm-plugin-manager = { path = "../mesh-llm-plugin-manager" }

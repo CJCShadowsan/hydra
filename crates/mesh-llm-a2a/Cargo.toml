@@ -1,0 +1,20 @@
+[package]
+name = "mesh-llm-a2a"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A2A agent directory primitives for Mesh LLM"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+a2a-lf = "0.3.0"
+anyhow.workspace = true
+mesh-llm-config = { path = "../mesh-llm-config" }
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true

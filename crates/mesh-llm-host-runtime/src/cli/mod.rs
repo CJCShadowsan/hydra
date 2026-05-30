@@ -667,6 +667,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: DoctorCommand,
     },
+    /// Inspect configured A2A/ACP agents without starting them.
+    Agents {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Load a local model into a running mesh-llm instance.
     Load {
         /// Model name/path/url to load
@@ -908,6 +913,30 @@ pub(crate) enum PluginCommand {
     },
     /// List installed, auto-registered, and configured plugins.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum AgentCommand {
+    /// List configured agents.
+    List {
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one configured agent and its protocol projection.
+    Show {
+        /// Agent id from [[agent]].id.
+        id: String,
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate the configured agent directory.
+    Validate {
+        /// Print machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -14,8 +14,8 @@ pub use validate::validate_config;
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigStore, GpuAssignment, LocalServingNodeConfig, MeshConfig, ModelRuntimeKind,
-        parse_config_toml,
+        AgentProtocol, ConfigStore, GpuAssignment, LocalServingNodeConfig, MeshConfig,
+        ModelRuntimeKind, parse_config_toml,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -206,6 +206,55 @@ reconcile_model_targets = true
         .unwrap();
 
         assert!(config.runtime.reconcile_model_targets);
+    }
+
+    #[test]
+    fn agent_directory_deserializes_from_toml() {
+        let config = parse_config_toml(
+            r#"
+version = 1
+
+[[agent]]
+id = "codex"
+name = "Codex"
+description = "Local coding agent"
+protocol = "acp"
+command = "codex"
+
+[[agent]]
+id = "remote-coder"
+name = "Remote Coder"
+description = "Remote A2A coding agent"
+protocol = "a2a"
+endpoint = "https://agents.example.com/remote-coder"
+skills = ["coding"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.agents[0].protocol, AgentProtocol::Acp);
+        assert_eq!(config.agents[1].protocol, AgentProtocol::A2a);
+    }
+
+    #[test]
+    fn agent_directory_rejects_wrong_protocol_target() {
+        let err = parse_config_toml(
+            r#"
+version = 1
+
+[[agent]]
+id = "remote"
+name = "Remote"
+description = "bad"
+protocol = "a2a"
+endpoint = "file:///tmp/agent.sock"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("must use http or https"));
     }
 
     #[test]

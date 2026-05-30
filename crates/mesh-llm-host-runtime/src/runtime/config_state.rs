@@ -249,6 +249,7 @@ mod tests {
             runtime: Default::default(),
             models: vec![],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         }
     }
@@ -576,6 +577,7 @@ reasoning_format = "qwen"
                 ..Default::default()
             }],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
 
@@ -622,6 +624,7 @@ reasoning_format = "qwen"
                 ..Default::default()
             }],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
         state.apply(config_with_model, 0);
@@ -781,6 +784,7 @@ temperature = 0.2
                 ..Default::default()
             }],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
 

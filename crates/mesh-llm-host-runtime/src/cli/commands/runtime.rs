@@ -568,6 +568,7 @@ mod tests {
             mesh_requirements: Default::default(),
             models: Vec::new(),
             plugins: Vec::new(),
+            agents: Vec::new(),
             owner_control: Default::default(),
             telemetry: Default::default(),
             defaults: None,

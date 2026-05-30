@@ -26,6 +26,8 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-plugin"
   "mesh-llm-skills"
   "mesh-llm-plugin-manager"
+  "mesh-llm-a2a"
+  "mesh-llm-acp-bridge"
   "mesh-llm-client"
   "mesh-llm-api-client"
   "mesh-llm-api-server"

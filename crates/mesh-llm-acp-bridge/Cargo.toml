@@ -1,0 +1,19 @@
+[package]
+name = "mesh-llm-acp-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ACP bridge planning primitives for Mesh LLM agents"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+agent-client-protocol = "0.12.1"
+anyhow.workspace = true
+mesh-llm-a2a = { path = "../mesh-llm-a2a" }
+mesh-llm-config = { path = "../mesh-llm-config" }
+serde.workspace = true

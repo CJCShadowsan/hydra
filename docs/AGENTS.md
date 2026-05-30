@@ -257,6 +257,44 @@ reusable `nightly-stability-run.yml` workflow, which owns the harness run,
 artifact upload, and timing summary. Treat this as a trend/evidence harness,
 not a required PR gate.
 
+## Agent Directory
+
+Mesh LLM can read a local agent directory from `~/.mesh-llm/config.toml`.
+This is a control-plane registry only: it validates A2A/ACP agent metadata and
+lets operators inspect the projected A2A card or ACP bridge plan without
+starting an agent process or publishing anything to the mesh.
+
+```toml
+[[agent]]
+id = "codex"
+name = "Codex"
+description = "Local coding agent"
+protocol = "acp"
+command = "codex"
+args = ["--model", "gpt-5"]
+skills = ["coding", "tool-use"]
+
+[[agent]]
+id = "remote-coder"
+name = "Remote Coder"
+description = "Remote A2A-compatible coding agent"
+protocol = "a2a"
+endpoint = "https://agents.example.com/remote-coder"
+skills = ["coding"]
+```
+
+Inspect the directory:
+
+```bash
+mesh-llm agents list
+mesh-llm agents show codex --json
+mesh-llm agents validate
+```
+
+`protocol = "a2a"` requires an HTTP(S) `endpoint`. `protocol = "acp"`
+requires a local `command`; the current bridge plan is metadata-only and does
+not spawn the command.
+
 ## curl or any OpenAI client
 
 ```bash

@@ -2026,6 +2026,7 @@ alias = "model-alias"
                 args: vec!["--plugin".to_string()],
                 url: None,
             }],
+            agents: vec![],
             extra: Default::default(),
         };
         let snapshot = mesh_config_to_proto(&config);
@@ -2083,6 +2084,7 @@ alias = "model-alias"
             runtime: Default::default(),
             models: vec![],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
         let snapshot = mesh_config_to_proto(&original);
@@ -2219,6 +2221,7 @@ alias = "model-alias"
                 ..Default::default()
             }],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
         let snap1 = mesh_config_to_proto(&config);
@@ -2252,6 +2255,7 @@ alias = "model-alias"
                 ..Default::default()
             }],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
         let snap3 = mesh_config_to_proto(&config2);
@@ -2319,6 +2323,7 @@ alias = "model-alias"
                 ..Default::default()
             }],
             plugins: vec![],
+            agents: vec![],
             extra: Default::default(),
         };
 

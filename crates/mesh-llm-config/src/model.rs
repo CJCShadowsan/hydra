@@ -24,6 +24,8 @@ pub struct MeshConfig {
     pub models: Vec<ModelConfigEntry>,
     #[serde(rename = "plugin", default)]
     pub plugins: Vec<PluginConfigEntry>,
+    #[serde(rename = "agent", default)]
+    pub agents: Vec<AgentConfigEntry>,
     #[serde(flatten, default)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -618,6 +620,8 @@ struct RawMeshConfig {
     models: Vec<ModelConfigEntry>,
     #[serde(rename = "plugin", default)]
     plugins: Vec<PluginConfigEntry>,
+    #[serde(rename = "agent", default)]
+    agents: Vec<AgentConfigEntry>,
     #[serde(flatten, default)]
     extra: BTreeMap<String, toml::Value>,
 }
@@ -715,6 +719,7 @@ impl<'de> Deserialize<'de> for MeshConfig {
             runtime: raw.runtime,
             models: raw.models,
             plugins: raw.plugins,
+            agents: raw.agents,
             extra: raw.extra,
         })
     }
@@ -948,4 +953,33 @@ pub struct PluginConfigEntry {
     /// Optional URL passed to the plugin as `MESH_LLM_PLUGIN_URL`.
     #[serde(default)]
     pub url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProtocol {
+    A2a,
+    Acp,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentConfigEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub protocol: AgentProtocol,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub input_modes: Vec<String>,
+    #[serde(default)]
+    pub output_modes: Vec<String>,
 }
