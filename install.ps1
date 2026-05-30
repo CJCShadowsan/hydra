@@ -325,6 +325,30 @@ function Install-Bundle {
     }
 }
 
+function Install-RecommendedNativeRuntime {
+    param([string]$TempDir)
+    $meshBinary = Join-Path $InstallDir "mesh-llm.exe"
+    if (-not (Test-Path $meshBinary)) {
+        return
+    }
+
+    $manifestPath = Join-Path $TempDir "native-runtimes.json"
+    $manifestUrl = Get-ReleaseUrl "native-runtimes.json"
+    try {
+        Invoke-WebRequest -Uri $manifestUrl -OutFile $manifestPath
+    } catch {
+        Write-Host "Native runtime manifest was not available for this release; skipping runtime install."
+        return
+    }
+
+    & $meshBinary runtime install --manifest $manifestPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Native runtime install did not complete successfully."
+        return
+    }
+    & $meshBinary runtime prune --active-only
+}
+
 function Add-InstallDirToPath {
     if ($NoPathUpdate) {
         return
@@ -380,6 +404,7 @@ try {
     }
 
     Install-Bundle $bundleDir
+    Install-RecommendedNativeRuntime $tmpRoot
     Add-InstallDirToPath
 
     Write-Host "Installed $asset to $InstallDir"

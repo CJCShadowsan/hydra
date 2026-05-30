@@ -29,13 +29,16 @@ pub(crate) async fn dispatch_runtime_command(command: Option<&RuntimeCommand>) -
             bundle_dirs,
             cache_dir,
             json,
-        }) => runtime_native::run_native_runtime_install(
-            runtime.as_deref(),
-            manifest.as_deref(),
-            bundle_dirs,
-            cache_dir.as_deref(),
-            *json,
-        ),
+        }) => {
+            runtime_native::run_native_runtime_install(
+                runtime.as_deref(),
+                manifest.as_deref(),
+                bundle_dirs,
+                cache_dir.as_deref(),
+                *json,
+            )
+            .await
+        }
         Some(RuntimeCommand::Remove {
             native_runtime_id,
             mesh_version,

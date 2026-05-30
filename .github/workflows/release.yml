@@ -746,7 +746,6 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
-        if: github.event_name == 'workflow_dispatch'
         with:
           fetch-depth: 0
 
@@ -762,6 +761,16 @@ jobs:
 
       - name: Remove smoke-only binary
         run: rm -f release-artifacts/mesh-llm
+
+      - name: Generate native runtime release manifest
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          scripts/generate-native-runtime-release-manifest.sh \
+            --tag "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --out release-artifacts/native-runtimes.json \
+            release-artifacts/meshllm-native-*.tar.gz
 
       - name: Download generated SwiftPM manifest
         if: github.event_name == 'workflow_dispatch'

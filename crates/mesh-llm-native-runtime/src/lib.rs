@@ -3,6 +3,7 @@
 mod cache;
 mod flavor;
 mod host;
+mod load_plan;
 mod manifest;
 mod resolver;
 
@@ -12,9 +13,10 @@ pub use cache::{
 };
 pub use flavor::{NativeRuntimeFlavor, NativeRuntimeFlavorParseError};
 pub use host::{HostGpuProfile, HostRuntimeProfile};
+pub use load_plan::NativeRuntimeLoadPlan;
 pub use manifest::{
-    NativeRuntimeArtifact, NativeRuntimeManifest, NativeRuntimeReleaseManifest,
-    NativeRuntimeRequirement,
+    NATIVE_RUNTIME_MANIFEST_FILE, NativeRuntimeArtifact, NativeRuntimeManifest,
+    NativeRuntimeReleaseManifest, NativeRuntimeRequirement,
 };
 pub use resolver::{
     CandidateEvaluation, CandidateRejection, NativeRuntimeResolution, NativeRuntimeResolver,

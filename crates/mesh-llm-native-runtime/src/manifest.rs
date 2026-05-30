@@ -17,7 +17,9 @@ pub struct NativeRuntimeRequirement {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeRuntimeArtifact {
+    #[serde(alias = "artifact_id")]
     pub native_runtime_id: String,
+    #[serde(alias = "sdk_version")]
     pub mesh_version: String,
     #[serde(default)]
     pub target_triple: Option<String>,
@@ -45,6 +47,13 @@ pub struct NativeRuntimeManifest {
     pub artifact: NativeRuntimeArtifact,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NativeRuntimeManifestWire {
+    Wrapped { artifact: NativeRuntimeArtifact },
+    Direct(NativeRuntimeArtifact),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeRuntimeReleaseManifest {
     pub mesh_version: String,
@@ -57,8 +66,12 @@ impl NativeRuntimeManifest {
         let path = dir.join(NATIVE_RUNTIME_MANIFEST_FILE);
         let text = fs::read_to_string(&path)
             .with_context(|| format!("read native runtime manifest {}", path.display()))?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("parse native runtime manifest {}", path.display()))
+        let wire: NativeRuntimeManifestWire = serde_json::from_str(&text)
+            .with_context(|| format!("parse native runtime manifest {}", path.display()))?;
+        Ok(match wire {
+            NativeRuntimeManifestWire::Wrapped { artifact } => Self { artifact },
+            NativeRuntimeManifestWire::Direct(artifact) => Self { artifact },
+        })
     }
 
     pub fn write_to_dir(&self, dir: &Path) -> Result<()> {
@@ -121,4 +134,60 @@ fn validate_artifact(artifact: &NativeRuntimeArtifact) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_direct_sdk_manifest_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join(NATIVE_RUNTIME_MANIFEST_FILE),
+            r#"{
+  "artifact_id": "meshllm-native-linux-x86_64-cpu",
+  "sdk_version": "0.68.0",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "os": "linux",
+  "arch": "x86_64",
+  "flavor": "cpu",
+  "library_paths": ["lib/libmeshllm_ffi.so"]
+}"#,
+        )
+        .unwrap();
+
+        let manifest = NativeRuntimeManifest::read_from_dir(temp.path()).unwrap();
+
+        assert_eq!(
+            manifest.artifact.native_runtime_id,
+            "meshllm-native-linux-x86_64-cpu"
+        );
+        assert_eq!(manifest.artifact.mesh_version, "0.68.0");
+    }
+
+    #[test]
+    fn preserves_unknown_flavor_as_string() {
+        let artifact = NativeRuntimeArtifact {
+            native_runtime_id: "meshllm-native-linux-x86_64-cuda-sm120".to_string(),
+            mesh_version: "0.68.0".to_string(),
+            target_triple: Some("x86_64-unknown-linux-gnu".to_string()),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            flavor: NativeRuntimeFlavor::Other("cuda-sm120".to_string()),
+            priority: 0,
+            skippy_abi_version: None,
+            url: None,
+            sha256: None,
+            signature: None,
+            library_paths: vec!["lib/libmeshllm_ffi.so".to_string()],
+            requirements: Vec::new(),
+        };
+
+        let text = serde_json::to_string(&artifact).unwrap();
+        let reparsed = serde_json::from_str::<NativeRuntimeArtifact>(&text).unwrap();
+
+        assert_eq!(reparsed.flavor, artifact.flavor);
+        assert!(text.contains("\"cuda-sm120\""));
+    }
 }

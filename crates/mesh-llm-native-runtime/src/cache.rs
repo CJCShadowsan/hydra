@@ -217,6 +217,8 @@ mod tests {
     use crate::{NativeRuntimeArtifact, NativeRuntimeFlavor};
 
     fn write_runtime(dir: &Path, version: &str, id: &str) {
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("lib/libmeshllm_ffi.so"), b"native runtime").unwrap();
         let manifest = NativeRuntimeManifest {
             artifact: NativeRuntimeArtifact {
                 native_runtime_id: id.to_string(),
@@ -230,7 +232,7 @@ mod tests {
                 url: None,
                 sha256: None,
                 signature: None,
-                library_paths: Vec::new(),
+                library_paths: vec!["lib/libmeshllm_ffi.so".to_string()],
                 requirements: Vec::new(),
             },
         };
@@ -267,5 +269,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.remove_dirs, vec![cache.root().join("0.67.0")]);
+    }
+
+    #[test]
+    fn installed_runtime_exposes_load_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        write_runtime(&source, "0.68.0", "meshllm-native-linux-x86_64-cpu");
+
+        let cache = NativeRuntimeCache::new(temp.path().join("cache"));
+        let installed = cache.install_from_dir(&source).unwrap();
+        let plan = installed.load_plan().unwrap();
+
+        assert_eq!(plan.native_runtime_id, "meshllm-native-linux-x86_64-cpu");
+        assert_eq!(
+            plan.libraries,
+            vec![
+                cache
+                    .runtime_dir("0.68.0", "meshllm-native-linux-x86_64-cpu")
+                    .join("lib/libmeshllm_ffi.so")
+            ]
+        );
     }
 }
