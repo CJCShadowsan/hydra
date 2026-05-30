@@ -157,7 +157,7 @@ should expose operations equivalent to:
 - prune runtimes for older MeshLLM versions
 - diagnose why a runtime was selected or rejected
 
-The CLI should mirror those operations, for example:
+The `mesh-llm runtime` CLI should own inventory and cache management:
 
 ```bash
 mesh-llm runtime list --available
@@ -166,8 +166,13 @@ mesh-llm runtime install cuda
 mesh-llm runtime remove meshllm-native-linux-x86_64-cuda
 mesh-llm runtime prune
 mesh-llm runtime prune --active-only
-mesh-llm runtime doctor
 ```
+
+Selected-runtime diagnostics belong in `mesh-llm doctor`, not in a separate
+`mesh-llm runtime doctor` command. Doctor output should include the active
+MeshLLM version, selected native runtime ID, runtime flavor, runtime path,
+cache path, manifest version, verification status, and any rejected compatible
+candidates with reasons.
 
 The `mesh-llm runtime` commands should use the same interactive UX conventions
 as the rest of the MeshLLM CLI:
