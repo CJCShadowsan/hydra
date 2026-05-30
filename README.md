@@ -188,7 +188,7 @@ run `mesh-llm doctor` first and attach the output archive to a new GitHub issue:
 mesh-llm doctor
 ```
 
-Open `https://github.com/Mesh-LLM/mesh-llm/issues/new`, attach the archive
-created by `mesh-llm doctor`, and include the command you ran, platform/backend
-flavor, model ref, `/api/status` output if available, and whether the node was
-private, published, or joined with `--auto`.
+Open a [new GitHub issue](https://github.com/Mesh-LLM/mesh-llm/issues/new),
+attach the archive created by `mesh-llm doctor`, and include the command you
+ran, platform/backend flavor, model ref, `/api/status` output if available, and
+whether the node was private, published, or joined with `--auto`.

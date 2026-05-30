@@ -12,7 +12,7 @@ Capture a doctor archive:
 mesh-llm doctor
 ```
 
-Open a new GitHub issue at `https://github.com/Mesh-LLM/mesh-llm/issues/new` and attach the archive created by `mesh-llm doctor`. Include the command you ran, your OS, GPU/backend flavor, model ref, whether you used a private mesh or `--auto`, and what you expected to happen.
+Open a [new GitHub issue](https://github.com/Mesh-LLM/mesh-llm/issues/new) and attach the archive created by `mesh-llm doctor`. Include the command you ran, your OS, GPU/backend flavor, model ref, whether you used a private mesh or `--auto`, and what you expected to happen.
 
 ## Is Mesh running?
 
