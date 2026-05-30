@@ -8,7 +8,8 @@ license.workspace = true
 default = ["client", "serve"]
 client = ["dep:anyhow", "dep:mesh-llm-host-runtime", "dep:serde_json"]
 serve = ["dep:anyhow", "dep:mesh-llm-host-runtime", "dep:serde_json"]
-web-ui = ["mesh-llm-host-runtime?/web-ui"]
+console = ["dep:mesh-llm-console-server"]
+web-ui = ["console", "mesh-llm-host-runtime?/web-ui"]
 
 [lints]
 workspace = true
@@ -16,4 +17,5 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+mesh-llm-console-server = { path = "../mesh-llm-console-server", optional = true }
 mesh-llm-host-runtime = { path = "../mesh-llm-host-runtime", default-features = false, optional = true }

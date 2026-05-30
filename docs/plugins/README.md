@@ -8,8 +8,8 @@ As implementation lands, this document should be updated to match the intended e
 
 Plugin-specific documentation:
 
-- [Flash-MoE](flash-moe.md) - built-in OpenAI-compatible backend adapter for single-node SSD expert streaming
-- [Telemetry](telemetry.md) - built-in OTLP metrics-only runtime and routing telemetry
+- [Flash-MoE](flash-moe.md) - external OpenAI-compatible backend adapter for single-node SSD expert streaming
+- [Telemetry](telemetry.md) - OTLP metrics-only runtime telemetry and external metrics plugin notes
 
 The main goals are:
 
@@ -51,6 +51,22 @@ A plugin owns:
 Plugins do not need to implement raw MCP or raw HTTP servers.
 
 The `stapler` is the host projection layer that turns plugin manifests into exposed MCP and HTTP surfaces.
+
+## Launch Contract
+
+When `mesh-llm` launches an external plugin, it provides the host connection
+details through environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `MESH_LLM_PLUGIN_ENDPOINT` | Local IPC endpoint the plugin connects to |
+| `MESH_LLM_PLUGIN_TRANSPORT` | Transport kind, such as `unix` or `pipe` |
+| `MESH_LLM_PLUGIN_NAME` | Configured plugin name |
+| `MESH_LLM_PLUGIN_URL` | Optional `[[plugin]].url` value from config |
+
+Plugin-specific configuration should live in the plugin process or use generic
+plugin config fields. The host should not special-case behavior for a plugin by
+repository or package name.
 
 ## High-Level Model
 

@@ -27,7 +27,19 @@ The release bundle is now a single `mesh-llm` runtime binary. External
 just bundle
 ```
 
-This creates `/tmp/mesh-bundle.tar.gz` containing `mesh-llm`.
+This creates `/tmp/mesh-bundle.tar.gz` containing the packaged `mesh-llm`
+executable. That packaged binary is the release-attestation source of truth.
+Local and dev builds from `just build` stay unstamped by default, so `missing`
+is expected there.
+
+Verify the packaged executable with `cargo run -p xtask -- release-attestation inspect --binary /tmp/test-bundle/mesh-llm --public-key-file /tmp/mesh-release-key.pub`.
+`valid` means the packaged binary matches a trusted release signer, `missing`
+means an unstamped build, and `invalid` means the bytes changed after packaging.
+Bare `inspect --binary ...` is only sufficient for unstamped binaries that
+should classify as `missing`; a stamped package requires `--public-key-file` and
+otherwise reports `invalid` with an explicit error. A post-download mutation can
+turn a stamped binary `invalid`, but default startup still allows it because this
+is provenance and admission hardening, not runtime integrity proof.
 
 Platform release archives are created with:
 
@@ -59,12 +71,13 @@ in the workflow workspace, and creates the requested release tag at a
 manifest-only commit before publishing.
 
 The current GitHub Actions release workflow publishes macOS aarch64, Linux
-x86_64 CPU, Linux ARM64 CPU, Linux CUDA, Linux CUDA Blackwell, Linux ROCm,
-Linux Vulkan, Windows CPU, Windows CUDA, Windows ROCm, and Windows Vulkan
-bundles, plus the SwiftPM `MeshLLMFFI.xcframework.zip` binary artifact. The
-Linux ARM64 artifact is named
-`mesh-llm-aarch64-unknown-linux-gnu.tar.gz`; CUDA lanes are named
-`mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz` and
+x86_64 CPU, Linux ARM64 CPU, Linux ARM64 CUDA, Linux CUDA, Linux CUDA
+Blackwell, Linux ROCm, Linux Vulkan, Windows CPU, Windows CUDA, Windows ROCm,
+and Windows Vulkan bundles, plus the SwiftPM `MeshLLMFFI.xcframework.zip`
+binary artifact. The Linux ARM64 CPU artifact is named
+`mesh-llm-aarch64-unknown-linux-gnu.tar.gz`; the Linux ARM64 CUDA artifact is
+named `mesh-llm-aarch64-unknown-linux-gnu-cuda.tar.gz`. x86_64 CUDA lanes are
+named `mesh-llm-x86_64-unknown-linux-gnu-cuda.tar.gz` and
 `mesh-llm-x86_64-unknown-linux-gnu-cuda-blackwell.tar.gz`.
 
 Windows release artifacts use the `x86_64-pc-windows-msvc` target triple and

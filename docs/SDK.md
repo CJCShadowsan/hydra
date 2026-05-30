@@ -239,6 +239,28 @@ mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "<commi
 consumer binary. The local management API still runs for status and lifecycle
 checks.
 
+To include the web console in the embedded Rust node, enable `web-ui` and turn
+on `console_ui`:
+
+```toml
+[dependencies]
+mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", rev = "<commit>", default-features = false, features = ["client", "web-ui"] }
+```
+
+SDK packages that ship the built console as package resources can enable the
+`console` feature and use the file-backed console server without embedding
+those assets into the native runtime:
+
+```rust
+let console = mesh_llm_sdk::console::start_file_console(
+    mesh_llm_sdk::console::ConsoleServerOptions {
+        asset_dir: "/path/to/packaged/console/dist".into(),
+        port: 0,
+        listen_all: false,
+    },
+).await?;
+```
+
 ```rust
 use mesh_llm_sdk::client::{self, EmbeddedClientConfig};
 

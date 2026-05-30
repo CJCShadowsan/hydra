@@ -28,6 +28,7 @@ pub(crate) fn status_payload(snapshot: StatusViewSnapshot) -> StatusPayload {
         latest_version: snapshot.latest_version,
         node_id: snapshot.node_id,
         owner: snapshot.owner,
+        release_attestation: snapshot.release_attestation,
         token: snapshot.token,
         node_state: snapshot.node_state,
         node_status: snapshot.node_status,
@@ -67,6 +68,8 @@ pub(crate) fn status_payload(snapshot: StatusViewSnapshot) -> StatusPayload {
         routing_affinity: snapshot.routing_affinity,
         routing_metrics: snapshot.routing_metrics,
         first_joined_mesh_ts: snapshot.hardware.first_joined_mesh_ts,
+        mesh_requirements: None,
+        recent_mesh_rejections: vec![],
     }
 }
 
@@ -80,7 +83,7 @@ mod tests {
     use crate::api::status::{
         LocalInstance, NodeState, StatusPayload, build_gpus, build_ownership_payload,
     };
-    use crate::crypto::OwnershipSummary;
+    use crate::crypto::{OwnershipSummary, ReleaseAttestationStatus, ReleaseAttestationSummary};
     use crate::mesh::MeshCatalogEntry;
     use crate::models::LocalModelInventorySnapshot;
     use crate::runtime::instance::LocalInstanceSnapshot;
@@ -119,6 +122,12 @@ mod tests {
             latest_version: Some("0.68.0".into()),
             node_id: "node-1".into(),
             owner: OwnershipSummary::default(),
+            release_attestation: ReleaseAttestationSummary {
+                status: ReleaseAttestationStatus::Valid,
+                signer_key_id: Some("ed25519:test-signer".into()),
+                verified: true,
+                ..ReleaseAttestationSummary::default()
+            },
             token: "invite-token".into(),
             is_host: false,
             is_client: false,
@@ -149,6 +158,12 @@ mod tests {
             latest_version: Some("0.68.0".into()),
             node_id: "node-1".into(),
             owner: build_ownership_payload(&OwnershipSummary::default()),
+            release_attestation: ReleaseAttestationSummary {
+                status: ReleaseAttestationStatus::Valid,
+                signer_key_id: Some("ed25519:test-signer".into()),
+                verified: true,
+                ..ReleaseAttestationSummary::default()
+            },
             token: "invite-token".into(),
             node_state: NodeState::Standby,
             node_status: NodeState::Standby.node_status_alias().into(),
@@ -202,6 +217,8 @@ mod tests {
             routing_affinity: crate::network::affinity::AffinityStatsSnapshot::default(),
             routing_metrics: crate::network::metrics::RoutingMetricsStatusSnapshot::default(),
             first_joined_mesh_ts: Some(123),
+            mesh_requirements: None,
+            recent_mesh_rejections: vec![],
         };
 
         assert_eq!(

@@ -14,6 +14,11 @@ on:
         required: true
         default: false
         type: boolean
+      canary:
+        description: Dry-run mode — build + smoke everything but skip actual publishing
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
@@ -36,12 +41,14 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
       skip_gpu_bundles: ${{ steps.meta.outputs.skip_gpu_bundles }}
+      canary: ${{ steps.meta.outputs.canary }}
     steps:
       - id: meta
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SKIP_GPU_BUNDLES: ${{ inputs.skip_gpu_bundles || 'false' }}
+          INPUT_CANARY: ${{ inputs.canary || 'false' }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -63,6 +70,7 @@ jobs:
             echo "version=$version"
             echo "prerelease=$prerelease"
             echo "skip_gpu_bundles=$INPUT_SKIP_GPU_BUNDLES"
+            echo "canary=$INPUT_CANARY"
           } >> "$GITHUB_OUTPUT"
 
   build:
@@ -124,8 +132,14 @@ jobs:
 
       - name: Build release bundle
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
+          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
+          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
           just --shell bash --shell-arg -c ${{ matrix.build_recipe }}
           just --shell bash --shell-arg -c ${{ matrix.bundle_recipe }} "$RELEASE_TAG" dist
 
@@ -138,10 +152,19 @@ jobs:
 
       - name: Upload Linux smoke binary
         if: matrix.artifact_name == 'release-linux'
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          tar -xzf dist/mesh-llm-x86_64-unknown-linux-gnu.tar.gz -C "$tmp_dir"
+          cp "$tmp_dir/mesh-bundle/mesh-llm" dist/mesh-llm
+
+      - name: Upload Linux smoke binary artifact
+        if: matrix.artifact_name == 'release-linux'
         uses: actions/upload-artifact@v6
         with:
           name: release-linux-inference-binary
-          path: target/release/mesh-llm
+          path: dist/mesh-llm
           if-no-files-found: error
 
   inference_smoke_tests:
@@ -309,25 +332,37 @@ jobs:
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Build ARM64 CPU release bundle
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
-          just --shell bash --shell-arg -c release-build-arm64
-          just --shell bash --shell-arg -c release-bundle-arm64 "$RELEASE_TAG" dist
+          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
+          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+          just --shell bash --shell-arg -c release-build-aarch64
+          just --shell bash --shell-arg -c release-bundle-aarch64 "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-arm64
           path: dist/*
           if-no-files-found: error
 
-  build_linux_cuda:
-    name: Build Linux CUDA
+  build_linux_aarch64_cuda:
+    name: Build Linux aarch64 CUDA (${{ matrix.cuda_version }})
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.9.2', '13.1.2']
     container:
-      image: nvidia/cuda:${{ vars.CUDA_VERSION || '12.6.3' }}-devel-ubuntu22.04
+      image: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04
     env:
       LLAMA_STAGE_BACKEND: cuda
+      MESH_RELEASE_ARCH: aarch64
+      MESH_CUDA_VERSION: ${{ matrix.cuda_version }}
     steps:
       - name: Install base packages
         run: |
@@ -342,6 +377,60 @@ jobs:
           done
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            .github/cache-version.txt
+            crates/mesh-llm-ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - name: Build aarch64 CUDA release bundle
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          just --shell bash --shell-arg -c release-build-aarch64-cuda
+          just --shell bash --shell-arg -c release-bundle-aarch64-cuda "$RELEASE_TAG" dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-linux-aarch64-cuda-${{ matrix.cuda_version }}
+          path: dist/*
+          if-no-files-found: error
+
+  build_linux_cuda:
+    name: Build Linux CUDA (${{ matrix.cuda_version }})
+    needs: metadata
+    if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_version: ['12.9.2', '13.1.2']
+    container:
+      image: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04
+    env:
+      LLAMA_STAGE_BACKEND: cuda
+      MESH_CUDA_VERSION: ${{ matrix.cuda_version }}
+    steps:
+      - name: Install base packages
+        run: |
+          for attempt in 1 2 3; do
+            apt-get -o Acquire::Retries=5 update &&
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
+              break
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@v5
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -361,67 +450,23 @@ jobs:
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Build CUDA release bundle
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
+          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
+          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
           just --shell bash --shell-arg -c release-build-cuda
           just --shell bash --shell-arg -c release-bundle-cuda "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
         with:
-          name: release-linux-cuda
+          name: release-linux-cuda-${{ matrix.cuda_version }}
           path: dist/*
           if-no-files-found: error
 
-  build_linux_cuda_blackwell:
-    name: Build Linux CUDA (Blackwell)
-    needs: metadata
-    if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    container:
-      image: nvidia/cuda:${{ vars.CUDA_BLACKWELL_VERSION || '12.8.0' }}-devel-ubuntu22.04
-    env:
-      LLAMA_STAGE_BACKEND: cuda
-    steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - name: Prepare dispatched release version
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-        run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build CUDA Blackwell release bundle
-        env:
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-        run: |
-          just --shell bash --shell-arg -c release-build-cuda-blackwell
-          just --shell bash --shell-arg -c release-bundle-cuda-blackwell "$RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-linux-cuda-blackwell
-          path: dist/*
-          if-no-files-found: error
+
 
   build_linux_rocm:
     name: Build Linux ROCm
@@ -446,6 +491,8 @@ jobs:
           done
           rm -rf /var/lib/apt/lists/*
       - uses: actions/checkout@v5
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -465,8 +512,14 @@ jobs:
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Build ROCm release bundle
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
+          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
+          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
           just --shell bash --shell-arg -c release-build-rocm
           just --shell bash --shell-arg -c release-bundle-rocm "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
@@ -505,8 +558,14 @@ jobs:
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Build Vulkan release bundle
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
+          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
+          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
           just --shell bash --shell-arg -c release-build-vulkan
           just --shell bash --shell-arg -c release-bundle-vulkan "$RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
@@ -545,9 +604,15 @@ jobs:
       - name: Build Windows CPU release bundle
         shell: pwsh
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           MESH_LLM_REQUIRE_SCCACHE: "1"
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
+          Set-Content -Path $env:MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE -Value $env:RELEASE_ATTESTATION_SIGNING_KEY -NoNewline
+          Set-Content -Path $env:MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE -Value $env:RELEASE_ATTESTATION_PUBLIC_KEY -NoNewline
           just release-build-windows
           just release-bundle-windows "$env:RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
@@ -568,7 +633,7 @@ jobs:
       # pulls latest = CUDA 13.2, which deterministically crashes sccache
       # on nvcc output (see mozilla/sccache#2470). CI pins to the same
       # version via Jimver/cuda-toolkit; mirror that here.
-      WINDOWS_CUDA_VERSION: ${{ vars.CUDA_VERSION || '12.6.3' }}
+      WINDOWS_CUDA_VERSION: ${{ vars.CUDA_VERSION || '12.9.2' }}
     strategy:
       fail-fast: false
       matrix:
@@ -644,10 +709,16 @@ jobs:
       - name: Build Windows GPU release bundle
         shell: pwsh
         env:
+          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           MESH_LLM_REQUIRE_SCCACHE: "1"
           MESH_LLM_WINDOWS_BUILD_JOBS: ${{ matrix.backend == 'cuda' && '1' || '' }}
+          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
+          Set-Content -Path $env:MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE -Value $env:RELEASE_ATTESTATION_SIGNING_KEY -NoNewline
+          Set-Content -Path $env:MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE -Value $env:RELEASE_ATTESTATION_PUBLIC_KEY -NoNewline
           just ${{ matrix.build_recipe }}
           just ${{ matrix.bundle_recipe }} "$env:RELEASE_TAG" dist
       - uses: actions/upload-artifact@v6
@@ -665,13 +736,13 @@ jobs:
       - build_native_sdk_runtime
       - build_swift_sdk_artifact
       - build_linux_arm64
+      - build_linux_aarch64_cuda
       - build_linux_cuda
-      - build_linux_cuda_blackwell
       - build_linux_rocm
       - build_linux_vulkan
       - build_windows_cpu
       - build_windows_gpu
-    if: ${{ always() && needs.metadata.result == 'success' && needs.build.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.build_native_sdk_runtime.result == 'success' && needs.build_swift_sdk_artifact.result == 'success' && needs.build_linux_arm64.result == 'success' && (needs.build_linux_cuda.result == 'success' || needs.build_linux_cuda.result == 'skipped') && (needs.build_linux_cuda_blackwell.result == 'success' || needs.build_linux_cuda_blackwell.result == 'skipped') && (needs.build_linux_rocm.result == 'success' || needs.build_linux_rocm.result == 'skipped') && (needs.build_linux_vulkan.result == 'success' || needs.build_linux_vulkan.result == 'skipped') && needs.build_windows_cpu.result == 'success' && (needs.build_windows_gpu.result == 'success' || needs.build_windows_gpu.result == 'skipped') }}
+    if: ${{ always() && needs.metadata.result == 'success' && needs.metadata.outputs.canary != 'true' && needs.build.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.build_native_sdk_runtime.result == 'success' && needs.build_swift_sdk_artifact.result == 'success' && needs.build_linux_arm64.result == 'success' && (needs.build_linux_aarch64_cuda.result == 'success' || needs.build_linux_aarch64_cuda.result == 'skipped') && (needs.build_linux_cuda.result == 'success' || needs.build_linux_cuda.result == 'skipped') && (needs.build_linux_rocm.result == 'success' || needs.build_linux_rocm.result == 'skipped') && (needs.build_linux_vulkan.result == 'success' || needs.build_linux_vulkan.result == 'skipped') && needs.build_windows_cpu.result == 'success' && (needs.build_windows_gpu.result == 'success' || needs.build_windows_gpu.result == 'skipped') }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
@@ -706,8 +777,8 @@ jobs:
         run: |
           set -euo pipefail
           if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release tag already exists: $RELEASE_TAG" >&2
-            exit 1
+            echo "Release tag already exists: $RELEASE_TAG; reusing it"
+            exit 0
           fi
           scripts/release-version.sh "$RELEASE_TAG"
           cp generated-swift-manifest/Package.swift Package.swift
@@ -727,16 +798,22 @@ jobs:
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
           prerelease: ${{ needs.metadata.outputs.prerelease }}
+          overwrite_files: true
           files: release-artifacts/*
 
   publish_crates:
     name: Publish crates.io packages
     needs: [metadata, publish]
-    if: ${{ needs.metadata.outputs.prerelease != 'true' }}
+    if: ${{ needs.metadata.outputs.prerelease != 'true' && needs.metadata.outputs.canary != 'true' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare dispatched release version
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Publish crates.io package chain
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

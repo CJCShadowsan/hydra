@@ -3828,6 +3828,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "mesh-llm-types",
+ "semver",
  "serde",
  "skippy-protocol",
  "tempfile",
@@ -4064,6 +4065,7 @@ name = "mesh-llm-sdk"
 version = "0.68.0"
 dependencies = [
  "anyhow",
+ "mesh-llm-console-server",
  "mesh-llm-host-runtime",
  "serde_json",
 ]
@@ -9716,8 +9718,13 @@ dependencies = [
 name = "xtask"
 version = "0.68.0"
 dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "mesh-llm-system",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

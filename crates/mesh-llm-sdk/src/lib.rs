@@ -7,6 +7,13 @@ use std::time::Duration;
 #[cfg(any(feature = "client", feature = "serve"))]
 use anyhow::Result;
 
+#[cfg(feature = "console")]
+pub mod console {
+    pub use mesh_llm_console_server::{
+        ConsoleServerHandle, ConsoleServerOptions, start_file_console,
+    };
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MeshDiscoveryMode {
     #[default]

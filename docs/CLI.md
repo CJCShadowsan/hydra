@@ -81,6 +81,10 @@ Runtime switches:
   diagnostics as JSONL. See [SWARM_CAPTURE.md](SWARM_CAPTURE.md) for the full
   debug-capture workflow.
 - `--publish`: publish your mesh for discovery.
+- `--require-release-attestation`: when creating a requirement-aware mesh,
+  require peers to present a trusted release attestation.
+- `--release-signer-key <KEY>`: allow a release signer key in the creation-time
+  attestation policy (repeatable). Use with `--require-release-attestation`.
 - `--mesh-name <MESH_NAME>`: friendly mesh name in discovery.
 - `--region <REGION>`: region hint for discovery.
 - `--name <NAME>`: display name for this node.
@@ -327,6 +331,32 @@ Use this to update mesh-llm and exit.
 Switches:
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
 
+
+### `release-attestation inspect`
+
+Use this to inspect the embedded release attestation on the packaged `mesh-llm` executable.
+
+Usage:
+
+```bash
+cargo run -p xtask -- release-attestation inspect --binary /path/to/mesh-bundle/mesh-llm --public-key-file /path/to/release-signing-public-key.json
+```
+
+Switches:
+
+- `--binary <PATH>`: packaged `mesh-llm` executable to inspect.
+- `--public-key-file <PATH>`: release-signing trust root required to validate an embedded stamped binary.
+- `--json`: machine-readable output.
+
+The command reports `missing`, `valid`, or `invalid`. It applies only to the
+shipped executable, not SDK, XCFramework, or other native artifacts. Local and
+dev builds are unstamped by default, so `missing` is normal there. A
+post-download mutation can turn a stamped binary `invalid`, but the default
+startup path still allows it because this is provenance and admission
+hardening, not runtime integrity proof. Bare `inspect --binary ...` is only
+enough to classify an unstamped binary as `missing`; if an embedded attestation
+is present, the command requires `--public-key-file` and otherwise reports
+`invalid` with an explicit error.
 
 ### `gpus`
 

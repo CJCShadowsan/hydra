@@ -112,12 +112,48 @@ inference request.
 ## Mesh Identity
 
 Every mesh has a stable `mesh_id`:
-- **Named mesh**: `hash(name + originator_nostr_pubkey)` — deterministic, unique per creator
-- **Unnamed mesh**: random UUID, persisted to `~/.mesh-llm/mesh-id`
+- **Requirement-aware mesh**: canonical genesis policy hash, deterministic from
+  the immutable creation-time requirements policy
+- **Legacy named unrestricted mesh**: `hash(name + originator_nostr_pubkey)`,
+  deterministic and unique per creator
+- **Legacy unnamed unrestricted mesh**: random UUID, persisted to
+  `~/.mesh-llm/mesh-id`
+
+For requirement-aware meshes, the immutable inputs are node-version bounds,
+protocol-generation bounds, and release-attestation policy. Local owner-trust
+policy is excluded from the mesh identity hash.
 
 Propagated via gossip (`PeerAnnouncement.mesh_id`) and routing table (`RoutingTable.mesh_id`).
 Published in Nostr listings (`MeshListing.mesh_id`).
 Saved to `~/.mesh-llm/last-mesh` on successful join for sticky preference scoring.
+
+Mesh metadata and admission facts are different things:
+
+- Node version is self-advertised metadata in gossip and status surfaces.
+- Protocol generation is a negotiated and validated transport fact.
+- Build attestation is release certification proof, not proof that a remote
+  process is unmodified official code running with trusted hardware or OS state.
+- Certified-build admission is not remote runtime attestation.
+
+### Release provenance
+
+The shipped `mesh-llm` executable uses embedded release attestation, and the
+release-signing trust root is separate from owner trust. This applies only to
+the packaged `mesh-llm` binary, not SDK, XCFramework, or other native
+artifacts. `missing` is expected for unstamped local and dev builds, `valid`
+means the packaged binary matches a trusted release signer, and `invalid` means
+the bytes changed after packaging. Operators can verify stamped packaged
+binaries with `cargo run -p xtask -- release-attestation inspect --binary <path-to-packaged-mesh-llm> --public-key-file <release-signing-public-key.json>`.
+Bare `inspect --binary ...` is only sufficient for unstamped binaries that
+should classify as `missing`; stamped binaries require `--public-key-file` and
+otherwise report `invalid` with an explicit error.
+
+This is provenance and admission hardening, not runtime integrity proof. Mesh
+requirements can require a certified build at admission time through
+`require_release_attestation` and `release_signer_keys`, but that does not prove
+the remote process is running unmodified code on trusted hardware or OS state.
+
+Changing mesh requirements creates a new mesh.
 
 ## Bootstrap Proxy
 
@@ -155,6 +191,19 @@ Pinned GPU startup is also local-node only:
 
 Bare `mesh-llm serve` is the config-owned path. If `[[models]]` is empty, it warns,
 prints help, and exits cleanly. Background services use that path directly.
+
+Creation-time mesh requirement fields live under `[mesh_requirements]` in
+`~/.mesh-llm/config.toml`:
+
+- `min_node_version`
+- `max_node_version`
+- `min_protocol_version`
+- `max_protocol_version`
+- `require_release_attestation`
+- `release_signer_keys`
+
+Those fields are evaluated at mesh creation and join time. Changing them creates
+a new requirement-aware mesh; it does not mutate a running mesh.
 
 ## Passive Mode
 
