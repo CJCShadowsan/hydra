@@ -24,7 +24,6 @@ members = [
     "crates/mesh-llm-test-harness",
     "crates/model-ref",
     "crates/model-artifact",
-    "crates/model-fit",
     "crates/model-hf",
     "crates/model-resolver",
     "crates/skippy-protocol",

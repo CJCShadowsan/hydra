@@ -35,7 +35,6 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-test-harness"
   "model-ref"
   "model-artifact"
-  "model-fit"
   "model-hf"
   "model-resolver"
   "skippy-protocol"
@@ -132,7 +131,6 @@ weights = {
     "skippy-model-package": 4,
     "openai-frontend": 4,
     "model-artifact": 4,
-    "model-fit": 2,
     "model-hf": 4,
     "model-resolver": 3,
     "mesh-llm-config": 2,

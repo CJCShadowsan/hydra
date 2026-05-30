@@ -4205,19 +4205,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "model-fit"
-version = "0.68.0"
-dependencies = [
- "anyhow",
- "mesh-llm-gpu-bench",
- "model-artifact",
- "model-ref",
- "model-resolver",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "model-hf"
 version = "0.68.0"
 dependencies = [

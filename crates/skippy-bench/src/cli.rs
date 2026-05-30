@@ -297,8 +297,6 @@ pub struct LocalSingleArgs {
     pub prompt: String,
     #[arg(long, default_value_t = 1)]
     pub max_new_tokens: usize,
-    #[arg(long, default_value_t = 0)]
-    pub warmup_new_tokens: usize,
     #[arg(long)]
     pub db: Option<PathBuf>,
     #[arg(long)]
