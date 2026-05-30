@@ -3914,6 +3914,7 @@ dependencies = [
  "mesh-llm-config",
  "mesh-llm-guardrails",
  "mesh-llm-identity",
+ "mesh-llm-native-runtime",
  "mesh-llm-node",
  "mesh-llm-plugin",
  "mesh-llm-plugin-manager",
@@ -3978,6 +3979,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "mesh-llm-native-runtime"
+version = "0.68.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]
