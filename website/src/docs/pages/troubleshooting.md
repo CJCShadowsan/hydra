@@ -2,6 +2,30 @@
 
 Start with these checks before changing configuration.
 
+## Report a problem
+
+Run `mesh-llm doctor` before opening a bug report. The doctor output gives the Mesh LLM team the local status, runtime diagnostics, and logs needed to debug the issue.
+
+For model loading, split readiness, or large-model routing issues, capture a doctor bundle for the model that failed:
+
+```sh
+mesh-llm doctor split --model-ref unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL --output-dir mesh-llm-doctor
+```
+
+On macOS or Linux, archive the output directory:
+
+```sh
+tar -czf mesh-llm-doctor.tar.gz mesh-llm-doctor
+```
+
+On Windows PowerShell:
+
+```powershell
+Compress-Archive -Path mesh-llm-doctor -DestinationPath mesh-llm-doctor.zip -Force
+```
+
+Open a new GitHub issue at `https://github.com/Mesh-LLM/mesh-llm/issues/new` and attach the archive. Include the command you ran, your OS, GPU/backend flavor, model ref, whether you used a private mesh or `--auto`, and what you expected to happen.
+
 ## Is Mesh running?
 
 ```sh

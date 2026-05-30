@@ -188,6 +188,18 @@
     <div class="crumb"><a href="/docs/">Docs</a> / Troubleshooting</div>
     <h1 id="troubleshooting" tabindex="-1">Troubleshooting</h1>
 <p>Start with these checks before changing configuration.</p>
+<h2 id="report-a-problem" tabindex="-1">Report a problem</h2>
+<p>Run <code>mesh-llm doctor</code> before opening a bug report. The doctor output gives the Mesh LLM team the local status, runtime diagnostics, and logs needed to debug the issue.</p>
+<p>For model loading, split readiness, or large-model routing issues, capture a doctor bundle for the model that failed:</p>
+<pre><code class="language-sh">mesh-llm doctor split --model-ref unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL --output-dir mesh-llm-doctor
+</code></pre>
+<p>On macOS or Linux, archive the output directory:</p>
+<pre><code class="language-sh">tar -czf mesh-llm-doctor.tar.gz mesh-llm-doctor
+</code></pre>
+<p>On Windows PowerShell:</p>
+<pre><code class="language-powershell">Compress-Archive -Path mesh-llm-doctor -DestinationPath mesh-llm-doctor.zip -Force
+</code></pre>
+<p>Open a new GitHub issue at <code>https://github.com/Mesh-LLM/mesh-llm/issues/new</code> and attach the archive. Include the command you ran, your OS, GPU/backend flavor, model ref, whether you used a private mesh or <code>--auto</code>, and what you expected to happen.</p>
 <h2 id="is-mesh-running" tabindex="-1">Is Mesh running?</h2>
 <pre><code class="language-sh">curl -s http://localhost:3131/api/status | jq .
 </code></pre>
