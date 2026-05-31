@@ -1,0 +1,148 @@
+From b39210a5d0d214783a3d8072d5d34d3014b26bb1 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Mon, 1 Jun 2026 07:51:19 +1000
+Subject: [PATCH 82/82] Expose skippy decode benchmark ABI
+
+---
+ include/skippy.h        | 17 +++++++++++++
+ include/skippy/common.h |  3 ++-
+ src/skippy.cpp          | 53 ++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 84173c028..8dd982b34 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -131,6 +131,15 @@ struct skippy_kv_page_desc {
+     uint64_t flags;
+ };
+ 
++struct skippy_decode_benchmark_result {
++    uint32_t version;
++    uint32_t warmup_tokens;
++    uint32_t measured_tokens;
++    double elapsed_ms;
++    double tokens_per_second;
++    llama_token final_token;
++};
++
+ LLAMA_API enum skippy_status skippy_model_open(
+         const char * path,
+         const struct skippy_runtime_config * config,
+@@ -242,6 +251,14 @@ LLAMA_API enum skippy_status skippy_decode_step(
+         llama_token * out_predicted_token,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_session_benchmark_decode(
++        struct skippy_session * session,
++        llama_token seed_token,
++        uint32_t warmup_tokens,
++        uint32_t measured_tokens,
++        struct skippy_decode_benchmark_result * out_result,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_verify_tokens(
+         struct skippy_session * session,
+         const llama_token * token_ids,
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 26e944d8b..9e9e056f4 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 24
++#define SKIPPY_ABI_VERSION_PATCH 25
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+@@ -53,6 +53,7 @@ enum skippy_feature {
+     SKIPPY_FEATURE_CHAT_TEMPLATE_TOOLS    = 1 << 21,
+     SKIPPY_FEATURE_CHAT_SAMPLING_GRAMMAR  = 1 << 22,
+     SKIPPY_FEATURE_BACKEND_DEVICES        = 1 << 23,
++    SKIPPY_FEATURE_DECODE_BENCHMARK       = 1 << 24,
+ };
+ 
+ enum skippy_status {
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index f0f14820e..89188bf3d 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include <algorithm>
+ #include <cerrno>
++#include <chrono>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+@@ -1766,7 +1767,8 @@ uint64_t skippy_abi_features(void) {
+            SKIPPY_FEATURE_PACKAGE_PART_LOAD |
+            SKIPPY_FEATURE_GENERATION_SIGNALS |
+            SKIPPY_FEATURE_EXTERNAL_MEDIA_PREFILL |
+-           SKIPPY_FEATURE_BACKEND_DEVICES;
++           SKIPPY_FEATURE_BACKEND_DEVICES |
++           SKIPPY_FEATURE_DECODE_BENCHMARK;
+ }
+ 
+ const char * skippy_status_string(enum skippy_status status) {
+@@ -2573,6 +2575,55 @@ enum skippy_status skippy_decode_step_sampled(
+     return skippy_success(out_error);
+ }
+ 
++enum skippy_status skippy_session_benchmark_decode(
++        struct skippy_session * session,
++        llama_token seed_token,
++        uint32_t warmup_tokens,
++        uint32_t measured_tokens,
++        struct skippy_decode_benchmark_result * out_result,
++        struct skippy_error ** out_error) {
++    if (session == nullptr || session->ctx == nullptr || out_result == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and output result are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (measured_tokens == 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "measured_tokens must be greater than zero");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (skippy_is_filtered(session) && session->stage_model->config.layer_start > 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "decode benchmark requires a first-stage or full-model session");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    llama_token token = seed_token;
++    for (uint32_t i = 0; i < warmup_tokens; ++i) {
++        enum skippy_status status = skippy_decode_tokens(session, &token, 1, true, out_error);
++        if (status != SKIPPY_STATUS_OK) {
++            return status;
++        }
++        token = skippy_greedy_sample(session);
++    }
++
++    const auto started = std::chrono::steady_clock::now();
++    for (uint32_t i = 0; i < measured_tokens; ++i) {
++        enum skippy_status status = skippy_decode_tokens(session, &token, 1, true, out_error);
++        if (status != SKIPPY_STATUS_OK) {
++            return status;
++        }
++        token = skippy_greedy_sample(session);
++    }
++    const auto elapsed = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - started).count();
++
++    out_result->version = 1;
++    out_result->warmup_tokens = warmup_tokens;
++    out_result->measured_tokens = measured_tokens;
++    out_result->elapsed_ms = elapsed;
++    out_result->tokens_per_second = elapsed > 0.0 ? (static_cast<double>(measured_tokens) * 1000.0 / elapsed) : 0.0;
++    out_result->final_token = token;
++    return skippy_success(out_error);
++}
++
+ enum skippy_status skippy_verify_tokens(
+         struct skippy_session * session,
+         const llama_token * token_ids,
+-- 
+2.50.1 (Apple Git-155)
+

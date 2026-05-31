@@ -944,7 +944,7 @@ impl Default for RuntimeConfig {
 pub fn parse_cache_type(value: &str) -> Result<u32> {
     let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
     match normalized.as_str() {
-        "" | "f16" => Ok(GGML_TYPE_F16),
+        "" | "auto" | "f16" => Ok(GGML_TYPE_F16),
         "q4" | "q4_0" => Ok(GGML_TYPE_Q4_0),
         "q8" | "q8_0" => Ok(GGML_TYPE_Q8_0),
         _ => Err(anyhow!("unsupported KV cache type {value:?}")),
@@ -1317,6 +1317,15 @@ impl Default for ChatTemplateJsonOptions {
 pub struct ChatTemplateJsonResult {
     pub prompt: String,
     pub metadata_json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeBenchmarkResult {
+    pub warmup_tokens: u32,
+    pub measured_tokens: u32,
+    pub elapsed_ms: f64,
+    pub tokens_per_second: f64,
+    pub final_token: i32,
 }
 
 // The experimental C ABI owns synchronization internally for model/session use.
@@ -2507,6 +2516,38 @@ impl StageSession {
         Ok(predicted_token)
     }
 
+    pub fn benchmark_decode(
+        &mut self,
+        seed_token: i32,
+        warmup_tokens: u32,
+        measured_tokens: u32,
+    ) -> Result<DecodeBenchmarkResult> {
+        let mut raw = skippy_ffi::DecodeBenchmarkResult::default();
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_session_benchmark_decode(
+                self.raw,
+                seed_token,
+                warmup_tokens,
+                measured_tokens,
+                &mut raw,
+                &mut error,
+            )
+        };
+        ensure_ok(status, error)?;
+        self.token_count = self
+            .token_count
+            .checked_add(u64::from(raw.warmup_tokens) + u64::from(raw.measured_tokens))
+            .context("session token count overflow")?;
+        Ok(DecodeBenchmarkResult {
+            warmup_tokens: raw.warmup_tokens,
+            measured_tokens: raw.measured_tokens,
+            elapsed_ms: raw.elapsed_ms,
+            tokens_per_second: raw.tokens_per_second,
+            final_token: raw.final_token,
+        })
+    }
+
     pub fn last_token_signal(&mut self) -> Result<TokenSignal> {
         let mut signal = RawTokenSignal::default();
         let mut error = ptr::null_mut();
@@ -3676,6 +3717,9 @@ mod tests {
         assert_eq!(parse_cache_type("f16")?, GGML_TYPE_F16);
         assert_eq!(parse_cache_type("q8_0")?, GGML_TYPE_Q8_0);
         assert_eq!(parse_cache_type("q4_0")?, GGML_TYPE_Q4_0);
+        assert_eq!(parse_cache_type("auto")?, GGML_TYPE_F16);
+        assert_eq!(parse_cache_type("Auto")?, GGML_TYPE_F16);
+        assert_eq!(parse_cache_type("")?, GGML_TYPE_F16);
         Ok(())
     }
 

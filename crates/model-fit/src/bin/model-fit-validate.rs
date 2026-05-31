@@ -29,8 +29,16 @@ const DEFAULT_CTX_SIZE: u32 = 8192;
 const DEFAULT_WARMUP_TOKENS: usize = 16;
 const DEFAULT_MAX_NEW_TOKENS: usize = 256;
 const DEFAULT_REPEATS: usize = 3;
+const DEFAULT_REMEASURE_REPEATS: usize = 3;
+const DEFAULT_REMEASURE_RAW_SPREAD: f64 = 0.25;
+const DEFAULT_REMEASURE_ORDERED_DROP: f64 = 0.20;
+const DEFAULT_REMEASURE_PAUSE: Duration = Duration::from_secs(3);
+const DEFAULT_CONFIRM_REPEATS: usize = 3;
+const DEFAULT_CONFIRM_DELTA: f64 = 0.20;
 const DEFAULT_TOLERANCE: f64 = 0.10;
 const DEFAULT_MAX_SPREAD: f64 = 0.10;
+const DEFAULT_ABI_DECODE_REPEATS: usize = 3;
+const DEFAULT_ABI_DECODE_MEASURED_TOKENS: usize = 128;
 const FIRST_TOKEN_MAX_NEW_TOKENS: usize = 1;
 const KV_WARM_REUSE_MAX_NEW_TOKENS: usize = 16;
 
@@ -65,6 +73,7 @@ struct ValidationReport {
     schema_version: u32,
     generated_at_unix_secs: u64,
     command: Vec<String>,
+    fit_input_contract: FitInputContract,
     hardware_profile: HardwareProfile,
     gpu_benchmark_outputs: Vec<GpuBenchmarkOutput>,
     gpu_benchmark_json: Value,
@@ -75,6 +84,14 @@ struct ValidationReport {
 }
 
 #[derive(Debug, Serialize)]
+struct FitInputContract {
+    hardware_fields_consumed: Vec<&'static str>,
+    model_fields_consumed: Vec<&'static str>,
+    validation_backend: &'static str,
+    validation_note: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct ValidationConfig {
     ctx_size: u32,
     warmup_tokens: usize,
@@ -82,6 +99,13 @@ struct ValidationConfig {
     repeats: usize,
     tolerance: f64,
     max_spread: f64,
+    remeasure_repeats: usize,
+    remeasure_raw_spread: f64,
+    remeasure_ordered_drop: f64,
+    confirm_repeats: usize,
+    confirm_delta: f64,
+    abi_decode_repeats: usize,
+    abi_decode_measured_tokens: usize,
     benchmark_all: bool,
     show_progress: bool,
     prompt: String,
@@ -100,9 +124,42 @@ struct ModelValidationReport {
     model_profile: Option<ModelProfile>,
     recommendation: Option<ModelRecommendation>,
     recommendations: Vec<WorkloadRecommendation>,
+    abi_decode_probe: Option<AbiDecodeProbeSummary>,
     benchmarks: Vec<BenchmarkScenarioSummary>,
     benchmark: BenchmarkSummary,
     errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AbiDecodeProbeSummary {
+    attempted: bool,
+    tokens_per_second: Option<f64>,
+    elapsed_ms: Option<f64>,
+    measured_tokens: Option<u64>,
+    prompt_token_count: Option<u64>,
+    command: Vec<String>,
+    observations: Vec<AbiDecodeProbeObservation>,
+    sample_count: usize,
+    raw_sample_count: usize,
+    min_tokens_per_second: Option<f64>,
+    max_tokens_per_second: Option<f64>,
+    spread_pct: Option<f64>,
+    raw_spread_pct: Option<f64>,
+    denoised_outlier_count: usize,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AbiDecodeProbeObservation {
+    repeat: usize,
+    command: Vec<String>,
+    status_code: Option<i32>,
+    tokens_per_second: Option<f64>,
+    elapsed_ms: Option<f64>,
+    measured_tokens: Option<u64>,
+    prompt_token_count: Option<u64>,
+    stderr_tail: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,6 +186,12 @@ struct BenchmarkScenarioSpec {
     warmup_tokens: usize,
     request_count: usize,
     reuse_session: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BenchmarkExpected {
+    predicted: Option<f64>,
+    range: Option<(f64, f64)>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,6 +222,10 @@ struct BenchmarkSummary {
     raw_max_tokens_per_sec: Option<f64>,
     raw_spread_pct: Option<f64>,
     denoised_outlier_count: usize,
+    remeasured: bool,
+    remeasure_reason: Option<String>,
+    initial_observations: Vec<BenchmarkObservation>,
+    rejected_remeasure_observations: Vec<BenchmarkObservation>,
     observed_over_fit: Option<f64>,
     verdict: String,
     errors: Vec<String>,
@@ -213,6 +280,24 @@ struct ValidationSummary {
     mean_observed_over_fit: Option<f64>,
     median_absolute_percent_error: Option<f64>,
     within_tolerance_count: usize,
+    scenario_summaries: Vec<ScenarioValidationSummary>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct ScenarioValidationSummary {
+    scenario: String,
+    sample_count: usize,
+    matched_count: usize,
+    slower_than_fit_count: usize,
+    faster_than_fit_count: usize,
+    noisy_count: usize,
+    skipped_count: usize,
+    error_count: usize,
+    runtime_error_count: usize,
+    within_tolerance_count: usize,
+    median_observed_over_fit: Option<f64>,
+    mean_observed_over_fit: Option<f64>,
+    median_absolute_percent_error: Option<f64>,
 }
 
 struct PreparedModel {
@@ -248,6 +333,7 @@ async fn main() -> Result<()> {
         schema_version: 1,
         generated_at_unix_secs: unix_timestamp_secs(),
         command: std::env::args().collect(),
+        fit_input_contract: fit_input_contract(),
         hardware_profile: hardware.profile,
         gpu_benchmark_outputs: hardware.benchmark_outputs,
         gpu_benchmark_json: hardware.raw_json,
@@ -381,6 +467,13 @@ impl ValidationConfig {
             repeats: DEFAULT_REPEATS,
             tolerance: DEFAULT_TOLERANCE,
             max_spread: DEFAULT_MAX_SPREAD,
+            remeasure_repeats: DEFAULT_REMEASURE_REPEATS,
+            remeasure_raw_spread: DEFAULT_REMEASURE_RAW_SPREAD,
+            remeasure_ordered_drop: DEFAULT_REMEASURE_ORDERED_DROP,
+            confirm_repeats: DEFAULT_CONFIRM_REPEATS,
+            confirm_delta: DEFAULT_CONFIRM_DELTA,
+            abi_decode_repeats: DEFAULT_ABI_DECODE_REPEATS,
+            abi_decode_measured_tokens: DEFAULT_ABI_DECODE_MEASURED_TOKENS,
             benchmark_all: args.benchmark_all,
             show_progress: args.show_progress,
             prompt: validation_prompt().into(),
@@ -429,6 +522,7 @@ fn validate_prepared_model(
                 .clone()
         });
     let benchmarks = benchmark_model(args, hardware, &prepared, &recommendation, model_index);
+    let abi_decode_probe = Some(run_abi_decode_probe(args, &prepared));
     let benchmark = benchmarks
         .iter()
         .find(|benchmark| benchmark.scenario == "steady_decode")
@@ -447,6 +541,7 @@ fn validate_prepared_model(
         model_profile: Some(prepared.profile),
         recommendation: Some(recommendation),
         recommendations,
+        abi_decode_probe,
         benchmarks,
         benchmark,
         errors: Vec::new(),
@@ -522,6 +617,199 @@ fn prepare_local_model(args: &Args, local: &LocalModelInput) -> Result<PreparedM
     })
 }
 
+fn run_abi_decode_probe(args: &Args, model: &PreparedModel) -> AbiDecodeProbeSummary {
+    let mut summary = AbiDecodeProbeSummary {
+        attempted: true,
+        tokens_per_second: None,
+        elapsed_ms: None,
+        measured_tokens: None,
+        prompt_token_count: None,
+        command: Vec::new(),
+        observations: Vec::new(),
+        sample_count: 0,
+        raw_sample_count: 0,
+        min_tokens_per_second: None,
+        max_tokens_per_second: None,
+        spread_pct: None,
+        raw_spread_pct: None,
+        denoised_outlier_count: 0,
+        error: None,
+    };
+    let Some(layer_count) = model.profile.layer_count else {
+        summary.error = Some("model metadata did not include layer count".into());
+        return summary;
+    };
+    let command_args = vec![
+        "abi-decode-probe".to_string(),
+        "--model-path".to_string(),
+        model.primary_gguf_path.display().to_string(),
+        "--ctx-size".to_string(),
+        DEFAULT_CTX_SIZE.to_string(),
+        "--n-gpu-layers=-1".to_string(),
+        "--layer-end".to_string(),
+        layer_count.to_string(),
+        "--prompt".to_string(),
+        validation_prompt().to_string(),
+        "--warmup-tokens".to_string(),
+        DEFAULT_WARMUP_TOKENS.to_string(),
+        "--measured-tokens".to_string(),
+        DEFAULT_ABI_DECODE_MEASURED_TOKENS.to_string(),
+    ];
+    summary.command = command_display(&args.skippy_bench_bin, &command_args);
+    for repeat in 0..DEFAULT_ABI_DECODE_REPEATS {
+        summary
+            .observations
+            .push(run_abi_decode_probe_once(args, &command_args, repeat));
+    }
+    finalize_abi_decode_probe_summary(summary)
+}
+
+fn run_abi_decode_probe_once(
+    args: &Args,
+    command_args: &[String],
+    repeat: usize,
+) -> AbiDecodeProbeObservation {
+    let command = command_display(&args.skippy_bench_bin, command_args);
+    let output = Command::new(&args.skippy_bench_bin)
+        .args(command_args)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            match parse_abi_decode_probe_json(&output.stdout) {
+                Ok(parsed) => AbiDecodeProbeObservation {
+                    repeat,
+                    command,
+                    status_code: output.status.code(),
+                    tokens_per_second: parsed.tokens_per_second,
+                    elapsed_ms: parsed.elapsed_ms,
+                    measured_tokens: parsed.measured_tokens,
+                    prompt_token_count: parsed.prompt_token_count,
+                    stderr_tail: stderr_tail(&output.stderr),
+                    error: None,
+                },
+                Err(err) => AbiDecodeProbeObservation {
+                    repeat,
+                    command,
+                    status_code: output.status.code(),
+                    tokens_per_second: None,
+                    elapsed_ms: None,
+                    measured_tokens: None,
+                    prompt_token_count: None,
+                    stderr_tail: stderr_tail(&output.stderr),
+                    error: Some(err),
+                },
+            }
+        }
+        Ok(output) => AbiDecodeProbeObservation {
+            repeat,
+            command,
+            status_code: output.status.code(),
+            tokens_per_second: None,
+            elapsed_ms: None,
+            measured_tokens: None,
+            prompt_token_count: None,
+            stderr_tail: stderr_tail(&output.stderr),
+            error: Some(format!(
+                "abi decode probe exited with status {}",
+                output.status.code().unwrap_or(-1)
+            )),
+        },
+        Err(err) => AbiDecodeProbeObservation {
+            repeat,
+            command,
+            status_code: None,
+            tokens_per_second: None,
+            elapsed_ms: None,
+            measured_tokens: None,
+            prompt_token_count: None,
+            stderr_tail: None,
+            error: Some(format!("failed to start abi decode probe: {err}")),
+        },
+    }
+}
+
+fn finalize_abi_decode_probe_summary(mut summary: AbiDecodeProbeSummary) -> AbiDecodeProbeSummary {
+    let samples = summary
+        .observations
+        .iter()
+        .filter_map(|observation| observation.tokens_per_second)
+        .collect::<Vec<_>>();
+    summary.raw_sample_count = samples.len();
+    if samples.is_empty() {
+        summary.error = Some("all abi decode probe repeats failed".into());
+        return summary;
+    }
+
+    let stats = throughput_sample_stats(&samples, DEFAULT_MAX_SPREAD);
+    let median = stats.clean_median.expect("non-empty ABI sample stats");
+    summary.tokens_per_second = Some(median);
+    summary.sample_count = stats.clean_sample_count;
+    summary.min_tokens_per_second = stats.clean_min;
+    summary.max_tokens_per_second = stats.clean_max;
+    summary.spread_pct = stats.clean_spread.map(|spread| spread * 100.0);
+    summary.raw_spread_pct = stats.raw_spread.map(|spread| spread * 100.0);
+    summary.denoised_outlier_count = stats.outlier_count;
+    summary.measured_tokens = first_abi_measured_tokens(&summary);
+    summary.prompt_token_count = first_abi_prompt_tokens(&summary);
+    summary.elapsed_ms = summary
+        .measured_tokens
+        .map(|tokens| tokens as f64 * 1000.0 / median);
+    summary.error = abi_decode_probe_error(&summary);
+    summary
+}
+
+#[derive(Clone, Debug)]
+struct ParsedAbiDecodeProbe {
+    tokens_per_second: Option<f64>,
+    elapsed_ms: Option<f64>,
+    measured_tokens: Option<u64>,
+    prompt_token_count: Option<u64>,
+}
+
+fn parse_abi_decode_probe_json(stdout: &[u8]) -> Result<ParsedAbiDecodeProbe, String> {
+    let value = serde_json::from_slice::<Value>(stdout)
+        .map_err(|err| format!("parse abi decode probe JSON: {err}"))?;
+    let tokens_per_second = value.get("tokens_per_second").and_then(Value::as_f64);
+    if tokens_per_second.is_none() {
+        return Err("abi decode probe omitted tokens_per_second".into());
+    }
+    Ok(ParsedAbiDecodeProbe {
+        tokens_per_second,
+        elapsed_ms: value.get("elapsed_ms").and_then(Value::as_f64),
+        measured_tokens: value.get("measured_tokens").and_then(Value::as_u64),
+        prompt_token_count: value.get("prompt_token_count").and_then(Value::as_u64),
+    })
+}
+
+fn first_abi_measured_tokens(summary: &AbiDecodeProbeSummary) -> Option<u64> {
+    summary
+        .observations
+        .iter()
+        .find_map(|observation| observation.measured_tokens)
+}
+
+fn first_abi_prompt_tokens(summary: &AbiDecodeProbeSummary) -> Option<u64> {
+    summary
+        .observations
+        .iter()
+        .find_map(|observation| observation.prompt_token_count)
+}
+
+fn abi_decode_probe_error(summary: &AbiDecodeProbeSummary) -> Option<String> {
+    let errors = summary
+        .observations
+        .iter()
+        .filter_map(|observation| observation.error.as_deref())
+        .collect::<Vec<_>>();
+    (!errors.is_empty()).then(|| format!("{} abi decode repeats failed", errors.len()))
+}
+
+fn stderr_tail(stderr: &[u8]) -> Option<String> {
+    let stderr = String::from_utf8_lossy(stderr);
+    let tail = tail_lines(&stderr, 20);
+    (!tail.trim().is_empty()).then_some(tail)
+}
+
 fn benchmark_model(
     args: &Args,
     hardware: &HardwareProfile,
@@ -565,28 +853,40 @@ fn benchmark_scenario(
         return scenario_summary(scenario, recommendation, summary);
     }
 
-    summary.attempted = true;
-    for repeat in 0..DEFAULT_REPEATS {
-        let _status = TerminalStatus::start(
-            args.show_progress,
-            format!(
-                "Benchmarking {} {} repeat {}/{}",
-                model.input_ref,
-                scenario.name,
-                repeat + 1,
-                DEFAULT_REPEATS
-            ),
-        );
-        let observation =
-            run_one_benchmark(args, model, model_index, scenario_index, repeat, &scenario);
-        if let Some(error) = observation.error.as_ref() {
-            summary.errors.push(error.clone());
-        }
-        summary.observations.push(observation);
-    }
     let prediction = scenario_prediction(&scenario, recommendation);
     let range = scenario_prediction_range(&scenario, recommendation);
-    let summary = finalize_benchmark_summary(summary, &scenario, prediction, range);
+    let expected = BenchmarkExpected {
+        predicted: prediction,
+        range,
+    };
+    let initial = run_benchmark_repeats(
+        args,
+        model,
+        model_index,
+        scenario_index,
+        &scenario,
+        0,
+        DEFAULT_REPEATS,
+    );
+    let summary = finalize_benchmark_summary(initial, &scenario, expected);
+    let summary = remeasure_unstable_summary(
+        args,
+        model,
+        model_index,
+        scenario_index,
+        &scenario,
+        expected,
+        summary,
+    );
+    let summary = confirm_stable_fit_mismatch_summary(
+        args,
+        model,
+        model_index,
+        scenario_index,
+        &scenario,
+        expected,
+        summary,
+    );
     let scenario_recommendation = benchmark_scenario_recommendation(
         hardware,
         &model.profile,
@@ -595,6 +895,42 @@ fn benchmark_scenario(
         &summary,
     );
     scenario_summary(scenario, &scenario_recommendation, summary)
+}
+
+fn run_benchmark_repeats(
+    args: &Args,
+    model: &PreparedModel,
+    model_index: usize,
+    scenario_index: usize,
+    scenario: &BenchmarkScenarioSpec,
+    repeat_start: usize,
+    repeat_count: usize,
+) -> BenchmarkSummary {
+    let mut summary = BenchmarkSummary {
+        attempted: true,
+        verdict: "skipped".into(),
+        ..BenchmarkSummary::default()
+    };
+    for repeat_offset in 0..repeat_count {
+        let repeat = repeat_start + repeat_offset;
+        let _status = TerminalStatus::start(
+            args.show_progress,
+            format!(
+                "Benchmarking {} {} repeat {}/{}",
+                model.input_ref,
+                scenario.name,
+                repeat_offset + 1,
+                repeat_count
+            ),
+        );
+        let observation =
+            run_one_benchmark(args, model, model_index, scenario_index, repeat, scenario);
+        if let Some(error) = observation.error.as_ref() {
+            summary.errors.push(error.clone());
+        }
+        summary.observations.push(observation);
+    }
+    summary
 }
 
 fn benchmark_skip_reason(
@@ -659,8 +995,7 @@ fn steady_decode_tokens_for_active_bytes(active_bytes: u64) -> usize {
 fn finalize_benchmark_summary(
     mut summary: BenchmarkSummary,
     scenario: &BenchmarkScenarioSpec,
-    predicted: Option<f64>,
-    predicted_range: Option<(f64, f64)>,
+    expected: BenchmarkExpected,
 ) -> BenchmarkSummary {
     let samples = throughput_samples(&summary, scenario);
     summary.raw_sample_count = samples.len();
@@ -684,8 +1019,8 @@ fn finalize_benchmark_summary(
     let min = stats.clean_min.expect("non-empty sample stats");
     let max = stats.clean_max.expect("non-empty sample stats");
     let spread = stats.clean_spread.expect("non-empty sample stats");
-    let observed_over_fit = if predicted.is_some_and(|fit| fit > 0.0) {
-        predicted.map(|fit| median / fit)
+    let observed_over_fit = if expected.predicted.is_some_and(|fit| fit > 0.0) {
+        expected.predicted.map(|fit| median / fit)
     } else {
         None
     };
@@ -701,8 +1036,201 @@ fn finalize_benchmark_summary(
     summary.raw_spread_pct = stats.raw_spread.map(|spread| spread * 100.0);
     summary.denoised_outlier_count = stats.outlier_count;
     summary.observed_over_fit = observed_over_fit;
-    summary.verdict = benchmark_verdict(median, observed_over_fit, spread, predicted_range);
+    summary.verdict = benchmark_verdict(median, observed_over_fit, spread, expected.range);
     summary
+}
+
+fn remeasure_unstable_summary(
+    args: &Args,
+    model: &PreparedModel,
+    model_index: usize,
+    scenario_index: usize,
+    scenario: &BenchmarkScenarioSpec,
+    expected: BenchmarkExpected,
+    mut initial: BenchmarkSummary,
+) -> BenchmarkSummary {
+    let Some(reason) = remeasure_reason(&initial, scenario) else {
+        return initial;
+    };
+    thread::sleep(DEFAULT_REMEASURE_PAUSE);
+    let remeasure = run_benchmark_repeats(
+        args,
+        model,
+        model_index,
+        scenario_index,
+        scenario,
+        DEFAULT_REPEATS,
+        DEFAULT_REMEASURE_REPEATS,
+    );
+    let mut remeasure = finalize_benchmark_summary(remeasure, scenario, expected);
+    if accepts_remeasure_summary(&remeasure) {
+        remeasure.remeasured = true;
+        remeasure.remeasure_reason = Some(reason);
+        remeasure.initial_observations = initial.observations;
+        return remeasure;
+    }
+    initial.remeasured = true;
+    initial.remeasure_reason = Some(format!(
+        "{reason}; remeasure was not stable enough to replace the initial pass"
+    ));
+    initial.rejected_remeasure_observations = remeasure.observations;
+    initial
+}
+
+fn remeasure_reason(
+    summary: &BenchmarkSummary,
+    scenario: &BenchmarkScenarioSpec,
+) -> Option<String> {
+    if scenario.kind != BenchmarkScenarioKind::SteadyDecode || benchmark_has_runtime_error(summary)
+    {
+        return None;
+    }
+    let raw_spread = summary.raw_spread_pct? / 100.0;
+    if raw_spread >= DEFAULT_REMEASURE_RAW_SPREAD {
+        return Some(format!(
+            "raw steady-decode spread {:.1}% exceeded remeasure threshold {:.1}%",
+            raw_spread * 100.0,
+            DEFAULT_REMEASURE_RAW_SPREAD * 100.0
+        ));
+    }
+    let ordered_drop = ordered_sample_drop(summary, scenario)?;
+    (ordered_drop >= DEFAULT_REMEASURE_ORDERED_DROP).then(|| {
+        format!(
+            "ordered steady-decode samples dropped {:.1}% across repeats",
+            ordered_drop * 100.0
+        )
+    })
+}
+
+fn ordered_sample_drop(
+    summary: &BenchmarkSummary,
+    scenario: &BenchmarkScenarioSpec,
+) -> Option<f64> {
+    let samples = throughput_samples(summary, scenario);
+    let first = samples.first().copied().filter(|sample| *sample > 0.0)?;
+    let last = samples.last().copied()?;
+    (last < first).then_some((first - last) / first)
+}
+
+fn accepts_remeasure_summary(summary: &BenchmarkSummary) -> bool {
+    if benchmark_has_runtime_error(summary) {
+        return false;
+    }
+    if summary.successful_repeats < 2 {
+        return false;
+    }
+    summary
+        .spread_pct
+        .is_some_and(|spread| spread <= DEFAULT_MAX_SPREAD * 100.0)
+}
+
+fn confirm_stable_fit_mismatch_summary(
+    args: &Args,
+    model: &PreparedModel,
+    model_index: usize,
+    scenario_index: usize,
+    scenario: &BenchmarkScenarioSpec,
+    expected: BenchmarkExpected,
+    mut initial: BenchmarkSummary,
+) -> BenchmarkSummary {
+    let Some(reason) = stable_fit_mismatch_confirmation_reason(&initial, scenario) else {
+        return initial;
+    };
+    thread::sleep(DEFAULT_REMEASURE_PAUSE);
+    let confirmation = run_benchmark_repeats(
+        args,
+        model,
+        model_index,
+        scenario_index,
+        scenario,
+        DEFAULT_REPEATS + DEFAULT_REMEASURE_REPEATS,
+        DEFAULT_CONFIRM_REPEATS,
+    );
+    let mut confirmation = finalize_benchmark_summary(confirmation, scenario, expected);
+    if accepts_confirmation_summary(&initial, &confirmation) {
+        confirmation.remeasured = true;
+        confirmation.remeasure_reason = Some(reason);
+        confirmation.initial_observations = preserved_initial_observations(initial);
+        return confirmation;
+    }
+    initial.remeasured = true;
+    initial.remeasure_reason = Some(format!(
+        "{reason}; confirmation did not materially change the stable mismatch"
+    ));
+    initial.rejected_remeasure_observations = confirmation.observations;
+    initial
+}
+
+fn stable_fit_mismatch_confirmation_reason(
+    summary: &BenchmarkSummary,
+    scenario: &BenchmarkScenarioSpec,
+) -> Option<String> {
+    if scenario.kind != BenchmarkScenarioKind::SteadyDecode || benchmark_has_runtime_error(summary)
+    {
+        return None;
+    }
+    if !is_stable_summary(summary) {
+        return None;
+    }
+    let ratio = summary.observed_over_fit?;
+    let outside_tolerance = (ratio - 1.0).abs() > DEFAULT_TOLERANCE;
+    let mismatch_verdict = matches!(
+        summary.verdict.as_str(),
+        "slower-than-fit" | "faster-than-fit"
+    );
+    (outside_tolerance || mismatch_verdict).then(|| {
+        format!(
+            "stable steady-decode fit mismatch ratio {:.3} exceeded tolerance {:.1}%",
+            ratio,
+            DEFAULT_TOLERANCE * 100.0
+        )
+    })
+}
+
+fn accepts_confirmation_summary(
+    initial: &BenchmarkSummary,
+    confirmation: &BenchmarkSummary,
+) -> bool {
+    if !accepts_remeasure_summary(confirmation) {
+        return false;
+    }
+    let Some(initial_ratio) = initial.observed_over_fit else {
+        return false;
+    };
+    let Some(confirmation_ratio) = confirmation.observed_over_fit else {
+        return false;
+    };
+    let Some(initial_median) = initial.median_tokens_per_sec else {
+        return false;
+    };
+    let Some(confirmation_median) = confirmation.median_tokens_per_sec else {
+        return false;
+    };
+    let observed_delta = relative_delta(initial_median, confirmation_median);
+    let initial_error = (initial_ratio - 1.0).abs();
+    let confirmation_error = (confirmation_ratio - 1.0).abs();
+    observed_delta >= DEFAULT_CONFIRM_DELTA || confirmation_error + 0.05 < initial_error
+}
+
+fn is_stable_summary(summary: &BenchmarkSummary) -> bool {
+    summary
+        .spread_pct
+        .is_some_and(|spread| spread <= DEFAULT_MAX_SPREAD * 100.0)
+}
+
+fn preserved_initial_observations(initial: BenchmarkSummary) -> Vec<BenchmarkObservation> {
+    let mut observations = initial.initial_observations;
+    observations.extend(initial.observations);
+    observations
+}
+
+fn relative_delta(left: f64, right: f64) -> f64 {
+    let baseline = left.abs().max(right.abs());
+    if baseline <= f64::EPSILON {
+        0.0
+    } else {
+        (left - right).abs() / baseline
+    }
 }
 
 fn benchmark_has_runtime_error(summary: &BenchmarkSummary) -> bool {
@@ -1128,10 +1656,12 @@ fn benchmark_port_base(
     scenario_index: usize,
     repeat: usize,
 ) -> Result<u16> {
+    let repeats_per_scenario =
+        DEFAULT_REPEATS + DEFAULT_REMEASURE_REPEATS + DEFAULT_CONFIRM_REPEATS;
     args.base_port
         .checked_add(
-            (model_index * benchmark_scenarios().len() * DEFAULT_REPEATS
-                + scenario_index * DEFAULT_REPEATS
+            (model_index * benchmark_scenarios().len() * repeats_per_scenario
+                + scenario_index * repeats_per_scenario
                 + repeat) as u16
                 * 10,
         )
@@ -1254,6 +1784,8 @@ fn gpu_output_from_command_json(gpu: &Value, p90_gbps: f64) -> GpuBenchmarkOutpu
         runs: 0,
         p50_gbps: p90_gbps,
         p90_gbps,
+        decode_effective_gbps: gpu.get("decode_effective_gbps").and_then(Value::as_f64),
+        decode_fixed_overhead_ms: gpu.get("decode_fixed_overhead_ms").and_then(Value::as_f64),
         compute_tflops_fp32: gpu.get("compute_tflops_fp32").and_then(Value::as_f64),
         compute_tflops_fp16: gpu.get("compute_tflops_fp16").and_then(Value::as_f64),
         noise_pct: 0.0,
@@ -1477,11 +2009,14 @@ fn system_total_memory_bytes() -> Option<u64> {
 fn system_available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        return fs::read_to_string("/proc/meminfo")
+        fs::read_to_string("/proc/meminfo")
             .ok()
-            .and_then(|text| meminfo_value_bytes(&text, "MemAvailable:"));
+            .and_then(|text| meminfo_value_bytes(&text, "MemAvailable:"))
     }
-    None
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1593,6 +2128,53 @@ fn benchmark_scenarios() -> Vec<BenchmarkScenarioSpec> {
     ]
 }
 
+fn fit_input_contract() -> FitInputContract {
+    FitInputContract {
+        hardware_fields_consumed: vec![
+            "memory.available_system_bytes",
+            "memory.available_unified_bytes",
+            "accelerators.kind",
+            "accelerators.backend",
+            "accelerators.available_memory_bytes",
+            "accelerators.memory_bandwidth_bytes_per_sec",
+            "accelerators.decode_effective_bandwidth_bytes_per_sec",
+            "accelerators.decode_fixed_overhead_ms",
+            "accelerators.bandwidth_source",
+            "accelerators.benchmark_noise_pct",
+            "accelerators.compute_tflops_fp16",
+            "accelerators.unified_memory",
+            "cpu.memory_bandwidth_bytes_per_sec",
+        ],
+        model_fields_consumed: vec![
+            "architecture",
+            "architecture_class",
+            "weight_coverage",
+            "file_size_bytes",
+            "tensor_bytes",
+            "base_resident_bytes",
+            "expert_tensor_bytes",
+            "tensor_group_bytes",
+            "tensor_matmul",
+            "quantization",
+            "layer_count",
+            "hidden_size",
+            "ffn_size",
+            "attention_heads",
+            "kv_heads",
+            "key_length",
+            "value_length",
+            "context_length",
+            "expert_count",
+            "expert_used_count",
+            "rope",
+            "tokenizer",
+            "capability_evidence",
+        ],
+        validation_backend: "skippy-bench local-single plus abi-decode-probe using skippy-server/llama.cpp full-model inference and the native skippy decode benchmark ABI",
+        validation_note: "Validation observations exercise real GGML/llama.cpp model execution. They are reported as evidence only; observed model throughput and ABI probe throughput are not fed back into metadata-only fit scoring.",
+    }
+}
+
 fn first_token_prompt() -> String {
     let seed = "Summarize this benchmark context into one operational takeaway: local inference fit depends on model bytes, active layers, KV cache pressure, backend overhead, and memory bandwidth.";
     std::iter::repeat_n(seed, 96).collect::<Vec<_>>().join("\n")
@@ -1635,7 +2217,73 @@ fn summarize(models: &[ModelValidationReport], tolerance: f64) -> ValidationSumm
     summary.median_observed_over_fit = (!ratios.is_empty()).then(|| median(&ratios));
     summary.mean_observed_over_fit = mean(&ratios);
     summary.median_absolute_percent_error = median_absolute_percent_error(&ratios);
+    summary.scenario_summaries = summarize_scenarios(models, tolerance);
     summary
+}
+
+fn summarize_scenarios(
+    models: &[ModelValidationReport],
+    tolerance: f64,
+) -> Vec<ScenarioValidationSummary> {
+    benchmark_scenarios()
+        .into_iter()
+        .map(|scenario| summarize_scenario(models, scenario.name, tolerance))
+        .collect()
+}
+
+fn summarize_scenario(
+    models: &[ModelValidationReport],
+    scenario: &str,
+    tolerance: f64,
+) -> ScenarioValidationSummary {
+    let mut summary = ScenarioValidationSummary {
+        scenario: scenario.into(),
+        ..ScenarioValidationSummary::default()
+    };
+    let mut ratios = Vec::new();
+
+    for benchmark in models.iter().filter_map(|model| {
+        model
+            .benchmarks
+            .iter()
+            .find(|entry| entry.scenario == scenario)
+    }) {
+        summary.sample_count += usize::from(benchmark.observed_over_fit.is_some());
+        count_scenario_verdict(benchmark, tolerance, &mut summary, &mut ratios);
+    }
+
+    ratios.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    summary.median_observed_over_fit = (!ratios.is_empty()).then(|| median(&ratios));
+    summary.mean_observed_over_fit = mean(&ratios);
+    summary.median_absolute_percent_error = median_absolute_percent_error(&ratios);
+    summary
+}
+
+fn count_scenario_verdict(
+    benchmark: &BenchmarkScenarioSummary,
+    tolerance: f64,
+    summary: &mut ScenarioValidationSummary,
+    ratios: &mut Vec<f64>,
+) {
+    match benchmark.verdict.as_str() {
+        "match" => summary.matched_count += 1,
+        "slower-than-fit" => summary.slower_than_fit_count += 1,
+        "faster-than-fit" => summary.faster_than_fit_count += 1,
+        "inconclusive-noisy" => summary.noisy_count += 1,
+        "skipped" => summary.skipped_count += 1,
+        "runtime-error" => summary.runtime_error_count += 1,
+        "error" => summary.error_count += 1,
+        _ => {}
+    }
+    if !accuracy_gated_verdict(&benchmark.verdict) {
+        return;
+    }
+    if let Some(ratio) = benchmark.observed_over_fit {
+        if (ratio - 1.0).abs() <= tolerance {
+            summary.within_tolerance_count += 1;
+        }
+        ratios.push(ratio);
+    }
 }
 
 fn count_model_summary(
@@ -1694,6 +2342,7 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
         model_profile: None,
         recommendation: None,
         recommendations: Vec::new(),
+        abi_decode_probe: None,
         benchmarks: Vec::new(),
         benchmark: BenchmarkSummary {
             verdict: "error".into(),
@@ -1706,15 +2355,16 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
 
 fn print_markdown_table(rows: &[ModelValidationReport]) {
     println!(
-        "| model_ref | fit | est tok/s | est range | steady median | steady/fit | steady | first-token | kv-reuse |"
+        "| model_ref | fit | est tok/s | abi tok/s | est range | steady median | steady/fit | steady | first-token | kv-reuse |"
     );
-    println!("|---|---|---:|---:|---:|---:|---|---|---|");
+    println!("|---|---|---:|---:|---:|---:|---:|---|---|---|");
     for row in rows {
         println!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.input_ref,
             fit_status(row),
             display_estimated_tps(row),
+            display_abi_decode_probe(row),
             display_estimated_range(row),
             display_opt(row.benchmark.median_tokens_per_sec),
             display_opt(row.benchmark.observed_over_fit),
@@ -1723,6 +2373,14 @@ fn print_markdown_table(rows: &[ModelValidationReport]) {
             scenario_verdict(row, "kv_warm_reuse"),
         );
     }
+}
+
+fn display_abi_decode_probe(row: &ModelValidationReport) -> String {
+    row.abi_decode_probe
+        .as_ref()
+        .and_then(|probe| probe.tokens_per_second)
+        .map(|tps| format!("{tps:.1}"))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn scenario_verdict(row: &ModelValidationReport, scenario: &str) -> String {

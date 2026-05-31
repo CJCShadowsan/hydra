@@ -1,14 +1,14 @@
-From 2fc05e01f3571c7b19835d7abf001286e306f4d0 Mon Sep 17 00:00:00 2001
+From bf8cd978da6957d21d8579b73d8064a60fb5c091 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Tue, 28 Apr 2026 07:38:29 +1000
-Subject: [PATCH 26/81] Strip split metadata from stage GGUF artifacts
+Subject: [PATCH 26/82] Strip split metadata from stage GGUF artifacts
 
 ---
  src/skippy.cpp | 8 ++++++++
  1 file changed, 8 insertions(+)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 36e8826d..5abc8776 100644
+index 36e8826df..5abc8776d 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
 @@ -328,6 +328,12 @@ static size_t skippy_align(size_t value, size_t alignment) {

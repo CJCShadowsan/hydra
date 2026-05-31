@@ -1,3 +1,4 @@
+mod abi_decode_probe;
 mod chat_corpus;
 mod cli;
 mod distributed;
@@ -11,6 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::{
+    abi_decode_probe::abi_decode_probe,
     chat_corpus::chat_corpus,
     cli::{Cli, CommandKind},
     distributed::{focused_runtime, run_distributed},
@@ -24,6 +26,7 @@ use crate::{
 fn main() -> Result<()> {
     match Cli::parse().command {
         CommandKind::LocalSingle(args) => local_single(args),
+        CommandKind::AbiDecodeProbe(args) => abi_decode_probe(args),
         CommandKind::LocalSplitInprocess(args) => local_split_inprocess(args),
         CommandKind::LocalSplitBinary(args) => local_split_binary(args),
         CommandKind::LocalSplitCompare(args) => local_split_compare(args),

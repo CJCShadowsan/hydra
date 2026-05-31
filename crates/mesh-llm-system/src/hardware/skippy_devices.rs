@@ -89,6 +89,8 @@ fn gpu_facts_from_backend_devices(
             vram_bytes,
             reserved_bytes,
             mem_bandwidth_gbps: None,
+            decode_effective_gbps: None,
+            decode_fixed_overhead_ms: None,
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
             unified_memory,

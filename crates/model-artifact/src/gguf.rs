@@ -552,6 +552,20 @@ pub struct GgufMatmulGroupProfile {
     pub bytes: u64,
     pub flops_per_token: u64,
     pub type_bytes: GgufTensorTypeByteProfile,
+    pub shape: GgufMatmulShapeProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GgufMatmulShapeProfile {
+    pub tensor_count: u64,
+    pub logical_matrix_count: u64,
+    pub total_elements: u64,
+    pub min_input_width: u64,
+    pub max_input_width: u64,
+    pub min_output_width: u64,
+    pub max_output_width: u64,
+    pub weighted_avg_input_width: u64,
+    pub weighted_avg_output_width: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -955,7 +969,13 @@ fn add_matmul_profile(
         TensorGroup::Output => &mut profile.output,
         _ => return,
     };
-    add_matmul_group_profile(group_profile, tensor.tensor_type, tensor_bytes, flops);
+    add_matmul_group_profile(
+        group_profile,
+        tensor.tensor_type,
+        tensor,
+        tensor_bytes,
+        flops,
+    );
     if is_expert_partitioned_tensor(&tensor.name) {
         profile.expert_bytes = profile.expert_bytes.saturating_add(tensor_bytes);
         profile.expert_flops_per_token = profile.expert_flops_per_token.saturating_add(flops);
@@ -978,12 +998,14 @@ fn add_matmul_profile(
 fn add_matmul_group_profile(
     profile: &mut GgufMatmulGroupProfile,
     tensor_type: u32,
+    tensor: &GgufTensorInfo,
     tensor_bytes: u64,
     flops: u64,
 ) {
     profile.bytes = profile.bytes.saturating_add(tensor_bytes);
     profile.flops_per_token = profile.flops_per_token.saturating_add(flops);
     add_tensor_type_bytes(&mut profile.type_bytes, tensor_type, tensor_bytes);
+    profile.shape.add_tensor(tensor);
 }
 
 fn is_decode_matmul_group(group: TensorGroup) -> bool {
@@ -1003,6 +1025,102 @@ fn tensor_flops_per_token(tensor: &GgufTensorInfo) -> u64 {
         .try_fold(1u64, |acc, dim| acc.checked_mul(*dim))
         .unwrap_or(u64::MAX / 2)
         .saturating_mul(2)
+}
+
+impl GgufMatmulShapeProfile {
+    fn add_tensor(&mut self, tensor: &GgufTensorInfo) {
+        let Some(shape) = tensor_matrix_shape(tensor) else {
+            return;
+        };
+        self.tensor_count = self.tensor_count.saturating_add(1);
+        self.logical_matrix_count = self
+            .logical_matrix_count
+            .saturating_add(shape.logical_matrix_count);
+        self.total_elements = self.total_elements.saturating_add(shape.elements);
+        self.min_input_width = nonzero_min(self.min_input_width, shape.input_width);
+        self.max_input_width = self.max_input_width.max(shape.input_width);
+        self.min_output_width = nonzero_min(self.min_output_width, shape.output_width);
+        self.max_output_width = self.max_output_width.max(shape.output_width);
+
+        let previous_elements = self.total_elements.saturating_sub(shape.elements);
+        self.weighted_avg_input_width = weighted_average_after_add(
+            self.weighted_avg_input_width,
+            previous_elements,
+            shape.input_width,
+            shape.elements,
+        );
+        self.weighted_avg_output_width = weighted_average_after_add(
+            self.weighted_avg_output_width,
+            previous_elements,
+            shape.output_width,
+            shape.elements,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TensorMatrixShape {
+    input_width: u64,
+    output_width: u64,
+    logical_matrix_count: u64,
+    elements: u64,
+}
+
+fn tensor_matrix_shape(tensor: &GgufTensorInfo) -> Option<TensorMatrixShape> {
+    // GGUF tensor dimensions follow GGML's `ne[]` order. For the transformer
+    // weight matrices llama.cpp feeds to GGML_OP_MUL_MAT / GGML_OP_MUL_MAT_ID,
+    // `ne[0]` is the input width and `ne[1]` is the output width. Additional
+    // dimensions represent a stack of logical matrices, most commonly MoE
+    // experts. We keep this as a compact summary rather than storing every
+    // tensor because model-fit only needs portable shape facts: how large the
+    // matvec/GEMM operations are and how many separately dispatched logical
+    // matrices exist.
+    if tensor.dimensions.len() < 2 {
+        return None;
+    }
+    let input_width = tensor.dimensions[0];
+    let output_width = tensor.dimensions[1];
+    let logical_matrix_count = tensor.dimensions[2..]
+        .iter()
+        .try_fold(1u64, |acc, dim| acc.checked_mul(*dim))
+        .unwrap_or(u64::MAX);
+    let elements = tensor
+        .dimensions
+        .iter()
+        .try_fold(1u64, |acc, dim| acc.checked_mul(*dim))
+        .unwrap_or(u64::MAX);
+    Some(TensorMatrixShape {
+        input_width,
+        output_width,
+        logical_matrix_count,
+        elements,
+    })
+}
+
+fn nonzero_min(current: u64, candidate: u64) -> u64 {
+    if current == 0 {
+        candidate
+    } else {
+        current.min(candidate)
+    }
+}
+
+fn weighted_average_after_add(
+    previous_average: u64,
+    previous_weight: u64,
+    added_value: u64,
+    added_weight: u64,
+) -> u64 {
+    let total_weight = previous_weight.saturating_add(added_weight);
+    if total_weight == 0 {
+        return 0;
+    }
+    let weighted_sum = u128::from(previous_average)
+        .saturating_mul(u128::from(previous_weight))
+        .saturating_add(u128::from(added_value).saturating_mul(u128::from(added_weight)));
+    (weighted_sum / u128::from(total_weight))
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn add_tensor_type_bytes(profile: &mut GgufTensorTypeByteProfile, tensor_type: u32, bytes: u64) {
@@ -1196,6 +1314,15 @@ mod tests {
         push_gguf_string(bytes, name);
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&16u64.to_le_bytes());
+        bytes.extend_from_slice(&(GgufType::Uint8 as u32).to_le_bytes());
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    fn push_tensor_info_2d(bytes: &mut Vec<u8>, name: &str, input: u64, output: u64, offset: u64) {
+        push_gguf_string(bytes, name);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&input.to_le_bytes());
+        bytes.extend_from_slice(&output.to_le_bytes());
         bytes.extend_from_slice(&(GgufType::Uint8 as u32).to_le_bytes());
         bytes.extend_from_slice(&offset.to_le_bytes());
     }
@@ -1427,6 +1554,38 @@ mod tests {
             profile.full_model_bytes,
             profile.base_resident_bytes + profile.expert_tensor_bytes + profile.file_overhead_bytes
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_gguf_tensor_byte_profile_records_matmul_shapes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+
+        push_u32_kv(&mut bytes, "general.alignment", 32);
+        push_tensor_info_2d(&mut bytes, "blk.0.ffn_up.weight", 4, 16, 0);
+        push_tensor_info_2d(&mut bytes, "blk.0.ffn_down.weight", 16, 4, 64);
+
+        let data_start = align_offset(bytes.len() as u64, 32) as usize;
+        bytes.resize(data_start, 0);
+        bytes.resize(data_start + 96, 0);
+
+        let path = write_bytes("model-artifact-gguf-matmul-shapes", &bytes);
+        let profile = scan_gguf_tensor_byte_profile(&path).unwrap();
+        let shape = profile.matmul.feed_forward.shape;
+
+        assert_eq!(shape.tensor_count, 2);
+        assert_eq!(shape.logical_matrix_count, 2);
+        assert_eq!(shape.total_elements, 128);
+        assert_eq!(shape.min_input_width, 4);
+        assert_eq!(shape.max_input_width, 16);
+        assert_eq!(shape.min_output_width, 4);
+        assert_eq!(shape.max_output_width, 16);
+        assert_eq!(shape.weighted_avg_input_width, 10);
+        assert_eq!(shape.weighted_avg_output_width, 10);
         let _ = std::fs::remove_file(path);
     }
 }

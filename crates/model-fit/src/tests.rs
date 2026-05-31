@@ -17,6 +17,8 @@ fn m1_ultra() -> HardwareProfile {
             total_memory_bytes: Some(128 * GIB),
             available_memory_bytes: Some(110 * GIB),
             memory_bandwidth_bytes_per_sec: Some(800_000_000_000),
+            decode_effective_bandwidth_bytes_per_sec: Some(320_000_000_000),
+            decode_fixed_overhead_ms: Some(1.25),
             bandwidth_source: MeasurementSource::Measured,
             benchmark_noise_pct: Some(1.0),
             bandwidth_efficiency_pct: None,
@@ -33,6 +35,9 @@ fn m1_ultra() -> HardwareProfile {
 }
 
 fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> ModelProfile {
+    let attention_bytes = bytes / 3;
+    let feed_forward_bytes = bytes / 2;
+    let output_bytes = bytes / 12;
     ModelProfile {
         source: ModelSource {
             id: id.into(),
@@ -47,11 +52,11 @@ fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> 
         base_resident_bytes: Some(bytes),
         expert_tensor_bytes: Some(0),
         tensor_group_bytes: TensorGroupBytes {
-            attention_bytes: bytes / 3,
-            feed_forward_bytes: bytes / 2,
+            attention_bytes,
+            feed_forward_bytes,
             expert_feed_forward_bytes: 0,
             embedding_bytes: bytes / 12,
-            output_bytes: bytes / 12,
+            output_bytes,
             normalization_bytes: bytes / 100,
             other_bytes: bytes
                 .saturating_sub(bytes / 3)
@@ -61,39 +66,23 @@ fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> 
                 .saturating_sub(bytes / 100),
         },
         tensor_matmul: TensorMatmulProfile {
-            base_bytes: bytes / 3 + bytes / 2 + bytes / 12,
+            base_bytes: attention_bytes + feed_forward_bytes + output_bytes,
             expert_bytes: 0,
             base_flops_per_token: 0,
             expert_flops_per_token: 0,
             base_type_bytes: TensorTypeBytes {
-                q4_k_bytes: bytes / 3 + bytes / 2 + bytes / 12,
+                q4_k_bytes: attention_bytes + feed_forward_bytes + output_bytes,
                 ..TensorTypeBytes::default()
             },
             expert_type_bytes: TensorTypeBytes::default(),
-            attention: TensorMatmulGroupProfile {
-                bytes: bytes / 3,
-                type_bytes: TensorTypeBytes {
-                    q4_k_bytes: bytes / 3,
-                    ..TensorTypeBytes::default()
-                },
-                ..TensorMatmulGroupProfile::default()
-            },
-            feed_forward: TensorMatmulGroupProfile {
-                bytes: bytes / 2,
-                type_bytes: TensorTypeBytes {
-                    q4_k_bytes: bytes / 2,
-                    ..TensorTypeBytes::default()
-                },
-                ..TensorMatmulGroupProfile::default()
-            },
-            output: TensorMatmulGroupProfile {
-                bytes: bytes / 12,
-                type_bytes: TensorTypeBytes {
-                    q4_k_bytes: bytes / 12,
-                    ..TensorTypeBytes::default()
-                },
-                ..TensorMatmulGroupProfile::default()
-            },
+            attention: synthetic_matmul_group(attention_bytes, layers * 4, hidden, hidden),
+            feed_forward: synthetic_matmul_group(
+                feed_forward_bytes,
+                layers * 3,
+                hidden,
+                hidden * 4,
+            ),
+            output: synthetic_matmul_group(output_bytes, 1, hidden, hidden),
             expert_feed_forward: TensorMatmulGroupProfile::default(),
         },
         parameter_count: None,
@@ -118,6 +107,35 @@ fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> 
             CapabilityEvidence::SystemRoleInChatTemplate,
             CapabilityEvidence::NativeContextAtLeast(context),
         ],
+    }
+}
+
+fn synthetic_matmul_group(
+    bytes: u64,
+    logical_matrix_count: u32,
+    input_width: u32,
+    output_width: u32,
+) -> TensorMatmulGroupProfile {
+    TensorMatmulGroupProfile {
+        bytes,
+        type_bytes: TensorTypeBytes {
+            q4_k_bytes: bytes,
+            ..TensorTypeBytes::default()
+        },
+        shape: MatmulShapeProfile {
+            tensor_count: u64::from(logical_matrix_count),
+            logical_matrix_count: u64::from(logical_matrix_count),
+            total_elements: u64::from(logical_matrix_count)
+                .saturating_mul(u64::from(input_width))
+                .saturating_mul(u64::from(output_width)),
+            min_input_width: u64::from(input_width.min(output_width)),
+            max_input_width: u64::from(input_width.max(output_width)),
+            min_output_width: u64::from(input_width.min(output_width)),
+            max_output_width: u64::from(input_width.max(output_width)),
+            weighted_avg_input_width: u64::from(input_width),
+            weighted_avg_output_width: u64::from(output_width),
+        },
+        ..TensorMatmulGroupProfile::default()
     }
 }
 
@@ -217,6 +235,26 @@ fn moe_decode_uses_active_expert_bytes() {
     moe.tensor_matmul.attention.bytes = 8 * GIB;
     moe.tensor_matmul.feed_forward.bytes = 4 * GIB;
     moe.tensor_matmul.expert_feed_forward.bytes = 48 * GIB;
+    moe.tensor_matmul.base_type_bytes = TensorTypeBytes {
+        q4_k_bytes: 12 * GIB,
+        ..TensorTypeBytes::default()
+    };
+    moe.tensor_matmul.expert_type_bytes = TensorTypeBytes {
+        q4_k_bytes: 48 * GIB,
+        ..TensorTypeBytes::default()
+    };
+    moe.tensor_matmul.attention.type_bytes = TensorTypeBytes {
+        q4_k_bytes: 8 * GIB,
+        ..TensorTypeBytes::default()
+    };
+    moe.tensor_matmul.feed_forward.type_bytes = TensorTypeBytes {
+        q4_k_bytes: 4 * GIB,
+        ..TensorTypeBytes::default()
+    };
+    moe.tensor_matmul.expert_feed_forward.type_bytes = TensorTypeBytes {
+        q4_k_bytes: 48 * GIB,
+        ..TensorTypeBytes::default()
+    };
     moe.expert_count = Some(16);
     moe.expert_used_count = Some(2);
 
@@ -338,20 +376,21 @@ fn prefill_estimate_reports_first_token_latency_range() {
 }
 
 #[test]
-fn decode_estimate_penalizes_small_hidden_width_efficiency() {
-    let hardware = m1_ultra();
+fn decode_estimate_uses_measured_graph_overhead_for_deeper_shapes() {
+    let mut hardware = m1_ultra();
+    hardware.memory.available_system_bytes = None;
     let mut config = SelectionConfig {
         workload: WorkloadProfile::chat(),
         ..SelectionConfig::default()
     };
     config.weights = config.workload.default_weights();
-    let narrow = dense_model("narrow", 3 * GIB, 32, 2048, 32_768);
-    let wide = dense_model("wide", 3 * GIB, 32, 4096, 32_768);
+    let shallow = dense_model("shallow", 3 * GIB, 16, 4096, 32_768);
+    let deep = dense_model("deep", 3 * GIB, 40, 4096, 32_768);
 
-    let narrow_rec = score_model(&hardware, &narrow, &config);
-    let wide_rec = score_model(&hardware, &wide, &config);
+    let shallow_rec = score_model(&hardware, &shallow, &config);
+    let deep_rec = score_model(&hardware, &deep, &config);
 
-    assert!(narrow_rec.estimated_decode_tokens_per_sec < wide_rec.estimated_decode_tokens_per_sec);
+    assert!(deep_rec.estimated_decode_tokens_per_sec < shallow_rec.estimated_decode_tokens_per_sec);
 }
 
 #[test]
@@ -377,7 +416,7 @@ fn measured_gpu_bandwidth_uses_backend_neutral_efficiency() {
 }
 
 #[test]
-fn q8_decode_traffic_stays_resident_bytes_without_matmul_profile() {
+fn q8_decode_uses_ggml_type_kernel_traffic() {
     let hardware = m1_ultra();
     let mut config = SelectionConfig {
         workload: WorkloadProfile::chat(),
@@ -415,10 +454,11 @@ fn q8_decode_traffic_stays_resident_bytes_without_matmul_profile() {
     let q4_active = q4_rec.estimated_active_decode_bytes_per_token.unwrap();
     let q8_active = q8_rec.estimated_active_decode_bytes_per_token.unwrap();
 
-    assert!(q8_active > q4_active * 19 / 10);
+    assert!(q8_active > q4_active);
+    assert!(q8_active < q4_active * 14 / 10);
     assert!(
         q8_rec.estimated_decode_tokens_per_sec.unwrap()
-            < q4_rec.estimated_decode_tokens_per_sec.unwrap() * 0.70
+            > q4_rec.estimated_decode_tokens_per_sec.unwrap() * 0.70
     );
 }
 
@@ -447,6 +487,8 @@ fn hardware_profile_uses_mesh_gpu_benchmark_output_as_measured_bandwidth() {
             runs: 7,
             p50_gbps: 710.0,
             p90_gbps: 737.0,
+            decode_effective_gbps: Some(295.0),
+            decode_fixed_overhead_ms: Some(1.25),
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
             noise_pct: 1.0,

@@ -34,7 +34,13 @@ target/release/model-fit-validate \
 target/release/model-fit-check-validation \
   --min-models 8 \
   /tmp/model-fit-validation.json
+
+target/release/model-fit-check-validation \
+  --scenario all \
+  --markdown-out /tmp/model-fit-validation.md \
+  /tmp/model-fit-validation.json
 ```
 
 The validation report is JSON so later agents can analyze hardware facts, model
-profiles, recommendations, benchmark observations, and scenario-level agreement.
+profiles, recommendations, benchmark observations, the estimator input
+contract, and scenario-level agreement.

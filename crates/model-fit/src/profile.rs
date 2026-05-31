@@ -1,6 +1,6 @@
 use crate::{
-    CapabilityEvidence, ModelArchitectureClass, ModelProfile, ModelSource, RopeProfile,
-    TensorGroupBytes, TensorMatmulGroupProfile, TensorMatmulProfile, TensorTypeBytes,
+    CapabilityEvidence, MatmulShapeProfile, ModelArchitectureClass, ModelProfile, ModelSource,
+    RopeProfile, TensorGroupBytes, TensorMatmulGroupProfile, TensorMatmulProfile, TensorTypeBytes,
     TokenizerProfile, WeightCoverage,
 };
 use anyhow::{Context, Result};
@@ -98,6 +98,21 @@ fn tensor_matmul_group(
         bytes: group.bytes,
         flops_per_token: group.flops_per_token,
         type_bytes: tensor_type_bytes(group.type_bytes),
+        shape: matmul_shape(group.shape),
+    }
+}
+
+fn matmul_shape(shape: model_artifact::gguf::GgufMatmulShapeProfile) -> MatmulShapeProfile {
+    MatmulShapeProfile {
+        tensor_count: shape.tensor_count,
+        logical_matrix_count: shape.logical_matrix_count,
+        total_elements: shape.total_elements,
+        min_input_width: shape.min_input_width,
+        max_input_width: shape.max_input_width,
+        min_output_width: shape.min_output_width,
+        max_output_width: shape.max_output_width,
+        weighted_avg_input_width: shape.weighted_avg_input_width,
+        weighted_avg_output_width: shape.weighted_avg_output_width,
     }
 }
 

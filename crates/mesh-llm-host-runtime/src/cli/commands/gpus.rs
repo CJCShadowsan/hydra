@@ -90,6 +90,8 @@ fn gpu_json(gpu: &GpuFacts) -> Value {
         "vram_bytes": gpu.vram_bytes,
         "reserved_bytes": gpu.reserved_bytes,
         "mem_bandwidth_gbps": gpu.mem_bandwidth_gbps,
+        "decode_effective_gbps": gpu.decode_effective_gbps,
+        "decode_fixed_overhead_ms": gpu.decode_fixed_overhead_ms,
         "compute_tflops_fp32": gpu.compute_tflops_fp32,
         "compute_tflops_fp16": gpu.compute_tflops_fp16,
         "unified_memory": gpu.unified_memory,
@@ -149,6 +151,16 @@ fn gpu_benchmark_json(hw: &HardwareSurvey, saved: &SavedBenchmark) -> Value {
                 "dxgi_luid": gpu.dxgi_luid,
                 "pnp_instance_id": gpu.pnp_instance_id,
                 "mem_bandwidth_gbps": saved.result.mem_bandwidth_gbps.get(index),
+                "decode_effective_gbps": saved
+                    .result
+                    .decode_effective_gbps
+                    .as_ref()
+                    .and_then(|values| values.get(index)),
+                "decode_fixed_overhead_ms": saved
+                    .result
+                    .decode_fixed_overhead_ms
+                    .as_ref()
+                    .and_then(|values| values.get(index)),
                 "compute_tflops_fp32": saved
                     .result
                     .compute_tflops_fp32
@@ -189,6 +201,10 @@ fn attach_cached_bandwidth(hw: &mut HardwareSurvey) {
 
     for (gpu, cached) in hw.gpus.iter_mut().zip(fingerprint.gpus.iter()) {
         gpu.mem_bandwidth_gbps = Some(cached.p90_gbps);
+        gpu.decode_effective_gbps = cached.decode_effective_gbps;
+        gpu.decode_fixed_overhead_ms = cached.decode_fixed_overhead_ms;
+        gpu.compute_tflops_fp32 = cached.compute_tflops_fp32;
+        gpu.compute_tflops_fp16 = cached.compute_tflops_fp16;
     }
 }
 
@@ -258,6 +274,8 @@ mod tests {
             vram_bytes: 24_000_000_000,
             reserved_bytes: Some(1_000_000_000),
             mem_bandwidth_gbps: Some(1008.0),
+            decode_effective_gbps: Some(402.0),
+            decode_fixed_overhead_ms: Some(1.25),
             compute_tflops_fp32: Some(82.4),
             compute_tflops_fp16: Some(164.8),
             unified_memory: false,
@@ -297,6 +315,8 @@ mod tests {
         assert_eq!(value["gpu_count"], json!(1));
         assert_eq!(value["gpus"][0]["name"], json!("GPU 0"));
         assert_eq!(value["gpus"][0]["mem_bandwidth_gbps"], json!(1008.0));
+        assert_eq!(value["gpus"][0]["decode_effective_gbps"], json!(402.0));
+        assert_eq!(value["gpus"][0]["decode_fixed_overhead_ms"], json!(1.25));
         assert_eq!(value["gpus"][0]["stable_id"], json!("stable-0"));
         assert_eq!(
             value["gpus"][0]["runtime_offload"],
@@ -331,6 +351,8 @@ mod tests {
             path: PathBuf::from("/tmp/benchmark-fingerprint.json"),
             result: benchmark::BenchmarkResult {
                 mem_bandwidth_gbps: vec![1008.0, 912.5],
+                decode_effective_gbps: Some(vec![402.0, 365.0]),
+                decode_fixed_overhead_ms: Some(vec![1.25, 1.5]),
                 compute_tflops_fp32: Some(vec![82.4, 70.2]),
                 compute_tflops_fp16: Some(vec![164.8, 140.4]),
             },
@@ -347,6 +369,8 @@ mod tests {
             json!("/tmp/benchmark-fingerprint.json")
         );
         assert_eq!(value["gpus"][1]["mem_bandwidth_gbps"], json!(912.5));
+        assert_eq!(value["gpus"][1]["decode_effective_gbps"], json!(365.0));
+        assert_eq!(value["gpus"][1]["decode_fixed_overhead_ms"], json!(1.5));
         assert_eq!(value["gpus"][1]["compute_tflops_fp16"], json!(140.4));
     }
 
@@ -360,6 +384,8 @@ mod tests {
             path: PathBuf::from("/tmp/benchmark-fingerprint.json"),
             result: benchmark::BenchmarkResult {
                 mem_bandwidth_gbps: vec![1008.0],
+                decode_effective_gbps: Some(vec![402.0]),
+                decode_fixed_overhead_ms: Some(vec![1.25]),
                 compute_tflops_fp32: Some(vec![82.4]),
                 compute_tflops_fp16: Some(vec![164.8]),
             },

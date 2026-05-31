@@ -8,6 +8,8 @@ fn synthetic_gpu(index: usize, stable_id: Option<&str>) -> GpuFacts {
         vram_bytes: 24_000_000_000,
         reserved_bytes: None,
         mem_bandwidth_gbps: None,
+        decode_effective_gbps: None,
+        decode_fixed_overhead_ms: None,
         compute_tflops_fp32: None,
         compute_tflops_fp16: None,
         unified_memory: false,

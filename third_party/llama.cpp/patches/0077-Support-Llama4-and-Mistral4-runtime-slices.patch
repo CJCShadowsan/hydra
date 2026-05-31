@@ -1,7 +1,7 @@
-From a16d1f2f15bf1a0d0bb668b8ec719ab9e85dcd43 Mon Sep 17 00:00:00 2001
+From ed26df25c7c853fee16cc3a60c1d00fc4f092bf5 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 8 May 2026 05:58:50 +1000
-Subject: [PATCH 77/81] Support Llama4 and Mistral4 runtime slices
+Subject: [PATCH 77/82] Support Llama4 and Mistral4 runtime slices
 
 ---
  src/llama-graph.cpp    | 50 ++++++++++++++++++++++++++++--------------
@@ -11,10 +11,10 @@ Subject: [PATCH 77/81] Support Llama4 and Mistral4 runtime slices
  4 files changed, 83 insertions(+), 21 deletions(-)
 
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5c67d271..e36af917 100644
+index b75cfe1cc..4cec7ddc8 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -608,19 +608,19 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
+@@ -669,19 +669,19 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
          mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
      }
  
@@ -38,7 +38,7 @@ index 5c67d271..e36af917 100644
          mctx->get_swa()->set_input_v_rot(self_v_rot_swa);
      }
  }
-@@ -701,7 +701,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -769,7 +769,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -47,7 +47,7 @@ index 5c67d271..e36af917 100644
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
  
-@@ -724,10 +724,16 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+@@ -792,10 +792,16 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
  
      res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
  
@@ -67,7 +67,7 @@ index 5c67d271..e36af917 100644
  
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
-@@ -750,7 +756,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+@@ -818,7 +824,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -76,7 +76,7 @@ index 5c67d271..e36af917 100644
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
  
-@@ -772,10 +778,16 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+@@ -840,10 +846,16 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
  
      res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
  
@@ -96,7 +96,7 @@ index 5c67d271..e36af917 100644
  
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
-@@ -820,7 +832,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+@@ -888,7 +900,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -105,7 +105,7 @@ index 5c67d271..e36af917 100644
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
  
-@@ -856,10 +868,16 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+@@ -924,10 +936,16 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
          res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
      }
  
@@ -126,7 +126,7 @@ index 5c67d271..e36af917 100644
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 diff --git a/src/models/gemma3n.cpp b/src/models/gemma3n.cpp
-index 625de79d..454977b1 100644
+index 625de79d9..454977b16 100644
 --- a/src/models/gemma3n.cpp
 +++ b/src/models/gemma3n.cpp
 @@ -112,6 +112,25 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
@@ -156,7 +156,7 @@ index 625de79d..454977b1 100644
          inpL = build_inp_embd(model.tok_embd);
  
 diff --git a/src/models/llama4.cpp b/src/models/llama4.cpp
-index 0ff5376d..2f47caa0 100644
+index 0ff5376d5..2f47caa04 100644
 --- a/src/models/llama4.cpp
 +++ b/src/models/llama4.cpp
 @@ -112,14 +112,30 @@ llama_model_llama4::graph<iswa>::graph(const llama_model & model, const llm_grap
@@ -228,7 +228,7 @@ index 0ff5376d..2f47caa0 100644
              model.output_norm, NULL,
              LLM_NORM_RMS, -1);
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 75479955..925ecc70 100644
+index d61f922c9..27dc78b07 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
 @@ -1764,12 +1764,14 @@ static enum skippy_status skippy_finish_model_open(

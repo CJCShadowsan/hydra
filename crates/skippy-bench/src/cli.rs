@@ -16,6 +16,7 @@ pub struct Cli {
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
 pub enum CommandKind {
     LocalSingle(LocalSingleArgs),
+    AbiDecodeProbe(AbiDecodeProbeArgs),
     LocalSplitInprocess(LocalSplitInprocessArgs),
     LocalSplitBinary(LocalSplitBinaryArgs),
     LocalSplitCompare(LocalSplitCompareArgs),
@@ -27,6 +28,26 @@ pub enum CommandKind {
     #[command(name = "focused-runtime")]
     FocusedRuntime(FocusedRuntimeArgs),
     Run(RunArgs),
+}
+
+#[derive(Parser)]
+pub struct AbiDecodeProbeArgs {
+    #[arg(long)]
+    pub model_path: PathBuf,
+    #[arg(long, default_value_t = 8192)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+    pub n_gpu_layers: i32,
+    #[arg(long, default_value_t = 0)]
+    pub layer_start: u32,
+    #[arg(long, default_value_t = 30)]
+    pub layer_end: u32,
+    #[arg(long, default_value = "You are validating local decode throughput.")]
+    pub prompt: String,
+    #[arg(long, default_value_t = 16)]
+    pub warmup_tokens: u32,
+    #[arg(long, default_value_t = 128)]
+    pub measured_tokens: u32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

@@ -185,6 +185,9 @@ fn build_cuda() {
     });
     archive_static_lib(&object, "mesh_llm_gpu_bench_cuda");
     println!("cargo:rustc-link-lib=dylib=cudart");
+    if !cfg!(windows) {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
 }
 
 fn build_hip() {

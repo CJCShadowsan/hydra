@@ -18,6 +18,10 @@ pub struct GpuBandwidth {
     pub p50_gbps: f64,
     pub p90_gbps: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_effective_gbps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_fixed_overhead_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_tflops_fp32: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compute_tflops_fp16: Option<f64>,
@@ -33,6 +37,8 @@ pub struct BenchmarkFingerprint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchmarkResult {
     pub mem_bandwidth_gbps: Vec<f64>,
+    pub decode_effective_gbps: Option<Vec<f64>>,
+    pub decode_fixed_overhead_ms: Option<Vec<f64>>,
     pub compute_tflops_fp32: Option<Vec<f64>>,
     pub compute_tflops_fp16: Option<Vec<f64>>,
 }
@@ -353,8 +359,20 @@ pub fn run_or_load(
                 .iter()
                 .map(|g| g.compute_tflops_fp16)
                 .collect::<Option<Vec<f64>>>();
+            let decode_effective_gbps = cached
+                .gpus
+                .iter()
+                .map(|g| g.decode_effective_gbps)
+                .collect::<Option<Vec<f64>>>();
+            let decode_fixed_overhead_ms = cached
+                .gpus
+                .iter()
+                .map(|g| g.decode_fixed_overhead_ms)
+                .collect::<Option<Vec<f64>>>();
             let result = BenchmarkResult {
                 mem_bandwidth_gbps: mem_bandwidth,
+                decode_effective_gbps,
+                decode_fixed_overhead_ms,
                 compute_tflops_fp32,
                 compute_tflops_fp16,
             };
@@ -456,12 +474,22 @@ fn build_benchmark_result(
             vram_bytes: hw.gpu_vram.get(i).copied().unwrap_or(0),
             p50_gbps: outputs[i].p50_gbps,
             p90_gbps: outputs[i].p90_gbps,
+            decode_effective_gbps: outputs[i].decode_effective_gbps,
+            decode_fixed_overhead_ms: outputs[i].decode_fixed_overhead_ms,
             compute_tflops_fp32: outputs[i].compute_tflops_fp32,
             compute_tflops_fp16: outputs[i].compute_tflops_fp16,
         })
         .collect();
 
     let mem_bandwidth_gbps = gpus.iter().map(|g| g.p90_gbps).collect();
+    let decode_effective_gbps = gpus
+        .iter()
+        .map(|g| g.decode_effective_gbps)
+        .collect::<Option<Vec<f64>>>();
+    let decode_fixed_overhead_ms = gpus
+        .iter()
+        .map(|g| g.decode_fixed_overhead_ms)
+        .collect::<Option<Vec<f64>>>();
     let compute_tflops_fp32 = gpus
         .iter()
         .map(|g| g.compute_tflops_fp32)
@@ -475,6 +503,8 @@ fn build_benchmark_result(
         gpus,
         BenchmarkResult {
             mem_bandwidth_gbps,
+            decode_effective_gbps,
+            decode_fixed_overhead_ms,
             compute_tflops_fp32,
             compute_tflops_fp16,
         },
@@ -519,6 +549,8 @@ mod tests {
             runs: 0,
             p50_gbps: 1.0,
             p90_gbps: 2.0,
+            decode_effective_gbps: None,
+            decode_fixed_overhead_ms: None,
             compute_tflops_fp32: fp32,
             compute_tflops_fp16: fp16,
             noise_pct: 0.0,
@@ -574,6 +606,8 @@ mod tests {
                 vram_bytes: 64_000_000_000,
                 reserved_bytes: None,
                 mem_bandwidth_gbps: None,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
                 unified_memory: false,
@@ -598,6 +632,8 @@ mod tests {
                 vram_bytes: 80_000_000_000,
                 p50_gbps: 1935.0,
                 p90_gbps: 1948.7,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
             }],
@@ -616,6 +652,8 @@ mod tests {
                 vram_bytes: 80_000_000_000,
                 p50_gbps: 1935.0,
                 p90_gbps: 1948.7,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
             }],
@@ -639,6 +677,8 @@ mod tests {
                 vram_bytes: 80_000_000_000,
                 p50_gbps: 1935.0,
                 p90_gbps: 1948.7,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
             }],
@@ -809,6 +849,8 @@ mod tests {
                 vram_bytes: 80_000_000_000,
                 p50_gbps: 1935.0,
                 p90_gbps: 1948.7,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
             }],
@@ -830,6 +872,8 @@ mod tests {
                 vram_bytes: 80_000_000_000,
                 p50_gbps: 1935.2,
                 p90_gbps: 1948.7,
+                decode_effective_gbps: Some(780.0),
+                decode_fixed_overhead_ms: Some(1.25),
                 compute_tflops_fp32: Some(19.5),
                 compute_tflops_fp16: Some(312.0),
             }],
@@ -857,6 +901,8 @@ mod tests {
                 vram_bytes: 80_000_000_000,
                 p50_gbps: 1935.2,
                 p90_gbps: 1948.7,
+                decode_effective_gbps: Some(780.0),
+                decode_fixed_overhead_ms: Some(1.25),
                 compute_tflops_fp32: Some(19.5),
                 compute_tflops_fp16: Some(312.0),
             }],
@@ -889,6 +935,8 @@ mod tests {
                 vram_bytes: 64_000_000_000,
                 p50_gbps: 1.0,
                 p90_gbps: 2.0,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
             }],
@@ -913,6 +961,8 @@ mod tests {
                 runs: 2,
                 p50_gbps: 111.0,
                 p90_gbps: 222.0,
+                decode_effective_gbps: Some(88.0),
+                decode_fixed_overhead_ms: Some(1.5),
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
                 noise_pct: 0.1,
@@ -1071,6 +1121,8 @@ mod tests {
             vram_bytes: 80_000_000_000,
             p50_gbps: 1935.2,
             p90_gbps: 1948.7,
+            decode_effective_gbps: Some(780.0),
+            decode_fixed_overhead_ms: Some(1.25),
             compute_tflops_fp32: Some(19.5),
             compute_tflops_fp16: Some(312.0),
         };
@@ -1088,6 +1140,8 @@ mod tests {
             vram_bytes: 80_000_000_000,
             p50_gbps: 1935.2,
             p90_gbps: 1948.7,
+            decode_effective_gbps: None,
+            decode_fixed_overhead_ms: None,
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
         };
@@ -1148,6 +1202,8 @@ mod tests {
                 runs: 2,
                 p50_gbps: 100.0,
                 p90_gbps: 110.0,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
                 noise_pct: 0.0,
@@ -1166,6 +1222,8 @@ mod tests {
                 runs: 2,
                 p50_gbps: 120.0,
                 p90_gbps: 130.0,
+                decode_effective_gbps: None,
+                decode_fixed_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
                 noise_pct: 0.0,

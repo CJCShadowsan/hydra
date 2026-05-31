@@ -19,6 +19,21 @@
 #define BLOCK_SIZE   256
 #define COMPUTE_ITERS 16384
 #define COMPUTE_BLOCKS_PER_SM 16
+// Decode spends its time in many matmul launches, but the bytes that model-fit
+// predicts are model-weight bytes, not a tiny cache-resident working set. Keep
+// this chunk below the full streaming pass so launch overhead still appears,
+// but large enough that a discrete GPU cannot satisfy the measurement entirely
+// from L2. The final value is also capped by the full-buffer p90 measurement
+// before it is reported as decode-effective bandwidth.
+#define DECODE_CHUNK_BYTES (256 * 1024 * 1024)
+#define DECODE_DISPATCHES 8
+#define FIXED_OVERHEAD_DISPATCHES 256
+
+__global__ void empty_kernel(float* sink) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        sink[0] += 0.0f;
+    }
+}
 
 __global__ void memread(const float4* __restrict__ src, float* sink, int n) {
     int id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -188,10 +203,41 @@ int main(int argc, char** argv) {
             return totalFlops / (ms / 1000.0) / 1e12;
         };
 
+        auto measure_decode_effective_gbps = [&]() -> double {
+            int chunkElements = DECODE_CHUNK_BYTES / sizeof(float4);
+            int chunkGridSize = (chunkElements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            check(cudaEventRecord(evStart), "eventRecord decode effective start");
+            for (int i = 0; i < DECODE_DISPATCHES; ++i) {
+                memread<<<chunkGridSize, BLOCK_SIZE>>>(dSrc, dSink, chunkElements);
+            }
+            check(cudaGetLastError(), "decode effective launch");
+            check(cudaEventRecord(evStop), "eventRecord decode effective stop");
+            check(cudaEventSynchronize(evStop), "eventSync decode effective");
+            float ms = 0.0f;
+            check(cudaEventElapsedTime(&ms, evStart, evStop), "eventElapsed decode effective");
+            double totalBytes = (double)DECODE_CHUNK_BYTES * (double)DECODE_DISPATCHES;
+            return totalBytes / (ms / 1000.0) / 1e9;
+        };
+
+        auto measure_fixed_overhead_ms = [&]() -> double {
+            check(cudaEventRecord(evStart), "eventRecord fixed overhead start");
+            for (int i = 0; i < FIXED_OVERHEAD_DISPATCHES; ++i) {
+                empty_kernel<<<1, 1>>>(dSink);
+            }
+            check(cudaGetLastError(), "fixed overhead launch");
+            check(cudaEventRecord(evStop), "eventRecord fixed overhead stop");
+            check(cudaEventSynchronize(evStop), "eventSync fixed overhead");
+            float ms = 0.0f;
+            check(cudaEventElapsedTime(&ms, evStart, evStop), "eventElapsed fixed overhead");
+            return (double)ms / (double)FIXED_OVERHEAD_DISPATCHES;
+        };
+
         for (int i = 0; i < WARMUP_RUNS; i++) dispatch();
         for (int i = 0; i < WARMUP_RUNS; i++) {
             (void)measure_compute_fp32();
             (void)measure_compute_fp16();
+            (void)measure_decode_effective_gbps();
+            (void)measure_fixed_overhead_ms();
         }
 
         double wallStart = steady_seconds();
@@ -199,10 +245,14 @@ int main(int argc, char** argv) {
         double samples[TIMED_RUNS];
         double fp32Samples[TIMED_RUNS];
         double fp16Samples[TIMED_RUNS];
+        double decodeEffectiveSamples[TIMED_RUNS];
+        double fixedOverheadSamples[TIMED_RUNS];
         for (int i = 0; i < TIMED_RUNS; i++) {
             samples[i] = dispatch();
             fp32Samples[i] = measure_compute_fp32();
             fp16Samples[i] = measure_compute_fp16();
+            decodeEffectiveSamples[i] = measure_decode_effective_gbps();
+            fixedOverheadSamples[i] = measure_fixed_overhead_ms();
         }
 
         double wallEnd = steady_seconds();
@@ -211,10 +261,15 @@ int main(int argc, char** argv) {
         qsort(samples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(fp32Samples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(fp16Samples, TIMED_RUNS, sizeof(double), cmp_double);
+        qsort(decodeEffectiveSamples, TIMED_RUNS, sizeof(double), cmp_double);
+        qsort(fixedOverheadSamples, TIMED_RUNS, sizeof(double), cmp_double);
         double p50      = samples[TIMED_RUNS / 2];
         double p90      = samples[(int)(TIMED_RUNS * 0.90) - 1];
         double tf32P90  = fp32Samples[(int)(TIMED_RUNS * 0.90) - 1];
         double tf16P90  = fp16Samples[(int)(TIMED_RUNS * 0.90) - 1];
+        double decodeEffectiveP90 = decodeEffectiveSamples[(int)(TIMED_RUNS * 0.90) - 1];
+        decodeEffectiveP90 = std::min(decodeEffectiveP90, p90);
+        double fixedOverheadP50 = fixedOverheadSamples[TIMED_RUNS / 2];
         double noisePct = (p90 - p50) / p90 * 100.0;
         double effPct   = p90 / ratedGBps * 100.0;
 
@@ -232,6 +287,8 @@ int main(int argc, char** argv) {
                    "\"efficiency_pct\":%.2f,"
                    "\"bus_width_bits\":%d,"
                    "\"mem_clock_mhz\":%.0f,"
+                   "\"decode_effective_gbps\":%.2f,"
+                   "\"decode_fixed_overhead_ms\":%.4f,"
                    "\"compute_tflops_fp32\":%.2f,"
                    "\"compute_tflops_fp16\":%.2f}",
                    props.name, TIMED_RUNS,
@@ -239,6 +296,8 @@ int main(int argc, char** argv) {
                    ratedGBps, effPct,
                    props.memoryBusWidth,
                    memClockKHz / 1000.0,
+                   decodeEffectiveP90,
+                   fixedOverheadP50,
                    tf32P90, tf16P90);
             if (dev < deviceCount - 1) printf(",");
             else printf("]\n");
@@ -252,6 +311,8 @@ int main(int argc, char** argv) {
             printf("p90    : %.1f GB/s  efficiency: %.1f%%\n", p90, effPct);
             printf("tf32   : %.2f TFLOPS\n", tf32P90);
             printf("tf16   : %.2f TFLOPS\n", tf16P90);
+            printf("decode : %.1f GB/s effective, %.4f ms fixed dispatch\n",
+                   decodeEffectiveP90, fixedOverheadP50);
             printf("noise  : %.1f%%  (p90-p50 spread -- lower is better)\n", noisePct);
             printf("runtime: %.2fs\n", runtimeSecs);
             if (dev < deviceCount - 1) printf("\n");

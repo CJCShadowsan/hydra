@@ -31,6 +31,22 @@ pub struct AcceleratorProfile {
     /// local inference will use, which makes it a better predictor of decode
     /// throughput while still remaining model-independent.
     pub memory_bandwidth_bytes_per_sec: Option<u64>,
+    /// Effective bandwidth measured by a decode-shaped benchmark.
+    ///
+    /// This differs from raw memory bandwidth. Raw bandwidth measures a large,
+    /// sustained streaming kernel. Decode runs many smaller kernels and pays
+    /// scheduling/synchronization costs between them. `model-fit` uses this
+    /// field when available so measured hardware profiles do not need hidden
+    /// backend-specific efficiency constants.
+    #[serde(default)]
+    pub decode_effective_bandwidth_bytes_per_sec: Option<u64>,
+    /// Fixed per-token dispatch overhead measured by the GPU benchmark.
+    ///
+    /// This is a runtime fact, not a model fact. If the benchmark did not
+    /// measure it, model-fit leaves the measured-GPU fixed overhead out of the
+    /// equation and reports that the decode calibration is incomplete.
+    #[serde(default)]
+    pub decode_fixed_overhead_ms: Option<f32>,
     pub bandwidth_source: MeasurementSource,
     /// Run-to-run spread from the GPU bandwidth benchmark.
     ///
@@ -157,6 +173,20 @@ pub struct TensorMatmulGroupProfile {
     pub bytes: u64,
     pub flops_per_token: u64,
     pub type_bytes: TensorTypeBytes,
+    pub shape: MatmulShapeProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MatmulShapeProfile {
+    pub tensor_count: u64,
+    pub logical_matrix_count: u64,
+    pub total_elements: u64,
+    pub min_input_width: u64,
+    pub max_input_width: u64,
+    pub min_output_width: u64,
+    pub max_output_width: u64,
+    pub weighted_avg_input_width: u64,
+    pub weighted_avg_output_width: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -231,25 +261,11 @@ pub enum CapabilityEvidence {
 pub struct SelectionConfig {
     pub safety_margin: f32,
     pub kv_cache_type: KvCacheType,
-    /// Fraction of measured raw bandwidth that a local decode loop is expected
-    /// to turn into useful model-byte throughput.
-    ///
-    /// This is deliberately separate from `BackendEfficiencyConfig`. When
-    /// bandwidth came from `mesh-llm gpus benchmark`, we have already measured
-    /// the concrete backend/device path, so backend-specific multipliers would
-    /// double-count assumptions and reduce portability. Backend efficiencies
-    /// remain the fallback for hand-authored or estimated hardware profiles.
-    #[serde(default = "default_measured_decode_efficiency")]
-    pub measured_decode_efficiency: f32,
     pub backend_efficiency: BackendEfficiencyConfig,
     pub decode_overhead: DecodeOverheadConfig,
     pub workload: WorkloadProfile,
     pub weights: ScoreWeights,
     pub kv_read_scale: f32,
-}
-
-fn default_measured_decode_efficiency() -> f32 {
-    0.40
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -287,29 +303,26 @@ pub struct BackendEfficiencyConfig {
 
 impl Default for BackendEfficiencyConfig {
     fn default() -> Self {
+        // Default to a neutral multiplier. Hardware profiles produced from
+        // `mesh-llm gpus benchmark` should carry decode-shaped bandwidth
+        // directly, so model-fit does not need backend-specific "Metal is X%"
+        // or "CUDA is Y%" assumptions to predict measured machines. Callers may
+        // still override these fields for hypothetical/manual profiles, but the
+        // crate default keeps missing benchmark data visible instead of hiding
+        // it behind magic backend constants.
         Self {
-            metal: 0.40,
-            cuda: 0.55,
-            rocm: 0.45,
-            vulkan: 0.35,
-            cpu: 0.20,
-            unknown: 0.30,
+            metal: 1.0,
+            cuda: 1.0,
+            rocm: 1.0,
+            vulkan: 1.0,
+            cpu: 1.0,
+            unknown: 1.0,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct DecodeOverheadConfig {
-    /// Fixed per-token decode cost used for measured GPU profiles.
-    ///
-    /// Memory bandwidth explains the slope for medium/large local models, but
-    /// every token also pays launch/scheduler/runtime overhead that does not
-    /// shrink just because the model is tiny. The measured-GPU value is
-    /// backend-neutral for the same reason as `measured_decode_efficiency`: once
-    /// the hardware profile came from the benchmark, portability is better if
-    /// we avoid extra Metal/CUDA/ROCm assumptions in the primary path.
-    #[serde(default = "default_measured_gpu_fixed_ms")]
-    pub measured_gpu_fixed_ms: f32,
     pub metal_fixed_ms: f32,
     pub cuda_fixed_ms: f32,
     pub rocm_fixed_ms: f32,
@@ -319,20 +332,20 @@ pub struct DecodeOverheadConfig {
     pub moe_dispatch_ms_per_layer: f32,
 }
 
-fn default_measured_gpu_fixed_ms() -> f32 {
-    4.0
-}
-
 impl Default for DecodeOverheadConfig {
     fn default() -> Self {
         Self {
-            measured_gpu_fixed_ms: default_measured_gpu_fixed_ms(),
-            metal_fixed_ms: 4.0,
-            cuda_fixed_ms: 1.5,
-            rocm_fixed_ms: 2.0,
-            vulkan_fixed_ms: 3.0,
-            cpu_fixed_ms: 0.5,
-            unknown_fixed_ms: 3.0,
+            // Fixed decode overhead is highly runtime/backend/hardware shaped.
+            // Measured GPU profiles get this from `mesh-llm gpus benchmark`.
+            // For unmeasured profiles the honest default is no fixed overhead
+            // plus a warning from scoring that decode calibration is missing,
+            // not a backend-specific constant chosen from local observations.
+            metal_fixed_ms: 0.0,
+            cuda_fixed_ms: 0.0,
+            rocm_fixed_ms: 0.0,
+            vulkan_fixed_ms: 0.0,
+            cpu_fixed_ms: 0.0,
+            unknown_fixed_ms: 0.0,
             moe_dispatch_ms_per_layer: 0.11,
         }
     }
@@ -501,7 +514,6 @@ impl Default for SelectionConfig {
         Self {
             safety_margin: 0.20,
             kv_cache_type: KvCacheType::default(),
-            measured_decode_efficiency: default_measured_decode_efficiency(),
             backend_efficiency: BackendEfficiencyConfig::default(),
             decode_overhead: DecodeOverheadConfig::default(),
             weights: workload.default_weights(),

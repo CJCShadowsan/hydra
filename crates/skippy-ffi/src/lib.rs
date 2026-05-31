@@ -1,6 +1,6 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 24;
+pub const ABI_VERSION_PATCH: u32 = 25;
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -70,6 +70,7 @@ pub const BACKEND_DEVICE_CAP_ASYNC: u64 = 1 << 0;
 pub const BACKEND_DEVICE_CAP_HOST_BUFFER: u64 = 1 << 1;
 pub const BACKEND_DEVICE_CAP_BUFFER_FROM_HOST_PTR: u64 = 1 << 2;
 pub const BACKEND_DEVICE_CAP_EVENTS: u64 = 1 << 3;
+pub const FEATURE_DECODE_BENCHMARK: u64 = 1 << 24;
 
 #[repr(C)]
 pub struct Error {
@@ -206,6 +207,17 @@ pub struct TensorInfo {
     pub ggml_type: u32,
     pub byte_size: u64,
     pub element_count: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DecodeBenchmarkResult {
+    pub version: u32,
+    pub warmup_tokens: u32,
+    pub measured_tokens: u32,
+    pub elapsed_ms: f64,
+    pub tokens_per_second: f64,
+    pub final_token: i32,
 }
 
 #[repr(C)]
@@ -416,6 +428,15 @@ unsafe extern "C" {
         output_activation_capacity: usize,
         out_output_activation_bytes: *mut usize,
         out_predicted_token: *mut i32,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_session_benchmark_decode(
+        session: *mut Session,
+        seed_token: i32,
+        warmup_tokens: u32,
+        measured_tokens: u32,
+        out_result: *mut DecodeBenchmarkResult,
         out_error: *mut *mut Error,
     ) -> Status;
 

@@ -9524,6 +9524,8 @@ mod tests {
             vram_bytes: 24_000_000_000,
             reserved_bytes: None,
             mem_bandwidth_gbps: None,
+            decode_effective_gbps: None,
+            decode_fixed_overhead_ms: None,
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
             unified_memory: false,
@@ -10494,6 +10496,8 @@ mod tests {
         let fp16_arc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         let result = benchmark::BenchmarkResult {
             mem_bandwidth_gbps: vec![10.5, 20.0],
+            decode_effective_gbps: None,
+            decode_fixed_overhead_ms: None,
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
         };

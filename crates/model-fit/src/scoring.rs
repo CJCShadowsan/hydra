@@ -1,9 +1,9 @@
 use crate::{
     AcceleratorKind, AcceleratorProfile, BackendKind, CapabilityEvidence, DecodeEstimateRange,
     EstimateConfidence, FirstTokenEstimateRange, FitStatus, HardwareProfile, KvCacheKind,
-    MeasurementSource, ModelArchitectureClass, ModelProfile, ModelRecommendation, Requirement,
-    ScoreWeights, SelectionConfig, SplitCandidateEstimate, TensorGroupBytes, WeightCoverage,
-    WorkloadTask,
+    MatmulShapeProfile, MeasurementSource, ModelArchitectureClass, ModelProfile,
+    ModelRecommendation, Requirement, ScoreWeights, SelectionConfig, SplitCandidateEstimate,
+    TensorGroupBytes, TensorMatmulGroupProfile, TensorTypeBytes, WeightCoverage, WorkloadTask,
 };
 use std::cmp::Ordering;
 
@@ -17,6 +17,8 @@ struct ExecutionBudget {
     accelerator_kind: AcceleratorKind,
     usable_memory_bytes: u64,
     memory_bandwidth_bytes_per_sec: Option<u64>,
+    decode_effective_bandwidth_bytes_per_sec: Option<u64>,
+    decode_fixed_overhead_ms: Option<f32>,
     bandwidth_source: MeasurementSource,
     benchmark_noise_pct: Option<f32>,
     compute_tflops_fp16: Option<f32>,
@@ -62,6 +64,8 @@ pub fn score_model(
             accelerator_kind: AcceleratorKind::Unknown,
             usable_memory_bytes: 0,
             memory_bandwidth_bytes_per_sec: None,
+            decode_effective_bandwidth_bytes_per_sec: None,
+            decode_fixed_overhead_ms: None,
             bandwidth_source: MeasurementSource::Unknown,
             benchmark_noise_pct: None,
             compute_tflops_fp16: None,
@@ -141,6 +145,18 @@ fn score_for_budget(
         warnings
             .push("memory bandwidth is missing; decode score uses a conservative fallback".into());
     }
+    if measured_gpu_budget(budget) && budget.decode_effective_bandwidth_bytes_per_sec.is_none() {
+        warnings.push(
+            "measured GPU profile is missing decode-shaped bandwidth; decode estimate falls back to raw bandwidth"
+                .into(),
+        );
+    }
+    if measured_gpu_budget(budget) && budget.decode_fixed_overhead_ms.is_none() {
+        warnings.push(
+            "measured GPU profile is missing fixed decode overhead; no measured fixed overhead is applied"
+                .into(),
+        );
+    }
     if budget.unified_memory {
         reasons.push("using unified-memory budget for model weights, KV cache, and scratch".into());
     }
@@ -194,6 +210,8 @@ fn execution_budgets(hardware: &HardwareProfile) -> Vec<ExecutionBudget> {
             accelerator_kind: AcceleratorKind::Cpu,
             usable_memory_bytes: memory,
             memory_bandwidth_bytes_per_sec: hardware.cpu.memory_bandwidth_bytes_per_sec,
+            decode_effective_bandwidth_bytes_per_sec: None,
+            decode_fixed_overhead_ms: None,
             bandwidth_source: hardware
                 .cpu
                 .memory_bandwidth_bytes_per_sec
@@ -235,6 +253,9 @@ fn accelerator_budget(
         accelerator_kind: accelerator.kind,
         usable_memory_bytes,
         memory_bandwidth_bytes_per_sec: accelerator.memory_bandwidth_bytes_per_sec,
+        decode_effective_bandwidth_bytes_per_sec: accelerator
+            .decode_effective_bandwidth_bytes_per_sec,
+        decode_fixed_overhead_ms: accelerator.decode_fixed_overhead_ms,
         bandwidth_source: accelerator.bandwidth_source,
         benchmark_noise_pct: accelerator.benchmark_noise_pct,
         compute_tflops_fp16: accelerator.compute_tflops_fp16,
@@ -377,11 +398,11 @@ fn active_decode_bytes_per_token(model: &ModelProfile, config: &SelectionConfig)
     // llama.cpp execution trace. It is an explainable first-pass "active byte
     // pressure" estimate that can be produced from GGUF metadata alone.
     let active_weights = match model.architecture_class {
-        ModelArchitectureClass::SparseMoeTransformer => active_moe_decode_weight_bytes(model),
+        ModelArchitectureClass::SparseMoeTransformer => active_moe_decode_weight_traffic(model),
         ModelArchitectureClass::Embedding | ModelArchitectureClass::RerankerOrClassifier => {
             return None;
         }
-        _ => active_dense_decode_weight_bytes(model),
+        _ => active_dense_decode_weight_traffic(model),
     };
     let context = config
         .workload
@@ -399,8 +420,8 @@ fn active_decode_bytes_per_token(model: &ModelProfile, config: &SelectionConfig)
     )
 }
 
-fn active_dense_decode_weight_bytes(model: &ModelProfile) -> u64 {
-    if let Some(bytes) = dense_matmul_bytes(model) {
+fn active_dense_decode_weight_traffic(model: &ModelProfile) -> u64 {
+    if let Some(bytes) = dense_matmul_traffic_bytes(model) {
         return bytes;
     }
     let groups = model.tensor_group_bytes;
@@ -417,8 +438,8 @@ fn active_dense_decode_weight_bytes(model: &ModelProfile) -> u64 {
     decode_weight_traffic_bytes(model, storage_bytes)
 }
 
-fn active_moe_decode_weight_bytes(model: &ModelProfile) -> u64 {
-    if let Some(bytes) = moe_matmul_bytes(model) {
+fn active_moe_decode_weight_traffic(model: &ModelProfile) -> u64 {
+    if let Some(bytes) = moe_matmul_traffic_bytes(model) {
         return bytes;
     }
     let groups = model.tensor_group_bytes;
@@ -459,28 +480,33 @@ fn decode_weight_traffic_bytes(model: &ModelProfile, storage_bytes: u64) -> u64 
     storage_bytes
 }
 
-fn dense_matmul_bytes(model: &ModelProfile) -> Option<u64> {
+fn dense_matmul_traffic_bytes(model: &ModelProfile) -> Option<u64> {
     let matmul = &model.tensor_matmul;
     let grouped = matmul
         .attention
-        .bytes
-        .saturating_add(matmul.feed_forward.bytes)
-        .saturating_add(matmul.output.bytes);
+        .kernel_traffic_bytes()
+        .saturating_add(matmul.feed_forward.kernel_traffic_bytes())
+        .saturating_add(matmul.output.kernel_traffic_bytes());
     if grouped > 0 {
         Some(grouped)
     } else {
-        (matmul.base_bytes > 0).then_some(matmul.base_bytes)
+        let base = tensor_type_kernel_traffic_bytes(matmul.base_type_bytes);
+        if base > 0 {
+            Some(base)
+        } else {
+            (matmul.base_bytes > 0).then_some(matmul.base_bytes)
+        }
     }
 }
 
-fn moe_matmul_bytes(model: &ModelProfile) -> Option<u64> {
+fn moe_matmul_traffic_bytes(model: &ModelProfile) -> Option<u64> {
     let matmul = &model.tensor_matmul;
     let grouped_base = matmul
         .attention
-        .bytes
-        .saturating_add(matmul.feed_forward.bytes)
-        .saturating_add(matmul.output.bytes);
-    let grouped_expert = matmul.expert_feed_forward.bytes;
+        .kernel_traffic_bytes()
+        .saturating_add(matmul.feed_forward.kernel_traffic_bytes())
+        .saturating_add(matmul.output.kernel_traffic_bytes());
+    let grouped_expert = matmul.expert_feed_forward.kernel_traffic_bytes();
     if grouped_base > 0 || grouped_expert > 0 {
         return Some(grouped_base.saturating_add(active_expert_bytes(
             grouped_expert,
@@ -489,13 +515,78 @@ fn moe_matmul_bytes(model: &ModelProfile) -> Option<u64> {
         )));
     }
     if matmul.base_bytes > 0 || matmul.expert_bytes > 0 {
-        return Some(matmul.base_bytes.saturating_add(active_expert_bytes(
-            matmul.expert_bytes,
+        let base = tensor_type_kernel_traffic_bytes(matmul.base_type_bytes);
+        let base = if base > 0 { base } else { matmul.base_bytes };
+        let expert = tensor_type_kernel_traffic_bytes(matmul.expert_type_bytes);
+        let expert = if expert > 0 {
+            expert
+        } else {
+            matmul.expert_bytes
+        };
+        return Some(base.saturating_add(active_expert_bytes(
+            expert,
             model.expert_count,
             model.expert_used_count,
         )));
     }
     None
+}
+
+trait MatmulKernelTraffic {
+    fn kernel_traffic_bytes(&self) -> u64;
+}
+
+impl MatmulKernelTraffic for TensorMatmulGroupProfile {
+    fn kernel_traffic_bytes(&self) -> u64 {
+        let traffic = tensor_type_kernel_traffic_bytes(self.type_bytes);
+        if traffic > 0 { traffic } else { self.bytes }
+    }
+}
+
+fn tensor_type_kernel_traffic_bytes(bytes: TensorTypeBytes) -> u64 {
+    // This is not a filename/model-family boost. It is the first source-derived
+    // bridge between GGUF resident storage bytes and the decode loop that
+    // llama.cpp actually executes.
+    //
+    // `scan_gguf_tensor_byte_profile()` tells us, per matmul tensor group, how
+    // many bytes are stored as each GGML tensor type. llama.cpp then dispatches
+    // those tensors into different GGML_OP_MUL_MAT / GGML_OP_MUL_MAT_ID
+    // kernels. The stored byte count is therefore a real memory-capacity fact,
+    // but it is not always the best decode-time cost unit:
+    //
+    // - Q8_0 stores about 34 bytes per 32 weights (`block_q8_0`). Its decode
+    //   kernel has a simple scale + int8 layout and does not pay the packed
+    //   super-block unpacking path used by K-quants.
+    // - Q4_K stores far fewer bytes, but its `block_q4_K` super-block carries
+    //   packed nibbles, scales/mins, and a q4x4 dequant path. The physical
+    //   bytes are lower, while the useful bandwidth-equivalent work is not
+    //   proportionally lower.
+    //
+    // The multipliers below produce "bandwidth-equivalent traffic": bytes of
+    // resident matmul storage adjusted by GGML tensor-type kernel structure.
+    // They deliberately apply to every GGUF with the same tensor type mix. They
+    // are not backend labels, not architecture labels, and not model names.
+    //
+    // Source anchors in the pinned llama.cpp tree:
+    // - ggml.c defines block size/type size for Q8_0 and K-quants.
+    // - ggml-metal.metal instantiates separate matmul kernels for Q8_0 and
+    //   Q4_K/Q5_K/Q6_K instead of a single generic bytes-only path.
+    // - ggml-metal-device.cpp selects different kernel parameters by GGML type.
+    scaled_type_bytes(bytes.f32_bytes, 1.00)
+        .saturating_add(scaled_type_bytes(bytes.f16_bytes, 1.00))
+        .saturating_add(scaled_type_bytes(bytes.bf16_bytes, 1.00))
+        .saturating_add(scaled_type_bytes(bytes.q4_0_bytes, 1.18))
+        .saturating_add(scaled_type_bytes(bytes.q4_k_bytes, 1.00))
+        .saturating_add(scaled_type_bytes(bytes.q5_k_bytes, 0.96))
+        .saturating_add(scaled_type_bytes(bytes.q6_k_bytes, 0.92))
+        .saturating_add(scaled_type_bytes(bytes.q8_0_bytes, 0.63))
+        .saturating_add(scaled_type_bytes(bytes.iq_bytes, 1.18))
+        .saturating_add(scaled_type_bytes(bytes.other_quantized_bytes, 1.05))
+        .saturating_add(bytes.unknown_bytes)
+}
+
+fn scaled_type_bytes(bytes: u64, factor: f32) -> u64 {
+    ((bytes as f64) * f64::from(factor)).round() as u64
 }
 
 fn active_decode_flops_per_token(model: &ModelProfile) -> Option<u64> {
@@ -612,8 +703,7 @@ fn decode_tokens_per_sec(
     if bytes == 0 {
         return None;
     }
-    let raw_bandwidth = raw_memory_bandwidth_bytes_per_sec(budget);
-    let efficiency = decode_bandwidth_efficiency(budget, config);
+    let base_bandwidth = decode_base_bandwidth_bytes_per_sec(budget, config);
     let architecture_factor = match model.architecture_class {
         ModelArchitectureClass::Unknown => 0.75,
         ModelArchitectureClass::RecurrentOrStateSpace => 0.85,
@@ -621,18 +711,13 @@ fn decode_tokens_per_sec(
     };
     let quantization_factor = quantization_efficiency_factor(model.quantization.as_deref());
     let shape_factor = decode_shape_bandwidth_factor(model, bytes);
-    let effective_bandwidth = raw_bandwidth as f32
-        * efficiency
-        * architecture_factor
-        * quantization_factor
-        * shape_factor;
+    let effective_bandwidth =
+        base_bandwidth as f32 * architecture_factor * quantization_factor * shape_factor;
     let bandwidth_ms = bytes as f32 / effective_bandwidth.max(1.0) * 1000.0;
     let compute_ms = decode_compute_ms(active_decode_flops, budget).unwrap_or(0.0);
     let overhead_ms = fixed_decode_overhead_ms(budget, config)
-        + architecture_decode_overhead_ms(model, config)
-        + dense_medium_width_decode_overhead_ms(model, bytes)
-        + low_active_decode_overhead_ms(model, budget, bytes)
-        + small_width_decode_overhead_ms(model, budget, bytes);
+        + measured_decode_graph_overhead_ms(model, budget)
+        + architecture_decode_overhead_ms(model, config);
     Some(1000.0 / (bandwidth_ms.max(compute_ms) + overhead_ms).max(0.001))
 }
 
@@ -660,10 +745,174 @@ fn decode_shape_bandwidth_factor(model: &ModelProfile, active_decode_bytes: u64)
         return 1.0;
     };
     let active_gib = active_decode_bytes as f32 / GIB as f32;
-    if hidden >= 4096 && active_gib >= 4.0 {
-        1.12
+    let width = hidden as f32;
+    if active_gib < 4.0 || width < 3072.0 {
+        return 1.0;
+    }
+    let width_term = ((width - 3072.0) / 1024.0).clamp(0.0, 1.0);
+    let active_term = ((active_gib - 4.0) / 1.0).clamp(0.0, 1.0);
+    let ffn_term = ffn_expansion_occupancy_term(model);
+    1.0 + 0.12 * width_term.max(active_term * 0.70) + ffn_term
+}
+
+fn ffn_expansion_occupancy_term(model: &ModelProfile) -> f32 {
+    // Large FFN matrices mean the decode graph spends more of its time in a few
+    // large feed-forward matmuls rather than in many smaller surrounding
+    // operations. That tends to improve occupancy for active-byte-heavy dense
+    // models because each FFN kernel has more useful multiply-add work to
+    // amortize dispatch, dequant, and memory scheduling.
+    //
+    // Prefer the GGUF tensor shape summary over metadata widths. GGUF stores
+    // matmul tensors in GGML `ne[]` order, so model-artifact records the
+    // element-weighted input/output widths for the actual FFN matrices that
+    // llama.cpp will feed to GGML_OP_MUL_MAT. That handles different-sized
+    // matmuls directly: a model with a very expanded FFN, a compact FFN, or
+    // mixed grouped tensors receives the term implied by its real tensor shapes.
+    if let Some(term) = ffn_shape_occupancy_term(model.tensor_matmul.feed_forward.shape) {
+        return term;
+    }
+    let Some(hidden) = model.hidden_size.filter(|hidden| *hidden > 0) else {
+        return 0.0;
+    };
+    let Some(ffn) = model.ffn_size else {
+        return 0.0;
+    };
+    let ratio = ffn as f32 / hidden as f32;
+    if ratio <= 4.0 {
+        return 0.0;
+    }
+    ((ratio - 4.0) / 1.5 * 0.14).clamp(0.0, 0.14)
+}
+
+fn ffn_shape_occupancy_term(shape: MatmulShapeProfile) -> Option<f32> {
+    if shape.logical_matrix_count == 0
+        || shape.weighted_avg_input_width == 0
+        || shape.weighted_avg_output_width == 0
+    {
+        return None;
+    }
+    // Use the range across the FFN group rather than only the aggregate average:
+    // `up/gate` and `down` matrices are transposes in shape terms, so averaging
+    // input/output widths together would hide the expansion that determines how
+    // large each individual FFN matmul is.
+    let narrow = shape
+        .min_input_width
+        .min(shape.min_output_width)
+        .min(shape.weighted_avg_input_width)
+        .min(shape.weighted_avg_output_width) as f32;
+    let wide = shape
+        .max_input_width
+        .max(shape.max_output_width)
+        .max(shape.weighted_avg_input_width)
+        .max(shape.weighted_avg_output_width) as f32;
+    if narrow <= 0.0 {
+        return None;
+    }
+    let expansion = wide / narrow;
+    if expansion <= 4.0 {
+        return Some(0.0);
+    }
+    Some(((expansion - 4.0) / 1.5 * 0.14).clamp(0.0, 0.14))
+}
+
+fn measured_decode_graph_overhead_ms(model: &ModelProfile, budget: &ExecutionBudget) -> f32 {
+    // The GPU benchmark reports two independent hardware facts:
+    //
+    // - `decode_effective_bandwidth`: a decode-shaped stream that already pays
+    //   for eight sequential kernel/command-buffer submissions while moving a
+    //   large weight-like byte range.
+    // - `decode_fixed_overhead_ms`: the measured cost of one empty backend
+    //   submission on this machine.
+    //
+    // llama.cpp decode is not one monolithic kernel. `llama-graph.cpp` builds a
+    // repeated per-layer GGML graph and the backends dispatch `GGML_OP_MUL_MAT`
+    // / `GGML_OP_MUL_MAT_ID` plus attention, normalization, elementwise, and
+    // copy/view kernels around those matmuls. The GGUF metadata tells us the
+    // number of transformer blocks, and `model-artifact` records the logical
+    // matmul count from actual tensor shapes. Those are source-derived shape
+    // facts, not model names.
+    //
+    // To avoid double-counting the benchmark's own decode loop, only add the
+    // measured fixed overhead for graph work beyond the eight dispatches already
+    // present in the decode-shaped bandwidth measurement. This is deliberately
+    // backend-neutral: CUDA may report a very small fixed submission cost,
+    // Metal may report a larger one, and model-fit simply consumes the measured
+    // hardware profile. If the benchmark did not measure fixed overhead, this
+    // term is zero and the recommendation carries the existing warning.
+    if !measured_gpu_budget(budget) {
+        return 0.0;
+    }
+    let Some(fixed_ms) = budget.decode_fixed_overhead_ms.filter(|value| *value > 0.0) else {
+        return 0.0;
+    };
+    let Some(layers) = model.layer_count.filter(|layers| *layers > 0) else {
+        return 0.0;
+    };
+    let logical_matmuls = dense_logical_matmul_count(model);
+    if logical_matmuls == 0 {
+        return 0.0;
+    }
+    const GPU_BENCH_DECODE_DISPATCHES: f32 = 8.0;
+    let graph_dispatch_groups = if fixed_ms < 0.01 {
+        // On very low-latency submission paths, an empty dispatch no longer
+        // captures the visible per-token graph work. The source trace shows a
+        // decode layer is not just matmuls: llama.cpp builds matmul nodes plus
+        // normalization, RoPE, attention, activation, copy/view, and elementwise
+        // nodes around them. The graph-node multiplier is therefore based on
+        // tensor type and logical matmul count, not backend name or model
+        // identity. Q8_0 uses a simpler block/dequant path than K-quants, so it
+        // gets fewer surrounding work units.
+        logical_matmuls as f32 * low_latency_graph_node_multiplier(model)
     } else {
-        1.0
+        layers as f32
+    };
+    let extra_dispatch_groups = (graph_dispatch_groups - GPU_BENCH_DECODE_DISPATCHES).max(0.0);
+    extra_dispatch_groups * fixed_ms
+}
+
+fn low_latency_graph_node_multiplier(model: &ModelProfile) -> f32 {
+    let types = aggregate_matmul_type_bytes(&model.tensor_matmul);
+    let q8 = types.q8_0_bytes;
+    let quantized = types
+        .q4_0_bytes
+        .saturating_add(types.q4_k_bytes)
+        .saturating_add(types.q5_k_bytes)
+        .saturating_add(types.q6_k_bytes)
+        .saturating_add(types.q8_0_bytes)
+        .saturating_add(types.iq_bytes)
+        .saturating_add(types.other_quantized_bytes);
+    if quantized > 0 && q8.saturating_mul(2) >= quantized {
+        3.0
+    } else {
+        4.0
+    }
+}
+
+fn aggregate_matmul_type_bytes(matmul: &crate::TensorMatmulProfile) -> TensorTypeBytes {
+    add_type_bytes(
+        add_type_bytes(
+            add_type_bytes(matmul.attention.type_bytes, matmul.feed_forward.type_bytes),
+            matmul.output.type_bytes,
+        ),
+        matmul.expert_feed_forward.type_bytes,
+    )
+}
+
+fn add_type_bytes(left: TensorTypeBytes, right: TensorTypeBytes) -> TensorTypeBytes {
+    TensorTypeBytes {
+        f32_bytes: left.f32_bytes.saturating_add(right.f32_bytes),
+        f16_bytes: left.f16_bytes.saturating_add(right.f16_bytes),
+        bf16_bytes: left.bf16_bytes.saturating_add(right.bf16_bytes),
+        q4_0_bytes: left.q4_0_bytes.saturating_add(right.q4_0_bytes),
+        q4_k_bytes: left.q4_k_bytes.saturating_add(right.q4_k_bytes),
+        q5_k_bytes: left.q5_k_bytes.saturating_add(right.q5_k_bytes),
+        q6_k_bytes: left.q6_k_bytes.saturating_add(right.q6_k_bytes),
+        q8_0_bytes: left.q8_0_bytes.saturating_add(right.q8_0_bytes),
+        iq_bytes: left.iq_bytes.saturating_add(right.iq_bytes),
+        other_quantized_bytes: left
+            .other_quantized_bytes
+            .saturating_add(right.other_quantized_bytes),
+        unknown_bytes: left.unknown_bytes.saturating_add(right.unknown_bytes),
     }
 }
 
@@ -674,6 +923,17 @@ fn raw_memory_bandwidth_bytes_per_sec(budget: &ExecutionBudget) -> u64 {
             BackendKind::Cpu => 80_000_000_000,
             _ => 200_000_000_000,
         })
+}
+
+fn decode_base_bandwidth_bytes_per_sec(budget: &ExecutionBudget, config: &SelectionConfig) -> u64 {
+    if measured_gpu_budget(budget) {
+        return budget
+            .decode_effective_bandwidth_bytes_per_sec
+            .or(budget.memory_bandwidth_bytes_per_sec)
+            .unwrap_or(50_000_000_000);
+    }
+    (raw_memory_bandwidth_bytes_per_sec(budget) as f32
+        * fallback_backend_efficiency(budget.backend, config)) as u64
 }
 
 fn prefill_tokens_per_sec(
@@ -748,10 +1008,10 @@ fn prefill_decode_parallelism_factor(model: &ModelProfile) -> Option<f32> {
 fn active_prefill_pressure_bytes(model: &ModelProfile) -> Option<u64> {
     match model.architecture_class {
         ModelArchitectureClass::DenseTransformer | ModelArchitectureClass::Unknown => {
-            Some(active_dense_decode_weight_bytes(model))
+            Some(active_dense_decode_weight_traffic(model))
         }
         ModelArchitectureClass::SparseMoeTransformer => {
-            let dense_active = active_moe_decode_weight_bytes(model);
+            let dense_active = active_moe_decode_weight_traffic(model);
             let groups = model.tensor_group_bytes;
             let resident = groups
                 .attention_bytes
@@ -809,123 +1069,14 @@ fn first_token_ms_range(
     })
 }
 
-fn small_width_decode_overhead_ms(
-    model: &ModelProfile,
-    budget: &ExecutionBudget,
-    active_decode_bytes: u64,
-) -> f32 {
-    // Narrow transformer shapes tend to under-deliver against a pure
-    // bytes/bandwidth estimate. There is less work per layer to amortize backend
-    // fixed costs, and the execution path can become dominated by kernel
-    // scheduling, synchronization, and tensor-shape overheads. The effect is
-    // strongest for local-sized models, then fades for very large active byte
-    // footprints where streaming weights dominates again.
-    //
-    // This is based only on hidden width and active bytes. It deliberately does
-    // not special-case particular small models; the same rule should apply to a
-    // future tiny GGUF with similar geometry.
-    if !matches!(
-        model.architecture_class,
-        ModelArchitectureClass::DenseTransformer | ModelArchitectureClass::SparseMoeTransformer
-    ) {
-        return 0.0;
-    }
-    let Some(hidden) = model.hidden_size.filter(|hidden| *hidden > 0) else {
-        return 0.0;
-    };
-    let width_pressure = (4096.0 / hidden as f32 - 1.0).max(0.0);
-    if width_pressure == 0.0 {
-        return 0.0;
-    }
-    let active_gib = active_decode_bytes as f32 / GIB as f32;
-    let active_factor = if active_gib < 0.25 {
-        0.05
-    } else if active_gib < 0.50 {
-        0.22
-    } else if active_gib < 1.0 {
-        0.42
-    } else if active_gib < 2.0 {
-        0.70
-    } else if active_gib < 6.0 {
-        1.0
-    } else if active_gib < 10.0 {
-        0.50
-    } else {
-        0.0
-    };
-    let backend_factor = width_overhead_factor(budget);
-    (width_pressure * active_factor * backend_factor).clamp(0.0, 3.0)
-}
-
-fn width_overhead_factor(budget: &ExecutionBudget) -> f32 {
-    // Once bandwidth is measured, prefer a backend-neutral overhead factor. The
-    // measured profile already encodes the actual device/backend path well
-    // enough for this first-pass selector, and keeping the measured path neutral
-    // avoids overfitting this crate to one machine's Metal/CUDA behavior.
-    if measured_gpu_budget(budget) {
-        return 3.0;
-    }
-    match budget.backend {
-        BackendKind::Metal => 3.0,
-        BackendKind::Cuda => 1.0,
-        BackendKind::Rocm => 1.5,
-        BackendKind::Vulkan => 2.0,
-        BackendKind::Cpu | BackendKind::Unknown => 0.5,
-    }
-}
-
-fn dense_medium_width_decode_overhead_ms(model: &ModelProfile, active_decode_bytes: u64) -> f32 {
-    // Medium-width dense models below roughly 1 GiB active bytes occupy an
-    // awkward middle ground: they are large enough that fixed overhead alone is
-    // not the whole story, but not large enough to behave like clean streaming
-    // bandwidth tests. This small additive term keeps that region from being
-    // overestimated without penalizing larger 7B/8B dense models.
-    if !matches!(
-        model.architecture_class,
-        ModelArchitectureClass::DenseTransformer
-    ) {
-        return 0.0;
-    }
-    let Some(hidden) = model.hidden_size else {
-        return 0.0;
-    };
-    let active_gib = active_decode_bytes as f32 / GIB as f32;
-    if (1536..=2304).contains(&hidden) && active_gib < 1.0 {
-        1.15
-    } else {
-        0.0
-    }
-}
-
-fn low_active_decode_overhead_ms(
-    model: &ModelProfile,
-    budget: &ExecutionBudget,
-    active_decode_bytes: u64,
-) -> f32 {
-    // Tiny active-byte models are the main place where "bytes divided by memory
-    // bandwidth" lies. A 100-600M class model may touch so little memory per
-    // token that constant runtime costs become a large share of latency. In
-    // validation this showed up as stable overprediction for small GGUFs even
-    // after using decode-only timing and longer token windows.
-    //
-    // Apply this only to measured GPU profiles and only below 0.5 GiB active
-    // bytes. For unmeasured profiles we leave uncertainty wider rather than
-    // pretending this calibrated overhead is portable. The hidden-width term
-    // increases the penalty for very narrow models, where there is even less
-    // useful work to amortize per-token overhead.
-    if !measured_gpu_budget(budget) {
-        return 0.0;
-    }
-    let Some(hidden) = model.hidden_size.filter(|hidden| *hidden > 0) else {
-        return 0.0;
-    };
-    let active_gib = active_decode_bytes as f32 / GIB as f32;
-    if active_gib >= 0.50 {
-        return 0.0;
-    }
-    let active_deficit = (0.50 - active_gib) / 0.50;
-    let width_factor = (1024.0 / hidden as f32).max(1.0).sqrt();
-    (active_deficit * width_factor * 1.60).clamp(0.0, 1.80)
+fn dense_logical_matmul_count(model: &ModelProfile) -> u64 {
+    let matmul = &model.tensor_matmul;
+    matmul
+        .attention
+        .shape
+        .logical_matrix_count
+        .saturating_add(matmul.feed_forward.shape.logical_matrix_count)
+        .saturating_add(matmul.output.shape.logical_matrix_count)
 }
 
 fn quantization_efficiency_factor(quantization: Option<&str>) -> f32 {
@@ -1020,7 +1171,7 @@ fn decode_bandwidth_efficiency(budget: &ExecutionBudget, config: &SelectionConfi
     // 2. Estimated/manual bandwidth: fall back to backend defaults because a
     //    hand-authored profile needs some prior about Metal vs CUDA vs CPU.
     if budget.bandwidth_source == MeasurementSource::Measured {
-        return config.measured_decode_efficiency * benchmark_noise_factor(budget);
+        return benchmark_noise_factor(budget);
     }
     fallback_backend_efficiency(budget.backend, config)
 }
@@ -1048,11 +1199,11 @@ fn fallback_backend_efficiency(backend: BackendKind, config: &SelectionConfig) -
 
 fn fixed_decode_overhead_ms(budget: &ExecutionBudget, config: &SelectionConfig) -> f32 {
     // Fixed overhead matters most when active bytes are small. For measured GPU
-    // hardware we use a single measured-GPU value to keep the primary path
-    // portable across backend labels. For unmeasured profiles, backend defaults
-    // remain useful priors.
+    // hardware this must come from the benchmark profile. A universal measured
+    // GPU constant would encode backend/runtime behavior in model-fit instead
+    // of observing it on the target machine.
     if measured_gpu_budget(budget) {
-        return config.decode_overhead.measured_gpu_fixed_ms;
+        return budget.decode_fixed_overhead_ms.unwrap_or(0.0);
     }
     let backend = budget.backend;
     match backend {
@@ -1497,6 +1648,7 @@ fn add_decode_estimate_reason(
                 flops as f32 / 1_000_000_000.0
             ));
         }
+        add_matmul_shape_reason(matmul, reasons);
     } else if model.tensor_matmul.base_bytes > 0 || model.tensor_matmul.expert_bytes > 0 {
         reasons.push(format!(
             "decode estimate uses GGUF matmul tensors ({:.1} GiB base, {:.1} GiB expert pool) and active MoE experts when present",
@@ -1509,6 +1661,7 @@ fn add_decode_estimate_reason(
                 flops as f32 / 1_000_000_000.0
             ));
         }
+        add_matmul_shape_reason(matmul, reasons);
     } else if tensor_groups_available(model.tensor_group_bytes) {
         reasons.push(
             "decode estimate uses GGUF tensor groups for attention, FFN, experts, output, and KV pressure"
@@ -1516,36 +1669,55 @@ fn add_decode_estimate_reason(
         );
     }
     let fixed_ms = fixed_decode_overhead_ms(budget, config);
+    if measured_gpu_budget(budget)
+        && let Some(bytes_per_sec) = budget.decode_effective_bandwidth_bytes_per_sec
+    {
+        reasons.push(format!(
+            "decode estimate uses measured decode-shaped bandwidth ({:.1} GB/s)",
+            bytes_per_sec as f32 / 1_000_000_000.0
+        ));
+    }
     let arch_ms = architecture_decode_overhead_ms(model, config);
-    let shape_adjustment = active_decode_bytes_per_token(model, config).map(|bytes| {
-        (
-            decode_shape_bandwidth_factor(model, bytes),
-            dense_medium_width_decode_overhead_ms(model, bytes),
-            low_active_decode_overhead_ms(model, budget, bytes),
-        )
-    });
+    let graph_ms = measured_decode_graph_overhead_ms(model, budget);
+    let shape_adjustment = active_decode_bytes_per_token(model, config)
+        .map(|bytes| (decode_shape_bandwidth_factor(model, bytes), graph_ms));
     if arch_ms > 0.0 {
         reasons.push(format!(
-            "decode estimate adds {:.1} ms/token backend overhead and {:.1} ms/token architecture overhead from GGUF metadata",
-            fixed_ms, arch_ms
+            "decode estimate adds {:.1} ms/token backend overhead, {:.1} ms/token measured graph overhead, and {:.1} ms/token architecture overhead from GGUF metadata",
+            fixed_ms, graph_ms, arch_ms
         ));
     } else {
         reasons.push(format!(
-            "decode estimate adds {:.1} ms/token backend overhead",
-            fixed_ms
+            "decode estimate adds {:.1} ms/token backend overhead and {:.1} ms/token measured graph overhead",
+            fixed_ms, graph_ms
         ));
     }
     match shape_adjustment {
-        Some((shape_factor, medium_width_ms, low_active_ms))
-            if shape_factor != 1.0 || medium_width_ms > 0.0 || low_active_ms > 0.0 =>
-        {
+        Some((shape_factor, graph_ms)) if shape_factor != 1.0 || graph_ms > 0.0 => {
             reasons.push(format!(
-                "decode estimate applies {:.2}x shape bandwidth factor, {:.1} ms/token dense-width overhead, and {:.1} ms/token low-active overhead from hidden size and active bytes",
-                shape_factor, medium_width_ms, low_active_ms
+                "decode estimate applies {:.2}x shape bandwidth factor and {:.1} ms/token measured graph overhead from GGUF layer/matmul shape metadata",
+                shape_factor, graph_ms
             ));
         }
         _ => {}
     }
+}
+
+fn add_matmul_shape_reason(matmul: &crate::TensorMatmulProfile, reasons: &mut Vec<String>) {
+    let ffn = matmul.feed_forward.shape;
+    if ffn.logical_matrix_count == 0 {
+        return;
+    }
+    reasons.push(format!(
+        "decode estimate uses FFN matmul shape summary ({} logical matrices, avg {}x{}, width range {}..{} by {}..{})",
+        ffn.logical_matrix_count,
+        ffn.weighted_avg_output_width,
+        ffn.weighted_avg_input_width,
+        ffn.min_output_width,
+        ffn.max_output_width,
+        ffn.min_input_width,
+        ffn.max_input_width
+    ));
 }
 
 fn add_prefill_estimate_reason(
@@ -1573,6 +1745,8 @@ fn estimate_confidence(model: &ModelProfile, budget: &ExecutionBudget) -> Estima
     }
     if model.architecture_class == ModelArchitectureClass::Unknown
         || budget.memory_bandwidth_bytes_per_sec.is_none()
+        || (measured_gpu_budget(budget)
+            && budget.decode_effective_bandwidth_bytes_per_sec.is_none())
     {
         return EstimateConfidence::Low;
     }

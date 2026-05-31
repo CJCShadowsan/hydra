@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BenchmarkOutput {
     pub device: String,
     pub buffer_mb: u32,
     pub runs: u32,
     pub p50_gbps: f64,
     pub p90_gbps: f64,
+    #[serde(default)]
+    pub decode_effective_gbps: Option<f64>,
+    #[serde(default)]
+    pub decode_fixed_overhead_ms: Option<f64>,
     pub compute_tflops_fp32: Option<f64>,
     pub compute_tflops_fp16: Option<f64>,
     pub noise_pct: f64,
