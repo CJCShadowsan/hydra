@@ -541,6 +541,17 @@ pub struct GgufTensorMatmulProfile {
     pub expert_flops_per_token: u64,
     pub base_type_bytes: GgufTensorTypeByteProfile,
     pub expert_type_bytes: GgufTensorTypeByteProfile,
+    pub attention: GgufMatmulGroupProfile,
+    pub feed_forward: GgufMatmulGroupProfile,
+    pub expert_feed_forward: GgufMatmulGroupProfile,
+    pub output: GgufMatmulGroupProfile,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GgufMatmulGroupProfile {
+    pub bytes: u64,
+    pub flops_per_token: u64,
+    pub type_bytes: GgufTensorTypeByteProfile,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -937,6 +948,14 @@ fn add_matmul_profile(
         return;
     }
     let flops = tensor_flops_per_token(tensor);
+    let group_profile = match group {
+        TensorGroup::Attention => &mut profile.attention,
+        TensorGroup::FeedForward => &mut profile.feed_forward,
+        TensorGroup::ExpertFeedForward => &mut profile.expert_feed_forward,
+        TensorGroup::Output => &mut profile.output,
+        _ => return,
+    };
+    add_matmul_group_profile(group_profile, tensor.tensor_type, tensor_bytes, flops);
     if is_expert_partitioned_tensor(&tensor.name) {
         profile.expert_bytes = profile.expert_bytes.saturating_add(tensor_bytes);
         profile.expert_flops_per_token = profile.expert_flops_per_token.saturating_add(flops);
@@ -954,6 +973,17 @@ fn add_matmul_profile(
             tensor_bytes,
         );
     }
+}
+
+fn add_matmul_group_profile(
+    profile: &mut GgufMatmulGroupProfile,
+    tensor_type: u32,
+    tensor_bytes: u64,
+    flops: u64,
+) {
+    profile.bytes = profile.bytes.saturating_add(tensor_bytes);
+    profile.flops_per_token = profile.flops_per_token.saturating_add(flops);
+    add_tensor_type_bytes(&mut profile.type_bytes, tensor_type, tensor_bytes);
 }
 
 fn is_decode_matmul_group(group: TensorGroup) -> bool {
@@ -1386,6 +1416,12 @@ mod tests {
         assert_eq!(profile.matmul.base_flops_per_token, 32);
         assert_eq!(profile.matmul.expert_type_bytes.f32_bytes, 64);
         assert_eq!(profile.matmul.base_type_bytes.f32_bytes, 32);
+        assert_eq!(profile.matmul.expert_feed_forward.bytes, 64);
+        assert_eq!(profile.matmul.expert_feed_forward.flops_per_token, 32);
+        assert_eq!(profile.matmul.expert_feed_forward.type_bytes.f32_bytes, 64);
+        assert_eq!(profile.matmul.attention.bytes, 32);
+        assert_eq!(profile.matmul.attention.flops_per_token, 32);
+        assert_eq!(profile.matmul.attention.type_bytes.f32_bytes, 32);
         assert_eq!(profile.full_model_bytes, bytes.len() as u64);
         assert_eq!(
             profile.full_model_bytes,

@@ -400,8 +400,8 @@ fn active_decode_bytes_per_token(model: &ModelProfile, config: &SelectionConfig)
 }
 
 fn active_dense_decode_weight_bytes(model: &ModelProfile) -> u64 {
-    if model.tensor_matmul.base_bytes > 0 {
-        return model.tensor_matmul.base_bytes;
+    if let Some(bytes) = dense_matmul_bytes(model) {
+        return bytes;
     }
     let groups = model.tensor_group_bytes;
     let storage_bytes = if tensor_groups_available(groups) {
@@ -418,15 +418,8 @@ fn active_dense_decode_weight_bytes(model: &ModelProfile) -> u64 {
 }
 
 fn active_moe_decode_weight_bytes(model: &ModelProfile) -> u64 {
-    if model.tensor_matmul.base_bytes > 0 || model.tensor_matmul.expert_bytes > 0 {
-        return model
-            .tensor_matmul
-            .base_bytes
-            .saturating_add(active_expert_bytes(
-                model.tensor_matmul.expert_bytes,
-                model.expert_count,
-                model.expert_used_count,
-            ));
+    if let Some(bytes) = moe_matmul_bytes(model) {
+        return bytes;
     }
     let groups = model.tensor_group_bytes;
     let storage_bytes = if tensor_groups_available(groups) {
@@ -466,25 +459,96 @@ fn decode_weight_traffic_bytes(model: &ModelProfile, storage_bytes: u64) -> u64 
     storage_bytes
 }
 
-fn active_decode_flops_per_token(model: &ModelProfile) -> Option<u64> {
+fn dense_matmul_bytes(model: &ModelProfile) -> Option<u64> {
     let matmul = &model.tensor_matmul;
+    let grouped = matmul
+        .attention
+        .bytes
+        .saturating_add(matmul.feed_forward.bytes)
+        .saturating_add(matmul.output.bytes);
+    if grouped > 0 {
+        Some(grouped)
+    } else {
+        (matmul.base_bytes > 0).then_some(matmul.base_bytes)
+    }
+}
+
+fn moe_matmul_bytes(model: &ModelProfile) -> Option<u64> {
+    let matmul = &model.tensor_matmul;
+    let grouped_base = matmul
+        .attention
+        .bytes
+        .saturating_add(matmul.feed_forward.bytes)
+        .saturating_add(matmul.output.bytes);
+    let grouped_expert = matmul.expert_feed_forward.bytes;
+    if grouped_base > 0 || grouped_expert > 0 {
+        return Some(grouped_base.saturating_add(active_expert_bytes(
+            grouped_expert,
+            model.expert_count,
+            model.expert_used_count,
+        )));
+    }
+    if matmul.base_bytes > 0 || matmul.expert_bytes > 0 {
+        return Some(matmul.base_bytes.saturating_add(active_expert_bytes(
+            matmul.expert_bytes,
+            model.expert_count,
+            model.expert_used_count,
+        )));
+    }
+    None
+}
+
+fn active_decode_flops_per_token(model: &ModelProfile) -> Option<u64> {
     match model.architecture_class {
         ModelArchitectureClass::DenseTransformer | ModelArchitectureClass::Unknown => {
-            (matmul.base_flops_per_token > 0).then_some(matmul.base_flops_per_token)
+            dense_matmul_flops(model)
         }
-        ModelArchitectureClass::SparseMoeTransformer => {
-            let active_expert_flops = active_expert_bytes(
-                matmul.expert_flops_per_token,
-                model.expert_count,
-                model.expert_used_count,
-            );
-            let flops = matmul
-                .base_flops_per_token
-                .saturating_add(active_expert_flops);
-            (flops > 0).then_some(flops)
-        }
+        ModelArchitectureClass::SparseMoeTransformer => moe_matmul_flops(model),
         _ => None,
     }
+}
+
+fn dense_matmul_flops(model: &ModelProfile) -> Option<u64> {
+    let matmul = &model.tensor_matmul;
+    let grouped = matmul
+        .attention
+        .flops_per_token
+        .saturating_add(matmul.feed_forward.flops_per_token)
+        .saturating_add(matmul.output.flops_per_token);
+    if grouped > 0 {
+        Some(grouped)
+    } else {
+        (matmul.base_flops_per_token > 0).then_some(matmul.base_flops_per_token)
+    }
+}
+
+fn moe_matmul_flops(model: &ModelProfile) -> Option<u64> {
+    let matmul = &model.tensor_matmul;
+    let grouped_base = matmul
+        .attention
+        .flops_per_token
+        .saturating_add(matmul.feed_forward.flops_per_token)
+        .saturating_add(matmul.output.flops_per_token);
+    let grouped_expert = matmul.expert_feed_forward.flops_per_token;
+    if grouped_base > 0 || grouped_expert > 0 {
+        return Some(grouped_base.saturating_add(active_expert_bytes(
+            grouped_expert,
+            model.expert_count,
+            model.expert_used_count,
+        )));
+    }
+    if matmul.base_flops_per_token > 0 || matmul.expert_flops_per_token > 0 {
+        return Some(
+            matmul
+                .base_flops_per_token
+                .saturating_add(active_expert_bytes(
+                    matmul.expert_flops_per_token,
+                    model.expert_count,
+                    model.expert_used_count,
+                )),
+        );
+    }
+    None
 }
 
 fn tensor_groups_available(groups: TensorGroupBytes) -> bool {
@@ -1412,7 +1476,28 @@ fn add_decode_estimate_reason(
     if !uses_transformer_kv_cache(model.architecture_class) {
         return;
     }
-    if model.tensor_matmul.base_bytes > 0 || model.tensor_matmul.expert_bytes > 0 {
+    let matmul = &model.tensor_matmul;
+    let grouped_matmul_bytes = matmul
+        .attention
+        .bytes
+        .saturating_add(matmul.feed_forward.bytes)
+        .saturating_add(matmul.output.bytes)
+        .saturating_add(matmul.expert_feed_forward.bytes);
+    if grouped_matmul_bytes > 0 {
+        reasons.push(format!(
+            "decode estimate uses GGUF matmul groups ({:.1} GiB attention, {:.1} GiB FFN, {:.1} GiB output, {:.1} GiB expert FFN pool)",
+            gib(matmul.attention.bytes),
+            gib(matmul.feed_forward.bytes),
+            gib(matmul.output.bytes),
+            gib(matmul.expert_feed_forward.bytes)
+        ));
+        if let Some(flops) = active_decode_flops_per_token(model) {
+            reasons.push(format!(
+                "decode estimate includes {:.1} GFLOP/token matmul compute floor from GGUF tensor shapes",
+                flops as f32 / 1_000_000_000.0
+            ));
+        }
+    } else if model.tensor_matmul.base_bytes > 0 || model.tensor_matmul.expert_bytes > 0 {
         reasons.push(format!(
             "decode estimate uses GGUF matmul tensors ({:.1} GiB base, {:.1} GiB expert pool) and active MoE experts when present",
             gib(model.tensor_matmul.base_bytes),

@@ -70,6 +70,31 @@ fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> 
                 ..TensorTypeBytes::default()
             },
             expert_type_bytes: TensorTypeBytes::default(),
+            attention: TensorMatmulGroupProfile {
+                bytes: bytes / 3,
+                type_bytes: TensorTypeBytes {
+                    q4_k_bytes: bytes / 3,
+                    ..TensorTypeBytes::default()
+                },
+                ..TensorMatmulGroupProfile::default()
+            },
+            feed_forward: TensorMatmulGroupProfile {
+                bytes: bytes / 2,
+                type_bytes: TensorTypeBytes {
+                    q4_k_bytes: bytes / 2,
+                    ..TensorTypeBytes::default()
+                },
+                ..TensorMatmulGroupProfile::default()
+            },
+            output: TensorMatmulGroupProfile {
+                bytes: bytes / 12,
+                type_bytes: TensorTypeBytes {
+                    q4_k_bytes: bytes / 12,
+                    ..TensorTypeBytes::default()
+                },
+                ..TensorMatmulGroupProfile::default()
+            },
+            expert_feed_forward: TensorMatmulGroupProfile::default(),
         },
         parameter_count: None,
         quantization: Some("Q4_K_M".into()),
@@ -189,6 +214,9 @@ fn moe_decode_uses_active_expert_bytes() {
     moe.tensor_group_bytes.expert_feed_forward_bytes = 48 * GIB;
     moe.tensor_matmul.base_bytes = 12 * GIB;
     moe.tensor_matmul.expert_bytes = 48 * GIB;
+    moe.tensor_matmul.attention.bytes = 8 * GIB;
+    moe.tensor_matmul.feed_forward.bytes = 4 * GIB;
+    moe.tensor_matmul.expert_feed_forward.bytes = 48 * GIB;
     moe.expert_count = Some(16);
     moe.expert_used_count = Some(2);
 
@@ -372,6 +400,15 @@ fn q8_decode_traffic_stays_resident_bytes_without_matmul_profile() {
     q8.tensor_matmul.base_bytes *= 2;
     q8.tensor_matmul.base_type_bytes.q4_k_bytes = 0;
     q8.tensor_matmul.base_type_bytes.q8_0_bytes = q8.tensor_matmul.base_bytes;
+    q8.tensor_matmul.attention.bytes *= 2;
+    q8.tensor_matmul.feed_forward.bytes *= 2;
+    q8.tensor_matmul.output.bytes *= 2;
+    q8.tensor_matmul.attention.type_bytes.q4_k_bytes = 0;
+    q8.tensor_matmul.feed_forward.type_bytes.q4_k_bytes = 0;
+    q8.tensor_matmul.output.type_bytes.q4_k_bytes = 0;
+    q8.tensor_matmul.attention.type_bytes.q8_0_bytes = q8.tensor_matmul.attention.bytes;
+    q8.tensor_matmul.feed_forward.type_bytes.q8_0_bytes = q8.tensor_matmul.feed_forward.bytes;
+    q8.tensor_matmul.output.type_bytes.q8_0_bytes = q8.tensor_matmul.output.bytes;
 
     let q4_rec = score_model(&hardware, &q4, &config);
     let q8_rec = score_model(&hardware, &q8, &config);

@@ -1,6 +1,7 @@
 use crate::{
     CapabilityEvidence, ModelArchitectureClass, ModelProfile, ModelSource, RopeProfile,
-    TensorGroupBytes, TensorMatmulProfile, TensorTypeBytes, TokenizerProfile, WeightCoverage,
+    TensorGroupBytes, TensorMatmulGroupProfile, TensorMatmulProfile, TensorTypeBytes,
+    TokenizerProfile, WeightCoverage,
 };
 use anyhow::{Context, Result};
 use model_artifact::gguf::{
@@ -55,6 +56,10 @@ pub fn profile_gguf_path(path: impl AsRef<Path>) -> Result<ModelProfile> {
             expert_flops_per_token: tensor_profile.matmul.expert_flops_per_token,
             base_type_bytes: tensor_type_bytes(tensor_profile.matmul.base_type_bytes),
             expert_type_bytes: tensor_type_bytes(tensor_profile.matmul.expert_type_bytes),
+            attention: tensor_matmul_group(tensor_profile.matmul.attention),
+            feed_forward: tensor_matmul_group(tensor_profile.matmul.feed_forward),
+            expert_feed_forward: tensor_matmul_group(tensor_profile.matmul.expert_feed_forward),
+            output: tensor_matmul_group(tensor_profile.matmul.output),
         },
         parameter_count: parameter_count_from_size_label(compact.parameter_size.as_deref()),
         quantization: fit
@@ -84,6 +89,16 @@ pub fn profile_gguf_path(path: impl AsRef<Path>) -> Result<ModelProfile> {
         },
         capability_evidence,
     })
+}
+
+fn tensor_matmul_group(
+    group: model_artifact::gguf::GgufMatmulGroupProfile,
+) -> TensorMatmulGroupProfile {
+    TensorMatmulGroupProfile {
+        bytes: group.bytes,
+        flops_per_token: group.flops_per_token,
+        type_bytes: tensor_type_bytes(group.type_bytes),
+    }
 }
 
 fn tensor_type_bytes(bytes: model_artifact::gguf::GgufTensorTypeByteProfile) -> TensorTypeBytes {

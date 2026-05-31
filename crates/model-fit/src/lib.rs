@@ -21,9 +21,9 @@ pub use types::{
     EstimateConfidence, FirstTokenEstimateRange, FitStatus, HardwareProfile, InteractionProfile,
     KvCacheKind, KvCacheType, MeasurementSource, MemoryProfile, ModelArchitectureClass,
     ModelProfile, ModelRecommendation, ModelSource, Requirement, RopeProfile, ScoreWeights,
-    SelectionConfig, SplitCandidateEstimate, TensorGroupBytes, TensorMatmulProfile,
-    TensorTypeBytes, TokenizerProfile, WeightCoverage, WorkloadPreferences, WorkloadProfile,
-    WorkloadTask,
+    SelectionConfig, SplitCandidateEstimate, TensorGroupBytes, TensorMatmulGroupProfile,
+    TensorMatmulProfile, TensorTypeBytes, TokenizerProfile, WeightCoverage, WorkloadPreferences,
+    WorkloadProfile, WorkloadTask,
 };
 pub use validation_stats::{ThroughputSampleStats, throughput_sample_stats};
 

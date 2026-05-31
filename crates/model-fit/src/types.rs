@@ -146,6 +146,17 @@ pub struct TensorMatmulProfile {
     pub expert_flops_per_token: u64,
     pub base_type_bytes: TensorTypeBytes,
     pub expert_type_bytes: TensorTypeBytes,
+    pub attention: TensorMatmulGroupProfile,
+    pub feed_forward: TensorMatmulGroupProfile,
+    pub expert_feed_forward: TensorMatmulGroupProfile,
+    pub output: TensorMatmulGroupProfile,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TensorMatmulGroupProfile {
+    pub bytes: u64,
+    pub flops_per_token: u64,
+    pub type_bytes: TensorTypeBytes,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
