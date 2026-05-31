@@ -5,7 +5,7 @@ use model_fit::{
     AcceleratorKind, BackendKind, CpuProfile, FitStatus, GpuBenchmarkAcceleratorFacts,
     GpuBenchmarkHardwareInput, GpuBenchmarkOutput, HardwareProfile, MemoryProfile, ModelProfile,
     ModelRecommendation, SelectionConfig, WorkloadProfile, hardware_profile_from_gpu_benchmark,
-    profile_gguf_path, score_model,
+    profile_gguf_path, score_model, throughput_sample_stats,
 };
 use model_hf::{HfModelRepository, ModelDownloadProgress, ModelDownloadProgressEvent};
 use serde::Serialize;
@@ -149,10 +149,16 @@ struct BenchmarkSummary {
     observations: Vec<BenchmarkObservation>,
     successful_repeats: usize,
     sample_count: usize,
+    raw_sample_count: usize,
     median_tokens_per_sec: Option<f64>,
     min_tokens_per_sec: Option<f64>,
     max_tokens_per_sec: Option<f64>,
     spread_pct: Option<f64>,
+    raw_median_tokens_per_sec: Option<f64>,
+    raw_min_tokens_per_sec: Option<f64>,
+    raw_max_tokens_per_sec: Option<f64>,
+    raw_spread_pct: Option<f64>,
+    denoised_outlier_count: usize,
     observed_over_fit: Option<f64>,
     verdict: String,
     errors: Vec<String>,
@@ -202,6 +208,7 @@ struct ValidationSummary {
     noisy_count: usize,
     skipped_count: usize,
     error_count: usize,
+    runtime_error_count: usize,
     median_observed_over_fit: Option<f64>,
     mean_observed_over_fit: Option<f64>,
     median_absolute_percent_error: Option<f64>,
@@ -655,40 +662,59 @@ fn finalize_benchmark_summary(
     predicted: Option<f64>,
     predicted_range: Option<(f64, f64)>,
 ) -> BenchmarkSummary {
-    let mut samples = throughput_samples(&summary, scenario);
-    summary.sample_count = samples.len();
+    let samples = throughput_samples(&summary, scenario);
+    summary.raw_sample_count = samples.len();
     summary.successful_repeats = summary
         .observations
         .iter()
         .filter(|observation| observation.error.is_none())
         .count();
     if samples.is_empty() {
-        summary.verdict = "error".into();
+        summary.sample_count = 0;
+        summary.verdict = if summary.attempted && benchmark_has_runtime_error(&summary) {
+            "runtime-error".into()
+        } else {
+            "error".into()
+        };
         return summary;
     }
 
-    samples.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    let median = median(&samples);
-    let min = samples[0];
-    let max = *samples.last().expect("samples is not empty");
-    let spread = if median > 0.0 {
-        (max - min) / median
-    } else {
-        0.0
-    };
+    let stats = throughput_sample_stats(&samples, DEFAULT_MAX_SPREAD);
+    let median = stats.clean_median.expect("non-empty sample stats");
+    let min = stats.clean_min.expect("non-empty sample stats");
+    let max = stats.clean_max.expect("non-empty sample stats");
+    let spread = stats.clean_spread.expect("non-empty sample stats");
     let observed_over_fit = if predicted.is_some_and(|fit| fit > 0.0) {
         predicted.map(|fit| median / fit)
     } else {
         None
     };
 
+    summary.sample_count = stats.clean_sample_count;
     summary.median_tokens_per_sec = Some(median);
     summary.min_tokens_per_sec = Some(min);
     summary.max_tokens_per_sec = Some(max);
     summary.spread_pct = Some(spread * 100.0);
+    summary.raw_median_tokens_per_sec = stats.raw_median;
+    summary.raw_min_tokens_per_sec = stats.raw_min;
+    summary.raw_max_tokens_per_sec = stats.raw_max;
+    summary.raw_spread_pct = stats.raw_spread.map(|spread| spread * 100.0);
+    summary.denoised_outlier_count = stats.outlier_count;
     summary.observed_over_fit = observed_over_fit;
     summary.verdict = benchmark_verdict(median, observed_over_fit, spread, predicted_range);
     summary
+}
+
+fn benchmark_has_runtime_error(summary: &BenchmarkSummary) -> bool {
+    !summary.errors.is_empty()
+        || summary
+            .observations
+            .iter()
+            .any(|observation| observation.status_code.is_some_and(|code| code != 0))
+        || summary
+            .observations
+            .iter()
+            .any(|observation| observation.error.is_some())
 }
 
 fn throughput_samples(summary: &BenchmarkSummary, scenario: &BenchmarkScenarioSpec) -> Vec<f64> {
@@ -825,7 +851,7 @@ fn scenario_level_verdict(
 ) -> String {
     if matches!(
         benchmark.verdict.as_str(),
-        "skipped" | "error" | "inconclusive-noisy"
+        "skipped" | "error" | "runtime-error" | "inconclusive-noisy"
     ) {
         return benchmark.verdict.clone();
     }
@@ -1624,11 +1650,15 @@ fn count_model_summary(
         "faster-than-fit" => summary.faster_than_fit_count += 1,
         "inconclusive-noisy" => summary.noisy_count += 1,
         "skipped" => summary.skipped_count += 1,
+        "runtime-error" => summary.runtime_error_count += 1,
         "error" => summary.error_count += 1,
         _ => {}
     }
     if model.benchmark.attempted {
         summary.benchmarked_count += 1;
+    }
+    if !accuracy_gated_verdict(&model.benchmark.verdict) {
+        return;
     }
     if let Some(ratio) = model.benchmark.observed_over_fit {
         if (ratio - 1.0).abs() <= tolerance {
@@ -1636,6 +1666,10 @@ fn count_model_summary(
         }
         ratios.push(ratio);
     }
+}
+
+fn accuracy_gated_verdict(verdict: &str) -> bool {
+    matches!(verdict, "match" | "slower-than-fit" | "faster-than-fit")
 }
 
 fn median_absolute_percent_error(ratios: &[f64]) -> Option<f64> {

@@ -3,6 +3,7 @@ mod hf_cache;
 mod profile;
 mod scoring;
 mod types;
+mod validation_stats;
 mod workload;
 
 pub use gpu_benchmark::{
@@ -23,6 +24,7 @@ pub use types::{
     SelectionConfig, SplitCandidateEstimate, TensorGroupBytes, TokenizerProfile, WeightCoverage,
     WorkloadPreferences, WorkloadProfile, WorkloadTask,
 };
+pub use validation_stats::{ThroughputSampleStats, throughput_sample_stats};
 
 #[cfg(test)]
 mod tests;

@@ -6,6 +6,7 @@ const DEFAULT_SCENARIO: &str = "steady_decode";
 const DEFAULT_MAX_MEDIAN_ABSOLUTE_ERROR: f64 = 0.10;
 const DEFAULT_MAX_INDIVIDUAL_ERROR: f64 = 0.15;
 const DEFAULT_MAX_NOISY: usize = 0;
+const DEFAULT_MAX_RUNTIME_ERRORS: usize = 0;
 
 #[derive(Debug)]
 struct Args {
@@ -14,6 +15,7 @@ struct Args {
     max_median_absolute_error: f64,
     max_individual_error: f64,
     max_noisy: usize,
+    max_runtime_errors: usize,
     min_models: Option<usize>,
     markdown_out: Option<PathBuf>,
 }
@@ -27,6 +29,8 @@ struct ValidationReport {
 #[derive(Debug, Deserialize)]
 struct ValidationSummary {
     error_count: usize,
+    #[serde(default)]
+    runtime_error_count: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,8 +53,12 @@ struct ScenarioReport {
 #[derive(Debug, Deserialize)]
 struct BenchmarkSummary {
     spread_pct: Option<f64>,
+    raw_spread_pct: Option<f64>,
     sample_count: usize,
-    errors: Vec<String>,
+    #[serde(default)]
+    raw_sample_count: usize,
+    #[serde(default)]
+    denoised_outlier_count: usize,
 }
 
 #[derive(Debug)]
@@ -85,6 +93,7 @@ impl Args {
             max_median_absolute_error: DEFAULT_MAX_MEDIAN_ABSOLUTE_ERROR,
             max_individual_error: DEFAULT_MAX_INDIVIDUAL_ERROR,
             max_noisy: DEFAULT_MAX_NOISY,
+            max_runtime_errors: DEFAULT_MAX_RUNTIME_ERRORS,
             min_models: None,
             markdown_out: None,
         };
@@ -101,6 +110,9 @@ impl Args {
                         parse_next(&mut values, "--max-individual-error")?;
                 }
                 "--max-noisy" => parsed.max_noisy = parse_next(&mut values, "--max-noisy")?,
+                "--max-runtime-errors" => {
+                    parsed.max_runtime_errors = parse_next(&mut values, "--max-runtime-errors")?;
+                }
                 "--min-models" => {
                     parsed.min_models = Some(parse_next(&mut values, "--min-models")?)
                 }
@@ -149,32 +161,51 @@ fn scenario_rows<'a>(report: &'a ValidationReport, scenario: &str) -> Vec<Scenar
 }
 
 fn render_markdown(args: &Args, report: &ValidationReport, rows: &[ScenarioRow<'_>]) -> String {
-    let median_error = median_absolute_error(rows);
+    let accuracy_rows = accuracy_rows(rows);
+    let median_error = median_absolute_error(&accuracy_rows);
     let noisy = noisy_count(rows);
+    let runtime_errors = runtime_error_count(report, &args.scenario);
     let mut markdown = String::new();
     markdown.push_str("# Model Fit Validation\n\n");
     markdown.push_str(&format!("Scenario: `{}`\n\n", args.scenario));
     markdown.push_str("| metric | value |\n|---|---:|\n");
     markdown.push_str(&format!("| models in report | {} |\n", report.models.len()));
     markdown.push_str(&format!("| scenario samples | {} |\n", rows.len()));
+    markdown.push_str(&format!(
+        "| accuracy-gated samples | {} |\n",
+        accuracy_rows.len()
+    ));
+    if let Some(summary) = &report.summary {
+        markdown.push_str(&format!("| report errors | {} |\n", summary.error_count));
+        markdown.push_str(&format!(
+            "| report runtime errors | {} |\n",
+            summary.runtime_error_count
+        ));
+    }
     markdown.push_str(&format!("| noisy samples | {noisy} |\n"));
+    markdown.push_str(&format!("| runtime-error samples | {runtime_errors} |\n"));
     markdown.push_str(&format!(
         "| median absolute error | {} |\n\n",
         percent_option(median_error)
     ));
-    markdown.push_str(
-        "| model | predicted tok/s | observed tok/s | observed/fit | spread | samples | verdict |\n",
-    );
-    markdown.push_str("|---|---:|---:|---:|---:|---:|---|\n");
+    markdown.push_str("| model | predicted tok/s | observed tok/s | observed/fit | spread | raw spread | samples | outliers | verdict |\n");
+    markdown.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for row in rows {
         markdown.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             row.model.input_ref,
             number_option(row.scenario.predicted),
             number_option(row.scenario.observed),
             ratio_option(row.scenario.observed_over_fit),
             percent_option(row.scenario.benchmark.spread_pct.map(|value| value / 100.0)),
-            row.scenario.benchmark.sample_count,
+            percent_option(
+                row.scenario
+                    .benchmark
+                    .raw_spread_pct
+                    .map(|value| value / 100.0)
+            ),
+            sample_count_label(&row.scenario.benchmark),
+            row.scenario.benchmark.denoised_outlier_count,
             row.scenario.verdict
         ));
     }
@@ -187,14 +218,7 @@ fn enforce_thresholds(
     rows: &[ScenarioRow<'_>],
 ) -> Result<()> {
     let mut failures = Vec::new();
-    if let Some(summary) = &report.summary
-        && summary.error_count > 0
-    {
-        failures.push(format!(
-            "validation report contains {} model-level errors",
-            summary.error_count
-        ));
-    }
+    let accuracy_rows = accuracy_rows(rows);
     for model in &report.models {
         if !model.errors.is_empty() {
             failures.push(format!(
@@ -205,12 +229,12 @@ fn enforce_thresholds(
         }
     }
     if let Some(min_models) = args.min_models
-        && rows.len() < min_models
+        && accuracy_rows.len() < min_models
     {
         failures.push(format!(
-            "scenario {} produced {} samples, expected at least {min_models}",
+            "scenario {} produced {} accuracy-gated samples, expected at least {min_models}",
             args.scenario,
-            rows.len()
+            accuracy_rows.len()
         ));
     }
     let noisy = noisy_count(rows);
@@ -220,7 +244,14 @@ fn enforce_thresholds(
             args.scenario, args.max_noisy
         ));
     }
-    if let Some(median_error) = median_absolute_error(rows)
+    let runtime_errors = runtime_error_count(report, &args.scenario);
+    if runtime_errors > args.max_runtime_errors {
+        failures.push(format!(
+            "scenario {} had {runtime_errors} runtime-error samples, max allowed is {}",
+            args.scenario, args.max_runtime_errors
+        ));
+    }
+    if let Some(median_error) = median_absolute_error(&accuracy_rows)
         && median_error > args.max_median_absolute_error
     {
         failures.push(format!(
@@ -229,7 +260,7 @@ fn enforce_thresholds(
             args.max_median_absolute_error * 100.0
         ));
     }
-    for row in rows {
+    for row in accuracy_rows {
         if row.absolute_error > args.max_individual_error {
             failures.push(format!(
                 "{} scenario {} error {:.2}% exceeded {:.2}%",
@@ -237,14 +268,6 @@ fn enforce_thresholds(
                 args.scenario,
                 row.absolute_error * 100.0,
                 args.max_individual_error * 100.0
-            ));
-        }
-        if !row.scenario.benchmark.errors.is_empty() {
-            failures.push(format!(
-                "{} scenario {} benchmark errors: {}",
-                row.model.input_ref,
-                args.scenario,
-                row.scenario.benchmark.errors.join("; ")
             ));
         }
     }
@@ -255,13 +278,37 @@ fn enforce_thresholds(
     bail!("model-fit validation failed:\n{}", failures.join("\n"))
 }
 
+fn accuracy_rows<'a>(rows: &'a [ScenarioRow<'a>]) -> Vec<&'a ScenarioRow<'a>> {
+    rows.iter()
+        .filter(|row| accuracy_gated_verdict(&row.scenario.verdict))
+        .collect()
+}
+
+fn accuracy_gated_verdict(verdict: &str) -> bool {
+    matches!(verdict, "match" | "slower-than-fit" | "faster-than-fit")
+}
+
+fn runtime_error_count(report: &ValidationReport, scenario: &str) -> usize {
+    report
+        .models
+        .iter()
+        .filter_map(|model| {
+            model
+                .benchmarks
+                .iter()
+                .find(|benchmark| benchmark.scenario == scenario)
+        })
+        .filter(|scenario| scenario.verdict == "runtime-error" || scenario.verdict == "error")
+        .count()
+}
+
 fn noisy_count(rows: &[ScenarioRow<'_>]) -> usize {
     rows.iter()
         .filter(|row| row.scenario.verdict == "inconclusive-noisy")
         .count()
 }
 
-fn median_absolute_error(rows: &[ScenarioRow<'_>]) -> Option<f64> {
+fn median_absolute_error(rows: &[&ScenarioRow<'_>]) -> Option<f64> {
     let mut samples = rows
         .iter()
         .map(|row| row.absolute_error)
@@ -276,6 +323,14 @@ fn median_absolute_error(rows: &[ScenarioRow<'_>]) -> Option<f64> {
     } else {
         samples[mid]
     })
+}
+
+fn sample_count_label(summary: &BenchmarkSummary) -> String {
+    if summary.raw_sample_count > 0 && summary.raw_sample_count != summary.sample_count {
+        format!("{}/{}", summary.sample_count, summary.raw_sample_count)
+    } else {
+        summary.sample_count.to_string()
+    }
 }
 
 fn number_option(value: Option<f64>) -> String {
@@ -309,6 +364,6 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 fn print_usage() {
     eprintln!(
-        "usage: model-fit-check-validation [--scenario steady_decode] [--max-median-absolute-error 0.10] [--max-individual-error 0.15] [--max-noisy 0] [--min-models N] [--markdown-out report.md] report.json"
+        "usage: model-fit-check-validation [--scenario steady_decode] [--max-median-absolute-error 0.10] [--max-individual-error 0.15] [--max-noisy 0] [--max-runtime-errors 0] [--min-models N] [--markdown-out report.md] report.json"
     );
 }

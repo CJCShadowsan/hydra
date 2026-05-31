@@ -336,6 +336,40 @@ fn measured_gpu_bandwidth_uses_backend_neutral_efficiency() {
 }
 
 #[test]
+fn q8_decode_traffic_uses_quantization_shape_not_resident_bytes() {
+    let hardware = m1_ultra();
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let q4 = dense_model("q4", 8 * GIB, 32, 4096, 32_768);
+    let mut q8 = q4.clone();
+    q8.source.id = "q8".into();
+    q8.quantization = Some("Q8_0".into());
+    q8.file_size_bytes = 16 * GIB;
+    q8.tensor_bytes = Some(16 * GIB);
+    q8.base_resident_bytes = Some(16 * GIB);
+    q8.tensor_group_bytes.attention_bytes *= 2;
+    q8.tensor_group_bytes.feed_forward_bytes *= 2;
+    q8.tensor_group_bytes.output_bytes *= 2;
+    q8.tensor_group_bytes.embedding_bytes *= 2;
+    q8.tensor_group_bytes.normalization_bytes *= 2;
+    q8.tensor_group_bytes.other_bytes *= 2;
+
+    let q4_rec = score_model(&hardware, &q4, &config);
+    let q8_rec = score_model(&hardware, &q8, &config);
+    let q4_active = q4_rec.estimated_active_decode_bytes_per_token.unwrap();
+    let q8_active = q8_rec.estimated_active_decode_bytes_per_token.unwrap();
+
+    assert!(q8_active < q4_active * 2);
+    assert!(
+        q8_rec.estimated_decode_tokens_per_sec.unwrap()
+            > q4_rec.estimated_decode_tokens_per_sec.unwrap() * 0.70
+    );
+}
+
+#[test]
 fn hardware_profile_uses_mesh_gpu_benchmark_output_as_measured_bandwidth() {
     let hardware = hardware_profile_from_gpu_benchmark(GpuBenchmarkHardwareInput {
         memory: MemoryProfile {

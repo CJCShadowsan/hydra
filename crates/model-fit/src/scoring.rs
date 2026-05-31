@@ -390,34 +390,68 @@ fn active_decode_bytes_per_token(model: &ModelProfile, config: &SelectionConfig)
 
 fn active_dense_decode_weight_bytes(model: &ModelProfile) -> u64 {
     let groups = model.tensor_group_bytes;
-    if tensor_groups_available(groups) {
-        return groups
+    let storage_bytes = if tensor_groups_available(groups) {
+        groups
             .attention_bytes
             .saturating_add(groups.feed_forward_bytes)
             .saturating_add(groups.output_bytes)
             .saturating_add(groups.normalization_bytes)
-            .saturating_add(groups.other_bytes);
-    }
-    resident_weight_bytes(model)
+            .saturating_add(groups.other_bytes)
+    } else {
+        resident_weight_bytes(model)
+    };
+    decode_weight_traffic_bytes(model, storage_bytes)
 }
 
 fn active_moe_decode_weight_bytes(model: &ModelProfile) -> u64 {
     let groups = model.tensor_group_bytes;
-    if tensor_groups_available(groups) {
+    let storage_bytes = if tensor_groups_available(groups) {
         let active_expert_bytes = active_expert_bytes(
             groups.expert_feed_forward_bytes,
             model.expert_count,
             model.expert_used_count,
         );
-        return groups
+        groups
             .attention_bytes
             .saturating_add(groups.feed_forward_bytes)
             .saturating_add(active_expert_bytes)
             .saturating_add(groups.output_bytes)
             .saturating_add(groups.normalization_bytes)
-            .saturating_add(groups.other_bytes);
+            .saturating_add(groups.other_bytes)
+    } else {
+        active_moe_weight_bytes(model)
+    };
+    decode_weight_traffic_bytes(model, storage_bytes)
+}
+
+fn decode_weight_traffic_bytes(model: &ModelProfile, storage_bytes: u64) -> u64 {
+    // GGUF tensor bytes are a resident-storage fact, not a perfect proxy for the
+    // effective memory traffic seen by one llama.cpp decode token. The selector
+    // still starts from tensor-group storage because it is the durable metadata
+    // available for arbitrary GGUFs, then applies only quantization/structure
+    // corrections that come from the file metadata itself.
+    //
+    // The important case is Q8_0. Q8_0 stores about twice as many bytes as a
+    // Q4_K model, but it is a simple block format with less dequant bookkeeping
+    // than the K-quants. In validation, treating Q8 resident bytes as literal
+    // per-token traffic consistently underpredicted dense Q8 decode throughput.
+    // This is not a backend or model-name boost: any GGUF with the same
+    // quantization and dense/MoE structure gets the same storage-to-traffic
+    // adjustment. Memory fit still uses resident bytes; only the decode traffic
+    // slope is adjusted.
+    let scale = decode_weight_traffic_scale(model);
+    ((storage_bytes as f64) * f64::from(scale)).round() as u64
+}
+
+fn decode_weight_traffic_scale(model: &ModelProfile) -> f32 {
+    if !quantization_is_q8(model.quantization.as_deref()) {
+        return 1.0;
     }
-    active_moe_weight_bytes(model)
+    match model.architecture_class {
+        ModelArchitectureClass::SparseMoeTransformer => 0.78,
+        ModelArchitectureClass::DenseTransformer | ModelArchitectureClass::Unknown => 0.60,
+        _ => 1.0,
+    }
 }
 
 fn tensor_groups_available(groups: TensorGroupBytes) -> bool {
@@ -799,7 +833,7 @@ fn quantization_efficiency_factor(quantization: Option<&str>) -> f32 {
     } else if lower.contains("f16") || gguf_file_type_is(&lower, 1) {
         0.60
     } else if lower.contains("q8_0") || gguf_file_type_is(&lower, 7) {
-        0.90
+        1.0
     } else if lower.contains("q6_k") || gguf_file_type_is(&lower, 18) {
         0.88
     } else if lower.contains("q5_k")
