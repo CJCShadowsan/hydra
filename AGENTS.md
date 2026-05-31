@@ -6,6 +6,31 @@ This repo (`mesh-llm`) contains mesh-llm — a Rust binary that pools GPUs over 
 
 The workspace is split across many crates under `crates/`. The shipped binary `mesh-llm` is a thin shim (`crates/mesh-llm/`) that re-exports `mesh-llm-host-runtime`, where the bulk of host-side logic lives. A lighter parallel crate `mesh-client` (`mesh-llm-client`) carries the same domain shape for client-only usage. Embedded llama.cpp staged-runtime support lives in the `skippy-*` crates.
 
+## Empirical Heuristic Rule
+
+Empirical evidence is allowed and expected, but do not fit heuristics to make
+the current local result set pass. This rule applies across the whole repo:
+model-fit scoring, routing, scheduling, benchmarks, cache policy, split
+planning, and any other decision logic.
+
+- Treat surprising measurements as hypotheses, not as permission to tune a
+  constant until the table looks good.
+- A heuristic must have an independent rationale grounded in source behavior,
+  protocol semantics, hardware facts, metadata, or a documented benchmark
+  design.
+- If benchmark data is used to calibrate a heuristic, use a validation shape
+  that can falsify it: paired comparisons where possible, unrelated model or
+  hardware families, and held-out cases instead of only the models that exposed
+  the miss.
+- Do not hide a miss by widening confidence bands, loosening thresholds, or
+  excluding samples unless the exclusion rule is itself justified and reported
+  separately.
+- Never use model names, filenames, local catalog reputation, or current-run
+  observed throughput as inputs to a metadata-only estimator unless that is the
+  explicit feature being built and documented.
+- Report residual misses honestly. Prefer a known, visible limitation over an
+  overfit fix that will fail on the next machine or model family.
+
 ## Key Docs
 
 | Doc | What it covers |
