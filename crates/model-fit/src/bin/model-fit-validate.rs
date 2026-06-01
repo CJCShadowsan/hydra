@@ -575,9 +575,35 @@ async fn validate_model(
     input: &ModelInput,
     model_index: usize,
 ) -> ModelValidationReport {
-    match prepare_model(args, repository, input).await {
-        Ok(prepared) => validate_prepared_model(args, hardware, prepared, model_index),
-        Err(err) => error_report(input_label(input), format!("{err:#}")),
+    let label = input_label(input);
+    heartbeat(
+        Some(model_index),
+        &label,
+        "model_start",
+        "starting validation",
+    );
+    match prepare_model(args, repository, input, model_index).await {
+        Ok(prepared) => {
+            heartbeat(
+                Some(model_index),
+                &prepared.input_ref,
+                "model_prepared",
+                "metadata profile is ready",
+            );
+            let report = validate_prepared_model(args, hardware, prepared, model_index);
+            heartbeat(
+                Some(model_index),
+                &report.input_ref,
+                "model_done",
+                &format!("steady_decode_verdict={}", report.benchmark.verdict),
+            );
+            report
+        }
+        Err(err) => {
+            let error = format!("{err:#}");
+            heartbeat(Some(model_index), &label, "model_error", &error);
+            error_report(label, error)
+        }
     }
 }
 
@@ -587,6 +613,12 @@ fn validate_prepared_model(
     prepared: PreparedModel,
     model_index: usize,
 ) -> ModelValidationReport {
+    heartbeat(
+        Some(model_index),
+        &prepared.input_ref,
+        "score_start",
+        "scoring workload recommendations",
+    );
     let recommendations = score_workloads(hardware, &prepared.profile);
     let recommendation = recommendations
         .iter()
@@ -599,8 +631,22 @@ fn validate_prepared_model(
                 .recommendation
                 .clone()
         });
+    heartbeat(
+        Some(model_index),
+        &prepared.input_ref,
+        "score_done",
+        &format!(
+            "fit_status={:?} decode_tps={}",
+            recommendation.fit_status,
+            display_opt(
+                recommendation
+                    .estimated_decode_tokens_per_sec
+                    .map(f64::from)
+            )
+        ),
+    );
     let benchmarks = benchmark_model(args, hardware, &prepared, &recommendation, model_index);
-    let abi_decode_probe = Some(run_abi_decode_probe(args, &prepared));
+    let abi_decode_probe = Some(run_abi_decode_probe(args, &prepared, model_index));
     let benchmark = benchmarks
         .iter()
         .find(|benchmark| benchmark.scenario == "steady_decode")
@@ -630,10 +676,13 @@ async fn prepare_model(
     args: &Args,
     repository: &HfModelRepository,
     input: &ModelInput,
+    model_index: usize,
 ) -> Result<PreparedModel> {
     match input {
-        ModelInput::Ref(model_ref) => prepare_model_ref(args, repository, model_ref).await,
-        ModelInput::Local(local) => prepare_local_model(args, local),
+        ModelInput::Ref(model_ref) => {
+            prepare_model_ref(args, repository, model_ref, model_index).await
+        }
+        ModelInput::Local(local) => prepare_local_model(args, local, model_index),
     }
 }
 
@@ -641,29 +690,66 @@ async fn prepare_model_ref(
     args: &Args,
     repository: &HfModelRepository,
     model_ref: &str,
+    model_index: usize,
 ) -> Result<PreparedModel> {
+    heartbeat(
+        Some(model_index),
+        model_ref,
+        "resolve_start",
+        "resolving model artifact",
+    );
     let artifact = {
         let _status = TerminalStatus::start(args.show_progress, format!("Resolving {model_ref}"));
         resolve_model_artifact_ref(model_ref, repository)
             .await
             .with_context(|| format!("resolve model ref {model_ref}"))?
     };
+    heartbeat(
+        Some(model_index),
+        model_ref,
+        "resolve_done",
+        &format!("canonical_ref={}", artifact.canonical_ref),
+    );
     if artifact.format != ModelFormat::Gguf {
         bail!(
             "{model_ref} resolved to {:?}, expected GGUF",
             artifact.format
         );
     }
+    heartbeat(
+        Some(model_index),
+        model_ref,
+        "download_start",
+        "ensuring GGUF artifact is available",
+    );
     let progress = download_progress(args, model_ref);
     let downloaded_paths = repository
         .download_artifact_files_with_progress(&artifact, progress)
         .await
         .with_context(|| format!("download model ref {model_ref}"))?;
+    heartbeat(
+        Some(model_index),
+        model_ref,
+        "download_done",
+        &format!("files={}", downloaded_paths.len()),
+    );
     let primary_gguf_path = primary_download_path(&artifact, &downloaded_paths)?;
+    heartbeat(
+        Some(model_index),
+        model_ref,
+        "profile_start",
+        &format!("path={}", primary_gguf_path.display()),
+    );
     let mut profile = {
         let _status = TerminalStatus::start(args.show_progress, format!("Profiling {model_ref}"));
         profile_gguf_path(&primary_gguf_path)?
     };
+    heartbeat(
+        Some(model_index),
+        model_ref,
+        "profile_done",
+        &profile_summary(&profile),
+    );
     profile.source.id = model_ref.to_string();
     profile.source.path = Some(primary_gguf_path.clone());
 
@@ -677,12 +763,28 @@ async fn prepare_model_ref(
     })
 }
 
-fn prepare_local_model(args: &Args, local: &LocalModelInput) -> Result<PreparedModel> {
+fn prepare_local_model(
+    args: &Args,
+    local: &LocalModelInput,
+    model_index: usize,
+) -> Result<PreparedModel> {
+    heartbeat(
+        Some(model_index),
+        &local.model_ref,
+        "profile_start",
+        &format!("path={}", local.gguf_path.display()),
+    );
     let mut profile = {
         let _status =
             TerminalStatus::start(args.show_progress, format!("Profiling {}", local.model_ref));
         profile_gguf_path(&local.gguf_path)?
     };
+    heartbeat(
+        Some(model_index),
+        &local.model_ref,
+        "profile_done",
+        &profile_summary(&profile),
+    );
     profile.source.id = local.model_ref.clone();
     profile.source.path = Some(local.gguf_path.clone());
     Ok(PreparedModel {
@@ -695,7 +797,11 @@ fn prepare_local_model(args: &Args, local: &LocalModelInput) -> Result<PreparedM
     })
 }
 
-fn run_abi_decode_probe(args: &Args, model: &PreparedModel) -> AbiDecodeProbeSummary {
+fn run_abi_decode_probe(
+    args: &Args,
+    model: &PreparedModel,
+    model_index: usize,
+) -> AbiDecodeProbeSummary {
     let mut summary = AbiDecodeProbeSummary {
         attempted: true,
         tokens_per_second: None,
@@ -715,6 +821,12 @@ fn run_abi_decode_probe(args: &Args, model: &PreparedModel) -> AbiDecodeProbeSum
     };
     let Some(layer_count) = model.profile.layer_count else {
         summary.error = Some("model metadata did not include layer count".into());
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "abi_probe_skip",
+            "model metadata did not include layer count",
+        );
         return summary;
     };
     let command_args = vec![
@@ -734,16 +846,57 @@ fn run_abi_decode_probe(args: &Args, model: &PreparedModel) -> AbiDecodeProbeSum
         DEFAULT_ABI_DECODE_MEASURED_TOKENS.to_string(),
     ];
     summary.command = command_display(&args.skippy_bench_bin, &command_args);
+    heartbeat(
+        Some(model_index),
+        &model.input_ref,
+        "abi_probe_start",
+        &format!(
+            "repeats={} measured_tokens={}",
+            DEFAULT_ABI_DECODE_REPEATS, DEFAULT_ABI_DECODE_MEASURED_TOKENS
+        ),
+    );
     for repeat in 0..DEFAULT_ABI_DECODE_REPEATS {
-        summary
-            .observations
-            .push(run_abi_decode_probe_once(args, &command_args, repeat));
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "abi_probe_repeat_start",
+            &format!("repeat={}", repeat + 1),
+        );
+        summary.observations.push(run_abi_decode_probe_once(
+            args,
+            &model.input_ref,
+            model_index,
+            &command_args,
+            repeat,
+        ));
+        if let Some(observation) = summary.observations.last() {
+            heartbeat(
+                Some(model_index),
+                &model.input_ref,
+                "abi_probe_repeat_done",
+                &abi_probe_observation_detail(observation),
+            );
+        }
     }
-    finalize_abi_decode_probe_summary(summary)
+    let summary = finalize_abi_decode_probe_summary(summary);
+    heartbeat(
+        Some(model_index),
+        &model.input_ref,
+        "abi_probe_done",
+        &format!(
+            "tok_s={} sample_count={} error={}",
+            display_opt(summary.tokens_per_second),
+            summary.sample_count,
+            summary.error.as_deref().unwrap_or("-")
+        ),
+    );
+    summary
 }
 
 fn run_abi_decode_probe_once(
     args: &Args,
+    model_ref: &str,
+    model_index: usize,
     command_args: &[String],
     repeat: usize,
 ) -> AbiDecodeProbeObservation {
@@ -792,17 +945,25 @@ fn run_abi_decode_probe_once(
                 output.status.code().unwrap_or(-1)
             )),
         },
-        Err(err) => AbiDecodeProbeObservation {
-            repeat,
-            command,
-            status_code: None,
-            tokens_per_second: None,
-            elapsed_ms: None,
-            measured_tokens: None,
-            prompt_token_count: None,
-            stderr_tail: None,
-            error: Some(format!("failed to start abi decode probe: {err}")),
-        },
+        Err(err) => {
+            heartbeat(
+                Some(model_index),
+                model_ref,
+                "abi_probe_start_error",
+                &format!("repeat={} error={err}", repeat + 1),
+            );
+            AbiDecodeProbeObservation {
+                repeat,
+                command,
+                status_code: None,
+                tokens_per_second: None,
+                elapsed_ms: None,
+                measured_tokens: None,
+                prompt_token_count: None,
+                stderr_tail: None,
+                error: Some(format!("failed to start abi decode probe: {err}")),
+            }
+        }
     }
 }
 
@@ -922,13 +1083,35 @@ fn benchmark_scenario(
     scenario: BenchmarkScenarioSpec,
 ) -> BenchmarkScenarioSummary {
     let scenario = adapt_scenario_for_model(scenario, recommendation);
+    heartbeat(
+        Some(model_index),
+        &model.input_ref,
+        "scenario_start",
+        &format!(
+            "scenario={} max_new_tokens={} request_count={} reuse_session={}",
+            scenario.name, scenario.max_new_tokens, scenario.request_count, scenario.reuse_session
+        ),
+    );
     let mut summary = BenchmarkSummary {
         verdict: "skipped".into(),
         ..BenchmarkSummary::default()
     };
     if let Some(reason) = benchmark_skip_reason(args, model, recommendation, scenario.kind) {
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "scenario_skip",
+            &format!("scenario={} reason={reason}", scenario.name),
+        );
         summary.skip_reason = Some(reason);
-        return scenario_summary(scenario, &model.profile, recommendation, summary);
+        let result = scenario_summary(scenario, &model.profile, recommendation, summary);
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "scenario_done",
+            &scenario_summary_detail(&result),
+        );
+        return result;
     }
 
     let prediction = scenario_prediction(&scenario, recommendation);
@@ -972,7 +1155,14 @@ fn benchmark_scenario(
         &scenario,
         &summary,
     );
-    scenario_summary(scenario, &model.profile, &scenario_recommendation, summary)
+    let result = scenario_summary(scenario, &model.profile, &scenario_recommendation, summary);
+    heartbeat(
+        Some(model_index),
+        &model.input_ref,
+        "scenario_done",
+        &scenario_summary_detail(&result),
+    );
+    result
 }
 
 fn run_benchmark_repeats(
@@ -991,6 +1181,18 @@ fn run_benchmark_repeats(
     };
     for repeat_offset in 0..repeat_count {
         let repeat = repeat_start + repeat_offset;
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "benchmark_repeat_start",
+            &format!(
+                "scenario={} repeat={} batch_repeat={}/{}",
+                scenario.name,
+                repeat + 1,
+                repeat_offset + 1,
+                repeat_count
+            ),
+        );
         let _status = TerminalStatus::start(
             args.show_progress,
             format!(
@@ -1003,6 +1205,12 @@ fn run_benchmark_repeats(
         );
         let observation =
             run_one_benchmark(args, model, model_index, scenario_index, repeat, scenario);
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "benchmark_repeat_done",
+            &benchmark_observation_detail(&observation, scenario),
+        );
         if let Some(error) = observation.error.as_ref() {
             summary.errors.push(error.clone());
         }
@@ -1922,12 +2130,30 @@ fn benchmark_verdict(
 }
 
 fn load_hardware_profile(args: &Args) -> Result<LoadedHardware> {
+    heartbeat(
+        None,
+        "hardware",
+        "hardware_start",
+        "building hardware profile",
+    );
     let survey = mesh_llm_system::hardware::survey();
     let (benchmark_outputs, facts, raw_json) = if let Some(path) = args.gpu_benchmark_json.as_ref()
     {
+        heartbeat(
+            None,
+            "hardware",
+            "gpu_benchmark_json_start",
+            &format!("path={}", path.display()),
+        );
         let bytes = read_json_input(path)?;
         let raw_json: Value = serde_json::from_slice(&bytes).context("parse GPU benchmark JSON")?;
         let (outputs, facts) = parse_gpu_benchmark_json(&raw_json, &survey)?;
+        heartbeat(
+            None,
+            "hardware",
+            "gpu_benchmark_json_done",
+            &format!("outputs={}", outputs.len()),
+        );
         (outputs, facts, raw_json)
     } else {
         let outputs = run_local_gpu_benchmark(args, &survey)?;
@@ -1949,6 +2175,16 @@ fn load_hardware_profile(args: &Args) -> Result<LoadedHardware> {
         accelerators: facts,
         benchmark_outputs: benchmark_outputs.clone(),
     })?;
+    heartbeat(
+        None,
+        "hardware",
+        "hardware_done",
+        &format!(
+            "accelerators={} backend={:?}",
+            profile.accelerators.len(),
+            default_backend
+        ),
+    );
     Ok(LoadedHardware {
         profile,
         benchmark_outputs,
@@ -2173,13 +2409,26 @@ fn run_local_gpu_benchmark(
     args: &Args,
     survey: &HardwareSurvey,
 ) -> Result<Vec<GpuBenchmarkOutput>> {
+    heartbeat(
+        None,
+        "hardware",
+        "gpu_benchmark_start",
+        "running local GPU benchmark",
+    );
     let _status = TerminalStatus::start(
         args.show_progress,
         "Benchmarking local GPU memory bandwidth".into(),
     );
     let runner = benchmark_runner_for_survey(survey)?;
-    mesh_llm_gpu_bench::run_benchmark(runner, Duration::from_secs(120))
-        .context("run local GPU benchmark")
+    let outputs = mesh_llm_gpu_bench::run_benchmark(runner, Duration::from_secs(120))
+        .context("run local GPU benchmark")?;
+    heartbeat(
+        None,
+        "hardware",
+        "gpu_benchmark_done",
+        &format!("outputs={}", outputs.len()),
+    );
+    Ok(outputs)
 }
 
 fn benchmark_runner_for_survey(
@@ -2723,6 +2972,101 @@ fn display_estimated_range(row: &ModelValidationReport) -> String {
 fn display_opt(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn heartbeat(model_index: Option<usize>, model_ref: &str, phase: &str, detail: &str) {
+    let index = model_index
+        .map(|index| index.to_string())
+        .unwrap_or_else(|| "-".into());
+    let detail = detail.replace(['\r', '\n'], " ");
+    eprintln!(
+        "[model-fit-validate] model_index={index} phase={phase} model_ref={:?} {detail}",
+        model_ref
+    );
+}
+
+fn profile_summary(profile: &ModelProfile) -> String {
+    format!(
+        "architecture={} layers={} hidden={} ctx={} quant={} params={} file_bytes={}",
+        profile.architecture.as_deref().unwrap_or("-"),
+        display_u32(profile.layer_count),
+        display_u32(profile.hidden_size),
+        display_u32(profile.context_length),
+        profile.quantization.as_deref().unwrap_or("-"),
+        display_u64(profile.parameter_count),
+        profile.file_size_bytes
+    )
+}
+
+fn display_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn display_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn abi_probe_observation_detail(observation: &AbiDecodeProbeObservation) -> String {
+    format!(
+        "repeat={} status={} tok_s={} elapsed_ms={} error={}",
+        observation.repeat + 1,
+        status_label(observation.status_code),
+        display_opt(observation.tokens_per_second),
+        display_opt(observation.elapsed_ms),
+        observation.error.as_deref().unwrap_or("-")
+    )
+}
+
+fn benchmark_observation_detail(
+    observation: &BenchmarkObservation,
+    scenario: &BenchmarkScenarioSpec,
+) -> String {
+    format!(
+        "scenario={} repeat={} status={} wall_s={:.2} metric={} error={}",
+        scenario.name,
+        observation.repeat + 1,
+        status_label(observation.status_code),
+        observation.wall_seconds,
+        display_opt(benchmark_observation_metric(observation, scenario)),
+        observation.error.as_deref().unwrap_or("-")
+    )
+}
+
+fn benchmark_observation_metric(
+    observation: &BenchmarkObservation,
+    scenario: &BenchmarkScenarioSpec,
+) -> Option<f64> {
+    match scenario.kind {
+        BenchmarkScenarioKind::SteadyDecode => {
+            steady_decode_observation_tokens_per_sec(observation)
+        }
+        BenchmarkScenarioKind::Prefill => prefill_observation_tokens_per_sec(observation),
+        BenchmarkScenarioKind::FirstToken => observation.text_request_elapsed_ms,
+        BenchmarkScenarioKind::KvWarmReuse => observation
+            .request_results
+            .last()
+            .and_then(|request| request.generated_tokens_per_sec),
+    }
+}
+
+fn scenario_summary_detail(summary: &BenchmarkScenarioSummary) -> String {
+    format!(
+        "scenario={} verdict={} observed={} observed_over_fit={}",
+        summary.scenario,
+        summary.verdict,
+        display_opt(summary.observed),
+        display_opt(summary.observed_over_fit)
+    )
+}
+
+fn status_label(status_code: Option<i32>) -> String {
+    status_code
+        .map(|code| code.to_string())
         .unwrap_or_else(|| "-".into())
 }
 
