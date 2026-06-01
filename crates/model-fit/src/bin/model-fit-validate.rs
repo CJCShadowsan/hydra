@@ -636,8 +636,13 @@ fn validate_prepared_model(
         &prepared.input_ref,
         "score_done",
         &format!(
-            "fit_status={:?} decode_tps={}",
+            "fit_status={:?} selected_backend={:?} selected_accelerator={} decode_tps={}",
             recommendation.fit_status,
+            recommendation.selected_backend,
+            recommendation
+                .selected_accelerator
+                .as_deref()
+                .unwrap_or("-"),
             display_opt(
                 recommendation
                     .estimated_decode_tokens_per_sec
@@ -876,6 +881,15 @@ fn run_abi_decode_probe(
                 "abi_probe_repeat_done",
                 &abi_probe_observation_detail(observation),
             );
+            if fatal_abi_probe_observation(observation) {
+                heartbeat(
+                    Some(model_index),
+                    &model.input_ref,
+                    "abi_probe_repeats_abort",
+                    "aborting ABI decode probe repeats after runtime startup failure",
+                );
+                break;
+            }
         }
     }
     let summary = finalize_abi_decode_probe_summary(summary);
@@ -1041,6 +1055,14 @@ fn abi_decode_probe_error(summary: &AbiDecodeProbeSummary) -> Option<String> {
         .filter_map(|observation| observation.error.as_deref())
         .collect::<Vec<_>>();
     (!errors.is_empty()).then(|| format!("{} abi decode repeats failed", errors.len()))
+}
+
+fn fatal_abi_probe_observation(observation: &AbiDecodeProbeObservation) -> bool {
+    observation.error.is_some()
+        && observation.status_code.is_some_and(|code| code != 0)
+        && observation.tokens_per_second.is_none()
+        && observation.elapsed_ms.is_none()
+        && observation.measured_tokens.is_none()
 }
 
 fn stderr_tail(stderr: &[u8]) -> Option<String> {
@@ -1295,6 +1317,12 @@ fn benchmark_skip_reason(
             "fit status is {:?}; use --benchmark-all to force single-stage benchmark",
             recommendation.fit_status
         ));
+    }
+    if !args.benchmark_all && recommendation.selected_backend == BackendKind::Cpu {
+        return Some(
+            "fit selected CPU backend; use --benchmark-all to force the single-stage Skippy benchmark"
+                .into(),
+        );
     }
     None
 }
@@ -2985,14 +3013,15 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
 
 fn print_markdown_table(rows: &[ModelValidationReport]) {
     println!(
-        "| model_ref | fit | est tok/s | abi tok/s | est range | steady median | steady/fit | steady | first-token | kv-reuse |"
+        "| model_ref | fit | backend | est tok/s | abi tok/s | est range | steady median | steady/fit | steady | first-token | kv-reuse |"
     );
-    println!("|---|---|---:|---:|---:|---:|---:|---|---|---|");
+    println!("|---|---|---|---:|---:|---:|---:|---:|---|---|---|");
     for row in rows {
         println!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.input_ref,
             fit_status(row),
+            display_selected_backend(row),
             display_estimated_tps(row),
             display_abi_decode_probe(row),
             display_estimated_range(row),
@@ -3003,6 +3032,16 @@ fn print_markdown_table(rows: &[ModelValidationReport]) {
             scenario_verdict(row, "kv_warm_reuse"),
         );
     }
+}
+
+fn display_selected_backend(row: &ModelValidationReport) -> String {
+    row.recommendation
+        .as_ref()
+        .map(|rec| match rec.selected_accelerator.as_deref() {
+            Some(accelerator) => format!("{:?} ({accelerator})", rec.selected_backend),
+            None => format!("{:?}", rec.selected_backend),
+        })
+        .unwrap_or_else(|| "-".into())
 }
 
 fn display_abi_decode_probe(row: &ModelValidationReport) -> String {
