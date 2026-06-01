@@ -1056,21 +1056,39 @@ fn benchmark_model(
     recommendation: &ModelRecommendation,
     model_index: usize,
 ) -> Vec<BenchmarkScenarioSummary> {
-    selected_benchmark_scenarios(args)
-        .into_iter()
-        .enumerate()
-        .map(|(scenario_index, scenario)| {
-            benchmark_scenario(
-                args,
-                hardware,
-                model,
-                recommendation,
-                model_index,
-                scenario_index,
+    let scenarios = selected_benchmark_scenarios(args);
+    let mut summaries = Vec::with_capacity(scenarios.len());
+    let mut abort_reason = None;
+
+    for (scenario_index, scenario) in scenarios.into_iter().enumerate() {
+        if let Some(reason) = abort_reason.as_deref() {
+            summaries.push(skipped_scenario_summary(
                 scenario,
-            )
-        })
-        .collect()
+                &model.profile,
+                recommendation,
+                reason,
+            ));
+            continue;
+        }
+        let summary = benchmark_scenario(
+            args,
+            hardware,
+            model,
+            recommendation,
+            model_index,
+            scenario_index,
+            scenario,
+        );
+        if fatal_benchmark_runtime_failure(&summary.benchmark) {
+            abort_reason = Some(format!(
+                "previous scenario {} failed to start the benchmark runtime",
+                summary.scenario
+            ));
+        }
+        summaries.push(summary);
+    }
+
+    summaries
 }
 
 fn benchmark_scenario(
@@ -1214,9 +1232,38 @@ fn run_benchmark_repeats(
         if let Some(error) = observation.error.as_ref() {
             summary.errors.push(error.clone());
         }
+        let fatal = fatal_benchmark_observation(&observation, scenario);
         summary.observations.push(observation);
+        if fatal {
+            let reason = format!(
+                "aborting {} repeats after runtime startup failure; later repeats would relaunch the same single-stage runtime",
+                scenario.name
+            );
+            heartbeat(
+                Some(model_index),
+                &model.input_ref,
+                "benchmark_repeats_abort",
+                &reason,
+            );
+            summary.errors.push(reason);
+            break;
+        }
     }
     summary
+}
+
+fn skipped_scenario_summary(
+    scenario: BenchmarkScenarioSpec,
+    model: &ModelProfile,
+    recommendation: &ModelRecommendation,
+    reason: &str,
+) -> BenchmarkScenarioSummary {
+    let summary = BenchmarkSummary {
+        skip_reason: Some(reason.into()),
+        verdict: "skipped".into(),
+        ..BenchmarkSummary::default()
+    };
+    scenario_summary(scenario, model, recommendation, summary)
 }
 
 fn benchmark_skip_reason(
@@ -1537,6 +1584,34 @@ fn benchmark_has_runtime_error(summary: &BenchmarkSummary) -> bool {
             .observations
             .iter()
             .any(|observation| observation.error.is_some())
+}
+
+fn fatal_benchmark_runtime_failure(summary: &BenchmarkSummary) -> bool {
+    summary
+        .observations
+        .iter()
+        .any(fatal_benchmark_observation_without_scenario)
+}
+
+fn fatal_benchmark_observation(
+    observation: &BenchmarkObservation,
+    scenario: &BenchmarkScenarioSpec,
+) -> bool {
+    fatal_benchmark_observation_without_scenario(observation)
+        && benchmark_observation_metric(observation, scenario).is_none()
+}
+
+fn fatal_benchmark_observation_without_scenario(observation: &BenchmarkObservation) -> bool {
+    // A non-zero `skippy-bench` exit with no request observations and no
+    // measured aggregate metric means the stage runtime did not reach the
+    // request path. Retrying the same model/scenario launches the same
+    // single-stage runtime with the same metadata-derived config, so this is
+    // not a throughput sample and should not consume another startup timeout.
+    observation.error.is_some()
+        && observation.status_code.is_some_and(|code| code != 0)
+        && observation.generated_tokens_per_sec.is_none()
+        && observation.text_request_elapsed_ms.is_none()
+        && observation.request_results.is_empty()
 }
 
 fn scenario_metric_samples(
