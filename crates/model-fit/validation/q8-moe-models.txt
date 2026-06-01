@@ -1,0 +1,18 @@
+# Model-fit Q8/MoE focused validation corpus.
+#
+# Use this set when changing tensor-type traffic, Q8_0 decode modeling, or MoE
+# active-expert/dispatch modeling. It keeps the run short while covering the
+# cases that have historically falsified the estimator:
+#
+# - a same-family Qwen2.5-Coder Q4/Q5/Q6/Q8 slope
+# - one small active-expert MoE
+# - one Q8 reranker/control model that should remain visibly separate from
+#   chat-decoder behavior
+
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q6_K
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q8_0
+
+bartowski/OLMoE-1B-7B-0924-Instruct-GGUF:Q4_K_M
+gpustack/bge-reranker-v2-m3-GGUF:Q8_0

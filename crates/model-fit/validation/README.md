@@ -40,6 +40,16 @@ target/release/model-fit-validate \
 
 `model-fit-validate --models-file` ignores blank lines and `#` comments.
 
+Use the Q8/MoE focused set when changing tensor-type traffic or active-expert
+dispatch modeling:
+
+```bash
+target/release/model-fit-validate \
+  --no-progress \
+  --models-file crates/model-fit/validation/q8-moe-models.txt \
+  --output-json /tmp/model-fit-validation-q8-moe.json
+```
+
 ## ABI decode validation
 
 The validator can run Skippy's single-stage benchmark and the Skippy decode ABI
@@ -79,3 +89,15 @@ These numbers are validation evidence, not calibration inputs. Do not loosen
 thresholds, add model-specific exceptions, or use observed throughput in the
 metadata-only estimator to make this table pass. Treat misses as hypotheses to
 test against source behavior, hardware facts, or broader held-out models.
+
+Focused Q8/MoE follow-up after removing the Q8_0 stored-byte discount and
+making measured MoE dispatch overhead use measured fixed submission cost:
+
+| machine | backend | scenario | samples | median abs error | notable result |
+|---|---|---|---:|---:|---|
+| Mac Studio M1 Ultra | Metal | steady_decode | 6 | 8.8% | Qwen2.5-Coder Q8 moved from slower-than-fit to a 1.06 observed/fit match; OLMoE remained close but noisy; bge reranker stayed slower-than-fit. |
+| white.local | CUDA | steady_decode | 6 | 8.3% | Qwen2.5-Coder Q8 improved from 0.60 to 0.86 observed/fit, and OLMoE improved from 1.97 faster-than-fit to 0.90 match. |
+| Mac Studio M1 Ultra | Metal | prefill | 5 | 12.2% | Qwen2.5-Coder Q4/Q5/Q6 and OLMoE are close; Q8 prefill remains noisy/slower-than-fit. |
+| white.local | CUDA | prefill | 5 | 223.6% | CUDA prefill remains a known residual miss and should not be hidden by decode changes. |
+| Mac Studio M1 Ultra | Metal | kv_warm_reuse | 6 | 14.3% | Qwen2.5-Coder Q8 now matches KV reuse; Q4/Q5 and bge reranker remain slower-than-fit/noisy. |
+| white.local | CUDA | kv_warm_reuse | 6 | 17.5% | Qwen2.5-Coder and bge reranker KV reuse remain slower than steady-decode fit. |

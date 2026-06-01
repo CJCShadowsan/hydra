@@ -269,6 +269,38 @@ fn moe_decode_uses_active_expert_bytes() {
 }
 
 #[test]
+fn measured_moe_dispatch_overhead_uses_submission_cost() {
+    let mut low_overhead = m1_ultra();
+    low_overhead.accelerators[0].decode_fixed_overhead_ms = Some(0.002);
+    let mut high_overhead = m1_ultra();
+    high_overhead.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let mut moe = dense_model("measured-moe", 4 * GIB, 16, 2048, 4096);
+    moe.architecture_class = ModelArchitectureClass::SparseMoeTransformer;
+    moe.expert_count = Some(64);
+    moe.expert_used_count = Some(8);
+    moe.tensor_group_bytes.expert_feed_forward_bytes = 3 * GIB;
+    moe.tensor_matmul.expert_bytes = 3 * GIB;
+    moe.tensor_matmul.expert_feed_forward.bytes = 3 * GIB;
+    moe.tensor_matmul.expert_feed_forward.type_bytes = TensorTypeBytes {
+        q4_k_bytes: 3 * GIB,
+        ..TensorTypeBytes::default()
+    };
+
+    let low_rec = score_model(&low_overhead, &moe, &config);
+    let high_rec = score_model(&high_overhead, &moe, &config);
+
+    assert!(
+        low_rec.estimated_decode_tokens_per_sec.unwrap()
+            > high_rec.estimated_decode_tokens_per_sec.unwrap()
+    );
+}
+
+#[test]
 fn filename_like_identifier_does_not_create_coding_suitability() {
     let hardware = m1_ultra();
     let mut config = SelectionConfig {
@@ -504,10 +536,10 @@ fn q8_decode_uses_ggml_type_kernel_traffic() {
     let q8_active = q8_rec.estimated_active_decode_bytes_per_token.unwrap();
 
     assert!(q8_active > q4_active);
-    assert!(q8_active < q4_active * 14 / 10);
+    assert!(q8_active > q4_active * 16 / 10);
     assert!(
         q8_rec.estimated_decode_tokens_per_sec.unwrap()
-            > q4_rec.estimated_decode_tokens_per_sec.unwrap() * 0.70
+            < q4_rec.estimated_decode_tokens_per_sec.unwrap()
     );
 }
 

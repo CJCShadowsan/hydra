@@ -554,9 +554,11 @@ fn tensor_type_kernel_traffic_bytes(bytes: TensorTypeBytes) -> u64 {
     // kernels. The stored byte count is therefore a real memory-capacity fact,
     // but it is not always the best decode-time cost unit:
     //
-    // - Q8_0 stores about 34 bytes per 32 weights (`block_q8_0`). Its decode
-    //   kernel has a simple scale + int8 layout and does not pay the packed
-    //   super-block unpacking path used by K-quants.
+    // - Q8_0 stores about 34 bytes per 32 weights (`block_q8_0`). Its Metal
+    //   mat-vec kernel reads that block directly (`qs` plus `d`), and CUDA's
+    //   MMVQ/MMQ path uses q8-specific `vec_dot_q8_0_q8_1` helpers. The source
+    //   does not justify counting less than the resident Q8_0 block bytes as
+    //   decode traffic, so Q8_0 is charged at its stored bytes.
     // - Q4_K stores far fewer bytes, but its `block_q4_K` super-block carries
     //   packed nibbles, scales/mins, and a q4x4 dequant path. The physical
     //   bytes are lower, while the useful bandwidth-equivalent work is not
@@ -571,15 +573,25 @@ fn tensor_type_kernel_traffic_bytes(bytes: TensorTypeBytes) -> u64 {
     // - ggml.c defines block size/type size for Q8_0 and K-quants.
     // - ggml-metal.metal instantiates separate matmul kernels for Q8_0 and
     //   Q4_K/Q5_K/Q6_K instead of a single generic bytes-only path.
-    // - ggml-metal-device.cpp selects different kernel parameters by GGML type.
+    // - ggml-metal-ops.cpp dispatches Q8_0 with the f32/f16/bf16 row-grouping
+    //   path for generic mat-vec, not with the K-quant grouping branch.
+    // - ggml-cuda uses q8-specific MMVQ/MMQ vec-dot helpers and q8-specific
+    //   MUL_MAT_ID templates.
+    //
+    // Earlier versions discounted Q8_0 storage bytes because Q8 has a simpler
+    // block layout than K-quants. Broader validation falsified that as a
+    // portable traffic model: Q8_0 was over-predicted on both Metal and CUDA.
+    // The source-grounded rule is now simpler and stricter: count stored bytes
+    // for Q4_K/Q5_K/Q6_K/Q8_0 and let measured hardware bandwidth, graph shape,
+    // and compute floors decide the final rate.
     scaled_type_bytes(bytes.f32_bytes, 1.00)
         .saturating_add(scaled_type_bytes(bytes.f16_bytes, 1.00))
         .saturating_add(scaled_type_bytes(bytes.bf16_bytes, 1.00))
         .saturating_add(scaled_type_bytes(bytes.q4_0_bytes, 1.18))
         .saturating_add(scaled_type_bytes(bytes.q4_k_bytes, 1.00))
-        .saturating_add(scaled_type_bytes(bytes.q5_k_bytes, 0.96))
-        .saturating_add(scaled_type_bytes(bytes.q6_k_bytes, 0.92))
-        .saturating_add(scaled_type_bytes(bytes.q8_0_bytes, 0.63))
+        .saturating_add(scaled_type_bytes(bytes.q5_k_bytes, 1.00))
+        .saturating_add(scaled_type_bytes(bytes.q6_k_bytes, 1.00))
+        .saturating_add(scaled_type_bytes(bytes.q8_0_bytes, 1.00))
         .saturating_add(scaled_type_bytes(bytes.iq_bytes, 1.18))
         .saturating_add(scaled_type_bytes(bytes.other_quantized_bytes, 1.05))
         .saturating_add(bytes.unknown_bytes)
@@ -717,7 +729,7 @@ fn decode_tokens_per_sec(
     let compute_ms = decode_compute_ms(active_decode_flops, budget).unwrap_or(0.0);
     let overhead_ms = fixed_decode_overhead_ms(budget, config)
         + measured_decode_graph_overhead_ms(model, budget)
-        + architecture_decode_overhead_ms(model, config);
+        + architecture_decode_overhead_ms(model, budget, config);
     Some(1000.0 / (bandwidth_ms.max(compute_ms) + overhead_ms).max(0.001))
 }
 
@@ -1222,14 +1234,48 @@ fn measured_gpu_budget(budget: &ExecutionBudget) -> bool {
         && budget.accelerator_kind != AcceleratorKind::Cpu
 }
 
-fn architecture_decode_overhead_ms(model: &ModelProfile, config: &SelectionConfig) -> f32 {
+fn architecture_decode_overhead_ms(
+    model: &ModelProfile,
+    budget: &ExecutionBudget,
+    config: &SelectionConfig,
+) -> f32 {
     match model.architecture_class {
         ModelArchitectureClass::SparseMoeTransformer => {
             model.layer_count.unwrap_or_default() as f32
-                * config.decode_overhead.moe_dispatch_ms_per_layer
+                * moe_dispatch_overhead_ms_per_layer(budget, config)
         }
         _ => 0.0,
     }
+}
+
+fn moe_dispatch_overhead_ms_per_layer(budget: &ExecutionBudget, config: &SelectionConfig) -> f32 {
+    // MoE decode adds source-visible graph work beyond dense FFN decode:
+    // router logits/probabilities/top-k, GGML_OP_MUL_MAT_ID expert matmuls,
+    // weighting, and expert aggregation. That work is real, but it is not a
+    // backend-independent latency constant.
+    //
+    // On measured hardware, use the benchmark's fixed submission cost as the
+    // per-layer dispatch unit and cap it at the fallback MoE prior. This keeps
+    // the estimator portable:
+    //
+    // - a low-latency measured path with MMVQ/MMQ and fusion support in the
+    //   llama.cpp backend is not forced to pay a large hand-written MoE
+    //   constant;
+    // - a higher-latency measured path still pays visible extra graph work;
+    // - unmeasured hardware keeps the conservative config prior and carries the
+    //   existing calibration warnings.
+    //
+    // The rule consumes only GGUF architecture class plus measured hardware
+    // facts. It does not branch on backend names, model names, or observed model
+    // throughput from validation.
+    if measured_gpu_budget(budget) {
+        return budget
+            .decode_fixed_overhead_ms
+            .filter(|value| *value > 0.0)
+            .map(|fixed| fixed.min(config.decode_overhead.moe_dispatch_ms_per_layer))
+            .unwrap_or(0.0);
+    }
+    config.decode_overhead.moe_dispatch_ms_per_layer
 }
 
 fn fit_status(
@@ -1677,7 +1723,7 @@ fn add_decode_estimate_reason(
             bytes_per_sec as f32 / 1_000_000_000.0
         ));
     }
-    let arch_ms = architecture_decode_overhead_ms(model, config);
+    let arch_ms = architecture_decode_overhead_ms(model, budget, config);
     let graph_ms = measured_decode_graph_overhead_ms(model, budget);
     let shape_adjustment = active_decode_bytes_per_token(model, config)
         .map(|bytes| (decode_shape_bandwidth_factor(model, bytes), graph_ms));
