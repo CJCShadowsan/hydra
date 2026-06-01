@@ -32,6 +32,9 @@ fn m1_ultra() -> HardwareProfile {
             physical_cores: Some(20),
             logical_cores: Some(20),
             memory_bandwidth_bytes_per_sec: Some(200_000_000_000),
+            compute_tflops_fp16: None,
+            prefill_matmul_tflops_fp16: None,
+            prefill_moe_matmul_tflops_fp16: None,
         },
     }
 }
@@ -541,6 +544,9 @@ fn budget_selection_prefers_faster_measured_gpu_over_cpu_headroom() {
             physical_cores: Some(8),
             logical_cores: Some(16),
             memory_bandwidth_bytes_per_sec: None,
+            compute_tflops_fp16: None,
+            prefill_matmul_tflops_fp16: None,
+            prefill_moe_matmul_tflops_fp16: None,
         },
     };
     let mut config = SelectionConfig {

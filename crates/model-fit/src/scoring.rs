@@ -225,9 +225,9 @@ fn execution_budgets(hardware: &HardwareProfile) -> Vec<ExecutionBudget> {
                 .map(|_| MeasurementSource::Measured)
                 .unwrap_or(MeasurementSource::Unknown),
             benchmark_noise_pct: None,
-            compute_tflops_fp16: None,
-            prefill_matmul_tflops_fp16: None,
-            prefill_moe_matmul_tflops_fp16: None,
+            compute_tflops_fp16: hardware.cpu.compute_tflops_fp16,
+            prefill_matmul_tflops_fp16: hardware.cpu.prefill_matmul_tflops_fp16,
+            prefill_moe_matmul_tflops_fp16: hardware.cpu.prefill_moe_matmul_tflops_fp16,
             unified_memory: false,
         });
     }

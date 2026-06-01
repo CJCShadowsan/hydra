@@ -71,10 +71,14 @@ The steady-decode estimator is source-grounded rather than model-name grounded:
   of assuming Metal, CUDA, or ROCm behavior.
 - Dense prefill uses a separate roofline over GGUF matmul FLOPs, llama.cpp
   ubatch count, measured memory bandwidth, measured graph overhead, and the
-  optional `prefill_matmul_tflops_fp16` hardware probe. Sparse MoE records a
-  separate `prefill_moe_matmul_tflops_fp16` probe, but the scorer treats that as
-  an upper bound because raw expert GEMM does not include router/id-map,
-  weighting, and aggregation work around `GGML_OP_MUL_MAT_ID`.
+  optional `prefill_matmul_tflops_fp16` hardware probe. CUDA, Metal, and ROCm
+  backends can all report the same semantic probe through their native matrix
+  APIs. Sparse MoE records a separate `prefill_moe_matmul_tflops_fp16` probe,
+  but the scorer treats that as an upper bound because raw expert GEMM does not
+  include router/id-map, weighting, and aggregation work around
+  `GGML_OP_MUL_MAT_ID`. CPU profiles may carry the same optional facts when a
+  CPU benchmark supplies them; model-fit does not invent CPU FP16 throughput for
+  machines where that is not measured.
 - First-token validation serializes predicted prefill, decode, and overhead
   components plus observed tokenize, prefill, decode, and unattributed request
   time. That keeps request/setup residuals visible instead of blaming them on

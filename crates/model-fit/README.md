@@ -5,7 +5,8 @@
 The crate is intentionally metadata-first and deterministic. It consumes:
 
 - hardware facts and measured GPU bandwidth, decode overhead, scalar compute,
-  and prefill-shaped matmul throughput from `mesh-llm gpus benchmark`
+  dense prefill matmul throughput, and MoE-shaped prefill matmul throughput
+  from `mesh-llm gpus benchmark`
 - GGUF-derived model metadata such as tensor bytes, layer count, hidden width,
   KV dimensions, context length, architecture class, quantization, tokenizer
   metadata, and workload capability evidence

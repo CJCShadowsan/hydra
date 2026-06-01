@@ -43,6 +43,7 @@ fn build_metal() {
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
 }
 
 fn add_macos_target_flags(command: &mut std::process::Command) {
@@ -212,6 +213,7 @@ fn build_hip() {
     });
     archive_static_lib(&object, "mesh_llm_gpu_bench_hip");
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=hipblas");
 }
 
 fn build_intel() {

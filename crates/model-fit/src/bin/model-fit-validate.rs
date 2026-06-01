@@ -2054,6 +2054,9 @@ fn cpu_profile() -> CpuProfile {
             .ok()
             .and_then(|count| u32::try_from(count.get()).ok()),
         memory_bandwidth_bytes_per_sec: None,
+        compute_tflops_fp16: None,
+        prefill_matmul_tflops_fp16: None,
+        prefill_moe_matmul_tflops_fp16: None,
     }
 }
 
@@ -2297,6 +2300,9 @@ fn fit_input_contract() -> FitInputContract {
             "accelerators.prefill_moe_matmul_tflops_fp16",
             "accelerators.unified_memory",
             "cpu.memory_bandwidth_bytes_per_sec",
+            "cpu.compute_tflops_fp16",
+            "cpu.prefill_matmul_tflops_fp16",
+            "cpu.prefill_moe_matmul_tflops_fp16",
         ],
         model_fields_consumed: vec![
             "architecture",

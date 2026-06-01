@@ -1,9 +1,16 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
 #include <sys/sysctl.h>
+
+#define PREFILL_MATMUL_SIZE 4096
+#define PREFILL_MOE_M 1024
+#define PREFILL_MOE_N 512
+#define PREFILL_MOE_K 2048
+#define PREFILL_MOE_EXPERTS 8
 
 typedef struct {
     const char *key;
@@ -205,8 +212,48 @@ static double run_empty_dispatch_overhead_ms(id<MTLCommandQueue> queue,
     return elapsed * 1000.0 / (double)dispatches;
 }
 
+static double run_mps_matmul(id<MTLCommandQueue> queue,
+                             MPSMatrixMultiplication *gemm,
+                             MPSMatrix *left,
+                             MPSMatrix *right,
+                             MPSMatrix *result,
+                             double flops) {
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    __block double elapsed = 0.0;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+      elapsed = [b GPUEndTime] - [b GPUStartTime];
+    }];
+    [gemm encodeToCommandBuffer:cmd leftMatrix:left rightMatrix:right resultMatrix:result];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return flops / elapsed / 1e12;
+}
+
+static double run_mps_moe_matmul(id<MTLCommandQueue> queue,
+                                 MPSMatrixMultiplication *gemm,
+                                 NSArray<MPSMatrix *> *left,
+                                 NSArray<MPSMatrix *> *right,
+                                 NSArray<MPSMatrix *> *result,
+                                 double flops) {
+    id<MTLCommandBuffer> cmd = [queue commandBuffer];
+    __block double elapsed = 0.0;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> b) {
+      elapsed = [b GPUEndTime] - [b GPUStartTime];
+    }];
+    for (NSUInteger expert = 0; expert < [left count]; ++expert) {
+        [gemm encodeToCommandBuffer:cmd
+                         leftMatrix:left[expert]
+                        rightMatrix:right[expert]
+                       resultMatrix:result[expert]];
+    }
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    return flops / elapsed / 1e12;
+}
+
 char *mesh_llm_gpu_bench_metal_json(char **error_out) {
     @autoreleasepool {
+        @try {
         if (error_out != NULL) {
             *error_out = NULL;
         }
@@ -300,6 +347,100 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         MTLSize compute_tpg_fp32 = MTLSizeMake([pso_fp32 maxTotalThreadsPerThreadgroup], 1, 1);
         MTLSize compute_tpg_fp16 = MTLSizeMake([pso_fp16 maxTotalThreadsPerThreadgroup], 1, 1);
 
+        const NSUInteger half_bytes = sizeof(uint16_t);
+        const NSUInteger dense_row_bytes = PREFILL_MATMUL_SIZE * half_bytes;
+        const NSUInteger dense_matrix_bytes = dense_row_bytes * PREFILL_MATMUL_SIZE;
+        id<MTLBuffer> dense_a = [device newBufferWithLength:dense_matrix_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dense_b = [device newBufferWithLength:dense_matrix_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dense_c = [device newBufferWithLength:dense_matrix_bytes options:MTLResourceStorageModeShared];
+        if (dense_a == nil || dense_b == nil || dense_c == nil) {
+            if (error_out != NULL) {
+                *error_out = copy_c_string(@"failed to allocate Metal dense matmul benchmark resources");
+            }
+            return NULL;
+        }
+        memset([dense_a contents], 1, dense_matrix_bytes);
+        memset([dense_b contents], 1, dense_matrix_bytes);
+        memset([dense_c contents], 0, dense_matrix_bytes);
+
+        MPSMatrixDescriptor *dense_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:PREFILL_MATMUL_SIZE
+                                                  columns:PREFILL_MATMUL_SIZE
+                                                 rowBytes:dense_row_bytes
+                                                 dataType:MPSDataTypeFloat16];
+        MPSMatrix *dense_left = [[MPSMatrix alloc] initWithBuffer:dense_a descriptor:dense_desc];
+        MPSMatrix *dense_right = [[MPSMatrix alloc] initWithBuffer:dense_b descriptor:dense_desc];
+        MPSMatrix *dense_result = [[MPSMatrix alloc] initWithBuffer:dense_c descriptor:dense_desc];
+        MPSMatrixMultiplication *dense_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                 resultRows:PREFILL_MATMUL_SIZE
+                                              resultColumns:PREFILL_MATMUL_SIZE
+                                            interiorColumns:PREFILL_MATMUL_SIZE
+                                                      alpha:1.0
+                                                       beta:0.0];
+
+        const NSUInteger moe_a_bytes = (NSUInteger)PREFILL_MOE_M * PREFILL_MOE_K * half_bytes;
+        const NSUInteger moe_b_bytes = (NSUInteger)PREFILL_MOE_K * PREFILL_MOE_N * half_bytes;
+        const NSUInteger moe_c_bytes = (NSUInteger)PREFILL_MOE_M * PREFILL_MOE_N * half_bytes;
+        MPSMatrixDescriptor *moe_a_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:PREFILL_MOE_M
+                                                  columns:PREFILL_MOE_K
+                                                 rowBytes:PREFILL_MOE_K * half_bytes
+                                                 dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *moe_b_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:PREFILL_MOE_K
+                                                  columns:PREFILL_MOE_N
+                                                 rowBytes:PREFILL_MOE_N * half_bytes
+                                                 dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *moe_c_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:PREFILL_MOE_M
+                                                  columns:PREFILL_MOE_N
+                                                 rowBytes:PREFILL_MOE_N * half_bytes
+                                                 dataType:MPSDataTypeFloat16];
+        id<MTLBuffer> moe_a_buffers[PREFILL_MOE_EXPERTS];
+        id<MTLBuffer> moe_b_buffers[PREFILL_MOE_EXPERTS];
+        id<MTLBuffer> moe_c_buffers[PREFILL_MOE_EXPERTS];
+        NSMutableArray<MPSMatrix *> *moe_left = [NSMutableArray arrayWithCapacity:PREFILL_MOE_EXPERTS];
+        NSMutableArray<MPSMatrix *> *moe_right = [NSMutableArray arrayWithCapacity:PREFILL_MOE_EXPERTS];
+        NSMutableArray<MPSMatrix *> *moe_result = [NSMutableArray arrayWithCapacity:PREFILL_MOE_EXPERTS];
+        for (NSUInteger expert = 0; expert < PREFILL_MOE_EXPERTS; ++expert) {
+            moe_a_buffers[expert] = [device newBufferWithLength:moe_a_bytes options:MTLResourceStorageModeShared];
+            moe_b_buffers[expert] = [device newBufferWithLength:moe_b_bytes options:MTLResourceStorageModeShared];
+            moe_c_buffers[expert] = [device newBufferWithLength:moe_c_bytes options:MTLResourceStorageModeShared];
+            if (moe_a_buffers[expert] == nil || moe_b_buffers[expert] == nil || moe_c_buffers[expert] == nil) {
+                if (error_out != NULL) {
+                    *error_out = copy_c_string(@"failed to allocate Metal MoE matmul benchmark resources");
+                }
+                return NULL;
+            }
+            memset([moe_a_buffers[expert] contents], 1, moe_a_bytes);
+            memset([moe_b_buffers[expert] contents], 1, moe_b_bytes);
+            memset([moe_c_buffers[expert] contents], 0, moe_c_bytes);
+            [moe_left addObject:[[MPSMatrix alloc] initWithBuffer:moe_a_buffers[expert] descriptor:moe_a_desc]];
+            [moe_right addObject:[[MPSMatrix alloc] initWithBuffer:moe_b_buffers[expert] descriptor:moe_b_desc]];
+            [moe_result addObject:[[MPSMatrix alloc] initWithBuffer:moe_c_buffers[expert] descriptor:moe_c_desc]];
+        }
+        MPSMatrixMultiplication *moe_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                 resultRows:PREFILL_MOE_M
+                                              resultColumns:PREFILL_MOE_N
+                                            interiorColumns:PREFILL_MOE_K
+                                                      alpha:1.0
+                                                       beta:0.0];
+        const double dense_flops = 2.0
+            * (double)PREFILL_MATMUL_SIZE
+            * (double)PREFILL_MATMUL_SIZE
+            * (double)PREFILL_MATMUL_SIZE;
+        const double moe_flops = 2.0
+            * (double)PREFILL_MOE_M
+            * (double)PREFILL_MOE_N
+            * (double)PREFILL_MOE_K
+            * (double)PREFILL_MOE_EXPERTS;
+
         for (int i = 0; i < 3; ++i) {
             (void)run_memread(queue, pso, buf, sink, grid, tpg);
         }
@@ -312,6 +453,10 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
                                           decode_chunk_bytes, decode_dispatches);
             (void)run_empty_dispatch_overhead_ms(queue, pso_empty, sink, empty_grid, empty_tpg,
                                                  fixed_overhead_dispatches);
+            (void)run_mps_matmul(queue, dense_gemm, dense_left, dense_right, dense_result,
+                                 dense_flops);
+            (void)run_mps_moe_matmul(queue, moe_gemm, moe_left, moe_right, moe_result,
+                                     moe_flops);
         }
 
         const int runs = 20;
@@ -319,6 +464,8 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         NSMutableArray<NSNumber *> *gbps = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *fp32_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *fp16_samples = [NSMutableArray arrayWithCapacity:runs];
+        NSMutableArray<NSNumber *> *prefill_matmul_samples = [NSMutableArray arrayWithCapacity:runs];
+        NSMutableArray<NSNumber *> *prefill_moe_matmul_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *decode_effective_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *fixed_overhead_samples = [NSMutableArray arrayWithCapacity:runs];
 
@@ -329,6 +476,13 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
                                                   compute_grid, compute_tpg_fp32, 16.0))];
             [fp16_samples addObject:@(run_compute(queue, pso_fp16, compute_sink, compute_thread_count, compute_iters,
                                                   compute_grid, compute_tpg_fp16, 32.0))];
+            [prefill_matmul_samples addObject:@(run_mps_matmul(queue, dense_gemm,
+                                                               dense_left, dense_right,
+                                                               dense_result, dense_flops))];
+            [prefill_moe_matmul_samples addObject:@(run_mps_moe_matmul(queue, moe_gemm,
+                                                                       moe_left, moe_right,
+                                                                       moe_result,
+                                                                       moe_flops))];
             [decode_effective_samples addObject:@(run_decode_like_memread(queue, pso, buf, sink,
                                                                           decode_grid, tpg,
                                                                           decode_chunk_bytes,
@@ -343,6 +497,10 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         double noise = (p90 - p50) / p90 * 100.0;
         double fp32_measured = percentile_value(fp32_samples, (NSUInteger)((double)runs * 0.90) - 1);
         double fp16_measured = percentile_value(fp16_samples, (NSUInteger)((double)runs * 0.90) - 1);
+        double prefill_matmul_measured =
+            percentile_value(prefill_matmul_samples, (NSUInteger)((double)runs * 0.90) - 1);
+        double prefill_moe_matmul_measured =
+            percentile_value(prefill_moe_matmul_samples, (NSUInteger)((double)runs * 0.90) - 1);
         double decode_effective = percentile_value(decode_effective_samples, (NSUInteger)((double)runs * 0.90) - 1);
         decode_effective = MIN(decode_effective, p90);
         double fixed_overhead = percentile_value(fixed_overhead_samples, runs / 2);
@@ -355,15 +513,25 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         double efficiency = has_rated ? p90 / rated * 100.0 : 0.0;
 
         NSMutableString *json = [NSMutableString stringWithFormat:
-            @"[{\"device\":\"%@\",\"buffer_mb\":512,\"runs\":%d,\"p50_gbps\":%.2f,\"p90_gbps\":%.2f,\"noise_pct\":%.2f,\"runtime_s\":%.3f,\"decode_effective_gbps\":%.2f,\"decode_fixed_overhead_ms\":%.4f,\"compute_tflops_fp32\":%.2f,\"compute_tflops_fp16\":%.2f",
+            @"[{\"device\":\"%@\",\"buffer_mb\":512,\"runs\":%d,\"p50_gbps\":%.2f,\"p90_gbps\":%.2f,\"noise_pct\":%.2f,\"runtime_s\":%.3f,\"decode_effective_gbps\":%.2f,\"decode_fixed_overhead_ms\":%.4f,\"compute_tflops_fp32\":%.2f,\"compute_tflops_fp16\":%.2f,\"prefill_matmul_tflops_fp16\":%.2f,\"prefill_moe_matmul_tflops_fp16\":%.2f",
             device_name, runs, p50, p90, noise, runtime_secs, decode_effective, fixed_overhead,
-            fp32_measured, fp16_measured];
+            fp32_measured, fp16_measured, prefill_matmul_measured,
+            prefill_moe_matmul_measured];
         if (has_rated) {
             [json appendFormat:@",\"rated_gbps\":%.0f,\"rated_estimated\":%@", rated, estimated ? @"true" : @"false"];
             [json appendFormat:@",\"efficiency_pct\":%.2f", efficiency];
         }
         [json appendString:@"}]"];
         return copy_c_string(json);
+        } @catch (NSException *exception) {
+            if (error_out != NULL) {
+                *error_out = copy_c_string([NSString stringWithFormat:
+                    @"Metal benchmark exception: %@: %@",
+                    [exception name],
+                    [exception reason]]);
+            }
+            return NULL;
+        }
     }
 }
 

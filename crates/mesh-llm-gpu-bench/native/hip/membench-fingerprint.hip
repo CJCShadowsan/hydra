@@ -15,6 +15,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hipblas/hipblas.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,11 @@
 #define BLOCK_SIZE   256
 #define COMPUTE_ITERS 16384
 #define COMPUTE_BLOCKS_PER_CU 16
+#define PREFILL_MATMUL_SIZE 4096
+#define PREFILL_MOE_M 1024
+#define PREFILL_MOE_N 512
+#define PREFILL_MOE_K 2048
+#define PREFILL_MOE_EXPERTS 8
 
 // Read-only kernel. __ldg maps to scalar cache on RDNA/CDNA.
 // Wavefront: 64 threads on GCN/CDNA, 32 on RDNA — gridDim accounts for warpSize.
@@ -96,6 +102,13 @@ static void check(hipError_t err, const char* ctx) {
     }
 }
 
+static void check_hipblas(hipblasStatus_t status, const char* ctx) {
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        fprintf(stderr, "hipBLAS error at %s: %d\n", ctx, (int)status);
+        exit(1);
+    }
+}
+
 static int cmp_double(const void* a, const void* b) {
     double da = *(const double*)a, db = *(const double*)b;
     return (da > db) - (da < db);
@@ -154,12 +167,37 @@ int main(int argc, char** argv) {
         float4* dSrc;
         float*  dSink;
         float*  dComputeSink;
+        __half* dMatmulA;
+        __half* dMatmulB;
+        __half* dMatmulC;
+        __half* dMoeA;
+        __half* dMoeB;
+        __half* dMoeC;
         check(hipMalloc(&dSrc,  BUFFER_BYTES), "hipMalloc src");
         check(hipMalloc(&dSink, sizeof(float)), "hipMalloc sink");
         check(hipMalloc(&dComputeSink, sizeof(float) * computeThreads), "hipMalloc compute sink");
+        size_t matmulBytes = (size_t)PREFILL_MATMUL_SIZE * (size_t)PREFILL_MATMUL_SIZE * sizeof(__half);
+        check(hipMalloc(&dMatmulA, matmulBytes), "hipMalloc matmul A");
+        check(hipMalloc(&dMatmulB, matmulBytes), "hipMalloc matmul B");
+        check(hipMalloc(&dMatmulC, matmulBytes), "hipMalloc matmul C");
+        size_t moeABytes = (size_t)PREFILL_MOE_EXPERTS * (size_t)PREFILL_MOE_M * (size_t)PREFILL_MOE_K * sizeof(__half);
+        size_t moeBBytes = (size_t)PREFILL_MOE_EXPERTS * (size_t)PREFILL_MOE_K * (size_t)PREFILL_MOE_N * sizeof(__half);
+        size_t moeCBytes = (size_t)PREFILL_MOE_EXPERTS * (size_t)PREFILL_MOE_M * (size_t)PREFILL_MOE_N * sizeof(__half);
+        check(hipMalloc(&dMoeA, moeABytes), "hipMalloc moe A");
+        check(hipMalloc(&dMoeB, moeBBytes), "hipMalloc moe B");
+        check(hipMalloc(&dMoeC, moeCBytes), "hipMalloc moe C");
         check(hipMemset(dSrc,  0, BUFFER_BYTES), "hipMemset src");
         check(hipMemset(dSink, 0, sizeof(float)), "hipMemset sink");
         check(hipMemset(dComputeSink, 0, sizeof(float) * computeThreads), "hipMemset compute sink");
+        check(hipMemset(dMatmulA, 1, matmulBytes), "hipMemset matmul A");
+        check(hipMemset(dMatmulB, 1, matmulBytes), "hipMemset matmul B");
+        check(hipMemset(dMatmulC, 0, matmulBytes), "hipMemset matmul C");
+        check(hipMemset(dMoeA, 1, moeABytes), "hipMemset moe A");
+        check(hipMemset(dMoeB, 1, moeBBytes), "hipMemset moe B");
+        check(hipMemset(dMoeC, 0, moeCBytes), "hipMemset moe C");
+
+        hipblasHandle_t hipblas;
+        check_hipblas(hipblasCreate(&hipblas), "hipblasCreate");
 
         hipEvent_t evStart, evStop;
         check(hipEventCreate(&evStart), "hipEventCreate start");
@@ -202,10 +240,87 @@ int main(int argc, char** argv) {
             return totalFlops / (ms / 1000.0) / 1e12;
         };
 
+        auto measure_prefill_matmul_fp16 = [&]() -> double {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            check(hipEventRecord(evStart, 0), "hipEventRecord prefill matmul start");
+            check_hipblas(
+                hipblasGemmEx(hipblas,
+                              HIPBLAS_OP_N,
+                              HIPBLAS_OP_N,
+                              PREFILL_MATMUL_SIZE,
+                              PREFILL_MATMUL_SIZE,
+                              PREFILL_MATMUL_SIZE,
+                              &alpha,
+                              dMatmulA,
+                              HIPBLAS_R_16F,
+                              PREFILL_MATMUL_SIZE,
+                              dMatmulB,
+                              HIPBLAS_R_16F,
+                              PREFILL_MATMUL_SIZE,
+                              &beta,
+                              dMatmulC,
+                              HIPBLAS_R_16F,
+                              PREFILL_MATMUL_SIZE,
+                              HIPBLAS_R_32F,
+                              HIPBLAS_GEMM_DEFAULT),
+                "hipblasGemmEx prefill matmul");
+            check(hipEventRecord(evStop, 0), "hipEventRecord prefill matmul stop");
+            check(hipEventSynchronize(evStop), "hipEventSync prefill matmul");
+            float ms = 0.0f;
+            check(hipEventElapsedTime(&ms, evStart, evStop), "hipEventElapsed prefill matmul");
+            double n = (double)PREFILL_MATMUL_SIZE;
+            double totalFlops = 2.0 * n * n * n;
+            return totalFlops / (ms / 1000.0) / 1e12;
+        };
+
+        auto measure_prefill_moe_matmul_fp16 = [&]() -> double {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            check(hipEventRecord(evStart, 0), "hipEventRecord prefill moe matmul start");
+            check_hipblas(
+                hipblasGemmStridedBatchedEx(hipblas,
+                                            HIPBLAS_OP_N,
+                                            HIPBLAS_OP_N,
+                                            PREFILL_MOE_M,
+                                            PREFILL_MOE_N,
+                                            PREFILL_MOE_K,
+                                            &alpha,
+                                            dMoeA,
+                                            HIPBLAS_R_16F,
+                                            PREFILL_MOE_M,
+                                            (long long)PREFILL_MOE_M * PREFILL_MOE_K,
+                                            dMoeB,
+                                            HIPBLAS_R_16F,
+                                            PREFILL_MOE_K,
+                                            (long long)PREFILL_MOE_K * PREFILL_MOE_N,
+                                            &beta,
+                                            dMoeC,
+                                            HIPBLAS_R_16F,
+                                            PREFILL_MOE_M,
+                                            (long long)PREFILL_MOE_M * PREFILL_MOE_N,
+                                            PREFILL_MOE_EXPERTS,
+                                            HIPBLAS_R_32F,
+                                            HIPBLAS_GEMM_DEFAULT),
+                "hipblasGemmStridedBatchedEx prefill moe matmul");
+            check(hipEventRecord(evStop, 0), "hipEventRecord prefill moe matmul stop");
+            check(hipEventSynchronize(evStop), "hipEventSync prefill moe matmul");
+            float ms = 0.0f;
+            check(hipEventElapsedTime(&ms, evStart, evStop), "hipEventElapsed prefill moe matmul");
+            double totalFlops = 2.0
+                * (double)PREFILL_MOE_M
+                * (double)PREFILL_MOE_N
+                * (double)PREFILL_MOE_K
+                * (double)PREFILL_MOE_EXPERTS;
+            return totalFlops / (ms / 1000.0) / 1e12;
+        };
+
         for (int i = 0; i < WARMUP_RUNS; i++) dispatch();
         for (int i = 0; i < WARMUP_RUNS; i++) {
             (void)measure_compute_fp32();
             (void)measure_compute_fp16();
+            (void)measure_prefill_matmul_fp16();
+            (void)measure_prefill_moe_matmul_fp16();
         }
 
         double wallStart = steady_seconds();
@@ -213,10 +328,14 @@ int main(int argc, char** argv) {
         double samples[TIMED_RUNS];
         double fp32Samples[TIMED_RUNS];
         double fp16Samples[TIMED_RUNS];
+        double prefillMatmulSamples[TIMED_RUNS];
+        double prefillMoeMatmulSamples[TIMED_RUNS];
         for (int i = 0; i < TIMED_RUNS; i++) {
             samples[i] = dispatch();
             fp32Samples[i] = measure_compute_fp32();
             fp16Samples[i] = measure_compute_fp16();
+            prefillMatmulSamples[i] = measure_prefill_matmul_fp16();
+            prefillMoeMatmulSamples[i] = measure_prefill_moe_matmul_fp16();
         }
 
         double wallEnd = steady_seconds();
@@ -225,10 +344,14 @@ int main(int argc, char** argv) {
         qsort(samples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(fp32Samples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(fp16Samples, TIMED_RUNS, sizeof(double), cmp_double);
+        qsort(prefillMatmulSamples, TIMED_RUNS, sizeof(double), cmp_double);
+        qsort(prefillMoeMatmulSamples, TIMED_RUNS, sizeof(double), cmp_double);
         double p50      = samples[TIMED_RUNS / 2];
         double p90      = samples[(int)(TIMED_RUNS * 0.90) - 1];
         double tf32P90  = fp32Samples[(int)(TIMED_RUNS * 0.90) - 1];
         double tf16P90  = fp16Samples[(int)(TIMED_RUNS * 0.90) - 1];
+        double prefillMatmulP90 = prefillMatmulSamples[(int)(TIMED_RUNS * 0.90) - 1];
+        double prefillMoeMatmulP90 = prefillMoeMatmulSamples[(int)(TIMED_RUNS * 0.90) - 1];
         double noisePct = (p90 - p50) / p90 * 100.0;
         double effPct   = p90 / ratedGBps * 100.0;
 
@@ -249,6 +372,8 @@ int main(int argc, char** argv) {
                    "\"mem_clock_mhz\":%.0f,"
                    "\"compute_tflops_fp32\":%.2f,"
                    "\"compute_tflops_fp16\":%.2f,"
+                   "\"prefill_matmul_tflops_fp16\":%.2f,"
+                   "\"prefill_moe_matmul_tflops_fp16\":%.2f,"
                    "\"hbm\":%s}",
                    props.name, props.gcnArchName, TIMED_RUNS,
                    p50, p90, noisePct, runtimeSecs,
@@ -259,6 +384,8 @@ int main(int argc, char** argv) {
                    props.memoryClockRate / 1000.0,
                    tf32P90,
                    tf16P90,
+                   prefillMatmulP90,
+                   prefillMoeMatmulP90,
                    hbm ? "true" : "false");
             if (dev < deviceCount - 1) printf(",");
             else printf("]\n");
@@ -276,6 +403,8 @@ int main(int argc, char** argv) {
             printf("p90     : %.1f GB/s  efficiency: %.1f%%\n", p90, effPct);
             printf("tf32    : %.2f TFLOPS\n", tf32P90);
             printf("tf16    : %.2f TFLOPS\n", tf16P90);
+            printf("prefill matmul fp16: %.2f TFLOPS\n", prefillMatmulP90);
+            printf("prefill moe matmul fp16: %.2f TFLOPS\n", prefillMoeMatmulP90);
             printf("noise   : %.1f%%  (p90-p50 spread -- lower is better)\n", noisePct);
             printf("runtime : %.2fs\n", runtimeSecs);
             if (dev < deviceCount - 1) printf("\n");
@@ -284,6 +413,13 @@ int main(int argc, char** argv) {
         hipFree(dSrc);
         hipFree(dSink);
         hipFree(dComputeSink);
+        hipFree(dMatmulA);
+        hipFree(dMatmulB);
+        hipFree(dMatmulC);
+        hipFree(dMoeA);
+        hipFree(dMoeB);
+        hipFree(dMoeC);
+        hipblasDestroy(hipblas);
         hipEventDestroy(evStart);
         hipEventDestroy(evStop);
     }

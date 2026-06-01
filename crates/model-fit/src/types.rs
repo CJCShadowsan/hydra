@@ -98,6 +98,19 @@ pub struct CpuProfile {
     pub physical_cores: Option<u32>,
     pub logical_cores: Option<u32>,
     pub memory_bandwidth_bytes_per_sec: Option<u64>,
+    /// Optional CPU FP16 throughput measured by a hardware benchmark.
+    ///
+    /// This is deliberately optional. Many CPUs either do not expose a native
+    /// FP16 matrix path or do not use it for GGML quantized inference. When a
+    /// future CPU benchmark can measure the same semantic facts as the GPU
+    /// benchmark, model-fit can consume them without adding backend-name
+    /// branches.
+    #[serde(default)]
+    pub compute_tflops_fp16: Option<f32>,
+    #[serde(default)]
+    pub prefill_matmul_tflops_fp16: Option<f32>,
+    #[serde(default)]
+    pub prefill_moe_matmul_tflops_fp16: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
