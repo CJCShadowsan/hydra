@@ -1,9 +1,9 @@
 use std::{
-    fs,
-    io::Write,
+    fs::{self, File},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -722,6 +722,23 @@ fn verify_cached_hf_package_files(
     include_embeddings: bool,
     include_output: bool,
 ) -> Result<Option<String>> {
+    let manifest = read_layer_package_manifest(package_dir)?;
+    let artifacts = needed_hf_package_artifacts(
+        &manifest,
+        layer_start,
+        layer_end,
+        include_embeddings,
+        include_output,
+    )?;
+    let repaired = repair_existing_hf_package_artifacts(package_dir, &artifacts)?;
+    if repaired > 0 {
+        tracing::warn!(
+            package_dir = %package_dir.display(),
+            repaired,
+            "cached HF layer package snapshot had corrupt artifacts; quarantined before retry"
+        );
+        return Ok(None);
+    }
     match verify_resolved_hf_package_files(
         package_dir,
         layer_start,
@@ -740,6 +757,241 @@ fn verify_cached_hf_package_files(
         }
         Err(error) => Err(error),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HfPackageArtifactExpectation {
+    relative_path: PathBuf,
+    expected_bytes: Option<u64>,
+    expected_sha256: Option<String>,
+}
+
+fn read_layer_package_manifest(package_dir: &Path) -> Result<serde_json::Value> {
+    let manifest_contents =
+        fs::read(package_dir.join("model-package.json")).context("read package manifest")?;
+    serde_json::from_slice(&manifest_contents).context("parse package manifest")
+}
+
+fn needed_hf_package_artifacts(
+    manifest: &serde_json::Value,
+    layer_start: u32,
+    layer_end: u32,
+    include_embeddings: bool,
+    include_output: bool,
+) -> Result<Vec<HfPackageArtifactExpectation>> {
+    let metadata_only = is_metadata_only_package_inspection(
+        layer_start,
+        layer_end,
+        include_embeddings,
+        include_output,
+    );
+    let mut artifacts = Vec::new();
+    let metadata = manifest
+        .pointer("/shared/metadata")
+        .context("manifest missing required /shared/metadata")?;
+    push_hf_package_artifact(&mut artifacts, metadata)?;
+    if include_embeddings && let Some(artifact) = manifest.pointer("/shared/embeddings") {
+        push_hf_package_artifact(&mut artifacts, artifact)?;
+    }
+    if include_output && let Some(artifact) = manifest.pointer("/shared/output") {
+        push_hf_package_artifact(&mut artifacts, artifact)?;
+    }
+    if let Some(layers) = manifest.get("layers").and_then(|layers| layers.as_array()) {
+        for (index, layer) in layers.iter().enumerate() {
+            let layer_index = layer
+                .get("layer_index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(index as u64) as u32;
+            if layer_index >= layer_start && layer_index < layer_end {
+                push_hf_package_artifact(&mut artifacts, layer)?;
+            }
+        }
+    }
+    if layer_start == 0
+        && !metadata_only
+        && let Some(projectors) = manifest
+            .get("projectors")
+            .and_then(|value| value.as_array())
+    {
+        for projector in projectors {
+            push_hf_package_artifact(&mut artifacts, projector)?;
+        }
+    }
+    Ok(artifacts)
+}
+
+fn push_hf_package_artifact(
+    artifacts: &mut Vec<HfPackageArtifactExpectation>,
+    artifact: &serde_json::Value,
+) -> Result<()> {
+    let path = artifact
+        .get("path")
+        .and_then(|value| value.as_str())
+        .context("manifest artifact missing path")?;
+    let relative_path = safe_manifest_file_path(path)?;
+    if artifacts
+        .iter()
+        .any(|item| item.relative_path == relative_path)
+    {
+        return Ok(());
+    }
+    let expected_sha256 = artifact
+        .get("sha256")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_ascii_lowercase());
+    artifacts.push(HfPackageArtifactExpectation {
+        relative_path,
+        expected_bytes: manifest_artifact_bytes(artifact),
+        expected_sha256,
+    });
+    Ok(())
+}
+
+fn repair_existing_hf_package_artifacts(
+    package_dir: &Path,
+    artifacts: &[HfPackageArtifactExpectation],
+) -> Result<usize> {
+    let mut repaired = 0;
+    for artifact in artifacts {
+        if repair_existing_hf_package_artifact(package_dir, artifact)? {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
+fn repair_existing_hf_package_artifact(
+    package_dir: &Path,
+    artifact: &HfPackageArtifactExpectation,
+) -> Result<bool> {
+    let path = package_dir.join(&artifact.relative_path);
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    if let Some(expected_bytes) = artifact.expected_bytes
+        && metadata.len() != expected_bytes
+    {
+        quarantine_hf_package_artifact(package_dir, &artifact.relative_path, "size_mismatch")?;
+        return Ok(true);
+    }
+    if let Some(expected_sha256) = artifact.expected_sha256.as_deref() {
+        let actual_sha256 = file_sha256_hex(&path)
+            .with_context(|| format!("hash cached package artifact {}", path.display()))?;
+        if actual_sha256 != expected_sha256 {
+            quarantine_hf_package_artifact(
+                package_dir,
+                &artifact.relative_path,
+                "checksum_mismatch",
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn quarantine_hf_package_artifact(
+    package_dir: &Path,
+    relative_path: &Path,
+    reason: &str,
+) -> Result<PathBuf> {
+    let source = package_dir.join(relative_path);
+    let source_metadata = fs::symlink_metadata(&source)
+        .with_context(|| format!("read cached package artifact entry {}", source.display()))?;
+    if source_metadata.file_type().is_symlink()
+        && let Some(blob_target) = resolved_hf_blob_target(package_dir, &source)?
+    {
+        let destination = quarantine_path(package_dir, &blob_target, reason)?;
+        fs::rename(&blob_target, &destination).with_context(|| {
+            format!(
+                "quarantine corrupt HF blob {} to {}",
+                blob_target.display(),
+                destination.display()
+            )
+        })?;
+        fs::remove_file(&source).with_context(|| {
+            format!("remove corrupt package artifact link {}", source.display())
+        })?;
+        tracing::warn!(
+            artifact = %relative_path.display(),
+            blob = %blob_target.display(),
+            reason,
+            quarantine = %destination.display(),
+            "quarantined corrupt HF layer package blob target"
+        );
+        return Ok(destination);
+    }
+    let destination = quarantine_path(package_dir, &source, reason)?;
+    fs::rename(&source, &destination).with_context(|| {
+        format!(
+            "quarantine corrupt package artifact {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    tracing::warn!(
+        artifact = %relative_path.display(),
+        reason,
+        quarantine = %destination.display(),
+        "quarantined corrupt HF layer package artifact"
+    );
+    Ok(destination)
+}
+
+fn resolved_hf_blob_target(package_dir: &Path, source: &Path) -> Result<Option<PathBuf>> {
+    let target = fs::canonicalize(source)
+        .with_context(|| format!("resolve cached package artifact link {}", source.display()))?;
+    let Some(snapshots_dir) = package_dir.parent() else {
+        return Ok(None);
+    };
+    let Some(repo_cache_dir) = snapshots_dir.parent() else {
+        return Ok(None);
+    };
+    let blobs_dir = repo_cache_dir.join("blobs");
+    let blobs_dir = fs::canonicalize(&blobs_dir).unwrap_or(blobs_dir);
+    if target.starts_with(&blobs_dir) {
+        Ok(Some(target))
+    } else {
+        Ok(None)
+    }
+}
+
+fn quarantine_path(package_dir: &Path, source: &Path, reason: &str) -> Result<PathBuf> {
+    let file_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("package artifact path has no file name")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let quarantine_dir = package_dir.join(".mesh-llm-quarantine");
+    fs::create_dir_all(&quarantine_dir).with_context(|| {
+        format!(
+            "create package artifact quarantine {}",
+            quarantine_dir.display()
+        )
+    })?;
+    let destination = quarantine_dir.join(format!("{file_name}.{reason}.{stamp}.bad"));
+    Ok(destination)
+}
+
+fn file_sha256_hex(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn manifest_artifact_bytes(artifact: &serde_json::Value) -> Option<u64> {
@@ -949,80 +1201,26 @@ fn download_hf_package_to_local_sync(
         .context("manifest has no parent directory")?
         .to_path_buf();
 
-    // Read manifest to determine which files we need
-    let manifest_contents = fs::read(&manifest_path).context("read package manifest")?;
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&manifest_contents).context("parse package manifest")?;
-
-    // Collect the files we need to download
-    let mut needed_files: Vec<(PathBuf, Option<u64>)> = Vec::new();
-
-    // Always need shared/metadata.gguf — required for materialization
-    let metadata_artifact = manifest
-        .pointer("/shared/metadata")
-        .context("manifest missing required /shared/metadata")?;
-    let metadata_path = metadata_artifact
-        .get("path")
-        .and_then(|v| v.as_str())
-        .context("manifest missing required /shared/metadata/path")?;
-    needed_files.push((
-        safe_manifest_file_path(metadata_path)?,
-        manifest_artifact_bytes(metadata_artifact),
-    ));
-    if include_embeddings
-        && let Some(artifact) = manifest.pointer("/shared/embeddings")
-        && let Some(path) = artifact.get("path").and_then(|v| v.as_str())
-    {
-        needed_files.push((
-            safe_manifest_file_path(path)?,
-            manifest_artifact_bytes(artifact),
-        ));
-    }
-    if include_output
-        && let Some(artifact) = manifest.pointer("/shared/output")
-        && let Some(path) = artifact.get("path").and_then(|v| v.as_str())
-    {
-        needed_files.push((
-            safe_manifest_file_path(path)?,
-            manifest_artifact_bytes(artifact),
-        ));
-    }
-
-    // Layer files for assigned range — use explicit layer_index if present,
-    // fall back to array position.
-    if let Some(layers) = manifest.get("layers").and_then(|l| l.as_array()) {
-        for (i, layer) in layers.iter().enumerate() {
-            let idx = layer
-                .get("layer_index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(i as u64) as u32;
-            if idx >= layer_start
-                && idx < layer_end
-                && let Some(path) = layer.get("path").and_then(|a| a.as_str())
-            {
-                needed_files.push((
-                    safe_manifest_file_path(path)?,
-                    manifest_artifact_bytes(layer),
-                ));
-            }
-        }
-    }
-    if layer_start == 0
-        && let Some(projectors) = manifest.get("projectors").and_then(|p| p.as_array())
-    {
-        for projector in projectors {
-            if let Some(path) = projector.get("path").and_then(|value| value.as_str()) {
-                needed_files.push((
-                    safe_manifest_file_path(path)?,
-                    manifest_artifact_bytes(projector),
-                ));
-            }
-        }
+    let manifest = read_layer_package_manifest(&package_dir)?;
+    let needed_files = needed_hf_package_artifacts(
+        &manifest,
+        layer_start,
+        layer_end,
+        include_embeddings,
+        include_output,
+    )?;
+    let repaired = repair_existing_hf_package_artifacts(&package_dir, &needed_files)?;
+    if repaired > 0 {
+        tracing::warn!(
+            package_dir = %package_dir.display(),
+            repaired,
+            "HF layer package cache had corrupt artifacts before download; quarantined for redownload"
+        );
     }
 
     let missing_files: Vec<_> = needed_files
         .iter()
-        .filter(|(file, _)| !package_dir.join(file).is_file())
+        .filter(|artifact| !package_dir.join(&artifact.relative_path).is_file())
         .collect();
     let package_scope = Arc::new(LayerPackageDownloadScope::new(
         &progress_label,
@@ -1030,14 +1228,14 @@ fn download_hf_package_to_local_sync(
     ));
 
     // Download each needed file
-    for (index, (file, total_bytes)) in missing_files.into_iter().enumerate() {
-        let file_name = file.to_string_lossy().to_string();
+    for (index, artifact) in missing_files.into_iter().enumerate() {
+        let file_name = artifact.relative_path.to_string_lossy().to_string();
         download_layer_package_file(
             &model_api,
             revision,
             &progress_label,
             &file_name,
-            *total_bytes,
+            artifact.expected_bytes,
             Some(Arc::clone(&package_scope)),
             index + 1,
         )?;
@@ -1661,6 +1859,33 @@ mod tests {
         .unwrap();
     }
 
+    fn quarantine_entry_count(package_dir: &Path) -> usize {
+        let quarantine_dir = package_dir.join(".mesh-llm-quarantine");
+        fs::read_dir(quarantine_dir)
+            .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+            .unwrap_or_default()
+    }
+
+    fn add_projector_to_cached_snapshot(snapshot: &Path, contents: &[u8]) {
+        fs::create_dir_all(snapshot.join("projectors")).unwrap();
+        fs::write(snapshot.join("projectors/mmproj.gguf"), contents).unwrap();
+
+        let manifest_path = snapshot.join("model-package.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["projectors"] = serde_json::json!([
+            {
+                "kind": "mmproj",
+                "path": "projectors/mmproj.gguf",
+                "tensor_count": 1,
+                "tensor_bytes": 1,
+                "artifact_bytes": 9,
+                "sha256": sha256_hex(b"projector")
+            }
+        ]);
+        fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
     #[test]
     fn layer_package_ref_detects_local_manifest_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -1726,6 +1951,92 @@ mod tests {
                 "unexpected error for {path:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn package_artifact_repair_quarantines_wrong_size_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_local_package_fixture(dir.path());
+        fs::write(dir.path().join("layers/layer-000.gguf"), b"wrong-size").unwrap();
+        let manifest = read_layer_package_manifest(dir.path()).unwrap();
+        let artifacts = needed_hf_package_artifacts(&manifest, 0, 1, false, false).unwrap();
+
+        let repaired = repair_existing_hf_package_artifacts(dir.path(), &artifacts).unwrap();
+
+        assert_eq!(repaired, 1);
+        assert!(!dir.path().join("layers/layer-000.gguf").exists());
+        assert_eq!(quarantine_entry_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn package_artifact_repair_quarantines_same_size_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_local_package_fixture(dir.path());
+        fs::write(dir.path().join("layers/layer-000.gguf"), b"lauer").unwrap();
+        let manifest = read_layer_package_manifest(dir.path()).unwrap();
+        let artifacts = needed_hf_package_artifacts(&manifest, 0, 1, false, false).unwrap();
+
+        let repaired = repair_existing_hf_package_artifacts(dir.path(), &artifacts).unwrap();
+
+        assert_eq!(repaired, 1);
+        assert!(!dir.path().join("layers/layer-000.gguf").exists());
+        assert_eq!(quarantine_entry_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn cached_hf_verification_returns_none_after_quarantining_corrupt_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cached_package_snapshot(
+            dir.path(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+
+        let resolved = verify_cached_hf_package_files(dir.path(), 0, 1, false, false)
+            .expect("verify cached package");
+
+        assert_eq!(resolved, None);
+        assert!(!dir.path().join("layers/layer-000.gguf").exists());
+        assert_eq!(quarantine_entry_count(dir.path()), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn package_artifact_repair_quarantines_corrupt_hf_blob_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_cache = dir.path().join("models--owner--repo");
+        let blob = repo_cache.join("blobs/deadbeef");
+        let snapshot = repo_cache.join("snapshots/abc123");
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        write_cached_package_snapshot(&snapshot, sha256_hex(b"layer"));
+        fs::remove_file(snapshot.join("layers/layer-000.gguf")).unwrap();
+        fs::write(&blob, b"lauer").unwrap();
+        std::os::unix::fs::symlink(
+            "../../../blobs/deadbeef",
+            snapshot.join("layers/layer-000.gguf"),
+        )
+        .unwrap();
+
+        let resolved = verify_cached_hf_package_files(&snapshot, 0, 1, false, false)
+            .expect("verify cached package");
+
+        assert_eq!(resolved, None);
+        assert!(!snapshot.join("layers/layer-000.gguf").exists());
+        assert!(!blob.exists());
+        assert!(quarantine_entry_count(&snapshot) > 0);
+    }
+
+    #[test]
+    fn metadata_only_hf_verification_ignores_corrupt_projectors() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cached_package_snapshot(dir.path(), sha256_hex(b"layer"));
+        add_projector_to_cached_snapshot(dir.path(), b"wrong-projector");
+
+        let resolved = verify_cached_hf_package_files(dir.path(), 0, 0, false, false)
+            .expect("verify cached package");
+
+        assert_eq!(resolved, Some(dir.path().to_string_lossy().to_string()));
+        assert!(dir.path().join("projectors/mmproj.gguf").exists());
+        assert_eq!(quarantine_entry_count(dir.path()), 0);
     }
 
     #[test]
@@ -1999,11 +2310,11 @@ mod tests {
         assert_eq!(info.layer_count, 1);
 
         fs::write(snapshot.join("shared/metadata.gguf"), b"metadota").unwrap();
-        let error = resolve_hf_package_to_local("hf://owner/repo@abc123", 0, 0, false, false)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("checksum mismatch"), "{error}");
-        assert!(error.contains("shared/metadata.gguf"), "{error}");
+        let resolved = verify_cached_hf_package_files(&snapshot, 0, 0, false, false)
+            .expect("verify cached package");
+        assert_eq!(resolved, None);
+        assert!(!snapshot.join("shared/metadata.gguf").exists());
+        assert_eq!(quarantine_entry_count(&snapshot), 1);
 
         restore_env("HF_HOME", prev_hf_home);
         restore_env("HF_HUB_CACHE", prev_hf_cache);
@@ -2041,11 +2352,11 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
         );
 
-        let error = resolve_hf_package_to_local("hf://owner/repo@abc123", 0, 1, false, false)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("checksum mismatch"), "{error}");
+        let resolved = verify_cached_hf_package_files(&snapshot, 0, 1, false, false)
+            .expect("verify cached package");
+        assert_eq!(resolved, None);
+        assert!(!snapshot.join("layers/layer-000.gguf").exists());
+        assert_eq!(quarantine_entry_count(&snapshot), 1);
 
         restore_env("HF_HOME", prev_hf_home);
         restore_env("HF_HUB_CACHE", prev_hf_cache);
