@@ -264,6 +264,14 @@ fn is_classifier_metadata(fit: &model_artifact::gguf::GgufFitMeta) -> bool {
         || fit.general_type.as_deref().is_some_and(|value| {
             value.eq_ignore_ascii_case("classifier") || value.eq_ignore_ascii_case("reranker")
         })
+        || fit.general_tags.iter().any(|tag| {
+            let tag = tag.trim().to_ascii_lowercase();
+            tag == "text-classification"
+                || tag == "text_classification"
+                || tag == "reranker"
+                || tag == "ranking"
+                || tag == "ranker"
+        })
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -293,4 +301,39 @@ fn parameter_count_from_size_label(value: Option<&str>) -> Option<u64> {
 
 fn evidence_sort_key(evidence: &CapabilityEvidence) -> String {
     format!("{evidence:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_classification_tag_marks_classifier_or_reranker() {
+        let fit = model_artifact::gguf::GgufFitMeta {
+            general_tags: vec!["sentence-transformers".into(), "text-classification".into()],
+            ..Default::default()
+        };
+
+        assert!(is_classifier_metadata(&fit));
+    }
+
+    #[test]
+    fn reranker_evidence_beats_dense_transformer_shape() {
+        let compact = model_artifact::gguf::GgufCompactMeta {
+            architecture: "bert".into(),
+            layer_count: 24,
+            embedding_size: 1024,
+            ..Default::default()
+        };
+        let fit = model_artifact::gguf::GgufFitMeta {
+            general_tags: vec!["text-classification".into()],
+            ..Default::default()
+        };
+        let evidence = capability_evidence(&compact, &fit);
+
+        assert_eq!(
+            architecture_class(&compact, &fit, &evidence),
+            ModelArchitectureClass::RerankerOrClassifier
+        );
+    }
 }

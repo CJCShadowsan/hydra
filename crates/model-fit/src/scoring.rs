@@ -813,6 +813,14 @@ fn ffn_expansion_occupancy_term(model: &ModelProfile) -> f32 {
 }
 
 fn ffn_shape_occupancy_term(shape: MatmulShapeProfile) -> Option<f32> {
+    let expansion = ffn_shape_expansion_ratio(shape)?;
+    if expansion <= 4.0 {
+        return Some(0.0);
+    }
+    Some(((expansion - 4.0) / 1.5 * 0.14).clamp(0.0, 0.14))
+}
+
+fn ffn_shape_expansion_ratio(shape: MatmulShapeProfile) -> Option<f32> {
     if shape.logical_matrix_count == 0
         || shape.weighted_avg_input_width == 0
         || shape.weighted_avg_output_width == 0
@@ -836,11 +844,7 @@ fn ffn_shape_occupancy_term(shape: MatmulShapeProfile) -> Option<f32> {
     if narrow <= 0.0 {
         return None;
     }
-    let expansion = wide / narrow;
-    if expansion <= 4.0 {
-        return Some(0.0);
-    }
-    Some(((expansion - 4.0) / 1.5 * 0.14).clamp(0.0, 0.14))
+    Some(wide / narrow)
 }
 
 fn measured_decode_graph_overhead_ms(model: &ModelProfile, budget: &ExecutionBudget) -> f32 {
@@ -892,10 +896,56 @@ fn measured_decode_graph_overhead_ms(model: &ModelProfile, budget: &ExecutionBud
         // gets fewer surrounding work units.
         logical_matmuls as f32 * low_latency_graph_node_multiplier(model)
     } else {
-        layers as f32
+        layers as f32 + expanded_ffn_sequential_stage_groups(model, layers, logical_matmuls)
     };
     let extra_dispatch_groups = (graph_dispatch_groups - GPU_BENCH_DECODE_DISPATCHES).max(0.0);
     extra_dispatch_groups * fixed_ms
+}
+
+fn expanded_ffn_sequential_stage_groups(
+    model: &ModelProfile,
+    layers: u32,
+    logical_matmuls: u64,
+) -> f32 {
+    // For measured-GPU paths with non-trivial fixed submission cost, the base
+    // graph term charges roughly one backend submission per transformer layer.
+    // That is a useful lower bound for a backend that can encode many GGML
+    // nodes into one command buffer, but it misses a source-level shape:
+    // expanded FFNs are not one opaque operation. llama.cpp builds separate
+    // attention projection/output matmuls, FFN gate/up/down matmuls,
+    // activation/multiply nodes, norms, RoPE, views/copies, and attention nodes
+    // around them. The FFN path is especially sequential because down
+    // projection depends on the gate/up activation.
+    //
+    // GGUF gives us the portable inputs for this without looking at backend
+    // names, model IDs, or validation throughput: actual logical matmul count,
+    // layer count, hidden width, and FFN expansion from tensor dimensions. This
+    // returns additional sequential graph groups, later multiplied by the
+    // measured fixed dispatch cost for the selected hardware profile.
+    let Some(hidden) = model.hidden_size.filter(|hidden| *hidden > 0) else {
+        return 0.0;
+    };
+    let Some(ffn_expansion) = ffn_expansion_ratio(model) else {
+        return 0.0;
+    };
+    if layers == 0 || logical_matmuls == 0 {
+        return 0.0;
+    }
+
+    let sequential_stage_pressure =
+        ((logical_matmuls as f32).sqrt() - (layers as f32).sqrt()).max(0.0);
+    let width_visibility = ((hidden as f32 - 576.0) / (1024.0 - 576.0)).clamp(0.0, 1.0);
+    let expansion_visibility = ((ffn_expansion - 2.0) / 1.0).clamp(0.0, 1.0);
+    sequential_stage_pressure * width_visibility * expansion_visibility
+}
+
+fn ffn_expansion_ratio(model: &ModelProfile) -> Option<f32> {
+    if let Some(ratio) = ffn_shape_expansion_ratio(model.tensor_matmul.feed_forward.shape) {
+        return Some(ratio);
+    }
+    let hidden = model.hidden_size.filter(|hidden| *hidden > 0)? as f32;
+    let ffn = model.ffn_size? as f32;
+    Some(ffn / hidden)
 }
 
 fn low_latency_graph_node_multiplier(model: &ModelProfile) -> f32 {

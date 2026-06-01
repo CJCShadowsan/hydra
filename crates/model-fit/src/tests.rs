@@ -494,6 +494,57 @@ fn decode_estimate_uses_measured_graph_overhead_for_deeper_shapes() {
 }
 
 #[test]
+fn decode_estimate_charges_expanded_ffn_graph_stages_from_shape() {
+    let mut hardware = m1_ultra();
+    hardware.memory.available_system_bytes = None;
+    hardware.accelerators[0].decode_fixed_overhead_ms = Some(0.25);
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let mut compact_ffn = dense_model("compact-ffn", 4 * GIB, 28, 2048, 32_768);
+    compact_ffn.ffn_size = Some(2048 * 2);
+    compact_ffn.tensor_matmul.feed_forward.shape.max_input_width = 4096;
+    compact_ffn
+        .tensor_matmul
+        .feed_forward
+        .shape
+        .max_output_width = 4096;
+    compact_ffn
+        .tensor_matmul
+        .feed_forward
+        .shape
+        .weighted_avg_input_width = 2048;
+    compact_ffn
+        .tensor_matmul
+        .feed_forward
+        .shape
+        .weighted_avg_output_width = 4096;
+    let mut expanded_ffn = compact_ffn.clone();
+    expanded_ffn.source.id = "expanded-ffn".into();
+    expanded_ffn.ffn_size = Some(2048 * 4);
+    expanded_ffn
+        .tensor_matmul
+        .feed_forward
+        .shape
+        .max_input_width = 8192;
+    expanded_ffn
+        .tensor_matmul
+        .feed_forward
+        .shape
+        .max_output_width = 8192;
+
+    let compact_rec = score_model(&hardware, &compact_ffn, &config);
+    let expanded_rec = score_model(&hardware, &expanded_ffn, &config);
+
+    assert!(
+        expanded_rec.estimated_decode_tokens_per_sec.unwrap()
+            < compact_rec.estimated_decode_tokens_per_sec.unwrap()
+    );
+}
+
+#[test]
 fn measured_gpu_bandwidth_uses_backend_neutral_efficiency() {
     let metal = m1_ultra();
     let mut cuda = metal.clone();
