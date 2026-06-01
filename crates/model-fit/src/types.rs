@@ -89,6 +89,16 @@ pub struct AcceleratorProfile {
     /// benchmarking the GGUF being fitted.
     #[serde(default)]
     pub prefill_matmul_tflops_fp16: Option<f32>,
+    /// Optional ubatch-shaped FP16 matrix-multiply throughput from the GPU
+    /// benchmark.
+    ///
+    /// llama.cpp prompt ingestion is not one square GEMM. It splits prompt
+    /// tokens into ubatches, commonly 512 tokens, and feeds those skinny
+    /// activation batches through the model weight matrices. This measured fact
+    /// lets first-token/prefill estimates use that source shape instead of
+    /// assuming peak square-GEMM throughput.
+    #[serde(default)]
+    pub prefill_ubatch_matmul_tflops_fp16: Option<f32>,
     /// Optional MoE-prefill-shaped FP16 matrix-multiply throughput from the GPU
     /// benchmark.
     ///
@@ -120,6 +130,8 @@ pub struct CpuProfile {
     pub post_prefill_decode_overhead_ms: Option<f32>,
     #[serde(default)]
     pub prefill_matmul_tflops_fp16: Option<f32>,
+    #[serde(default)]
+    pub prefill_ubatch_matmul_tflops_fp16: Option<f32>,
     #[serde(default)]
     pub prefill_moe_matmul_tflops_fp16: Option<f32>,
 }

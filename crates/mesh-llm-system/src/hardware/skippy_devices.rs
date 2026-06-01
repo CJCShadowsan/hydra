@@ -95,6 +95,7 @@ fn gpu_facts_from_backend_devices(
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
             unified_memory,
             stable_id,

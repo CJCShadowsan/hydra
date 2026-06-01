@@ -96,6 +96,7 @@ fn gpu_json(gpu: &GpuFacts) -> Value {
         "compute_tflops_fp32": gpu.compute_tflops_fp32,
         "compute_tflops_fp16": gpu.compute_tflops_fp16,
         "prefill_matmul_tflops_fp16": gpu.prefill_matmul_tflops_fp16,
+        "prefill_ubatch_matmul_tflops_fp16": gpu.prefill_ubatch_matmul_tflops_fp16,
         "prefill_moe_matmul_tflops_fp16": gpu.prefill_moe_matmul_tflops_fp16,
         "unified_memory": gpu.unified_memory,
         "pci_bdf": gpu.pci_bdf,
@@ -184,6 +185,11 @@ fn gpu_benchmark_json(hw: &HardwareSurvey, saved: &SavedBenchmark) -> Value {
                     .prefill_matmul_tflops_fp16
                     .as_ref()
                     .and_then(|values| values.get(index)),
+                "prefill_ubatch_matmul_tflops_fp16": saved
+                    .result
+                    .prefill_ubatch_matmul_tflops_fp16
+                    .as_ref()
+                    .and_then(|values| values.get(index)),
                 "prefill_moe_matmul_tflops_fp16": saved
                     .result
                     .prefill_moe_matmul_tflops_fp16
@@ -225,6 +231,7 @@ fn attach_cached_bandwidth(hw: &mut HardwareSurvey) {
         gpu.compute_tflops_fp32 = cached.compute_tflops_fp32;
         gpu.compute_tflops_fp16 = cached.compute_tflops_fp16;
         gpu.prefill_matmul_tflops_fp16 = cached.prefill_matmul_tflops_fp16;
+        gpu.prefill_ubatch_matmul_tflops_fp16 = cached.prefill_ubatch_matmul_tflops_fp16;
         gpu.prefill_moe_matmul_tflops_fp16 = cached.prefill_moe_matmul_tflops_fp16;
     }
 }
@@ -301,6 +308,7 @@ mod tests {
             compute_tflops_fp32: Some(82.4),
             compute_tflops_fp16: Some(164.8),
             prefill_matmul_tflops_fp16: Some(11.0),
+            prefill_ubatch_matmul_tflops_fp16: Some(7.5),
             prefill_moe_matmul_tflops_fp16: Some(9.0),
             unified_memory: false,
             stable_id: Some(format!("stable-{index}")),
@@ -381,6 +389,7 @@ mod tests {
                 compute_tflops_fp32: Some(vec![82.4, 70.2]),
                 compute_tflops_fp16: Some(vec![164.8, 140.4]),
                 prefill_matmul_tflops_fp16: Some(vec![11.0, 10.0]),
+                prefill_ubatch_matmul_tflops_fp16: Some(vec![7.5, 7.0]),
                 prefill_moe_matmul_tflops_fp16: Some(vec![9.0, 8.0]),
             },
         };
@@ -399,6 +408,10 @@ mod tests {
         assert_eq!(value["gpus"][1]["decode_effective_gbps"], json!(365.0));
         assert_eq!(value["gpus"][1]["decode_fixed_overhead_ms"], json!(1.5));
         assert_eq!(value["gpus"][1]["compute_tflops_fp16"], json!(140.4));
+        assert_eq!(
+            value["gpus"][1]["prefill_ubatch_matmul_tflops_fp16"],
+            json!(7.0)
+        );
     }
 
     #[test]
@@ -417,6 +430,7 @@ mod tests {
                 compute_tflops_fp32: Some(vec![82.4]),
                 compute_tflops_fp16: Some(vec![164.8]),
                 prefill_matmul_tflops_fp16: Some(vec![11.0]),
+                prefill_ubatch_matmul_tflops_fp16: Some(vec![7.5]),
                 prefill_moe_matmul_tflops_fp16: Some(vec![9.0]),
             },
         };

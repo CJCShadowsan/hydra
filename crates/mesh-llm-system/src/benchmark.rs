@@ -30,6 +30,8 @@ pub struct GpuBandwidth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_matmul_tflops_fp16: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_ubatch_matmul_tflops_fp16: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_moe_matmul_tflops_fp16: Option<f64>,
 }
 
@@ -49,6 +51,7 @@ pub struct BenchmarkResult {
     pub compute_tflops_fp32: Option<Vec<f64>>,
     pub compute_tflops_fp16: Option<Vec<f64>>,
     pub prefill_matmul_tflops_fp16: Option<Vec<f64>>,
+    pub prefill_ubatch_matmul_tflops_fp16: Option<Vec<f64>>,
     pub prefill_moe_matmul_tflops_fp16: Option<Vec<f64>>,
 }
 
@@ -373,6 +376,11 @@ pub fn run_or_load(
                 .iter()
                 .map(|g| g.prefill_matmul_tflops_fp16)
                 .collect::<Option<Vec<f64>>>();
+            let prefill_ubatch_matmul_tflops_fp16 = cached
+                .gpus
+                .iter()
+                .map(|g| g.prefill_ubatch_matmul_tflops_fp16)
+                .collect::<Option<Vec<f64>>>();
             let prefill_moe_matmul_tflops_fp16 = cached
                 .gpus
                 .iter()
@@ -401,6 +409,7 @@ pub fn run_or_load(
                 compute_tflops_fp32,
                 compute_tflops_fp16,
                 prefill_matmul_tflops_fp16,
+                prefill_ubatch_matmul_tflops_fp16,
                 prefill_moe_matmul_tflops_fp16,
             };
             tracing::info!(
@@ -507,6 +516,7 @@ fn build_benchmark_result(
             compute_tflops_fp32: outputs[i].compute_tflops_fp32,
             compute_tflops_fp16: outputs[i].compute_tflops_fp16,
             prefill_matmul_tflops_fp16: outputs[i].prefill_matmul_tflops_fp16,
+            prefill_ubatch_matmul_tflops_fp16: outputs[i].prefill_ubatch_matmul_tflops_fp16,
             prefill_moe_matmul_tflops_fp16: outputs[i].prefill_moe_matmul_tflops_fp16,
         })
         .collect();
@@ -536,6 +546,10 @@ fn build_benchmark_result(
         .iter()
         .map(|g| g.prefill_matmul_tflops_fp16)
         .collect::<Option<Vec<f64>>>();
+    let prefill_ubatch_matmul_tflops_fp16 = gpus
+        .iter()
+        .map(|g| g.prefill_ubatch_matmul_tflops_fp16)
+        .collect::<Option<Vec<f64>>>();
     let prefill_moe_matmul_tflops_fp16 = gpus
         .iter()
         .map(|g| g.prefill_moe_matmul_tflops_fp16)
@@ -551,6 +565,7 @@ fn build_benchmark_result(
             compute_tflops_fp32,
             compute_tflops_fp16,
             prefill_matmul_tflops_fp16,
+            prefill_ubatch_matmul_tflops_fp16,
             prefill_moe_matmul_tflops_fp16,
         },
     )
@@ -599,6 +614,9 @@ mod tests {
             post_prefill_decode_overhead_ms: None,
             compute_tflops_fp32: fp32,
             compute_tflops_fp16: fp16,
+            prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
+            prefill_moe_matmul_tflops_fp16: None,
             noise_pct: 0.0,
             runtime_s: 0.0,
             rated_gbps: None,
@@ -657,6 +675,9 @@ mod tests {
                 post_prefill_decode_overhead_ms: None,
                 compute_tflops_fp32: None,
                 compute_tflops_fp16: None,
+                prefill_matmul_tflops_fp16: None,
+                prefill_ubatch_matmul_tflops_fp16: None,
+                prefill_moe_matmul_tflops_fp16: None,
                 unified_memory: false,
                 stable_id: None,
                 pci_bdf: None,

@@ -1928,6 +1928,9 @@ fn gpu_output_from_command_json(gpu: &Value, p90_gbps: f64) -> GpuBenchmarkOutpu
         prefill_matmul_tflops_fp16: gpu
             .get("prefill_matmul_tflops_fp16")
             .and_then(Value::as_f64),
+        prefill_ubatch_matmul_tflops_fp16: gpu
+            .get("prefill_ubatch_matmul_tflops_fp16")
+            .and_then(Value::as_f64),
         prefill_moe_matmul_tflops_fp16: gpu
             .get("prefill_moe_matmul_tflops_fp16")
             .and_then(Value::as_f64),
@@ -2060,6 +2063,7 @@ fn cpu_profile() -> CpuProfile {
         compute_tflops_fp16: None,
         post_prefill_decode_overhead_ms: None,
         prefill_matmul_tflops_fp16: None,
+        prefill_ubatch_matmul_tflops_fp16: None,
         prefill_moe_matmul_tflops_fp16: None,
     }
 }
@@ -2302,12 +2306,14 @@ fn fit_input_contract() -> FitInputContract {
             "accelerators.benchmark_noise_pct",
             "accelerators.compute_tflops_fp16",
             "accelerators.prefill_matmul_tflops_fp16",
+            "accelerators.prefill_ubatch_matmul_tflops_fp16",
             "accelerators.prefill_moe_matmul_tflops_fp16",
             "accelerators.unified_memory",
             "cpu.memory_bandwidth_bytes_per_sec",
             "cpu.compute_tflops_fp16",
             "cpu.post_prefill_decode_overhead_ms",
             "cpu.prefill_matmul_tflops_fp16",
+            "cpu.prefill_ubatch_matmul_tflops_fp16",
             "cpu.prefill_moe_matmul_tflops_fp16",
         ],
         model_fields_consumed: vec![

@@ -14,6 +14,7 @@ fn synthetic_gpu(index: usize, stable_id: Option<&str>) -> GpuFacts {
         compute_tflops_fp32: None,
         compute_tflops_fp16: None,
         prefill_matmul_tflops_fp16: None,
+        prefill_ubatch_matmul_tflops_fp16: None,
         prefill_moe_matmul_tflops_fp16: None,
         unified_memory: false,
         stable_id: stable_id.map(str::to_string),

@@ -25,6 +25,7 @@ struct ExecutionBudget {
     benchmark_noise_pct: Option<f32>,
     compute_tflops_fp16: Option<f32>,
     prefill_matmul_tflops_fp16: Option<f32>,
+    prefill_ubatch_matmul_tflops_fp16: Option<f32>,
     prefill_moe_matmul_tflops_fp16: Option<f32>,
     unified_memory: bool,
 }
@@ -75,6 +76,7 @@ pub fn score_model(
             benchmark_noise_pct: None,
             compute_tflops_fp16: None,
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
             unified_memory: false,
         };
@@ -231,6 +233,7 @@ fn execution_budgets(hardware: &HardwareProfile) -> Vec<ExecutionBudget> {
             post_prefill_decode_overhead_ms: hardware.cpu.post_prefill_decode_overhead_ms,
             compute_tflops_fp16: hardware.cpu.compute_tflops_fp16,
             prefill_matmul_tflops_fp16: hardware.cpu.prefill_matmul_tflops_fp16,
+            prefill_ubatch_matmul_tflops_fp16: hardware.cpu.prefill_ubatch_matmul_tflops_fp16,
             prefill_moe_matmul_tflops_fp16: hardware.cpu.prefill_moe_matmul_tflops_fp16,
             unified_memory: false,
         });
@@ -274,6 +277,7 @@ fn accelerator_budget(
         benchmark_noise_pct: accelerator.benchmark_noise_pct,
         compute_tflops_fp16: accelerator.compute_tflops_fp16,
         prefill_matmul_tflops_fp16: accelerator.prefill_matmul_tflops_fp16,
+        prefill_ubatch_matmul_tflops_fp16: accelerator.prefill_ubatch_matmul_tflops_fp16,
         prefill_moe_matmul_tflops_fp16: accelerator.prefill_moe_matmul_tflops_fp16,
         unified_memory: accelerator.unified_memory,
     }
@@ -1105,15 +1109,23 @@ fn prefill_compute_ms(
 
 fn prefill_compute_tflops(model: &ModelProfile, budget: &ExecutionBudget) -> Option<f32> {
     // Dense and sparse-MoE prefill are intentionally separate measured hardware
-    // facts. Dense prompt processing maps to batched GEMM. Sparse MoE routes
-    // through expert selection and `GGML_OP_MUL_MAT_ID`, so it only uses the
-    // MoE-shaped probe when that probe is present. If the MoE probe is absent,
-    // return `None` so the caller falls back to the older MoE-aware estimate
-    // instead of overpredicting MoE with the dense matmul probe.
+    // facts. Dense prompt processing maps to batched GEMM, but llama.cpp does
+    // not feed the backend one square peak-throughput GEMM. It splits prompt
+    // tokens into ubatches (`n_ubatch` defaults to 512), so the common source
+    // shape is a weight matrix times a skinny token batch. Prefer that measured
+    // ubatch-shaped probe when present, and keep the square GEMM probe as a
+    // fallback for older benchmark JSON.
+    //
+    // Sparse MoE routes through expert selection and `GGML_OP_MUL_MAT_ID`, so
+    // it only uses the MoE-shaped probe when that probe is present. If the MoE
+    // probe is absent, return `None` so the caller falls back to the older
+    // MoE-aware estimate instead of overpredicting MoE with the dense matmul
+    // probe.
     let measured = match model.architecture_class {
         ModelArchitectureClass::SparseMoeTransformer => budget.prefill_moe_matmul_tflops_fp16,
         _ => budget
-            .prefill_matmul_tflops_fp16
+            .prefill_ubatch_matmul_tflops_fp16
+            .or(budget.prefill_matmul_tflops_fp16)
             .or(budget.compute_tflops_fp16),
     };
     measured.filter(|value| *value > 0.0)

@@ -18,6 +18,8 @@ pub struct BenchmarkOutput {
     #[serde(default)]
     pub prefill_matmul_tflops_fp16: Option<f64>,
     #[serde(default)]
+    pub prefill_ubatch_matmul_tflops_fp16: Option<f64>,
+    #[serde(default)]
     pub prefill_moe_matmul_tflops_fp16: Option<f64>,
     pub noise_pct: f64,
     pub runtime_s: f64,

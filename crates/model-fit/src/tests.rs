@@ -26,6 +26,7 @@ fn m1_ultra() -> HardwareProfile {
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
             unified_memory: true,
         }],
@@ -36,6 +37,7 @@ fn m1_ultra() -> HardwareProfile {
             compute_tflops_fp16: None,
             post_prefill_decode_overhead_ms: None,
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
         },
     }
@@ -476,6 +478,37 @@ fn prefill_roofline_uses_measured_compute_for_wide_models() {
 }
 
 #[test]
+fn prefill_roofline_prefers_measured_ubatch_matmul_shape() {
+    let mut square_only = m1_ultra();
+    square_only.memory.available_system_bytes = None;
+    square_only.cpu.memory_bandwidth_bytes_per_sec = None;
+    square_only.accelerators[0].prefill_matmul_tflops_fp16 = Some(12.0);
+    square_only.accelerators[0].prefill_ubatch_matmul_tflops_fp16 = None;
+    let mut ubatch_measured = square_only.clone();
+    ubatch_measured.accelerators[0].prefill_ubatch_matmul_tflops_fp16 = Some(1.0);
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.workload.interaction.expected_prompt_tokens = Some(4096);
+    config.weights = config.workload.default_weights();
+    let mut model = dense_model("ubatch-prefill", 4 * GIB, 32, 4096, 32_768);
+    model.tensor_matmul.base_flops_per_token = 12_000_000_000;
+    model.tensor_matmul.attention.flops_per_token = 2_000_000_000;
+    model.tensor_matmul.feed_forward.flops_per_token = 9_000_000_000;
+    model.tensor_matmul.output.flops_per_token = 1_000_000_000;
+
+    let square = score_model(&square_only, &model, &config)
+        .estimated_prefill_tokens_per_sec
+        .expect("square prefill estimate should exist");
+    let ubatch = score_model(&ubatch_measured, &model, &config)
+        .estimated_prefill_tokens_per_sec
+        .expect("ubatch prefill estimate should exist");
+
+    assert!(ubatch < square);
+}
+
+#[test]
 fn decode_estimate_uses_measured_graph_overhead_for_deeper_shapes() {
     let mut hardware = m1_ultra();
     hardware.memory.available_system_bytes = None;
@@ -591,6 +624,7 @@ fn budget_selection_prefers_faster_measured_gpu_over_cpu_headroom() {
             compute_tflops_fp32: None,
             compute_tflops_fp16: Some(50.0),
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
             unified_memory: false,
         }],
@@ -601,6 +635,7 @@ fn budget_selection_prefers_faster_measured_gpu_over_cpu_headroom() {
             compute_tflops_fp16: None,
             post_prefill_decode_overhead_ms: None,
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
         },
     };
@@ -700,6 +735,7 @@ fn hardware_profile_uses_mesh_gpu_benchmark_output_as_measured_bandwidth() {
             compute_tflops_fp32: None,
             compute_tflops_fp16: None,
             prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
             prefill_moe_matmul_tflops_fp16: None,
             noise_pct: 1.0,
             runtime_s: 0.25,

@@ -7,6 +7,7 @@
 #include <sys/sysctl.h>
 
 #define PREFILL_MATMUL_SIZE 4096
+#define PREFILL_UBATCH_TOKENS 512
 #define PREFILL_MOE_M 1024
 #define PREFILL_MOE_N 512
 #define PREFILL_MOE_K 2048
@@ -381,6 +382,41 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
                                                       alpha:1.0
                                                        beta:0.0];
 
+        const NSUInteger ubatch_row_bytes = PREFILL_UBATCH_TOKENS * half_bytes;
+        const NSUInteger ubatch_matrix_bytes =
+            (NSUInteger)PREFILL_MATMUL_SIZE * PREFILL_UBATCH_TOKENS * half_bytes;
+        id<MTLBuffer> ubatch_b = [device newBufferWithLength:ubatch_matrix_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ubatch_c = [device newBufferWithLength:ubatch_matrix_bytes options:MTLResourceStorageModeShared];
+        if (ubatch_b == nil || ubatch_c == nil) {
+            if (error_out != NULL) {
+                *error_out = copy_c_string(@"failed to allocate Metal ubatch matmul benchmark resources");
+            }
+            return NULL;
+        }
+        memset([ubatch_b contents], 1, ubatch_matrix_bytes);
+        memset([ubatch_c contents], 0, ubatch_matrix_bytes);
+        MPSMatrixDescriptor *ubatch_b_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:PREFILL_MATMUL_SIZE
+                                                  columns:PREFILL_UBATCH_TOKENS
+                                                 rowBytes:ubatch_row_bytes
+                                                 dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *ubatch_c_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:PREFILL_MATMUL_SIZE
+                                                  columns:PREFILL_UBATCH_TOKENS
+                                                 rowBytes:ubatch_row_bytes
+                                                 dataType:MPSDataTypeFloat16];
+        MPSMatrix *ubatch_right = [[MPSMatrix alloc] initWithBuffer:ubatch_b descriptor:ubatch_b_desc];
+        MPSMatrix *ubatch_result = [[MPSMatrix alloc] initWithBuffer:ubatch_c descriptor:ubatch_c_desc];
+        MPSMatrixMultiplication *ubatch_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                 resultRows:PREFILL_MATMUL_SIZE
+                                              resultColumns:PREFILL_UBATCH_TOKENS
+                                            interiorColumns:PREFILL_MATMUL_SIZE
+                                                      alpha:1.0
+                                                       beta:0.0];
+
         const NSUInteger moe_a_bytes = (NSUInteger)PREFILL_MOE_M * PREFILL_MOE_K * half_bytes;
         const NSUInteger moe_b_bytes = (NSUInteger)PREFILL_MOE_K * PREFILL_MOE_N * half_bytes;
         const NSUInteger moe_c_bytes = (NSUInteger)PREFILL_MOE_M * PREFILL_MOE_N * half_bytes;
@@ -435,6 +471,10 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
             * (double)PREFILL_MATMUL_SIZE
             * (double)PREFILL_MATMUL_SIZE
             * (double)PREFILL_MATMUL_SIZE;
+        const double ubatch_flops = 2.0
+            * (double)PREFILL_MATMUL_SIZE
+            * (double)PREFILL_UBATCH_TOKENS
+            * (double)PREFILL_MATMUL_SIZE;
         const double moe_flops = 2.0
             * (double)PREFILL_MOE_M
             * (double)PREFILL_MOE_N
@@ -455,6 +495,8 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
                                                  fixed_overhead_dispatches);
             (void)run_mps_matmul(queue, dense_gemm, dense_left, dense_right, dense_result,
                                  dense_flops);
+            (void)run_mps_matmul(queue, ubatch_gemm, dense_left, ubatch_right, ubatch_result,
+                                 ubatch_flops);
             (void)run_mps_moe_matmul(queue, moe_gemm, moe_left, moe_right, moe_result,
                                      moe_flops);
             (void)run_empty_dispatch_overhead_ms(queue, pso_empty, sink, empty_grid, empty_tpg, 1);
@@ -466,6 +508,7 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         NSMutableArray<NSNumber *> *fp32_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *fp16_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *prefill_matmul_samples = [NSMutableArray arrayWithCapacity:runs];
+        NSMutableArray<NSNumber *> *prefill_ubatch_matmul_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *prefill_moe_matmul_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *post_prefill_decode_samples = [NSMutableArray arrayWithCapacity:runs];
         NSMutableArray<NSNumber *> *decode_effective_samples = [NSMutableArray arrayWithCapacity:runs];
@@ -481,6 +524,10 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
             [prefill_matmul_samples addObject:@(run_mps_matmul(queue, dense_gemm,
                                                                dense_left, dense_right,
                                                                dense_result, dense_flops))];
+            [prefill_ubatch_matmul_samples addObject:@(run_mps_matmul(queue, ubatch_gemm,
+                                                                      dense_left, ubatch_right,
+                                                                      ubatch_result,
+                                                                      ubatch_flops))];
             [prefill_moe_matmul_samples addObject:@(run_mps_moe_matmul(queue, moe_gemm,
                                                                        moe_left, moe_right,
                                                                        moe_result,
@@ -509,6 +556,8 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         double fp16_measured = percentile_value(fp16_samples, (NSUInteger)((double)runs * 0.90) - 1);
         double prefill_matmul_measured =
             percentile_value(prefill_matmul_samples, (NSUInteger)((double)runs * 0.90) - 1);
+        double prefill_ubatch_matmul_measured =
+            percentile_value(prefill_ubatch_matmul_samples, (NSUInteger)((double)runs * 0.90) - 1);
         double prefill_moe_matmul_measured =
             percentile_value(prefill_moe_matmul_samples, (NSUInteger)((double)runs * 0.90) - 1);
         double post_prefill_decode_measured = percentile_value(post_prefill_decode_samples, runs / 2);
@@ -524,10 +573,10 @@ char *mesh_llm_gpu_bench_metal_json(char **error_out) {
         double efficiency = has_rated ? p90 / rated * 100.0 : 0.0;
 
         NSMutableString *json = [NSMutableString stringWithFormat:
-            @"[{\"device\":\"%@\",\"buffer_mb\":512,\"runs\":%d,\"p50_gbps\":%.2f,\"p90_gbps\":%.2f,\"noise_pct\":%.2f,\"runtime_s\":%.3f,\"decode_effective_gbps\":%.2f,\"decode_fixed_overhead_ms\":%.4f,\"post_prefill_decode_overhead_ms\":%.4f,\"compute_tflops_fp32\":%.2f,\"compute_tflops_fp16\":%.2f,\"prefill_matmul_tflops_fp16\":%.2f,\"prefill_moe_matmul_tflops_fp16\":%.2f",
+            @"[{\"device\":\"%@\",\"buffer_mb\":512,\"runs\":%d,\"p50_gbps\":%.2f,\"p90_gbps\":%.2f,\"noise_pct\":%.2f,\"runtime_s\":%.3f,\"decode_effective_gbps\":%.2f,\"decode_fixed_overhead_ms\":%.4f,\"post_prefill_decode_overhead_ms\":%.4f,\"compute_tflops_fp32\":%.2f,\"compute_tflops_fp16\":%.2f,\"prefill_matmul_tflops_fp16\":%.2f,\"prefill_ubatch_matmul_tflops_fp16\":%.2f,\"prefill_moe_matmul_tflops_fp16\":%.2f",
             device_name, runs, p50, p90, noise, runtime_secs, decode_effective, fixed_overhead,
             post_prefill_decode_measured, fp32_measured, fp16_measured, prefill_matmul_measured,
-            prefill_moe_matmul_measured];
+            prefill_ubatch_matmul_measured, prefill_moe_matmul_measured];
         if (has_rated) {
             [json appendFormat:@",\"rated_gbps\":%.0f,\"rated_estimated\":%@", rated, estimated ? @"true" : @"false"];
             [json appendFormat:@",\"efficiency_pct\":%.2f", efficiency];

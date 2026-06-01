@@ -30,6 +30,7 @@
 #define DECODE_DISPATCHES 8
 #define FIXED_OVERHEAD_DISPATCHES 256
 #define PREFILL_MATMUL_SIZE 4096
+#define PREFILL_UBATCH_TOKENS 512
 #define PREFILL_MOE_M 1024
 #define PREFILL_MOE_N 512
 #define PREFILL_MOE_K 2048
@@ -276,6 +277,42 @@ int main(int argc, char** argv) {
             return totalFlops / (ms / 1000.0) / 1e12;
         };
 
+        auto measure_prefill_ubatch_matmul_fp16 = [&]() -> double {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            check(cudaEventRecord(evStart), "eventRecord prefill ubatch matmul start");
+            check_cublas(
+                cublasGemmEx(cublas,
+                             CUBLAS_OP_N,
+                             CUBLAS_OP_N,
+                             PREFILL_MATMUL_SIZE,
+                             PREFILL_UBATCH_TOKENS,
+                             PREFILL_MATMUL_SIZE,
+                             &alpha,
+                             dMatmulA,
+                             CUDA_R_16F,
+                             PREFILL_MATMUL_SIZE,
+                             dMatmulB,
+                             CUDA_R_16F,
+                             PREFILL_MATMUL_SIZE,
+                             &beta,
+                             dMatmulC,
+                             CUDA_R_16F,
+                             PREFILL_MATMUL_SIZE,
+                             CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmEx prefill ubatch matmul");
+            check(cudaEventRecord(evStop), "eventRecord prefill ubatch matmul stop");
+            check(cudaEventSynchronize(evStop), "eventSync prefill ubatch matmul");
+            float ms = 0.0f;
+            check(cudaEventElapsedTime(&ms, evStart, evStop), "eventElapsed prefill ubatch matmul");
+            double totalFlops = 2.0
+                * (double)PREFILL_MATMUL_SIZE
+                * (double)PREFILL_UBATCH_TOKENS
+                * (double)PREFILL_MATMUL_SIZE;
+            return totalFlops / (ms / 1000.0) / 1e12;
+        };
+
         auto measure_prefill_moe_matmul_fp16 = [&]() -> double {
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -385,6 +422,7 @@ int main(int argc, char** argv) {
             (void)measure_compute_fp32();
             (void)measure_compute_fp16();
             (void)measure_prefill_matmul_fp16();
+            (void)measure_prefill_ubatch_matmul_fp16();
             (void)measure_prefill_moe_matmul_fp16();
             (void)measure_post_prefill_decode_overhead_ms();
             (void)measure_decode_effective_gbps();
@@ -397,6 +435,7 @@ int main(int argc, char** argv) {
         double fp32Samples[TIMED_RUNS];
         double fp16Samples[TIMED_RUNS];
         double prefillMatmulSamples[TIMED_RUNS];
+        double prefillUbatchMatmulSamples[TIMED_RUNS];
         double prefillMoeMatmulSamples[TIMED_RUNS];
         double postPrefillDecodeSamples[TIMED_RUNS];
         double decodeEffectiveSamples[TIMED_RUNS];
@@ -406,6 +445,7 @@ int main(int argc, char** argv) {
             fp32Samples[i] = measure_compute_fp32();
             fp16Samples[i] = measure_compute_fp16();
             prefillMatmulSamples[i] = measure_prefill_matmul_fp16();
+            prefillUbatchMatmulSamples[i] = measure_prefill_ubatch_matmul_fp16();
             prefillMoeMatmulSamples[i] = measure_prefill_moe_matmul_fp16();
             postPrefillDecodeSamples[i] = measure_post_prefill_decode_overhead_ms();
             decodeEffectiveSamples[i] = measure_decode_effective_gbps();
@@ -419,6 +459,7 @@ int main(int argc, char** argv) {
         qsort(fp32Samples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(fp16Samples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(prefillMatmulSamples, TIMED_RUNS, sizeof(double), cmp_double);
+        qsort(prefillUbatchMatmulSamples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(prefillMoeMatmulSamples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(postPrefillDecodeSamples, TIMED_RUNS, sizeof(double), cmp_double);
         qsort(decodeEffectiveSamples, TIMED_RUNS, sizeof(double), cmp_double);
@@ -428,6 +469,7 @@ int main(int argc, char** argv) {
         double tf32P90  = fp32Samples[(int)(TIMED_RUNS * 0.90) - 1];
         double tf16P90  = fp16Samples[(int)(TIMED_RUNS * 0.90) - 1];
         double prefillMatmulP90 = prefillMatmulSamples[(int)(TIMED_RUNS * 0.90) - 1];
+        double prefillUbatchMatmulP90 = prefillUbatchMatmulSamples[(int)(TIMED_RUNS * 0.90) - 1];
         double prefillMoeMatmulP90 = prefillMoeMatmulSamples[(int)(TIMED_RUNS * 0.90) - 1];
         double postPrefillDecodeP50 = postPrefillDecodeSamples[TIMED_RUNS / 2];
         double decodeEffectiveP90 = decodeEffectiveSamples[(int)(TIMED_RUNS * 0.90) - 1];
@@ -456,6 +498,7 @@ int main(int argc, char** argv) {
                    "\"compute_tflops_fp32\":%.2f,"
                    "\"compute_tflops_fp16\":%.2f,"
                    "\"prefill_matmul_tflops_fp16\":%.2f,"
+                   "\"prefill_ubatch_matmul_tflops_fp16\":%.2f,"
                    "\"prefill_moe_matmul_tflops_fp16\":%.2f}",
                    props.name, TIMED_RUNS,
                    p50, p90, noisePct, runtimeSecs,
@@ -465,7 +508,7 @@ int main(int argc, char** argv) {
                    decodeEffectiveP90,
                    fixedOverheadP50,
                    postPrefillDecodeP50,
-                   tf32P90, tf16P90, prefillMatmulP90, prefillMoeMatmulP90);
+                   tf32P90, tf16P90, prefillMatmulP90, prefillUbatchMatmulP90, prefillMoeMatmulP90);
             if (dev < deviceCount - 1) printf(",");
             else printf("]\n");
         } else {
@@ -479,6 +522,7 @@ int main(int argc, char** argv) {
             printf("tf32   : %.2f TFLOPS\n", tf32P90);
             printf("tf16   : %.2f TFLOPS\n", tf16P90);
             printf("prefill matmul fp16: %.2f TFLOPS\n", prefillMatmulP90);
+            printf("prefill ubatch matmul fp16: %.2f TFLOPS\n", prefillUbatchMatmulP90);
             printf("prefill moe matmul fp16: %.2f TFLOPS\n", prefillMoeMatmulP90);
             printf("decode : %.1f GB/s effective, %.4f ms fixed dispatch\n",
                    decodeEffectiveP90, fixedOverheadP50);
