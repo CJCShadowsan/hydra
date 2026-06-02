@@ -42,6 +42,7 @@ pub(super) async fn run_moa_turn_with_progress(
     moa_body: serde_json::Value,
     config: &moa::GatewayConfig,
     response_adapter: proxy::ResponseAdapter,
+    is_baton: bool,
 ) {
     // Generate a single completion id up front so progress chunks,
     // the (eventual) final body, and any failure tail all share the
@@ -75,6 +76,7 @@ pub(super) async fn run_moa_turn_with_progress(
         response_adapter,
         &completion_id,
         progress_created_at,
+        is_baton,
     )
     .await
     else {
@@ -106,6 +108,7 @@ async fn drip_progress_phase(
     response_adapter: proxy::ResponseAdapter,
     completion_id: &str,
     progress_created_at: Option<i64>,
+    is_baton: bool,
 ) -> Option<(moa::TurnResult, Option<ProgressContinuation>)> {
     let (mut moa_result, next_sequence_number) = match drip_progress_until_moa_completes(
         tcp_stream,
@@ -113,6 +116,7 @@ async fn drip_progress_phase(
         moa_body,
         response_adapter,
         completion_id,
+        is_baton,
     )
     .await
     {
@@ -280,8 +284,15 @@ async fn drip_progress_until_moa_completes(
     moa_body: &serde_json::Value,
     adapter: proxy::ResponseAdapter,
     completion_id: &str,
+    is_baton: bool,
 ) -> Result<(moa::TurnResult, i32), ClientGone> {
-    let moa_fut = moa::handle_turn(config, moa_body);
+    let moa_fut = async move {
+        if is_baton {
+            moa::handle_baton_turn(config, moa_body).await
+        } else {
+            moa::handle_turn(config, moa_body).await
+        }
+    };
     drip_progress_against_future(
         stream,
         moa_fut,

@@ -37,6 +37,7 @@
 
 pub mod arbiter;
 pub mod backend;
+mod baton;
 pub mod context;
 mod fanout;
 pub mod normalize;
@@ -61,6 +62,8 @@ pub use worker::{strip_thinking, truncate_chars};
 
 /// The virtual model name that triggers MoA routing.
 pub const VIRTUAL_MODEL_NAME: &str = "mesh";
+/// Experimental peer-baton MoA mode.
+pub const VIRTUAL_BATON_MODEL_NAME: &str = "mesh-baton";
 
 // ─── Configuration ───────────────────────────────────────────────────
 
@@ -195,6 +198,49 @@ pub async fn handle_turn(config: &GatewayConfig, body: &Value) -> TurnResult {
     }
 }
 
+/// Process one experimental peer-baton MoA turn.
+///
+/// `mesh-baton` keeps tool-result turns on the existing reducer-only path,
+/// but for fresh user turns it runs a compact peer handoff pass before
+/// falling back to the normal arbiter/reducer machinery.
+pub async fn handle_baton_turn(config: &GatewayConfig, body: &Value) -> TurnResult {
+    let start = Instant::now();
+
+    let mut session = Session::new();
+    let incoming_messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let tools = body.get("tools").cloned();
+    let has_tools = tools
+        .as_ref()
+        .and_then(|t| t.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+
+    session.ingest(&incoming_messages, &tools);
+
+    let turn_type = session.classify_turn();
+    tracing::info!(
+        "moa-baton: turn={:?}, {} models, tools={}",
+        turn_type,
+        config.models.len(),
+        has_tools,
+    );
+
+    let allowed_tools = session.tool_names();
+
+    match turn_type {
+        session::TurnType::ToolResult => {
+            handle_tool_result(config, &session, has_tools, &allowed_tools, start).await
+        }
+        session::TurnType::Fresh => {
+            handle_baton_query(config, &session, has_tools, &allowed_tools, start).await
+        }
+    }
+}
+
 // ─── Query handling ──────────────────────────────────────────────────
 
 async fn handle_query(
@@ -296,6 +342,61 @@ async fn handle_query(
     TurnResult {
         response_body,
         worker_summaries: summaries,
+        reducer_used,
+        reducer_attempts,
+        turn_kind,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+async fn handle_baton_query(
+    config: &GatewayConfig,
+    session: &Session,
+    has_tools: bool,
+    allowed_tools: &[String],
+    start: Instant,
+) -> TurnResult {
+    let run = baton::run_baton_query(config, session, has_tools, allowed_tools).await;
+
+    if run.outputs.is_empty() {
+        let mut response_body =
+            error_response("All MoA baton workers failed", MOA_ERR_ALL_WORKERS_FAILED);
+        set_response_model(&mut response_body, VIRTUAL_BATON_MODEL_NAME);
+        return TurnResult {
+            response_body,
+            worker_summaries: run.summaries,
+            reducer_used: false,
+            reducer_attempts: 0,
+            turn_kind: TurnKind::Failed,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+
+    let took_early_exit = run.early_exit;
+    let decision = run
+        .decision
+        .unwrap_or_else(|| arbiter::arbitrate(&run.outputs, has_tools));
+    let (mut response_body, reducer_used, reducer_attempts) = resolve_decision(
+        config,
+        session,
+        decision,
+        &run.outputs,
+        has_tools,
+        allowed_tools,
+    )
+    .await;
+    baton::clean_response_body(&mut response_body);
+    set_response_model(&mut response_body, VIRTUAL_BATON_MODEL_NAME);
+
+    let turn_kind = if took_early_exit && !reducer_used {
+        TurnKind::EarlyExit
+    } else {
+        TurnKind::Fanout
+    };
+
+    TurnResult {
+        response_body,
+        worker_summaries: run.summaries,
         reducer_used,
         reducer_attempts,
         turn_kind,
@@ -620,6 +721,12 @@ fn tool_call_response(name: &str, arguments: &Value) -> Value {
         }],
         "usage": usage_for_content(&args_str)
     })
+}
+
+fn set_response_model(response_body: &mut Value, model: &str) {
+    if let Some(obj) = response_body.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
 }
 
 fn short_id() -> String {

@@ -668,15 +668,15 @@ enum MoaInterceptResult {
     NotMoa(tokio::net::TcpStream),
 }
 
-/// Dispatch to the MoA gateway when `model == "mesh"`. Self-gates on the
-/// effective model so the call site is unconditional.
+/// Dispatch to the MoA gateway when a virtual MoA model is requested.
+/// Self-gates on the effective model so the call site is unconditional.
 async fn try_handle_moa_intercept(
     tcp_stream: tokio::net::TcpStream,
     request: &mut proxy::BufferedHttpRequest,
     ctx: &ProxyConnectionContext<'_>,
     decision: &AutoRouteDecision,
 ) -> MoaInterceptResult {
-    if decision.effective_model.as_deref() != Some(moa::VIRTUAL_MODEL_NAME) {
+    if !is_virtual_moa_model(decision.effective_model.as_deref()) {
         return MoaInterceptResult::NotMoa(tcp_stream);
     }
     // `try_handle_moa` self-gates on the model name and consumes the
@@ -902,4 +902,11 @@ pub(crate) fn callable_models(targets: &election::ModelTargets) -> Vec<String> {
         .collect();
     models.sort();
     models
+}
+
+fn is_virtual_moa_model(model: Option<&str>) -> bool {
+    matches!(
+        model,
+        Some(moa::VIRTUAL_MODEL_NAME) | Some(moa::VIRTUAL_BATON_MODEL_NAME)
+    )
 }

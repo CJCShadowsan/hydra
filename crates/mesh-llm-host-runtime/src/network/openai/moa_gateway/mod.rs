@@ -18,7 +18,7 @@ use progress::ProgressContinuation;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-/// Detect `model: "mesh"`, build a mesh-wide MoA config, run the turn,
+/// Detect a virtual MoA model, build a mesh-wide MoA config, run the turn,
 /// and write the HTTP response (JSON or SSE) directly to the stream.
 ///
 /// Return value carries the un-consumed `TcpStream` so the caller knows
@@ -39,7 +39,11 @@ pub async fn try_handle_moa(
     effective_model: Option<&str>,
     targets: Option<&election::ModelTargets>,
 ) -> Option<TcpStream> {
-    if effective_model != Some(moa::VIRTUAL_MODEL_NAME) {
+    let Some(model) = effective_model else {
+        return Some(tcp_stream);
+    };
+    let is_baton = model == moa::VIRTUAL_BATON_MODEL_NAME;
+    if model != moa::VIRTUAL_MODEL_NAME && !is_baton {
         return Some(tcp_stream);
     }
 
@@ -57,7 +61,14 @@ pub async fn try_handle_moa(
     };
     config.enable_thinking = enable_thinking;
 
-    run_moa_turn(tcp_stream, body_json, &config, request.response_adapter).await;
+    run_moa_turn(
+        tcp_stream,
+        body_json,
+        &config,
+        request.response_adapter,
+        is_baton,
+    )
+    .await;
     None
 }
 
@@ -154,6 +165,7 @@ async fn run_moa_turn(
     body_json: serde_json::Value,
     config: &moa::GatewayConfig,
     response_adapter: proxy::ResponseAdapter,
+    is_baton: bool,
 ) {
     let was_streaming = body_json
         .get("stream")
@@ -178,11 +190,22 @@ async fn run_moa_turn(
                 | proxy::ResponseAdapter::OpenAiResponsesStream
         )
     {
-        progress::run_moa_turn_with_progress(tcp_stream, moa_body, config, response_adapter).await;
+        progress::run_moa_turn_with_progress(
+            tcp_stream,
+            moa_body,
+            config,
+            response_adapter,
+            is_baton,
+        )
+        .await;
         return;
     }
 
-    let moa_result = moa::handle_turn(config, &moa_body).await;
+    let moa_result = if is_baton {
+        moa::handle_baton_turn(config, &moa_body).await
+    } else {
+        moa::handle_turn(config, &moa_body).await
+    };
     let extra_headers = build_moa_headers(&moa_result);
     write_moa_response(
         tcp_stream,
@@ -373,7 +396,7 @@ pub async fn build_moa_config(
         .models_being_served()
         .await
         .into_iter()
-        .filter(|n| n != moa::VIRTUAL_MODEL_NAME)
+        .filter(|n| n != moa::VIRTUAL_MODEL_NAME && n != moa::VIRTUAL_BATON_MODEL_NAME)
         .collect();
 
     // Group aliases by canonical base. The old shape sorted by name

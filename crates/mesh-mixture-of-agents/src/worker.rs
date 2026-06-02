@@ -30,6 +30,7 @@ impl WorkerRole {
 }
 
 /// A worker assignment: which model plays which role.
+#[derive(Clone)]
 pub struct Assignment {
     pub model_name: String,
     pub backend_index: usize,
