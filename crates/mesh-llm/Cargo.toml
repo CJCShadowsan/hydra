@@ -4,12 +4,13 @@ version.workspace = true
 edition = "2024"
 
 [features]
-default = ["web-ui"]
+default = ["web-ui", "gpu-bench-ggml"]
 # Embed the React web console into the binary. Default on so the shipped
 # binary keeps shipping the console; turn off (`--no-default-features`)
 # for a lean variant that drops the embedded UI assets.
 web-ui = ["mesh-llm-host-runtime/web-ui"]
 gpu-bench-cuda = ["mesh-llm-host-runtime/gpu-bench-cuda"]
+gpu-bench-ggml = ["mesh-llm-host-runtime/gpu-bench-ggml"]
 gpu-bench-hip = ["mesh-llm-host-runtime/gpu-bench-hip"]
 gpu-bench-intel = ["mesh-llm-host-runtime/gpu-bench-intel"]
 

@@ -1,5 +1,11 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=MESH_LLM_GPU_BENCH_RUST_ONLY");
+    println!("cargo:rerun-if-env-changed=LLAMA_STAGE_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=SKIPPY_LLAMA_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rustc-check-cfg=cfg(mesh_llm_gpu_bench_has_ggml_probe)");
     if std::env::var_os("MESH_LLM_GPU_BENCH_RUST_ONLY").is_some() {
         return;
     }
@@ -18,6 +24,10 @@ fn main() {
 
     if std::env::var_os("CARGO_FEATURE_INTEL").is_some() {
         build_intel();
+    }
+
+    if std::env::var_os("CARGO_FEATURE_GGML_PROBE").is_some() {
+        build_ggml_probe();
     }
 }
 
@@ -237,4 +247,251 @@ fn build_intel() {
     archive_static_lib(&object, "mesh_llm_gpu_bench_intel");
     println!("cargo:rustc-link-lib=dylib=sycl");
     println!("cargo:rustc-link-lib=dylib=stdc++");
+}
+
+fn build_ggml_probe() {
+    let workspace_root =
+        std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let build_dir = std::env::var("LLAMA_STAGE_BUILD_DIR")
+        .or_else(|_| std::env::var("SKIPPY_LLAMA_BUILD_DIR"))
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace_root.join(path)
+            }
+        })
+        .unwrap_or_else(|_| default_llama_build_dir(&workspace_root, &target));
+    let source_dir = workspace_root.join(".deps/llama.cpp");
+    let ggml_header = source_dir.join("ggml/include/ggml.h");
+    let ggml_base = build_dir.join("ggml/src/libggml-base.a");
+    let ggml = build_dir.join("ggml/src/libggml.a");
+    let has_ggml_cpu = any_archive_exists(
+        &build_dir,
+        &["ggml/src/libggml-cpu.a", "ggml/src/ggml-cpu/libggml-cpu.a"],
+    );
+    if !ggml_header.exists() || !ggml_base.exists() || !ggml.exists() || !has_ggml_cpu {
+        println!(
+            "cargo:warning=GGML decode probes disabled; run scripts/prepare-llama.sh and scripts/build-llama.sh first"
+        );
+        return;
+    }
+
+    let has_metal = build_dir
+        .join("ggml/src/ggml-metal/libggml-metal.a")
+        .exists();
+    let has_cuda = build_dir.join("ggml/src/ggml-cuda/libggml-cuda.a").exists();
+    let has_hip = build_dir.join("ggml/src/ggml-hip/libggml-hip.a").exists();
+    if !has_metal && !has_cuda && !has_hip {
+        println!(
+            "cargo:warning=GGML decode probes disabled; no accelerated GGML backend archive found"
+        );
+        return;
+    }
+
+    let object = compile_ggml_probe_object(&source_dir, has_metal, has_cuda, has_hip);
+    archive_static_lib(&object, "mesh_llm_gpu_bench_ggml_probe");
+
+    println!("cargo:rustc-cfg=mesh_llm_gpu_bench_has_ggml_probe");
+    println!("cargo:rerun-if-changed=native/ggml/decode-probe.cpp");
+    println!("cargo:rerun-if-changed={}", ggml_header.display());
+    for dir in [
+        build_dir.join("ggml/src"),
+        build_dir.join("ggml/src/ggml-cpu"),
+        build_dir.join("ggml/src/ggml-blas"),
+        build_dir.join("ggml/src/ggml-cuda"),
+        build_dir.join("ggml/src/ggml-hip"),
+        build_dir.join("ggml/src/ggml-metal"),
+        build_dir.join("ggml/src/ggml-vulkan"),
+    ]
+    .iter()
+    .filter(|dir| dir.exists())
+    {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    println!("cargo:rerun-if-changed={}", object.display());
+    link_optional_static(&build_dir, "ggml/src/ggml-cuda/libggml-cuda.a", "ggml-cuda");
+    link_optional_static(&build_dir, "ggml/src/ggml-hip/libggml-hip.a", "ggml-hip");
+    link_optional_static(
+        &build_dir,
+        "ggml/src/ggml-metal/libggml-metal.a",
+        "ggml-metal",
+    );
+    link_first_static(
+        &build_dir,
+        &["ggml/src/libggml-cpu.a", "ggml/src/ggml-cpu/libggml-cpu.a"],
+        "ggml-cpu",
+    );
+    link_first_static(
+        &build_dir,
+        &[
+            "ggml/src/libggml-blas.a",
+            "ggml/src/ggml-blas/libggml-blas.a",
+        ],
+        "ggml-blas",
+    );
+    println!("cargo:rustc-link-lib=static=ggml");
+    println!("cargo:rustc-link-lib=static=ggml-base");
+
+    if target.contains("apple") {
+        println!("cargo:rustc-link-lib=c++");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        if has_metal {
+            println!("cargo:rustc-link-lib=framework=Foundation");
+            println!("cargo:rustc-link-lib=framework=Metal");
+            println!("cargo:rustc-link-lib=framework=MetalKit");
+        }
+    } else if target.contains("linux") {
+        println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=m");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        if has_cuda {
+            link_linux_cuda_libs(&build_dir.join("CMakeCache.txt"));
+        }
+        if has_hip {
+            link_linux_hip_libs();
+        }
+    }
+}
+
+fn compile_ggml_probe_object(
+    source_dir: &std::path::Path,
+    has_metal: bool,
+    has_cuda: bool,
+    has_hip: bool,
+) -> std::path::PathBuf {
+    let object = out_path("mesh_llm_gpu_bench_ggml_probe.o");
+    run_or_panic({
+        let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+        let mut command = std::process::Command::new(cxx);
+        command
+            .arg("-O3")
+            .arg("-std=c++17")
+            .arg("-fPIC")
+            .arg("-I")
+            .arg(source_dir.join("ggml/include"))
+            .arg("-I")
+            .arg(source_dir.join("ggml/src"))
+            .arg("-I")
+            .arg(source_dir.join("ggml/src/ggml-cpu"));
+        if has_metal {
+            command
+                .arg("-DMESH_LLM_GGML_PROBE_METAL")
+                .arg("-I")
+                .arg(source_dir.join("ggml/src/ggml-metal"));
+        }
+        if has_cuda {
+            command
+                .arg("-DMESH_LLM_GGML_PROBE_CUDA")
+                .arg("-I")
+                .arg(source_dir.join("ggml/src/ggml-cuda"));
+        }
+        if has_hip {
+            command
+                .arg("-DMESH_LLM_GGML_PROBE_HIP")
+                .arg("-I")
+                .arg(source_dir.join("ggml/src/ggml-hip"));
+        }
+        command
+            .arg("-c")
+            .arg("native/ggml/decode-probe.cpp")
+            .arg("-o")
+            .arg(&object);
+        command
+    });
+    object
+}
+
+fn default_llama_build_dir(workspace_root: &std::path::Path, target: &str) -> std::path::PathBuf {
+    let suffix = if target.contains("apple") {
+        "metal"
+    } else {
+        "cpu"
+    };
+    workspace_root.join(format!(".deps/llama-build/build-stage-abi-{suffix}"))
+}
+
+fn link_optional_static(build_dir: &std::path::Path, archive: &str, lib: &str) {
+    let path = build_dir.join(archive);
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
+}
+
+fn any_archive_exists(build_dir: &std::path::Path, archives: &[&str]) -> bool {
+    archives
+        .iter()
+        .any(|archive| build_dir.join(archive).exists())
+}
+
+fn link_first_static(build_dir: &std::path::Path, archives: &[&str], lib: &str) {
+    if let Some(path) = archives
+        .iter()
+        .map(|archive| build_dir.join(archive))
+        .find(|path| path.exists())
+    {
+        println!("cargo:rerun-if-changed={}", path.display());
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
+}
+
+fn link_linux_cuda_libs(cmake_cache: &std::path::Path) {
+    for (cache_key, lib) in [
+        ("CUDA_cuda_driver_LIBRARY", "cuda"),
+        ("CUDA_cudart_LIBRARY", "cudart"),
+        ("CUDA_cublas_LIBRARY", "cublas"),
+        ("CUDA_cublasLt_LIBRARY", "cublasLt"),
+    ] {
+        link_linux_lib_from_cache(cmake_cache, cache_key, lib);
+    }
+    if let Ok(contents) = std::fs::read_to_string(cmake_cache)
+        && let Some(nccl_path) = cmake_cache_value(&contents, "NCCL_LIBRARY")
+        && !nccl_path.contains("NOTFOUND")
+        && !nccl_path.contains("-NOTFOUND")
+    {
+        let path = std::path::PathBuf::from(&nccl_path);
+        if let Some(parent) = path.parent()
+            && parent.is_dir()
+        {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        println!("cargo:rustc-link-lib=dylib=nccl");
+    }
+}
+
+fn link_linux_lib_from_cache(cmake_cache: &std::path::Path, cache_key: &str, lib: &str) {
+    if let Ok(contents) = std::fs::read_to_string(cmake_cache)
+        && let Some(path) = cmake_cache_value(&contents, cache_key)
+    {
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent()
+            && parent.is_dir()
+        {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+    }
+    println!("cargo:rustc-link-lib=dylib={lib}");
+}
+
+fn cmake_cache_value(contents: &str, key: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (left, value) = line.split_once('=')?;
+        let name = left.split_once(':').map(|(name, _)| name).unwrap_or(left);
+        (name == key).then(|| value.to_string())
+    })
+}
+
+fn link_linux_hip_libs() {
+    for root in ["/opt/rocm/lib", "/opt/rocm/lib64"] {
+        if std::path::Path::new(root).is_dir() {
+            println!("cargo:rustc-link-search=native={root}");
+        }
+    }
+    for lib in ["amdhip64", "rocblas", "hipblas"] {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
 }

@@ -22,6 +22,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 gpu-bench-cuda = ["mesh-llm-gpu-bench/cuda"]
+gpu-bench-ggml = ["mesh-llm-gpu-bench/ggml-probe"]
 gpu-bench-hip = ["mesh-llm-gpu-bench/hip"]
 gpu-bench-intel = ["mesh-llm-gpu-bench/intel"]
 skippy-devices = ["dep:skippy-runtime"]

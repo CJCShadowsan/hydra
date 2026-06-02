@@ -18,3 +18,4 @@ cc = "1"
 cuda = []
 hip = []
 intel = []
+ggml-probe = []

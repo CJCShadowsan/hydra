@@ -119,8 +119,35 @@ pub fn run_benchmark(runner: BenchmarkRunner, _timeout: Duration) -> Result<Vec<
         BenchmarkBackend::Hip => run_hip_benchmark(),
         BenchmarkBackend::Intel => run_intel_benchmark(),
     }?;
+    attach_ggml_decode_probes(runner.backend, &mut outputs);
     attach_sampler_probe(&mut outputs);
     Ok(outputs)
+}
+
+fn attach_ggml_decode_probes(backend: BenchmarkBackend, outputs: &mut [BenchmarkOutput]) {
+    let probes = run_ggml_decode_probes(backend);
+    if probes.is_empty() {
+        return;
+    }
+    for output in outputs {
+        output.decode_kernel_probes.extend(probes.clone());
+    }
+}
+
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+fn run_ggml_decode_probes(backend: BenchmarkBackend) -> Vec<crate::DecodeKernelProbe> {
+    match crate::ggml_probe::run(backend) {
+        Ok(probes) => probes,
+        Err(error) => {
+            tracing::warn!("GGML decode kernel probe failed: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe)))]
+fn run_ggml_decode_probes(_backend: BenchmarkBackend) -> Vec<crate::DecodeKernelProbe> {
+    Vec::new()
 }
 
 fn attach_sampler_probe(outputs: &mut [BenchmarkOutput]) {

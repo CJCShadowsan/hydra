@@ -13,6 +13,9 @@ mod hip;
 #[cfg(feature = "intel")]
 mod intel;
 
+#[cfg(all(feature = "ggml-probe", mesh_llm_gpu_bench_has_ggml_probe))]
+mod ggml_probe;
+
 #[cfg(target_os = "macos")]
 mod metal;
 
