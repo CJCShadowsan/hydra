@@ -59,7 +59,7 @@ pub fn score_model(
     model: &ModelProfile,
     config: &SelectionConfig,
 ) -> ModelRecommendation {
-    let mut recommendations = execution_budgets(hardware)
+    let mut recommendations = execution_budgets(hardware, config)
         .into_iter()
         .map(|budget| score_for_budget(model, config, &budget))
         .collect::<Vec<_>>();
@@ -219,13 +219,15 @@ fn score_for_budget(
     }
 }
 
-fn execution_budgets(hardware: &HardwareProfile) -> Vec<ExecutionBudget> {
+fn execution_budgets(hardware: &HardwareProfile, config: &SelectionConfig) -> Vec<ExecutionBudget> {
     let mut budgets = hardware
         .accelerators
         .iter()
         .map(|accelerator| accelerator_budget(hardware, accelerator))
         .collect::<Vec<_>>();
-    if let Some(memory) = hardware.memory.available_system_bytes {
+    if include_cpu_budget(hardware, config)
+        && let Some(memory) = hardware.memory.available_system_bytes
+    {
         budgets.push(ExecutionBudget {
             backend: BackendKind::Cpu,
             accelerator_name: Some("CPU".into()),
@@ -251,6 +253,36 @@ fn execution_budgets(hardware: &HardwareProfile) -> Vec<ExecutionBudget> {
         });
     }
     budgets
+}
+
+fn include_cpu_budget(hardware: &HardwareProfile, config: &SelectionConfig) -> bool {
+    // A CPU budget is real when the host is CPU-only, and it is still useful for
+    // non-generative workloads such as embeddings and reranking where CPU
+    // serving can be an acceptable local path. It must not be a silent fallback
+    // for transformer generation on a discrete-GPU host, though.
+    //
+    // llama.cpp full-offload loads resident model tensors into the selected
+    // backend buffer. If a 30B MoE GGUF requires ~17 GiB of CUDA buffer and the
+    // device has ~15 GiB free, that model does not fit the accelerated local
+    // serving path even if system RAM can hold the file. Reporting `FitsLocal`
+    // through CPU RAM would conflate "can be mmap'd somewhere" with "fits the
+    // machine profile that mesh-llm will actually serve with." For those
+    // generation workloads, keep the accelerator budget in charge so the result
+    // becomes `SplitCandidate` or `Rejected` instead.
+    !has_non_cpu_accelerator(hardware) || cpu_is_valid_workload_budget(config.workload.task)
+}
+
+fn has_non_cpu_accelerator(hardware: &HardwareProfile) -> bool {
+    hardware.accelerators.iter().any(|accelerator| {
+        accelerator.backend != BackendKind::Cpu && accelerator.kind != AcceleratorKind::Cpu
+    })
+}
+
+fn cpu_is_valid_workload_budget(task: WorkloadTask) -> bool {
+    matches!(
+        task,
+        WorkloadTask::Embedding | WorkloadTask::Reranking | WorkloadTask::Classification
+    )
 }
 
 fn accelerator_budget(

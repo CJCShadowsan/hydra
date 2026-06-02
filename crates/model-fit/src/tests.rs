@@ -47,6 +47,51 @@ fn m1_ultra() -> HardwareProfile {
     }
 }
 
+fn discrete_cuda_16g() -> HardwareProfile {
+    HardwareProfile {
+        memory: MemoryProfile {
+            total_system_bytes: Some(64 * GIB),
+            available_system_bytes: Some(48 * GIB),
+            total_unified_bytes: None,
+            available_unified_bytes: None,
+        },
+        accelerators: vec![AcceleratorProfile {
+            name: Some("Measured CUDA GPU".into()),
+            kind: AcceleratorKind::DiscreteGpu,
+            backend: BackendKind::Cuda,
+            total_memory_bytes: Some(16 * GIB),
+            available_memory_bytes: Some(15 * GIB),
+            memory_bandwidth_bytes_per_sec: Some(900_000_000_000),
+            decode_effective_bandwidth_bytes_per_sec: Some(850_000_000_000),
+            decode_fixed_overhead_ms: Some(0.002),
+            post_prefill_decode_overhead_ms: None,
+            bandwidth_source: MeasurementSource::Measured,
+            benchmark_noise_pct: Some(0.5),
+            bandwidth_efficiency_pct: Some(90.0),
+            compute_tflops_fp32: None,
+            compute_tflops_fp16: Some(50.0),
+            prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
+            prefill_moe_matmul_tflops_fp16: None,
+            sampler_history_us_per_token: None,
+            sampler_vocab_us_per_token: None,
+            unified_memory: false,
+        }],
+        cpu: CpuProfile {
+            physical_cores: Some(8),
+            logical_cores: Some(16),
+            memory_bandwidth_bytes_per_sec: None,
+            compute_tflops_fp16: None,
+            post_prefill_decode_overhead_ms: None,
+            prefill_matmul_tflops_fp16: None,
+            prefill_ubatch_matmul_tflops_fp16: None,
+            prefill_moe_matmul_tflops_fp16: None,
+            sampler_history_us_per_token: None,
+            sampler_vocab_us_per_token: None,
+        },
+    }
+}
+
 fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> ModelProfile {
     let attention_bytes = bytes / 3;
     let feed_forward_bytes = bytes / 2;
@@ -606,48 +651,7 @@ fn measured_gpu_bandwidth_uses_backend_neutral_efficiency() {
 
 #[test]
 fn budget_selection_prefers_faster_measured_gpu_over_cpu_headroom() {
-    let hardware = HardwareProfile {
-        memory: MemoryProfile {
-            total_system_bytes: Some(32 * GIB),
-            available_system_bytes: Some(30 * GIB),
-            total_unified_bytes: None,
-            available_unified_bytes: None,
-        },
-        accelerators: vec![AcceleratorProfile {
-            name: Some("Measured CUDA GPU".into()),
-            kind: AcceleratorKind::DiscreteGpu,
-            backend: BackendKind::Cuda,
-            total_memory_bytes: Some(16 * GIB),
-            available_memory_bytes: Some(15 * GIB),
-            memory_bandwidth_bytes_per_sec: Some(900_000_000_000),
-            decode_effective_bandwidth_bytes_per_sec: Some(850_000_000_000),
-            decode_fixed_overhead_ms: Some(0.002),
-            post_prefill_decode_overhead_ms: None,
-            bandwidth_source: MeasurementSource::Measured,
-            benchmark_noise_pct: Some(0.5),
-            bandwidth_efficiency_pct: Some(90.0),
-            compute_tflops_fp32: None,
-            compute_tflops_fp16: Some(50.0),
-            prefill_matmul_tflops_fp16: None,
-            prefill_ubatch_matmul_tflops_fp16: None,
-            prefill_moe_matmul_tflops_fp16: None,
-            sampler_history_us_per_token: None,
-            sampler_vocab_us_per_token: None,
-            unified_memory: false,
-        }],
-        cpu: CpuProfile {
-            physical_cores: Some(8),
-            logical_cores: Some(16),
-            memory_bandwidth_bytes_per_sec: None,
-            compute_tflops_fp16: None,
-            post_prefill_decode_overhead_ms: None,
-            prefill_matmul_tflops_fp16: None,
-            prefill_ubatch_matmul_tflops_fp16: None,
-            prefill_moe_matmul_tflops_fp16: None,
-            sampler_history_us_per_token: None,
-            sampler_vocab_us_per_token: None,
-        },
-    };
+    let hardware = discrete_cuda_16g();
     let mut config = SelectionConfig {
         workload: WorkloadProfile::chat(),
         ..SelectionConfig::default()
@@ -664,6 +668,24 @@ fn budget_selection_prefers_faster_measured_gpu_over_cpu_headroom() {
             .any(|warning| warning.contains("memory bandwidth is missing"))
     );
     assert!(rec.estimated_decode_tokens_per_sec.unwrap() > 100.0);
+}
+
+#[test]
+fn generation_workload_does_not_use_cpu_ram_as_discrete_gpu_fit() {
+    let hardware = discrete_cuda_16g();
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let model = dense_model("too-large-for-vram", 18 * GIB, 48, 4096, 32_768);
+
+    let rec = score_model(&hardware, &model, &config);
+
+    assert_eq!(rec.selected_backend, BackendKind::Cuda);
+    assert_eq!(rec.fit_status, FitStatus::SplitCandidate);
+    assert!(rec.split_candidate.is_some());
+    assert!(rec.estimated_runtime_memory_bytes > 15 * GIB);
 }
 
 #[test]
