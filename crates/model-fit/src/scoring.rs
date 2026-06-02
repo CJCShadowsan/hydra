@@ -211,18 +211,29 @@ fn score_for_budget(
         estimated_runtime_memory_bytes: memory.runtime_bytes,
         estimated_kv_cache_bytes: memory.kv_cache_bytes,
         estimated_active_decode_bytes_per_token: active_decode_bytes,
-        estimated_decode_tokens_per_sec: estimated_decode_tps,
-        estimated_decode_tokens_per_sec_range: estimated_decode_range,
-        estimated_prefill_tokens_per_sec: estimated_prefill_tps,
-        estimated_first_token_prefill_ms: first_token.prefill_ms,
-        estimated_first_token_decode_ms: first_token.decode_ms,
-        estimated_first_token_overhead_ms: first_token.overhead_ms,
-        estimated_first_token_sampler_ms: first_token.sampler_ms,
-        estimated_first_token_ms: first_token.total_ms,
-        estimated_first_token_ms_range: estimated_first_token_range,
+        estimated_decode_tokens_per_sec: local_fit_value(fit_status, estimated_decode_tps),
+        estimated_decode_tokens_per_sec_range: local_fit_value(fit_status, estimated_decode_range),
+        estimated_prefill_tokens_per_sec: local_fit_value(fit_status, estimated_prefill_tps),
+        estimated_first_token_prefill_ms: local_fit_value(fit_status, first_token.prefill_ms),
+        estimated_first_token_decode_ms: local_fit_value(fit_status, first_token.decode_ms),
+        estimated_first_token_overhead_ms: local_fit_value(fit_status, first_token.overhead_ms),
+        estimated_first_token_sampler_ms: local_fit_value(fit_status, first_token.sampler_ms),
+        estimated_first_token_ms: local_fit_value(fit_status, first_token.total_ms),
+        estimated_first_token_ms_range: local_fit_value(fit_status, estimated_first_token_range),
         capability_evidence: model.capability_evidence.clone(),
         reasons,
         warnings,
+    }
+}
+
+fn local_fit_value<T>(fit_status: FitStatus, value: Option<T>) -> Option<T> {
+    if matches!(
+        fit_status,
+        FitStatus::FitsLocal | FitStatus::FitsWithWarning
+    ) {
+        value
+    } else {
+        None
     }
 }
 
