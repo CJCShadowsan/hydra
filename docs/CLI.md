@@ -131,10 +131,12 @@ Subcommands:
 
 - `recommended`
 - `installed`
+- `recommend`
 - `cleanup`
 - `prune`
 - `search`
 - `show`
+- `plan`
 - `download`
 - `package`
 - `certify`
@@ -156,6 +158,39 @@ Run this when you want to see what’s already on your machine.
 Switches:
 
 - `--json`: machine-readable output.
+
+### `models recommend`
+
+Run this when you do not know which catalog model to try. It ranks remote
+catalog models against local hardware capacity, or against the current mesh when
+`--api-base` is supplied.
+
+Usage:
+
+```bash
+mesh-llm models recommend
+mesh-llm models recommend --limit 5
+mesh-llm models recommend --api-base http://127.0.0.1:3131
+mesh-llm models recommend --ctx-size 65536
+```
+
+Switches:
+
+- `--api-base <URL>`: include current mesh peers from `<URL>/api/status`.
+- `--ctx-size <TOKENS>`: context window to reserve KV-cache memory for,
+  default `32768`.
+- `--limit <LIMIT>`: maximum results to show, default `10`.
+- `--json`: machine-readable output.
+
+This is a catalog estimate only. It does not download or run the model. The
+budget includes model-weight headroom, estimated KV cache for the requested
+context, and a local memory reserve. Unified-memory machines reserve a larger
+local buffer because the OS and apps share the same memory pool; discrete GPU
+nodes reserve a smaller VRAM buffer. MoE models are not treated as magically
+smaller for placement: the estimate keeps full expert weights in the weight
+budget, while active-expert hints only influence the KV/throughput estimate. It
+also checks free space on the Hugging Face cache filesystem and reports whether
+the full model download should fit on disk.
 
 ### `models cleanup`
 
@@ -208,6 +243,35 @@ mesh-llm models show mlx-community/SmolLM-135M-8bit
 Switches:
 
 - `--json`: machine-readable output.
+
+### `models plan`
+
+Use this when you want a first-pass capacity plan for a catalog model without
+downloading or running the model. The plan combines catalog size metadata with
+local GPU capacity and, optionally, current mesh capacity from a console/API
+endpoint.
+
+Usage:
+
+```bash
+mesh-llm models plan Qwen3-8B-Q4_K_M
+mesh-llm models plan Qwen3-235B-A22B-UD-Q4_K_XL --api-base http://127.0.0.1:3131
+mesh-llm models plan Qwen3-8B-Q4_K_M --ctx-size 65536
+```
+
+Switches:
+
+- `--api-base <URL>`: include current mesh peers from `<URL>/api/status`.
+- `--ctx-size <TOKENS>`: context window to reserve KV-cache memory for,
+  default `32768`.
+- `--json`: machine-readable output.
+
+This planner uses catalog metadata only. It estimates model-weight headroom,
+KV-cache memory for the requested context, and local memory reserve, but it
+does not download the GGUF, inspect tensor groups, or run benchmark validation.
+It also reports local cache disk space for the full model, the full layer
+package when catalog metadata is present, an approximate one-layer package
+artifact, and the approximate per-node package space for the planned split.
 
 ### `models download`
 

@@ -79,6 +79,21 @@ pub enum ModelsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Recommend remote catalog models for this machine or the current mesh.
+    Recommend {
+        /// Include current mesh capacity from a local console/API base URL.
+        #[arg(long)]
+        api_base: Option<String>,
+        /// Context window to reserve KV-cache memory for.
+        #[arg(long, default_value_t = 32_768)]
+        ctx_size: u32,
+        /// Maximum number of recommendations to show.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit JSON output.
+        #[arg(long)]
+        json: bool,
+    },
     /// Preview or remove mesh-managed models from the Hugging Face cache.
     Cleanup {
         /// Only include models that mesh-llm has not used for the given age (for example 30d or 12h).
@@ -159,6 +174,20 @@ pub enum ModelsCommand {
     Show {
         /// Exact remote catalog id or Hugging Face ref.
         model: String,
+        /// Emit JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Plan whether a remote catalog model fits locally or across a mesh.
+    Plan {
+        /// Exact remote catalog id or Hugging Face ref.
+        model: String,
+        /// Include current mesh capacity from a local console/API base URL.
+        #[arg(long)]
+        api_base: Option<String>,
+        /// Context window to reserve KV-cache memory for.
+        #[arg(long, default_value_t = 32_768)]
+        ctx_size: u32,
         /// Emit JSON output.
         #[arg(long)]
         json: bool,

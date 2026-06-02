@@ -1,6 +1,7 @@
 mod formatters;
 mod formatters_console;
 mod formatters_json;
+mod plan;
 
 use crate::cli::commands::model_package;
 use crate::cli::models::ModelSearchSort;
@@ -499,6 +500,12 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             run_model_recommended(*json)?
         }
         ModelsCommand::Installed { json } => run_model_installed(*json)?,
+        ModelsCommand::Recommend {
+            api_base,
+            ctx_size,
+            limit,
+            json,
+        } => plan::run_model_recommend(api_base.as_deref(), *ctx_size, *limit, *json).await?,
         ModelsCommand::Cleanup {
             unused_since,
             yes,
@@ -535,6 +542,12 @@ pub async fn dispatch_models_command(command: &ModelsCommand) -> Result<()> {
             json,
         } => run_model_search(query, *gguf, *mlx, *catalog, *limit, *sort, *json).await?,
         ModelsCommand::Show { model, json } => run_model_show(model, *json).await?,
+        ModelsCommand::Plan {
+            model,
+            api_base,
+            ctx_size,
+            json,
+        } => plan::run_model_plan(model, api_base.as_deref(), *ctx_size, *json).await?,
         ModelsCommand::Download { model, draft, json } => {
             run_model_download(model, *draft, *json).await?
         }
