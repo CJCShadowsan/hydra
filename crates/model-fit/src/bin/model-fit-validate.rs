@@ -134,6 +134,7 @@ struct ModelValidationReport {
 #[derive(Clone, Debug, Serialize)]
 struct AbiDecodeProbeSummary {
     attempted: bool,
+    skip_reason: Option<String>,
     tokens_per_second: Option<f64>,
     elapsed_ms: Option<f64>,
     measured_tokens: Option<u64>,
@@ -651,7 +652,12 @@ fn validate_prepared_model(
         ),
     );
     let benchmarks = benchmark_model(args, hardware, &prepared, &recommendation, model_index);
-    let abi_decode_probe = Some(run_abi_decode_probe(args, &prepared, model_index));
+    let abi_decode_probe = Some(run_abi_decode_probe_for_recommendation(
+        args,
+        &prepared,
+        &recommendation,
+        model_index,
+    ));
     let benchmark = benchmarks
         .iter()
         .find(|benchmark| benchmark.scenario == "steady_decode")
@@ -802,6 +808,69 @@ fn prepare_local_model(
     })
 }
 
+fn run_abi_decode_probe_for_recommendation(
+    args: &Args,
+    model: &PreparedModel,
+    recommendation: &ModelRecommendation,
+    model_index: usize,
+) -> AbiDecodeProbeSummary {
+    if let Some(reason) = abi_decode_probe_skip_reason(args, recommendation) {
+        heartbeat(
+            Some(model_index),
+            &model.input_ref,
+            "abi_probe_skip",
+            &reason,
+        );
+        return skipped_abi_decode_probe(reason);
+    }
+    run_abi_decode_probe(args, model, model_index)
+}
+
+fn abi_decode_probe_skip_reason(
+    args: &Args,
+    recommendation: &ModelRecommendation,
+) -> Option<String> {
+    if !args.benchmark_all
+        && !matches!(
+            recommendation.fit_status,
+            FitStatus::FitsLocal | FitStatus::FitsWithWarning
+        )
+    {
+        return Some(format!(
+            "fit status is {:?}; use --benchmark-all to force single-stage ABI decode probe",
+            recommendation.fit_status
+        ));
+    }
+    if !args.benchmark_all && recommendation.selected_backend == BackendKind::Cpu {
+        return Some(
+            "fit selected CPU backend; use --benchmark-all to force the single-stage ABI decode probe"
+                .into(),
+        );
+    }
+    None
+}
+
+fn skipped_abi_decode_probe(reason: String) -> AbiDecodeProbeSummary {
+    AbiDecodeProbeSummary {
+        attempted: false,
+        skip_reason: Some(reason),
+        tokens_per_second: None,
+        elapsed_ms: None,
+        measured_tokens: None,
+        prompt_token_count: None,
+        command: Vec::new(),
+        observations: Vec::new(),
+        sample_count: 0,
+        raw_sample_count: 0,
+        min_tokens_per_second: None,
+        max_tokens_per_second: None,
+        spread_pct: None,
+        raw_spread_pct: None,
+        denoised_outlier_count: 0,
+        error: None,
+    }
+}
+
 fn run_abi_decode_probe(
     args: &Args,
     model: &PreparedModel,
@@ -809,6 +878,7 @@ fn run_abi_decode_probe(
 ) -> AbiDecodeProbeSummary {
     let mut summary = AbiDecodeProbeSummary {
         attempted: true,
+        skip_reason: None,
         tokens_per_second: None,
         elapsed_ms: None,
         measured_tokens: None,
