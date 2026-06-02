@@ -169,6 +169,84 @@ fn dense_model(id: &str, bytes: u64, layers: u32, hidden: u32, context: u32) -> 
     }
 }
 
+fn qwen3_30b_a3b_q4_moe() -> ModelProfile {
+    let file_bytes = 18_556_686_912;
+    let attention_bytes = 1_700_000_000;
+    let feed_forward_bytes = 900_000_000;
+    let expert_bytes = file_bytes - attention_bytes - feed_forward_bytes - 800_000_000;
+    let output_bytes = 400_000_000;
+    ModelProfile {
+        source: ModelSource {
+            id: "unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M".into(),
+            path: None,
+            metadata_name: Some("Qwen3-30B-A3B-Q4_K_M.gguf".into()),
+        },
+        architecture: Some("qwen3moe".into()),
+        architecture_class: ModelArchitectureClass::SparseMoeTransformer,
+        weight_coverage: WeightCoverage::Full,
+        file_size_bytes: file_bytes,
+        tensor_bytes: Some(file_bytes),
+        base_resident_bytes: Some(file_bytes.saturating_sub(expert_bytes)),
+        expert_tensor_bytes: Some(expert_bytes),
+        tensor_group_bytes: TensorGroupBytes {
+            attention_bytes,
+            feed_forward_bytes,
+            expert_feed_forward_bytes: expert_bytes,
+            embedding_bytes: 300_000_000,
+            output_bytes,
+            normalization_bytes: 100_000_000,
+            other_bytes: file_bytes
+                .saturating_sub(attention_bytes)
+                .saturating_sub(feed_forward_bytes)
+                .saturating_sub(expert_bytes)
+                .saturating_sub(300_000_000)
+                .saturating_sub(output_bytes)
+                .saturating_sub(100_000_000),
+        },
+        tensor_matmul: TensorMatmulProfile {
+            base_bytes: attention_bytes + feed_forward_bytes + output_bytes,
+            expert_bytes,
+            base_flops_per_token: 0,
+            expert_flops_per_token: 0,
+            base_type_bytes: TensorTypeBytes {
+                q4_k_bytes: attention_bytes + feed_forward_bytes + output_bytes,
+                ..TensorTypeBytes::default()
+            },
+            expert_type_bytes: TensorTypeBytes {
+                q4_k_bytes: expert_bytes,
+                ..TensorTypeBytes::default()
+            },
+            attention: synthetic_matmul_group(attention_bytes, 48 * 4, 2048, 2048),
+            feed_forward: synthetic_matmul_group(feed_forward_bytes, 48 * 3, 2048, 6144),
+            output: synthetic_matmul_group(output_bytes, 1, 2048, 2048),
+            expert_feed_forward: synthetic_matmul_group(expert_bytes, 48 * 128 * 3, 2048, 768),
+        },
+        parameter_count: None,
+        quantization: Some("Q4_K_M".into()),
+        layer_count: Some(48),
+        hidden_size: Some(2048),
+        ffn_size: Some(6144),
+        attention_heads: Some(32),
+        kv_heads: Some(4),
+        key_length: Some(128),
+        value_length: Some(128),
+        context_length: Some(40_960),
+        expert_count: Some(128),
+        expert_used_count: Some(8),
+        rope: RopeProfile::default(),
+        tokenizer: TokenizerProfile {
+            model: Some("gpt2".into()),
+            vocab_size: Some(151_936),
+            chat_template_available: true,
+        },
+        capability_evidence: vec![
+            CapabilityEvidence::ChatTemplatePresent,
+            CapabilityEvidence::SystemRoleInChatTemplate,
+            CapabilityEvidence::NativeContextAtLeast(40_960),
+        ],
+    }
+}
+
 fn synthetic_matmul_group(
     bytes: u64,
     logical_matrix_count: u32,
@@ -686,6 +764,29 @@ fn generation_workload_does_not_use_cpu_ram_as_discrete_gpu_fit() {
     assert_eq!(rec.fit_status, FitStatus::SplitCandidate);
     assert!(rec.split_candidate.is_some());
     assert!(rec.estimated_runtime_memory_bytes > 15 * GIB);
+}
+
+#[test]
+fn white_qwen3_moe_fixture_is_split_candidate_not_cpu_fit() {
+    let hardware = discrete_cuda_16g();
+    let mut config = SelectionConfig {
+        workload: WorkloadProfile::chat(),
+        ..SelectionConfig::default()
+    };
+    config.weights = config.workload.default_weights();
+    let model = qwen3_30b_a3b_q4_moe();
+
+    let rec = score_model(&hardware, &model, &config);
+
+    assert_eq!(rec.selected_backend, BackendKind::Cuda);
+    assert_eq!(rec.fit_status, FitStatus::SplitCandidate);
+    assert!(rec.split_candidate.is_some());
+    assert!(rec.estimated_runtime_memory_bytes > 19 * GIB);
+    assert!(
+        rec.warnings
+            .iter()
+            .any(|warning| warning.contains("MoE decode estimate uses active experts"))
+    );
 }
 
 #[test]

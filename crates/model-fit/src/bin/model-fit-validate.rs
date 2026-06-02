@@ -124,11 +124,31 @@ struct ModelValidationReport {
     primary_gguf_path: Option<PathBuf>,
     model_profile: Option<ModelProfile>,
     recommendation: Option<ModelRecommendation>,
+    fit_interpretation: Option<FitInterpretation>,
+    split_validation: Option<SplitValidationSummary>,
     recommendations: Vec<WorkloadRecommendation>,
     abi_decode_probe: Option<AbiDecodeProbeSummary>,
     benchmarks: Vec<BenchmarkScenarioSummary>,
     benchmark: BenchmarkSummary,
     errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FitInterpretation {
+    local_accelerated_fit: bool,
+    single_node_validation_allowed: bool,
+    summary: String,
+    details: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SplitValidationSummary {
+    status: String,
+    attempted: bool,
+    estimated_stages: Option<u32>,
+    per_stage_memory_budget_bytes: Option<u64>,
+    reason: String,
+    warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -658,6 +678,8 @@ fn validate_prepared_model(
         &recommendation,
         model_index,
     ));
+    let fit_interpretation = Some(fit_interpretation(&recommendation));
+    let split_validation = split_validation_summary(&recommendation);
     let benchmark = benchmarks
         .iter()
         .find(|benchmark| benchmark.scenario == "steady_decode")
@@ -675,12 +697,83 @@ fn validate_prepared_model(
         primary_gguf_path: Some(prepared.primary_gguf_path),
         model_profile: Some(prepared.profile),
         recommendation: Some(recommendation),
+        fit_interpretation,
+        split_validation,
         recommendations,
         abi_decode_probe,
         benchmarks,
         benchmark,
         errors: Vec::new(),
     }
+}
+
+fn fit_interpretation(recommendation: &ModelRecommendation) -> FitInterpretation {
+    let local_accelerated_fit = matches!(
+        recommendation.fit_status,
+        FitStatus::FitsLocal | FitStatus::FitsWithWarning
+    ) && recommendation.selected_backend != BackendKind::Cpu;
+    let single_node_validation_allowed = matches!(
+        recommendation.fit_status,
+        FitStatus::FitsLocal | FitStatus::FitsWithWarning
+    );
+    let summary = match recommendation.fit_status {
+        FitStatus::FitsLocal => "fits local selected backend".into(),
+        FitStatus::FitsWithWarning => "fits local selected backend with warnings".into(),
+        FitStatus::SplitCandidate => {
+            "does not fit single-node local selected backend; candidate for Skippy split serving"
+                .into()
+        }
+        FitStatus::Rejected => "does not fit this hardware profile".into(),
+    };
+    let mut details = Vec::new();
+    match recommendation.fit_status {
+        FitStatus::SplitCandidate => {
+            details.push(
+                "single-stage local validation is skipped by default because it would force a runtime shape the fit algorithm rejected"
+                    .into(),
+            );
+            if let Some(split) = recommendation.split_candidate.as_ref() {
+                details.push(format!(
+                    "estimated split plan requires {} stages with about {:.1} GiB safety-adjusted memory budget per stage",
+                    split.estimated_stages,
+                    split.per_stage_memory_budget_bytes as f64 / 1024_f64.powi(3)
+                ));
+            }
+        }
+        FitStatus::Rejected => {
+            details.push(
+                "validation is skipped by default because no local serving shape was selected"
+                    .into(),
+            );
+        }
+        _ => {
+            details.push(format!(
+                "selected backend {:?} is the local validation target",
+                recommendation.selected_backend
+            ));
+        }
+    }
+    FitInterpretation {
+        local_accelerated_fit,
+        single_node_validation_allowed,
+        summary,
+        details,
+    }
+}
+
+fn split_validation_summary(
+    recommendation: &ModelRecommendation,
+) -> Option<SplitValidationSummary> {
+    let split = recommendation.split_candidate.as_ref()?;
+    Some(SplitValidationSummary {
+        status: "requires-mesh-split-validation".into(),
+        attempted: false,
+        estimated_stages: Some(split.estimated_stages),
+        per_stage_memory_budget_bytes: Some(split.per_stage_memory_budget_bytes),
+        reason: "model-fit identified a split candidate; single-host local-single validation is not evidence that a multi-node Skippy split can serve it"
+            .into(),
+        warning: Some(split.warning.clone()),
+    })
 }
 
 async fn prepare_model(
@@ -3069,6 +3162,8 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
         primary_gguf_path: None,
         model_profile: None,
         recommendation: None,
+        fit_interpretation: None,
+        split_validation: None,
         recommendations: Vec::new(),
         abi_decode_probe: None,
         benchmarks: Vec::new(),
@@ -3083,14 +3178,15 @@ fn error_report(input_ref: String, error: String) -> ModelValidationReport {
 
 fn print_markdown_table(rows: &[ModelValidationReport]) {
     println!(
-        "| model_ref | fit | backend | est tok/s | abi tok/s | est range | steady median | steady/fit | steady | first-token | kv-reuse |"
+        "| model_ref | fit | meaning | backend | est tok/s | abi tok/s | est range | steady median | steady/fit | steady | first-token | kv-reuse |"
     );
-    println!("|---|---|---|---:|---:|---:|---:|---:|---|---|---|");
+    println!("|---|---|---|---|---:|---:|---:|---:|---:|---|---|---|");
     for row in rows {
         println!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.input_ref,
             fit_status(row),
+            display_fit_meaning(row),
             display_selected_backend(row),
             display_estimated_tps(row),
             display_abi_decode_probe(row),
@@ -3102,6 +3198,13 @@ fn print_markdown_table(rows: &[ModelValidationReport]) {
             scenario_verdict(row, "kv_warm_reuse"),
         );
     }
+}
+
+fn display_fit_meaning(row: &ModelValidationReport) -> String {
+    row.fit_interpretation
+        .as_ref()
+        .map(|fit| fit.summary.clone())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn display_selected_backend(row: &ModelValidationReport) -> String {

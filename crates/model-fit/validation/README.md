@@ -83,6 +83,19 @@ The steady-decode estimator is source-grounded rather than model-name grounded:
   components plus observed tokenize, prefill, decode, and unattributed request
   time. That keeps request/setup residuals visible instead of blaming them on
   decode or prefill.
+- `SplitCandidate` is not a local single-node fit. It means the selected
+  accelerator budget could not hold the estimated resident runtime allocation
+  after safety margin, but the model has enough transformer structure to plan a
+  Skippy split. Validators skip local-single and ABI decode probes by default
+  for this status because forcing full offload would only re-test the rejected
+  allocation shape. The JSON `split_validation` section records the estimated
+  stage count and per-stage memory budget; actual split validation requires a
+  mesh/stage topology with enough per-stage accelerator memory.
+- On discrete-GPU hosts, transformer generation workloads do not silently fall
+  back to CPU RAM to become `FitsLocal`. CPU budgets remain valid for CPU-only
+  hosts and non-generative workloads such as embeddings/reranking, but chat,
+  coding, tool-calling, summarization, and general generation must fit the
+  selected accelerator or be reported as `SplitCandidate`/`Rejected`.
 
 TODO: Verify the ROCm/HIP dense and MoE prefill probes on a real AMD host. The
 HIP backend is implemented with hipBLAS and should emit
