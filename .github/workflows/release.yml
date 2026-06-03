@@ -472,6 +472,11 @@ jobs:
             crates/mesh-llm-ui/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@just
+      - name: Prepare dispatched release version
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Build aarch64 CUDA release bundle
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}

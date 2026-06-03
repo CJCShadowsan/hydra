@@ -708,6 +708,8 @@ fn check_release_targets() -> DynResult<()> {
     }
     check_windows_name_invariance(&fixture_rows, &fixture_version)?;
     check_ci_script_workspace_members(&repo_root)?;
+    check_workspace_package_versions(&repo_root)?;
+    check_workspace_internal_dependency_versions(&repo_root)?;
     check_attestation_default_version(&repo_root)?;
     check_publish_crates_consistency(&repo_root)?;
     check_docs_and_workflow_invariants(&repo_root)?;
@@ -1036,6 +1038,62 @@ fn check_installer_outcomes(repo_root: &Path, rows: &[FixtureRow]) -> DynResult<
         &actual_message,
         "Linux/armv7l installer error",
     )?;
+
+    Ok(())
+}
+
+fn check_workspace_package_versions(repo_root: &Path) -> DynResult<()> {
+    let metadata = workspace_metadata(repo_root, "workspace package version ownership")?;
+    let workspace_members = metadata
+        .workspace_members
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for package in metadata.packages {
+        if !workspace_members.contains(&package.id) {
+            continue;
+        }
+
+        let manifest = fs::read_to_string(&package.manifest_path)?;
+        let package_section = manifest_section(&manifest, "package").ok_or_else(|| {
+            format!(
+                "{}: missing [package] section",
+                display_relative(repo_root, &package.manifest_path)
+            )
+        })?;
+        if !package_section_uses_workspace_version(package_section) {
+            return Err(format!(
+                "{}: workspace member `{}` must use `version.workspace = true`",
+                display_relative(repo_root, &package.manifest_path),
+                package.name
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn check_workspace_internal_dependency_versions(repo_root: &Path) -> DynResult<()> {
+    let manifest_path = repo_root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path)?;
+    let Some(workspace_deps) = manifest_section(&manifest, "workspace.dependencies") else {
+        return Ok(());
+    };
+
+    for line in workspace_deps.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || !trimmed.contains("path = \"crates/") {
+            continue;
+        }
+        if !trimmed.contains("version =") {
+            return Err(format!(
+                "Cargo.toml [workspace.dependencies]: internal dependency must carry a release-updated version: `{trimmed}`"
+            )
+            .into());
+        }
+    }
 
     Ok(())
 }
@@ -1446,7 +1504,48 @@ fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<()> {
         &pr_builds_workflow,
         &windows_warm_caches_workflow,
     )?;
+    check_release_dispatch_version_preparation(&release_workflow)?;
     check_ci_crate_test_coverage(&pr_builds_workflow)?;
+
+    Ok(())
+}
+
+fn check_release_dispatch_version_preparation(release_workflow: &str) -> DynResult<()> {
+    const DISPATCH_RELEASE_JOBS: &[&str] = &[
+        "build",
+        "build_native_sdk_runtime",
+        "build_swift_sdk_artifact",
+        "build_linux_arm64",
+        "build_linux_aarch64_cuda",
+        "build_linux_cuda",
+        "build_linux_rocm",
+        "build_linux_vulkan",
+        "build_windows_cpu",
+        "build_windows_gpu",
+    ];
+    const REQUIRED_STEP: &str = "Prepare dispatched release version";
+    const REQUIRED_COMMAND: &str = "scripts/release-version.sh \"$RELEASE_TAG\"";
+
+    for job_name in DISPATCH_RELEASE_JOBS {
+        let job = workflow_job_section(release_workflow, job_name).ok_or_else(|| {
+            format!("release workflow: missing `{job_name}` job for dispatched version check")
+        })?;
+        ensure_contains(
+            job,
+            REQUIRED_STEP,
+            &format!("release workflow `{job_name}` dispatch version step"),
+        )?;
+        ensure_contains(
+            job,
+            "if: github.event_name == 'workflow_dispatch'",
+            &format!("release workflow `{job_name}` dispatch version condition"),
+        )?;
+        ensure_contains(
+            job,
+            REQUIRED_COMMAND,
+            &format!("release workflow `{job_name}` dispatch version command"),
+        )?;
+    }
 
     Ok(())
 }
@@ -2176,6 +2275,73 @@ fn ensure_contains_normalized(haystack: &str, needle: &str, context: &str) -> Dy
     } else {
         Err(format!("{context}: missing `{needle}`").into())
     }
+}
+
+fn manifest_section<'a>(manifest: &'a str, section: &str) -> Option<&'a str> {
+    let header = format!("[{section}]");
+    let mut section_start = None;
+
+    let mut offset = 0;
+    for raw_line in manifest.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw_line.len();
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = line.trim();
+        if trimmed == header {
+            section_start = Some(offset);
+            continue;
+        }
+        if section_start.is_some() && trimmed.starts_with('[') {
+            return section_start.map(|start| &manifest[start..line_start]);
+        }
+    }
+
+    section_start.map(|start| &manifest[start..])
+}
+
+fn package_section_uses_workspace_version(section: &str) -> bool {
+    section.lines().any(|line| {
+        let compact = line
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
+        compact == "version.workspace=true" || compact == "version={workspace=true}"
+    })
+}
+
+fn workflow_job_section<'a>(workflow: &'a str, job_name: &str) -> Option<&'a str> {
+    let header = format!("  {job_name}:");
+    let mut section_start = None;
+
+    let mut offset = 0;
+    for raw_line in workflow.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw_line.len();
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if line == header {
+            section_start = Some(offset);
+            continue;
+        }
+        if section_start.is_some()
+            && line.starts_with("  ")
+            && !line.starts_with("    ")
+            && line.trim_end().ends_with(':')
+        {
+            return section_start.map(|start| &workflow[start..line_start]);
+        }
+    }
+
+    section_start.map(|start| &workflow[start..])
+}
+
+fn display_relative(repo_root: &Path, path: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 fn normalize_whitespace(value: &str) -> String {
