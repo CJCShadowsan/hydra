@@ -6,7 +6,7 @@ REPO="${MESH_LLM_INSTALL_REPO:-Mesh-LLM/mesh-llm}"
 REPO_REF="${MESH_LLM_INSTALL_REF:-main}"
 INSTALL_DIR="${MESH_LLM_INSTALL_DIR:-$HOME/.local/bin}"
 INSTALL_FLAVOR="${MESH_LLM_INSTALL_FLAVOR:-}"
-INSTALL_PRERELEASE="${MESH_LLM_INSTALL_PRERELEASE:-0}"
+INSTALL_PRERELEASE="${MESH_LLM_INSTALL_PRERELEASE:-1}"
 INSTALL_SERVICE="${MESH_LLM_INSTALL_SERVICE:-0}"
 INSTALL_SERVICE_ARGS="${MESH_LLM_INSTALL_SERVICE_ARGS:-}"
 INSTALL_SERVICE_START="${MESH_LLM_INSTALL_SERVICE_START:-1}"
@@ -53,10 +53,11 @@ bool_is_true() {
 
 usage() {
     cat <<EOF
-Usage: install.sh [--pre-release] [--service] [--no-start-service]
+Usage: install.sh [--pre-release] [--stable] [--service] [--no-start-service]
 
 Options:
-  --pre-release              Install the latest published GitHub prerelease instead of the latest stable release.
+  --pre-release              Install the latest published GitHub prerelease. This is the default.
+  --stable                   Install the latest stable release. Requires runtime release assets.
   --service                  Install a per-user background service for this platform.
   --no-start-service         Install the service files but do not start them yet.
   -h, --help                 Show this help text.
@@ -64,8 +65,9 @@ Options:
 Environment overrides:
   MESH_LLM_INSTALL_DIR
   MESH_LLM_INSTALL_FLAVOR
-  MESH_LLM_INSTALL_PRERELEASE=1
+  MESH_LLM_INSTALL_PRERELEASE=0
   MESH_LLM_INSTALL_REF=main
+  MESH_LLM_INSTALL_REPO=Mesh-LLM/mesh-llm
   MESH_LLM_INSTALL_SERVICE=1
   MESH_LLM_INSTALL_SERVICE_START=0
 EOF
@@ -76,6 +78,9 @@ parse_args() {
         case "$1" in
             --pre-release)
                 INSTALL_PRERELEASE=1
+                ;;
+            --stable)
+                INSTALL_PRERELEASE=0
                 ;;
             --service)
                 INSTALL_SERVICE=1
@@ -581,18 +586,86 @@ PRE-RELEASE#g" |
     printf '%s\n' "$tag"
 }
 
+latest_stable_tag() {
+    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+    local response
+    local -a curl_args=(
+        -fsSL
+        -H 'Accept: application/vnd.github+json'
+        -H 'X-GitHub-Api-Version: 2022-11-28'
+    )
+
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        curl_args+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+    elif [[ -n "${GH_TOKEN:-}" ]]; then
+        curl_args+=(-H "Authorization: Bearer ${GH_TOKEN}")
+    fi
+
+    if ! response="$(curl "${curl_args[@]}" "$api_url" 2>/dev/null)"; then
+        echo "error: could not query latest GitHub release for ${REPO}" >&2
+        return 1
+    fi
+
+    local compact
+    local tag
+    compact="$(printf '%s' "$response" | tr -d '\n\r\t ')"
+    tag="$(
+        printf '%s' "$compact" |
+            awk '
+                {
+                    if (match($0, /"tag_name":"[^"]+"/)) {
+                        value = substr($0, RSTART, RLENGTH)
+                        sub(/^"tag_name":"/, "", value)
+                        sub(/"$/, "", value)
+                        print value
+                    }
+                }
+            '
+    )"
+
+    if [[ -z "$tag" ]]; then
+        echo "error: could not find latest release tag for ${REPO}" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$tag"
+}
+
+versioned_release_asset_name() {
+    local asset="$1"
+    local tag="$2"
+
+    case "$asset" in
+        native-runtimes.json)
+            printf '%s\n' "$asset"
+            ;;
+        mesh-llm-v[0-9]*)
+            printf '%s\n' "$asset"
+            ;;
+        mesh-llm-*)
+            printf 'mesh-llm-%s-%s\n' "$tag" "${asset#mesh-llm-}"
+            ;;
+        *)
+            printf '%s\n' "$asset"
+            ;;
+    esac
+}
+
 release_url() {
     local asset="$1"
+    local tag
     if bool_is_true "$INSTALL_PRERELEASE"; then
-        local tag
         if ! tag="$(latest_prerelease_tag)"; then
             return 1
         fi
-        printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$tag" "$asset"
-        return 0
+    else
+        if ! tag="$(latest_stable_tag)"; then
+            return 1
+        fi
     fi
 
-    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$asset"
+    printf 'https://github.com/%s/releases/download/%s/%s\n' \
+        "$REPO" "$tag" "$(versioned_release_asset_name "$asset" "$tag")"
 }
 
 stale_binary_names() {
@@ -633,27 +706,80 @@ install_bundle() {
     done
 }
 
-install_recommended_native_runtime() {
+download_native_runtime_manifest() {
     local tmp_dir="$1"
+    local manifest_path="$tmp_dir/native-runtimes.json"
     local manifest_url
+
+    if [[ -f "$manifest_path" ]]; then
+        return 0
+    fi
+    if ! manifest_url="$(release_url "native-runtimes.json")"; then
+        return 1
+    fi
+
+    echo "Downloading $manifest_url"
+    curl -fsSL "$manifest_url" -o "$manifest_path" 2>/dev/null
+}
+
+download_release_asset() {
+    local asset="$1"
+    local archive="$2"
+    local url
+
+    if ! url="$(release_url "$asset")"; then
+        return 1
+    fi
+
+    echo "Downloading $url"
+    curl -fsSL "$url" -o "$archive" 2>/dev/null
+}
+
+download_runtime_binary_archive() {
+    local tmp_dir="$1"
+    local requested_asset="$2"
+    local requested_archive="$tmp_dir/$requested_asset"
+    local fallback_asset="mesh-bundle.tar.gz"
+    local fallback_archive="$tmp_dir/$fallback_asset"
+
+    DOWNLOADED_ASSET="$requested_asset"
+    DOWNLOADED_ARCHIVE="$requested_archive"
+
+    if download_release_asset "$requested_asset" "$requested_archive"; then
+        return 0
+    fi
+
+    if [[ "$requested_asset" != "$fallback_asset" ]] &&
+        download_release_asset "$fallback_asset" "$fallback_archive"; then
+        echo "Using runtime-enabled mesh bundle because $requested_asset was not available."
+        DOWNLOADED_ASSET="$fallback_asset"
+        DOWNLOADED_ARCHIVE="$fallback_archive"
+        return 0
+    fi
+
+    echo "error: could not download runtime release archive: $requested_asset or $fallback_asset" >&2
+    return 1
+}
+
+install_native_runtime_required() {
+    local tmp_dir="$1"
     local manifest_path="$tmp_dir/native-runtimes.json"
     local binary="$INSTALL_DIR/mesh-llm"
 
     if [[ ! -x "$binary" ]]; then
-        return 0
+        echo "error: mesh-llm binary was not installed at $binary" >&2
+        return 1
     fi
-    if ! manifest_url="$(release_url "native-runtimes.json")"; then
-        return 0
+    if ! "$binary" runtime install --help >/dev/null 2>&1; then
+        echo "error: installed mesh-llm does not support native runtime install" >&2
+        return 1
     fi
-    if ! curl -fsSL "$manifest_url" -o "$manifest_path"; then
-        echo "Native runtime manifest was not available for this release; skipping runtime install."
-        return 0
+    if [[ ! -f "$manifest_path" ]]; then
+        echo "error: native runtime manifest was not downloaded" >&2
+        return 1
     fi
 
-    "$binary" runtime install --manifest "$manifest_path" || {
-        echo "warning: native runtime install did not complete successfully." >&2
-        return 0
-    }
+    "$binary" runtime install --manifest "$manifest_path"
     "$binary" runtime prune --active-only || true
 }
 
@@ -898,10 +1024,6 @@ main() {
     flavor="$(choose_flavor)"
     local asset
     asset="$(asset_name "$flavor")"
-    local url
-    if ! url="$(release_url "$asset")"; then
-        exit 1
-    fi
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
@@ -909,17 +1031,21 @@ main() {
     printf -v tmp_dir_escaped '%q' "$tmp_dir"
     trap "rm -rf -- $tmp_dir_escaped" EXIT
 
-    local archive="$tmp_dir/$asset"
     echo "Installing flavor: $flavor"
     if bool_is_true "$INSTALL_PRERELEASE"; then
         echo "Release channel: prerelease"
     else
         echo "Release channel: stable"
     fi
-    echo "Downloading $url"
-    curl -fsSL "$url" -o "$archive"
 
-    tar -xzf "$archive" -C "$tmp_dir"
+    if ! download_native_runtime_manifest "$tmp_dir"; then
+        echo "error: native runtime manifest was not available for this release." >&2
+        echo "Retry with --pre-release, or wait for stable to publish runtime release assets." >&2
+        exit 1
+    fi
+    download_runtime_binary_archive "$tmp_dir" "$asset"
+
+    tar -xzf "$DOWNLOADED_ARCHIVE" -C "$tmp_dir"
 
     if [[ ! -d "$tmp_dir/mesh-bundle" ]]; then
         echo "error: release archive did not contain mesh-bundle/" >&2
@@ -927,9 +1053,9 @@ main() {
     fi
 
     install_bundle "$tmp_dir/mesh-bundle"
-    install_recommended_native_runtime "$tmp_dir"
+    install_native_runtime_required "$tmp_dir"
 
-    echo "Installed $asset to $INSTALL_DIR"
+    echo "Installed $DOWNLOADED_ASSET and native runtime to $INSTALL_DIR"
 
     if bool_is_true "$INSTALL_SERVICE"; then
         echo

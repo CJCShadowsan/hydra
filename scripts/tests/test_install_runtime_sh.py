@@ -117,7 +117,7 @@ class InstallRuntimeScriptTests(unittest.TestCase):
                 release_url() {{
                     printf 'file://{assets_dir}/%s\\n' "$1"
                 }}
-                main_runtime
+                main
                 """,
             )
 

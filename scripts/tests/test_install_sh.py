@@ -13,7 +13,19 @@ SCRIPT = ROOT / "install.sh"
 
 
 class InstallScriptTests(unittest.TestCase):
-    def test_legacy_installer_uses_platform_asset_name(self) -> None:
+    def test_defaults_to_prerelease_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._run_helper(
+                Path(tmp),
+                """
+                printf '%s\\n' "$INSTALL_PRERELEASE"
+                """,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "1")
+
+    def test_runtime_installer_uses_platform_asset_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             result = self._run_helper(
@@ -28,34 +40,22 @@ class InstallScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "mesh-llm-aarch64-apple-darwin.tar.gz")
 
-    def test_legacy_installer_still_treats_runtime_manifest_as_optional(self) -> None:
+    def test_runtime_installer_requires_native_runtime_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            install_dir = tmp_path / "bin"
-            install_dir.mkdir()
-            calls = tmp_path / "calls.log"
-            self._write_fake_mesh_llm(
-                install_dir / "mesh-llm",
-                f"""
-                echo "$*" >> {calls}
-                exit 0
-                """,
-            )
 
             result = self._run_helper(
                 tmp_path,
-                f"""
-                INSTALL_DIR={install_dir}
-                release_url() {{
-                    printf 'file://{tmp_path}/missing-native-runtimes.json\\n'
-                }}
-                install_recommended_native_runtime "{tmp_path}"
+                """
+                release_url() {
+                    printf 'file:///missing/%s\\n' "$1"
+                }
+                main
                 """,
             )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("Native runtime manifest was not available", result.stdout)
-            self.assertFalse(calls.exists())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("native runtime manifest was not available", result.stderr)
 
     def _run_helper(self, tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
