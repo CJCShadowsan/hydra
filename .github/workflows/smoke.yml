@@ -16,6 +16,9 @@ on:
         required: false
         default: '"ubuntu-24.04"'
         type: string
+    secrets:
+      HF_TOKEN:
+        required: false
 
 env:
   CACHE_NAMESPACE: mesh-llm
@@ -26,6 +29,8 @@ jobs:
   smoke_tests:
     name: Skippy Inference Smoke Tests
     runs-on: ${{ fromJson(inputs.runs_on) }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
