@@ -1505,6 +1505,7 @@ fn check_docs_and_workflow_invariants(repo_root: &Path) -> DynResult<()> {
         &windows_warm_caches_workflow,
     )?;
     check_release_dispatch_version_preparation(&release_workflow)?;
+    check_release_container_safe_directories(&release_workflow)?;
     check_ci_crate_test_coverage(&pr_builds_workflow)?;
 
     Ok(())
@@ -1544,6 +1545,34 @@ fn check_release_dispatch_version_preparation(release_workflow: &str) -> DynResu
             job,
             REQUIRED_COMMAND,
             &format!("release workflow `{job_name}` dispatch version command"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn check_release_container_safe_directories(release_workflow: &str) -> DynResult<()> {
+    const CONTAINER_RELEASE_JOBS: &[&str] = &[
+        "build_linux_aarch64_cuda",
+        "build_linux_cuda",
+        "build_linux_rocm",
+    ];
+    const REQUIRED_STEP: &str = "Trust checkout directory";
+    const REQUIRED_COMMAND: &str = "git config --global --add safe.directory \"$GITHUB_WORKSPACE\"";
+
+    for job_name in CONTAINER_RELEASE_JOBS {
+        let job = workflow_job_section(release_workflow, job_name).ok_or_else(|| {
+            format!("release workflow: missing `{job_name}` job for container safe-directory check")
+        })?;
+        ensure_contains(
+            job,
+            REQUIRED_STEP,
+            &format!("release workflow `{job_name}` safe-directory step"),
+        )?;
+        ensure_contains(
+            job,
+            REQUIRED_COMMAND,
+            &format!("release workflow `{job_name}` safe-directory command"),
         )?;
     }
 
