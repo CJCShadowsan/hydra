@@ -254,12 +254,12 @@ jobs:
       matrix:
         include:
           - name: macOS aarch64 Metal
-            os: blacksmith-6vcpu-macos-15
+            os: macos-15
             backend: metal
             target: aarch64-apple-darwin
             artifact_suffix: darwin-aarch64-metal
           - name: Linux x86_64 CPU
-            os: blacksmith-4vcpu-ubuntu-2404
+            os: ubuntu-24.04
             backend: cpu
             target: x86_64-unknown-linux-gnu
             artifact_suffix: linux-x86_64-cpu
