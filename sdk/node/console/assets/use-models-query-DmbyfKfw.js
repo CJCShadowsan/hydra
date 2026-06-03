@@ -1,0 +1,1 @@
+import{Gt as e,Wt as t,vn as n,zt as r}from"./index-BgBNOO8w.js";async function i(){let e=await fetch(`${n.managementApiUrl}/api/models`);if(!e.ok){let t=await e.text();throw new r(e.status,t,`HTTP ${e.status}`)}return e.json()}function a(n){return e({queryKey:t.catalog(),queryFn:i,staleTime:6e4,refetchInterval:6e4,enabled:n?.enabled??!0})}export{a as t};

@@ -16,5 +16,5 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-mesh-llm-events = { path = "../mesh-llm-events", version = "0.68.0" }
+mesh-llm-events = { path = "../mesh-llm-events", version = "0.72.0-rc1" }
 serde.workspace = true
