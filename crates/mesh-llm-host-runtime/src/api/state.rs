@@ -43,6 +43,10 @@ impl Serialize for PublicationState {
 }
 
 pub enum RuntimeControlRequest {
+    Join {
+        invite_token: String,
+        resp: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
     Load {
         spec: String,
         resp: tokio::sync::oneshot::Sender<anyhow::Result<RuntimeLoadResponse>>,
@@ -56,7 +60,9 @@ pub enum RuntimeControlRequest {
         mode: GuardrailMode,
         resp: tokio::sync::oneshot::Sender<anyhow::Result<OpenAiGuardrailModeUpdateResponse>>,
     },
-    Shutdown,
+    Shutdown {
+        source: &'static str,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
