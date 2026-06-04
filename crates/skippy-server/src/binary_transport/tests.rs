@@ -177,10 +177,11 @@ fn decode_record_tokens_sideband_records_metadata_without_changing_exec_token() 
     let message = first_decode_message_with_full_prompt_sideband();
 
     let exec_tokens = token_sideband_or_fill(&message).unwrap();
-    let prompt_tokens = decode_record_tokens_sideband(&message).unwrap();
+    let record_sideband = decode_record_tokens_sideband(&message).unwrap();
 
     assert_eq!(exec_tokens, vec![104]);
-    assert_eq!(prompt_tokens, &[101, 102, 103, 104]);
+    assert_eq!(record_sideband.tokens, &[101, 102, 103, 104]);
+    assert_eq!(record_sideband.anchor_token_count, None);
 }
 
 #[test]
@@ -190,11 +191,22 @@ fn decode_record_tokens_sideband_accepts_decode_checkpoint() {
     message.state.current_token = 201;
     message.tokens.push(201);
 
-    assert_eq!(
-        decode_record_tokens_sideband(&message).unwrap(),
-        &[101, 102, 103, 104, 201]
-    );
+    let record_sideband = decode_record_tokens_sideband(&message).unwrap();
+    assert_eq!(record_sideband.tokens, &[101, 102, 103, 104, 201]);
+    assert_eq!(record_sideband.anchor_token_count, None);
     assert_eq!(token_sideband_or_fill(&message).unwrap(), vec![201]);
+}
+
+#[test]
+fn decode_record_tokens_sideband_accepts_anchor_position() {
+    let mut message = first_decode_message_with_full_prompt_sideband();
+    message.positions = vec![3];
+
+    let record_sideband = decode_record_tokens_sideband(&message).unwrap();
+
+    assert_eq!(record_sideband.tokens, &[101, 102, 103, 104]);
+    assert_eq!(record_sideband.anchor_token_count, Some(3));
+    assert_eq!(token_sideband_or_fill(&message).unwrap(), vec![104]);
 }
 
 #[test]

@@ -51,6 +51,25 @@ impl StageOpenAiBackend {
         }
         let max_tokens = max_tokens.resolve(prompt_token_ids.len(), self.ctx_size)?;
         let chat_sampling_metadata = prompt.chat_parse_metadata.as_deref();
+        let prompt_anchor_token_count =
+            prompt_cache_anchor_token_count(&ids, prompt_token_ids.len());
+        if let Some(anchor_tokens) = prompt_anchor_token_count {
+            let mut anchor_attrs = self.openai_attrs(&ids);
+            anchor_attrs.insert(
+                "skippy.kv.decision".to_string(),
+                json!("prompt_anchor_requested"),
+            );
+            anchor_attrs.insert(
+                "skippy.kv.anchor_token_count".to_string(),
+                json!(anchor_tokens),
+            );
+            anchor_attrs.insert(
+                "llama_stage.prompt_token_count".to_string(),
+                json!(prompt_token_ids.len()),
+            );
+            self.telemetry
+                .emit("stage.openai_kv_lookup_decision", anchor_attrs);
+        }
 
         let mut collector =
             TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
@@ -109,6 +128,7 @@ impl StageOpenAiBackend {
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,
                     prompt_token_ids: &prompt_token_ids,
+                    prompt_anchor_token_count,
                     max_tokens,
                     sampling: &sampling,
                     chat_sampling_metadata,
@@ -932,4 +952,18 @@ impl StageOpenAiBackend {
         result?;
         collector.finish(prompt_tokens, GenerationCacheStats::default())
     }
+}
+
+pub(super) fn prompt_cache_anchor_token_count(
+    ids: &OpenAiGenerationIds,
+    prompt_token_count: usize,
+) -> Option<usize> {
+    let anchor_tokens = ids.cache.prompt_cache_anchor_tokens? as usize;
+    if ids.cache.prompt_cache_key.is_none()
+        || anchor_tokens == 0
+        || anchor_tokens >= prompt_token_count
+    {
+        return None;
+    }
+    Some(anchor_tokens)
 }

@@ -426,6 +426,7 @@ impl EmbeddedServingController {
             reasoning_effort: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            prompt_cache_anchor_tokens: None,
             stream_options: None,
             extra: BTreeMap::new(),
         };

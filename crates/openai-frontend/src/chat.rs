@@ -39,6 +39,7 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub prompt_cache_key: Option<String>,
     pub prompt_cache_retention: Option<PromptCacheRetention>,
+    pub prompt_cache_anchor_tokens: Option<u32>,
     pub stream_options: Option<StreamOptions>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

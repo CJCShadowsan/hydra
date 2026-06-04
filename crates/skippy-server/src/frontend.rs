@@ -76,6 +76,7 @@ mod generation_flow;
 mod local_generation;
 mod prefill;
 mod prefix_cache;
+mod prompt_anchor;
 mod prompting;
 mod request;
 mod speculative;
@@ -1045,6 +1046,7 @@ impl OpenAiGenerationIds {
 struct OpenAiCacheHints {
     prompt_cache_key: Option<String>,
     prompt_cache_retention: Option<String>,
+    prompt_cache_anchor_tokens: Option<u32>,
 }
 
 impl OpenAiCacheHints {
@@ -1060,6 +1062,7 @@ impl OpenAiCacheHints {
                 .prompt_cache_retention
                 .map(prompt_cache_retention_label)
                 .map(ToString::to_string),
+            prompt_cache_anchor_tokens: request.prompt_cache_anchor_tokens,
         }
     }
 
@@ -1075,6 +1078,7 @@ impl OpenAiCacheHints {
                 .prompt_cache_retention
                 .map(prompt_cache_retention_label)
                 .map(ToString::to_string),
+            prompt_cache_anchor_tokens: request.prompt_cache_anchor_tokens,
         }
     }
 
@@ -1640,6 +1644,7 @@ struct EmbeddedStageZeroGeneration<'a> {
     speculative_window: usize,
     adaptive_speculative_window: bool,
     prompt_token_ids: &'a [i32],
+    prompt_anchor_token_count: Option<usize>,
     max_tokens: u32,
     sampling: &'a SamplingConfig,
     chat_sampling_metadata: Option<&'a str>,

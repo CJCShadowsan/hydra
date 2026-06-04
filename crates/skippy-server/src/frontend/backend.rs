@@ -305,6 +305,12 @@ impl StageOpenAiBackend {
                 json!(retention),
             );
         }
+        if let Some(anchor_tokens) = ids.cache.prompt_cache_anchor_tokens {
+            attrs.insert(
+                "openai.prompt_cache_anchor_tokens".to_string(),
+                json!(anchor_tokens),
+            );
+        }
         attrs
     }
 

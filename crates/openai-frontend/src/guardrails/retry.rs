@@ -39,6 +39,7 @@ pub(crate) fn build_retry_request(
     );
     if attempt_index > 0 {
         retry_request.prompt_cache_key = None;
+        retry_request.prompt_cache_anchor_tokens = None;
     }
     retry_request
 }

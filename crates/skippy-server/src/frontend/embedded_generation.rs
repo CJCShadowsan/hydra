@@ -148,6 +148,26 @@ impl StageOpenAiBackend {
                     );
                     cache_stats.hit_kind = Some("chain_prefix");
                 }
+                if prefill_chain_restored_tokens == 0
+                    && let Some(anchor_restore) = self.try_restore_embedded_split_prompt_anchor(
+                        &request,
+                        &session_key,
+                        downstream,
+                    )?
+                {
+                    prefill_chain_restored_tokens = anchor_restore.restored_tokens;
+                    prefill_chain_cache_stats = anchor_restore.stats;
+                    cache_stats.cached_prompt_tokens =
+                        saturating_u32(prefill_chain_restored_tokens);
+                    cache_stats.matched_prefix_tokens =
+                        saturating_u32(prefill_chain_restored_tokens);
+                    cache_stats.suffix_prefill_tokens = saturating_u32(
+                        prefill_tokens
+                            .len()
+                            .saturating_sub(prefill_chain_restored_tokens),
+                    );
+                    cache_stats.hit_kind = Some("chain_prompt_anchor");
+                }
                 let mut pos_start = prefill_chain_restored_tokens.min(prefill_tokens.len());
                 let mut chunk_index = 0usize;
                 while pos_start < prefill_tokens.len() {
@@ -1070,6 +1090,10 @@ impl StageOpenAiBackend {
                     message_tokens.len() == context_tokens.len() && message_tokens.len() > 1;
                 let records_full_prompt_checkpoint =
                     decode_step == 0 && message_tokens.len() == request.prompt_token_ids.len();
+                let message_positions = super::prompt_anchor::prompt_anchor_positions(
+                    request.prompt_anchor_token_count,
+                    context_tokens.len(),
+                );
                 let message = StageWireMessage {
                     kind: WireMessageKind::DecodeEmbd,
                     pos_start: i32::try_from(prefill_token_count + decode_step as usize)
@@ -1081,7 +1105,7 @@ impl StageOpenAiBackend {
                     sampling: wire_sampling.clone(),
                     chat_sampling_metadata: None,
                     tokens: message_tokens,
-                    positions: Vec::new(),
+                    positions: message_positions,
                     activation: Vec::new(),
                     raw_bytes: Vec::new(),
                 };
@@ -1169,12 +1193,26 @@ impl StageOpenAiBackend {
                             chat_sampling_metadata: request.chat_sampling_metadata,
                         },
                     )?;
+                    if decode_step == 0 {
+                        self.record_embedded_stage0_prompt_anchor(
+                            &session_key,
+                            request.ids,
+                            request.prompt_token_ids,
+                            request.prompt_anchor_token_count,
+                        )?;
+                    }
                 } else if records_full_prompt_checkpoint {
                     self.record_embedded_stage0_full_prompt_first_token(
                         &session_key,
                         request.ids,
                         request.prompt_token_ids,
                         reply.predicted,
+                    )?;
+                    self.record_embedded_stage0_prompt_anchor(
+                        &session_key,
+                        request.ids,
+                        request.prompt_token_ids,
+                        request.prompt_anchor_token_count,
                     )?;
                 }
                 current = reply.predicted;

@@ -2030,6 +2030,39 @@ fn generation_ids_are_unique_under_fast_creation() {
 }
 
 #[test]
+fn prompt_cache_anchor_requires_cache_key_and_valid_prefix() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "prompt_cache_key": "agent-tools-v1",
+        "prompt_cache_anchor_tokens": 128
+    }))
+    .unwrap();
+    let ids = OpenAiGenerationIds::new(OpenAiCacheHints::from_chat_request(&request));
+
+    assert_eq!(
+        generation_flow::prompt_cache_anchor_token_count(&ids, 256),
+        Some(128)
+    );
+    assert_eq!(
+        generation_flow::prompt_cache_anchor_token_count(&ids, 128),
+        None
+    );
+
+    let request_without_key: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hello"}],
+        "prompt_cache_anchor_tokens": 64
+    }))
+    .unwrap();
+    let ids = OpenAiGenerationIds::new(OpenAiCacheHints::from_chat_request(&request_without_key));
+    assert_eq!(
+        generation_flow::prompt_cache_anchor_token_count(&ids, 256),
+        None
+    );
+}
+
+#[test]
 fn prefill_chunk_schedule_parses_and_repeats_last_size() {
     let schedule = PrefillChunkSchedule::parse(Some("128, 256,512"))
         .unwrap()

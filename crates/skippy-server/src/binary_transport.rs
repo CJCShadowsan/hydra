@@ -978,7 +978,7 @@ fn handle_binary_connection(
             }
         }
 
-        if let Some(full_prompt_tokens) = decode_record_tokens_sideband(&message) {
+        if let Some(record_sideband) = decode_record_tokens_sideband(&message) {
             let mut runtime = runtime.lock().expect("runtime lock poisoned");
             let record = maybe_record_binary_full_prefill(
                 config,
@@ -987,10 +987,26 @@ fn handle_binary_connection(
                 telemetry,
                 &session_key,
                 &message,
-                full_prompt_tokens,
+                record_sideband.tokens,
             );
+            let anchor_record = record_sideband
+                .anchor_token_count
+                .and_then(|token_count| record_sideband.tokens.get(..token_count))
+                .map(|anchor_tokens| {
+                    maybe_record_binary_full_prefill(
+                        config,
+                        &mut runtime,
+                        kv,
+                        telemetry,
+                        &session_key,
+                        &message,
+                        anchor_tokens,
+                    )
+                })
+                .unwrap_or_default();
             drop(runtime);
             add_binary_record_stats(&mut message_reply_stats, config, &record);
+            add_binary_record_stats(&mut message_reply_stats, config, &anchor_record);
         }
 
         let mut forward_write_ms = 0.0;
@@ -3377,7 +3393,12 @@ fn decode_execution_token(message: &StageWireMessage, token_count: usize) -> Opt
     Some(message.state.current_token)
 }
 
-fn decode_record_tokens_sideband(message: &StageWireMessage) -> Option<&[i32]> {
+struct DecodeRecordSideband<'a> {
+    tokens: &'a [i32],
+    anchor_token_count: Option<usize>,
+}
+
+fn decode_record_tokens_sideband(message: &StageWireMessage) -> Option<DecodeRecordSideband<'_>> {
     if message.kind != WireMessageKind::DecodeEmbd
         || message.token_count != 1
         || message.state.prompt_token_count <= 0
@@ -3392,7 +3413,22 @@ fn decode_record_tokens_sideband(message: &StageWireMessage) -> Option<&[i32]> {
     {
         return None;
     }
-    Some(message.tokens.as_slice())
+    Some(DecodeRecordSideband {
+        tokens: message.tokens.as_slice(),
+        anchor_token_count: decode_record_anchor_token_count(message, expected_token_count),
+    })
+}
+
+fn decode_record_anchor_token_count(
+    message: &StageWireMessage,
+    record_token_count: usize,
+) -> Option<usize> {
+    let [anchor_token_count] = message.positions.as_slice() else {
+        return None;
+    };
+    let anchor_token_count = usize::try_from(*anchor_token_count).ok()?;
+    (anchor_token_count > 0 && anchor_token_count < record_token_count)
+        .then_some(anchor_token_count)
 }
 
 fn add_binary_record_stats(
