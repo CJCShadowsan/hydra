@@ -26,6 +26,7 @@ impl StageOpenAiBackend {
         let session_id = request.ids.session_id;
         let request_id = request.ids.request_id;
         let session_key = session_id.to_string();
+        let emit_token_debug = self.telemetry.is_debug_enabled();
         let lane_pool = request
             .lane_pool
             .as_ref()
@@ -90,14 +91,17 @@ impl StageOpenAiBackend {
                         fused_first_decode = Some(fused);
                     }
                 }
-                if !prefill_chain_cache_restored
-                    && let Some(restore) = self.try_restore_embedded_split_prefill(
+                let split_restore = if prefill_chain_cache_restored {
+                    None
+                } else {
+                    self.try_restore_embedded_split_prefill(
                         &request,
                         &session_key,
                         downstream,
                         prefill_tokens,
                     )?
-                {
+                };
+                if let Some(restore) = split_restore {
                     prefill_chain_restored_tokens = restore.restored_tokens;
                     prefill_chain_cache_restored =
                         prefill_chain_restored_tokens >= prefill_tokens.len();
@@ -479,6 +483,15 @@ impl StageOpenAiBackend {
                 "skippy.kv.chain_cache_hit_stage_mask".to_string(),
                 json!(prefill_chain_cache_stats.kv_hit_stage_mask),
             );
+            super::prefix_cache::insert_chain_prefix_cache_savings_attrs(
+                &mut prefill_attrs,
+                super::prefix_cache::chain_prefix_cache_savings(
+                    &prefill_chain_cache_stats,
+                    prefill_chain_restored_tokens,
+                    request.wire_dtype,
+                    request.activation_width,
+                ),
+            );
             self.emit_openai_phase("stage.openai_prefill", prefill_timer, prefill_attrs);
 
             if let Some(message) = generation_config_message(
@@ -545,55 +558,57 @@ impl StageOpenAiBackend {
                     .saturating_add(fused.execution.forward_activation_bytes);
                 decode_forward_write_ms += fused.execution.forward_write_ms;
                 decode_downstream_wait_ms += fused.execution.downstream_wait_ms;
-                let mut token_attrs = self.openai_attrs(request.ids);
-                token_attrs.insert("llama_stage.decode_step".to_string(), json!(0));
-                token_attrs.insert(
-                    "llama_stage.decode_token_phase".to_string(),
-                    json!("fused-restore"),
-                );
-                token_attrs.insert(
-                    "llama_stage.message_kind".to_string(),
-                    json!("TryRestorePrefillDecode"),
-                );
-                token_attrs.insert(
-                    "llama_stage.elapsed_ms".to_string(),
-                    json!(fused.elapsed_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.stage0_compute_ms".to_string(),
-                    json!(fused.execution.stage0_compute_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.runtime_lock_wait_ms".to_string(),
-                    json!(fused.execution.runtime_lock_wait_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.runtime_lock_hold_ms".to_string(),
-                    json!(fused.execution.runtime_lock_hold_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.output_activation_bytes".to_string(),
-                    json!(fused.execution.output_activation_bytes),
-                );
-                token_attrs.insert(
-                    "llama_stage.forward_activation_bytes".to_string(),
-                    json!(fused.execution.forward_activation_bytes),
-                );
-                token_attrs.insert(
-                    "llama_stage.activation_encode_ms".to_string(),
-                    json!(fused.execution.activation_encode_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.forward_write_ms".to_string(),
-                    json!(fused.execution.forward_write_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.downstream_wait_ms".to_string(),
-                    json!(fused.execution.downstream_wait_ms),
-                );
-                token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
-                self.telemetry
-                    .emit_debug("stage.openai_decode_token", token_attrs);
+                if emit_token_debug {
+                    let mut token_attrs = self.openai_attrs(request.ids);
+                    token_attrs.insert("llama_stage.decode_step".to_string(), json!(0));
+                    token_attrs.insert(
+                        "llama_stage.decode_token_phase".to_string(),
+                        json!("fused-restore"),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.message_kind".to_string(),
+                        json!("TryRestorePrefillDecode"),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.elapsed_ms".to_string(),
+                        json!(fused.elapsed_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.stage0_compute_ms".to_string(),
+                        json!(fused.execution.stage0_compute_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.runtime_lock_wait_ms".to_string(),
+                        json!(fused.execution.runtime_lock_wait_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.runtime_lock_hold_ms".to_string(),
+                        json!(fused.execution.runtime_lock_hold_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.output_activation_bytes".to_string(),
+                        json!(fused.execution.output_activation_bytes),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.forward_activation_bytes".to_string(),
+                        json!(fused.execution.forward_activation_bytes),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.activation_encode_ms".to_string(),
+                        json!(fused.execution.activation_encode_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.forward_write_ms".to_string(),
+                        json!(fused.execution.forward_write_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.downstream_wait_ms".to_string(),
+                        json!(fused.execution.downstream_wait_ms),
+                    );
+                    token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
+                    self.telemetry
+                        .emit_debug("stage.openai_decode_token", token_attrs);
+                }
                 fused_reached_stop = on_token(current)? == TokenControl::Stop;
             }
             let max_speculative_window = request.speculative_window.max(1);
@@ -653,7 +668,7 @@ impl StageOpenAiBackend {
                 {
                     break;
                 }
-                let token_timer = PhaseTimer::start();
+                let token_timer = emit_token_debug.then(PhaseTimer::start);
                 if draft_guard.is_some() {
                     let remaining = request.max_tokens as usize - decoded_tokens;
                     if remaining == 0 {
@@ -663,9 +678,12 @@ impl StageOpenAiBackend {
                     let proposal_limit = remaining.min(adaptive_window);
                     let propose_timer = PhaseTimer::start();
                     let mut draft_tokens = Vec::new();
-                    if draft_tokens.is_empty()
-                        && let Some(draft) = draft_guard.as_deref_mut()
-                    {
+                    let draft = if draft_tokens.is_empty() {
+                        draft_guard.as_deref_mut()
+                    } else {
+                        None
+                    };
+                    if let Some(draft) = draft {
                         let proposal_limit = proposal_limit.min(draft.window);
                         draft_tokens = draft
                             .propose(current, proposal_limit)
@@ -888,76 +906,82 @@ impl StageOpenAiBackend {
                                 speculative_stats.draft_reset_ms += draft_reset_timer.elapsed_ms();
                             }
                         }
-                        let mut token_attrs = self.openai_attrs(request.ids);
-                        token_attrs
-                            .insert("llama_stage.decode_step".to_string(), json!(decode_step));
-                        token_attrs
-                            .insert("llama_stage.message_kind".to_string(), json!("VerifySpan"));
-                        token_attrs.insert(
-                            "llama_stage.spec.windows".to_string(),
-                            json!(speculative_stats.windows),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.spec.proposed".to_string(),
-                            json!(draft_tokens.len()),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.spec.accepted".to_string(),
-                            json!(decision.accepted_before_reject),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.spec.rejected".to_string(),
-                            json!(decision.rejected()),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.spec.draft_propose_ms".to_string(),
-                            json!(draft_propose_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.spec.proposal_source".to_string(),
-                            json!(proposal_source),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.spec.proposal_limit".to_string(),
-                            json!(proposal_limit),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.stage0_compute_ms".to_string(),
-                            json!(verify.stats.stage0_compute_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.runtime_lock_wait_ms".to_string(),
-                            json!(verify.stats.runtime_lock_wait_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.runtime_lock_hold_ms".to_string(),
-                            json!(verify.stats.runtime_lock_hold_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.activation_encode_ms".to_string(),
-                            json!(verify.stats.activation_encode_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.forward_write_ms".to_string(),
-                            json!(verify.stats.forward_write_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.downstream_wait_ms".to_string(),
-                            json!(verify.stats.downstream_wait_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.output_activation_bytes".to_string(),
-                            json!(verify.stats.output_activation_bytes),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.forward_activation_bytes".to_string(),
-                            json!(verify.stats.forward_activation_bytes),
-                        );
-                        self.emit_openai_phase(
-                            "stage.openai_decode_verify_window",
-                            token_timer,
-                            token_attrs,
-                        );
+                        if emit_token_debug {
+                            let mut token_attrs = self.openai_attrs(request.ids);
+                            token_attrs
+                                .insert("llama_stage.decode_step".to_string(), json!(decode_step));
+                            token_attrs.insert(
+                                "llama_stage.message_kind".to_string(),
+                                json!("VerifySpan"),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.windows".to_string(),
+                                json!(speculative_stats.windows),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.proposed".to_string(),
+                                json!(draft_tokens.len()),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.accepted".to_string(),
+                                json!(decision.accepted_before_reject),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.rejected".to_string(),
+                                json!(decision.rejected()),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.draft_propose_ms".to_string(),
+                                json!(draft_propose_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.proposal_source".to_string(),
+                                json!(proposal_source),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.spec.proposal_limit".to_string(),
+                                json!(proposal_limit),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.stage0_compute_ms".to_string(),
+                                json!(verify.stats.stage0_compute_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.runtime_lock_wait_ms".to_string(),
+                                json!(verify.stats.runtime_lock_wait_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.runtime_lock_hold_ms".to_string(),
+                                json!(verify.stats.runtime_lock_hold_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.activation_encode_ms".to_string(),
+                                json!(verify.stats.activation_encode_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.forward_write_ms".to_string(),
+                                json!(verify.stats.forward_write_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.downstream_wait_ms".to_string(),
+                                json!(verify.stats.downstream_wait_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.output_activation_bytes".to_string(),
+                                json!(verify.stats.output_activation_bytes),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.forward_activation_bytes".to_string(),
+                                json!(verify.stats.forward_activation_bytes),
+                            );
+                            let token_timer =
+                                token_timer.expect("token debug timer should be present");
+                            self.emit_openai_phase(
+                                "stage.openai_decode_verify_window",
+                                token_timer,
+                                token_attrs,
+                            );
+                        }
                         if reached_stop {
                             break;
                         }
@@ -1060,47 +1084,50 @@ impl StageOpenAiBackend {
                 current = reply.predicted;
                 decoded_tokens += 1;
                 context_tokens.push(current);
-                let mut token_attrs = self.openai_attrs(request.ids);
-                token_attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
-                token_attrs.insert(
-                    "llama_stage.decode_token_phase".to_string(),
-                    json!(decode_token_phase(decode_step)),
-                );
-                token_attrs.insert(
-                    "llama_stage.stage0_compute_ms".to_string(),
-                    json!(stage0_compute_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.runtime_lock_wait_ms".to_string(),
-                    json!(token_runtime_lock_wait_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.runtime_lock_hold_ms".to_string(),
-                    json!(token_runtime_lock_hold_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.output_activation_bytes".to_string(),
-                    json!(output.payload.len()),
-                );
-                token_attrs.insert(
-                    "llama_stage.forward_activation_bytes".to_string(),
-                    json!(forwarded.message.activation.len()),
-                );
-                token_attrs.insert(
-                    "llama_stage.activation_encode_ms".to_string(),
-                    json!(forwarded.activation_encode_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.forward_write_ms".to_string(),
-                    json!(forward_write_ms),
-                );
-                token_attrs.insert(
-                    "llama_stage.downstream_wait_ms".to_string(),
-                    json!(downstream_wait_ms),
-                );
-                token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
-                token_attrs.insert("llama_stage.message_kind".to_string(), json!("DecodeEmbd"));
-                self.emit_openai_phase("stage.openai_decode_token", token_timer, token_attrs);
+                if emit_token_debug {
+                    let mut token_attrs = self.openai_attrs(request.ids);
+                    token_attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
+                    token_attrs.insert(
+                        "llama_stage.decode_token_phase".to_string(),
+                        json!(decode_token_phase(decode_step)),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.stage0_compute_ms".to_string(),
+                        json!(stage0_compute_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.runtime_lock_wait_ms".to_string(),
+                        json!(token_runtime_lock_wait_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.runtime_lock_hold_ms".to_string(),
+                        json!(token_runtime_lock_hold_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.output_activation_bytes".to_string(),
+                        json!(output.payload.len()),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.forward_activation_bytes".to_string(),
+                        json!(forwarded.message.activation.len()),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.activation_encode_ms".to_string(),
+                        json!(forwarded.activation_encode_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.forward_write_ms".to_string(),
+                        json!(forward_write_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.downstream_wait_ms".to_string(),
+                        json!(downstream_wait_ms),
+                    );
+                    token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
+                    token_attrs.insert("llama_stage.message_kind".to_string(), json!("DecodeEmbd"));
+                    let token_timer = token_timer.expect("token debug timer should be present");
+                    self.emit_openai_phase("stage.openai_decode_token", token_timer, token_attrs);
+                }
                 if on_token(current)? == TokenControl::Stop {
                     break;
                 }

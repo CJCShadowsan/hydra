@@ -1,5 +1,67 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ChainPrefixCacheSavings {
+    pub(super) hit_stage_count: u32,
+    pub(super) stage0_activation_bytes_avoided: usize,
+    pub(super) interstage_activation_bytes_avoided_estimate: usize,
+}
+
+pub(super) fn chain_prefix_cache_savings(
+    stats: &StageReplyStats,
+    restored_tokens: usize,
+    wire_dtype: WireActivationDType,
+    activation_width: i32,
+) -> ChainPrefixCacheSavings {
+    let hit_stage_count = prefix_cache_hit_stage_count(stats.kv_hit_stage_mask);
+    let stage0_activation_bytes_avoided =
+        estimated_activation_bytes(wire_dtype, restored_tokens, activation_width);
+    let interstage_activation_bytes_avoided_estimate =
+        stage0_activation_bytes_avoided.saturating_mul(hit_stage_count.saturating_sub(1) as usize);
+    ChainPrefixCacheSavings {
+        hit_stage_count,
+        stage0_activation_bytes_avoided,
+        interstage_activation_bytes_avoided_estimate,
+    }
+}
+
+pub(super) fn insert_chain_prefix_cache_savings_attrs(
+    attrs: &mut BTreeMap<String, Value>,
+    savings: ChainPrefixCacheSavings,
+) {
+    attrs.insert(
+        "skippy.kv.chain_cache_hit_stage_count".to_string(),
+        json!(savings.hit_stage_count),
+    );
+    attrs.insert(
+        "skippy.kv.chain_cache_stage0_activation_bytes_avoided".to_string(),
+        json!(savings.stage0_activation_bytes_avoided),
+    );
+    attrs.insert(
+        "skippy.kv.chain_cache_interstage_activation_bytes_avoided_estimate".to_string(),
+        json!(savings.interstage_activation_bytes_avoided_estimate),
+    );
+}
+
+fn prefix_cache_hit_stage_count(hit_stage_mask: i64) -> u32 {
+    if hit_stage_mask <= 0 {
+        return 0;
+    }
+    (hit_stage_mask as u64).count_ones()
+}
+
+fn estimated_activation_bytes(
+    wire_dtype: WireActivationDType,
+    token_count: usize,
+    activation_width: i32,
+) -> usize {
+    let Ok(token_count) = i32::try_from(token_count) else {
+        return 0;
+    };
+    skippy_protocol::binary::activation_wire_bytes(wire_dtype, token_count, activation_width)
+        .unwrap_or(0)
+}
+
 pub(super) fn stage0_prefill_record_identities(
     kv: &KvStageIntegration,
     config: &StageConfig,
@@ -417,6 +479,15 @@ impl StageOpenAiBackend {
             "skippy.kv.hit_stage_mask".to_string(),
             json!(restore_stats.kv_hit_stage_mask),
         );
+        insert_chain_prefix_cache_savings_attrs(
+            &mut attrs,
+            chain_prefix_cache_savings(
+                &restore_stats,
+                restored_tokens,
+                request.wire_dtype,
+                request.activation_width,
+            ),
+        );
         self.telemetry
             .emit("stage.openai_kv_lookup_decision", attrs);
         Ok(Some(ChainPrefixRestore {
@@ -576,6 +647,15 @@ impl StageOpenAiBackend {
             "skippy.kv.hit_stage_mask".to_string(),
             json!(reply_stats.kv_hit_stage_mask),
         );
+        insert_chain_prefix_cache_savings_attrs(
+            &mut attrs,
+            chain_prefix_cache_savings(
+                &reply_stats,
+                prefill_tokens.len(),
+                request.wire_dtype,
+                request.activation_width,
+            ),
+        );
         self.telemetry
             .emit("stage.openai_kv_lookup_decision", attrs);
         Ok(Some(EmbeddedFusedFirstDecode {
@@ -619,5 +699,46 @@ impl StageOpenAiBackend {
         {
             let _ = recv_reply(&mut *downstream);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_prefix_cache_savings_counts_confirmed_stage_hits() {
+        let stats = StageReplyStats {
+            kv_hit_stage_mask: openai_stage_mask(0)
+                | openai_stage_mask(1)
+                | openai_stage_mask(2)
+                | openai_stage_mask(3),
+            ..Default::default()
+        };
+
+        let savings = chain_prefix_cache_savings(&stats, 256, WireActivationDType::F16, 5120);
+
+        assert_eq!(savings.hit_stage_count, 4);
+        assert_eq!(savings.stage0_activation_bytes_avoided, 2_621_440);
+        assert_eq!(
+            savings.interstage_activation_bytes_avoided_estimate,
+            7_864_320
+        );
+    }
+
+    #[test]
+    fn chain_prefix_cache_savings_uses_wire_dtype() {
+        let stats = StageReplyStats {
+            kv_hit_stage_mask: openai_stage_mask(0) | openai_stage_mask(1),
+            ..Default::default()
+        };
+
+        let q8 = chain_prefix_cache_savings(&stats, 256, WireActivationDType::Q8, 5120);
+        let f32 = chain_prefix_cache_savings(&stats, 256, WireActivationDType::F32, 5120);
+
+        assert_eq!(q8.stage0_activation_bytes_avoided, 1_311_744);
+        assert_eq!(q8.interstage_activation_bytes_avoided_estimate, 1_311_744);
+        assert_eq!(f32.stage0_activation_bytes_avoided, 5_242_880);
+        assert_eq!(f32.interstage_activation_bytes_avoided_estimate, 5_242_880);
     }
 }
