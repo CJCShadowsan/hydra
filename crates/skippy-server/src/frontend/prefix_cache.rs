@@ -339,8 +339,22 @@ impl StageOpenAiBackend {
             identities
                 .iter()
                 .map(|identity| {
-                    kv.record_resident_prefix(&mut runtime, session_id, identity, token_ids)
-                        .map_err(openai_backend_error)
+                    let token_count = identity
+                        .identity
+                        .token_count
+                        .try_into()
+                        .unwrap_or(usize::MAX)
+                        .min(token_ids.len());
+                    if token_count == token_ids.len() {
+                        let _ = kv.record_exact_state(&mut runtime, session_id, identity);
+                    }
+                    kv.record_resident_prefix(
+                        &mut runtime,
+                        session_id,
+                        identity,
+                        &token_ids[..token_count],
+                    )
+                    .map_err(openai_backend_error)
                 })
                 .collect::<OpenAiResult<Vec<_>>>()?
         };
@@ -387,6 +401,118 @@ impl StageOpenAiBackend {
                 .emit("stage.openai_kv_record_decision", attrs);
         }
         Ok(recorded_any)
+    }
+
+    pub(super) fn record_embedded_stage0_full_prompt_first_token(
+        &self,
+        session_id: &str,
+        ids: &OpenAiGenerationIds,
+        token_ids: &[i32],
+        predicted: i32,
+    ) -> OpenAiResult<bool> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(false);
+        };
+        if token_ids.is_empty() || !kv.should_record() {
+            return Ok(false);
+        }
+        let base = self.local_kv_message_base(session_id, ids);
+        let identity = kv.prefill_identity(&self.config, &base, 0, token_ids);
+        let recorded_state =
+            self.record_embedded_stage0_full_prefill(session_id, ids, token_ids)?;
+        let recorded_token = kv.record_cached_first_token(&identity, predicted);
+        let mut attrs = self.openai_attrs(ids);
+        attrs.insert(
+            "skippy.kv.decision".to_string(),
+            json!("stage0_full_prompt_first_token_record"),
+        );
+        attrs.insert("skippy.kv.token_count".to_string(), json!(token_ids.len()));
+        attrs.insert("skippy.kv.predicted_token".to_string(), json!(predicted));
+        attrs.insert(
+            "skippy.kv.recorded_page_id".to_string(),
+            json!(identity.page_id),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_state".to_string(),
+            json!(recorded_state),
+        );
+        attrs.insert(
+            "skippy.kv.recorded_first_token".to_string(),
+            json!(recorded_token),
+        );
+        self.telemetry
+            .emit("stage.openai_kv_record_decision", attrs);
+        Ok(recorded_state || recorded_token)
+    }
+
+    pub(super) fn try_restore_embedded_split_full_prompt_first_token(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        session_key: &str,
+        downstream: &mut TcpStream,
+    ) -> OpenAiResult<Option<EmbeddedFusedFirstDecode>> {
+        let Some(kv) = self.kv.as_ref() else {
+            return Ok(None);
+        };
+        if request.prompt_token_ids.is_empty() || !kv.should_lookup() {
+            return Ok(None);
+        }
+        let timer = PhaseTimer::start();
+        let base = self.local_kv_message_base(session_key, request.ids);
+        let identity = kv.prefill_identity(request.config, &base, 0, request.prompt_token_ids);
+        let Some(predicted) = kv.lookup_cached_first_token(&identity) else {
+            return Ok(None);
+        };
+        let Some(restore) = self.try_restore_embedded_split_prefill(
+            request,
+            session_key,
+            downstream,
+            request.prompt_token_ids,
+        )?
+        else {
+            return Ok(None);
+        };
+        if restore.restored_tokens < request.prompt_token_ids.len() {
+            return Ok(None);
+        }
+        let mut attrs = self.openai_attrs(request.ids);
+        attrs.insert(
+            "skippy.kv.decision".to_string(),
+            json!("chain_full_prompt_first_token_hit"),
+        );
+        attrs.insert(
+            "skippy.kv.restored_tokens".to_string(),
+            json!(restore.restored_tokens),
+        );
+        attrs.insert("skippy.kv.predicted_token".to_string(), json!(predicted));
+        attrs.insert("skippy.kv.hit_page_id".to_string(), json!(identity.page_id));
+        attrs.insert(
+            "skippy.kv.lookup_hits".to_string(),
+            json!(restore.stats.kv_lookup_hits),
+        );
+        attrs.insert(
+            "skippy.kv.hit_stage_mask".to_string(),
+            json!(restore.stats.kv_hit_stage_mask),
+        );
+        insert_chain_prefix_cache_savings_attrs(
+            &mut attrs,
+            chain_prefix_cache_savings(
+                &restore.stats,
+                restore.restored_tokens,
+                request.wire_dtype,
+                request.activation_width,
+            ),
+        );
+        self.telemetry
+            .emit("stage.openai_kv_lookup_decision", attrs);
+        Ok(Some(EmbeddedFusedFirstDecode {
+            predicted,
+            reply_stats: restore.stats,
+            execution: EmbeddedExecutionStats::default(),
+            elapsed_ms: timer.elapsed_ms(),
+            token_phase: "full-prompt-cache",
+            message_kind: "TryRestorePrefill",
+        }))
     }
 
     pub(super) fn try_restore_embedded_split_prefill(
@@ -658,6 +784,12 @@ impl StageOpenAiBackend {
         );
         self.telemetry
             .emit("stage.openai_kv_lookup_decision", attrs);
+        self.record_embedded_stage0_full_prompt_first_token(
+            session_key,
+            request.ids,
+            request.prompt_token_ids,
+            downstream_reply.predicted,
+        )?;
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted: downstream_reply.predicted,
             reply_stats,
@@ -672,6 +804,8 @@ impl StageOpenAiBackend {
                 downstream_wait_ms,
             },
             elapsed_ms: timer.elapsed_ms(),
+            token_phase: "fused-restore",
+            message_kind: "TryRestorePrefillDecode",
         }))
     }
 
