@@ -19,9 +19,10 @@ REPORT_DIR="${WORK_DIR}/reports"
 MODEL_DIR="${WORK_DIR}/models"
 
 DENSE_MODEL_REPO="${DENSE_MODEL_REPO:-jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF}"
-DENSE_MODEL_FILE="${DENSE_MODEL_FILE:-SmolLM2-135M-Instruct.Q4_K_M.gguf}"
+DENSE_MODEL_FILE="${DENSE_MODEL_FILE:-${MODEL_FILE:-SmolLM2-135M-Instruct.Q4_K_M.gguf}}"
 DENSE_MODEL_SELECTOR="${DENSE_MODEL_SELECTOR:-Q4_K_M}"
 DENSE_MODEL_ID="${DENSE_MODEL_ID:-${DENSE_MODEL_REPO}:${DENSE_MODEL_SELECTOR}}"
+DENSE_MODEL_URL="${DENSE_MODEL_URL:-${MODEL_URL:-}}"
 DENSE_MODEL_PATH="${DENSE_MODEL_PATH:-}"
 
 RECURRENT_MODEL_REPO="${RECURRENT_MODEL_REPO:-tiiuae/Falcon-H1-0.5B-Instruct-GGUF}"
@@ -121,7 +122,21 @@ download_model() {
   local repo="$1"
   local file="$2"
   local out_dir="$3"
+  local url="${4:-}"
   mkdir -p "$out_dir"
+  if [[ -n "$url" ]]; then
+    local url_path="${out_dir}/${file}"
+    if [[ ! -f "$url_path" ]]; then
+      echo "downloading ${url}" >&2
+      local curl_args=(--fail --location --show-error --retry 6 --retry-delay 10 --retry-all-errors)
+      if [[ -n "${HF_TOKEN:-}" ]]; then
+        curl_args+=(--header "Authorization: Bearer ${HF_TOKEN}")
+      fi
+      run_with_timeout "download ${url}" curl "${curl_args[@]}" "$url" -o "$url_path"
+    fi
+    printf '%s\n' "$url_path"
+    return
+  fi
   echo "downloading ${repo}/${file}" >&2
   local output path
   output="$(run_with_timeout "download ${repo}/${file}" hf download "$repo" "$file" --local-dir "$out_dir")"
@@ -291,7 +306,7 @@ fi
 mkdir -p "$REPORT_DIR" "$MODEL_DIR"
 
 if [[ -z "$DENSE_MODEL_PATH" ]]; then
-  DENSE_MODEL_PATH="$(download_model "$DENSE_MODEL_REPO" "$DENSE_MODEL_FILE" "${MODEL_DIR}/dense")"
+  DENSE_MODEL_PATH="$(download_model "$DENSE_MODEL_REPO" "$DENSE_MODEL_FILE" "${MODEL_DIR}/dense" "$DENSE_MODEL_URL")"
 fi
 if [[ -z "$RECURRENT_MODEL_PATH" ]]; then
   RECURRENT_MODEL_PATH="$(download_model "$RECURRENT_MODEL_REPO" "$RECURRENT_MODEL_FILE" "${MODEL_DIR}/recurrent")"
