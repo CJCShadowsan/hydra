@@ -479,6 +479,15 @@ impl StageOpenAiBackend {
                 "skippy.kv.chain_cache_hit_stage_mask".to_string(),
                 json!(prefill_chain_cache_stats.kv_hit_stage_mask),
             );
+            super::prefix_cache::insert_chain_prefix_cache_savings_attrs(
+                &mut prefill_attrs,
+                super::prefix_cache::chain_prefix_cache_savings(
+                    &prefill_chain_cache_stats,
+                    prefill_chain_restored_tokens,
+                    request.wire_dtype,
+                    request.activation_width,
+                ),
+            );
             self.emit_openai_phase("stage.openai_prefill", prefill_timer, prefill_attrs);
 
             if let Some(message) = generation_config_message(
