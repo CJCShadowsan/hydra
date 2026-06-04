@@ -301,7 +301,7 @@ async fn make_test_node_with_requirements(
         .secret_key(endpoint_secret_key.clone())
         .alpns(vec![
             ALPN_V1.to_vec(),
-            skippy_protocol::STAGE_ALPN_V1.to_vec(),
+            skippy_protocol::STAGE_ALPN_V2.to_vec(),
         ])
         .transport_config(transport_config)
         .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
@@ -7142,6 +7142,7 @@ fn pinned_gpu_runtime_push_rejects_invalid_pushed_pinned_config_before_apply() {
         mem_bandwidth_gbps: None,
         decode_effective_gbps: None,
         decode_fixed_overhead_ms: None,
+        decode_runtime_overhead_ms: None,
         post_prefill_decode_overhead_ms: None,
         compute_tflops_fp32: None,
         compute_tflops_fp16: None,
@@ -7197,6 +7198,7 @@ fn pinned_gpu_runtime_push_accepts_valid_pushed_pinned_config() {
         mem_bandwidth_gbps: None,
         decode_effective_gbps: None,
         decode_fixed_overhead_ms: None,
+        decode_runtime_overhead_ms: None,
         post_prefill_decode_overhead_ms: None,
         compute_tflops_fp32: None,
         compute_tflops_fp16: None,
@@ -7248,6 +7250,7 @@ fn pinned_gpu_runtime_push_rejects_resolved_gpu_without_backend_device() {
         mem_bandwidth_gbps: None,
         decode_effective_gbps: None,
         decode_fixed_overhead_ms: None,
+        decode_runtime_overhead_ms: None,
         post_prefill_decode_overhead_ms: None,
         compute_tflops_fp32: None,
         compute_tflops_fp16: None,
