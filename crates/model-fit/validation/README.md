@@ -22,6 +22,7 @@ target/release/model-fit-validate \
   --output-json "$HOME/tmp/model-fit-validation.json"
 
 target/release/model-fit-check-validation \
+  --scenario steady_decode \
   --min-models 5 \
   --max-median-absolute-error 0.10 \
   --max-individual-error 0.10 \
@@ -32,6 +33,7 @@ target/release/model-fit-check-validation \
 
 target/release/model-fit-check-validation \
   --scenario all \
+  --report-only \
   --markdown-out "$HOME/tmp/model-fit-validation.md" \
   "$HOME/tmp/model-fit-validation.json"
 ```
@@ -98,6 +100,25 @@ agreement:
 This shape is intentional. The smoke should catch structural regressions and
 unclassified surprises while still letting known, visible residuals stay in the
 evidence table until there is a source-grounded fix.
+
+CI gates only the `steady_decode` scenario. The validator still runs and
+renders prefill, first-token, and KV-warm-reuse scenarios, but those rows are
+report-only evidence until their timing models have the same backend coverage as
+steady decode. This prevents a first-token or cache-reuse residual from hiding a
+decode-regression signal, while keeping the extra measurements visible for
+future source-grounded fixes.
+
+When a steady-decode miss remains after graph inventory matches, treat it as a
+timing-model investigation rather than a metadata classification bug. Recent
+Metal and CUDA smoke runs show two useful shapes:
+
+- CUDA sparse MoE can have clean tensor inventory and stable runtime samples,
+  but still land slower than the metadata estimate because full single-stage
+  serving carries runtime/session overhead not present in the selected sparse
+  block ABI probe.
+- Metal dense Qwen-shape rows can miss in opposite directions on the same
+  machine while graph inventory stays exact. That points at backend timing and
+  probe representativeness, not model-family names or GGUF tensor grouping.
 
 The steady-decode estimator is source-grounded rather than model-name grounded:
 

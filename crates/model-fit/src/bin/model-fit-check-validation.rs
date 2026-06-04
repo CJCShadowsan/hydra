@@ -20,6 +20,7 @@ struct Args {
     markdown_out: Option<PathBuf>,
     require_graph_inventory_match: bool,
     allow_classified_individual_misses: bool,
+    report_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +180,9 @@ fn main() -> Result<()> {
         fs::write(path, &markdown)
             .with_context(|| format!("write markdown report {}", path.display()))?;
     }
+    if args.report_only {
+        return Ok(());
+    }
     enforce_thresholds(&args, &report)
 }
 
@@ -196,6 +200,7 @@ impl Args {
             markdown_out: None,
             require_graph_inventory_match: false,
             allow_classified_individual_misses: false,
+            report_only: false,
         };
 
         while let Some(arg) = values.next() {
@@ -224,6 +229,7 @@ impl Args {
                 "--allow-classified-individual-misses" => {
                     parsed.allow_classified_individual_misses = true;
                 }
+                "--report-only" => parsed.report_only = true,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -843,6 +849,6 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 fn print_usage() {
     eprintln!(
-        "usage: model-fit-check-validation [--scenario steady_decode|prefill|first_token|kv_warm_reuse|all] [--max-median-absolute-error 0.10] [--max-individual-error 0.10] [--max-noisy 0] [--max-runtime-errors 0] [--min-models N] [--markdown-out report.md] [--require-graph-inventory-match] [--allow-classified-individual-misses] report.json"
+        "usage: model-fit-check-validation [--scenario steady_decode|prefill|first_token|kv_warm_reuse|all] [--max-median-absolute-error 0.10] [--max-individual-error 0.10] [--max-noisy 0] [--max-runtime-errors 0] [--min-models N] [--markdown-out report.md] [--require-graph-inventory-match] [--allow-classified-individual-misses] [--report-only] report.json"
     );
 }
