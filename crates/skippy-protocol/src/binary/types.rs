@@ -63,6 +63,7 @@ pub enum WireMessageKind {
     TryRestorePrefill = 17,
     TryRestorePrefillDecode = 18,
     TrimSession = 19,
+    PredictionReturnOpen = 20,
 }
 
 impl WireMessageKind {
@@ -143,6 +144,7 @@ impl TryFrom<i32> for WireMessageKind {
             17 => Ok(Self::TryRestorePrefill),
             18 => Ok(Self::TryRestorePrefillDecode),
             19 => Ok(Self::TrimSession),
+            20 => Ok(Self::PredictionReturnOpen),
             _ => Err(invalid_data("unknown stage message kind")),
         }
     }
