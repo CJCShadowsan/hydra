@@ -18,6 +18,7 @@ use skippy_ffi::TensorRole;
 use skippy_runtime::{ModelInfo, TensorInfo, write_gguf_from_parts};
 
 mod preflight;
+mod profile;
 
 #[derive(Debug, Parser)]
 #[command(name = "skippy-model-package")]
@@ -91,6 +92,7 @@ enum Command {
         #[arg(long)]
         verify_sha256: bool,
     },
+    Profile(profile::ProfileArgs),
 }
 
 #[derive(Debug, Serialize)]
@@ -393,6 +395,7 @@ fn main() -> Result<()> {
             stages,
             verify_sha256,
         } => run_preflight(package, stages, verify_sha256),
+        Command::Profile(args) => profile::run_profile(args),
     }
 }
 
