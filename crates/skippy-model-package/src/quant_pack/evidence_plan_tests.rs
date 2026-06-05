@@ -67,6 +67,7 @@ fn evidence_plan_uses_candidate_stage_hints_when_splits_omitted() {
     .expect("write evidence plan");
 
     let report = read_json::<serde_json::Value>(&report_path).expect("read report");
+    assert_eq!(report["stage_count"], 4);
     assert_eq!(report["splits"], "16,32,47");
     assert_eq!(report["split_source"], "candidate_stage_hints");
     let commands = report["commands"].as_array().expect("commands array");
@@ -449,6 +450,7 @@ fn evidence_plan_all_filters_candidates_and_inherits_runtime_shape() {
     let candidates = report["candidates"].as_array().expect("candidate array");
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0]["candidate"], "middle-compressed");
+    assert_eq!(candidates[0]["stage_count"], 2);
     assert_eq!(candidates[0]["ctx_size"], 32768);
     assert_eq!(candidates[0]["cache_type_k"], "q8_0");
     assert_eq!(candidates[0]["activation_wire_dtype"], "q8");
@@ -817,6 +819,7 @@ fn evidence_script_contains_ordered_plan_commands() {
         quantized_model: "/tmp/run/model.gguf".to_string(),
         evidence_dir: "/tmp/run/evidence".to_string(),
         hosts: vec!["host-a".to_string(), "host-b".to_string()],
+        stage_count: 2,
         splits: "20".to_string(),
         split_source: "cli_override".to_string(),
         layer_end: 40,
@@ -1033,6 +1036,7 @@ fn test_evidence_report(candidate: &str) -> EvidencePlanReport {
         quantized_model: format!("/tmp/run/{candidate}/model.gguf"),
         evidence_dir: format!("/tmp/run/{candidate}/evidence"),
         hosts: vec!["host-a".to_string(), "host-b".to_string()],
+        stage_count: 2,
         splits: "20".to_string(),
         split_source: "cli_override".to_string(),
         layer_end: 40,

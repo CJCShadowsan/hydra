@@ -345,7 +345,8 @@ long-context `skippy-bench chat-corpus`, the agent QA scripts,
 candidate's quant-plan `stage_hints` as the default staged split when present,
 falls back to even split boundaries for older or ad hoc manifests, and lets
 `--splits` override both when a specific topology is being certified. The
-command requires one host per planned stage. Generated bench commands pin the
+report serializes the candidate `stage_count`, and the command requires one
+host per planned stage. Generated bench commands pin the
 tokenizer layer count, context size, decode budget, activation wire dtype,
 thinking mode, coding corpus, and staged GPU-offload policy so the evidence is
 reproducible. When the default corpus paths are used, the plan also includes
