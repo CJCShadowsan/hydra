@@ -234,6 +234,49 @@ fn runtime_shape_gate_checks_context_gpu_and_cache_shape() {
 }
 
 #[test]
+fn certification_runtime_shape_serializes_gate_inputs() {
+    let shape = CertificationRuntimeShape::new(
+        32768,
+        -1,
+        "q8_0".to_string(),
+        "f16".to_string(),
+        "q8".to_string(),
+    );
+    let value = serde_json::to_value(&shape).expect("serialize runtime shape");
+
+    assert_eq!(value["ctx_size"], 32768);
+    assert_eq!(value["n_gpu_layers"], -1);
+    assert_eq!(value["cache_type_k"], "q8_0");
+    assert_eq!(value["cache_type_v"], "f16");
+    assert_eq!(value["activation_wire_dtype"], "q8");
+
+    let gate = runtime_shape_gate(
+        shape.as_gate_expectation(),
+        &[evidence_with_runtime(
+            "skippy-bench-focused-runtime",
+            GateStatus::Pass,
+            runtime_shape_json("q8", 32768, -1, "q8_0", "f16"),
+        )],
+    );
+
+    assert_eq!(gate.status, GateStatus::Pass);
+}
+
+#[test]
+fn topology_expectation_serializes_certified_split_shape() {
+    let expected = TopologyExpectation {
+        splits: "16,32,47".to_string(),
+        layer_end: 62,
+        stage_count: 4,
+    };
+    let value = serde_json::to_value(&expected).expect("serialize topology expectation");
+
+    assert_eq!(value["splits"], "16,32,47");
+    assert_eq!(value["layer_end"], 62);
+    assert_eq!(value["stage_count"], 4);
+}
+
+#[test]
 fn required_skippy_bench_gate_fails_when_report_type_is_missing() {
     let reports = vec![evidence("skippy-bench-focused-runtime", GateStatus::Pass)];
 

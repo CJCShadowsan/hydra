@@ -507,10 +507,12 @@ checks package preflight and decode-profile gates, summarizes evidence hashes,
 checks the focused-runtime context size, GPU-layer policy, KV cache dtypes, and
 activation wire dtype, verifies focused-runtime split topology against the
 candidate's quant-plan stage hints when available, and emits a
-`skippy_quant_pack_certification` report. Focused-runtime evidence only passes
-when it is a real executed `skippy-bench` report with generated throughput and
-decode p50 latency; schema-smoke output never certifies performance. Without
-quality evidence
+`skippy_quant_pack_certification` report. The report serializes the certified
+runtime shape plus the expected split topology when quant-plan stage hints are
+available, so rank and audit tooling can verify the Skippy shape without
+scraping gate text. Focused-runtime evidence only passes when it is a real
+executed `skippy-bench` report with generated throughput and decode p50
+latency; schema-smoke output never certifies performance. Without quality evidence
 the best status is `measurement_only_candidate`; a candidate only becomes
 `agent_quality_candidate` when package, profiling, `skippy-bench`, and quality
 evidence gates all pass, including both agent tool-call and KV/tool-loop

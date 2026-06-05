@@ -45,6 +45,9 @@ struct CertificationReport {
     expected_model_id: String,
     expected_quantized_model: String,
     subject: CertificationSubject,
+    runtime_shape: CertificationRuntimeShape,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_topology: Option<TopologyExpectation>,
     layout_hash: Option<String>,
     gates: Vec<CertificationGate>,
     skippy_bench_reports: Vec<EvidenceReport>,
@@ -102,6 +105,43 @@ struct CertificationSubject {
     quantize_run: Option<HashedArtifactRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_identity: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CertificationRuntimeShape {
+    ctx_size: u32,
+    n_gpu_layers: i32,
+    cache_type_k: String,
+    cache_type_v: String,
+    activation_wire_dtype: String,
+}
+
+impl CertificationRuntimeShape {
+    fn new(
+        ctx_size: u32,
+        n_gpu_layers: i32,
+        cache_type_k: String,
+        cache_type_v: String,
+        activation_wire_dtype: String,
+    ) -> Self {
+        Self {
+            ctx_size,
+            n_gpu_layers,
+            cache_type_k,
+            cache_type_v,
+            activation_wire_dtype,
+        }
+    }
+
+    fn as_gate_expectation(&self) -> RuntimeShapeExpectation<'_> {
+        RuntimeShapeExpectation {
+            ctx_size: self.ctx_size,
+            n_gpu_layers: self.n_gpu_layers,
+            cache_type_k: &self.cache_type_k,
+            cache_type_v: &self.cache_type_v,
+            activation_wire_dtype: &self.activation_wire_dtype,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +256,13 @@ pub(crate) fn run_quant_pack_certify(args: QuantPackCertifyArgs) -> Result<()> {
         .transpose()?;
     let topology_expectation =
         topology_expectation(&run_dir, &manifest, package_manifest.layer_count)?;
+    let runtime_shape = CertificationRuntimeShape::new(
+        args.ctx_size,
+        args.n_gpu_layers,
+        args.cache_type_k.clone(),
+        args.cache_type_v.clone(),
+        args.activation_wire_dtype.clone(),
+    );
 
     let skippy_bench_reports = args
         .skippy_bench_report
@@ -236,13 +283,7 @@ pub(crate) fn run_quant_pack_certify(args: QuantPackCertifyArgs) -> Result<()> {
             quality_evidence: &quality_evidence,
             expected_model_id: &package_manifest.model_id,
             expected_quantized_model: &quantized_model,
-            expected_runtime: RuntimeShapeExpectation {
-                ctx_size: args.ctx_size,
-                n_gpu_layers: args.n_gpu_layers,
-                cache_type_k: &args.cache_type_k,
-                cache_type_v: &args.cache_type_v,
-                activation_wire_dtype: &args.activation_wire_dtype,
-            },
+            expected_runtime: runtime_shape.as_gate_expectation(),
             expected_topology: topology_expectation.as_ref(),
             require_skippy_bench: args.require_skippy_bench,
             require_quality_evidence: args.require_quality_evidence,
@@ -276,6 +317,8 @@ pub(crate) fn run_quant_pack_certify(args: QuantPackCertifyArgs) -> Result<()> {
         expected_model_id,
         expected_quantized_model,
         subject,
+        runtime_shape,
+        expected_topology: topology_expectation,
         layout_hash: agent_pack.quant_layout.layout_hash,
         gates,
         skippy_bench_reports,
@@ -349,6 +392,7 @@ struct RuntimeShapeExpectation<'a> {
     activation_wire_dtype: &'a str,
 }
 
+#[derive(Debug, Clone, Serialize)]
 struct TopologyExpectation {
     splits: String,
     layer_end: u32,
