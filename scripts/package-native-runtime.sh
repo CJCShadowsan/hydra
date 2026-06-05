@@ -288,7 +288,7 @@ mkdir -p "$stage_dir/lib"
 library_paths=()
 for library in "${runtime_libraries[@]}"; do
     name="$(basename "$library")"
-    cp "$library" "$stage_dir/lib/$name"
+    cp -P "$library" "$stage_dir/lib/$name"
     library_paths+=("lib/$name")
 done
 

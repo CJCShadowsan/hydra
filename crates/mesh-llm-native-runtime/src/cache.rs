@@ -203,7 +203,10 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            copy_symlink(&source_path, &target_path)?;
+        } else if file_type.is_dir() {
             copy_dir_recursive(&source_path, &target_path)?;
         } else {
             fs::copy(&source_path, &target_path).with_context(|| {
@@ -216,6 +219,28 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, target: &Path) -> Result<()> {
+    let link = fs::read_link(source).with_context(|| format!("read link {}", source.display()))?;
+    std::os::unix::fs::symlink(&link, target)
+        .with_context(|| format!("symlink {} to {}", link.display(), target.display()))
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, target: &Path) -> Result<()> {
+    let link = fs::read_link(source).with_context(|| format!("read link {}", source.display()))?;
+    let resolved = source
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&link);
+    if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir(&link, target)
+    } else {
+        std::os::windows::fs::symlink_file(&link, target)
+    }
+    .with_context(|| format!("symlink {} to {}", link.display(), target.display()))
 }
 
 #[cfg(test)]
@@ -299,6 +324,26 @@ mod tests {
                     .runtime_dir("0.68.0", "meshllm-native-linux-x86_64-cpu")
                     .join("lib/libmeshllm_ffi.so")
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_preserves_library_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        write_runtime(&source, "0.68.0", "meshllm-native-linux-x86_64-cpu");
+        std::os::unix::fs::symlink("libmeshllm_ffi.so", source.join("lib/libmeshllm_ffi.so.0"))
+            .unwrap();
+
+        let cache = NativeRuntimeCache::new(temp.path().join("cache"));
+        let installed = cache.install_from_dir(&source).unwrap();
+        let installed_alias = installed.path.join("lib/libmeshllm_ffi.so.0");
+
+        assert!(installed_alias.is_symlink());
+        assert_eq!(
+            fs::read_link(installed_alias).unwrap(),
+            Path::new("libmeshllm_ffi.so")
         );
     }
 }

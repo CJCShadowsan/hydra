@@ -904,6 +904,12 @@ fn runtime_config_from_stage_config(
         .map(u32::try_from)
         .transpose()
         .with_context(|| format!("n_threads_batch exceeds u32 for {}", config.stage_id))?;
+    let requires_tensor_filter = matches!(
+        config.load_mode,
+        LoadMode::LayerPackage | LoadMode::ArtifactSlice
+    ) || config.layer_start > 0
+        || config.downstream.is_some();
+
     Ok(RuntimeConfig {
         stage_index: config.stage_index,
         layer_start: config.layer_start,
@@ -934,7 +940,7 @@ fn runtime_config_from_stage_config(
         projector_path: config.projector_path.clone(),
         include_embeddings: config.layer_start == 0,
         include_output: config.downstream.is_none(),
-        filter_tensors_on_load: config.filter_tensors_on_load,
+        filter_tensors_on_load: config.filter_tensors_on_load || requires_tensor_filter,
     })
 }
 
@@ -1105,7 +1111,7 @@ mod tests {
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Enabled,
-            filter_tensors_on_load: true,
+            filter_tensors_on_load: false,
             selected_device: Some(StageDevice {
                 backend_device: "Vulkan1".into(),
                 stable_id: Some("pci:0000:65:00.0".into()),
@@ -1186,6 +1192,7 @@ mod tests {
 
         assert!(!runtime_config.include_embeddings);
         assert!(runtime_config.include_output);
+        assert!(runtime_config.filter_tensors_on_load);
     }
 
     #[test]
@@ -1231,6 +1238,55 @@ mod tests {
         assert_eq!(runtime_config.n_threads_batch, None);
         assert_eq!(runtime_config.n_batch, None);
         assert_eq!(runtime_config.n_ubatch, None);
+        assert!(!runtime_config.filter_tensors_on_load);
+    }
+
+    #[test]
+    fn runtime_config_forces_tensor_filter_for_first_stage_with_downstream() {
+        let config = StageConfig {
+            run_id: "run-a".to_string(),
+            topology_id: "topology-a".to_string(),
+            model_id: "model-a".to_string(),
+            package_ref: Some("/tmp/package".to_string()),
+            manifest_sha256: Some("manifest".to_string()),
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some("/tmp/package".to_string()),
+            projector_path: None,
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 20,
+            ctx_size: 512,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: -1,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Auto,
+            filter_tensors_on_load: false,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::RuntimeSlice,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: Some(PeerConfig {
+                stage_id: "stage-1".to_string(),
+                stage_index: 1,
+                endpoint: "tcp://127.0.0.1:19001".to_string(),
+            }),
+        };
+
+        let runtime_config =
+            runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
+
+        assert!(runtime_config.include_embeddings);
+        assert!(!runtime_config.include_output);
+        assert!(runtime_config.filter_tensors_on_load);
     }
 
     #[test]

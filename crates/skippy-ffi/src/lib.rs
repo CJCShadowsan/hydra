@@ -344,6 +344,8 @@ impl std::error::Error for NativeRuntimeLoadError {}
 mod dynamic {
     use super::*;
     use libloading::Library;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
     static SYMBOLS: OnceLock<Symbols> = OnceLock::new();
@@ -392,10 +394,26 @@ mod dynamic {
             .into_iter()
             .map(|path| path.as_ref().to_path_buf())
             .collect::<Vec<_>>();
-        let symbols = unsafe { Symbols::load_paths(&collected) }?;
+        let symbols = unsafe { Symbols::load_paths(&unique_library_paths(&collected)) }?;
         SYMBOLS
             .set(symbols)
             .map_err(|_| NativeRuntimeLoadError::AlreadyLoaded)
+    }
+
+    fn unique_library_paths<P>(paths: &[P]) -> Vec<PathBuf>
+    where
+        P: AsRef<Path>,
+    {
+        let mut seen = HashSet::new();
+        let mut unique = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path = path.as_ref();
+            let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if seen.insert(identity) {
+                unique.push(path.to_path_buf());
+            }
+        }
+        unique
     }
 
     fn symbols() -> &'static Symbols {
@@ -552,6 +570,38 @@ mod dynamic {
         mtmd_helper_image_get_decoder_pos(image: *const Opaque, pos_0: i32, out_pos: *mut MtmdDecoderPos);
         mtmd_helper_eval_chunks(ctx: *mut MtmdContext, lctx: *mut Opaque, chunks: *const MtmdInputChunks, n_past: i32, seq_id: i32, n_batch: i32, logits_last: bool, new_n_past: *mut i32) -> c_int;
         mtmd_helper_eval_chunk_single(ctx: *mut MtmdContext, lctx: *mut Opaque, chunk: *const Opaque, n_past: i32, seq_id: i32, n_batch: i32, logits_last: bool, new_n_past: *mut i32) -> c_int;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::unique_library_paths;
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[cfg(unix)]
+        #[test]
+        fn unique_library_paths_deduplicates_symlinks() {
+            let root = std::env::temp_dir().join(format!(
+                "skippy-ffi-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let real = root.join("libllama.0.0.dylib");
+            let soname = root.join("libllama.0.dylib");
+            let linker = root.join("libllama.dylib");
+            fs::write(&real, b"not a real dylib").unwrap();
+            std::os::unix::fs::symlink(&real, &soname).unwrap();
+            std::os::unix::fs::symlink(&real, &linker).unwrap();
+
+            let unique = unique_library_paths(&[&real, &soname, &linker]);
+
+            assert_eq!(unique, vec![real.clone()]);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
 
