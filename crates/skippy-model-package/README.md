@@ -438,7 +438,10 @@ report for the candidate.
 `quant-pack evidence-status` reads an evidence-plan JSON or evidence-plan-all
 JSON and checks every declared output path. It emits a compact resume report
 with complete vs missing command counts and the next missing command's shell
-line. Commands with some outputs present and some outputs missing are marked
+line. Candidate entries preserve the evidence topology from the plan, including
+hosts, stage count, split boundaries, split source, and layer end, so an
+interrupted run can be audited from the status output alone. Commands with some
+outputs present and some outputs missing are marked
 `partial`, which is useful for failed lab preflights that left diagnostic logs
 but not the `.ok` success marker. When a partial text log contains an obvious
 failure line, the command and next-command entries include `observed_failure`

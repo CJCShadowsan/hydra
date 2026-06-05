@@ -60,6 +60,8 @@ struct CandidateEvidenceStatus {
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "EvidencePlanToolchain::is_empty")]
     toolchain: EvidencePlanToolchain,
+    #[serde(skip_serializing_if = "EvidencePlanTopology::is_empty")]
+    topology: EvidencePlanTopology,
     next_command: Option<NextEvidenceCommand>,
     commands: Vec<EvidenceCommandStatus>,
 }
@@ -81,6 +83,26 @@ struct EvidencePlanToolchain {
 }
 
 impl EvidencePlanToolchain {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct EvidencePlanTopology {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    hosts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    splits: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    split_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layer_end: Option<u32>,
+}
+
+impl EvidencePlanTopology {
     fn is_empty(&self) -> bool {
         self == &Self::default()
     }
@@ -132,6 +154,8 @@ struct EvidencePlanInput {
     warnings: Vec<String>,
     #[serde(flatten)]
     toolchain: EvidencePlanToolchain,
+    #[serde(flatten)]
+    topology: EvidencePlanTopology,
     commands: Vec<EvidenceCommandInput>,
 }
 
@@ -149,6 +173,8 @@ struct EvidencePlanCandidateInput {
     warnings: Vec<String>,
     #[serde(flatten)]
     toolchain: EvidencePlanToolchain,
+    #[serde(flatten)]
+    topology: EvidencePlanTopology,
     commands: Vec<EvidenceCommandInput>,
 }
 
@@ -240,6 +266,7 @@ fn build_evidence_status_report(plan: &Path) -> Result<EvidenceStatusReport> {
                     &input.candidate,
                     &input.warnings,
                     input.toolchain,
+                    input.topology,
                     &input.commands,
                 )],
                 None,
@@ -256,6 +283,7 @@ fn build_evidence_status_report(plan: &Path) -> Result<EvidenceStatusReport> {
                         &candidate.candidate,
                         &candidate.warnings,
                         candidate.toolchain.clone(),
+                        candidate.topology.clone(),
                         &candidate.commands,
                     )
                 })
@@ -271,6 +299,7 @@ fn candidate_status(
     candidate: &str,
     warnings: &[String],
     toolchain: EvidencePlanToolchain,
+    topology: EvidencePlanTopology,
     commands: &[EvidenceCommandInput],
 ) -> CandidateEvidenceStatus {
     let mut warnings = warnings.to_vec();
@@ -303,6 +332,7 @@ fn candidate_status(
         missing_commands,
         warnings,
         toolchain,
+        topology,
         next_command,
         commands,
     }
@@ -968,6 +998,11 @@ mod tests {
                 r#"{{
   "kind": "skippy_quant_pack_evidence_plan",
   "candidate": "middle-compressed",
+  "hosts": ["host-a", "host-b"],
+  "stage_count": 2,
+  "splits": "20",
+  "split_source": "cli_override",
+  "layer_end": 40,
   "runbook_cwd": "{}",
   "warnings": ["runtime host alias differs from preflight host"],
   "skippy_bench_bin": "{}",
@@ -1016,6 +1051,14 @@ mod tests {
             report.candidates[0].warnings,
             ["runtime host alias differs from preflight host"]
         );
+        assert_eq!(report.candidates[0].topology.stage_count, Some(2));
+        assert_eq!(report.candidates[0].topology.hosts, ["host-a", "host-b"]);
+        assert_eq!(report.candidates[0].topology.splits.as_deref(), Some("20"));
+        assert_eq!(
+            report.candidates[0].topology.split_source.as_deref(),
+            Some("cli_override")
+        );
+        assert_eq!(report.candidates[0].topology.layer_end, Some(40));
         assert_eq!(
             report.toolchain.runbook_cwd.as_deref(),
             Some(dir.to_str().expect("utf-8 path"))
