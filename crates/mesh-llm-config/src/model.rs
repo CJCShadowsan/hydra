@@ -404,6 +404,8 @@ pub struct SpeculativeConfig {
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
+    pub package_strategy: Option<String>,
+    #[serde(default)]
     pub draft_model_path: Option<String>,
     #[serde(default)]
     pub draft_hf_repo: Option<String>,

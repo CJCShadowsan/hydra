@@ -497,6 +497,10 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Result<(
         &["auto", "disabled", "draft", "ngram"],
         &format!("{base_path}.mode"),
     )?;
+    validate_optional_non_empty(
+        config.package_strategy.as_deref(),
+        &format!("{base_path}.package_strategy"),
+    )?;
     validate_hf_pair(
         config.draft_hf_repo.as_deref(),
         config.draft_hf_file.as_deref(),
