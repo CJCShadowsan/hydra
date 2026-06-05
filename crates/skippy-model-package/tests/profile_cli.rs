@@ -54,6 +54,32 @@ fn profile_cli_emits_decode_scaffold_json() {
     fs::remove_dir_all(package_dir).ok();
 }
 
+#[test]
+fn profile_cli_rejects_local_stage_for_package_input() {
+    let package_dir = temp_dir("profile-cli-local-stage");
+    write_manifest(&package_dir);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skippy-model-package"))
+        .arg("profile")
+        .arg(&package_dir)
+        .arg("--timing-source")
+        .arg("local-stage")
+        .output()
+        .expect("run skippy-model-package profile");
+
+    assert!(
+        !output.status.success(),
+        "profile command unexpectedly passed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("direct GGUF inputs only"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(package_dir).ok();
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

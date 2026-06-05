@@ -48,9 +48,10 @@ pub(crate) enum ProfilePhase {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum TimingSourceKind {
     Static,
+    LocalStage,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,7 +78,7 @@ pub(crate) struct ProfileReport {
     pub(crate) stages: Vec<StageProfile>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProfileInputKind {
     LayerPackage,
@@ -214,13 +215,17 @@ trait ProfileTimingSource {
 }
 
 struct StaticTimingSource;
+struct LocalStageTimingSource;
 
 struct ProfileTimingInput<'a> {
     package: &'a Path,
+    input_kind: ProfileInputKind,
+    stage_count: usize,
     request_shape: &'a RequestShape,
     measurement: &'a MeasurementConfig,
 }
 
+#[derive(Debug)]
 struct ProfileTimingReport {
     measurement_status: MeasurementStatus,
     layer_timings: BTreeMap<u32, TimingProfile>,
@@ -246,6 +251,15 @@ impl ProfileTimingSource for StaticTimingSource {
             stage_timings: BTreeMap::new(),
             estimated_tokens_per_second: None,
         })
+    }
+}
+
+impl ProfileTimingSource for LocalStageTimingSource {
+    fn profile(&self, input: &ProfileTimingInput<'_>) -> Result<ProfileTimingReport> {
+        validate_local_stage_input(input)?;
+        bail!(
+            "--timing-source local-stage is reserved for direct-GGUF stage-level decode measurement, but runtime execution is not wired yet"
+        )
     }
 }
 
@@ -282,6 +296,8 @@ fn profile_package(args: &ProfileArgs) -> Result<ProfileReport> {
     let measurement = measurement_config(args);
     let timing_report = timing_source(args.timing_source).profile(&ProfileTimingInput {
         package: &args.package,
+        input_kind: ProfileInputKind::LayerPackage,
+        stage_count: args.stages,
         request_shape: &request_shape,
         measurement: &measurement,
     })?;
@@ -334,6 +350,8 @@ fn profile_direct_gguf(args: &ProfileArgs) -> Result<ProfileReport> {
     let measurement = measurement_config(args);
     let timing_report = timing_source(args.timing_source).profile(&ProfileTimingInput {
         package: &args.package,
+        input_kind: ProfileInputKind::DirectGguf,
+        stage_count: args.stages,
         request_shape: &request_shape,
         measurement: &measurement,
     })?;
@@ -744,7 +762,23 @@ fn measurement_config(args: &ProfileArgs) -> MeasurementConfig {
 fn timing_source(kind: TimingSourceKind) -> Box<dyn ProfileTimingSource> {
     match kind {
         TimingSourceKind::Static => Box::new(StaticTimingSource),
+        TimingSourceKind::LocalStage => Box::new(LocalStageTimingSource),
     }
+}
+
+fn validate_local_stage_input(input: &ProfileTimingInput<'_>) -> Result<()> {
+    if input.input_kind != ProfileInputKind::DirectGguf {
+        bail!(
+            "--timing-source local-stage currently supports direct GGUF inputs only; use --timing-source static for layer packages"
+        );
+    }
+    if input.stage_count != 1 {
+        bail!("--timing-source local-stage currently supports --stages 1 only");
+    }
+    if !matches!(input.request_shape.phase, ProfilePhase::Decode) {
+        bail!("--timing-source local-stage currently supports --phase decode only");
+    }
+    Ok(())
 }
 
 fn unmeasured_timing() -> TimingProfile {

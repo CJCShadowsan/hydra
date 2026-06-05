@@ -48,6 +48,7 @@ skippy-model-package validate model.gguf slices/stage-*.gguf
 skippy-model-package validate-package model.gguf model-package/
 skippy-model-package profile model.gguf --stages 4 --phase decode --existing-kv-tokens 32768
 skippy-model-package profile model-package/ --stages 4 --phase decode --existing-kv-tokens 32768 --warmup-samples 3 --samples 20
+skippy-model-package profile model.gguf --timing-source local-stage --stages 1 --phase decode --warmup-samples 3 --samples 20
 ```
 
 `write` and `write-stages` call the llama C ABI, which uses llama.cpp GGUF
@@ -107,3 +108,8 @@ introspection to summarize layer tensor bytes, shared tensor bytes, and
 synthetic split-stage byte totals before a package has been written. This lets
 operators profile candidate source models before choosing a split or mixed
 quantization layout.
+
+`--timing-source local-stage` is the reserved measured lane for direct-GGUF
+stage-level decode timing. It currently fails closed after validating that the
+input is a direct GGUF, `--stages 1`, and `--phase decode`; the runtime
+execution path will fill `stages[0].timing` through this source later.

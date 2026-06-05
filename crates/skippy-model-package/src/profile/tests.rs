@@ -123,6 +123,90 @@ fn profile_rejects_too_many_stages() {
     fs::remove_dir_all(dir).ok();
 }
 
+#[test]
+fn local_stage_timing_rejects_layer_package_inputs() {
+    let request_shape = local_stage_request(ProfilePhase::Decode);
+    let measurement = local_stage_measurement();
+    let input = local_stage_input(
+        ProfileInputKind::LayerPackage,
+        1,
+        &request_shape,
+        &measurement,
+    );
+
+    let error = LocalStageTimingSource
+        .profile(&input)
+        .expect_err("layer packages are not accepted yet");
+
+    assert!(
+        error
+            .to_string()
+            .contains("currently supports direct GGUF inputs only")
+    );
+}
+
+#[test]
+fn local_stage_timing_rejects_multi_stage_inputs() {
+    let request_shape = local_stage_request(ProfilePhase::Decode);
+    let measurement = local_stage_measurement();
+    let input = local_stage_input(
+        ProfileInputKind::DirectGguf,
+        2,
+        &request_shape,
+        &measurement,
+    );
+
+    let error = LocalStageTimingSource
+        .profile(&input)
+        .expect_err("multi-stage local timing is not accepted yet");
+
+    assert!(error.to_string().contains("currently supports --stages 1"));
+}
+
+#[test]
+fn local_stage_timing_rejects_non_decode_phase() {
+    let request_shape = local_stage_request(ProfilePhase::Prefill);
+    let measurement = local_stage_measurement();
+    let input = local_stage_input(
+        ProfileInputKind::DirectGguf,
+        1,
+        &request_shape,
+        &measurement,
+    );
+
+    let error = LocalStageTimingSource
+        .profile(&input)
+        .expect_err("non-decode local timing is not accepted yet");
+
+    assert!(
+        error
+            .to_string()
+            .contains("currently supports --phase decode")
+    );
+}
+
+#[test]
+fn local_stage_timing_marks_runtime_execution_unwired() {
+    let request_shape = local_stage_request(ProfilePhase::Decode);
+    let measurement = local_stage_measurement();
+    let input = local_stage_input(
+        ProfileInputKind::DirectGguf,
+        1,
+        &request_shape,
+        &measurement,
+    );
+
+    let error = LocalStageTimingSource
+        .profile(&input)
+        .expect_err("runtime execution should not be wired yet");
+
+    assert!(
+        error
+            .to_string()
+            .contains("runtime execution is not wired yet")
+    );
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -131,6 +215,42 @@ fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("skippy-profile-{name}-{nanos}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+fn local_stage_input<'a>(
+    input_kind: ProfileInputKind,
+    stage_count: usize,
+    request_shape: &'a RequestShape,
+    measurement: &'a MeasurementConfig,
+) -> ProfileTimingInput<'a> {
+    static PACKAGE: &str = "model.gguf";
+    ProfileTimingInput {
+        package: Path::new(PACKAGE),
+        input_kind,
+        stage_count,
+        request_shape,
+        measurement,
+    }
+}
+
+fn local_stage_request(phase: ProfilePhase) -> RequestShape {
+    RequestShape {
+        phase,
+        existing_kv_tokens: 8192,
+        generated_tokens: 1,
+        batch_size: 1,
+        kv_type: "f16".to_string(),
+        backend: None,
+        device: None,
+    }
+}
+
+fn local_stage_measurement() -> MeasurementConfig {
+    MeasurementConfig {
+        source: TimingSourceKind::LocalStage,
+        warmup_samples: 3,
+        samples: 20,
+    }
 }
 
 fn write_manifest(dir: &Path) {
