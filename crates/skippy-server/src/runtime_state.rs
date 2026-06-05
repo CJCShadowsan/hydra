@@ -7,10 +7,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use skippy_protocol::{FlashAttentionType, LoadMode, StageConfig};
 use skippy_runtime::{
-    ActivationFrame, DecodeBatchRequest, FlashAttentionType as RuntimeFlashAttentionType,
-    GenerationSignalWindow, MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig,
-    RuntimeKvPage, RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
-    StageSessionCheckpoint, TokenSignal, parse_cache_type,
+    ActivationFrame, DecodeBatchRequest, DecodeFrameBatchOutput, DecodeFrameBatchRequest,
+    FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow, MediaInput,
+    MediaPrefill, MediaPrefillFrame, RuntimeConfig, RuntimeKvPage, RuntimeKvPageDesc,
+    RuntimeLoadMode, SamplingConfig, StageModel, StageSession, StageSessionCheckpoint, TokenSignal,
+    parse_cache_type,
 };
 
 use crate::package::select_package_parts;
@@ -94,6 +95,13 @@ pub struct RuntimeDecodeBatchRequest<'a> {
     pub session_id: &'a str,
     pub token_id: i32,
     pub sampling: Option<&'a SamplingConfig>,
+}
+
+pub struct RuntimeDecodeFrameBatchRequest<'a> {
+    pub session_id: &'a str,
+    pub token_id: i32,
+    pub sampling: Option<&'a SamplingConfig>,
+    pub input: Option<&'a ActivationFrame>,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +314,54 @@ impl RuntimeState {
         Ok(output)
     }
 
+    pub fn decode_frame_batch_sampled(
+        &mut self,
+        requests: &[RuntimeDecodeFrameBatchRequest<'_>],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        Self::ensure_unique_frame_batch_sessions(requests)?;
+        for request in requests {
+            self.session(request.session_id)?;
+        }
+
+        let mut lane_sessions = Vec::with_capacity(requests.len());
+        for request in requests {
+            let lane_session = self.sessions.remove(request.session_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {} was not active after admission",
+                    request.session_id
+                )
+            })?;
+            lane_sessions.push((request.session_id.to_string(), lane_session));
+        }
+
+        let result = {
+            let mut decode_requests = lane_sessions
+                .iter_mut()
+                .zip(requests.iter())
+                .map(|((_, lane_session), request)| DecodeFrameBatchRequest {
+                    session: &mut lane_session.session,
+                    token_id: request.token_id,
+                    sampling: request.sampling,
+                    input: request.input,
+                })
+                .collect::<Vec<_>>();
+            StageSession::decode_step_frame_batch_sampled(&mut decode_requests)
+        };
+
+        for (session_id, lane_session) in lane_sessions {
+            self.sessions.insert(session_id, lane_session);
+        }
+        if result.is_ok() {
+            for request in requests {
+                self.add_session_tokens(request.session_id, 1);
+            }
+        }
+        result
+    }
+
     pub fn verify_frame(
         &mut self,
         session_id: &str,
@@ -371,6 +427,21 @@ impl RuntimeState {
         for request in requests {
             if !seen.insert(request.session_id) {
                 bail!("duplicate session {} in decode batch", request.session_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_unique_frame_batch_sessions(
+        requests: &[RuntimeDecodeFrameBatchRequest<'_>],
+    ) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if !seen.insert(request.session_id) {
+                bail!(
+                    "duplicate session {} in decode frame batch",
+                    request.session_id
+                );
             }
         }
         Ok(())

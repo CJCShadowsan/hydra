@@ -39,12 +39,14 @@ use skippy_runtime::{
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+mod decode_batcher;
 pub(crate) mod direct_return;
 pub(crate) mod forwarding;
 mod options;
 mod socket;
 mod wire;
 
+pub(crate) use self::decode_batcher::DecodeFrameBatcher;
 pub use self::direct_return::PredictionReturnHub;
 pub use self::direct_return::PredictionReturnListener;
 pub(crate) use self::direct_return::PredictionReturnReceiver;
@@ -197,6 +199,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
     );
     telemetry.emit("stage.binary_server_start", lifecycle_attrs(&config));
     let runtime = load_runtime(&config)?.context("binary stage server requires model_path")?;
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), max_inflight);
     {
         let timer = Instant::now();
         let sessions = runtime
@@ -295,6 +298,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         let config = config.clone();
         let topology = topology.clone();
         let runtime = runtime.clone();
+        let decode_frame_batcher = decode_frame_batcher.clone();
         let kv = kv.clone();
         let telemetry = telemetry.clone();
         let prediction_returns = prediction_returns.clone();
@@ -315,6 +319,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     &config,
                     topology.as_ref(),
                     &runtime,
+                    &decode_frame_batcher,
                     kv.as_ref(),
                     &telemetry,
                     &mut upstream,
@@ -357,6 +362,7 @@ fn handle_binary_connection(
     config: &StageConfig,
     topology: Option<&StageTopology>,
     runtime: &Arc<Mutex<RuntimeState>>,
+    decode_frame_batcher: &DecodeFrameBatcher,
     kv: Option<&Arc<KvStageIntegration>>,
     telemetry: &Telemetry,
     upstream: &mut TcpStream,
@@ -824,6 +830,8 @@ fn handle_binary_connection(
         let mut runtime_lock_acquires = 0usize;
         let mut runtime_sessions_before = None;
         let mut runtime_sessions_after = None;
+        let mut decode_batch_size = 1usize;
+        let mut decode_batch_wait_ms = 0.0;
         let input_activation_bytes = message.activation.len();
         let (predicted_token, predicted_tokens, output, compute_ms) = if restored_prefill {
             let now = now_unix_nanos() as u64;
@@ -873,7 +881,22 @@ fn handle_binary_connection(
             }
             compute_start_unix_nanos = now_unix_nanos() as u64;
             let compute_started = Instant::now();
-            let result = {
+            let result = if is_decode_frame_batch_candidate(&message, executable_token_ids) {
+                let token_id = executable_token_ids
+                    .first()
+                    .copied()
+                    .unwrap_or(message.state.current_token);
+                let sampling = runtime_sampling_config(message.sampling.as_ref());
+                let outcome = decode_frame_batcher
+                    .decode(&session_key, token_id, sampling.as_ref(), input)
+                    .context("execute batched binary decode frame")?;
+                runtime_lock_wait_ms = outcome.runtime_lock_wait_ms;
+                runtime_lock_hold_ms = outcome.runtime_lock_hold_ms;
+                runtime_lock_acquires = 1;
+                decode_batch_size = outcome.batch_size;
+                decode_batch_wait_ms = outcome.batch_wait_ms;
+                (outcome.predicted, Vec::new(), outcome.output)
+            } else {
                 let lock_started = Instant::now();
                 let mut runtime = runtime.lock().expect("runtime lock poisoned");
                 runtime_lock_wait_ms = elapsed_ms(lock_started);
@@ -918,6 +941,14 @@ fn handle_binary_connection(
         decode_attrs.insert(
             "llama_stage.runtime_lock_acquires".to_string(),
             json!(runtime_lock_acquires),
+        );
+        decode_attrs.insert(
+            "llama_stage.decode_batch_size".to_string(),
+            json!(decode_batch_size),
+        );
+        decode_attrs.insert(
+            "llama_stage.decode_batch_wait_ms".to_string(),
+            json!(decode_batch_wait_ms),
         );
         if let Some(stats) = runtime_sessions_before.as_ref() {
             insert_runtime_session_stats(
@@ -3269,6 +3300,18 @@ pub(crate) fn run_binary_stage_message(
             bail!("message kind is not executable")
         }
     }
+}
+
+fn is_decode_frame_batch_candidate(message: &StageWireMessage, token_ids: &[i32]) -> bool {
+    matches!(
+        message.kind,
+        WireMessageKind::DecodeEmbd
+            | WireMessageKind::DecodeReadout
+            | WireMessageKind::DecodeLightCtx
+            | WireMessageKind::DecodeReplayEmbd
+            | WireMessageKind::DecodeReplayFinalEmbd
+    ) && message.token_count == 1
+        && token_ids.len() == 1
 }
 
 fn runtime_sampling_config(sampling: Option<&StageSamplingConfig>) -> Option<SamplingConfig> {

@@ -1053,6 +1053,21 @@ impl From<RawActivationDesc> for ActivationDesc {
     }
 }
 
+fn empty_raw_activation_desc() -> RawActivationDesc {
+    RawActivationDesc {
+        version: 0,
+        dtype: ActivationDType::Unknown,
+        layout: ActivationLayout::Opaque,
+        producer_stage_index: -1,
+        layer_start: 0,
+        layer_end: 0,
+        token_count: 0,
+        sequence_count: 0,
+        payload_bytes: 0,
+        flags: 0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationFrame {
     pub desc: ActivationDesc,
@@ -1196,6 +1211,18 @@ pub struct DecodeBatchRequest<'a> {
     pub session: &'a mut StageSession,
     pub token_id: i32,
     pub sampling: Option<&'a SamplingConfig>,
+}
+
+pub struct DecodeFrameBatchRequest<'a> {
+    pub session: &'a mut StageSession,
+    pub token_id: i32,
+    pub sampling: Option<&'a SamplingConfig>,
+    pub input: Option<&'a ActivationFrame>,
+}
+
+pub struct DecodeFrameBatchOutput {
+    pub predicted_token: i32,
+    pub output: ActivationFrame,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2990,6 +3017,148 @@ impl StageSession {
             .checked_add(1)
             .context("session token count overflow")?;
         Ok((predicted_token, output_desc, output_payload))
+    }
+
+    pub fn decode_step_frame_batch_sampled(
+        requests: &mut [DecodeFrameBatchRequest<'_>],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        Self::decode_step_frame_batch_sampled_raw(requests, &vec![0; requests.len()])
+    }
+
+    fn decode_step_frame_batch_sampled_raw(
+        requests: &mut [DecodeFrameBatchRequest<'_>],
+        output_capacities: &[usize],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sessions = requests
+            .iter_mut()
+            .map(|request| request.session.raw)
+            .collect::<Vec<_>>();
+        let token_ids = requests
+            .iter()
+            .map(|request| request.token_id)
+            .collect::<Vec<_>>();
+        let raw_sampling = requests
+            .iter()
+            .map(|request| request.sampling.map(SamplingConfig::as_raw))
+            .collect::<Vec<_>>();
+        let sampling = raw_sampling
+            .iter()
+            .map(|sampling| {
+                sampling
+                    .as_ref()
+                    .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig)
+            })
+            .collect::<Vec<_>>();
+        let input_descs = requests
+            .iter()
+            .map(|request| request.input.map(|frame| frame.desc.as_raw()))
+            .collect::<Vec<_>>();
+        let input_desc_ptrs = input_descs
+            .iter()
+            .map(|desc| {
+                desc.as_ref()
+                    .map_or(ptr::null(), |desc| desc as *const RawActivationDesc)
+            })
+            .collect::<Vec<_>>();
+        let input_payloads = requests
+            .iter()
+            .map(|request| {
+                request
+                    .input
+                    .map_or(ptr::null(), |frame| frame.payload.as_ptr().cast())
+            })
+            .collect::<Vec<_>>();
+        let mut output_descs = vec![empty_raw_activation_desc(); requests.len()];
+        let mut output_payloads = output_capacities
+            .iter()
+            .map(|capacity| vec![0_u8; *capacity])
+            .collect::<Vec<_>>();
+        let output_payload_ptrs = output_payloads
+            .iter_mut()
+            .map(|payload| payload.as_mut_ptr().cast())
+            .collect::<Vec<_>>();
+        let mut output_bytes = vec![0_usize; requests.len()];
+        let mut predicted_tokens = vec![0_i32; requests.len()];
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_decode_step_frame_batch_sampled(
+                sessions.as_ptr(),
+                token_ids.as_ptr(),
+                sampling.as_ptr(),
+                input_desc_ptrs.as_ptr(),
+                input_payloads.as_ptr(),
+                output_descs.as_mut_ptr(),
+                output_payload_ptrs.as_ptr(),
+                output_capacities.as_ptr(),
+                output_bytes.as_mut_ptr(),
+                predicted_tokens.as_mut_ptr(),
+                predicted_tokens.len(),
+                requests.len(),
+                &mut error,
+            )
+        };
+        if status == Status::BufferTooSmall {
+            free_error(error);
+            error = ptr::null_mut();
+            if output_bytes
+                .iter()
+                .zip(output_capacities.iter())
+                .any(|(required, capacity)| required > capacity)
+            {
+                return Self::decode_step_frame_batch_sampled_raw(requests, &output_bytes);
+            }
+        }
+        if status == Status::Unsupported {
+            free_error(error);
+            return Self::decode_step_frame_batch_sampled_serial(requests);
+        }
+        ensure_ok(status, error)?;
+        for request in requests.iter_mut() {
+            request.session.token_count = request
+                .session
+                .token_count
+                .checked_add(1)
+                .context("session token count overflow")?;
+        }
+        Ok(output_payloads
+            .into_iter()
+            .zip(output_descs)
+            .zip(output_bytes)
+            .zip(predicted_tokens)
+            .map(|(((mut payload, desc), bytes), predicted_token)| {
+                payload.truncate(bytes);
+                DecodeFrameBatchOutput {
+                    predicted_token,
+                    output: ActivationFrame {
+                        desc: desc.into(),
+                        payload,
+                    },
+                }
+            })
+            .collect())
+    }
+
+    fn decode_step_frame_batch_sampled_serial(
+        requests: &mut [DecodeFrameBatchRequest<'_>],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        requests
+            .iter_mut()
+            .map(|request| {
+                let (predicted_token, output) = request.session.decode_step_frame_sampled(
+                    request.token_id,
+                    request.sampling,
+                    request.input,
+                    0,
+                )?;
+                Ok(DecodeFrameBatchOutput {
+                    predicted_token,
+                    output,
+                })
+            })
+            .collect()
     }
 
     pub fn verify_tokens_frame(

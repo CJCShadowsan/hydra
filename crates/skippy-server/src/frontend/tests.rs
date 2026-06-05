@@ -1086,6 +1086,7 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
     let runtime = load_runtime(&config)?.context("load smoke runtime")?;
     let ctx_size = usize::try_from(config.ctx_size).unwrap_or(usize::MAX);
     let decode_batcher = DecodeBatcher::new(runtime.clone(), 1);
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), 1);
     Ok(StageOpenAiBackend {
         runtime,
         telemetry: Telemetry::new(
@@ -1109,6 +1110,7 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         hook_policy: None,
         kv: None,
         decode_batcher,
+        decode_frame_batcher,
     })
 }
 
@@ -1267,6 +1269,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
     let runtime = load_runtime(&stage0_config)?.context("load stage-0 smoke runtime")?;
     let ctx_size = usize::try_from(stage0_config.ctx_size).unwrap_or(usize::MAX);
     let decode_batcher = DecodeBatcher::new(runtime.clone(), 1);
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), 1);
     let backend = StageOpenAiBackend {
         runtime,
         telemetry,
@@ -1294,6 +1297,7 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         hook_policy: None,
         kv: None,
         decode_batcher,
+        decode_frame_batcher,
     };
     let response = backend
         .chat_completion(multimodal_chat_request(&fixture)?)

@@ -585,8 +585,8 @@ impl StageOpenAiBackend {
             let mut decode_runtime_lock_hold_ms = 0.0;
             let mut decode_runtime_lock_hold_max_ms = 0.0_f64;
             let mut decode_runtime_lock_acquires = 0usize;
-            let mut decode_runtime_sessions_before = None;
-            let mut decode_runtime_sessions_after = None;
+            let mut decode_batch_size_max = 1usize;
+            let mut decode_batch_wait_ms = 0.0;
             let mut decode_forward_write_ms = 0.0;
             let mut decode_forward_activation_encode_ms = 0.0;
             let mut decode_output_activation_bytes = 0usize;
@@ -1114,39 +1114,22 @@ impl StageOpenAiBackend {
                     raw_bytes: Vec::new(),
                 };
                 let stage0_timer = PhaseTimer::start();
-                let token_runtime_lock_wait_ms;
-                let token_runtime_lock_hold_ms;
-                let output = {
-                    let lock_timer = PhaseTimer::start();
-                    let mut runtime = self
-                        .runtime
-                        .lock()
-                        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-                    let lock_wait_ms = lock_timer.elapsed_ms();
-                    token_runtime_lock_wait_ms = lock_wait_ms;
-                    decode_runtime_lock_wait_ms += lock_wait_ms;
-                    decode_runtime_lock_wait_max_ms =
-                        decode_runtime_lock_wait_max_ms.max(lock_wait_ms);
-                    decode_runtime_lock_acquires += 1;
-                    let lock_hold_timer = PhaseTimer::start();
-                    decode_runtime_sessions_before.get_or_insert_with(|| runtime.session_stats());
-                    let output = run_binary_stage_message(
-                        &mut runtime,
-                        &session_key,
-                        &message,
-                        &[current],
-                        None,
-                        false,
-                    )
-                    .map_err(openai_backend_error)?
-                    .2;
-                    decode_runtime_sessions_after = Some(runtime.session_stats());
-                    token_runtime_lock_hold_ms = lock_hold_timer.elapsed_ms();
-                    decode_runtime_lock_hold_ms += token_runtime_lock_hold_ms;
-                    decode_runtime_lock_hold_max_ms =
-                        decode_runtime_lock_hold_max_ms.max(token_runtime_lock_hold_ms);
-                    output
-                };
+                let batch_outcome = self
+                    .decode_frame_batcher
+                    .decode(&session_key, current, Some(request.sampling), None)
+                    .map_err(openai_backend_error)?;
+                let token_runtime_lock_wait_ms = batch_outcome.runtime_lock_wait_ms;
+                let token_runtime_lock_hold_ms = batch_outcome.runtime_lock_hold_ms;
+                decode_runtime_lock_wait_ms += token_runtime_lock_wait_ms;
+                decode_runtime_lock_wait_max_ms =
+                    decode_runtime_lock_wait_max_ms.max(token_runtime_lock_wait_ms);
+                decode_runtime_lock_hold_ms += token_runtime_lock_hold_ms;
+                decode_runtime_lock_hold_max_ms =
+                    decode_runtime_lock_hold_max_ms.max(token_runtime_lock_hold_ms);
+                decode_runtime_lock_acquires += 1;
+                decode_batch_size_max = decode_batch_size_max.max(batch_outcome.batch_size);
+                decode_batch_wait_ms += batch_outcome.batch_wait_ms;
+                let output = batch_outcome.output;
                 let stage0_compute_ms = stage0_timer.elapsed_ms();
                 decode_stage0_compute_ms += stage0_compute_ms;
                 let forwarded = forwarded_stage_message_timed(
@@ -1229,6 +1212,14 @@ impl StageOpenAiBackend {
                     json!(token_runtime_lock_hold_ms),
                 );
                 token_attrs.insert(
+                    "llama_stage.decode_batch_size".to_string(),
+                    json!(batch_outcome.batch_size),
+                );
+                token_attrs.insert(
+                    "llama_stage.decode_batch_wait_ms".to_string(),
+                    json!(batch_outcome.batch_wait_ms),
+                );
+                token_attrs.insert(
                     "llama_stage.output_activation_bytes".to_string(),
                     json!(output.payload.len()),
                 );
@@ -1284,20 +1275,14 @@ impl StageOpenAiBackend {
                 "llama_stage.runtime_lock_acquires".to_string(),
                 json!(decode_runtime_lock_acquires),
             );
-            if let Some(stats) = decode_runtime_sessions_before.as_ref() {
-                Self::insert_runtime_session_stats(
-                    &mut decode_attrs,
-                    "llama_stage.runtime_sessions_before",
-                    stats,
-                );
-            }
-            if let Some(stats) = decode_runtime_sessions_after.as_ref() {
-                Self::insert_runtime_session_stats(
-                    &mut decode_attrs,
-                    "llama_stage.runtime_sessions_after",
-                    stats,
-                );
-            }
+            decode_attrs.insert(
+                "llama_stage.decode_batch_size_max".to_string(),
+                json!(decode_batch_size_max),
+            );
+            decode_attrs.insert(
+                "llama_stage.decode_batch_wait_ms".to_string(),
+                json!(decode_batch_wait_ms),
+            );
             decode_attrs.insert(
                 "llama_stage.forward_write_ms".to_string(),
                 json!(decode_forward_write_ms),

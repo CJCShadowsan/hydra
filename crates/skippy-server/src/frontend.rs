@@ -57,9 +57,9 @@ use tokio::{
 
 use crate::{
     binary_transport::{
-        PredictionReturnHub, PredictionReturnReceiver, WireCondition, connect_binary_downstream,
-        forwarded_stage_message, forwarded_stage_message_timed, run_binary_stage_message,
-        write_stage_message_conditioned,
+        DecodeFrameBatcher, PredictionReturnHub, PredictionReturnReceiver, WireCondition,
+        connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
+        run_binary_stage_message, write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
@@ -171,6 +171,8 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
     let ctx_size = usize::try_from(config.ctx_size).unwrap_or(usize::MAX);
     let decode_batcher = DecodeBatcher::new(runtime.clone(), args.generation_concurrency);
+    let decode_frame_batcher =
+        DecodeFrameBatcher::new(runtime.clone(), args.generation_concurrency);
     let backend = Arc::new(StageOpenAiBackend {
         runtime,
         config,
@@ -189,6 +191,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         hook_policy: None,
         kv,
         decode_batcher,
+        decode_frame_batcher,
     });
     let app: Router = instrumented_openai_router(backend, telemetry.clone());
 
@@ -517,6 +520,8 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     let kv = KvStageIntegration::from_config(&args.config)?.map(Arc::new);
     let ctx_size = usize::try_from(args.config.ctx_size).unwrap_or(usize::MAX);
     let decode_batcher = DecodeBatcher::new(args.runtime.clone(), args.generation_concurrency);
+    let decode_frame_batcher =
+        DecodeFrameBatcher::new(args.runtime.clone(), args.generation_concurrency);
     let backend: Arc<dyn OpenAiBackend> = Arc::new(StageOpenAiBackend {
         runtime: args.runtime,
         config: args.config.clone(),
@@ -535,6 +540,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         hook_policy: args.hook_policy,
         kv,
         decode_batcher,
+        decode_frame_batcher,
     });
     let openai_guardrails = args
         .openai_guardrails
@@ -574,6 +580,7 @@ struct StageOpenAiBackend {
     hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     kv: Option<Arc<KvStageIntegration>>,
     decode_batcher: DecodeBatcher,
+    decode_frame_batcher: DecodeFrameBatcher,
 }
 
 struct GenerationQueueReservation {
