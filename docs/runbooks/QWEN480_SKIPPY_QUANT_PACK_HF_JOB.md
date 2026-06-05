@@ -12,9 +12,9 @@ of loading the 480B source model on Studio.
 - Stage count: `4`
 - Context shape: `8192`, `cache_type_k=f16`, `cache_type_v=f16`,
   `activation_wire_dtype=f16`
-- Job image: `ghcr.io/mesh-llm/skippy-quant-pack-job:sha-c2c11a0`
+- Job image: `ghcr.io/mesh-llm/skippy-quant-pack-job:sha-0b433a3`
 - Published image digest:
-  `sha256:6c5a2674d1397ce76eed036667834b4f4a206ad067216a36053e13dc4a316207`
+  `sha256:7dd65ff4c1abf851116c5ac8b788123c5e350445cc17cf24c048f8fb0459ac69`
 - Output repo: `alexz-oai/qwen480-skippy-pack`
 
 Generated local handoff artifacts live under:
@@ -37,7 +37,7 @@ payload:
 ```bash
 skippy-model-package quant-pack hf-jobs-validate \
   /Volumes/External/skippy-quant-packs/qwen3-coder-480b/hf-jobs/qwen480-hf-jobs-submit.json \
-  --expected-image ghcr.io/mesh-llm/skippy-quant-pack-job:sha-c2c11a0 \
+  --expected-image ghcr.io/mesh-llm/skippy-quant-pack-job:sha-0b433a3 \
   --expected-upload-repo alexz-oai/qwen480-skippy-pack
 ```
 
@@ -53,7 +53,7 @@ Preferred path: run the `docker` GitHub Actions workflow from this branch. It
 builds and pushes:
 
 ```text
-ghcr.io/mesh-llm/skippy-quant-pack-job:sha-c2c11a0
+ghcr.io/mesh-llm/skippy-quant-pack-job:sha-0b433a3
 ```
 
 The mutable `:cpu` tag was also pushed by workflow run
@@ -69,8 +69,8 @@ gh workflow run docker.yml --ref design/skippy-agent-quant-packs -f target=quant
 Local fallback, when Docker is running:
 
 ```bash
-just docker-build-quant-pack-job ghcr.io/mesh-llm/skippy-quant-pack-job:sha-c2c11a0
-just docker-push-quant-pack-job ghcr.io/mesh-llm/skippy-quant-pack-job:sha-c2c11a0
+just docker-build-quant-pack-job ghcr.io/mesh-llm/skippy-quant-pack-job:sha-0b433a3
+just docker-push-quant-pack-job ghcr.io/mesh-llm/skippy-quant-pack-job:sha-0b433a3
 ```
 
 The image contains `skippy-model-package`, `llama-quantize`, and `hf`. Its
