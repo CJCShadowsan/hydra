@@ -506,6 +506,18 @@ bool set_encoded_weights(
     double & bytes,
     double & flops) {
     const std::vector<uint8_t> & encoded = cached_encoded_weights(cache, type, rows, cols);
+    // Real GGUF files can mix tensor types per tensor, while these probes ask a
+    // stricter question: "can the backend execute this whole model-shaped graph
+    // if every matmul weight uses this candidate type?"  For very small or
+    // unusual widths, especially K-quants, GGML may allocate fewer bytes for the
+    // synthetic tensor than ggml_quantize_chunk produces for the same logical
+    // rows/cols.  Calling ggml_backend_tensor_set in that state trips GGML's
+    // bounds assertion and aborts the validator.  Treat it as an unsupported
+    // synthetic probe shape instead; the estimator can then fall back to another
+    // source of evidence without pretending this graph was measured.
+    if (encoded.size() > ggml_nbytes(tensor)) {
+        return false;
+    }
     ggml_backend_tensor_set(tensor, encoded.data(), 0, encoded.size());
     bytes += static_cast<double>(encoded.size());
     flops += 2.0 * static_cast<double>(rows) * static_cast<double>(cols);
@@ -529,6 +541,9 @@ bool set_active_encoded_weights(
     // also describe active traffic, not resident model size, matching the
     // model-fit active-expert accounting.
     const std::vector<uint8_t> & encoded = cached_encoded_weights(cache, type, rows, cols);
+    if (encoded.size() > ggml_nbytes(tensor)) {
+        return false;
+    }
     ggml_backend_tensor_set(tensor, encoded.data(), 0, encoded.size());
     bytes += static_cast<double>(encoded.size());
     flops += 2.0 * static_cast<double>(rows) * static_cast<double>(cols);
@@ -709,7 +724,11 @@ bool run_llama_graph_probe(
         }
         const int64_t rows = t->ne[1];
         const int64_t cols = t->ne[0];
-        set_encoded_weights(t, type, rows, cols, weight_cache, bytes, flops);
+        if (!set_encoded_weights(t, type, rows, cols, weight_cache, bytes, flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
     }
     bytes += static_cast<double>(layers * (4 * hidden + ffn) * sizeof(float));
     ggml_backend_synchronize(backend);
@@ -897,7 +916,11 @@ bool run_linear_attention_graph_probe(
         }
         const int64_t rows = t->ne[1];
         const int64_t cols = t->ne[0];
-        set_encoded_weights(t, type, rows, cols, weight_cache, bytes, flops);
+        if (!set_encoded_weights(t, type, rows, cols, weight_cache, bytes, flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
     }
     bytes += static_cast<double>((recurrent + full_attention) * (5 * hidden + ffn) * sizeof(float));
     ggml_backend_synchronize(backend);
@@ -966,14 +989,18 @@ bool run_moe_mul_mat_id_probe(
     double ignored_resident_bytes = 0.0;
     double flops = 0.0;
     EncodedWeightCache weight_cache;
-    set_encoded_weights(
+    if (!set_encoded_weights(
         experts,
         type,
         expert_width * expert_count,
         hidden,
         weight_cache,
         ignored_resident_bytes,
-        flops);
+        flops)) {
+        free_scheduled_graph(scheduled);
+        ggml_free(ctx);
+        return false;
+    }
     double bytes = static_cast<double>(ggml_row_size(type, hidden) * expert_width * experts_used);
     std::vector<float> input_f32 = deterministic_f32(hidden * experts_used * tokens, 223);
     ggml_backend_tensor_set(input, input_f32.data(), 0, input_f32.size() * sizeof(float));
@@ -1124,30 +1151,42 @@ bool run_moe_graph_probe(
             307 + static_cast<uint32_t>(layer * 17),
             ignored_resident_bytes,
             ignored_flops);
-        set_active_encoded_weights(
+        if (!set_active_encoded_weights(
             up_experts[static_cast<size_t>(layer)],
             type,
             expert_width * experts_used,
             hidden,
             weight_cache,
             ignored_resident_bytes,
-            ignored_flops);
-        set_active_encoded_weights(
+            ignored_flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        if (!set_active_encoded_weights(
             gate_experts[static_cast<size_t>(layer)],
             type,
             expert_width * experts_used,
             hidden,
             weight_cache,
             ignored_resident_bytes,
-            ignored_flops);
-        set_active_encoded_weights(
+            ignored_flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        if (!set_active_encoded_weights(
             down_experts[static_cast<size_t>(layer)],
             type,
             hidden * experts_used,
             expert_width,
             weight_cache,
             ignored_resident_bytes,
-            ignored_flops);
+            ignored_flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
     }
 
     double bytes = static_cast<double>(layers)
@@ -1330,10 +1369,14 @@ bool run_moe_block_graph_probe(
     EncodedWeightCache weight_cache;
     for (int64_t layer = 0; layer < layers; ++layer) {
         const LayerTensors & tensors = layer_tensors[static_cast<size_t>(layer)];
-        set_encoded_weights(tensors.wq, type, hidden, hidden, weight_cache, bytes, flops);
-        set_encoded_weights(tensors.wk, type, kv_width, hidden, weight_cache, bytes, flops);
-        set_encoded_weights(tensors.wv, type, kv_width, hidden, weight_cache, bytes, flops);
-        set_encoded_weights(tensors.wo, type, hidden, hidden, weight_cache, bytes, flops);
+        if (!set_encoded_weights(tensors.wq, type, hidden, hidden, weight_cache, bytes, flops)
+            || !set_encoded_weights(tensors.wk, type, kv_width, hidden, weight_cache, bytes, flops)
+            || !set_encoded_weights(tensors.wv, type, kv_width, hidden, weight_cache, bytes, flops)
+            || !set_encoded_weights(tensors.wo, type, hidden, hidden, weight_cache, bytes, flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
         set_f32_weights(
             tensors.router,
             expert_count,
@@ -1341,30 +1384,42 @@ bool run_moe_block_graph_probe(
             607 + static_cast<uint32_t>(layer * 19),
             bytes,
             flops);
-        set_active_encoded_weights(
+        if (!set_active_encoded_weights(
             tensors.up_experts,
             type,
             expert_width * experts_used,
             hidden,
             weight_cache,
             bytes,
-            flops);
-        set_active_encoded_weights(
+            flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        if (!set_active_encoded_weights(
             tensors.gate_experts,
             type,
             expert_width * experts_used,
             hidden,
             weight_cache,
             bytes,
-            flops);
-        set_active_encoded_weights(
+            flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
+        if (!set_active_encoded_weights(
             tensors.down_experts,
             type,
             hidden * experts_used,
             expert_width,
             weight_cache,
             bytes,
-            flops);
+            flops)) {
+            free_scheduled_graph(scheduled);
+            ggml_free(ctx);
+            return false;
+        }
     }
 
     std::vector<float> input_f32 = deterministic_f32(hidden, 631);
