@@ -175,6 +175,8 @@ enum RankCertificationStatus {
 struct CertificationInput {
     status: RankCertificationStatus,
     #[serde(default)]
+    runtime_shape: Option<CertificationRuntimeShapeInput>,
+    #[serde(default)]
     subject: Option<CertificationSubjectInput>,
     #[serde(default)]
     gates: Vec<CertificationGateInput>,
@@ -182,6 +184,15 @@ struct CertificationInput {
     skippy_bench_reports: Vec<serde_json::Value>,
     #[serde(default)]
     quality_evidence: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CertificationRuntimeShapeInput {
+    ctx_size: Option<u32>,
+    n_gpu_layers: Option<i32>,
+    cache_type_k: Option<String>,
+    cache_type_v: Option<String>,
+    activation_wire_dtype: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,7 +349,13 @@ fn load_ranked_candidate(
     let subject_check = certification
         .as_ref()
         .map(|(_, certification)| {
-            certification_subject_check(&run_dir, &manifest_path, &manifest, certification)
+            certification_subject_check(
+                &run_dir,
+                &manifest_path,
+                &manifest,
+                certification,
+                runtime_shape,
+            )
         })
         .unwrap_or_else(CertificationSubjectCheck::missing);
     let trusted_certification_summary = certification_summary
@@ -784,6 +801,7 @@ fn certification_subject_check(
     manifest_path: &Path,
     manifest: &BuildManifestInput,
     certification: &CertificationInput,
+    runtime_shape: RankRuntimeShape<'_>,
 ) -> CertificationSubjectCheck {
     let Some(subject) = certification.subject.as_ref() else {
         return CertificationSubjectCheck {
@@ -861,8 +879,127 @@ fn certification_subject_check(
         "quality_evidence",
         &certification.quality_evidence,
     );
+    compare_certification_runtime_shape(
+        &mut missing,
+        &mut mismatches,
+        certification.runtime_shape.as_ref(),
+        runtime_shape,
+    );
 
     subject_check_result(missing, mismatches)
+}
+
+fn compare_certification_runtime_shape(
+    missing: &mut Vec<String>,
+    mismatches: &mut Vec<String>,
+    certified: Option<&CertificationRuntimeShapeInput>,
+    expected: RankRuntimeShape<'_>,
+) {
+    let Some(certified) = certified else {
+        missing.push("runtime_shape: missing from certification report".to_string());
+        return;
+    };
+    compare_u32_shape_field(
+        missing,
+        mismatches,
+        "ctx_size",
+        certified.ctx_size,
+        expected.ctx_size,
+    );
+    compare_i32_shape_field(
+        missing,
+        mismatches,
+        "n_gpu_layers",
+        certified.n_gpu_layers,
+        expected.n_gpu_layers,
+    );
+    compare_cache_shape_field(
+        missing,
+        mismatches,
+        "cache_type_k",
+        certified.cache_type_k.as_deref(),
+        expected.cache_type_k,
+    );
+    compare_cache_shape_field(
+        missing,
+        mismatches,
+        "cache_type_v",
+        certified.cache_type_v.as_deref(),
+        expected.cache_type_v,
+    );
+    compare_activation_shape_field(
+        missing,
+        mismatches,
+        certified.activation_wire_dtype.as_deref(),
+        expected.activation_wire_dtype,
+    );
+}
+
+fn compare_u32_shape_field(
+    missing: &mut Vec<String>,
+    mismatches: &mut Vec<String>,
+    field: &str,
+    certified: Option<u32>,
+    expected: u32,
+) {
+    match certified {
+        Some(actual) if actual == expected => {}
+        Some(actual) => mismatches.push(format!("runtime_shape.{field} {actual} != {expected}")),
+        None => missing.push(format!(
+            "runtime_shape.{field}: missing from certification report"
+        )),
+    }
+}
+
+fn compare_i32_shape_field(
+    missing: &mut Vec<String>,
+    mismatches: &mut Vec<String>,
+    field: &str,
+    certified: Option<i32>,
+    expected: i32,
+) {
+    match certified {
+        Some(actual) if actual == expected => {}
+        Some(actual) => mismatches.push(format!("runtime_shape.{field} {actual} != {expected}")),
+        None => missing.push(format!(
+            "runtime_shape.{field}: missing from certification report"
+        )),
+    }
+}
+
+fn compare_cache_shape_field(
+    missing: &mut Vec<String>,
+    mismatches: &mut Vec<String>,
+    field: &str,
+    certified: Option<&str>,
+    expected: &str,
+) {
+    match certified {
+        Some(actual) if canonical_cache_type(actual) == canonical_cache_type(expected) => {}
+        Some(actual) => mismatches.push(format!("runtime_shape.{field} {actual} != {expected}")),
+        None => missing.push(format!(
+            "runtime_shape.{field}: missing from certification report"
+        )),
+    }
+}
+
+fn compare_activation_shape_field(
+    missing: &mut Vec<String>,
+    mismatches: &mut Vec<String>,
+    certified: Option<&str>,
+    expected: &str,
+) {
+    match certified {
+        Some(actual)
+            if canonical_activation_wire_dtype(actual)
+                == canonical_activation_wire_dtype(expected) => {}
+        Some(actual) => mismatches.push(format!(
+            "runtime_shape.activation_wire_dtype {actual} != {expected}"
+        )),
+        None => missing.push(
+            "runtime_shape.activation_wire_dtype: missing from certification report".to_string(),
+        ),
+    }
 }
 
 fn compare_required_subject_hash(
