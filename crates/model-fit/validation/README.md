@@ -74,6 +74,17 @@ target/release/model-fit-validate \
   --output-json "$HOME/tmp/model-fit-validation-q8-moe.json"
 ```
 
+Use the quant-ladder set when comparing Metal and CUDA behavior for the same
+dense metadata shape across Q4/Q5/Q6/Q8 without running the broader corpus:
+
+```bash
+target/release/model-fit-validate \
+  --no-progress \
+  --scenario steady_decode \
+  --models-file crates/model-fit/validation/quant-ladder-metal-cuda.txt \
+  --output-json "$HOME/tmp/model-fit-validation-quant-ladder.json"
+```
+
 ## ABI decode validation
 
 The validator can run Skippy's single-stage benchmark and the Skippy decode ABI

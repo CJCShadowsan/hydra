@@ -157,6 +157,43 @@ enum ggml_type probe_tensor_type(int tensor_type_kind) {
     }
 }
 
+bool quantized_row_width_supported(enum ggml_type type, int64_t cols) {
+    const int64_t block_size = ggml_blck_size(type);
+    return block_size > 0 && cols > 0 && cols % block_size == 0;
+}
+
+bool matrix_shape_supported(enum ggml_type type, int64_t rows, int64_t cols) {
+    return rows > 0 && quantized_row_width_supported(type, cols);
+}
+
+bool dense_llama_shape_supported(
+    enum ggml_type type,
+    int64_t hidden,
+    int64_t kv_width,
+    int64_t ffn) {
+    // GGML quantized tensor storage is row-blocked along ne[0]. Real GGUF
+    // loading enforces `ne[0] % ggml_blck_size(type) == 0`; a model can still
+    // be valid because mixed-quant files choose compatible tensor types per
+    // tensor. The synthetic validator probes ask a stricter question by forcing
+    // one candidate type across an entire llama-shaped block. When a small
+    // model has widths such as hidden=576 and kv_width=192, an all-Q6_K graph is
+    // not a source-plausible GGUF tensor layout even if the model file contains
+    // other Q6_K tensors. Reject those probe shapes before graph construction so
+    // backend planners never see an impossible quantized tensor.
+    return matrix_shape_supported(type, hidden, hidden)
+        && matrix_shape_supported(type, kv_width, hidden)
+        && matrix_shape_supported(type, ffn, hidden)
+        && matrix_shape_supported(type, hidden, ffn);
+}
+
+bool moe_shape_supported(
+    enum ggml_type type,
+    int64_t hidden,
+    int64_t expert_width) {
+    return matrix_shape_supported(type, expert_width, hidden)
+        && matrix_shape_supported(type, hidden, expert_width);
+}
+
 const char * probe_tensor_type_name(int tensor_type_kind) {
     switch (tensor_type_kind) {
         case PROBE_TENSOR_Q4_K:
@@ -253,6 +290,9 @@ bool run_probe(
     const char * tensor_type,
     const ProbeShape & shape,
     ProbeResult & result) {
+    if (!matrix_shape_supported(type, shape.rows, shape.cols)) {
+        return false;
+    }
     const size_t context_bytes = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
     ggml_init_params params{};
     params.mem_size = context_bytes;
@@ -603,6 +643,9 @@ bool run_llama_graph_probe(
     int64_t norm_head_width,
     ProbeResult & result) {
     const int64_t layers = std::max<int64_t>(1, repeat_layers);
+    if (!dense_llama_shape_supported(type, hidden, kv_width, ffn)) {
+        return false;
+    }
     const bool use_q_norm = (graph_features & GRAPH_FEATURE_ATTENTION_Q_NORM) != 0;
     const bool use_k_norm = (graph_features & GRAPH_FEATURE_ATTENTION_K_NORM) != 0;
     const bool use_post_attention_norm = (graph_features & GRAPH_FEATURE_ATTENTION_POST_NORM) != 0;
@@ -778,6 +821,15 @@ bool run_linear_attention_graph_probe(
     const int64_t safe_state = std::max<int64_t>(1, state_width);
     const int64_t safe_output_input = std::max<int64_t>(1, output_input_width);
     const int64_t safe_kv = std::max<int64_t>(1, std::min(kv_width, hidden));
+    if (!matrix_shape_supported(type, safe_qkv, hidden)
+        || !matrix_shape_supported(type, safe_gate, hidden)
+        || !matrix_shape_supported(type, safe_state, hidden)
+        || !matrix_shape_supported(type, hidden, safe_output_input)
+        || !matrix_shape_supported(type, ffn, hidden)
+        || !matrix_shape_supported(type, hidden, ffn)
+        || !dense_llama_shape_supported(type, hidden, safe_kv, ffn)) {
+        return false;
+    }
     const size_t context_bytes =
         ggml_tensor_overhead() * static_cast<size_t>(96 * (recurrent + full_attention))
         + ggml_graph_overhead();
@@ -953,6 +1005,9 @@ bool run_moe_mul_mat_id_probe(
     constexpr int64_t expert_width = 768;
     constexpr int64_t hidden = 2048;
     constexpr int64_t tokens = 1;
+    if (!moe_shape_supported(type, hidden, expert_width)) {
+        return false;
+    }
     const size_t context_bytes = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
     ggml_init_params params{};
     params.mem_size = context_bytes;
@@ -1049,6 +1104,9 @@ bool run_moe_graph_probe(
         return false;
     }
     if (experts_used > expert_count || expert_count > MAX_MODEL_SHAPED_MOE_EXPERTS) {
+        return false;
+    }
+    if (!moe_shape_supported(type, hidden, expert_width)) {
         return false;
     }
     const size_t context_bytes =
@@ -1249,6 +1307,10 @@ bool run_moe_block_graph_probe(
         return false;
     }
     kv_width = std::min(kv_width, hidden);
+    if (!dense_llama_shape_supported(type, hidden, kv_width, expert_width)
+        || !moe_shape_supported(type, hidden, expert_width)) {
+        return false;
+    }
     const size_t context_bytes =
         ggml_tensor_overhead() * static_cast<size_t>(160 * layers) + ggml_graph_overhead();
     ggml_init_params params{};

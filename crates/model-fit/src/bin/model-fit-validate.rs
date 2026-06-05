@@ -126,7 +126,7 @@ struct ValidationConfig {
     benchmark_scenarios: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ModelValidationReport {
     input_ref: String,
     resolved_ref: Option<String>,
@@ -345,7 +345,7 @@ struct OperationBucketSpec {
     note: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct WorkloadRecommendation {
     workload: String,
     recommendation: ModelRecommendation,
@@ -563,27 +563,37 @@ async fn main() -> Result<()> {
     for (index, input) in args.models.iter().enumerate() {
         let report = validate_model(&args, &repository, &hardware.profile, input, index).await;
         models.push(report);
+        let partial_report = build_validation_report(&args, &hardware, &selection_config, &models);
+        write_json_report(&args.output_json, &partial_report)?;
     }
 
-    let summary = summarize(&args, &models, DEFAULT_TOLERANCE);
-    let report = ValidationReport {
-        schema_version: 1,
-        generated_at_unix_secs: unix_timestamp_secs(),
-        command: std::env::args().collect(),
-        fit_input_contract: fit_input_contract(),
-        hardware_profile: hardware.profile,
-        gpu_benchmark_outputs: hardware.benchmark_outputs,
-        gpu_benchmark_json: hardware.raw_json,
-        selection_config,
-        validation_config: ValidationConfig::from_args(&args),
-        models,
-        summary,
-    };
-
+    let report = build_validation_report(&args, &hardware, &selection_config, &models);
     write_json_report(&args.output_json, &report)?;
     print_markdown_table(&report.models);
     eprintln!("wrote {}", args.output_json.display());
     Ok(())
+}
+
+fn build_validation_report(
+    args: &Args,
+    hardware: &LoadedHardware,
+    selection_config: &SelectionConfig,
+    models: &[ModelValidationReport],
+) -> ValidationReport {
+    let summary = summarize(args, models, DEFAULT_TOLERANCE);
+    ValidationReport {
+        schema_version: 1,
+        generated_at_unix_secs: unix_timestamp_secs(),
+        command: std::env::args().collect(),
+        fit_input_contract: fit_input_contract(),
+        hardware_profile: hardware.profile.clone(),
+        gpu_benchmark_outputs: hardware.benchmark_outputs.clone(),
+        gpu_benchmark_json: hardware.raw_json.clone(),
+        selection_config: selection_config.clone(),
+        validation_config: ValidationConfig::from_args(args),
+        models: models.to_vec(),
+        summary,
+    }
 }
 
 impl Args {

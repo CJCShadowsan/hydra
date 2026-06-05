@@ -1,0 +1,16 @@
+# Focused Metal/CUDA comparison corpus.
+#
+# This set exists to isolate the current quantization-slope questions without
+# burning a full broad sweep. It pairs the same Qwen2.5 Coder 7B metadata shape
+# across Q4/Q5/Q6/Q8, then includes Smol Q4 because tiny K-quant probe handling
+# exposed an unsupported synthetic GGML tensor shape on Metal.
+#
+# Format: one mesh/model ref per line. Blank lines and # comments are ignored by
+# model-fit-validate --models-file.
+
+unsloth/SmolLM2-135M-Instruct-GGUF:Q4_K_M
+
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q5_K_M
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q6_K
+unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q8_0
