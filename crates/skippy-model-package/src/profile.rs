@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use skippy_ffi::TensorRole;
-use skippy_runtime::{ModelInfo, TensorInfo};
+use skippy_runtime::{
+    FlashAttentionType, ModelInfo, RuntimeConfig, RuntimeLoadMode, SamplingConfig, StageModel,
+    TensorInfo, parse_cache_type,
+};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct ProfileArgs {
@@ -257,9 +261,7 @@ impl ProfileTimingSource for StaticTimingSource {
 impl ProfileTimingSource for LocalStageTimingSource {
     fn profile(&self, input: &ProfileTimingInput<'_>) -> Result<ProfileTimingReport> {
         validate_local_stage_input(input)?;
-        bail!(
-            "--timing-source local-stage is reserved for direct-GGUF stage-level decode measurement, but runtime execution is not wired yet"
-        )
+        profile_local_stage_decode(input)
     }
 }
 
@@ -778,7 +780,150 @@ fn validate_local_stage_input(input: &ProfileTimingInput<'_>) -> Result<()> {
     if !matches!(input.request_shape.phase, ProfilePhase::Decode) {
         bail!("--timing-source local-stage currently supports --phase decode only");
     }
+    if input.request_shape.generated_tokens != 1 {
+        bail!("--timing-source local-stage currently supports --generated-tokens 1 only");
+    }
+    if input.measurement.samples == 0 {
+        bail!("--samples must be greater than zero for --timing-source local-stage");
+    }
     Ok(())
+}
+
+fn profile_local_stage_decode(input: &ProfileTimingInput<'_>) -> Result<ProfileTimingReport> {
+    let model_info = ModelInfo::open(input.package)
+        .with_context(|| format!("open {}", input.package.display()))?;
+    let tensors = model_info
+        .tensors()
+        .with_context(|| format!("inspect {}", input.package.display()))?;
+    let layer_end = direct_layer_count(&tensors)?;
+    let model = StageModel::open(
+        input.package,
+        &local_stage_runtime_config(input, layer_end)?,
+    )
+    .with_context(|| format!("load local stage model {}", input.package.display()))?;
+    let mut session = model
+        .create_session()
+        .context("create local stage session")?;
+    let prefix_tokens =
+        deterministic_prefix_tokens(&model, input.request_shape.existing_kv_tokens)?;
+    session
+        .prefill_chunked(&prefix_tokens)
+        .context("prefill deterministic local-stage prefix")?;
+    let sampling = deterministic_sampling();
+    let mut token = session
+        .sample_current(Some(&sampling))
+        .context("sample first local-stage decode token")?;
+    for _ in 0..input.measurement.warmup_samples {
+        token = session
+            .decode_step_sampled(token, Some(&sampling))
+            .context("run local-stage warmup decode")?;
+    }
+    let mut samples = Vec::with_capacity(input.measurement.samples as usize);
+    for _ in 0..input.measurement.samples {
+        let started = Instant::now();
+        token = session
+            .decode_step_sampled(token, Some(&sampling))
+            .context("run local-stage measured decode")?;
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    let timing = measured_timing(samples)?;
+    let estimated_tokens_per_second = timing.mean_ms.map(|mean_ms| 1000.0 / mean_ms);
+    Ok(ProfileTimingReport {
+        measurement_status: MeasurementStatus {
+            status: "measured".to_string(),
+            reason: format!(
+                "measured local single-stage decode over {} warmup samples and {} measured samples",
+                input.measurement.warmup_samples, input.measurement.samples
+            ),
+        },
+        layer_timings: BTreeMap::new(),
+        stage_timings: BTreeMap::from([(0, timing)]),
+        estimated_tokens_per_second,
+    })
+}
+
+fn local_stage_runtime_config(
+    input: &ProfileTimingInput<'_>,
+    layer_end: u32,
+) -> Result<RuntimeConfig> {
+    let cache_type = parse_cache_type(&input.request_shape.kv_type)?;
+    let total_tokens = input
+        .request_shape
+        .existing_kv_tokens
+        .saturating_add(input.measurement.warmup_samples)
+        .saturating_add(input.measurement.samples)
+        .saturating_add(16);
+    Ok(RuntimeConfig {
+        stage_index: 0,
+        layer_start: 0,
+        layer_end,
+        ctx_size: total_tokens.max(128),
+        lane_count: 1,
+        n_batch: None,
+        n_ubatch: None,
+        n_threads: None,
+        n_threads_batch: None,
+        n_gpu_layers: 999,
+        selected_backend_device: input.request_shape.device.clone(),
+        cache_type_k: cache_type,
+        cache_type_v: cache_type,
+        flash_attn_type: FlashAttentionType::Auto,
+        load_mode: RuntimeLoadMode::RuntimeSlice,
+        projector_path: None,
+        include_embeddings: true,
+        include_output: true,
+        filter_tensors_on_load: false,
+    })
+}
+
+fn deterministic_prefix_tokens(model: &StageModel, target_tokens: u32) -> Result<Vec<i32>> {
+    let target = usize::try_from(target_tokens).context("existing_kv_tokens exceeds usize")?;
+    if target == 0 {
+        bail!("--existing-kv-tokens must be greater than zero for local-stage profiling");
+    }
+    let scaffold = " mesh-llm profiler decode scaffold.";
+    let mut repeat_count = target.div_ceil(8).max(1);
+    loop {
+        let prompt = scaffold.repeat(repeat_count);
+        let mut tokens = model.tokenize(&prompt, true)?;
+        if tokens.len() >= target {
+            tokens.truncate(target);
+            return Ok(tokens);
+        }
+        repeat_count = repeat_count.saturating_mul(2);
+    }
+}
+
+fn deterministic_sampling() -> SamplingConfig {
+    SamplingConfig {
+        enabled: true,
+        seed: 1,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 1,
+        ..SamplingConfig::default()
+    }
+}
+
+fn measured_timing(mut samples: Vec<f64>) -> Result<TimingProfile> {
+    if samples.is_empty() {
+        bail!("cannot summarize zero timing samples");
+    }
+    samples.sort_by(|left, right| left.total_cmp(right));
+    let mean_ms = samples.iter().sum::<f64>() / samples.len() as f64;
+    Ok(TimingProfile {
+        status: "measured".to_string(),
+        mean_ms: Some(mean_ms),
+        p50_ms: Some(percentile(&samples, 0.50)),
+        p95_ms: Some(percentile(&samples, 0.95)),
+        samples: samples.len() as u32,
+    })
+}
+
+fn percentile(sorted_samples: &[f64], percentile: f64) -> f64 {
+    let last = sorted_samples.len() - 1;
+    let index = (last as f64 * percentile).ceil() as usize;
+    sorted_samples[index.min(last)]
 }
 
 fn unmeasured_timing() -> TimingProfile {

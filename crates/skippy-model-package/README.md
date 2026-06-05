@@ -109,7 +109,7 @@ synthetic split-stage byte totals before a package has been written. This lets
 operators profile candidate source models before choosing a split or mixed
 quantization layout.
 
-`--timing-source local-stage` is the reserved measured lane for direct-GGUF
-stage-level decode timing. It currently fails closed after validating that the
-input is a direct GGUF, `--stages 1`, and `--phase decode`; the runtime
-execution path will fill `stages[0].timing` through this source later.
+`--timing-source local-stage` is the first measured lane for direct-GGUF
+stage-level decode timing. It currently supports direct GGUF inputs with
+`--stages 1`, `--phase decode`, and `--generated-tokens 1`, then fills
+`stages[0].timing` and `summary.estimated_tokens_per_second`.

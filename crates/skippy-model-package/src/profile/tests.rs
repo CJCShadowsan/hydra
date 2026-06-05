@@ -186,8 +186,11 @@ fn local_stage_timing_rejects_non_decode_phase() {
 }
 
 #[test]
-fn local_stage_timing_marks_runtime_execution_unwired() {
-    let request_shape = local_stage_request(ProfilePhase::Decode);
+fn local_stage_timing_rejects_multi_token_samples() {
+    let request_shape = RequestShape {
+        generated_tokens: 2,
+        ..local_stage_request(ProfilePhase::Decode)
+    };
     let measurement = local_stage_measurement();
     let input = local_stage_input(
         ProfileInputKind::DirectGguf,
@@ -198,13 +201,24 @@ fn local_stage_timing_marks_runtime_execution_unwired() {
 
     let error = LocalStageTimingSource
         .profile(&input)
-        .expect_err("runtime execution should not be wired yet");
+        .expect_err("multi-token local timing is not accepted yet");
 
     assert!(
         error
             .to_string()
-            .contains("runtime execution is not wired yet")
+            .contains("currently supports --generated-tokens 1")
     );
+}
+
+#[test]
+fn measured_timing_summarizes_samples_and_tps_inputs() {
+    let timing = measured_timing(vec![4.0, 1.0, 2.0, 3.0]).expect("timing summary");
+
+    assert_eq!(timing.status, "measured");
+    assert_eq!(timing.mean_ms, Some(2.5));
+    assert_eq!(timing.p50_ms, Some(3.0));
+    assert_eq!(timing.p95_ms, Some(4.0));
+    assert_eq!(timing.samples, 4);
 }
 
 fn temp_dir(name: &str) -> PathBuf {
