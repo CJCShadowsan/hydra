@@ -2,6 +2,16 @@ name: docker
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: "Docker image target to build"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - client
+          - quant-pack-job
   push:
     tags: ['v*']
 
@@ -12,6 +22,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ vars.IMAGE_NAME || 'mesh-llm/mesh-llm' }}
+  QUANT_PACK_JOB_IMAGE_NAME: ${{ vars.QUANT_PACK_JOB_IMAGE_NAME || 'mesh-llm/skippy-quant-pack-job' }}
 
 permissions:
   contents: read
@@ -19,6 +30,7 @@ permissions:
 
 jobs:
   docker-client:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'client' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -43,6 +55,36 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.client
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  docker-quant-pack-job:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'quant-pack-job' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.QUANT_PACK_JOB_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=cpu
+      - uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: docker/Dockerfile.quant-pack-job
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

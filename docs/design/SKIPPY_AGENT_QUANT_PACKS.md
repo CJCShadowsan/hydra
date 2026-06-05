@@ -2,19 +2,31 @@
 
 Status: design draft
 
-Skippy Agent Quant Packs are layer packages whose quantization layout,
-stage-planning hints, latency profiles, and certification evidence are optimized
-for coding-agent workloads.
+Skippy Agent Quant Packs are Skippy-native quantized model packages. They start
+from a source model and produce layer package artifacts whose quantization
+layout, stage-planning hints, latency profiles, and certification evidence are
+optimized for Skippy's staged runtime and coding-agent workloads.
 
-The goal is not to make one smaller GGUF. The goal is to produce a package that
-serves well through Skippy's staged architecture while preserving the behaviors
-that coding agents depend on: tool-call validity, patch quality, long-context
-recall, and stable repeated-prefix execution.
+The goal is not to make one smaller GGUF or to merely profile existing quants.
+The goal is to quantize source models so they run really well on Skippy: lower
+stage latency, better memory fit, more balanced splits, and preserved coding
+agent behavior such as tool-call validity, patch quality, long-context recall,
+and stable repeated-prefix execution.
+
+Profiling is an input to this pipeline, not the product. The product is a
+repeatable path from source model to validated Skippy quant pack.
+
+`skippy-bench` is the runtime evidence spine for the post-profiler work. The
+quant-pack tooling should generate reproducible `skippy-bench` plans and then
+consume the resulting reports; it should not grow a second benchmark runner.
 
 ## Problem
 
 Whole-model quantization treats the model as one artifact with one quality and
-latency tradeoff. Skippy execution does not work that way.
+latency tradeoff. Skippy execution does not work that way. Skippy runs a model
+as ordered stages, each with its own compute, memory, KV-cache pressure, and
+activation-transfer cost. A quant that is reasonable for single-process
+llama.cpp can still be poorly shaped for staged serving.
 
 For staged serving, the planner needs to understand:
 
@@ -24,6 +36,18 @@ For staged serving, the planner needs to understand:
 - whether a split plan leaves enough KV/cache headroom for agent loops;
 - whether activation transfer cost overwhelms the compute saved by splitting.
 
+For quantization, the pack builder also needs to decide where to spend
+precision:
+
+- embeddings and output tensors may need higher precision to protect token
+  identity and logits;
+- early and late layers may be more quality-sensitive than middle layers;
+- latency-heavy layer bands may be worth lowering if quality holds;
+- stage boundaries may need quant layouts that make the slowest stage less
+  dominant;
+- MoE routers, experts, and attention/FFN tensors may need different policies
+  by family.
+
 Coding-agent workloads make this sharper. They often combine large stable
 prefixes, repo context, tool definitions, short decode bursts, JSON/function
 arguments, and many repeated turns. A quant that looks good on generic
@@ -32,7 +56,8 @@ small patch details.
 
 ## Goals
 
-- Define a package-level design for stage-aware mixed quantization.
+- Define a package-level design for Skippy-native mixed quantization.
+- Generate quantized layer package artifacts from source models.
 - Keep quant evidence, native layer latency, and agent certification attached to
   package identity.
 - Let topology planning score stage layouts by measured latency and quality
@@ -57,6 +82,7 @@ small patch details.
 | --- | --- |
 | Source model | The original GGUF model coordinate, revision, file list, and checksums. |
 | Quant layout | The quantization format applied to each tensor group or layer band. |
+| Skippy quant pack | A quantized layer package optimized for Skippy staged execution. |
 | Native layer latency | Measured per-layer prefill/decode latency for a model artifact on a backend/device. |
 | Agent pack | A layer package with agent-focused quant layout, stage hints, profiles, and evidence. |
 | Certification evidence | Machine-readable reports proving package validity, staged correctness, agent behavior, and cache stability. |
@@ -276,6 +302,498 @@ agent_score / (decode_latency + transfer_cost + memory_pressure)
 where `agent_score` includes structured-output reliability and edit quality,
 not only text similarity.
 
+Quantization should improve Skippy serving in four concrete ways:
+
+- **Lower stage latency**: reduce decode and prefill cost in expensive layer
+  bands, especially the slowest planned stage.
+- **Better memory fit**: reduce model and KV/cache pressure so stages fit on
+  more nodes and leave headroom for long coding-agent sessions.
+- **Better stage balance**: choose layer/tensor precision so planned stages
+  finish closer together instead of one stage dominating the pipeline.
+- **Preserved quality**: spend higher precision on tensors or bands where lower
+  precision harms tool calls, code edits, long-context recall, or split
+  correctness.
+
+The pack builder should start with deterministic layout families before trying
+automatic search:
+
+| Layout family | Initial policy |
+| --- | --- |
+| Baseline | Match the source quant across all tensors, then package and certify it. |
+| Boundary protected | Raise embeddings, output, first band, and last band by one quant tier. |
+| Middle compressed | Lower the middle layer band while keeping boundaries protected. |
+| FFN compressed, attention protected | Lower middle-band FFN tensors while keeping attention tensors at a safer tier for long-context recall. |
+| Stage balanced | Lower precision in the currently slowest planned stage until stage times converge or quality fails. |
+| Quality repaired | Raise precision only in layer/tensor groups implicated by failed agent or correctness evals. |
+
+Protection is source-aware. If the input GGUF is already Q4, a protected group
+should usually stay Q4 so later broad compression rules cannot lower it further;
+it should not be up-quantized to Q6/Q5 and spend memory without recovering
+quality. Higher-precision sources such as F16, Q8, or Q6 can still use Q6/Q5
+protection tiers because those are real down-quant choices.
+
+For MoE coder models, the initial candidate matrix should not treat expert and
+router tensors as ordinary middle-layer weights. Router tensors such as
+`ffn_gate_inp` should be protected at a higher tier, and expert tensors such as
+`ffn_*_exps` should have explicit tensor-name selectors that appear before broad
+layer-range compression rules in the quantizer override file. Expert protection
+should be a source-aware floor: it should preserve Q6/Q5 source tiers and never
+drop below the initial Q4_K_M protection tier. This keeps stage-latency
+experiments from silently spending precision in the wrong place.
+
+The first implementation does not need a perfect optimizer. A deterministic
+candidate matrix plus measured ranking is enough to start producing useful
+packs and evidence.
+
+## End-to-End Pipeline
+
+The pack flow should be source-model driven:
+
+```text
+source model
+  -> inspect tensors, layers, architecture, and family policy
+  -> generate candidate quant layouts
+  -> quantize tensors by layout
+  -> write Skippy layer package artifacts
+  -> validate package ownership and staged correctness
+  -> profile Skippy serving shapes
+  -> run coding-agent certification
+  -> rank candidates and publish the best pack with evidence
+```
+
+The corresponding CLI surface can grow in this order:
+
+```bash
+skippy-model-package quant-pack source-plan unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF \
+  --revision main \
+  --local-dir /Volumes/External/models/qwen3-coder-480b \
+  --allow-pattern 'UD-Q4_K_XL/*.gguf' \
+  --quant-pack-out-dir target/skippy-quant-packs/qwen3-coder-480b \
+  --expected-download-bytes 275600000000 \
+  --min-free-bytes 330000000000 \
+  --hf-jobs-workload-out qwen-hf-job-workload.sh \
+  --hf-jobs-submit-json-out qwen-hf-job-submit.json \
+  --hf-jobs-image ghcr.io/<owner>/skippy-quant-pack-job:cpu \
+  --hf-jobs-timeout 36h \
+  --hf-jobs-upload-repo <owner>/<repo> \
+  --out qwen-source-plan.json \
+  --script-out fetch-qwen-source.sh
+
+skippy-model-package quant-pack hf-jobs-validate qwen-hf-job-submit.json \
+  --expected-image ghcr.io/<owner>/skippy-quant-pack-job:cpu \
+  --expected-upload-repo <owner>/<repo>
+
+skippy-model-package quant-plan <source.gguf> \
+  --profile coding-agent \
+  --stages 2 \
+  --out quant-plan.json
+
+skippy-model-package quantize <source.gguf> \
+  --plan quant-plan.json \
+  --candidate middle-compressed \
+  --out-dir quantize-run/ \
+  --llama-quantize /path/to/llama-quantize
+
+skippy-model-package quant-pack finalize quantize-run/quantize-run.json \
+  --out-dir candidate-pack-run/ \
+  --model-id org/model:middle-compressed \
+  --source-revision <revision> \
+  --source-file <source.gguf> \
+  --stages 2 \
+  --reuse-package-if-present
+
+skippy-model-package quant-pack build <source.gguf> \
+  --profile coding-agent \
+  --stages 2 \
+  --candidate middle-compressed \
+  --llama-quantize /path/to/llama-quantize \
+  --out-dir candidate-pack-run/ \
+  --model-id org/model:middle-compressed \
+  --source-revision <revision> \
+  --source-file <source.gguf> \
+  --decode-profile
+
+skippy-model-package quant-pack build-all <source.gguf> \
+  --profile coding-agent \
+  --stages 2 \
+  --llama-quantize /path/to/llama-quantize \
+  --out-dir candidate-sweep/ \
+  --model-id-prefix org/model \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --activation-wire-dtype f16 \
+  --decode-profile
+
+skippy-model-package quant-pack rank candidate-*/ \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --activation-wire-dtype f16 \
+  --out quant-pack-rank.json
+
+skippy-model-package quant-pack evidence-plan candidate-pack/ \
+  --hosts host-a,host-b \
+  --splits 20 \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --activation-wire-dtype f16 \
+  --remote-root /tmp/skippy-runtime-bench \
+  --remote-root-map host-b=/Volumes/External/skippy-runtime-bench \
+  --remote-shared-root-map host-a=/Volumes/External/skippy-runtime-bench \
+  --endpoint-host-map host-b=192.168.0.4 \
+  --metrics-otlp-grpc-url http://host-a:14317 \
+  --rsync-model-artifacts \
+  --evidence-dir candidate-pack/evidence \
+  --out candidate-pack/evidence-plan.json \
+  --script-out candidate-pack/run-evidence.sh
+
+skippy-model-package quant-pack evidence-plan-all candidate-sweep/ \
+  --hosts host-a,host-b \
+  --splits 20 \
+  --top-ranked 2 \
+  --out candidate-sweep/evidence-plan-all.json \
+  --script-out candidate-sweep/run-evidence.sh
+
+skippy-model-package quant-pack certify candidate-pack/ \
+  --skippy-bench-report evidence/focused-runtime-report.json \
+  --skippy-bench-report evidence/chat-corpus.json \
+  --skippy-bench-report evidence/long-context-chat-corpus.json \
+  --skippy-bench-report evidence/prompt-lengths-summary.json \
+  --quality-evidence evidence/agent-tool-call-results.jsonl \
+  --quality-evidence evidence/kv-tool-loop-stability/summary.json \
+  --require-skippy-bench \
+  --require-quality-evidence \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --activation-wire-dtype f16 \
+  --out candidate-pack/certification.json
+```
+
+The generated `source-plan` script runs `hf download`, discovers the first
+downloaded `.gguf`, derives `--source-file` from its basename, and prints the
+follow-on `quant-pack build-all` command rather than launching a huge
+quantization sweep automatically. Pass `--source-file <downloaded.gguf>` when a
+known first shard should be pinned instead of discovered. Do not use Skippy
+materialized stage/tokenizer slices as source inputs; those are derived cache
+artifacts. For large sources, pass `--expected-download-bytes` and
+`--min-free-bytes` so the runbook records the dry-run size and fails before
+download when the target volume cannot fit the source. For 480B-scale
+candidates, also pass `--hf-jobs-workload-out` and submit the generated
+workload to Hugging Face Jobs or another remote runner. That workload downloads
+the source inside the job, runs `quant-pack build-all`, and can upload the
+output directory when `HF_UPLOAD_REPO` is set, keeping Studio out of the
+high-memory quantize/package path.
+Pass `--hf-jobs-submit-json-out` with `--hf-jobs-image` when the source plan
+should also emit a reviewable Hugging Face Jobs `run` payload. That payload
+captures the image, flavor, timeout, command, `HF_TOKEN` secret, and optional
+`HF_UPLOAD_REPO` value; it is an operator handoff artifact, not an automatic
+paid job submission. The job image must provide `skippy-model-package`,
+`llama-quantize`, `hf`, and the backend libraries needed by the selected
+quantization path.
+The CPU image for this handoff is built with `just docker-build-quant-pack-job
+ghcr.io/<owner>/skippy-quant-pack-job:cpu` and pushed with
+`just docker-push-quant-pack-job ghcr.io/<owner>/skippy-quant-pack-job:cpu`.
+The current Qwen 480B remote build handoff is tracked in
+`docs/runbooks/QWEN480_SKIPPY_QUANT_PACK_HF_JOB.md`.
+Validate generated submit payloads with `quant-pack hf-jobs-validate` before
+submission. The validator checks the HF Jobs `run` envelope, known hardware
+flavor, timeout, detached execution, `HF_TOKEN` secret, source download,
+`quant-pack build-all`, output repo creation, and upload command.
+Its report also includes `hf_jobs_cli.shell`, an equivalent `hf jobs run ...`
+command for operators who submit through the Hugging Face CLI.
+
+The initial Qwen Coder source target has been verified with `hf models info` and
+`hf download --dry-run`:
+
+- repo: `unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF`;
+- revision: `b86deeefd82f1a3374c5536dfc1dd0ce27ac092d`;
+- source include: `UD-Q4_K_XL/*.gguf`;
+- shard count: 6;
+- dry-run size: about 275.6G;
+- first shard:
+  `UD-Q4_K_XL/Qwen3-Coder-480B-A35B-Instruct-UD-Q4_K_XL-00001-of-00006.gguf`.
+
+`quant-plan` should emit candidate layouts, not mutate model bytes. Each layout
+records:
+
+- source model identity and checksum;
+- target profile such as `coding-agent`;
+- layer count, tensor groups, and quant policy;
+- intended stage count and preferred split boundaries;
+- quality-risk notes such as protected embeddings/output or boundary bands;
+- expected artifact identity fields used later by package validation.
+
+`quantize` should turn one layout into a quantized GGUF plus the exact tensor
+override and `agent-pack.json` metadata needed to reproduce it. The metadata
+should include the source GGUF path/hash, inferred source quant, selected layout
+hash, and tensor groups.
+
+`quant-pack finalize` should be the resumable bridge from an existing
+`quantize-run.json` to the normal candidate build manifest. It should package
+the recorded quantized GGUF with the adjacent agent-pack metadata, run preflight,
+and write `quant-pack-build.json` without rerunning quantization. For
+Qwen-sized artifacts, it should also support reusing an already-materialized
+package while still regenerating preflight and manifest state, so interrupted or
+supervised runs can continue into `rank`, `evidence-plan`, and `certify`.
+
+`quant-pack build` should be the one-shot selected-candidate path. It should
+write the quant plan, run the quantizer, create ordinary Skippy layer package
+artifacts with additive quant metadata, run preflight, optionally attach a
+decode-first profile, and emit a build manifest that points at every
+intermediate artifact. The manifest should also serialize the resolved source
+identity, quantizer path, thread and split-output policy, package validation
+policy, and decode-profile request shape so the candidate can be audited without
+recovering shell history. Existing Skippy consumers can ignore the metadata;
+new tooling can use it for planning, certification, and ranking.
+
+`quant-pack build-all` should run the same selected-candidate path across every
+candidate in a quant plan, or across a requested subset. It should produce one
+run directory per candidate plus a top-level rank report so the operator can
+immediately see which candidates deserve quality certification. The sweep should
+record the context size, GPU-layer policy, KV cache dtypes, and activation wire
+dtype used for first-pass ranking so those assumptions match the later
+`skippy-bench` and certification commands. It should also record the shared
+quantizer, split-output, package-validation, and decode-profile assumptions
+once at the sweep level, while each candidate manifest records its resolved
+source/package identity and concrete artifacts. The sweep manifest should
+summarize candidate artifact readiness, including the quantized model, package,
+preflight output, decode profile, future evidence directory, and certification
+path, so missing local build outputs are visible before lab hardware is used. It
+should also carry a `next_steps.evidence_plan_all` command template that points
+at stable evidence-plan and runbook output paths, with only lab-specific host
+selection left for the operator to fill in.
+
+`quant-pack evidence-plan` should turn a chosen candidate build into an
+operator-ready evidence manifest. It should read the package `model_id`,
+quantized GGUF path, layer count, stage count, and package path, infer split
+boundaries by default or accept explicit `--splits`, record the activation wire
+dtype, and emit the exact corpus-prep, `skippy-bench`, QA, and
+`quant-pack certify` commands with stable output paths. It should end by
+rerunning `quant-pack rank` into a stable `rank-after-evidence.json` path so
+operators immediately see the post-certification score. It should carry
+focused-runtime deployment knobs such as remote root maps, shared roots,
+endpoint host maps, remote metrics collector URL, selected stage/metrics
+binaries, model artifact rsync policy, and keep-remote policy into the generated
+`skippy-bench focused-runtime` command. Before the measured remote run, it
+should emit a `focused-runtime --schema-smoke` command with the same topology
+and runtime-shape arguments so operators can validate split boundaries,
+layer-end, context, KV cache, activation-wire, corpus, and lab-option plumbing
+locally. It should also be able to emit an executable shell runbook from the
+same command list so operators can run the evidence pass without copying
+commands by hand. The script should check each command's declared outputs so
+missing reports fail close to the command that was supposed to produce them,
+and multi-candidate scripts should hoist shared corpus-preparation commands so
+a sweep does not redo shared setup once per candidate. This is the
+reproducibility bridge from candidate ranking to real hardware evidence.
+Plans should also be able to include an optional local split-chain evidence lane
+for Studio-scale proving before the lab is available. For topologies with at
+least two split boundaries, for example a 48-layer Qwen coder proxy with
+`--splits 16,32` or a four-stage Qwen-scale package with `--splits 16,32,47`,
+the plan can insert `skippy-bench local-split-chain-binary` and write
+`evidence/local-split-chain.json`. That report should record the predicted
+token, exact first-boundary activation payload/wire byte counts, and
+same-shape transfer estimates for later decode boundaries. This proves local
+stage slicing, stage chaining, and transfer-size shape for a candidate, and
+gives `rank`/`certify` another optional evidence report to attach. It is not a
+replacement for measured distributed `focused-runtime`, because it does not
+cover multi-node scheduling, network contention, remote backend differences, or
+tail latency under concurrent agent traffic.
+It is also not the safe default for 480B-scale direct GGUFs: a local chain can
+start one process per stage, and each process may map or load a large slice on
+the same machine. For large Qwen coder candidates, Studio should produce plans,
+token audits, schema smoke, and small-model/proxy local proofs; quantize,
+package, profile, and focused-runtime evidence should run on lab nodes or
+Hugging Face Jobs. Direct-GGUF local chain runs above the safety guard should
+require an explicit operator override.
+Plans should optionally include a lab preflight script before the measured
+focused-runtime command. For Qwen-scale runs this makes SSH reachability, stale
+stage processes, lab-port listeners, and free-space checks part of the declared
+evidence state instead of an oral runbook step. The preflight should declare a
+success marker that is written only after the checker exits cleanly, so a failed
+preflight log cannot accidentally satisfy resume/status checks. It should also
+make host roles explicit: `skippy-bench focused-runtime --hosts` are SSH
+targets for remote stage launch, while `--endpoint-host-map` carries separate
+stage fabric/IP addresses. The SSH preflight host list may check additional or
+equivalent host strings, but if it differs from runtime `--hosts`, the plan
+should warn that the runtime hosts still need to resolve over SSH. SSH options
+such as port, user, identity, and timeout policy should also be serializable
+into the evidence plan for both measured runtime launch and lab preflight
+instead of relying on the operator's ambient shell environment. Plans should
+warn when only the preflight has SSH options, because that can make the
+preflight pass while the measured `skippy-bench` remote launch still uses
+default SSH.
+`quant-pack evidence-status` should read those generated plans back, check the
+declared outputs, and report the next missing command so interrupted Qwen-scale
+evidence runs can resume from the actual artifact state instead of from memory.
+It should distinguish fully missing commands from partial commands where some
+diagnostics exist but a required success marker is absent. For partial text
+logs, it should surface an `observed_failure` line when possible so operators
+can tell whether they are blocked on SSH reachability, dirty remote processes,
+low disk, or a runtime command failure. It should also inspect known generated
+JSON outputs and stay partial when measured `focused-runtime` is not
+`mode: executed` with generated throughput and decode p50 latency,
+`chat-corpus` or `long-context-chat-corpus` reports request errors,
+`token-lengths` reports context overflow, rank outputs are malformed or
+internally inconsistent, or `certify` writes a
+failed, malformed, or status-less `certification.json`, because file existence
+alone does not prove evidence success. The
+`focused-runtime-schema-smoke` report remains useful as a topology and command
+shape check, but it must not satisfy measured runtime evidence or
+certification. Generated commands should also carry a stable `evidence_type`
+lane label, for example `skippy-bench-focused-runtime`,
+`skippy-bench-chat-corpus`, `skippy-bench-long-context-chat-corpus`, and
+`skippy-bench-local-split-chain`, and `skippy-bench-token-lengths`, so
+automation can identify report semantics without relying only on human-oriented
+command ids. Older plans without the label remain valid by falling back to
+command ids.
+For multi-candidate plans, status should also track the sweep-level final rank
+output and include it in aggregate complete/missing command counts.
+It should also audit serialized local toolchain paths and warn when a declared
+`skippy-bench`, `skippy-model-package`, QA script, or focused-runtime helper
+binary/script is missing or non-executable, so the existing warning gate can
+stop bad runbooks before remote hardware is touched.
+The evidence manifest should also serialize the local `skippy-bench` and
+`skippy-model-package` binary paths, plus the agent tool-call and KV tool-loop
+QA script paths, plus the local runbook working directory used to generate those
+commands. Generated runbooks should `cd` into that directory before running
+warning gates, corpus prep, and relative paths. That keeps runbooks reproducible
+across shells, background jobs, and resumed lab sessions where `target/debug`, a
+release bundle, or the repo-local `scripts/` directory may not be on `PATH` or
+relative to the caller's current working directory.
+
+`quant-pack evidence-plan-all` should apply that same bridge to a `build-all`
+sweep. It should inherit the sweep's runtime-shape assumptions, optionally
+filter to explicit candidate ids or the top valid candidates from the rank
+report, and emit per-candidate evidence directories and command plans without
+launching the benchmarks itself.
+When split boundaries come from quant-plan stage hints, the generated
+`skippy-bench focused-runtime` command should opt into uneven stage ranges. Raw
+layer-count balance is a useful guard for legacy split experiments, but
+Skippy-native quant packs may need latency-, byte-, or memory-balanced stage
+ranges that do not have identical layer counts.
+Generated evidence runbooks should be resumable: before running a command, the
+script should check that command's declared outputs and skip it only when every
+output already exists and `quant-pack evidence-status --command-complete`
+reports that the command is semantically complete. Partial commands must rerun,
+which lets a failed preflight log remain useful diagnostics without letting it
+satisfy the missing success marker, and prevents stale or failed JSON reports
+from being silently accepted. Multi-candidate evidence runbooks should also
+finish with a sweep-level rank report across all selected candidate run
+directories, so the operator gets one post-certification comparison artifact
+instead of stitching per-candidate reports by hand.
+
+`quant-pack certify` should bind package validation, profiler output,
+`skippy-bench` reports, agent harnesses, and cache stability checks to the exact
+candidate build. Certification should fail closed: a candidate can stay
+`experimental` with useful measurements, but it should not become
+`certified_agent` without evidence. When quality evidence is required,
+certification should require both the agent/tool-call reliability lane and the
+KV/tool-loop stability lane to pass; extra ad hoc quality evidence may be
+summarized, but it should not alone certify the pack for coding-agent use.
+Agent-quality status should require that same complete quality coverage even
+when the CLI is not failing the command on missing quality evidence.
+Focused-runtime evidence should also prove that the measured split topology
+matches the candidate's quant-plan stage hints. A latency report for the right
+model on the right hosts is not enough if it used different layer boundaries.
+The certification report should hash the build manifest, quantized GGUF,
+package manifest, agent-pack metadata, preflight output, quantize-run manifest,
+and all attached evidence reports so later audits can prove exactly which
+candidate artifacts were certified. Evidence files that live inside the
+candidate run should be recorded relative to the run directory, while outside
+evidence should be recorded by absolute path, so rank/audit tools can rehash
+in-run evidence after the candidate directory is moved or resumed elsewhere.
+
+`rank` should choose among candidates by request shape. The initial ranker can
+be a deterministic score:
+
+```text
+score =
+  quality_score
+- slowest_stage_decode_penalty
+- memory_pressure_penalty
+- transfer_penalty
+- cache_instability_penalty
+- uncertified_boundary_penalty
+```
+
+This makes profiler work useful without letting it become the main project:
+profiling supplies latency and memory terms; certification supplies quality and
+correctness terms; ranking decides which quant pack is worth using.
+
+`quant-pack rank` is the early evidence ranker for local candidate runs. Before
+full certification exists, it should compare preflight validity, attached decode
+profile timing, slowest-stage model plus estimated KV cache bytes for the
+selected context/cache dtype shape, stage-size imbalance, and a first-order
+activation-transfer estimate from activation width and the selected wire dtype.
+Its output can guide which candidates deserve expensive coding-agent quality checks.
+It should also read the standard generated `evidence/` outputs directly, so a
+sweep can rerank as soon as `skippy-bench focused-runtime`, `chat-corpus`,
+`token-lengths`, or `local-split-chain` reports appear. Direct evidence remains
+provisional until certification binds it to artifact hashes, and rank should
+only credit direct reports that pass basic semantics: measured focused-runtime
+must be `mode: executed`, chat corpus must have zero request errors, token
+lengths must fit context, and local split-chain reports must have a predicted
+token plus positive boundary wire bytes. A usable local split-chain report can
+replace the crude activation-width transfer estimate in provisional ranking.
+Rank output should record the transfer-cost source explicitly, for example
+`certified_local_split_chain`, `direct_local_split_chain`, or
+`preflight_estimate`, so operators know whether a candidate won on measured
+Studio evidence or on a fallback estimate.
+Schema-smoke or failed reports should remain useful diagnostics without
+improving a candidate's provisional rank, and rank notes should name the usable
+direct evidence lanes that counted and explain which direct evidence reports
+were ignored.
+Once `certification.json` exists beside a candidate build, or at the generated
+`evidence/certification.json` path, ranking should become quality-aware and
+should prefer the generated evidence copy when both paths exist. Agent-quality
+certified candidates should beat merely fast uncertified candidates,
+measurement-only candidates should stay provisional, and failed certifications
+should sink the candidate even when its decode profile is attractive. Attached
+certified evidence reports should only contribute rank measurements and counts
+when their summarized status is `pass`; failed attached reports remain audit
+evidence without improving the candidate's score. Ranking
+should require certification to be verifiable by checking subject hashes against
+the current build manifest, quantized GGUF, package manifest, agent-pack
+metadata, preflight output, quantize-run manifest when available, and attached
+`skippy-bench` or quality evidence report files. If those hashes no longer
+match, or if the certification is missing the hashes needed to audit freshness,
+the certification must be scored like a failed certification, and its attached
+runtime measurements must not influence rank scoring.
+Certified candidates should use focused-runtime generated-token throughput from
+the attached `skippy-bench` report as stronger ranking evidence than local
+single-stage decode triage, because it measures the actual staged runtime
+topology.
+
+## Reproducible Toolchain Requirements
+
+The Qwen Coder pack is the first target, not a special case. The same toolchain
+should work for other supported families by changing source model, family
+policy, and certification profile.
+
+Every generated plan, package, and evidence bundle should record enough inputs
+to reproduce or audit the result:
+
+- source model coordinate, revision, file list, and checksums;
+- source quant or base precision;
+- tool versions, Skippy ABI version, and llama.cpp revision;
+- quant layout candidate id, layout hash, tensor selectors, and quant targets;
+- stage count, split hints, activation dtype policy, and KV/cache shape;
+- backend/device/runtime used for measurements;
+- exact certification commands, prompt fixtures, and report paths;
+- ranker version, scoring weights, and selected candidate reason.
+
+The builder should avoid hidden defaults for decisions that affect artifacts.
+Defaults are acceptable for the first Qwen Coder candidate, but they must be
+serialized into the plan so a later run can explain why a tensor group was
+protected, compressed, repaired, or left unchanged.
+
 ## Certification Gates
 
 Promotion from candidate to certified should require evidence in these lanes.
@@ -294,12 +812,118 @@ possible:
 
 ```bash
 skippy-model-package preflight <package-dir> --stages 2
-cargo test -p skippy-runtime --lib
-cargo test -p skippy-server --lib
-cargo test -p mesh-llm-host-runtime --lib inference::skippy
+just bench-corpus long
+just bench-corpus coding-loop
+just bench-corpus long-context
+skippy-bench token-lengths \
+  --model-path <quantized.gguf> \
+  --prompt-corpus target/bench-corpora/long/corpus.jsonl \
+  --ctx-size 8192 \
+  --generation-limit 512 \
+  --layer-end <layer-count> \
+  --enable-thinking false \
+  --summary-json target/bench-corpora/long/prompt-lengths-summary.json
+skippy-bench focused-runtime \
+  --stage-model <package-dir> \
+  --model-id <model-id> \
+  --hosts <stage0-host>,<stage1-host> \
+  --splits <layer-boundary> \
+  --layer-end <layer-count> \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --activation-wire-dtype f16 \
+  --prompt-corpus target/bench-corpora/coding-loop/corpus.jsonl \
+  --max-new-tokens 512 \
+  --scenario steady-decode \
+  --execute-remote \
+  --focused-output target/bench-runs/<pack>/focused-runtime-report.json
+skippy-bench local-split-chain-binary \
+  --model-path <quantized.gguf> \
+  --model-id <model-id> \
+  --splits 16,32 \
+  --layer-end 48 \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --activation-wire-dtype q8 \
+  --prompt "Write a small Rust function that parses a semver string." \
+  --output target/bench-runs/<pack>/local-split-chain.json
+skippy-bench chat-corpus \
+  --base-url http://127.0.0.1:9337/v1 \
+  --model <model-id> \
+  --prompt-corpus target/bench-corpora/coding-loop/corpus.jsonl \
+  --max-tokens 512 \
+  --stream \
+  --include-usage true \
+  --enable-thinking false \
+  --output target/bench-runs/<pack>/chat-corpus.json
+skippy-bench chat-corpus \
+  --base-url http://127.0.0.1:9337/v1 \
+  --model <model-id> \
+  --prompt-corpus target/bench-corpora/long-context/corpus.jsonl \
+  --max-tokens 512 \
+  --stream \
+  --include-usage true \
+  --enable-thinking false \
+  --output target/bench-runs/<pack>/long-context-chat-corpus.json
 scripts/qa-agent-tool-call-reliability.py --base-url http://127.0.0.1:9337/v1 --models <model>
 scripts/qa-kv-tool-loop-stability.py --base-url http://127.0.0.1:9337/v1 --models <model>
+skippy-model-package quant-pack certify <quant-pack-run>/ \
+  --skippy-bench-report target/bench-runs/<pack>/focused-runtime-report.json \
+  --skippy-bench-report target/bench-runs/<pack>/chat-corpus.json \
+  --skippy-bench-report target/bench-runs/<pack>/long-context-chat-corpus.json \
+  --skippy-bench-report target/bench-corpora/long/prompt-lengths-summary.json \
+  --quality-evidence target/agent-tool-call-reliability/results.jsonl \
+  --quality-evidence target/kv-tool-loop-stability/<pack>/summary.json \
+  --require-skippy-bench \
+  --require-quality-evidence \
+  --ctx-size 8192 \
+  --n-gpu-layers -1 \
+  --cache-type-k f16 \
+  --cache-type-v f16 \
+  --activation-wire-dtype f16 \
+  --out <quant-pack-run>/certification.json
 ```
+
+`skippy-bench` should stay the owner of runtime evidence. It already has the
+shapes the quant-pack pipeline needs: `focused-runtime` for staged latency and
+throughput, coding-loop `chat-corpus` for OpenAI-compatible agent-loop
+behavior, long-context `chat-corpus` for product-path long-context stress,
+`token-lengths` for real tokenizer/context audits, plus `coding-loop` and
+`long-context` generated corpora. `skippy-model-package quant-pack certify`
+should consume those reports, hash them, summarize pass/fail status, and bind
+them to the exact quant layout, package manifest, context size, GPU-layer
+policy, KV cache dtype policy, and activation wire dtype. It should not grow a
+second benchmark runner.
+
+That makes the end-to-end split of ownership:
+
+1. `skippy-model-package quant-plan` proposes Skippy-shaped tensor layouts.
+2. `skippy-model-package quant-pack build-all` builds candidate GGUF/package
+   artifacts and performs cheap local decode-first triage.
+3. `skippy-model-package quant-pack evidence-plan-all` selects the best early
+   candidates and emits the exact `skippy-bench` runbook, using candidate
+   stage hints from the quant plan as the default split topology.
+4. Optional Studio-local split-chain evidence proves the candidate's local
+   stage slicing, predicted token path, and activation transfer byte counts
+   before remote hardware is reachable.
+5. `skippy-bench` runs the expensive hardware/product-path lanes and writes the
+   focused-runtime, coding-loop chat, long-context chat, and token-length
+   reports.
+6. `skippy-model-package quant-pack certify` binds those reports and agent QA
+   artifacts back to the exact quantized package.
+7. The generated runbook reruns `skippy-model-package quant-pack rank` so
+   certified evidence is reflected in per-candidate and sweep-level
+   `rank-after-evidence.json` reports before the operator chooses the pack to
+   publish or route.
+
+When certification is run with `--require-skippy-bench`, the gate should require
+the full initial evidence set: focused runtime, coding-loop chat, long-context
+chat, and token lengths. This prevents a candidate from being promoted on a
+latency-only result while context fit, product-path chat behavior, or
+long-context behavior is still unproven. Required `skippy-bench` reports should
+also identify the candidate by model id or quantized model path; otherwise
+certification cannot prove that the benchmark evidence belongs to the package
+being promoted.
 
 Each certification run should write machine-readable artifacts and record:
 
@@ -388,17 +1012,29 @@ must be optional and ignored by older peers.
 
 ## Implementation Plan
 
-1. Define the additive manifest metadata shape and report format.
-2. Add a native layer profiler that records decode-first latency by
+1. Define the additive quant metadata shape for `model-package.json` or a
+   companion `agent-pack.json`.
+2. Add `quant-plan` to generate deterministic layer/tensor-band candidate
+   layouts for a source model and target Skippy profile.
+3. Add `quantize` to apply one candidate layout and write a quantized GGUF plus
+   reproducibility metadata.
+4. Add `quant-pack build` to chain plan, quantize, package writing, preflight,
+   and optional decode profiling for a selected candidate.
+5. Extend package preflight to report quant layout identity, stage memory
+   summaries, and protected tensor groups.
+6. Add native profiler lanes that record decode-first latency by
    backend/device/runtime, with prefill and cache-replay guardrails.
-3. Add a quant-experiment generator for layer/tensor-band candidates.
-4. Extend package preflight to report quant layout identity and stage memory
-   summaries.
-5. Add an agent-pack certification wrapper that runs package, correctness,
-   agent, cache, and performance gates.
-6. Teach topology planning to consume local/package profile hints when scoring
+7. Add `certify` to run package, correctness, agent, cache, performance, and
+   routing gates against a candidate pack.
+8. Add `quant-pack build-all` to sweep candidate layouts and produce a local
+   rank report.
+9. Add `quant-pack rank` to compare local candidate build evidence before
+   expensive quality certification.
+10. Add `rank` to compare certified candidate evidence and select the best pack for a
+   request shape.
+11. Teach topology planning to consume local/package profile hints when scoring
    split plans.
-7. Publish one candidate Qwen Coder pack with evidence before generalizing to
+12. Publish one candidate Qwen Coder pack with evidence before generalizing to
    other families.
 
 ## First Model Candidates

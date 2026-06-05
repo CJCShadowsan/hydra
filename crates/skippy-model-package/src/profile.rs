@@ -810,9 +810,9 @@ fn profile_local_stage_decode(input: &ProfileTimingInput<'_>) -> Result<ProfileT
         .prefill_chunked(&prefix_tokens)
         .context("prefill deterministic local-stage prefix")?;
     let sampling = deterministic_sampling();
-    let mut token = session
-        .sample_current(Some(&sampling))
-        .context("sample first local-stage decode token")?;
+    let mut token = *prefix_tokens
+        .last()
+        .context("deterministic local-stage prefix is empty")?;
     for _ in 0..input.measurement.warmup_samples {
         token = session
             .decode_step_sampled(token, Some(&sampling))

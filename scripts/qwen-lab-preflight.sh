@@ -11,13 +11,14 @@ OUT=""
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/qwen-lab-preflight.sh [--kill] [--clean-tmp] [--min-free-gb N] [--hosts A,B,C] [--ports "P ..."] [--out path]
+Usage: scripts/qwen-lab-preflight.sh [--kill] [--clean-tmp] [--min-free-gb N] [--hosts A,B,C] [--ports "P ..."] [--ssh-opts "OPTS"] [--out path]
 
-Checks Qwen lab hosts for stale stage, llama, KV, Mesh, or Ollama processes and
-for listeners on common lab ports. With --kill, matching processes are stopped.
-With --clean-tmp, generated remote lab scratch directories under /tmp are
-removed. The command exits non-zero if any stale process, lab-port listener, or
-low-disk condition remains.
+Checks Qwen lab hosts for SSH reachability, stale stage, llama, KV, Mesh, or
+Ollama processes, and listeners on common lab ports. With --kill, matching
+processes are stopped. With --clean-tmp, generated remote lab scratch
+directories under /tmp are removed. The command exits non-zero if any host is
+unreachable or if any stale process, lab-port listener, or low-disk condition
+remains.
 USAGE
 }
 
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       PORTS="$2"
       shift 2
       ;;
+    --ssh-opts)
+      SSH_OPTS="$2"
+      shift 2
+      ;;
     --out)
       OUT="$2"
       shift 2
@@ -66,11 +71,42 @@ fi
 
 IFS=',' read -r -a HOST_ARRAY <<<"$HOSTS"
 overall_status=0
+ssh_failures=0
+remote_failures=0
+FAILED_SSH_HOSTS=()
+
+print_local_network_diagnostics() {
+  local host
+  echo "local_network_diagnostics:"
+  echo "local_ipv4_addresses:"
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 addr show 2>/dev/null | awk '/inet / { print "  " $2 " dev " $NF }' || true
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig 2>/dev/null | awk '
+      /^[a-zA-Z0-9]/ { iface = $1; sub(/:.*/, "", iface) }
+      /inet / && $2 != "127.0.0.1" { print "  " $2 " dev " iface }
+    ' || true
+  else
+    echo "  unavailable"
+  fi
+  echo "routes_to_failed_hosts:"
+  for host in "${FAILED_SSH_HOSTS[@]}"; do
+    echo "  == $host =="
+    if command -v ip >/dev/null 2>&1; then
+      ip route get "$host" 2>&1 | sed 's/^/  /' || true
+    elif command -v route >/dev/null 2>&1; then
+      route -n get "$host" 2>&1 | sed 's/^/  /' || true
+    else
+      echo "  route command unavailable"
+    fi
+  done
+}
 
 for host in "${HOST_ARRAY[@]}"; do
   echo "== qwen lab preflight: $host =="
   remote_cmd="$(printf 'PORTS=%q KILL_STALE=%q CLEAN_TMP=%q MIN_FREE_GB=%q bash -s' "$PORTS" "$KILL_STALE" "$CLEAN_TMP" "$MIN_FREE_GB")"
-  if ! ssh $SSH_OPTS "$host" "$remote_cmd" <<'REMOTE'
+  set +e
+  ssh $SSH_OPTS "$host" "$remote_cmd" <<'REMOTE'
 set -euo pipefail
 PROCESS_PATTERN='(skippy-server|skippy-correctness|skippy-prompt|kv-server|/(llama-server|llama-cli|llama-bench|llama-run|main)( |$)|(^| )llama-(server|cli|bench|run)( |$)|mesh-llm|mesh-server|/(mesh)( |$)|(^| )mesh( |$)|ollama)'
 
@@ -160,10 +196,23 @@ if [[ "$KILL_STALE" == "1" ]]; then
 fi
 
 if [[ -n "${matches:-}" || -n "${listeners:-}" || -n "$low_disk" ]]; then
-  exit 1
+  echo "remote_status: dirty"
+  exit 42
 fi
+echo "remote_status: clean"
 REMOTE
-  then
+  ssh_rc=$?
+  set -e
+  if [[ "$ssh_rc" -eq 0 ]]; then
+    echo "preflight_status: ok"
+  elif [[ "$ssh_rc" -eq 255 ]]; then
+    echo "preflight_status: ssh_failed rc=$ssh_rc" >&2
+    ssh_failures=$((ssh_failures + 1))
+    FAILED_SSH_HOSTS+=("$host")
+    overall_status=1
+  else
+    echo "preflight_status: remote_failed rc=$ssh_rc" >&2
+    remote_failures=$((remote_failures + 1))
     overall_status=1
   fi
 done
@@ -171,6 +220,12 @@ done
 if [[ "$overall_status" -eq 0 ]]; then
   echo "qwen lab preflight: clean"
 else
-  echo "qwen lab preflight: stale process, lab-port listener, or low-disk condition remains" >&2
+  if [[ "$ssh_failures" -gt 0 ]]; then
+    echo "qwen lab preflight: ssh connection failed for $ssh_failures host(s); check --hosts, --ssh-opts, and remote sshd" >&2
+    print_local_network_diagnostics >&2
+  fi
+  if [[ "$remote_failures" -gt 0 ]]; then
+    echo "qwen lab preflight: remote stale process, lab-port listener, low-disk, or remote command failure remains on $remote_failures host(s)" >&2
+  fi
 fi
 exit "$overall_status"

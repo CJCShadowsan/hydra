@@ -45,6 +45,9 @@ struct DistributedRunOutcome {
     execute_remote: bool,
     stage_count: usize,
     hosts: Vec<String>,
+    splits: String,
+    layer_end: u32,
+    stage_ranges: Vec<FocusedRuntimeStageRange>,
     report_counts: Value,
     remote_status_path: Option<PathBuf>,
     driver_result_path: Option<PathBuf>,
@@ -66,6 +69,7 @@ struct FocusedRuntimeReport {
     hosts: Vec<String>,
     topology: FocusedRuntimeTopology,
     model: FocusedRuntimeModel,
+    runtime: FocusedRuntimeRuntime,
     latency_ms: FocusedRuntimeLatency,
     throughput_tokens_per_second: FocusedRuntimeThroughput,
     token_counts: FocusedRuntimeTokenCounts,
@@ -97,12 +101,34 @@ struct FocusedRuntimeTopology {
     topology_id: String,
     stage_count: usize,
     hosts: Vec<String>,
+    splits: String,
+    layer_end: u32,
+    stage_ranges: Vec<FocusedRuntimeStageRange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FocusedRuntimeStageRange {
+    stage_index: usize,
+    host: String,
+    layer_start: u32,
+    layer_end: u32,
 }
 
 #[derive(Debug, Serialize)]
 struct FocusedRuntimeModel {
     model_id: String,
     model_identity: ModelIdentity,
+}
+
+#[derive(Debug, Serialize)]
+struct FocusedRuntimeRuntime {
+    stage_load_mode: String,
+    ctx_size: u32,
+    n_gpu_layers: i32,
+    cache_type_k: String,
+    cache_type_v: String,
+    activation_width: i32,
+    activation_wire_dtype: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,6 +189,8 @@ struct StageAssignment {
     remote_log_path: String,
     remote_pid_path: String,
     remote_exit_code_path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ssh_args: Vec<String>,
     remote_model_path: Option<String>,
     local_materialized_model_path: Option<PathBuf>,
     local_shared_model_path: Option<PathBuf>,
@@ -181,6 +209,8 @@ struct DeploymentPlan {
     remote_roots: BTreeMap<String, String>,
     remote_shared_roots: BTreeMap<String, PathBuf>,
     endpoint_hosts: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ssh_args: Vec<String>,
     work_dir: PathBuf,
     metrics_http: String,
     metrics_otlp_grpc: String,
@@ -327,7 +357,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
     let ranges = parse_stage_ranges(&args.splits, args.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_range_balance(&args, &ranges)?;
     let run_id = args.run_id.clone().unwrap_or_else(generate_bench_run_id);
     let run_dir = args.work_dir.join(&run_id);
     let config_dir = run_dir.join("configs");
@@ -381,6 +411,12 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         "hosts": hosts,
         "stage_load_mode": args.stage_load_mode,
         "stage_count": plan.stages.len(),
+        "ctx_size": args.ctx_size,
+        "n_gpu_layers": args.n_gpu_layers,
+        "cache_type_k": args.cache_type_k,
+        "cache_type_v": args.cache_type_v,
+        "activation_width": args.activation_width,
+        "activation_wire_dtype": args.activation_wire_dtype,
         "prompt_corpus": args.prompt_corpus.clone(),
         "prompt_limit": args.prompt_limit,
         "prefill_chunk_size": args.prefill_chunk_size,
@@ -502,6 +538,9 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         execute_remote: args.execute_remote,
         stage_count: plan.stages.len(),
         hosts: plan.hosts.clone(),
+        splits: args.splits.clone(),
+        layer_end: args.layer_end,
+        stage_ranges: focused_runtime_stage_ranges(&ranges, &hosts),
         report_counts: report["counts"].clone(),
         remote_status_path,
         driver_result_path,
@@ -543,8 +582,9 @@ pub fn focused_runtime(args: FocusedRuntimeArgs) -> Result<()> {
     let scenario = args.scenario;
     let focused_output = args.focused_output.clone();
     let preset = prepare_focused_runtime_inputs(&mut args)?;
+    let runtime = focused_runtime_runtime(&args.run);
     let outcome = run_distributed_collect(args.run)?;
-    let report = focused_runtime_report_from_outcome(scenario, preset, &outcome)?;
+    let report = focused_runtime_report_from_outcome(scenario, preset, runtime, &outcome)?;
     let output =
         focused_output.unwrap_or_else(|| outcome.run_dir.join("focused-runtime-report.json"));
     write_json_file(&output, &report)?;
@@ -604,7 +644,7 @@ fn validate_focused_runtime_topology(run: &RunArgs) -> Result<()> {
     let ranges = parse_stage_ranges(&run.splits, run.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(run, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_range_balance(run, &ranges)?;
     Ok(())
 }
 
@@ -672,6 +712,7 @@ fn focused_runtime_preset_description(scenario: FocusedRuntimeScenario) -> &'sta
 fn focused_runtime_report_from_outcome(
     scenario: FocusedRuntimeScenario,
     preset: FocusedRuntimePreset,
+    runtime: FocusedRuntimeRuntime,
     outcome: &DistributedRunOutcome,
 ) -> Result<FocusedRuntimeReport> {
     let driver = outcome
@@ -693,8 +734,12 @@ fn focused_runtime_report_from_outcome(
             &outcome.topology_id,
             outcome.stage_count,
             &outcome.hosts,
+            &outcome.splits,
+            outcome.layer_end,
+            &outcome.stage_ranges,
         ),
         model: focused_runtime_model(&outcome.model_id, &outcome.model_identity),
+        runtime,
         latency_ms: focused_runtime_latency(&summary),
         throughput_tokens_per_second: focused_runtime_throughput(&summary),
         token_counts: focused_runtime_token_counts(&summary),
@@ -737,7 +782,7 @@ fn focused_runtime_schema_smoke_report(args: &FocusedRuntimeArgs) -> Result<Focu
     let ranges = parse_stage_ranges(&args.run.splits, args.run.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args.run, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_range_balance(&args.run, &ranges)?;
     let stage_count = ranges.len();
     let prompt_count = args.run.prompt_limit.unwrap_or(1);
     let model_identity = ModelIdentity::from_model_id(args.run.model_id.clone());
@@ -771,8 +816,16 @@ fn focused_runtime_schema_smoke_report(args: &FocusedRuntimeArgs) -> Result<Focu
         model_identity: model_identity.clone(),
         stage_count,
         hosts: hosts.clone(),
-        topology: focused_runtime_topology(&args.run.topology_id, stage_count, &hosts),
+        topology: focused_runtime_topology(
+            &args.run.topology_id,
+            stage_count,
+            &hosts,
+            &args.run.splits,
+            args.run.layer_end,
+            &focused_runtime_stage_ranges(&ranges, &hosts),
+        ),
         model: focused_runtime_model(&args.run.model_id, &model_identity),
+        runtime: focused_runtime_runtime(&args.run),
         latency_ms: focused_runtime_latency(&summary),
         throughput_tokens_per_second: focused_runtime_throughput(&summary),
         token_counts: focused_runtime_token_counts(&summary),
@@ -797,18 +850,54 @@ fn focused_runtime_topology(
     topology_id: &str,
     stage_count: usize,
     hosts: &[String],
+    splits: &str,
+    layer_end: u32,
+    stage_ranges: &[FocusedRuntimeStageRange],
 ) -> FocusedRuntimeTopology {
     FocusedRuntimeTopology {
         topology_id: topology_id.to_string(),
         stage_count,
         hosts: hosts.to_vec(),
+        splits: splits.to_string(),
+        layer_end,
+        stage_ranges: stage_ranges.to_vec(),
     }
+}
+
+fn focused_runtime_stage_ranges(
+    ranges: &[(u32, u32)],
+    hosts: &[String],
+) -> Vec<FocusedRuntimeStageRange> {
+    ranges
+        .iter()
+        .enumerate()
+        .map(
+            |(stage_index, (layer_start, layer_end))| FocusedRuntimeStageRange {
+                stage_index,
+                host: hosts.get(stage_index).cloned().unwrap_or_default(),
+                layer_start: *layer_start,
+                layer_end: *layer_end,
+            },
+        )
+        .collect()
 }
 
 fn focused_runtime_model(model_id: &str, model_identity: &ModelIdentity) -> FocusedRuntimeModel {
     FocusedRuntimeModel {
         model_id: model_id.to_string(),
         model_identity: model_identity.clone(),
+    }
+}
+
+fn focused_runtime_runtime(args: &RunArgs) -> FocusedRuntimeRuntime {
+    FocusedRuntimeRuntime {
+        stage_load_mode: args.stage_load_mode.clone(),
+        ctx_size: args.ctx_size,
+        n_gpu_layers: args.n_gpu_layers,
+        cache_type_k: args.cache_type_k.clone(),
+        cache_type_v: args.cache_type_v.clone(),
+        activation_width: args.activation_width,
+        activation_wire_dtype: args.activation_wire_dtype.clone(),
     }
 }
 
@@ -951,6 +1040,7 @@ fn build_deployment_plan(
     let remote_root_map = parse_remote_root_map(args.remote_root_map.as_deref())?;
     let remote_shared_root_map = parse_path_map(args.remote_shared_root_map.as_deref())?;
     let endpoint_host_map = parse_remote_root_map(args.endpoint_host_map.as_deref())?;
+    let ssh_args = parse_ssh_opts(args.ssh_opts.as_deref());
     let package_manifest = if args.stage_load_mode == "layer-package" {
         args.stage_model
             .as_ref()
@@ -1042,6 +1132,7 @@ fn build_deployment_plan(
             remote_log_path: format!("{remote_stage_dir}/stage.log"),
             remote_pid_path: format!("{remote_stage_dir}/stage.pid"),
             remote_exit_code_path: format!("{remote_stage_dir}/stage.exit"),
+            ssh_args: ssh_args.clone(),
             remote_model_path,
             local_materialized_model_path,
             local_shared_model_path,
@@ -1065,6 +1156,7 @@ fn build_deployment_plan(
         remote_roots: remote_root_map,
         remote_shared_roots: remote_shared_root_map,
         endpoint_hosts: endpoint_host_map,
+        ssh_args,
         work_dir: args.work_dir.clone(),
         metrics_http,
         metrics_otlp_grpc: metrics_otlp,
@@ -1186,28 +1278,24 @@ fn execute_remote_plan(args: &RunArgs, plan: &DeploymentPlan) -> Result<Vec<Chil
             })?);
         } else {
             let remote_stage_dir = remote_parent(&stage.remote_config_path)?;
-            run_command(
-                Command::new("ssh")
-                    .arg(&stage.host)
-                    .arg(format!("mkdir -p {remote_stage_dir}")),
-            )
-            .with_context(|| format!("create remote stage dir on {}", stage.host))?;
+            let mut mkdir = ssh_command_with_remote(stage, format!("mkdir -p {remote_stage_dir}"));
+            run_command(&mut mkdir)
+                .with_context(|| format!("create remote stage dir on {}", stage.host))?;
 
-            run_command(
-                Command::new("rsync")
-                    .arg("-az")
-                    .arg(&args.stage_server_bin)
-                    .arg(format!("{}:{remote_stage_dir}/skippy-server", stage.host)),
-            )
-            .with_context(|| format!("rsync stage server to {}", stage.host))?;
+            let mut rsync = rsync_command(stage);
+            rsync
+                .arg("-az")
+                .arg(&args.stage_server_bin)
+                .arg(format!("{}:{remote_stage_dir}/skippy-server", stage.host));
+            run_command(&mut rsync)
+                .with_context(|| format!("rsync stage server to {}", stage.host))?;
 
-            run_command(
-                Command::new("rsync")
-                    .arg("-az")
-                    .arg(&stage.config_path)
-                    .arg(format!("{}:{}", stage.host, stage.remote_config_path)),
-            )
-            .with_context(|| format!("rsync config to {}", stage.host))?;
+            let mut rsync = rsync_command(stage);
+            rsync
+                .arg("-az")
+                .arg(&stage.config_path)
+                .arg(format!("{}:{}", stage.host, stage.remote_config_path));
+            run_command(&mut rsync).with_context(|| format!("rsync config to {}", stage.host))?;
 
             if args.rsync_model_artifacts {
                 rsync_model_artifacts(args, stage)?;
@@ -1215,10 +1303,8 @@ fn execute_remote_plan(args: &RunArgs, plan: &DeploymentPlan) -> Result<Vec<Chil
 
             let remote_bin = format!("{remote_stage_dir}/skippy-server");
             let command = remote_start_command(args, plan, stage, &remote_bin);
-            let mut ssh = Command::new("ssh");
-            ssh.arg(&stage.host)
-                .arg(command)
-                .stdin(Stdio::null())
+            let mut ssh = ssh_command_with_remote(stage, command);
+            ssh.stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             sessions
@@ -1991,7 +2077,7 @@ fn remote_pid(stage: &StageAssignment) -> Result<Option<u32>> {
         ));
     }
     let output = ssh_capture(
-        &stage.host,
+        stage,
         &format!(
             "cat {} 2>/dev/null || true",
             shell_quote(&stage.remote_pid_path)
@@ -2015,7 +2101,7 @@ fn remote_pid_alive(stage: &StageAssignment, pid: u32) -> Result<bool> {
             .with_context(|| format!("check local pid {pid} for {}", stage.stage_id))?
             .success());
     }
-    ssh_success(&stage.host, &format!("kill -0 {pid} 2>/dev/null"))
+    ssh_success(stage, &format!("kill -0 {pid} 2>/dev/null"))
 }
 
 fn remote_pid_alive_opt(stage: &StageAssignment, pid: Option<u32>) -> Result<bool> {
@@ -2035,7 +2121,7 @@ fn remote_exit_code(stage: &StageAssignment) -> Result<Option<i32>> {
         })?));
     }
     let output = ssh_capture(
-        &stage.host,
+        stage,
         &format!(
             "cat {} 2>/dev/null || true",
             shell_quote(&stage.remote_exit_code_path)
@@ -2070,7 +2156,7 @@ fn remote_log_ready(stage: &StageAssignment) -> Result<bool> {
         return Ok(log.contains("skippy-server listening: binary="));
     }
     ssh_success(
-        &stage.host,
+        stage,
         &format!(
             "test -f {} && grep -q {} {}",
             shell_quote(&stage.remote_log_path),
@@ -2095,7 +2181,7 @@ fn remote_log_tail(stage: &StageAssignment) -> Result<String> {
         return Ok(tail);
     }
     ssh_capture(
-        &stage.host,
+        stage,
         &format!(
             "tail -n 40 {} 2>/dev/null || true",
             shell_quote(&stage.remote_log_path)
@@ -2110,7 +2196,7 @@ fn collect_remote_log(stage: &StageAssignment, logs_dir: &Path) -> Option<PathBu
             .ok()
             .map(|_| local_path);
     }
-    let status = Command::new("rsync")
+    let status = rsync_command(stage)
         .arg("-az")
         .arg(format!("{}:{}", stage.host, stage.remote_log_path))
         .arg(&local_path)
@@ -2132,7 +2218,7 @@ fn terminate_remote_stage(stage: &StageAssignment, pid: Option<u32>) -> Result<(
         return Ok(());
     }
     ssh_success(
-        &stage.host,
+        stage,
         &format!(
             "kill -TERM {pid} 2>/dev/null || true; for i in 1 2 3 4 5; do kill -0 {pid} 2>/dev/null || exit 0; sleep 1; done; kill -KILL {pid} 2>/dev/null || true"
         ),
@@ -2181,19 +2267,16 @@ fn rsync_model_artifacts(args: &RunArgs, stage: &StageAssignment) -> Result<()> 
             })?;
         } else {
             let remote_parent = remote_parent(remote_model)?;
-            run_command(
-                Command::new("ssh")
-                    .arg(&stage.host)
-                    .arg(format!("mkdir -p {}", shell_quote(&remote_parent))),
-            )
-            .with_context(|| format!("create remote model cache dir on {}", stage.host))?;
-            run_command(
-                Command::new("rsync")
-                    .arg("-az")
-                    .arg(local_model)
-                    .arg(format!("{}:{}", stage.host, remote_model)),
-            )
-            .with_context(|| {
+            let mut mkdir =
+                ssh_command_with_remote(stage, format!("mkdir -p {}", shell_quote(&remote_parent)));
+            run_command(&mut mkdir)
+                .with_context(|| format!("create remote model cache dir on {}", stage.host))?;
+            let mut rsync = rsync_command(stage);
+            rsync
+                .arg("-az")
+                .arg(local_model)
+                .arg(format!("{}:{}", stage.host, remote_model));
+            run_command(&mut rsync).with_context(|| {
                 format!(
                     "rsync coordinator-materialized stage model for {} to {}",
                     stage.stage_id, stage.host
@@ -2202,12 +2285,9 @@ fn rsync_model_artifacts(args: &RunArgs, stage: &StageAssignment) -> Result<()> 
         }
     } else if args.stage_load_mode == "layer-package" && stage_model.is_dir() {
         let remote_package_dir = format!("{}/package", remote_parent(&stage.remote_config_path)?);
-        run_command(
-            Command::new("ssh")
-                .arg(&stage.host)
-                .arg(format!("mkdir -p {remote_package_dir}")),
-        )?;
-        let mut rsync = Command::new("rsync");
+        let mut mkdir = ssh_command_with_remote(stage, format!("mkdir -p {remote_package_dir}"));
+        run_command(&mut mkdir)?;
+        let mut rsync = rsync_command(stage);
         rsync.arg("-azR");
         rsync.arg("./model-package.json");
         for path in &stage.selected_package_files {
@@ -2222,13 +2302,13 @@ fn rsync_model_artifacts(args: &RunArgs, stage: &StageAssignment) -> Result<()> 
             )
         })?;
     } else {
-        run_command(
-            Command::new("rsync")
-                .arg("-az")
-                .arg(stage_model)
-                .arg(format!("{}:{}/model", stage.host, args.remote_root)),
-        )
-        .with_context(|| format!("rsync model artifact to {}", stage.host))?;
+        let mut rsync = rsync_command(stage);
+        rsync
+            .arg("-az")
+            .arg(stage_model)
+            .arg(format!("{}:{}/model", stage.host, args.remote_root));
+        run_command(&mut rsync)
+            .with_context(|| format!("rsync model artifact to {}", stage.host))?;
     }
     Ok(())
 }
@@ -2334,24 +2414,61 @@ fn run_command(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-fn ssh_success(host: &str, remote_command: &str) -> Result<bool> {
-    let status = Command::new("ssh")
-        .arg(host)
-        .arg(remote_command)
+fn ssh_command(stage: &StageAssignment) -> Command {
+    let mut command = Command::new("ssh");
+    command.args(&stage.ssh_args).arg(&stage.host);
+    command
+}
+
+fn ssh_command_with_remote(stage: &StageAssignment, remote_command: impl Into<String>) -> Command {
+    let mut command = ssh_command(stage);
+    command.arg(remote_command.into());
+    command
+}
+
+fn rsync_command(stage: &StageAssignment) -> Command {
+    let mut command = Command::new("rsync");
+    if !stage.ssh_args.is_empty() {
+        command.arg("-e").arg(rsync_ssh_transport(&stage.ssh_args));
+    }
+    command
+}
+
+fn rsync_ssh_transport(ssh_args: &[String]) -> String {
+    let suffix = ssh_args
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("ssh {suffix}")
+}
+
+fn parse_ssh_opts(opts: Option<&str>) -> Vec<String> {
+    opts.map(|value| {
+        value
+            .split_whitespace()
+            .filter(|arg| !arg.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn ssh_success(stage: &StageAssignment, remote_command: &str) -> Result<bool> {
+    let status = ssh_command_with_remote(stage, remote_command)
         .status()
-        .with_context(|| format!("run ssh command on {host}"))?;
+        .with_context(|| format!("run ssh command on {}", stage.host))?;
     Ok(status.success())
 }
 
-fn ssh_capture(host: &str, remote_command: &str) -> Result<String> {
-    let output = Command::new("ssh")
-        .arg(host)
-        .arg(remote_command)
+fn ssh_capture(stage: &StageAssignment, remote_command: &str) -> Result<String> {
+    let output = ssh_command_with_remote(stage, remote_command)
         .output()
-        .with_context(|| format!("run ssh command on {host}"))?;
+        .with_context(|| format!("run ssh command on {}", stage.host))?;
     if !output.status.success() {
         bail!(
-            "ssh command on {host} failed with status {}: {}",
+            "ssh command on {} failed with status {}: {}",
+            stage.host,
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -2489,6 +2606,13 @@ fn validate_balanced_stage_ranges(ranges: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
+fn validate_stage_range_balance(args: &RunArgs, ranges: &[(u32, u32)]) -> Result<()> {
+    if args.allow_uneven_stage_ranges {
+        return Ok(());
+    }
+    validate_balanced_stage_ranges(ranges)
+}
+
 fn parse_stage_ranges(splits: &str, layer_end: u32) -> Result<Vec<(u32, u32)>> {
     let mut boundaries = vec![0];
     for split in splits
@@ -2624,6 +2748,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_ssh_opts_for_remote_transport() {
+        let args = parse_ssh_opts(Some("-p 2222 -o BatchMode=yes -i /tmp/lab_key"));
+
+        assert_eq!(
+            args,
+            ["-p", "2222", "-o", "BatchMode=yes", "-i", "/tmp/lab_key"]
+        );
+        assert_eq!(
+            rsync_ssh_transport(&args),
+            "ssh '-p' '2222' '-o' 'BatchMode=yes' '-i' '/tmp/lab_key'"
+        );
+    }
+
+    #[test]
     fn requires_one_host_per_stage() {
         let hosts = parse_hosts("shadowfax.local,black.local").unwrap();
         assert!(validate_distinct_stage_hosts(&hosts, 3).is_err());
@@ -2643,6 +2781,7 @@ mod tests {
             stage_model: Some(PathBuf::from("model-package")),
             stage_load_mode: "layer-package".to_string(),
             splits: "1".to_string(),
+            allow_uneven_stage_ranges: false,
             layer_end: 2,
             ctx_size: 128,
             n_gpu_layers: 0,
@@ -2668,6 +2807,7 @@ mod tests {
             remote_root_map: None,
             remote_shared_root_map: None,
             endpoint_host_map: None,
+            ssh_opts: None,
             remote_bind_host: "0.0.0.0".to_string(),
             first_stage_port: 19031,
             execute_remote: false,
@@ -2710,6 +2850,19 @@ mod tests {
             validate_balanced_stage_ranges(&parse_stage_ranges("12,20,28", 40).unwrap()).is_err()
         );
         assert!(validate_balanced_stage_ranges(&parse_stage_ranges("1,4,7", 40).unwrap()).is_err());
+    }
+
+    #[test]
+    fn uneven_stage_ranges_require_explicit_opt_in() {
+        let mut args = test_run_args();
+        let ranges = parse_stage_ranges("12,20,28", 40).unwrap();
+
+        let err = validate_stage_range_balance(&args, &ranges)
+            .expect_err("uneven ranges should fail by default");
+
+        assert!(err.to_string().contains("evenly balanced"));
+        args.allow_uneven_stage_ranges = true;
+        validate_stage_range_balance(&args, &ranges).expect("explicit opt-in allows uneven ranges");
     }
 
     #[test]
@@ -2914,6 +3067,9 @@ mod tests {
             value["model"]["model_id"],
             "test-org/bench-model-GGUF:Q4_K_M"
         );
+        assert_eq!(value["runtime"]["stage_load_mode"], "runtime-slice");
+        assert_eq!(value["runtime"]["activation_wire_dtype"], "f32");
+        assert_eq!(value["runtime"]["activation_width"], 2048);
         assert_eq!(value["latency_ms"]["elapsed_ms_p95"], 10);
         assert_eq!(value["latency_ms"]["startup_elapsed_ms"], 0);
         assert_eq!(value["throughput_tokens_per_second"]["generated"], 100.0);
@@ -3128,6 +3284,7 @@ mod tests {
             stage_model: None,
             stage_load_mode: "runtime-slice".to_string(),
             splits: "1".to_string(),
+            allow_uneven_stage_ranges: false,
             layer_end: 2,
             ctx_size: 128,
             n_gpu_layers: 0,
@@ -3153,6 +3310,7 @@ mod tests {
             remote_root_map: None,
             remote_shared_root_map: None,
             endpoint_host_map: None,
+            ssh_opts: None,
             remote_bind_host: "0.0.0.0".to_string(),
             first_stage_port: 19031,
             execute_remote: true,
@@ -3179,6 +3337,7 @@ mod tests {
             remote_roots: BTreeMap::new(),
             remote_shared_roots: BTreeMap::new(),
             endpoint_hosts: BTreeMap::new(),
+            ssh_args: Vec::new(),
             work_dir: PathBuf::from("/tmp/work"),
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_otlp_grpc: "http://coordinator.local:14317".to_string(),
@@ -3201,6 +3360,7 @@ mod tests {
             remote_log_path: "/tmp/remote/run-1/stage-0/stage.log".to_string(),
             remote_pid_path: "/tmp/remote/run-1/stage-0/stage.pid".to_string(),
             remote_exit_code_path: "/tmp/remote/run-1/stage-0/stage.exit".to_string(),
+            ssh_args: Vec::new(),
             remote_model_path: None,
             local_materialized_model_path: None,
             local_shared_model_path: None,
@@ -3239,6 +3399,7 @@ mod tests {
             stage_model: None,
             stage_load_mode: "runtime-slice".to_string(),
             splits: "1".to_string(),
+            allow_uneven_stage_ranges: false,
             layer_end: 2,
             ctx_size: 128,
             n_gpu_layers: 0,
@@ -3264,6 +3425,7 @@ mod tests {
             remote_root_map: None,
             remote_shared_root_map: None,
             endpoint_host_map: None,
+            ssh_opts: None,
             remote_bind_host: "0.0.0.0".to_string(),
             first_stage_port: 19031,
             execute_remote: false,

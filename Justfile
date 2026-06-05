@@ -165,6 +165,10 @@ llama-prepare-latest:
 llama-build: llama-prepare
     @scripts/build-llama.sh
 
+# Build the patched llama.cpp quantize CLI used by skippy quant-pack tooling.
+llama-quantize-build: llama-prepare
+    @scripts/build-llama-quantize.sh
+
 release-build-windows:
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu -BuildProfile release
 
@@ -532,3 +536,16 @@ docker-build-client tag="mesh-llm:client":
 # Run the client console image locally
 docker-run-client tag="mesh-llm:client":
     docker run --rm -p 3131:3131 -p 9337:9337 -e APP_MODE=console {{ tag }}
+
+# Build the CPU Hugging Face Jobs image used for Skippy quant-pack construction.
+[unix]
+docker-build-quant-pack-job tag="skippy-quant-pack-job:cpu":
+    DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.quant-pack-job -t {{ tag }} .
+
+[windows]
+docker-build-quant-pack-job tag="skippy-quant-pack-job:cpu":
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:DOCKER_BUILDKIT='1'; docker build -f docker/Dockerfile.quant-pack-job -t '{{ tag }}' ."
+
+# Push a pre-tagged Hugging Face Jobs quant-pack image.
+docker-push-quant-pack-job tag:
+    docker push {{ tag }}

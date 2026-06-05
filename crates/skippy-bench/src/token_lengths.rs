@@ -138,6 +138,7 @@ pub fn token_lengths(args: TokenLengthsArgs) -> Result<()> {
     let summary = summarize(&args, &rows);
     let summary_json = serde_json::to_vec_pretty(&summary)?;
     if let Some(path) = args.summary_json.as_ref() {
+        create_parent_dir(path)?;
         fs::write(path, &summary_json)
             .with_context(|| format!("write summary JSON {}", path.display()))?;
     }
@@ -275,7 +276,18 @@ fn write_tsv(path: &Path, rows: &[TokenLengthRow]) -> Result<()> {
             row.fits_context
         ));
     }
+    create_parent_dir(path)?;
     fs::write(path, output).with_context(|| format!("write token length TSV {}", path.display()))
+}
+
+fn create_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create output directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn tsv_cell(value: Option<&str>) -> String {
@@ -417,5 +429,36 @@ mod tests {
         assert_eq!(summary.exceeds_context, 1);
         assert_eq!(summary.prompt_tokens_max, Some(8));
         assert_eq!(summary.requested_tokens_max, Some(12));
+    }
+
+    #[test]
+    fn output_writers_create_parent_directories() {
+        let dir = std::env::temp_dir().join(format!(
+            "skippy-token-lengths-output-{}",
+            std::process::id()
+        ));
+        let tsv_path = dir.join("nested").join("prompt-lengths.tsv");
+        let json_path = dir.join("summary").join("prompt-lengths-summary.json");
+        let rows = vec![TokenLengthRow {
+            sequence: 0,
+            prompt_id: Some("row-1".to_string()),
+            family: Some("coding".to_string()),
+            length_bucket: Some("short".to_string()),
+            prompt_chars: 5,
+            rendered_chars: 7,
+            prompt_tokens: 3,
+            generation_limit: 4,
+            requested_tokens: 7,
+            ctx_size: 10,
+            fits_context: true,
+        }];
+
+        write_tsv(&tsv_path, &rows).expect("write nested TSV");
+        create_parent_dir(&json_path).expect("create nested summary parent");
+        fs::write(&json_path, b"{}").expect("write nested summary");
+
+        assert!(tsv_path.exists());
+        assert!(json_path.exists());
+        fs::remove_dir_all(dir).expect("remove fixture");
     }
 }

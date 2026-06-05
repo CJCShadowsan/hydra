@@ -19,6 +19,10 @@ use skippy_runtime::{ModelInfo, TensorInfo, write_gguf_from_parts};
 
 mod preflight;
 mod profile;
+mod quant_certify;
+mod quant_pack;
+mod quant_plan;
+mod quantize;
 
 #[derive(Debug, Parser)]
 #[command(name = "skippy-model-package")]
@@ -69,6 +73,8 @@ enum Command {
         #[arg(long)]
         after_artifact_command: Option<PathBuf>,
         #[arg(long)]
+        agent_pack: Option<PathBuf>,
+        #[arg(long)]
         model_id: Option<String>,
         #[arg(long)]
         source_repo: Option<String>,
@@ -93,6 +99,9 @@ enum Command {
         verify_sha256: bool,
     },
     Profile(profile::ProfileArgs),
+    QuantPack(quant_pack::QuantPackArgs),
+    QuantPlan(quant_plan::QuantPlanArgs),
+    Quantize(quantize::QuantizeArgs),
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +191,8 @@ struct PackageManifest {
     layer_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     activation_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_pack: Option<serde_json::Value>,
     shared: PackageShared,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     projectors: Vec<PackageProjector>,
@@ -370,6 +381,7 @@ fn main() -> Result<()> {
             out_dir,
             projectors,
             after_artifact_command,
+            agent_pack,
             model_id,
             source_repo,
             source_revision,
@@ -381,6 +393,7 @@ fn main() -> Result<()> {
             ArtifactHook {
                 command: after_artifact_command,
             },
+            agent_pack,
             ExplicitSourceIdentity {
                 model_id,
                 source_repo,
@@ -396,6 +409,9 @@ fn main() -> Result<()> {
             verify_sha256,
         } => run_preflight(package, stages, verify_sha256),
         Command::Profile(args) => profile::run_profile(args),
+        Command::QuantPack(args) => quant_pack::run_quant_pack(args),
+        Command::QuantPlan(args) => quant_plan::run_quant_plan(args),
+        Command::Quantize(args) => quantize::run_quantize(args).map(|_| ()),
     }
 }
 
@@ -483,6 +499,7 @@ fn write_package(
     out_dir: PathBuf,
     projectors: Vec<PathBuf>,
     artifact_hook: ArtifactHook,
+    agent_pack: Option<PathBuf>,
     explicit: ExplicitSourceIdentity,
 ) -> Result<()> {
     let input = resolve_package_input(model, explicit)?;
@@ -502,6 +519,10 @@ fn write_package(
     let layer_count = layer_count(tensors)?;
     let activation_width = activation_width(&input.model_path)?;
     let source_sha256 = file_sha256(&input.model_path)?;
+    let agent_pack = agent_pack
+        .as_deref()
+        .map(read_agent_pack_metadata)
+        .transpose()?;
 
     let metadata = write_package_artifact(
         &source,
@@ -597,6 +618,7 @@ fn write_package(
         format: "layer-package".to_string(),
         layer_count,
         activation_width: Some(activation_width),
+        agent_pack,
         shared: PackageShared {
             metadata,
             embeddings,
@@ -664,6 +686,22 @@ fn resolve_package_input(model: String, explicit: ExplicitSourceIdentity) -> Res
             .context("downloaded artifact path list did not include primary file")?;
         Ok(package_input_from_resolved_artifact(model_path, artifact))
     })
+}
+
+fn read_agent_pack_metadata(path: &Path) -> Result<serde_json::Value> {
+    let contents =
+        fs::read(path).with_context(|| format!("read agent pack metadata {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&contents)
+        .with_context(|| format!("parse agent pack metadata {}", path.display()))?;
+    for field in ["schema_version", "profile", "pack_id", "quant_layout"] {
+        if value.get(field).is_none() {
+            bail!(
+                "agent pack metadata {} is missing required field {field:?}",
+                path.display()
+            );
+        }
+    }
+    Ok(value)
 }
 
 fn resolve_local_package_input(
@@ -1828,7 +1866,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         ExplicitSourceIdentity, activation_width, local_artifact_files, model_distribution_id,
-        resolve_gguf_shard_paths, resolve_local_package_input,
+        read_agent_pack_metadata, resolve_gguf_shard_paths, resolve_local_package_input,
     };
     use std::path::{Path, PathBuf};
 
@@ -1878,6 +1916,34 @@ mod tests {
             input.source_identity.distribution_id.as_deref(),
             Some("Qwen3-8B-Q4_K_M")
         );
+    }
+
+    #[test]
+    fn agent_pack_metadata_reader_requires_quant_layout_identity() {
+        let dir = unique_test_dir("agent-pack-reader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-pack.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "profile": "coding-agent",
+  "pack_id": "middle-compressed",
+  "quant_layout": {
+    "strategy": "stage-aware-middle-compressed",
+    "default": "Q4_K_M",
+    "layout_hash": "hash",
+    "groups": []
+  }
+}"#,
+        )
+        .unwrap();
+
+        let metadata = read_agent_pack_metadata(&path).unwrap();
+
+        assert_eq!(metadata["pack_id"], "middle-compressed");
+        assert_eq!(metadata["quant_layout"]["layout_hash"], "hash");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

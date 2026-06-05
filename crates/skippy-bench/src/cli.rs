@@ -154,9 +154,14 @@ pub struct RunArgs {
     #[arg(
         long,
         default_value = "14,27",
-        help = "Comma-separated layer boundaries. Lab runs must be evenly balanced; Qwen3.6 40 layers on three hosts uses 14,27."
+        help = "Comma-separated layer boundaries. Lab runs default to evenly balanced layer counts; Qwen3.6 40 layers on three hosts uses 14,27."
     )]
     pub splits: String,
+    #[arg(
+        long,
+        help = "Allow uneven layer counts across stages. Use for quant-pack stage hints that are balanced by measured latency/bytes instead of raw layer count."
+    )]
+    pub allow_uneven_stage_ranges: bool,
     #[arg(long, default_value_t = 40)]
     pub layer_end: u32,
     #[arg(long, default_value_t = 128)]
@@ -213,6 +218,11 @@ pub struct RunArgs {
     pub remote_shared_root_map: Option<String>,
     #[arg(long)]
     pub endpoint_host_map: Option<String>,
+    #[arg(
+        long,
+        help = "Whitespace-split options passed to ssh and rsync's ssh transport, for example '-p 2222 -o BatchMode=yes -i ~/.ssh/lab_key'."
+    )]
+    pub ssh_opts: Option<String>,
     #[arg(long, default_value = "0.0.0.0")]
     pub remote_bind_host: String,
     #[arg(long, default_value_t = 19031)]
@@ -346,6 +356,8 @@ pub struct LocalSplitBinaryArgs {
     #[arg(long, default_value = "f16")]
     pub activation_wire_dtype: String,
     #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
     pub child_logs: bool,
     #[arg(long, default_value_t = 60)]
     pub startup_timeout_secs: u64,
@@ -374,6 +386,8 @@ pub struct LocalSplitCompareArgs {
     #[arg(long, default_value = "f16")]
     pub activation_wire_dtype: String,
     #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
     pub child_logs: bool,
     #[arg(long, default_value_t = 60)]
     pub startup_timeout_secs: u64,
@@ -389,6 +403,11 @@ pub struct LocalSplitChainBinaryArgs {
     pub model_path: PathBuf,
     #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
     pub model_id: String,
+    #[arg(
+        long,
+        help = "Comma-separated split boundaries for an N-stage local chain. Overrides --split-layer-1 and --split-layer-2 when set."
+    )]
+    pub splits: Option<String>,
     #[arg(long, default_value_t = 10)]
     pub split_layer_1: u32,
     #[arg(long, default_value_t = 20)]
@@ -408,9 +427,16 @@ pub struct LocalSplitChainBinaryArgs {
     #[arg(long, default_value = "f16")]
     pub activation_wire_dtype: String,
     #[arg(long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
     pub child_logs: bool,
     #[arg(long, default_value_t = 60)]
     pub startup_timeout_secs: u64,
+    #[arg(
+        long,
+        help = "Allow direct-GGUF local split-chain runs that can load multiple large model slices concurrently on one machine."
+    )]
+    pub allow_high_memory_local_chain: bool,
 }
 
 #[cfg(test)]
@@ -435,6 +461,7 @@ mod tests {
             "2",
             "--max-new-tokens",
             "4",
+            "--allow-uneven-stage-ranges",
         ])
         .unwrap();
 
@@ -446,6 +473,7 @@ mod tests {
         assert!(matches!(args.scenario, FocusedRuntimeScenario::FirstToken));
         assert_eq!(args.run.hosts, "host-a,host-b");
         assert_eq!(args.run.splits, "1");
+        assert!(args.run.allow_uneven_stage_ranges);
         assert_eq!(args.run.layer_end, 2);
         assert_eq!(args.run.max_new_tokens, Some(4));
     }
@@ -470,5 +498,28 @@ mod tests {
         };
 
         assert_eq!(args.run.max_new_tokens, None);
+    }
+
+    #[test]
+    fn parses_local_split_chain_splits_override() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "local-split-chain-binary",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "16,32,47",
+            "--allow-high-memory-local-chain",
+        ])
+        .unwrap();
+
+        let CommandKind::LocalSplitChainBinary(args) = cli.command else {
+            panic!("expected local-split-chain-binary subcommand");
+        };
+
+        assert_eq!(args.splits.as_deref(), Some("16,32,47"));
+        assert_eq!(args.split_layer_1, 10);
+        assert_eq!(args.split_layer_2, 20);
+        assert!(args.allow_high_memory_local_chain);
     }
 }

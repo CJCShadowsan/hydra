@@ -20,6 +20,8 @@ pub(crate) struct PackagePreflightReport {
     pub model_id: Option<String>,
     pub layer_count: Option<u32>,
     pub activation_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_pack: Option<PreflightAgentPack>,
     pub manifest_sha256: Option<String>,
     pub checked_artifact_count: usize,
     pub missing_artifact_count: usize,
@@ -74,6 +76,34 @@ pub(crate) struct PreflightStage {
     pub missing_parts: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct PreflightAgentPack {
+    pub schema_version: u32,
+    pub profile: String,
+    pub pack_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PreflightAgentPackSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant_layout_hash: Option<String>,
+    pub strategy: String,
+    pub default_quant: String,
+    pub group_count: usize,
+    pub groups: Vec<PreflightQuantGroup>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PreflightAgentPackSource {
+    pub path: String,
+    pub sha256: String,
+    pub inferred_source_quant: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PreflightQuantGroup {
+    pub name: String,
+    pub quant: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct PackageManifest {
     schema_version: u32,
@@ -83,11 +113,47 @@ struct PackageManifest {
     layer_count: u32,
     #[serde(default)]
     activation_width: Option<u32>,
+    #[serde(default)]
+    agent_pack: Option<AgentPackMetadata>,
     shared: PackageShared,
     #[serde(default)]
     projectors: Vec<PackageProjector>,
     layers: Vec<PackageLayer>,
     skippy_abi_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentPackMetadata {
+    schema_version: u32,
+    profile: String,
+    pack_id: String,
+    #[serde(default)]
+    source: Option<AgentPackSource>,
+    quant_layout: QuantLayoutMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentPackSource {
+    path: String,
+    sha256: String,
+    inferred_source_quant: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuantLayoutMetadata {
+    strategy: String,
+    #[serde(rename = "default")]
+    default_quant: String,
+    #[serde(default)]
+    layout_hash: Option<String>,
+    #[serde(default)]
+    groups: Vec<QuantLayoutGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuantLayoutGroup {
+    name: String,
+    quant: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +244,7 @@ pub(crate) fn preflight_package(
     report.model_id = Some(manifest.model_id.clone());
     report.layer_count = Some(manifest.layer_count);
     report.activation_width = manifest.activation_width;
+    report.agent_pack = manifest.agent_pack.as_ref().map(preflight_agent_pack);
     validate_manifest_header(&manifest, &mut report);
     let artifacts = collect_artifacts(&manifest);
     validate_layer_coverage(&manifest, &mut report);
@@ -195,6 +262,7 @@ impl PackagePreflightReport {
             model_id: None,
             layer_count: None,
             activation_width: None,
+            agent_pack: None,
             manifest_sha256: None,
             checked_artifact_count: 0,
             missing_artifact_count: 0,
@@ -234,6 +302,35 @@ impl PackagePreflightReport {
             .iter()
             .any(|issue| issue.severity == PreflightSeverity::Error);
         self
+    }
+}
+
+fn preflight_agent_pack(agent_pack: &AgentPackMetadata) -> PreflightAgentPack {
+    PreflightAgentPack {
+        schema_version: agent_pack.schema_version,
+        profile: agent_pack.profile.clone(),
+        pack_id: agent_pack.pack_id.clone(),
+        source: agent_pack
+            .source
+            .as_ref()
+            .map(|source| PreflightAgentPackSource {
+                path: source.path.clone(),
+                sha256: source.sha256.clone(),
+                inferred_source_quant: source.inferred_source_quant.clone(),
+            }),
+        quant_layout_hash: agent_pack.quant_layout.layout_hash.clone(),
+        strategy: agent_pack.quant_layout.strategy.clone(),
+        default_quant: agent_pack.quant_layout.default_quant.clone(),
+        group_count: agent_pack.quant_layout.groups.len(),
+        groups: agent_pack
+            .quant_layout
+            .groups
+            .iter()
+            .map(|group| PreflightQuantGroup {
+                name: group.name.clone(),
+                quant: group.quant.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -843,6 +940,34 @@ mod tests {
     }
 
     #[test]
+    fn preflight_reports_agent_pack_quant_layout_identity() {
+        let dir = unique_test_dir("agent-pack-metadata");
+        let package = write_package_fixture(&dir, true);
+        add_agent_pack_metadata(&package);
+
+        let report = preflight_package(
+            &package,
+            &PackagePreflightOptions {
+                stages: None,
+                verify_sha256: false,
+            },
+        );
+
+        assert!(report.valid, "{:?}", report.issues);
+        let agent_pack = report.agent_pack.expect("agent pack metadata");
+        assert_eq!(agent_pack.schema_version, 1);
+        assert_eq!(agent_pack.profile, "coding-agent");
+        assert_eq!(agent_pack.pack_id, "test-qwen-coder-pack");
+        assert_eq!(agent_pack.quant_layout_hash.as_deref(), Some("layout-sha"));
+        assert_eq!(agent_pack.strategy, "stage-aware-middle-compressed");
+        assert_eq!(agent_pack.default_quant, "Q4_K_M");
+        assert_eq!(agent_pack.group_count, 2);
+        assert_eq!(agent_pack.groups[0].name, "embedding-and-output");
+        assert_eq!(agent_pack.groups[0].quant, "Q6_K");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn preflight_rejects_missing_activation_width() {
         let dir = unique_test_dir("missing-width");
         let package = write_package_fixture(&dir, false);
@@ -994,6 +1119,42 @@ mod tests {
         )
         .unwrap();
         package
+    }
+
+    fn add_agent_pack_metadata(package: &Path) {
+        let manifest_path = package.join("model-package.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["agent_pack"] = serde_json::json!({
+            "schema_version": 1,
+            "profile": "coding-agent",
+            "pack_id": "test-qwen-coder-pack",
+            "quant_layout": {
+                "strategy": "stage-aware-middle-compressed",
+                "default": "Q4_K_M",
+                "layout_hash": "layout-sha",
+                "groups": [
+                    {
+                        "name": "embedding-and-output",
+                        "quant": "Q6_K",
+                        "selector": {
+                            "kind": "role",
+                            "roles": ["embedding", "final_norm", "output"]
+                        }
+                    },
+                    {
+                        "name": "middle-latency-band",
+                        "quant": "Q3_K_M",
+                        "selector": {
+                            "kind": "layer_range",
+                            "start": 4,
+                            "end": 28
+                        }
+                    }
+                ]
+            }
+        });
+        fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     }
 
     fn write_artifact(package: &Path, relative_path: &str, bytes: &[u8]) {

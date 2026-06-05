@@ -1,5 +1,7 @@
 use std::{
     fs,
+    net::SocketAddr,
+    path::Path,
     process::{Command, Stdio},
 };
 
@@ -28,6 +30,8 @@ use crate::{
     },
 };
 
+const LARGE_LOCAL_CHAIN_MODEL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
 struct BinarySplitResult {
     model_identity: ModelIdentity,
     token_id: i32,
@@ -48,14 +52,14 @@ struct BinaryChainResult {
     predicted_token: i32,
     activation_width: i32,
     wire_dtype: String,
-    stage0_wire_payload_bytes: usize,
-    stage0_payload_bytes: u64,
-    split_layer_1: u32,
-    split_layer_2: u32,
+    splits: Vec<u32>,
     layer_end: u32,
+    stages: Vec<serde_json::Value>,
+    boundary_transfers: Vec<serde_json::Value>,
 }
 
 pub fn local_split_binary(args: LocalSplitBinaryArgs) -> Result<()> {
+    let output = args.output.clone();
     let result = run_binary_split(BinarySplitConfig {
         stage_server_bin: args.stage_server_bin,
         model_path: args.model_path,
@@ -71,9 +75,8 @@ pub fn local_split_binary(args: LocalSplitBinaryArgs) -> Result<()> {
         startup_timeout_secs: args.startup_timeout_secs,
     })?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
+    write_or_print_report(
+        &json!({
             "mode": "local-split-binary",
             "model_identity": result.model_identity,
             "token_id": result.token_id,
@@ -88,13 +91,15 @@ pub fn local_split_binary(args: LocalSplitBinaryArgs) -> Result<()> {
                 "payload_bytes": result.boundary_payload_bytes,
                 "wire_payload_bytes": result.boundary_wire_payload_bytes,
             }
-        }))?
-    );
+        }),
+        output.as_deref(),
+    )?;
 
     Ok(())
 }
 
 pub fn local_split_compare(args: LocalSplitCompareArgs) -> Result<()> {
+    let output_path = args.output.clone();
     let baseline = run_full_model_decode(
         &args.model_path,
         args.layer_end,
@@ -141,7 +146,7 @@ pub fn local_split_compare(args: LocalSplitCompareArgs) -> Result<()> {
             }
         }
     });
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    write_or_print_report(&output, output_path.as_deref())?;
 
     if !matches && !args.allow_mismatch {
         bail!(
@@ -155,39 +160,39 @@ pub fn local_split_compare(args: LocalSplitCompareArgs) -> Result<()> {
 }
 
 pub fn local_split_chain_binary(args: LocalSplitChainBinaryArgs) -> Result<()> {
+    let output = args.output.clone();
     let result = run_binary_chain(args)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
+    write_or_print_report(
+        &json!({
             "mode": "local-split-chain-binary",
             "model_identity": result.model_identity,
             "token_id": result.token_id,
             "predicted_token": result.predicted_token,
             "activation_width": result.activation_width,
             "wire_dtype": result.wire_dtype,
-            "stages": [
-                {
-                    "stage_index": 0,
-                    "layer_start": 0,
-                    "layer_end": result.split_layer_1,
-                    "payload_bytes": result.stage0_payload_bytes,
-                    "wire_payload_bytes": result.stage0_wire_payload_bytes,
-                },
-                {
-                    "stage_index": 1,
-                    "layer_start": result.split_layer_1,
-                    "layer_end": result.split_layer_2,
-                    "forwarded_over_binary": true,
-                },
-                {
-                    "stage_index": 2,
-                    "layer_start": result.split_layer_2,
-                    "layer_end": result.layer_end,
-                    "returned_predicted_token": true,
-                }
-            ]
-        }))?
-    );
+            "splits": result.splits,
+            "layer_end": result.layer_end,
+            "stages": result.stages,
+            "boundary_transfers": result.boundary_transfers,
+        }),
+        output.as_deref(),
+    )?;
+    Ok(())
+}
+
+fn write_or_print_report(report: &serde_json::Value, output: Option<&Path>) -> Result<()> {
+    let json = serde_json::to_string_pretty(report)?;
+    if let Some(output) = output {
+        if let Some(parent) = output.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create report dir {}", parent.display()))?;
+        }
+        fs::write(output, format!("{json}\n"))
+            .with_context(|| format!("write local split report {}", output.display()))?;
+    }
+    println!("{json}");
     Ok(())
 }
 
@@ -410,17 +415,16 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
 }
 
 fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult> {
-    if args.split_layer_1 == 0
-        || args.split_layer_1 >= args.split_layer_2
-        || args.split_layer_2 >= args.layer_end
-    {
-        bail!("split_layer_1 and split_layer_2 must partition 0..layer_end in ascending order");
-    }
+    let splits = chain_splits(&args)?;
+    validate_chain_splits(&splits, args.layer_end)?;
+    let stage_count = splits.len() + 1;
+    ensure_local_chain_memory_guard(&args, stage_count)?;
+    let bind_addrs = chain_bind_addrs(&args, stage_count - 1)?;
     validate_local_topology_plan(
         &args.model_path,
         args.layer_end,
-        &[args.split_layer_1, args.split_layer_2],
-        3,
+        &splits,
+        stage_count,
         &args.activation_wire_dtype,
     )?;
     let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
@@ -428,7 +432,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     let stage0_config = RuntimeConfig {
         stage_index: 0,
         layer_start: 0,
-        layer_end: args.split_layer_1,
+        layer_end: splits[0],
         ctx_size: args.ctx_size,
         lane_count: 1,
         n_batch: None,
@@ -464,96 +468,37 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     let activation_width = activation_width(&boundary)?;
 
     let run_id = generate_run_id();
-    let stage1_config_path = temp_config_path_for(&run_id, "stage-1");
-    let stage2_config_path = temp_config_path_for(&run_id, "stage-2");
-    let stage2_config = json!({
-        "run_id": run_id,
-        "topology_id": "local-split-chain-binary",
-        "model_id": model_identity.model_id,
-        "model_path": args.model_path,
-        "stage_id": "stage-2",
-        "stage_index": 2,
-        "layer_start": args.split_layer_2,
-        "layer_end": args.layer_end,
-        "ctx_size": args.ctx_size,
-        "n_gpu_layers": args.n_gpu_layers,
-        "filter_tensors_on_load": true,
-        "load_mode": "runtime-slice",
-        "bind_addr": args.stage2_bind_addr,
-        "upstream": {
-            "stage_id": "stage-1",
-            "stage_index": 1,
-            "endpoint": format!("tcp://{}", args.stage1_bind_addr)
-        },
-        "downstream": null
-    });
-    let stage1_config = json!({
-        "run_id": run_id,
-        "topology_id": "local-split-chain-binary",
-        "model_id": model_identity.model_id,
-        "model_path": args.model_path,
-        "stage_id": "stage-1",
-        "stage_index": 1,
-        "layer_start": args.split_layer_1,
-        "layer_end": args.split_layer_2,
-        "ctx_size": args.ctx_size,
-        "n_gpu_layers": args.n_gpu_layers,
-        "filter_tensors_on_load": true,
-        "load_mode": "runtime-slice",
-        "bind_addr": args.stage1_bind_addr,
-        "upstream": {
-            "stage_id": "stage-0",
-            "stage_index": 0,
-            "endpoint": "driver"
-        },
-        "downstream": {
-            "stage_id": "stage-2",
-            "stage_index": 2,
-            "endpoint": format!("tcp://{}", args.stage2_bind_addr)
-        }
-    });
-    fs::write(
-        &stage2_config_path,
-        serde_json::to_vec_pretty(&stage2_config)?,
-    )
-    .with_context(|| format!("failed to write {}", stage2_config_path.display()))?;
-    fs::write(
-        &stage1_config_path,
-        serde_json::to_vec_pretty(&stage1_config)?,
-    )
-    .with_context(|| format!("failed to write {}", stage1_config_path.display()))?;
+    let mut stage_guards = Vec::with_capacity(stage_count - 1);
+    for stage_index in (1..stage_count).rev() {
+        let config_path = temp_config_path_for(&run_id, &format!("stage-{stage_index}"));
+        let config = chain_stage_config(
+            &args,
+            &model_identity,
+            &run_id,
+            &splits,
+            &bind_addrs,
+            stage_index,
+        );
+        fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
 
-    let mut stage2_command = Command::new(&args.stage_server_bin);
-    stage2_command.args([
-        "serve-binary",
-        "--config",
-        stage2_config_path
-            .to_str()
-            .context("stage 2 config path is not valid UTF-8")?,
-        "--activation-width",
-        &activation_width.to_string(),
-        "--activation-wire-dtype",
-        &args.activation_wire_dtype,
-    ]);
-    configure_child_logs(&mut stage2_command, args.child_logs);
-    let _stage2 = ChildGuard::spawn(stage2_command)?;
+        let mut command = Command::new(&args.stage_server_bin);
+        command.args([
+            "serve-binary",
+            "--config",
+            config_path
+                .to_str()
+                .with_context(|| format!("stage {stage_index} config path is not valid UTF-8"))?,
+            "--activation-width",
+            &activation_width.to_string(),
+            "--activation-wire-dtype",
+            &args.activation_wire_dtype,
+        ]);
+        configure_child_logs(&mut command, args.child_logs);
+        stage_guards.push(ChildGuard::spawn(command)?);
+    }
 
-    let mut stage1_command = Command::new(&args.stage_server_bin);
-    stage1_command.args([
-        "serve-binary",
-        "--config",
-        stage1_config_path
-            .to_str()
-            .context("stage 1 config path is not valid UTF-8")?,
-        "--activation-width",
-        &activation_width.to_string(),
-        "--activation-wire-dtype",
-        &args.activation_wire_dtype,
-    ]);
-    configure_child_logs(&mut stage1_command, args.child_logs);
-    let _stage1 = ChildGuard::spawn(stage1_command)?;
-
-    let mut stream = connect_ready(args.stage1_bind_addr, args.startup_timeout_secs)
+    let mut stream = connect_ready(bind_addrs[0], args.startup_timeout_secs)
         .context("stage 1 binary server did not become ready")?;
     let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, wire_dtype);
     state.prompt_token_count = 0;
@@ -598,12 +543,219 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         predicted_token: reply.predicted,
         activation_width,
         wire_dtype: args.activation_wire_dtype,
-        stage0_wire_payload_bytes: message.activation.len(),
-        stage0_payload_bytes: boundary.desc.payload_bytes,
-        split_layer_1: args.split_layer_1,
-        split_layer_2: args.split_layer_2,
+        stages: chain_stage_reports(
+            &splits,
+            args.layer_end,
+            boundary.desc.payload_bytes,
+            message.activation.len(),
+        ),
+        boundary_transfers: chain_boundary_transfers(
+            &splits,
+            boundary.desc.payload_bytes,
+            message.activation.len(),
+        ),
+        splits,
         layer_end: args.layer_end,
     })
+}
+
+fn ensure_local_chain_memory_guard(
+    args: &LocalSplitChainBinaryArgs,
+    stage_count: usize,
+) -> Result<()> {
+    if args.allow_high_memory_local_chain || stage_count <= 2 {
+        return Ok(());
+    }
+    let model_bytes = fs::metadata(&args.model_path)
+        .with_context(|| format!("stat model {}", args.model_path.display()))?
+        .len();
+    if model_bytes < LARGE_LOCAL_CHAIN_MODEL_BYTES {
+        return Ok(());
+    }
+    bail!(
+        "refusing high-memory local split-chain: {} is {:.1} GiB and this command would load {} local stages concurrently; use a smaller model, use package/lab evidence, or pass --allow-high-memory-local-chain to override",
+        args.model_path.display(),
+        model_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+        stage_count
+    );
+}
+
+fn chain_splits(args: &LocalSplitChainBinaryArgs) -> Result<Vec<u32>> {
+    if let Some(splits) = args.splits.as_deref() {
+        return parse_split_list(splits);
+    }
+    Ok(vec![args.split_layer_1, args.split_layer_2])
+}
+
+fn parse_split_list(splits: &str) -> Result<Vec<u32>> {
+    splits
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<u32>()
+                .with_context(|| format!("parse split boundary {part:?}"))
+        })
+        .collect()
+}
+
+fn validate_chain_splits(splits: &[u32], layer_end: u32) -> Result<()> {
+    if splits.len() < 2 {
+        bail!("local split chain requires at least two split boundaries");
+    }
+    let mut previous = 0;
+    for &split in splits {
+        if split == 0 || split >= layer_end {
+            bail!("split boundaries must be within 1..layer_end");
+        }
+        if split <= previous {
+            bail!("split boundaries must partition 0..layer_end in ascending order");
+        }
+        previous = split;
+    }
+    Ok(())
+}
+
+fn chain_bind_addrs(
+    args: &LocalSplitChainBinaryArgs,
+    spawned_stages: usize,
+) -> Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::with_capacity(spawned_stages);
+    if spawned_stages == 0 {
+        return Ok(addrs);
+    }
+    addrs.push(args.stage1_bind_addr);
+    if spawned_stages == 1 {
+        return Ok(addrs);
+    }
+    addrs.push(args.stage2_bind_addr);
+    let ip = args.stage2_bind_addr.ip();
+    let base_port = args.stage2_bind_addr.port();
+    for offset in 1..spawned_stages.saturating_sub(1) {
+        let port = base_port
+            .checked_add(u16::try_from(offset).context("too many local split stages")?)
+            .context("local split stage port overflow")?;
+        addrs.push(SocketAddr::new(ip, port));
+    }
+    Ok(addrs)
+}
+
+fn chain_stage_config(
+    args: &LocalSplitChainBinaryArgs,
+    model_identity: &ModelIdentity,
+    run_id: &str,
+    splits: &[u32],
+    bind_addrs: &[SocketAddr],
+    stage_index: usize,
+) -> serde_json::Value {
+    let stage_count = splits.len() + 1;
+    let layer_start = splits[stage_index - 1];
+    let layer_end = if stage_index < splits.len() {
+        splits[stage_index]
+    } else {
+        args.layer_end
+    };
+    let upstream_endpoint = if stage_index == 1 {
+        "driver".to_string()
+    } else {
+        format!("tcp://{}", bind_addrs[stage_index - 2])
+    };
+    let downstream = (stage_index + 1 < stage_count).then(|| {
+        json!({
+            "stage_id": format!("stage-{}", stage_index + 1),
+            "stage_index": stage_index + 1,
+            "endpoint": format!("tcp://{}", bind_addrs[stage_index])
+        })
+    });
+    json!({
+        "run_id": run_id,
+        "topology_id": "local-split-chain-binary",
+        "model_id": model_identity.model_id,
+        "model_path": args.model_path,
+        "stage_id": format!("stage-{stage_index}"),
+        "stage_index": stage_index,
+        "layer_start": layer_start,
+        "layer_end": layer_end,
+        "ctx_size": args.ctx_size,
+        "n_gpu_layers": args.n_gpu_layers,
+        "filter_tensors_on_load": true,
+        "load_mode": "runtime-slice",
+        "bind_addr": bind_addrs[stage_index - 1],
+        "upstream": {
+            "stage_id": format!("stage-{}", stage_index - 1),
+            "stage_index": stage_index - 1,
+            "endpoint": upstream_endpoint
+        },
+        "downstream": downstream
+    })
+}
+
+fn chain_stage_reports(
+    splits: &[u32],
+    layer_end: u32,
+    observed_payload_bytes: u64,
+    observed_wire_payload_bytes: usize,
+) -> Vec<serde_json::Value> {
+    let stage_count = splits.len() + 1;
+    (0..stage_count)
+        .map(|stage_index| {
+            let layer_start = if stage_index == 0 {
+                0
+            } else {
+                splits[stage_index - 1]
+            };
+            let stage_layer_end = if stage_index < splits.len() {
+                splits[stage_index]
+            } else {
+                layer_end
+            };
+            let mut stage = json!({
+                "stage_index": stage_index,
+                "layer_start": layer_start,
+                "layer_end": stage_layer_end,
+            });
+            if stage_index + 1 < stage_count {
+                stage["payload_bytes"] = json!(observed_payload_bytes);
+                stage["wire_payload_bytes"] = json!(observed_wire_payload_bytes);
+                stage["transfer_bytes_source"] = if stage_index == 0 {
+                    json!("observed_driver_boundary")
+                } else {
+                    json!("estimated_from_first_boundary_shape")
+                };
+            } else {
+                stage["returned_predicted_token"] = json!(true);
+            }
+            if stage_index > 0 {
+                stage["forwarded_over_binary"] = json!(true);
+            }
+            stage
+        })
+        .collect()
+}
+
+fn chain_boundary_transfers(
+    splits: &[u32],
+    observed_payload_bytes: u64,
+    observed_wire_payload_bytes: usize,
+) -> Vec<serde_json::Value> {
+    splits
+        .iter()
+        .enumerate()
+        .map(|(index, boundary)| {
+            json!({
+                "from_stage": index,
+                "to_stage": index + 1,
+                "layer_boundary": boundary,
+                "payload_bytes": observed_payload_bytes,
+                "wire_payload_bytes": observed_wire_payload_bytes,
+                "source": if index == 0 {
+                    "observed_driver_boundary"
+                } else {
+                    "estimated_from_first_boundary_shape"
+                }
+            })
+        })
+        .collect()
 }
 
 fn validate_local_topology_plan(

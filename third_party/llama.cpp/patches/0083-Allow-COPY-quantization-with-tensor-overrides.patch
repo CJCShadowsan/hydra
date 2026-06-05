@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mesh-llm <mesh-llm@example.com>
+Date: Fri, 5 Jun 2026 23:59:00 +1000
+Subject: [PATCH] Allow COPY quantization with tensor overrides
+
+---
+ src/llama-quant.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index ad99e726..eb1624d6 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -287,8 +287,6 @@ static void llama_tensor_dequantize_impl(
+ 
+ static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
+     // trivial checks first -- no string ops needed
+-    if (params->only_copy)       return false;
+-
+     // quantize only 2D and 3D tensors (experts)
+     if (ggml_n_dims(tensor) < 2) return false;
+ 
+@@ -1031,7 +1031,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
+         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
+ 
+         if (metadata[i].allows_quantization) {
+-            metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
++            const ggml_type tensor_default_type = params->only_copy ? tensor->type : default_type;
++            metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, tensor_default_type, metadata[i]);
+         } else {
+             metadata[i].target_type = tensor->type;
+         }
+@@ -1402,6 +1403,7 @@ void llama_quant_compute_types(
+ 
+     // compute types
+     for (size_t i = 0; i < n_tensors; i++) {
+-        result_types[i] = llama_tensor_get_type(*qs, &local_params, tensors[i], default_type, metadata[i]);
++        const ggml_type tensor_default_type = local_params.only_copy ? tensors[i]->type : default_type;
++        result_types[i] = llama_tensor_get_type(*qs, &local_params, tensors[i], tensor_default_type, metadata[i]);
+     }
+ }
+-- 
+2.39.0

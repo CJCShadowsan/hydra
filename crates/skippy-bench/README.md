@@ -57,6 +57,14 @@ skippy-bench token-lengths --model-path model.gguf --prompt-corpus target/bench-
 skippy-bench focused-runtime --schema-smoke --hosts host-a,host-b --splits 1 --layer-end 2
 ```
 
+`local-split-chain-binary` runs multiple stage processes on one local machine.
+For direct GGUF inputs, large multi-stage chains can exceed unified memory
+quickly because every local stage may map/load a large model slice at the same
+time. The command refuses large direct-GGUF multi-stage runs by default; use a
+smaller model, package/lab evidence, or an external job runner for Qwen-scale
+models. `--allow-high-memory-local-chain` is an explicit override for operators
+who have verified the machine has enough headroom.
+
 The old standalone `kv-stage-integration` and `kv-hit-regression` commands are
 intentionally absent. Mesh does not carry the legacy standalone cache sidecar
 path; exact cache work should be reintroduced through the embedded runtime and
@@ -74,6 +82,14 @@ to `f16`. These are written into generated stage configs so benchmark reports
 can compare baseline K/V cache storage against runtime-supported package candidates
 such as `q8_0`. The experimental TCQ/TurboQuant lane is intentionally not
 compiled into mesh-llm.
+
+For Skippy Agent Quant Packs, `skippy-bench` is the post-profiler evidence
+owner. `skippy-model-package quant-pack evidence-plan` and `evidence-plan-all`
+emit reproducible `skippy-bench` commands after local quant candidate triage;
+the resulting `focused-runtime`, `chat-corpus`, and `token-lengths` reports are
+then consumed by `skippy-model-package quant-pack certify`. Keep new runtime
+measurement lanes here, and keep artifact provenance/certification binding in
+`skippy-model-package`.
 
 ## Benchmark Corpora
 
@@ -209,11 +225,14 @@ while later stages are launched over SSH. This keeps the first-stage process on
 the same routing and GPU path as the OpenAI frontend and avoids SSHing back into
 the launcher host.
 
-Distributed lab runs must also keep stage layer counts evenly balanced. The
+Distributed lab runs default to keeping stage layer counts evenly balanced. The
 launcher rejects splits where the largest and smallest stage differ by more than
 one layer. For Qwen3.6's 40-layer package on three hosts, use
-`--splits 14,27`; uneven splits are only for local investigation and should
-not be reported as lab benchmark results.
+`--splits 14,27`. Skippy Agent Quant Packs may intentionally use uneven layer
+ranges when a quant plan's stage hints are balanced by measured latency, package
+bytes, or memory headroom instead of raw layer count; pass
+`--allow-uneven-stage-ranges` only for those stage-hinted certification runs or
+other explicitly documented topology experiments.
 
 Performance runs default to `--n-gpu-layers -1`, and lab commands should pass
 that flag explicitly so each stage asks llama.cpp to offload all available
@@ -238,6 +257,10 @@ When that remote root is the same filesystem visible on the coordinator, add
 GGUF locally and skip rsync for that file. Use `--endpoint-host-map host=addr`
 to force binary stage endpoints onto the intended lab fabric, such as the
 private `192.168.0.x` network, instead of mDNS-selected addresses.
+Use `--ssh-opts '-p 2222 -o BatchMode=yes -i /path/to/key'` when remote stage
+launch, readiness polling, cleanup, log collection, or artifact rsync need a
+nondefault SSH transport. The option string is whitespace-split and is intended
+for ordinary `ssh` flags such as port, user/key policy, timeout, and batch mode.
 For remote runs, pass a remote-reachable collector URL with
 `--metrics-otlp-grpc-url`, for example `http://studio54.local:14317`.
 
@@ -299,7 +322,12 @@ the second request can exercise warm-prefix reuse where the model family and
 runtime path support it. The report records startup readiness separately from
 full run wall time, then mirrors the existing prompt-driver P50/P95 latency,
 token-count, and throughput fields under compact top-level `topology`, `model`,
-`latency_ms`, `throughput_tokens_per_second`, and `token_counts` objects.
+`runtime`, `latency_ms`, `throughput_tokens_per_second`, and `token_counts`
+objects. The `runtime` block records shape knobs such as context size,
+GPU-layer policy, KV cache dtypes, activation width, and activation wire dtype.
+The `topology` block records the exact split string, layer end, hosts, and
+per-stage layer ranges so downstream quant-pack certification can prove the
+benchmark ran the stage topology it claims to certify.
 
 For CI or command-shape validation without a GGUF or remote hosts, use the
 schema smoke mode:
