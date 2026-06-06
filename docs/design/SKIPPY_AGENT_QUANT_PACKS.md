@@ -612,6 +612,34 @@ token audits, schema smoke, and small-model/proxy local proofs; quantize,
 package, profile, and focused-runtime evidence should run on lab nodes or
 Hugging Face Jobs. Direct-GGUF local chain runs above the safety guard should
 require an explicit operator override.
+
+Current Studio-local proxy evidence uses
+`unsloth/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M` as a safe Qwen Coder family
+stand-in for the local split-chain lane. The static proxy profile at
+`/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/evidence/static-profile.json`
+records a 28-layer, three-stage split `10,19` with stage artifact bytes
+`1,707,802,624`, `1,234,151,424`, and `1,735,165,952`. The local split-chain
+report at
+`/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/evidence/local-split-chain.json`
+successfully returned a predicted token and measured a first-boundary f16 wire
+payload of `7,168` bytes for activation width `3,584`, with the second boundary
+recorded as a same-shape estimate. A separate direct-GGUF local-stage decode
+profile at
+`/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/evidence/local-stage-decode-profile.json`
+measured the full 7B proxy as a single stage with `existing_kv_tokens=128`,
+`samples=3`, and mean decode latency `14.145417 ms`. This proxy evidence proves
+the local stage-chain and transfer accounting path; it is not certification
+evidence for the 480B Qwen Coder pack.
+
+Artifact hashes:
+
+- `7a10f02dd143aeb7e59c4107ff8bc2f0b708a06698e7ac438be3c4ac2860151c`
+  `static-profile.json`
+- `8ecf18839f9650f1a571cd3f2ce0634c1b76b8cbeec99567587f2e11668e8a6a`
+  `local-split-chain.json`
+- `e233ae0db2387e8b13f73faaf151e7cd0fe1715b608dc19b367d20865d0d5bf8`
+  `local-stage-decode-profile.json`
+
 Plans should optionally include a lab preflight script before the measured
 focused-runtime command. For Qwen-scale runs this makes SSH reachability, stale
 stage processes, lab-port listeners, and free-space checks part of the declared
