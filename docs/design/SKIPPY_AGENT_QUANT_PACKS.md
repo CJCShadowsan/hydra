@@ -871,7 +871,7 @@ Studio while the resulting commands target a lab/HF filesystem. The job-path
 plan lives at
 `/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/evidence-plan-job-path.json`,
 with SHA-256
-`b5ff0b151dc5bd363a54df2978dcba59495d1c99883a70176923ddeefc5c3867`; its
+`fa3124fc49fb188068366528d820f7af1a0affbc3b1867e750b36da5884a3e38`; its
 runbook lives at
 `/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/run-evidence-job-path.sh`,
 with SHA-256
@@ -888,14 +888,22 @@ the target paths and binaries are job-environment contracts. It is a handoff
 artifact, not a completed evidence report.
 
 The same job-path generation now emits Hugging Face Jobs handoff artifacts. The
-workload script lives at
+input upload script lives at
+`/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/upload-evidence-input-hf.sh`,
+with SHA-256
+`f957455582b3ec8e2b8efb4cabb430beb60cd12d53cf368fcb40aaea1b2a8551`. It uploads
+the candidate bundle to
+`Mesh-LLM/qwen25-coder-7b-proxy-mixed-layer-candidate` with include patterns for
+the quantized GGUF, `package/**`, `quantize/**`, and provenance JSON, while
+excluding stale local `evidence/**`, evidence plans, submit JSON, and runbooks.
+The workload script lives at
 `/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/run-evidence-hf-job.sh`,
 with SHA-256
-`51003eb94cebab7489e422806f4d1fa388182944e2338f3f976909ed8ef1293f`. The
+`c5a0fd7a5d0ee9f7c951986d24dc2905ffdc4b2ac0ea168c62a8cdb1678a8eb9`. The
 reviewable submit payload lives at
 `/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/evidence-hf-job-submit.json`,
 with SHA-256
-`a07a4845f586e3fefab2e058f7c175399133e65051cc6794a85355e586f76f2b`. The
+`ce3298f2bb12cff84eeee8c91e1747be35c533631da605674d37596c1e5c7a23`. The
 generated payload is detached, requests `cpu-xl` for `24h`, carries the
 `HF_TOKEN` secret reference, downloads the candidate bundle from
 `Mesh-LLM/qwen25-coder-7b-proxy-mixed-layer-candidate`, and uploads evidence to

@@ -228,6 +228,7 @@ fn evidence_plan_can_emit_hf_jobs_handoff_artifacts() {
     );
     let report_path = dir.join("evidence-plan.json");
     let runbook_path = dir.join("run-evidence-job-path.sh");
+    let upload_path = dir.join("upload-evidence-input.sh");
     let workload_path = dir.join("run-evidence-hf-job.sh");
     let submit_path = dir.join("evidence-hf-job-submit.json");
 
@@ -260,6 +261,7 @@ fn evidence_plan_can_emit_hf_jobs_handoff_artifacts() {
         script_out: Some(runbook_path.clone()),
         runbook_plan_path: Some(execution_plan_path.clone()),
         hf_jobs: HfJobsEvidenceArgs {
+            hf_jobs_input_upload_script_out: Some(upload_path.clone()),
             hf_jobs_workload_out: Some(workload_path.clone()),
             hf_jobs_submit_json_out: Some(submit_path.clone()),
             hf_jobs_image: Some("ghcr.io/mesh-llm/skippy-evidence-job:cpu".to_string()),
@@ -279,6 +281,14 @@ fn evidence_plan_can_emit_hf_jobs_handoff_artifacts() {
         "org/qwen-coder-candidate-bundle"
     );
     assert_eq!(
+        report["hf_jobs_input_upload"]["input_repo"],
+        "org/qwen-coder-candidate-bundle"
+    );
+    assert_eq!(
+        report["hf_jobs_input_upload"]["source_run_dir"],
+        dir.display().to_string()
+    );
+    assert_eq!(
         report["hf_jobs_workload"]["execution_run_dir"],
         "/job/skippy-evidence/input/studio-local"
     );
@@ -292,6 +302,15 @@ fn evidence_plan_can_emit_hf_jobs_handoff_artifacts() {
     );
     assert_eq!(report["hf_jobs_submit"]["flavor"], "cpu-xl");
     assert_eq!(report["hf_jobs_submit"]["timeout"], "12h");
+
+    let upload = fs::read_to_string(&upload_path).expect("read upload script");
+    assert!(upload.contains("hf upload-large-folder \"${HF_INPUT_REPO}\" \"${SOURCE_RUN_DIR}\""));
+    assert!(upload.contains("--include model.gguf"));
+    assert!(upload.contains("--include 'package/**'"));
+    assert!(upload.contains("--include 'quantize/**'"));
+    assert!(upload.contains("--exclude 'evidence/**'"));
+    assert!(upload.contains("--exclude 'evidence-plan*.json'"));
+    assert!(upload.contains("--exclude 'run-evidence*.sh'"));
 
     let workload = fs::read_to_string(&workload_path).expect("read workload script");
     assert!(workload.contains("hf download \"${HF_INPUT_REPO}\""));
@@ -1071,6 +1090,7 @@ fn evidence_script_contains_ordered_plan_commands() {
         activation_wire_dtype: "q8".to_string(),
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
         warnings: vec!["runtime hosts must be SSH reachable".to_string()],
+        hf_jobs_input_upload: None,
         hf_jobs_workload: None,
         hf_jobs_submit: None,
         commands: evidence_commands(EvidenceCommandInputs {
@@ -1291,6 +1311,7 @@ fn test_evidence_report(candidate: &str) -> EvidencePlanReport {
         activation_wire_dtype: "q8".to_string(),
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
         warnings: Vec::new(),
+        hf_jobs_input_upload: None,
         hf_jobs_workload: None,
         hf_jobs_submit: None,
         commands: evidence_commands(EvidenceCommandInputs {

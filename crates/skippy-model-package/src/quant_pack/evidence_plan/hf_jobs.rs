@@ -11,6 +11,8 @@ use super::{EvidencePlanReport, shell_quote};
 #[derive(Debug, Default, clap::Args)]
 pub(super) struct HfJobsEvidenceArgs {
     #[arg(long)]
+    pub(super) hf_jobs_input_upload_script_out: Option<PathBuf>,
+    #[arg(long)]
     pub(super) hf_jobs_workload_out: Option<PathBuf>,
     #[arg(long)]
     pub(super) hf_jobs_submit_json_out: Option<PathBuf>,
@@ -32,8 +34,8 @@ pub(super) struct HfJobsEvidenceArgs {
 
 impl HfJobsEvidenceArgs {
     pub(super) fn validate(&self) -> Result<()> {
-        if self.has_workload_request() && self.hf_jobs_input_repo.is_none() {
-            bail!("--hf-jobs-input-repo is required when writing an evidence HF Jobs workload");
+        if self.has_hf_jobs_request() && self.hf_jobs_input_repo.is_none() {
+            bail!("--hf-jobs-input-repo is required when writing evidence HF Jobs artifacts");
         }
         if self.hf_jobs_submit_json_out.is_some() && self.hf_jobs_image.is_none() {
             bail!("--hf-jobs-submit-json-out requires --hf-jobs-image");
@@ -44,6 +46,22 @@ impl HfJobsEvidenceArgs {
     pub(super) fn has_workload_request(&self) -> bool {
         self.hf_jobs_workload_out.is_some() || self.hf_jobs_submit_json_out.is_some()
     }
+
+    fn has_hf_jobs_request(&self) -> bool {
+        self.has_workload_request() || self.hf_jobs_input_upload_script_out.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct HfJobsEvidenceInputUploadPlan {
+    upload_script: String,
+    input_repo: String,
+    input_revision: String,
+    source_run_dir: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    include_patterns: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +111,7 @@ struct HfJobsSubmitArgs {
 }
 
 pub(super) struct HfJobsEvidenceArtifacts {
+    pub(super) input_upload_plan: Option<HfJobsEvidenceInputUploadPlan>,
     pub(super) workload_plan: Option<HfJobsEvidenceWorkloadPlan>,
     pub(super) submit_plan: Option<HfJobsEvidenceSubmitPlan>,
 }
@@ -102,20 +121,30 @@ pub(super) fn plan_hf_jobs_artifacts(
     report: &EvidencePlanReport,
     plan_path: &Path,
 ) -> Result<HfJobsEvidenceArtifacts> {
-    if !args.has_workload_request() {
+    if !args.has_hf_jobs_request() {
         return Ok(HfJobsEvidenceArtifacts {
+            input_upload_plan: None,
             workload_plan: None,
             submit_plan: None,
         });
     }
     args.validate()?;
-    let workload_plan = build_workload_plan(args, report, plan_path);
+    let input_upload_plan = args
+        .hf_jobs_input_upload_script_out
+        .as_deref()
+        .map(|path| build_input_upload_plan(args, report, path));
+    let workload_plan = if args.has_workload_request() {
+        Some(build_workload_plan(args, report, plan_path))
+    } else {
+        None
+    };
     let submit_plan = args
         .hf_jobs_submit_json_out
         .as_deref()
         .map(|path| build_submit_plan(args, path));
     Ok(HfJobsEvidenceArtifacts {
-        workload_plan: Some(workload_plan),
+        input_upload_plan,
+        workload_plan,
         submit_plan,
     })
 }
@@ -126,20 +155,111 @@ pub(super) fn write_hf_jobs_artifacts(
     runbook_script: &str,
     plan_path: &Path,
 ) -> Result<()> {
-    if !args.has_workload_request() {
+    if !args.has_hf_jobs_request() {
         return Ok(());
     }
     args.validate()?;
-    let workload_plan = build_workload_plan(args, report, plan_path);
-    let workload_script = build_workload_script(args, report, runbook_script, &workload_plan)?;
-    if let Some(path) = args.hf_jobs_workload_out.as_deref() {
-        write_workload_script(path, &workload_script)?;
+    if let Some(path) = args.hf_jobs_input_upload_script_out.as_deref() {
+        let input_upload_plan = build_input_upload_plan(args, report, path);
+        let upload_script = build_input_upload_script(args, &input_upload_plan)?;
+        write_script(path, &upload_script, "HF Jobs evidence input upload")?;
     }
+    let workload_script = if args.has_workload_request() {
+        let workload_plan = build_workload_plan(args, report, plan_path);
+        let workload_script = build_workload_script(args, report, runbook_script, &workload_plan)?;
+        if let Some(path) = args.hf_jobs_workload_out.as_deref() {
+            write_script(path, &workload_script, "HF Jobs evidence workload")?;
+        }
+        Some(workload_script)
+    } else {
+        None
+    };
     if let Some(path) = args.hf_jobs_submit_json_out.as_deref() {
-        let payload = build_submit_payload(args, workload_script);
+        let payload = build_submit_payload(args, workload_script.unwrap_or_default());
         write_submit_json(path, &payload)?;
     }
     Ok(())
+}
+
+fn build_input_upload_plan(
+    args: &HfJobsEvidenceArgs,
+    report: &EvidencePlanReport,
+    script_path: &Path,
+) -> HfJobsEvidenceInputUploadPlan {
+    HfJobsEvidenceInputUploadPlan {
+        upload_script: script_path.display().to_string(),
+        input_repo: args.hf_jobs_input_repo.clone().unwrap_or_default(),
+        input_revision: args.hf_jobs_input_revision.clone(),
+        source_run_dir: report
+            .source_run_dir
+            .clone()
+            .unwrap_or_else(|| report.run_dir.clone()),
+        include_patterns: input_upload_include_patterns(report),
+        exclude_patterns: input_upload_exclude_patterns(),
+    }
+}
+
+fn input_upload_include_patterns(report: &EvidencePlanReport) -> Vec<String> {
+    let quantized_model = Path::new(&report.quantized_model)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "*.gguf".to_string());
+    vec![
+        "quant-pack-build.json".to_string(),
+        "quant-plan.json".to_string(),
+        "preflight.json".to_string(),
+        "decode-profile.json".to_string(),
+        quantized_model,
+        "package/**".to_string(),
+        "quantize/**".to_string(),
+    ]
+}
+
+fn input_upload_exclude_patterns() -> Vec<String> {
+    vec![
+        "evidence/**".to_string(),
+        "evidence-plan*.json".to_string(),
+        "evidence-hf-job-submit.json".to_string(),
+        "run-evidence*.sh".to_string(),
+    ]
+}
+
+fn build_input_upload_script(
+    args: &HfJobsEvidenceArgs,
+    plan: &HfJobsEvidenceInputUploadPlan,
+) -> Result<String> {
+    let mut script = "#!/usr/bin/env bash\nset -euo pipefail\n\n".to_string();
+    script.push_str("# Skippy quant-pack evidence input upload.\n");
+    script.push_str(
+        "# This uploads the candidate bundle consumed by the evidence HF Jobs workload.\n\n",
+    );
+    script.push_str(": \"${HF_TOKEN:?HF_TOKEN is required for Hugging Face uploads}\"\n");
+    writeln!(
+        script,
+        "HF_INPUT_REPO={}",
+        shell_quote(args.hf_jobs_input_repo.as_deref().unwrap_or_default())
+    )?;
+    writeln!(
+        script,
+        "HF_INPUT_REVISION={}",
+        shell_quote(&args.hf_jobs_input_revision)
+    )?;
+    writeln!(
+        script,
+        "SOURCE_RUN_DIR={}",
+        shell_quote(&plan.source_run_dir)
+    )?;
+    script.push_str("test -d \"${SOURCE_RUN_DIR}\" || { echo \"missing source run dir ${SOURCE_RUN_DIR}\" >&2; exit 1; }\n");
+    script.push_str("hf repos create \"${HF_INPUT_REPO}\" --repo-type model --exist-ok\n");
+    script.push_str("hf upload-large-folder \"${HF_INPUT_REPO}\" \"${SOURCE_RUN_DIR}\" --repo-type model --revision \"${HF_INPUT_REVISION}\"");
+    for include in &plan.include_patterns {
+        write!(script, " --include {}", shell_quote(include))?;
+    }
+    for exclude in &plan.exclude_patterns {
+        write!(script, " --exclude {}", shell_quote(exclude))?;
+    }
+    script.push('\n');
+    Ok(script)
 }
 
 fn build_workload_plan(
@@ -280,10 +400,9 @@ fn build_submit_plan(args: &HfJobsEvidenceArgs, path: &Path) -> HfJobsEvidenceSu
     }
 }
 
-fn write_workload_script(path: &Path, script: &str) -> Result<()> {
+fn write_script(path: &Path, script: &str, artifact: &str) -> Result<()> {
     create_parent_dir(path)?;
-    fs::write(path, script)
-        .with_context(|| format!("write HF Jobs evidence workload {}", path.display()))?;
+    fs::write(path, script).with_context(|| format!("write {artifact} {}", path.display()))?;
     make_executable(path)
 }
 

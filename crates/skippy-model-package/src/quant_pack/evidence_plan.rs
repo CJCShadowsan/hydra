@@ -10,7 +10,10 @@ mod focused_runtime;
 mod hf_jobs;
 
 use focused_runtime::FocusedRuntimeEvidenceArgs;
-use hf_jobs::{HfJobsEvidenceArgs, HfJobsEvidenceSubmitPlan, HfJobsEvidenceWorkloadPlan};
+use hf_jobs::{
+    HfJobsEvidenceArgs, HfJobsEvidenceInputUploadPlan, HfJobsEvidenceSubmitPlan,
+    HfJobsEvidenceWorkloadPlan,
+};
 
 const DEFAULT_TOKEN_CORPUS: &str = "target/bench-corpora/long/corpus.jsonl";
 const DEFAULT_CHAT_CORPUS: &str = "target/bench-corpora/coding-loop/corpus.jsonl";
@@ -173,6 +176,8 @@ struct EvidencePlanReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    hf_jobs_input_upload: Option<HfJobsEvidenceInputUploadPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     hf_jobs_workload: Option<HfJobsEvidenceWorkloadPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hf_jobs_submit: Option<HfJobsEvidenceSubmitPlan>,
@@ -304,6 +309,7 @@ pub(super) fn run_quant_pack_evidence_plan(args: QuantPackEvidencePlanArgs) -> R
         .unwrap_or_else(|| PathBuf::from(&report.run_dir).join("evidence-plan.json"));
     let hf_jobs_artifacts =
         hf_jobs::plan_hf_jobs_artifacts(&args.hf_jobs, &report, &runbook_plan_path)?;
+    report.hf_jobs_input_upload = hf_jobs_artifacts.input_upload_plan;
     report.hf_jobs_workload = hf_jobs_artifacts.workload_plan;
     report.hf_jobs_submit = hf_jobs_artifacts.submit_plan;
     let runbook_script = single_evidence_script(
@@ -503,6 +509,7 @@ fn build_evidence_plan(args: EvidencePlanBuildInput) -> Result<EvidencePlanRepor
         activation_wire_dtype: args.activation_wire_dtype.clone(),
         focused_runtime: args.focused_runtime.clone(),
         warnings,
+        hf_jobs_input_upload: None,
         hf_jobs_workload: None,
         hf_jobs_submit: None,
         commands: evidence_commands(EvidenceCommandInputs {

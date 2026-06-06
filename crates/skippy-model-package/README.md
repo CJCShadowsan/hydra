@@ -385,14 +385,19 @@ semantic skip checks, instead of the local `--out` path used to write the JSON
 artifact.
 For remote evidence execution, pass `--hf-jobs-workload-out` with
 `--hf-jobs-input-repo` to write an executable Hugging Face Jobs workload script.
-The workload downloads the candidate bundle into `--execution-run-dir`, writes
-the generated evidence plan and runbook into that same execution filesystem,
-runs the runbook, and uploads `evidence/`, `evidence-plan.json`, and
-`run-evidence.sh` when `HF_UPLOAD_REPO` or `--hf-jobs-upload-repo` is set. Pass
-`--hf-jobs-submit-json-out` with `--hf-jobs-image` to also write a reviewable
-HF Jobs `run` payload containing the image, flavor, timeout, detached command,
-`HF_TOKEN` secret, and optional upload repo environment. The CLI only writes
-handoff artifacts; it does not submit the job.
+Pass `--hf-jobs-input-upload-script-out` to also write the companion upload
+script for that input repo. The upload script uses `hf upload-large-folder` with
+include patterns for the quantized GGUF, `package/**`, `quantize/**`, and
+provenance JSON files, while excluding stale local `evidence/**`, evidence
+plans, submit JSON, and runbooks. The workload downloads that candidate bundle
+into `--execution-run-dir`, writes the generated evidence plan and runbook into
+the same execution filesystem, runs the runbook, and uploads `evidence/`,
+`evidence-plan.json`, and `run-evidence.sh` when `HF_UPLOAD_REPO` or
+`--hf-jobs-upload-repo` is set. Pass `--hf-jobs-submit-json-out` with
+`--hf-jobs-image` to also write a reviewable HF Jobs `run` payload containing
+the image, flavor, timeout, detached command, `HF_TOKEN` secret, and optional
+upload repo environment. The CLI only writes handoff artifacts; it does not
+upload or submit the job.
 Validate this payload with
 `quant-pack hf-jobs-validate --workload-kind evidence-run` before submission.
 Evidence-run validation checks the HF Jobs envelope plus candidate download,
