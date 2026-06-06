@@ -266,6 +266,42 @@ fn candidate_layouts(
             stage_hints,
             has_moe,
         ),
+        stage_balanced_ffn_part_candidate(
+            StageBalancedFfnPartCandidateInput {
+                default_quant,
+                source_quant,
+                groups: combine_groups(boundary_groups.clone(), moe_groups.clone()),
+                protected_width,
+                layer_count,
+                stage_hints,
+                has_moe,
+            },
+            "down",
+        ),
+        stage_balanced_ffn_part_candidate(
+            StageBalancedFfnPartCandidateInput {
+                default_quant,
+                source_quant,
+                groups: combine_groups(boundary_groups.clone(), moe_groups.clone()),
+                protected_width,
+                layer_count,
+                stage_hints,
+                has_moe,
+            },
+            "gate",
+        ),
+        stage_balanced_ffn_part_candidate(
+            StageBalancedFfnPartCandidateInput {
+                default_quant,
+                source_quant,
+                groups: combine_groups(boundary_groups.clone(), moe_groups.clone()),
+                protected_width,
+                layer_count,
+                stage_hints,
+                has_moe,
+            },
+            "up",
+        ),
         stage_balanced_candidate(
             default_quant,
             source_quant,
@@ -425,6 +461,54 @@ fn stage_balanced_ffn_candidate(
             "Narrows the stage-balance experiment to FFN tensors after broad largest-stage compression regressed decode latency."
                 .to_string(),
         ],
+    })
+}
+
+struct StageBalancedFfnPartCandidateInput<'a> {
+    default_quant: &'a str,
+    source_quant: &'a str,
+    groups: Vec<QuantGroup>,
+    protected_width: u32,
+    layer_count: u32,
+    stage_hints: &'a [StageQuantHint],
+    has_moe: bool,
+}
+
+fn stage_balanced_ffn_part_candidate(
+    mut input: StageBalancedFfnPartCandidateInput<'_>,
+    part: &'static str,
+) -> QuantLayoutCandidate {
+    if let Some(stage) =
+        largest_unprotected_stage(input.stage_hints, input.protected_width, input.layer_count)
+    {
+        input.groups.push(QuantGroup {
+            name: format!("stage-{}-ffn-{part}-balance-band", stage.stage_index),
+            quant: compression_quant_for_source(input.source_quant, "Q3_K_M").to_string(),
+            selector: QuantSelector::TensorNamePattern {
+                patterns: stage_ffn_part_patterns(
+                    stage.layer_start,
+                    stage.layer_end,
+                    part,
+                    input.has_moe,
+                ),
+            },
+            reason: format!(
+                "Compresses only FFN {part} tensors in the largest byte stage for per-tensor sensitivity evidence."
+            ),
+        });
+    }
+    with_layout_hash(QuantLayoutCandidate {
+        id: format!("stage-balanced-ffn-{part}-proxy"),
+        layout_hash: String::new(),
+        name: format!("Byte-proxy stage balance for FFN {part} tensors"),
+        status: "experimental".to_string(),
+        strategy: format!("stage-balanced-ffn-{part}-byte-proxy"),
+        default_quant: input.default_quant.to_string(),
+        groups: input.groups,
+        stage_hints: input.stage_hints.to_vec(),
+        notes: vec![format!(
+            "Narrows stage-balance compression to FFN {part} tensors after all-FFN lowering still trailed the baseline."
+        )],
     })
 }
 
@@ -647,6 +731,28 @@ fn stage_ffn_patterns(start: u32, end: u32, has_moe: bool) -> Vec<String> {
             stage_tensor_pattern(start, end, "ffn_.*"),
             stage_tensor_pattern(start, end, "ffn.*"),
         ]
+    }
+}
+
+fn stage_ffn_part_patterns(start: u32, end: u32, part: &str, has_moe: bool) -> Vec<String> {
+    if has_moe {
+        return stage_moe_ffn_part_patterns(start, end, part);
+    }
+    vec![stage_tensor_pattern(start, end, &format!("ffn_{part}"))]
+}
+
+fn stage_moe_ffn_part_patterns(start: u32, end: u32, part: &str) -> Vec<String> {
+    match part {
+        "down" => vec![stage_tensor_pattern(start, end, "ffn_down_exps")],
+        "gate" => vec![
+            stage_tensor_pattern(start, end, "ffn_gate_exps"),
+            stage_tensor_pattern(start, end, "ffn_gate_up_exps"),
+        ],
+        "up" => vec![
+            stage_tensor_pattern(start, end, "ffn_up_exps"),
+            stage_tensor_pattern(start, end, "ffn_gate_up_exps"),
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -904,7 +1010,7 @@ mod tests {
         assert_eq!(report.source.layer_count, 8);
         assert_eq!(report.stage_count, 2);
         assert_eq!(report.protected_band_width, 1);
-        assert_eq!(report.candidates.len(), 6);
+        assert_eq!(report.candidates.len(), 9);
         assert_eq!(report.candidates[0].id, "baseline-source-quant");
         assert_eq!(report.candidates[1].id, "boundary-protected");
         assert_eq!(report.candidates[2].id, "middle-compressed");
@@ -913,7 +1019,10 @@ mod tests {
             "ffn-compressed-attention-protected"
         );
         assert_eq!(report.candidates[4].id, "stage-balanced-ffn-proxy");
-        assert_eq!(report.candidates[5].id, "stage-balanced-proxy");
+        assert_eq!(report.candidates[5].id, "stage-balanced-ffn-down-proxy");
+        assert_eq!(report.candidates[6].id, "stage-balanced-ffn-gate-proxy");
+        assert_eq!(report.candidates[7].id, "stage-balanced-ffn-up-proxy");
+        assert_eq!(report.candidates[8].id, "stage-balanced-proxy");
         assert!(
             report
                 .candidates
@@ -1017,6 +1126,15 @@ mod tests {
             pattern == r"blk\.(2)\.ffn_.*\.weight" || pattern == r"blk\.(2)\.ffn.*\.weight"
         }));
         assert!(!patterns.iter().any(|pattern| pattern.contains("attn")));
+    }
+
+    #[test]
+    fn stage_balanced_ffn_part_candidates_target_single_ffn_parts() {
+        let report = build_quant_plan(test_input_with_heavy_stage()).expect("build quant plan");
+
+        assert_ffn_part_candidate(&report, "down", r"blk\.(2)\.ffn_down\.weight");
+        assert_ffn_part_candidate(&report, "gate", r"blk\.(2)\.ffn_gate\.weight");
+        assert_ffn_part_candidate(&report, "up", r"blk\.(2)\.ffn_up\.weight");
     }
 
     #[test]
@@ -1210,6 +1328,26 @@ mod tests {
             .iter()
             .find(|group| group.name == "moe-experts")
             .map(|group| group.quant.as_str())
+    }
+
+    fn assert_ffn_part_candidate(report: &QuantPlanReport, part: &str, expected_pattern: &str) {
+        let candidate_id = format!("stage-balanced-ffn-{part}-proxy");
+        let group_name = format!("stage-1-ffn-{part}-balance-band");
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == candidate_id)
+            .expect("stage-balanced ffn part candidate");
+        let group = candidate
+            .groups
+            .iter()
+            .find(|group| group.name == group_name)
+            .expect("stage ffn part group");
+
+        let QuantSelector::TensorNamePattern { patterns } = &group.selector else {
+            panic!("stage ffn part group should use tensor patterns");
+        };
+        assert_eq!(patterns, &[expected_pattern.to_string()]);
     }
 
     fn test_input(layer_count: u32, stage_count: usize) -> QuantPlanInput {
