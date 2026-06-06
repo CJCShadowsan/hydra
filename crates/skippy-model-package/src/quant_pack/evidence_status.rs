@@ -4,6 +4,8 @@ use std::{env, fs};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+mod semantic;
+
 const LARGE_LOCAL_CHAIN_MODEL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 #[derive(Debug, clap::Args)]
@@ -64,6 +66,8 @@ struct CandidateEvidenceStatus {
     toolchain: EvidencePlanToolchain,
     #[serde(skip_serializing_if = "EvidencePlanTopology::is_empty")]
     topology: EvidencePlanTopology,
+    #[serde(skip_serializing_if = "EvidencePlanRuntime::is_empty")]
+    runtime: EvidencePlanRuntime,
     next_command: Option<NextEvidenceCommand>,
     commands: Vec<EvidenceCommandStatus>,
 }
@@ -140,6 +144,34 @@ impl EvidencePlanTopology {
                 + 1,
         )
     }
+
+    fn split_boundaries(&self) -> Option<String> {
+        self.splits
+            .as_deref()
+            .map(str::trim)
+            .filter(|splits| !splits.is_empty())
+            .map(ToOwned::to_owned)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct EvidencePlanRuntime {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctx_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_gpu_layers: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_type_k: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_type_v: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_wire_dtype: Option<String>,
+}
+
+impl EvidencePlanRuntime {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +224,8 @@ struct EvidencePlanInput {
     toolchain: EvidencePlanToolchain,
     #[serde(flatten)]
     topology: EvidencePlanTopology,
+    #[serde(flatten)]
+    runtime: EvidencePlanRuntime,
     commands: Vec<EvidenceCommandInput>,
 }
 
@@ -213,6 +247,8 @@ struct EvidencePlanCandidateInput {
     toolchain: EvidencePlanToolchain,
     #[serde(flatten)]
     topology: EvidencePlanTopology,
+    #[serde(flatten)]
+    runtime: EvidencePlanRuntime,
     commands: Vec<EvidenceCommandInput>,
 }
 
@@ -305,6 +341,7 @@ fn build_evidence_status_report(plan: &Path) -> Result<EvidenceStatusReport> {
                     &input.warnings,
                     input.toolchain,
                     input.topology,
+                    input.runtime,
                     input.quantized_model.as_deref(),
                     &input.commands,
                 )],
@@ -323,6 +360,7 @@ fn build_evidence_status_report(plan: &Path) -> Result<EvidenceStatusReport> {
                         &candidate.warnings,
                         candidate.toolchain.clone(),
                         candidate.topology.clone(),
+                        candidate.runtime.clone(),
                         candidate.quantized_model.as_deref(),
                         &candidate.commands,
                     )
@@ -340,6 +378,7 @@ fn candidate_status(
     warnings: &[String],
     toolchain: EvidencePlanToolchain,
     topology: EvidencePlanTopology,
+    runtime: EvidencePlanRuntime,
     quantized_model: Option<&str>,
     commands: &[EvidenceCommandInput],
 ) -> CandidateEvidenceStatus {
@@ -353,9 +392,13 @@ fn candidate_status(
         output_base.as_deref(),
         topology.stage_count,
     ));
+    let semantic_context = semantic::EvidenceSemanticContext {
+        topology: &topology,
+        runtime: &runtime,
+    };
     let commands = commands
         .iter()
-        .map(|command| command_status(command, output_base.as_deref()))
+        .map(|command| command_status(command, output_base.as_deref(), &semantic_context))
         .collect::<Vec<EvidenceCommandStatus>>();
     let complete_commands = commands
         .iter()
@@ -381,6 +424,7 @@ fn candidate_status(
         warnings,
         toolchain,
         topology,
+        runtime,
         next_command,
         commands,
     }
@@ -389,6 +433,7 @@ fn candidate_status(
 fn command_status(
     command: &EvidenceCommandInput,
     output_base: Option<&Path>,
+    semantic_context: &semantic::EvidenceSemanticContext<'_>,
 ) -> EvidenceCommandStatus {
     let outputs = command
         .outputs
@@ -409,7 +454,7 @@ fn command_status(
         .collect::<Vec<_>>();
     let mut status = command_output_status(outputs.len(), missing_outputs.len());
     let mut observed_failure = observed_failure(status, &outputs);
-    let command_failure = completed_command_failure(command, &outputs);
+    let command_failure = semantic::completed_command_failure(command, &outputs, semantic_context);
     if status == EvidenceStatusKind::Complete && command_failure.is_some() {
         status = EvidenceStatusKind::Partial;
         observed_failure = command_failure;
@@ -423,285 +468,6 @@ fn command_status(
         missing_outputs,
         observed_failure,
         shell: command.shell.clone(),
-    }
-}
-
-fn completed_command_failure(
-    command: &EvidenceCommandInput,
-    outputs: &[EvidenceOutputStatus],
-) -> Option<String> {
-    match command_semantic_kind(command) {
-        "certify" | "skippy-quant-pack-certification" => certification_output_failure(outputs),
-        "chat-corpus"
-        | "skippy-bench-chat-corpus"
-        | "long-context-chat-corpus"
-        | "skippy-bench-long-context-chat-corpus" => chat_corpus_output_failure(outputs),
-        "focused-runtime" | "skippy-bench-focused-runtime" => {
-            focused_runtime_output_failure(outputs, FocusedRuntimeMode::Executed)
-        }
-        "focused-runtime-schema-smoke" | "skippy-bench-focused-runtime-schema-smoke" => {
-            focused_runtime_output_failure(outputs, FocusedRuntimeMode::SchemaSmoke)
-        }
-        "local-split-chain" | "skippy-bench-local-split-chain" => {
-            local_split_chain_output_failure(outputs)
-        }
-        "rank-after-evidence" | "rank-after-evidence-all" | "skippy-quant-pack-rank" => {
-            rank_output_failure(outputs)
-        }
-        "token-lengths" | "skippy-bench-token-lengths" => token_lengths_output_failure(outputs),
-        _ => None,
-    }
-}
-
-fn command_semantic_kind(command: &EvidenceCommandInput) -> &str {
-    command
-        .evidence_type
-        .as_deref()
-        .filter(|evidence_type| !evidence_type.trim().is_empty())
-        .unwrap_or(&command.id)
-}
-
-fn local_split_chain_output_failure(outputs: &[EvidenceOutputStatus]) -> Option<String> {
-    let output = outputs.iter().find(|output| output.exists)?;
-    let value = match read_json_output(output) {
-        Ok(value) => value,
-        Err(failure) => return Some(failure),
-    };
-    if value.get("mode").and_then(serde_json::Value::as_str) != Some("local-split-chain-binary") {
-        return Some(format!(
-            "{}: local split report mode missing or invalid",
-            output.path
-        ));
-    }
-    if value.get("predicted_token").is_none() {
-        return Some(format!(
-            "{}: local split predicted_token missing",
-            output.path
-        ));
-    }
-    let has_payload = value
-        .get("stages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|stage| {
-            stage
-                .get("wire_payload_bytes")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|bytes| bytes > 0)
-                && stage
-                    .get("payload_bytes")
-                    .and_then(serde_json::Value::as_u64)
-                    .is_some_and(|bytes| bytes > 0)
-        });
-    if !has_payload {
-        return Some(format!(
-            "{}: local split payload and wire payload bytes missing",
-            output.path
-        ));
-    }
-    None
-}
-
-fn certification_output_failure(outputs: &[EvidenceOutputStatus]) -> Option<String> {
-    outputs
-        .iter()
-        .find(|output| output.exists)
-        .and_then(certification_status_failure)
-}
-
-fn certification_status_failure(output: &EvidenceOutputStatus) -> Option<String> {
-    let contents = match fs::read_to_string(&output.resolved_path) {
-        Ok(contents) => contents,
-        Err(error) => {
-            return Some(format!(
-                "{}: cannot read certification output: {error}",
-                output.path
-            ));
-        }
-    };
-    let value = match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => value,
-        Err(error) => {
-            return Some(format!(
-                "{}: cannot parse certification output: {error}",
-                output.path
-            ));
-        }
-    };
-    let status = value
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing");
-    if status == "failed" {
-        return Some(format!("{}: certification status failed", output.path));
-    }
-    if status == "missing" {
-        return Some(format!("{}: certification status missing", output.path));
-    }
-    None
-}
-
-fn chat_corpus_output_failure(outputs: &[EvidenceOutputStatus]) -> Option<String> {
-    let output = outputs.iter().find(|output| output.exists)?;
-    let value = match read_json_output(output) {
-        Ok(value) => value,
-        Err(failure) => return Some(failure),
-    };
-    let errors = value
-        .get("summary")
-        .and_then(|summary| summary.get("errors"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    if errors > 0 {
-        return Some(format!("{}: chat corpus errors {errors}", output.path));
-    }
-    None
-}
-
-#[derive(Clone, Copy)]
-enum FocusedRuntimeMode {
-    Executed,
-    SchemaSmoke,
-}
-
-impl FocusedRuntimeMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Executed => "executed",
-            Self::SchemaSmoke => "schema-smoke",
-        }
-    }
-}
-
-fn focused_runtime_output_failure(
-    outputs: &[EvidenceOutputStatus],
-    expected_mode: FocusedRuntimeMode,
-) -> Option<String> {
-    let output = outputs.iter().find(|output| output.exists)?;
-    let value = match read_json_output(output) {
-        Ok(value) => value,
-        Err(failure) => return Some(failure),
-    };
-    let mode = value
-        .get("mode")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("missing");
-    if mode != expected_mode.as_str() {
-        return Some(format!(
-            "{}: focused-runtime mode {mode} != {}",
-            output.path,
-            expected_mode.as_str()
-        ));
-    }
-    if focused_runtime_generated_tps(&value).is_none() {
-        return Some(format!(
-            "{}: focused-runtime generated throughput missing or non-positive",
-            output.path
-        ));
-    }
-    if focused_runtime_decode_p50_ms(&value).is_none() {
-        return Some(format!(
-            "{}: focused-runtime decode p50 missing",
-            output.path
-        ));
-    }
-    None
-}
-
-fn focused_runtime_generated_tps(value: &serde_json::Value) -> Option<f64> {
-    value
-        .get("throughput_tokens_per_second")
-        .and_then(|throughput| throughput.get("generated"))
-        .and_then(value_as_f64)
-        .filter(|value| *value > 0.0)
-}
-
-fn focused_runtime_decode_p50_ms(value: &serde_json::Value) -> Option<f64> {
-    value
-        .get("latency_ms")
-        .and_then(|latency| latency.get("decode_elapsed_ms_p50"))
-        .and_then(value_as_f64)
-}
-
-fn token_lengths_output_failure(outputs: &[EvidenceOutputStatus]) -> Option<String> {
-    outputs
-        .iter()
-        .filter(|output| output.exists)
-        .find(|output| output.path.ends_with(".json"))
-        .and_then(token_lengths_summary_failure)
-}
-
-fn token_lengths_summary_failure(output: &EvidenceOutputStatus) -> Option<String> {
-    let value = match read_json_output(output) {
-        Ok(value) => value,
-        Err(failure) => return Some(failure),
-    };
-    let exceeds_context = value
-        .get("exceeds_context")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    if exceeds_context > 0 {
-        return Some(format!(
-            "{}: token length rows exceed context {exceeds_context}",
-            output.path
-        ));
-    }
-    None
-}
-
-fn rank_output_failure(outputs: &[EvidenceOutputStatus]) -> Option<String> {
-    let output = outputs.iter().find(|output| output.exists)?;
-    let value = match read_json_output(output) {
-        Ok(value) => value,
-        Err(failure) => return Some(failure),
-    };
-    if value.get("kind").and_then(serde_json::Value::as_str) != Some("skippy_quant_pack_rank") {
-        return Some(format!(
-            "{}: rank report kind missing or invalid",
-            output.path
-        ));
-    }
-    let Some(candidates) = value
-        .get("candidates")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Some(format!("{}: rank report candidates missing", output.path));
-    };
-    let candidate_count = value
-        .get("candidate_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default() as usize;
-    if candidate_count == 0 {
-        return Some(format!("{}: rank report candidate_count is 0", output.path));
-    }
-    if candidate_count != candidates.len() {
-        return Some(format!(
-            "{}: rank report candidate_count {candidate_count} != candidates length {}",
-            output.path,
-            candidates.len()
-        ));
-    }
-    None
-}
-
-fn value_as_f64(value: &serde_json::Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_u64().map(|value| value as f64))
-        .or_else(|| value.as_i64().map(|value| value as f64))
-}
-
-fn read_json_output(output: &EvidenceOutputStatus) -> Result<serde_json::Value, String> {
-    let contents = match fs::read_to_string(&output.resolved_path) {
-        Ok(contents) => contents,
-        Err(error) => {
-            return Err(format!("{}: cannot read output: {error}", output.path));
-        }
-    };
-    match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(value) => Ok(value),
-        Err(error) => Err(format!("{}: cannot parse output: {error}", output.path)),
     }
 }
 
@@ -732,8 +498,14 @@ fn status_report(
     let warnings = report_warnings(&candidates);
     let toolchain = report_toolchain(&candidates);
     let output_base = output_base_dir(&toolchain);
-    let final_rank =
-        final_rank_input.map(|command| command_status(command, output_base.as_deref()));
+    let default_topology = EvidencePlanTopology::default();
+    let default_runtime = EvidencePlanRuntime::default();
+    let semantic_context = semantic::EvidenceSemanticContext {
+        topology: &default_topology,
+        runtime: &default_runtime,
+    };
+    let final_rank = final_rank_input
+        .map(|command| command_status(command, output_base.as_deref(), &semantic_context));
     let final_rank_total = usize::from(final_rank.is_some());
     let final_rank_complete = final_rank
         .as_ref()
@@ -901,7 +673,7 @@ fn local_chain_warnings(
 
 fn is_guarded_local_chain_command(command: &EvidenceCommandInput) -> bool {
     matches!(
-        command_semantic_kind(command),
+        semantic::command_semantic_kind(command),
         "local-split-chain" | "skippy-bench-local-split-chain"
     ) && !command.shell.contains("--allow-high-memory-local-chain")
 }
@@ -1603,6 +1375,73 @@ mod tests {
     }
 
     #[test]
+    fn status_report_marks_focused_runtime_shape_mismatch_partial() {
+        let dir = unique_test_dir("focused-runtime-shape-mismatch");
+        fs::create_dir_all(dir.join("evidence")).expect("create evidence dir");
+        let focused = dir.join("evidence/focused-runtime-report.json");
+        fs::write(
+            &focused,
+            r#"{
+  "mode": "executed",
+  "stage_count": 3,
+  "topology": {"stage_count": 3, "splits": "10,19", "layer_end": 28},
+  "runtime": {
+    "ctx_size": 1024,
+    "n_gpu_layers": 0,
+    "cache_type_k": "f16",
+    "cache_type_v": "f16",
+    "activation_wire_dtype": "f16"
+  },
+  "latency_ms": {"decode_elapsed_ms_p50": 5},
+  "throughput_tokens_per_second": {"generated": 100.0}
+}"#,
+        )
+        .expect("write focused runtime");
+        let plan = dir.join("evidence-plan.json");
+        fs::write(
+            &plan,
+            format!(
+                r#"{{
+  "kind": "skippy_quant_pack_evidence_plan",
+  "candidate": "ffn-compressed-attention-protected",
+  "runbook_cwd": "{}",
+  "stage_count": 3,
+  "splits": "10,19",
+  "layer_end": 28,
+  "ctx_size": 8192,
+  "n_gpu_layers": 0,
+  "cache_type_k": "f16",
+  "cache_type_v": "f16",
+  "activation_wire_dtype": "f16",
+  "commands": [
+    {{
+      "id": "focused-runtime",
+      "description": "focused runtime",
+      "shell": "focused-runtime",
+      "outputs": ["evidence/focused-runtime-report.json"]
+    }}
+  ]
+}}"#,
+                dir.display()
+            ),
+        )
+        .expect("write plan");
+
+        let report = build_evidence_status_report(&plan).expect("build status");
+        let command = &report.candidates[0].commands[0];
+
+        assert_eq!(report.status, EvidenceStatusKind::Partial);
+        assert_eq!(command.status, EvidenceStatusKind::Partial);
+        assert_eq!(
+            command.observed_failure.as_deref(),
+            Some(
+                "evidence/focused-runtime-report.json: focused-runtime ctx_size Some(1024) != expected 8192"
+            )
+        );
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
     fn status_report_accepts_local_split_chain_payload_report() {
         let dir = unique_test_dir("local-split-chain-complete");
         fs::create_dir_all(dir.join("evidence")).expect("create evidence dir");
@@ -1742,6 +1581,55 @@ mod tests {
         assert_eq!(
             command.observed_failure.as_deref(),
             Some("evidence/prompt-lengths-summary.json: token length rows exceed context 1")
+        );
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn status_report_marks_token_lengths_shape_mismatch_partial() {
+        let dir = unique_test_dir("token-length-shape-mismatch");
+        fs::create_dir_all(dir.join("evidence")).expect("create evidence dir");
+        let tsv = dir.join("evidence/prompt-lengths.tsv");
+        let summary = dir.join("evidence/prompt-lengths-summary.json");
+        fs::write(&tsv, b"id\ttokens\n").expect("write tsv");
+        fs::write(
+            &summary,
+            r#"{"row_count":3,"ctx_size":1024,"exceeds_context":0}"#,
+        )
+        .expect("write token summary");
+        let plan = dir.join("evidence-plan.json");
+        fs::write(
+            &plan,
+            format!(
+                r#"{{
+  "kind": "skippy_quant_pack_evidence_plan",
+  "candidate": "ffn-compressed-attention-protected",
+  "runbook_cwd": "{}",
+  "ctx_size": 8192,
+  "commands": [
+    {{
+      "id": "token-lengths",
+      "description": "token lengths",
+      "shell": "token-lengths",
+      "outputs": ["evidence/prompt-lengths.tsv", "evidence/prompt-lengths-summary.json"]
+    }}
+  ]
+}}"#,
+                dir.display()
+            ),
+        )
+        .expect("write plan");
+
+        let report = build_evidence_status_report(&plan).expect("build status");
+        let command = &report.candidates[0].commands[0];
+
+        assert_eq!(report.status, EvidenceStatusKind::Partial);
+        assert_eq!(command.status, EvidenceStatusKind::Partial);
+        assert_eq!(
+            command.observed_failure.as_deref(),
+            Some(
+                "evidence/prompt-lengths-summary.json: token length ctx_size Some(1024) != expected 8192"
+            )
         );
         fs::remove_dir_all(dir).expect("remove fixture");
     }

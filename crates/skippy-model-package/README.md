@@ -456,11 +456,16 @@ top-level status and candidate entries, so host/SSH configuration risks remain
 visible in resume tooling. Known generated JSON outputs are also checked for
 semantic failure: measured `focused-runtime` stays partial unless the report is
 `mode: executed` with generated throughput and decode p50 latency,
-`chat-corpus`/`long-context-chat-corpus` stay partial when their summaries have errors, `token-lengths` stays
-partial when any row exceeds context, rank outputs stay partial when they are
-malformed or their `candidate_count` disagrees with the candidates array, and
-`certify` stays partial when `certification.json` is failed, malformed, or
-status-less. The separate
+`chat-corpus`/`long-context-chat-corpus` stay partial when their summaries have
+errors, `token-lengths` stays partial when any row exceeds context, rank outputs
+stay partial when they are malformed or their `candidate_count` disagrees with
+the candidates array, and `certify` stays partial when `certification.json` is
+failed, malformed, or status-less. Status also checks completed
+`focused-runtime`, `local-split-chain`, and `token-lengths` reports against the
+plan's declared runtime/topology shape where the plan provides it, including
+context size, GPU-layer policy, KV dtypes, activation wire dtype, split
+boundaries, stage count, and layer end. A stale `ctx_size=1024` report therefore
+does not satisfy a resumed `ctx_size=8192` evidence plan. The separate
 `focused-runtime-schema-smoke` step accepts `mode: schema-smoke` only as a
 command-shape check. New generated commands also carry an `evidence_type` lane
 label such as `skippy-bench-focused-runtime`, `skippy-bench-chat-corpus`,
