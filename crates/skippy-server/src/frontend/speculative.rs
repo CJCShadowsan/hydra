@@ -1,9 +1,16 @@
 use super::*;
 
+const SPEC_FALLBACK_MIN_WINDOWS: usize = 4;
+const SPEC_FALLBACK_MIN_DRAFT_TOKENS: usize = 8;
+const SPEC_FALLBACK_ACCEPT_RATE: f64 = 0.75;
+const SPEC_FALLBACK_REPAIR_RATE: f64 = 0.50;
+const SPEC_FALLBACK_MAX_MS_PER_COMMITTED_TOKEN: f64 = 220.0;
+
 #[derive(Default)]
 pub(super) struct OpenAiSpeculativeStats {
     pub(super) windows: usize,
     pub(super) draft_tokens: usize,
+    pub(super) committed_tokens: usize,
     pub(super) accepted_tokens: usize,
     pub(super) rejected_tokens: usize,
     pub(super) full_accept_windows: usize,
@@ -47,9 +54,26 @@ pub(super) struct OpenAiSpeculativeStats {
     pub(super) adaptive_window_grows: usize,
     pub(super) adaptive_window_shrinks: usize,
     pub(super) adaptive_window_enabled: bool,
+    pub(super) disabled_for_request: bool,
 }
 
 impl OpenAiSpeculativeStats {
+    pub(super) fn should_disable_for_request(&self) -> bool {
+        if self.disabled_for_request
+            || self.windows < SPEC_FALLBACK_MIN_WINDOWS
+            || self.draft_tokens < SPEC_FALLBACK_MIN_DRAFT_TOKENS
+        {
+            return false;
+        }
+        self.accept_rate() < SPEC_FALLBACK_ACCEPT_RATE
+            || self.repair_rate() >= SPEC_FALLBACK_REPAIR_RATE
+            || self.speculative_ms_per_committed_token() > SPEC_FALLBACK_MAX_MS_PER_COMMITTED_TOKEN
+    }
+
+    pub(super) fn mark_disabled_for_request(&mut self) {
+        self.disabled_for_request = true;
+    }
+
     pub(super) fn observe_verify_decision(
         &mut self,
         decision: VerifySpanDecision,
@@ -96,6 +120,32 @@ impl OpenAiSpeculativeStats {
                 self.early_reject_windows += 1;
                 self.early_reject_stop_windows += 1;
             }
+        }
+    }
+
+    fn accept_rate(&self) -> f64 {
+        if self.draft_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_tokens as f64 / self.draft_tokens as f64
+        }
+    }
+
+    fn repair_rate(&self) -> f64 {
+        if self.windows == 0 {
+            0.0
+        } else {
+            self.repair_required_windows as f64 / self.windows as f64
+        }
+    }
+
+    fn speculative_ms_per_committed_token(&self) -> f64 {
+        if self.committed_tokens == 0 {
+            0.0
+        } else {
+            let elapsed_ms =
+                self.draft_propose_ms + self.primary_verify_elapsed_ms + self.recovery_ms;
+            elapsed_ms / self.committed_tokens as f64
         }
     }
 
@@ -156,16 +206,20 @@ impl OpenAiSpeculativeStats {
             json!(self.accepted_tokens),
         );
         attrs.insert(
+            "llama_stage.spec.committed".to_string(),
+            json!(self.committed_tokens),
+        );
+        attrs.insert(
             "llama_stage.spec.rejected".to_string(),
             json!(self.rejected_tokens),
         );
         attrs.insert(
             "llama_stage.spec.accept_rate".to_string(),
-            json!(if self.draft_tokens == 0 {
-                0.0
-            } else {
-                self.accepted_tokens as f64 / self.draft_tokens as f64
-            }),
+            json!(self.accept_rate()),
+        );
+        attrs.insert(
+            "llama_stage.spec.ms_per_committed_token".to_string(),
+            json!(self.speculative_ms_per_committed_token()),
         );
         attrs.insert(
             "llama_stage.spec.full_accept_windows".to_string(),
@@ -290,6 +344,10 @@ impl OpenAiSpeculativeStats {
         attrs.insert(
             "llama_stage.spec.window_shrinks".to_string(),
             json!(self.adaptive_window_shrinks),
+        );
+        attrs.insert(
+            "llama_stage.spec.disabled_for_request".to_string(),
+            json!(self.disabled_for_request),
         );
     }
 }

@@ -718,7 +718,7 @@ impl StageOpenAiBackend {
             }
             let max_speculative_window = request.speculative_window.max(1);
             let mut adaptive_window = if request.adaptive_speculative_window {
-                max_speculative_window.min(4)
+                max_speculative_window.min(2)
             } else {
                 max_speculative_window
             };
@@ -767,6 +767,9 @@ impl StageOpenAiBackend {
                 if fused_reached_stop {
                     break;
                 }
+                if decoded_tokens >= request.max_tokens as usize {
+                    break;
+                }
                 if request
                     .cancellation
                     .is_some_and(openai_frontend::CancellationToken::is_cancelled)
@@ -774,6 +777,10 @@ impl StageOpenAiBackend {
                     break;
                 }
                 let token_timer = PhaseTimer::start();
+                if draft_guard.is_some() && speculative_stats.should_disable_for_request() {
+                    speculative_stats.mark_disabled_for_request();
+                    draft_guard = None;
+                }
                 if draft_guard.is_some() {
                     let remaining = request.max_tokens as usize - decoded_tokens;
                     if remaining == 0 {
@@ -984,6 +991,11 @@ impl StageOpenAiBackend {
                                 speculative_stats.recovery_reverify_elapsed_ms += repair.elapsed_ms;
                             }
                         }
+
+                        let remaining_commit_budget =
+                            (request.max_tokens as usize).saturating_sub(decoded_tokens);
+                        commit_tokens.truncate(remaining_commit_budget);
+                        speculative_stats.committed_tokens += commit_tokens.len();
 
                         let mut reached_stop = false;
                         for token in commit_tokens {

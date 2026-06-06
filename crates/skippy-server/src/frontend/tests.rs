@@ -29,6 +29,78 @@ const MM_MAX_TOKENS_ENV: &str = "SKIPPY_MM_MAX_TOKENS";
 const MM_N_GPU_LAYERS_ENV: &str = "SKIPPY_MM_N_GPU_LAYERS";
 
 #[test]
+fn speculative_fallback_waits_for_enough_evidence() {
+    let stats = OpenAiSpeculativeStats {
+        windows: 3,
+        draft_tokens: 7,
+        accepted_tokens: 0,
+        repair_required_windows: 3,
+        ..OpenAiSpeculativeStats::default()
+    };
+
+    assert!(!stats.should_disable_for_request());
+}
+
+#[test]
+fn speculative_fallback_disables_low_acceptance_requests() {
+    let mut stats = OpenAiSpeculativeStats {
+        windows: 4,
+        draft_tokens: 8,
+        committed_tokens: 5,
+        accepted_tokens: 5,
+        repair_required_windows: 0,
+        ..OpenAiSpeculativeStats::default()
+    };
+
+    assert!(stats.should_disable_for_request());
+    stats.mark_disabled_for_request();
+    assert!(!stats.should_disable_for_request());
+}
+
+#[test]
+fn speculative_fallback_disables_repair_heavy_requests() {
+    let stats = OpenAiSpeculativeStats {
+        windows: 4,
+        draft_tokens: 8,
+        committed_tokens: 8,
+        accepted_tokens: 8,
+        repair_required_windows: 2,
+        ..OpenAiSpeculativeStats::default()
+    };
+
+    assert!(stats.should_disable_for_request());
+}
+
+#[test]
+fn speculative_fallback_keeps_high_acceptance_requests() {
+    let stats = OpenAiSpeculativeStats {
+        windows: 4,
+        draft_tokens: 8,
+        committed_tokens: 8,
+        accepted_tokens: 8,
+        repair_required_windows: 1,
+        primary_verify_elapsed_ms: 1_600.0,
+        ..OpenAiSpeculativeStats::default()
+    };
+
+    assert!(!stats.should_disable_for_request());
+}
+
+#[test]
+fn speculative_fallback_disables_slow_accepted_requests() {
+    let stats = OpenAiSpeculativeStats {
+        windows: 4,
+        draft_tokens: 8,
+        committed_tokens: 8,
+        accepted_tokens: 8,
+        primary_verify_elapsed_ms: 1_900.0,
+        ..OpenAiSpeculativeStats::default()
+    };
+
+    assert!(stats.should_disable_for_request());
+}
+
+#[test]
 fn proactive_eviction_attrs_are_bounded_and_request_free() {
     let attrs = proactive_eviction_attrs("error", Some("inactive_session"), 1024, 2, 768);
 
