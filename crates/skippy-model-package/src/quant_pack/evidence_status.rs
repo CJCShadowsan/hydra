@@ -4,6 +4,8 @@ use std::{env, fs};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+const LARGE_LOCAL_CHAIN_MODEL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
 #[derive(Debug, clap::Args)]
 pub(super) struct QuantPackEvidenceStatusArgs {
     plan: PathBuf,
@@ -183,6 +185,8 @@ struct EvidencePlanEnvelope {
 struct EvidencePlanInput {
     candidate: String,
     #[serde(default)]
+    quantized_model: Option<String>,
+    #[serde(default)]
     warnings: Vec<String>,
     #[serde(flatten)]
     toolchain: EvidencePlanToolchain,
@@ -201,6 +205,8 @@ struct EvidencePlanAllInput {
 #[derive(Debug, Deserialize)]
 struct EvidencePlanCandidateInput {
     candidate: String,
+    #[serde(default)]
+    quantized_model: Option<String>,
     #[serde(default)]
     warnings: Vec<String>,
     #[serde(flatten)]
@@ -299,6 +305,7 @@ fn build_evidence_status_report(plan: &Path) -> Result<EvidenceStatusReport> {
                     &input.warnings,
                     input.toolchain,
                     input.topology,
+                    input.quantized_model.as_deref(),
                     &input.commands,
                 )],
                 None,
@@ -316,6 +323,7 @@ fn build_evidence_status_report(plan: &Path) -> Result<EvidenceStatusReport> {
                         &candidate.warnings,
                         candidate.toolchain.clone(),
                         candidate.topology.clone(),
+                        candidate.quantized_model.as_deref(),
                         &candidate.commands,
                     )
                 })
@@ -332,12 +340,19 @@ fn candidate_status(
     warnings: &[String],
     toolchain: EvidencePlanToolchain,
     topology: EvidencePlanTopology,
+    quantized_model: Option<&str>,
     commands: &[EvidenceCommandInput],
 ) -> CandidateEvidenceStatus {
     let mut warnings = warnings.to_vec();
     warnings.extend(toolchain_warnings(&toolchain));
     let topology = topology.with_inferred_stage_count(&mut warnings);
     let output_base = output_base_dir(&toolchain);
+    warnings.extend(local_chain_warnings(
+        commands,
+        quantized_model,
+        output_base.as_deref(),
+        topology.stage_count,
+    ));
     let commands = commands
         .iter()
         .map(|command| command_status(command, output_base.as_deref()))
@@ -852,6 +867,49 @@ fn toolchain_warnings(toolchain: &EvidencePlanToolchain) -> Vec<String> {
     warnings
 }
 
+fn local_chain_warnings(
+    commands: &[EvidenceCommandInput],
+    quantized_model: Option<&str>,
+    output_base: Option<&Path>,
+    stage_count: Option<usize>,
+) -> Vec<String> {
+    let Some(stage_count) = stage_count.filter(|stage_count| *stage_count > 2) else {
+        return Vec::new();
+    };
+    if !commands.iter().any(is_guarded_local_chain_command) {
+        return Vec::new();
+    }
+    let Some(quantized_model) = quantized_model
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Vec::new();
+    };
+    let model_path = resolve_output_path(quantized_model, output_base);
+    let Ok(metadata) = fs::metadata(&model_path) else {
+        return Vec::new();
+    };
+    if metadata.len() < LARGE_LOCAL_CHAIN_MODEL_BYTES {
+        return Vec::new();
+    }
+    vec![format!(
+        "local-split-chain is guarded: {} is {:.1} GiB and would launch {stage_count} local stages; use a smaller Studio-scale proxy, package/lab evidence, or add --allow-high-memory-local-chain deliberately",
+        model_path.display(),
+        bytes_to_gib(metadata.len())
+    )]
+}
+
+fn is_guarded_local_chain_command(command: &EvidenceCommandInput) -> bool {
+    matches!(
+        command_semantic_kind(command),
+        "local-split-chain" | "skippy-bench-local-split-chain"
+    ) && !command.shell.contains("--allow-high-memory-local-chain")
+}
+
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / 1024.0 / 1024.0 / 1024.0
+}
+
 fn check_toolchain_dir(warnings: &mut Vec<String>, label: &str, value: Option<&str>) {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
@@ -1164,6 +1222,52 @@ mod tests {
             Some("16,32,47")
         );
         assert_eq!(report.candidates[0].warnings, Vec::<String>::new());
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn status_report_warns_when_local_split_chain_would_hit_high_memory_guard() {
+        let dir = unique_test_dir("local-chain-high-memory-warning");
+        fs::create_dir_all(&dir).expect("create fixture");
+        let model = dir.join("large.gguf");
+        fs::File::create(&model)
+            .expect("create sparse model")
+            .set_len(LARGE_LOCAL_CHAIN_MODEL_BYTES)
+            .expect("size sparse model");
+        let plan = dir.join("evidence-plan.json");
+        fs::write(
+            &plan,
+            r#"{
+  "kind": "skippy_quant_pack_evidence_plan",
+  "candidate": "ffn-compressed-attention-protected",
+  "runbook_cwd": ".",
+  "quantized_model": "large.gguf",
+  "splits": "16,32",
+  "commands": [
+    {
+      "id": "local-split-chain",
+      "description": "local chain",
+      "evidence_type": "skippy-bench-local-split-chain",
+      "shell": "skippy-bench local-split-chain-binary --model-path large.gguf",
+      "outputs": ["evidence/local-split-chain.json"]
+    }
+  ]
+}"#,
+        )
+        .expect("write plan");
+        let cwd = env::current_dir().expect("current dir");
+        env::set_current_dir(&dir).expect("enter fixture dir");
+
+        let report = build_evidence_status_report(&plan).expect("build status");
+
+        env::set_current_dir(cwd).expect("restore cwd");
+        assert_eq!(report.candidates[0].topology.stage_count, Some(3));
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("local-split-chain is guarded"))
+        );
         fs::remove_dir_all(dir).expect("remove fixture");
     }
 
