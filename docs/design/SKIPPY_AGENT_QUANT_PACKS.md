@@ -505,7 +505,11 @@ The current Qwen 480B remote build handoff is tracked in
 Validate generated submit payloads with `quant-pack hf-jobs-validate` before
 submission. The validator checks the HF Jobs `run` envelope, known hardware
 flavor, timeout, detached execution, `HF_TOKEN` secret, source download,
-`quant-pack build-all`, output repo creation, and upload command.
+`quant-pack build-all`, output repo creation, and upload command in its default
+`source-build-all` mode. Evidence-run submit payloads use
+`--workload-kind evidence-run`, which checks candidate download, embedded
+evidence-plan/runbook writes, evidence-status resume checks, runbook execution,
+upload repo creation, and evidence upload instead of source quantization.
 Its report also includes `hf_jobs_cli.shell`, an equivalent `hf jobs run ...`
 command for operators who submit through the Hugging Face CLI.
 

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -13,6 +14,8 @@ pub(super) struct QuantPackHfJobsValidateArgs {
     expected_image: Option<String>,
     #[arg(long)]
     expected_upload_repo: Option<String>,
+    #[arg(long, value_enum, default_value_t = HfJobsWorkloadKind::SourceBuildAll)]
+    workload_kind: HfJobsWorkloadKind,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     require_detach: bool,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -27,6 +30,7 @@ struct HfJobsValidateReport {
     kind: String,
     status: HfJobsValidateStatus,
     submit_json: String,
+    workload_kind: HfJobsWorkloadKind,
     operation: Option<String>,
     image: Option<String>,
     flavor: Option<String>,
@@ -43,6 +47,13 @@ struct HfJobsValidateReport {
 enum HfJobsValidateStatus {
     Valid,
     Invalid,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum HfJobsWorkloadKind {
+    SourceBuildAll,
+    EvidenceRun,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +130,7 @@ fn build_validate_report(
         kind: "skippy_quant_pack_hf_jobs_validate".to_string(),
         status,
         submit_json: args.submit_json.display().to_string(),
+        workload_kind: args.workload_kind,
         operation,
         image,
         flavor,
@@ -227,6 +239,25 @@ fn validate_submit_payload(
         check_allowed_flavor(job_args),
         check_timeout(job_args),
         check_command(job_args, command_text),
+    ];
+    add_workload_kind_checks(args.workload_kind, command_text, &mut checks);
+    add_optional_checks(args, job_args, &mut checks);
+    checks
+}
+
+fn add_workload_kind_checks(
+    workload_kind: HfJobsWorkloadKind,
+    command_text: &str,
+    checks: &mut Vec<HfJobsValidateCheck>,
+) {
+    match workload_kind {
+        HfJobsWorkloadKind::SourceBuildAll => add_source_build_all_checks(command_text, checks),
+        HfJobsWorkloadKind::EvidenceRun => add_evidence_run_checks(command_text, checks),
+    }
+}
+
+fn add_source_build_all_checks(command_text: &str, checks: &mut Vec<HfJobsValidateCheck>) {
+    checks.extend([
         check_required_text(
             "command_downloads_source",
             command_text,
@@ -251,9 +282,54 @@ fn validate_submit_payload(
             "hf upload \"${HF_UPLOAD_REPO}\"",
             "command must upload generated quant-pack outputs",
         ),
-    ];
-    add_optional_checks(args, job_args, &mut checks);
-    checks
+    ]);
+}
+
+fn add_evidence_run_checks(command_text: &str, checks: &mut Vec<HfJobsValidateCheck>) {
+    checks.extend([
+        check_required_text(
+            "command_downloads_candidate",
+            command_text,
+            "hf download ",
+            "command must download the candidate bundle in the job",
+        ),
+        check_required_text(
+            "command_writes_evidence_plan",
+            command_text,
+            "cat > \"${PLAN_PATH}\"",
+            "command must write the evidence plan into the job filesystem",
+        ),
+        check_required_text(
+            "command_writes_runbook",
+            command_text,
+            "cat > \"${RUNBOOK_PATH}\"",
+            "command must write the evidence runbook into the job filesystem",
+        ),
+        check_required_text(
+            "command_runs_evidence_status",
+            command_text,
+            "quant-pack evidence-status",
+            "command must run evidence-status warning or resume checks",
+        ),
+        check_required_text(
+            "command_runs_runbook",
+            command_text,
+            "\"${RUNBOOK_PATH}\"",
+            "command must execute the generated evidence runbook",
+        ),
+        check_required_text(
+            "command_creates_upload_repo",
+            command_text,
+            "hf repos create \"${HF_UPLOAD_REPO}\" --repo-type model --exist-ok",
+            "command must create the upload repo idempotently before upload",
+        ),
+        check_required_text(
+            "command_uploads_evidence",
+            command_text,
+            "hf upload \"${HF_UPLOAD_REPO}\" \"${EXECUTION_RUN_DIR}/evidence\"",
+            "command must upload generated evidence outputs",
+        ),
+    ]);
 }
 
 fn add_optional_checks(

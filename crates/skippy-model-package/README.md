@@ -232,7 +232,8 @@ The current Qwen 480B handoff is tracked in
 Run `quant-pack hf-jobs-validate` before submission to check that the payload
 uses the HF Jobs `run` shape, a known flavor, `detach=true`, `HF_TOKEN` as a
 secret, source download, `quant-pack build-all`, idempotent output repo
-creation, and upload of generated outputs.
+creation, and upload of generated outputs. This is the default
+`--workload-kind source-build-all` validation mode.
 The validation report also renders an equivalent `hf jobs run ...` command
 under `hf_jobs_cli.shell` for operators who prefer the Hugging Face CLI over the
 MCP/API payload.
@@ -392,6 +393,11 @@ runs the runbook, and uploads `evidence/`, `evidence-plan.json`, and
 HF Jobs `run` payload containing the image, flavor, timeout, detached command,
 `HF_TOKEN` secret, and optional upload repo environment. The CLI only writes
 handoff artifacts; it does not submit the job.
+Validate this payload with
+`quant-pack hf-jobs-validate --workload-kind evidence-run` before submission.
+Evidence-run validation checks the HF Jobs envelope plus candidate download,
+embedded evidence-plan/runbook writes, evidence-status resume checks, runbook
+execution, upload repo creation, and evidence upload.
 The generated schema-smoke command writes `focused-runtime-schema-smoke.json`
 from the same split, layer-end, context, KV cache, activation-wire, corpus, and
 lab-option arguments as the measured run, but without launching remote stages.

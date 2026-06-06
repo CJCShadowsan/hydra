@@ -429,6 +429,96 @@ fn quant_pack_source_plan_cli_writes_hf_download_plan_and_script() {
 }
 
 #[test]
+fn quant_pack_hf_jobs_validate_cli_accepts_evidence_run_payload() {
+    let dir = temp_dir("quant-pack-hf-jobs-validate-evidence-cli");
+    let run_dir = dir.join("candidate");
+    write_evidence_candidate_fixture(&run_dir, "middle-compressed", "org/repo:middle-compressed");
+    let execution_run_dir = PathBuf::from("/tmp/skippy-evidence/input/middle-compressed");
+    let plan_path = dir.join("evidence-plan-job-path.json");
+    let workload_path = dir.join("run-evidence-hf-job.sh");
+    let submit_path = dir.join("evidence-hf-job-submit.json");
+    let validate_path = dir.join("evidence-hf-job-validate.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skippy-model-package"))
+        .arg("quant-pack")
+        .arg("evidence-plan")
+        .arg(&run_dir)
+        .arg("--hosts")
+        .arg("host-a,host-b")
+        .arg("--splits")
+        .arg("20")
+        .arg("--runbook-cwd")
+        .arg("/workspace/mesh-llm")
+        .arg("--execution-run-dir")
+        .arg(&execution_run_dir)
+        .arg("--runbook-plan-path")
+        .arg(execution_run_dir.join("evidence-plan.json"))
+        .arg("--hf-jobs-workload-out")
+        .arg(&workload_path)
+        .arg("--hf-jobs-submit-json-out")
+        .arg(&submit_path)
+        .arg("--hf-jobs-image")
+        .arg("ghcr.io/example/skippy-quant-pack:cpu")
+        .arg("--hf-jobs-input-repo")
+        .arg("example/qwen-coder-candidate")
+        .arg("--hf-jobs-upload-repo")
+        .arg("example/qwen-coder-evidence")
+        .arg("--out")
+        .arg(&plan_path)
+        .output()
+        .expect("run skippy-model-package quant-pack evidence-plan");
+
+    assert!(
+        output.status.success(),
+        "quant-pack evidence-plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let validate = Command::new(env!("CARGO_BIN_EXE_skippy-model-package"))
+        .arg("quant-pack")
+        .arg("hf-jobs-validate")
+        .arg(&submit_path)
+        .arg("--workload-kind")
+        .arg("evidence-run")
+        .arg("--expected-image")
+        .arg("ghcr.io/example/skippy-quant-pack:cpu")
+        .arg("--expected-upload-repo")
+        .arg("example/qwen-coder-evidence")
+        .arg("--out")
+        .arg(&validate_path)
+        .output()
+        .expect("run skippy-model-package quant-pack hf-jobs-validate");
+
+    assert!(
+        validate.status.success(),
+        "evidence HF Jobs payload failed validation: {}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let validate_report: Value =
+        serde_json::from_slice(&fs::read(&validate_path).expect("read validate report"))
+            .expect("parse validate report");
+    assert_eq!(validate_report["status"], "valid");
+    assert_eq!(validate_report["workload_kind"], "evidence-run");
+    let checks = validate_report["checks"].as_array().expect("checks array");
+    assert!(checks.iter().any(|check| {
+        check["id"] == "command_runs_evidence_status" && check["status"] == "valid"
+    }));
+    assert!(
+        checks.iter().any(|check| {
+            check["id"] == "command_uploads_evidence" && check["status"] == "valid"
+        })
+    );
+    assert!(
+        validate_report["hf_jobs_cli"]["shell"]
+            .as_str()
+            .expect("hf jobs shell command")
+            .contains("--env HF_UPLOAD_REPO=example/qwen-coder-evidence")
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn quant_pack_hf_jobs_validate_cli_rejects_bad_payload() {
     let dir = temp_dir("quant-pack-hf-jobs-validate-cli");
     let submit_path = dir.join("bad-submit.json");
