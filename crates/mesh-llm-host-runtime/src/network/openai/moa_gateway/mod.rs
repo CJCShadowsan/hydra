@@ -1458,7 +1458,7 @@ mod tests {
             best_context: Some(131_072),
             best_latency_ms: Some(350),
         };
-        let mut groups = vec![distant_large, near];
+        let mut groups = [distant_large, near];
 
         groups.sort_by(compare_worker_groups);
 
