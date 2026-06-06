@@ -188,6 +188,114 @@ fn read_file_tool() -> Value {
     }])
 }
 
+fn web_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                }
+            }
+        }
+    ])
+}
+
+#[tokio::test]
+async fn repeated_tool_guard_allows_different_tool_from_minimax_xml() {
+    let backend = RecordingBackend::new(
+        r#"<minimax:tool_call>
+<invoke name="web_fetch">
+<parameter name="url">https://github.com/Mesh-LLM/mesh-llm/issues</parameter>
+</invoke>
+</minimax:tool_call>"#,
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "minimax".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": web_tools(),
+        "messages": [
+            {"role": "user", "content": "Use web_search or web_fetch as needed. Find important GitHub issues."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{\"query\":\"Mesh-LLM issues\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"results\":[]}"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{\"query\":\"Mesh-LLM bug fixes\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "{\"results\":[]}"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_3",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{\"query\":\"Mesh-LLM pull requests\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_3", "content": "{\"results\":[]}"},
+        ],
+        "max_tokens": 64,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("tool_calls"),
+        "Minimax XML tool proposal must not leak as assistant text: {}",
+        result.response_body
+    );
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/message/tool_calls/0/function/name")
+            .and_then(Value::as_str),
+        Some("web_fetch")
+    );
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str),
+        Some("{\"url\":\"https://github.com/Mesh-LLM/mesh-llm/issues\"}")
+    );
+}
+
 #[tokio::test]
 async fn tool_result_retries_answer_only_when_schema_reducer_fails() {
     let backend = ToolSchemaFailBackend::new();

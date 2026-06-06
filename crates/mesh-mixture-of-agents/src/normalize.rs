@@ -59,6 +59,7 @@ pub fn normalize_worker_output(
     // can panic on `unwrap`.
     let output = try_json_parse(text, model, role, elapsed_ms)
         .or_else(|| try_kv_parse(text, model, role, elapsed_ms))
+        .or_else(|| try_minimax_xml_tool_call(text, model, role, elapsed_ms))
         .unwrap_or_else(|| {
             let mut heuristic = heuristic_classify(text, model, role, elapsed_ms);
             // Heuristic path can leak stray KV envelope lines into the payload
@@ -372,6 +373,28 @@ fn try_kv_parse(raw: &str, model: &str, role: WorkerRole, elapsed_ms: u64) -> Op
     })
 }
 
+/// Try parsing Minimax's XML-ish tool-call envelope:
+///
+/// `<minimax:tool_call><invoke name="web_fetch">...`
+fn try_minimax_xml_tool_call(
+    raw: &str,
+    model: &str,
+    role: WorkerRole,
+    elapsed_ms: u64,
+) -> Option<WorkerOutput> {
+    let (tool_name, arguments) = extract_minimax_xml_tool_call(raw)?;
+    Some(WorkerOutput {
+        kind: OutputKind::ToolProposal,
+        confidence: 0.75,
+        tool_name: Some(tool_name),
+        tool_arguments: Some(Value::Object(arguments)),
+        payload: raw.to_string(),
+        model: model.to_string(),
+        role,
+        elapsed_ms,
+    })
+}
+
 /// Heuristic: classify raw text by content patterns.
 fn heuristic_classify(raw: &str, model: &str, role: WorkerRole, elapsed_ms: u64) -> WorkerOutput {
     if let Some(tool_call) = first_rescued_tool_call(raw) {
@@ -526,6 +549,10 @@ fn looks_like_uncertainty(lower: &str) -> bool {
 
 /// Try to extract a tool name and arguments from messy text.
 fn extract_tool_proposal(raw: &str) -> (Option<String>, Option<Value>) {
+    if let Some((tool_name, arguments)) = extract_minimax_xml_tool_call(raw) {
+        return (Some(tool_name), Some(Value::Object(arguments)));
+    }
+
     if let Some(tool_call) = first_rescued_tool_call(raw) {
         return (
             Some(tool_call.name),
@@ -563,6 +590,59 @@ fn extract_tool_proposal(raw: &str) -> (Option<String>, Option<Value>) {
     }
 
     (None, None)
+}
+
+fn extract_minimax_xml_tool_call(raw: &str) -> Option<(String, serde_json::Map<String, Value>)> {
+    if !raw.contains("<invoke") || !raw.contains("<parameter") {
+        return None;
+    }
+
+    let invoke_start = raw.find("<invoke")?;
+    let invoke_tail = &raw[invoke_start..];
+    let invoke_tag_end = invoke_tail.find('>')?;
+    let invoke_tag = &invoke_tail[..=invoke_tag_end];
+    let tool_name = extract_xml_attr(invoke_tag, "name")?;
+
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = raw;
+    while let Some(parameter_start) = cursor.find("<parameter") {
+        cursor = &cursor[parameter_start..];
+        let tag_end = cursor.find('>')?;
+        let tag = &cursor[..=tag_end];
+        let name = extract_xml_attr(tag, "name")?;
+        let value_start = tag_end + 1;
+        let value_tail = &cursor[value_start..];
+        let value_end = value_tail.find("</parameter>")?;
+        let value = xml_unescape(value_tail[..value_end].trim());
+        arguments.insert(name, Value::String(value));
+        cursor = &value_tail[value_end + "</parameter>".len()..];
+    }
+
+    Some((tool_name, arguments))
+}
+
+fn extract_xml_attr(tag: &str, attr: &str) -> Option<String> {
+    extract_quoted_xml_attr(tag, attr, '"').or_else(|| extract_quoted_xml_attr(tag, attr, '\''))
+}
+
+fn extract_quoted_xml_attr(tag: &str, attr: &str, quote: char) -> Option<String> {
+    let marker = format!("{attr}={quote}");
+    let value_start = tag.find(&marker)? + marker.len();
+    let value_tail = &tag[value_start..];
+    let value_end = value_tail.find(quote)?;
+    let value = value_tail[..value_end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 /// Find the first JSON object in text (handles markdown fences, etc.).
@@ -853,5 +933,21 @@ mod tests {
         assert_eq!(out.kind, OutputKind::ToolProposal);
         assert_eq!(out.tool_name.as_deref(), Some("read_file"));
         assert_eq!(out.tool_arguments.expect("args")["path"], "README.md");
+    }
+
+    #[test]
+    fn minimax_xml_tool_call_uses_local_rescue() {
+        let raw = r#"<minimax:tool_call>
+<invoke name="web_fetch">
+<parameter name="url">https://github.com/Mesh-LLM/mesh-llm/issues?q=is%3Aissue+is%3Aopen+label%3Abug&amp;sort=updated</parameter>
+</invoke>
+</minimax:tool_call>"#;
+        let out = normalize_worker_output(raw, "minimax", WorkerRole::Reducer, 100);
+        assert_eq!(out.kind, OutputKind::ToolProposal);
+        assert_eq!(out.tool_name.as_deref(), Some("web_fetch"));
+        assert_eq!(
+            out.tool_arguments.expect("args")["url"],
+            "https://github.com/Mesh-LLM/mesh-llm/issues?q=is%3Aissue+is%3Aopen+label%3Abug&sort=updated"
+        );
     }
 }

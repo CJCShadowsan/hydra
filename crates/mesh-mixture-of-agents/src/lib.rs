@@ -510,6 +510,10 @@ fn tool_name_is_explicitly_requested(tool: &str, text: &str) -> bool {
         format!("tool {spaced}"),
         format!("call {spaced}"),
         format!("call the {spaced}"),
+        format!("or {tool}"),
+        format!("and {tool}"),
+        format!("or {spaced}"),
+        format!("and {spaced}"),
     ];
 
     patterns.iter().any(|pattern| text.contains(pattern))
@@ -627,7 +631,11 @@ fn tool_is_relevant_to_text(tool_name: &str, text: &str) -> bool {
                 "url",
                 "http://",
                 "https://",
+                "github",
                 "github.com/",
+                "issue",
+                "pull request",
+                "pr ",
             ],
         ),
         "dir_list" | "dir_fetch" | "list_files" => {
@@ -808,20 +816,20 @@ async fn handle_tool_result(
     let candidates = reducer_candidates(config);
     let candidate_count = candidates.len();
     let repeated_tool = repeated_same_tool_results(session);
-    let force_answer = repeated_tool.is_some();
-    let selected_tool_names = if force_answer {
-        Vec::new()
-    } else {
-        selected_tool_names_for_turn(session, allowed_tools)
-    };
-    let tools_enabled_for_reducer = has_tools && !force_answer;
+    let mut selected_tool_names = selected_tool_names_for_turn(session, allowed_tools);
+    if let Some((tool, _)) = repeated_tool.as_ref() {
+        selected_tool_names.retain(|name| name != tool);
+    }
+    let tools_enabled_for_reducer = has_tools && !selected_tool_names.is_empty();
     let (mut messages, tools) = context::pack_for_tool_result_turn_selected(
         session,
         tools_enabled_for_reducer,
         &selected_tool_names,
     );
     if let Some((tool, count)) = repeated_tool {
-        tracing::info!("moa: forcing answer after {count} consecutive completed {tool} tool calls");
+        tracing::info!(
+            "moa: suppressing repeated {tool} after {count} consecutive completed tool calls"
+        );
         append_tool_loop_answer_instruction(&mut messages, &tool, count);
     }
 
@@ -1068,8 +1076,9 @@ fn repeated_same_tool_results(session: &Session) -> Option<(String, usize)> {
 fn append_tool_loop_answer_instruction(messages: &mut [Value], tool: &str, count: usize) {
     let instruction = format!(
         "\n\nTool loop guard: the last {count} completed tool calls all used `{tool}`. \
-         Answer now from the gathered tool results. Do not call another tool. \
-         If the evidence is incomplete, say what can be determined and what is missing."
+         Do not call `{tool}` again. If a different declared tool can materially advance the \
+         request, use that tool. Otherwise answer now from the gathered tool results; if the \
+         evidence is incomplete, say what can be determined and what is missing."
     );
     append_system_instruction(messages, &instruction);
 }
