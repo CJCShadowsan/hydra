@@ -1,4 +1,6 @@
 use crate::mesh;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 
 pub(in crate::network::openai) fn context_can_satisfy(
     required_tokens: Option<u32>,
@@ -10,32 +12,84 @@ pub(in crate::network::openai) fn context_can_satisfy(
     }
 }
 
-pub(in crate::network::openai) async fn select_remote_host(
+pub(in crate::network::openai) async fn select_remote_hosts(
     node: &mesh::Node,
     model: &str,
     required_tokens: Option<u32>,
     hosts: Vec<iroh::EndpointId>,
-) -> Option<iroh::EndpointId> {
-    let Some(required_tokens) = required_tokens else {
-        return hosts.into_iter().next();
-    };
-
-    let mut unknown = None;
+) -> Vec<iroh::EndpointId> {
+    let latencies = remote_latency_map(node).await;
+    let mut adequate = Vec::new();
+    let mut unknown = Vec::new();
     for host in hosts {
         match node.peer_model_context_length(host, model).await {
-            Some(context) if context >= required_tokens => return Some(host),
             Some(context) => {
-                tracing::info!(
-                    "MoA: skipping remote worker {model} on {}; context {context} cannot fit {required_tokens} required tokens",
-                    host.fmt_short()
-                );
+                if required_tokens
+                    .map(|required| context >= required)
+                    .unwrap_or(true)
+                {
+                    adequate.push((host, context, latencies.get(&host).copied()));
+                } else if let Some(required_tokens) = required_tokens {
+                    tracing::info!(
+                        "MoA: skipping remote worker {model} on {}; context {context} cannot fit {required_tokens} required tokens",
+                        host.fmt_short()
+                    );
+                }
             }
             None => {
-                unknown.get_or_insert(host);
+                unknown.push((host, latencies.get(&host).copied()));
             }
         }
     }
+    adequate.sort_by_key(|candidate| (Reverse(candidate.1), candidate.2.unwrap_or(u32::MAX)));
+    if !adequate.is_empty() {
+        return adequate
+            .into_iter()
+            .map(|(host, _, _)| host)
+            .collect::<Vec<_>>();
+    }
+
+    unknown.sort_by_key(|candidate| candidate.1.unwrap_or(u32::MAX));
     unknown
+        .into_iter()
+        .map(|(host, _)| host)
+        .collect::<Vec<_>>()
+}
+
+pub(in crate::network::openai) async fn best_remote_context_length(
+    node: &mesh::Node,
+    model: &str,
+    hosts: &[iroh::EndpointId],
+) -> Option<u32> {
+    let mut best = None;
+    for host in hosts {
+        if let Some(context) = node.peer_model_context_length(*host, model).await {
+            best = Some(best.map_or(context, |current: u32| current.max(context)));
+        }
+    }
+    best
+}
+
+pub(in crate::network::openai) async fn best_remote_latency_ms(
+    node: &mesh::Node,
+    hosts: &[iroh::EndpointId],
+) -> Option<u32> {
+    let latencies = remote_latency_map(node).await;
+    hosts
+        .iter()
+        .filter_map(|host| latencies.get(host).copied())
+        .min()
+}
+
+async fn remote_latency_map(node: &mesh::Node) -> HashMap<iroh::EndpointId, u32> {
+    node.peers()
+        .await
+        .into_iter()
+        .filter_map(|peer| {
+            let latency = peer.display_latency().latency_ms?;
+            Some((peer.id, latency))
+        })
+        .collect()
 }
 
 pub(in crate::network::openai) fn virtual_mesh_context_length(

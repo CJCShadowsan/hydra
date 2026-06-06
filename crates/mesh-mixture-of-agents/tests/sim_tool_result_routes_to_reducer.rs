@@ -48,6 +48,60 @@ struct RecordingBackend {
     calls: AtomicUsize,
 }
 
+struct ToolSchemaFailBackend {
+    calls_with_tools: AtomicUsize,
+    calls_without_tools: AtomicUsize,
+}
+
+impl ToolSchemaFailBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls_with_tools: AtomicUsize::new(0),
+            calls_without_tools: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls_with_tools(&self) -> usize {
+        self.calls_with_tools.load(Ordering::SeqCst)
+    }
+
+    fn calls_without_tools(&self) -> usize {
+        self.calls_without_tools.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl moa::ModelBackend for ToolSchemaFailBackend {
+    async fn chat_completion(
+        &self,
+        _model: &str,
+        messages: &[Value],
+        tools: Option<&Value>,
+        _max_tokens: u32,
+        _timeout: Duration,
+        _sampling: moa::SamplingParams,
+    ) -> Result<Value, String> {
+        if tools.is_some() {
+            self.calls_with_tools.fetch_add(1, Ordering::SeqCst);
+            return Err("tool grammar rejected request".to_string());
+        }
+
+        if messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                || message.get("tool_calls").is_some()
+        }) {
+            return Err("native tool messages leaked into answer-only retry".to_string());
+        }
+
+        self.calls_without_tools.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "choices": [{
+                "message": {"content": "The tool output lists file_a.log and file_b.log."}
+            }],
+        }))
+    }
+}
+
 impl RecordingBackend {
     fn new(text: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
@@ -132,6 +186,74 @@ fn read_file_tool() -> Value {
             }
         }
     }])
+}
+
+#[tokio::test]
+async fn tool_result_retries_answer_only_when_schema_reducer_fails() {
+    let backend = ToolSchemaFailBackend::new();
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": read_file_tool(),
+        "messages": [
+            {"role": "user", "content": "Summarize the tool output."},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"/tmp\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "file_a.log\nfile_b.log\n"},
+        ],
+        "max_tokens": 64,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(backend.calls_with_tools(), 1);
+    assert_eq!(
+        backend.calls_without_tools(),
+        1,
+        "schema-backed reducer failure must retry once without native tools"
+    );
+    assert_eq!(result.reducer_attempts, 2);
+    assert!(
+        result.response_body.get("error").is_none(),
+        "tool-result answer-only fallback should not surface a MoA error: {}",
+        result.response_body
+    );
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("stop")
+    );
+    assert!(
+        result
+            .response_body
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("file_a.log")
+    );
 }
 
 #[tokio::test]

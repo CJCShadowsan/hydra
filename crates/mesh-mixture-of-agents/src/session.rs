@@ -77,7 +77,7 @@ impl Session {
     /// pairing them into `pending_tools` so the reducer-side context packer
     /// can surface tool outputs.
     pub fn ingest(&mut self, messages: &[Value], tools: &Option<Value>) {
-        self.tools = tools.clone();
+        self.tools = tools.as_ref().map(normalize_tool_schemas);
         self.messages = messages.to_vec();
 
         // Rebuild `pending_tools` from the canonical history. Previously
@@ -306,6 +306,44 @@ impl Session {
     }
 }
 
+fn normalize_tool_schemas(tools: &Value) -> Value {
+    let Some(items) = tools.as_array() else {
+        return tools.clone();
+    };
+
+    Value::Array(items.iter().map(normalize_tool_schema).collect())
+}
+
+fn normalize_tool_schema(tool: &Value) -> Value {
+    if tool.get("type").and_then(Value::as_str) == Some("function")
+        && tool.get("function").and_then(Value::as_object).is_some()
+    {
+        return tool.clone();
+    }
+
+    let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        return tool.clone();
+    };
+
+    let mut function = serde_json::Map::new();
+    function.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(description) = tool.get("description").cloned() {
+        function.insert("description".to_string(), description);
+    }
+    if let Some(parameters) = tool
+        .get("parameters")
+        .or_else(|| tool.get("input_schema"))
+        .cloned()
+    {
+        function.insert("parameters".to_string(), parameters);
+    }
+
+    serde_json::json!({
+        "type": "function",
+        "function": Value::Object(function),
+    })
+}
+
 /// Extract text content from a message (handles both string and multipart).
 fn extract_text_content(msg: &Value) -> Option<String> {
     if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
@@ -408,6 +446,41 @@ mod tests {
             ])),
         );
         assert_eq!(s.tool_names(), vec!["read_file", "web_search"]);
+    }
+
+    #[test]
+    fn flat_openclaw_tools_are_normalized_to_openai_function_tools() {
+        let mut s = Session::new();
+        s.ingest(
+            &[json!({"role": "user", "content": "Use read on /tmp/a.txt"})],
+            &Some(json!([{
+                "name": "read",
+                "description": "Read the contents of a file.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "number"},
+                        "limit": {"type": "number"}
+                    }
+                }
+            }])),
+        );
+
+        assert_eq!(s.tool_names(), vec!["read"]);
+        assert_eq!(
+            s.tools()
+                .and_then(|tools| tools.pointer("/0/function/name"))
+                .and_then(Value::as_str),
+            Some("read")
+        );
+        assert_eq!(
+            s.tools()
+                .and_then(|tools| tools.pointer("/0/function/parameters/required/0"))
+                .and_then(Value::as_str),
+            Some("path")
+        );
     }
 
     #[test]

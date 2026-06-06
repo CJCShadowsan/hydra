@@ -13,10 +13,20 @@
 use crate::inference::election;
 use crate::mesh;
 use crate::network::openai::transport as proxy;
+use context_budget::moa_required_tokens;
 use mesh_mixture_of_agents as moa;
 use progress::ProgressContinuation;
+use remote_backend::RemoteModelBackend;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+
+const MOA_LOCAL_INFLIGHT_SOFT_LIMIT: u64 = 3;
+const MOA_MAX_WORKERS: usize = 3;
+const MOA_REMOTE_PEER_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+const MOA_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+const MOA_REDUCER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+const MOA_FIRST_ANSWER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const MOA_NEAR_PEER_LATENCY_MS: u32 = 50;
 
 /// Detect `model: "mesh"`, build a mesh-wide MoA config, run the turn,
 /// and write the HTTP response (JSON or SSE) directly to the stream.
@@ -52,6 +62,8 @@ pub async fn try_handle_moa(
 
     let enable_thinking = effective_enable_thinking_for_moa(&body_json);
 
+    let required_tokens = moa_required_tokens(&body_json, required_tokens);
+    let _inflight = node.begin_inflight_request();
     let Some(mut config) = build_moa_config(node, targets, required_tokens).await else {
         let _ = proxy::send_503(tcp_stream, "MoA requires ≥2 models available in the mesh").await;
         return None;
@@ -76,8 +88,10 @@ fn effective_enable_thinking_for_moa(body: &serde_json::Value) -> Option<bool> {
     extract_enable_thinking_override(body).or(Some(false))
 }
 
+mod context_budget;
 pub(in crate::network::openai) mod context_selection;
 mod progress;
+mod remote_backend;
 
 /// Pull the caller's "disable / enable thinking" preference out of an
 /// inbound chat-completion or responses JSON body. Mirrors the same
@@ -369,37 +383,15 @@ pub async fn build_moa_config(
     let mut backends: Vec<std::sync::Arc<dyn moa::ModelBackend>> = Vec::new();
     let mut models: Vec<moa::ModelEntry> = Vec::new();
     let mut local_count = 0usize;
+    let resolution = WorkerBackendResolution {
+        node,
+        targets,
+        http: &http,
+        required_tokens,
+    };
 
-    // Full mesh-wide model list (local + every peer's advertised
-    // routable models).
-    let all_models: Vec<String> = node
-        .models_being_served()
-        .await
-        .into_iter()
-        .filter(|n| n != moa::VIRTUAL_MODEL_NAME)
-        .collect();
-
-    // Group aliases by canonical base. The old shape sorted by name
-    // length, took the *first* alias per base, and dropped the rest —
-    // which silently dropped the model from the worker pool whenever the
-    // shortest-named peer was unreachable (regression flagged by PR #566
-    // review). Now we keep every alias per base and try them in order so
-    // a longer-named reachable alias can still resolve when the shortest
-    // one is offline.
-    let groups = group_aliases_by_canonical_base(all_models, targets);
-    for aliases in groups {
-        resolve_one_worker_from_aliases(
-            node,
-            targets,
-            &http,
-            &aliases,
-            required_tokens,
-            &mut backends,
-            &mut models,
-            &mut local_count,
-        )
-        .await;
-    }
+    let total_groups =
+        add_ranked_worker_backends(&resolution, &mut backends, &mut models, &mut local_count).await;
 
     if models.len() < 2 {
         tracing::warn!(
@@ -412,8 +404,9 @@ pub async fn build_moa_config(
 
     tracing::info!(
         required_tokens = ?required_tokens,
-        "MoA config: {} workers ({} local, {} remote): {:?}",
+        "MoA config: {} workers from {} model group(s) ({} local, {} remote): {:?}",
         models.len(),
+        total_groups,
         local_count,
         models.len() - local_count,
         models.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
@@ -422,21 +415,12 @@ pub async fn build_moa_config(
     Some(moa::GatewayConfig {
         backends,
         models,
-        // Bumped from 15s → 60s. 15s was tight for big-context interactive
-        // turns: a large model with a 10–20k-token prompt and tool schema
-        // (typical for agent harnesses like OpenCode/Goose) can need 20–30s
-        // just to produce a first tool-call. Workers were getting killed
-        // mid-inference and MoA reported `kind=early-exit` with the small
-        // worker, never the strong one. 60s gives the strong worker room
-        // to land without making the no-progress wait painful.
-        worker_timeout: std::time::Duration::from_secs(60),
-        // Per-attempt cap; hedged_reducer_call hedges across candidates so the
-        // end-to-end wait is roughly reducer_timeout + a couple of hedge delays.
-        reducer_timeout: std::time::Duration::from_secs(60),
-        // Start a second reducer candidate after 5s if the first hasn't replied
-        // (or sooner on outright failure). Cheap on the happy path, big win on
-        // the cold-KV / stale-peer tail.
-        hedge_delay: std::time::Duration::from_secs(5),
+        // OpenClaw/Telegram agent lanes commonly surface provider failure
+        // around 75s. Keep MoA's worst normal path under that: bounded worker
+        // set, 25s worker phase, then a 25s hedged reducer phase.
+        worker_timeout: MOA_WORKER_TIMEOUT,
+        reducer_timeout: MOA_REDUCER_TIMEOUT,
+        hedge_delay: MOA_REMOTE_PEER_HEDGE_DELAY,
         // Chat-only grace: after this long since dispatch, if at least
         // one qualifying Answer is in hand we ship the highest-confidence
         // one. Tool turns bypass this entirely (consensus continues to
@@ -457,7 +441,7 @@ pub async fn build_moa_config(
         // With the relaxed eligibility added in this change, the timer
         // is the dominant chat path, so a tighter default is the right
         // default.
-        first_answer_grace: std::time::Duration::from_secs(3),
+        first_answer_grace: MOA_FIRST_ANSWER_GRACE,
         // Defaults to leaving each model's thinking behavior alone.
         // `try_handle_moa` overrides this from the inbound request body
         // when the caller has expressed a preference
@@ -468,31 +452,83 @@ pub async fn build_moa_config(
 
 /// Try each alias in `aliases` until one resolves to a backend, then stop.
 ///
-/// Aliases are pre-sorted by `group_aliases_by_canonical_base` so the most
-/// preferred (locally-served first, then shortest) is tried first. Falls
-/// back to longer aliases when the preferred one's peer is unreachable.
-#[allow(clippy::too_many_arguments)]
+/// Aliases are ranked by the best known context length available for that
+/// public model ID. This keeps a small local or low-latency alias from hiding
+/// a larger same-family peer when OpenClaw asks for the virtual `mesh` model.
+async fn add_ranked_worker_backends(
+    resolution: &WorkerBackendResolution<'_>,
+    backends: &mut Vec<std::sync::Arc<dyn moa::ModelBackend>>,
+    models: &mut Vec<moa::ModelEntry>,
+    local_count: &mut usize,
+) -> usize {
+    let all_models: Vec<String> = resolution
+        .node
+        .models_being_served()
+        .await
+        .into_iter()
+        .filter(|n| n != moa::VIRTUAL_MODEL_NAME)
+        .collect();
+    let groups = rank_worker_groups(
+        resolution.node,
+        resolution.targets,
+        group_aliases_by_canonical_base(all_models, resolution.targets),
+    )
+    .await;
+    let total_groups = groups.len();
+    for aliases in groups {
+        resolve_one_worker_from_aliases(resolution, &aliases, backends, models, local_count).await;
+        if models.len() >= MOA_MAX_WORKERS {
+            break;
+        }
+    }
+    total_groups
+}
+
 async fn resolve_one_worker_from_aliases(
-    node: &mesh::Node,
-    targets: Option<&election::ModelTargets>,
-    http: &reqwest::Client,
+    resolution: &WorkerBackendResolution<'_>,
     aliases: &[String],
-    required_tokens: Option<u32>,
     backends: &mut Vec<std::sync::Arc<dyn moa::ModelBackend>>,
     models: &mut Vec<moa::ModelEntry>,
     local_count: &mut usize,
 ) {
-    let resolution = WorkerBackendResolution {
-        node,
-        targets,
-        http,
-        required_tokens,
-    };
-    for name in aliases {
-        if add_worker_backend(&resolution, name, backends, models, local_count).await {
+    let ranked_aliases = rank_worker_aliases(resolution.node, resolution.targets, aliases).await;
+    for name in &ranked_aliases {
+        if add_worker_backend(resolution, name, backends, models, local_count).await {
             return;
         }
     }
+}
+
+async fn rank_worker_aliases(
+    node: &mesh::Node,
+    targets: Option<&election::ModelTargets>,
+    aliases: &[String],
+) -> Vec<String> {
+    let mut ranked = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let local_context = if is_locally_served(alias, targets) {
+            node.local_model_context_length(alias).await
+        } else {
+            None
+        };
+        let remote_hosts = node.hosts_for_model(alias).await;
+        let remote_context =
+            context_selection::best_remote_context_length(node, alias, &remote_hosts).await;
+        ranked.push((
+            alias.clone(),
+            local_context.into_iter().chain(remote_context).max(),
+            is_locally_served(alias, targets),
+        ));
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.len().cmp(&right.0.len()))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.into_iter().map(|(alias, _, _)| alias).collect()
 }
 
 /// Group all advertised model names by their canonical base so each
@@ -533,7 +569,8 @@ fn group_aliases_by_canonical_base(
     // Deterministic group order so the worker list is stable across
     // builds even though HashMap iteration is not. Sort group entries
     // (locally-served first, then shortest), then sort groups by their
-    // first ("best") alias.
+    // first deterministic alias. The resolver applies context-aware
+    // ranking inside each group before choosing a backend.
     let mut groups: Vec<Vec<String>> = by_base
         .into_values()
         .map(|mut aliases| {
@@ -549,6 +586,102 @@ fn group_aliases_by_canonical_base(
         .collect();
     groups.sort_by(|a, b| a[0].cmp(&b[0]));
     groups
+}
+
+struct WorkerGroupRank {
+    aliases: Vec<String>,
+    has_local: bool,
+    is_near: bool,
+    best_context: Option<u32>,
+    best_latency_ms: Option<u32>,
+}
+
+async fn rank_worker_groups(
+    node: &mesh::Node,
+    targets: Option<&election::ModelTargets>,
+    groups: Vec<Vec<String>>,
+) -> Vec<Vec<String>> {
+    let mut ranked = Vec::with_capacity(groups.len());
+    for aliases in groups {
+        ranked.push(worker_group_rank(node, targets, aliases).await);
+    }
+    ranked.sort_by(compare_worker_groups);
+    ranked.into_iter().map(|rank| rank.aliases).collect()
+}
+
+async fn worker_group_rank(
+    node: &mesh::Node,
+    targets: Option<&election::ModelTargets>,
+    aliases: Vec<String>,
+) -> WorkerGroupRank {
+    let mut has_local = false;
+    let mut best_context = None;
+    let mut best_latency_ms = None;
+
+    for alias in &aliases {
+        if is_locally_served(alias, targets) {
+            has_local = true;
+            best_context =
+                max_optional_context(best_context, node.local_model_context_length(alias).await);
+            best_latency_ms = Some(0);
+        }
+        let remote_hosts = node.hosts_for_model(alias).await;
+        best_context = max_optional_context(
+            best_context,
+            context_selection::best_remote_context_length(node, alias, &remote_hosts).await,
+        );
+        best_latency_ms = min_optional_latency(
+            best_latency_ms,
+            context_selection::best_remote_latency_ms(node, &remote_hosts).await,
+        );
+    }
+
+    WorkerGroupRank {
+        aliases,
+        has_local,
+        is_near: has_local
+            || best_latency_ms.is_some_and(|latency| latency <= MOA_NEAR_PEER_LATENCY_MS),
+        best_context,
+        best_latency_ms,
+    }
+}
+
+fn compare_worker_groups(left: &WorkerGroupRank, right: &WorkerGroupRank) -> std::cmp::Ordering {
+    right
+        .is_near
+        .cmp(&left.is_near)
+        .then_with(|| right.has_local.cmp(&left.has_local))
+        .then_with(|| {
+            right
+                .best_context
+                .is_some()
+                .cmp(&left.best_context.is_some())
+        })
+        .then_with(|| right.best_context.cmp(&left.best_context))
+        .then_with(|| {
+            left.best_latency_ms
+                .unwrap_or(u32::MAX)
+                .cmp(&right.best_latency_ms.unwrap_or(u32::MAX))
+        })
+        .then_with(|| left.aliases[0].cmp(&right.aliases[0]))
+}
+
+fn max_optional_context(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn min_optional_latency(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 /// Does the local routing table have a backend port for this exact name?
@@ -580,7 +713,38 @@ async fn add_worker_backend(
     models: &mut Vec<moa::ModelEntry>,
     local_count: &mut usize,
 ) -> bool {
-    // Prefer local skippy port when this node serves the model.
+    let remote_hosts = context_selection::select_remote_hosts(
+        resolution.node,
+        name,
+        resolution.required_tokens,
+        resolution.node.hosts_for_model(name).await,
+    )
+    .await;
+
+    if try_add_local_worker(
+        resolution,
+        name,
+        &remote_hosts,
+        backends,
+        models,
+        local_count,
+    )
+    .await
+    {
+        return true;
+    }
+
+    add_remote_worker(resolution, name, remote_hosts, backends, models)
+}
+
+async fn try_add_local_worker(
+    resolution: &WorkerBackendResolution<'_>,
+    name: &str,
+    remote_hosts: &[iroh::EndpointId],
+    backends: &mut Vec<std::sync::Arc<dyn moa::ModelBackend>>,
+    models: &mut Vec<moa::ModelEntry>,
+    local_count: &mut usize,
+) -> bool {
     let local_port = resolution.targets.and_then(|t| {
         t.targets.get(name).and_then(|tv| {
             tv.iter().find_map(|t| match t {
@@ -589,45 +753,51 @@ async fn add_worker_backend(
             })
         })
     });
-    if let Some(port) = local_port {
-        let context_length = resolution.node.local_model_context_length(name).await;
-        if context_selection::context_can_satisfy(resolution.required_tokens, context_length) {
-            let backend_idx = backends.len();
-            backends.push(std::sync::Arc::new(LocalModelBackend {
-                port,
-                http: resolution.http.clone(),
-            }));
-            models.push(moa::ModelEntry {
-                name: name.to_string(),
-                backend_index: backend_idx,
-            });
-            *local_count += 1;
-            return true;
-        } else {
-            tracing::info!(
-                "MoA: skipping local worker {name}; context {:?} cannot fit {:?} required tokens",
-                context_length,
-                resolution.required_tokens
-            );
-        }
+    let Some(port) = local_port else {
+        return false;
+    };
+
+    let context_length = resolution.node.local_model_context_length(name).await;
+    let remote_context =
+        context_selection::best_remote_context_length(resolution.node, name, remote_hosts).await;
+    if should_skip_local_for_inflight(name, resolution.node.inflight_requests()) {
+        return false;
+    }
+    if should_skip_local_for_remote_context(name, context_length, remote_context) {
+        return false;
+    }
+    if should_skip_local_for_required_context(name, resolution.required_tokens, context_length) {
+        return false;
     }
 
-    // Otherwise find a remote host. hosts_for_model returns peers in
-    // hash-preferred order; prefer hosts with enough advertised context.
-    let remote_hosts = resolution.node.hosts_for_model(name).await;
-    if let Some(peer_id) = context_selection::select_remote_host(
-        resolution.node,
-        name,
-        resolution.required_tokens,
-        remote_hosts,
-    )
-    .await
-    {
+    let backend_idx = backends.len();
+    backends.push(std::sync::Arc::new(LocalModelBackend {
+        node: resolution.node.clone(),
+        port,
+        http: resolution.http.clone(),
+    }));
+    models.push(moa::ModelEntry {
+        name: name.to_string(),
+        backend_index: backend_idx,
+    });
+    *local_count += 1;
+    true
+}
+
+fn add_remote_worker(
+    resolution: &WorkerBackendResolution<'_>,
+    name: &str,
+    remote_hosts: Vec<iroh::EndpointId>,
+    backends: &mut Vec<std::sync::Arc<dyn moa::ModelBackend>>,
+    models: &mut Vec<moa::ModelEntry>,
+) -> bool {
+    if !remote_hosts.is_empty() {
         let backend_idx = backends.len();
-        backends.push(std::sync::Arc::new(RemoteModelBackend {
-            node: resolution.node.clone(),
-            peer_id,
-        }));
+        backends.push(std::sync::Arc::new(RemoteModelBackend::new(
+            resolution.node.clone(),
+            remote_hosts,
+            MOA_REMOTE_PEER_HEDGE_DELAY,
+        )));
         models.push(moa::ModelEntry {
             name: name.to_string(),
             backend_index: backend_idx,
@@ -635,6 +805,56 @@ async fn add_worker_backend(
         return true;
     }
     false
+}
+
+fn should_skip_local_for_inflight(name: &str, local_inflight: u64) -> bool {
+    if local_inflight >= MOA_LOCAL_INFLIGHT_SOFT_LIMIT {
+        tracing::info!(
+            "MoA: skipping local worker {name}; local inflight {local_inflight} is at/above soft limit {MOA_LOCAL_INFLIGHT_SOFT_LIMIT}"
+        );
+        return true;
+    }
+    false
+}
+
+fn should_skip_local_for_remote_context(
+    name: &str,
+    local_context: Option<u32>,
+    remote_context: Option<u32>,
+) -> bool {
+    if should_prefer_remote_worker(local_context, remote_context) {
+        tracing::info!(
+            "MoA: preferring remote worker {name}; remote context {:?} is better than local context {:?}",
+            remote_context,
+            local_context
+        );
+        return true;
+    }
+    false
+}
+
+fn should_skip_local_for_required_context(
+    name: &str,
+    required_tokens: Option<u32>,
+    local_context: Option<u32>,
+) -> bool {
+    if !context_selection::context_can_satisfy(required_tokens, local_context) {
+        tracing::info!(
+            "MoA: skipping local worker {name}; context {:?} cannot fit {:?} required tokens",
+            local_context,
+            required_tokens
+        );
+        return true;
+    }
+    false
+}
+
+fn should_prefer_remote_worker(local_context: Option<u32>, remote_context: Option<u32>) -> bool {
+    match (local_context, remote_context) {
+        (Some(local), Some(remote)) => remote > local,
+        (None, Some(_)) => true,
+        _ => false,
+    }
 }
 
 /// Canonical name used for cross-peer dedup. Different peers advertise the
@@ -668,6 +888,7 @@ fn canonical_base_name(name: &str) -> String {
 
 /// Backend that calls a local model directly on its skippy HTTP port.
 struct LocalModelBackend {
+    node: mesh::Node,
     port: u16,
     http: reqwest::Client,
 }
@@ -684,6 +905,7 @@ impl moa::ModelBackend for LocalModelBackend {
         sampling: moa::SamplingParams,
     ) -> Result<serde_json::Value, String> {
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", self.port);
+        let _inflight = self.node.begin_inflight_request();
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -719,89 +941,6 @@ impl moa::ModelBackend for LocalModelBackend {
             .await
             .map_err(|e| format!("parse: {e}"))
     }
-}
-
-/// Backend that calls a remote model over the QUIC tunnel.
-struct RemoteModelBackend {
-    node: mesh::Node,
-    peer_id: iroh::EndpointId,
-}
-
-#[async_trait::async_trait]
-impl moa::ModelBackend for RemoteModelBackend {
-    async fn chat_completion(
-        &self,
-        model: &str,
-        messages: &[serde_json::Value],
-        tools: Option<&serde_json::Value>,
-        max_tokens: u32,
-        timeout: std::time::Duration,
-        sampling: moa::SamplingParams,
-    ) -> Result<serde_json::Value, String> {
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": sampling.temperature,
-            "top_p": sampling.top_p,
-            "stream": false,
-            "mesh_hooks": false,
-        });
-        if let Some(tools) = tools {
-            body.as_object_mut()
-                .unwrap()
-                .insert("tools".to_string(), tools.clone());
-        }
-        moa::apply_enable_thinking(&mut body, sampling.enable_thinking);
-        let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("serialize: {e}"))?;
-        let http_request = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             \r\n",
-            body_bytes.len()
-        );
-        let mut raw = http_request.into_bytes();
-        raw.extend_from_slice(&body_bytes);
-
-        tokio::time::timeout(timeout, async {
-            let (mut send, mut recv) = self
-                .node
-                .open_http_tunnel(self.peer_id)
-                .await
-                .map_err(|e| format!("tunnel: {e}"))?;
-            send.write_all(&raw)
-                .await
-                .map_err(|e| format!("send: {e}"))?;
-            send.finish().map_err(|e| format!("finish: {e}"))?;
-            let response = recv
-                .read_to_end(4 * 1024 * 1024)
-                .await
-                .map_err(|e| format!("recv: {e}"))?;
-            parse_quic_http_response(&response)
-        })
-        .await
-        .map_err(|_| format!("remote timeout after {}s", timeout.as_secs()))?
-    }
-}
-
-fn parse_quic_http_response(response: &[u8]) -> Result<serde_json::Value, String> {
-    let s = String::from_utf8_lossy(response);
-    let header_end = s
-        .find("\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
-    let status_line = s[..header_end].lines().next().unwrap_or("");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if status != 200 {
-        return Err(format!("HTTP {status}: {}", moa::truncate_chars(&s, 200)));
-    }
-    let body = &s[header_end + 4..];
-    serde_json::from_str(body).map_err(|e| format!("parse: {e}"))
 }
 
 /// Send the MoA response as a one-shot SSE stream so SSE-only clients
@@ -945,11 +1084,7 @@ pub(in crate::network::openai::moa_gateway) async fn send_moa_as_sse_inner(
             let framed = format!("{:x}\r\n{}\r\n", data.len(), data);
             stream.write_all(framed.as_bytes()).await?;
             stream.flush().await?;
-            if let Some(delay) = inter_chunk_delay
-                && idx + 1 < pieces.len()
-            {
-                tokio::time::sleep(delay).await;
-            }
+            sleep_between_stream_chunks(inter_chunk_delay, idx, pieces.len()).await;
         }
     }
 
@@ -1092,6 +1227,16 @@ fn content_pieces_for_streaming(
     }
 }
 
+async fn sleep_between_stream_chunks(
+    delay: Option<std::time::Duration>,
+    chunk_idx: usize,
+    chunk_count: usize,
+) {
+    if let (true, Some(delay)) = (chunk_idx + 1 < chunk_count, delay) {
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Emit the MoA response as an OpenAI Responses-API SSE stream so callers
 /// that hit `/v1/responses` with `stream:true` get event shapes their parser
 /// understands.
@@ -1216,11 +1361,7 @@ pub(in crate::network::openai::moa_gateway) async fn send_moa_as_responses_sse_i
         let framed = format!("{:x}\r\n{}\r\n", data.len(), data);
         stream.write_all(framed.as_bytes()).await?;
         stream.flush().await?;
-        if let Some(delay) = inter_chunk_delay
-            && idx + 1 < pieces.len()
-        {
-            tokio::time::sleep(delay).await;
-        }
+        sleep_between_stream_chunks(inter_chunk_delay, idx, pieces.len()).await;
     }
 
     let text_done =
@@ -1299,6 +1440,37 @@ mod tests {
             canonical_base_name("unsloth/Qwen3-32B-GGUF:Q4_K_M"),
             canonical_base_name("unsloth/MiniMax-M2.5-GGUF:Q4_K_M")
         );
+    }
+
+    #[test]
+    fn worker_group_ranking_prefers_near_known_candidate_over_distant_large_candidate() {
+        let near = WorkerGroupRank {
+            aliases: vec!["unsloth/Qwen3.5-9B-GGUF:Q4_K_M".to_string()],
+            has_local: false,
+            is_near: true,
+            best_context: Some(32_768),
+            best_latency_ms: Some(2),
+        };
+        let distant_large = WorkerGroupRank {
+            aliases: vec!["unsloth/MiniMax-M2.5-GGUF:Q4_K_M".to_string()],
+            has_local: false,
+            is_near: false,
+            best_context: Some(131_072),
+            best_latency_ms: Some(350),
+        };
+        let mut groups = vec![distant_large, near];
+
+        groups.sort_by(compare_worker_groups);
+
+        assert_eq!(groups[0].aliases[0], "unsloth/Qwen3.5-9B-GGUF:Q4_K_M");
+    }
+
+    #[test]
+    fn optional_rank_helpers_keep_best_context_and_latency() {
+        assert_eq!(max_optional_context(Some(8), Some(32)), Some(32));
+        assert_eq!(max_optional_context(None, Some(32)), Some(32));
+        assert_eq!(min_optional_latency(Some(300), Some(2)), Some(2));
+        assert_eq!(min_optional_latency(None, Some(2)), Some(2));
     }
 
     #[test]

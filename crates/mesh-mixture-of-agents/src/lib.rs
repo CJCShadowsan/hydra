@@ -106,6 +106,8 @@ pub enum TurnKind {
     Fanout,
     /// Fan-out path with early-exit consensus before all workers returned.
     EarlyExit,
+    /// Explicit or safely inferred tool intent returned a native tool call directly.
+    DirectTool,
     /// Tool-result turn: skipped fan-out, went straight to reducer.
     ToolResult,
     /// All workers failed and no reducer recovery happened.
@@ -118,6 +120,7 @@ impl TurnKind {
         match self {
             Self::Fanout => "fanout",
             Self::EarlyExit => "early-exit",
+            Self::DirectTool => "direct-tool",
             Self::ToolResult => "tool-result",
             Self::Failed => "failed",
         }
@@ -242,6 +245,26 @@ async fn handle_query(
     } else {
         Vec::new()
     };
+    let intent_required_tool = if forced_tool.is_none() && query_uses_tools {
+        required_tool_choice_for_intent(session, &tools_value(session), &selected_tool_names)
+    } else {
+        None
+    };
+    let required_tool = forced_tool.or(intent_required_tool.as_ref());
+    if let Some(tool) = required_tool.filter(|_| has_tools) {
+        tracing::info!(
+            "moa: direct tool call for explicit {} intent",
+            tool.name.as_str()
+        );
+        return TurnResult {
+            response_body: tool_call_response(&tool.name, &tool.fallback_arguments),
+            worker_summaries: Vec::new(),
+            reducer_used: false,
+            reducer_attempts: 0,
+            turn_kind: TurnKind::DirectTool,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        };
+    }
 
     tracing::info!(
         "moa: dispatching to {} workers: [{}]",
@@ -325,7 +348,7 @@ async fn handle_query(
             outputs: &outputs,
             has_tools: query_uses_tools,
             selected_tool_names: &selected_tool_names,
-            forced_tool,
+            forced_tool: required_tool,
             allowed_tools,
         },
     )
@@ -492,6 +515,35 @@ fn tool_name_is_explicitly_requested(tool: &str, text: &str) -> bool {
     patterns.iter().any(|pattern| text.contains(pattern))
 }
 
+fn tools_value(session: &Session) -> Option<Value> {
+    session.tools().cloned()
+}
+
+fn required_tool_choice_for_intent(
+    session: &Session,
+    tools: &Option<Value>,
+    selected_tool_names: &[String],
+) -> Option<ForcedToolChoice> {
+    let [name] = selected_tool_names else {
+        return None;
+    };
+
+    let inferred =
+        infer_tool_arguments_from_prompt(name, tools.as_ref(), &session.last_user_text());
+    match sanitize_tool_arguments_for_tool(name, &inferred, tools.as_ref()) {
+        Ok(arguments) => Some(ForcedToolChoice {
+            name: name.clone(),
+            fallback_arguments: arguments,
+        }),
+        Err(err) => {
+            tracing::info!(
+                "moa: explicit tool intent selected {name}, but arguments could not be inferred: {err}"
+            );
+            None
+        }
+    }
+}
+
 fn recent_tool_chain_names(session: &Session) -> Vec<String> {
     let all = session.all_messages();
     let Some(latest_tool_idx) = all.iter().rposition(|msg| message_role(msg) == "tool") else {
@@ -645,7 +697,10 @@ fn infer_string_argument(field: &str, schema: &Value, prompt: &str) -> Option<St
         return None;
     }
 
-    infer_enum_argument(schema, prompt).or_else(|| infer_assignment_argument(field, prompt))
+    infer_enum_argument(schema, prompt)
+        .or_else(|| infer_assignment_argument(field, prompt))
+        .or_else(|| infer_path_like_argument(field, prompt))
+        .or_else(|| infer_query_argument(field, prompt))
 }
 
 fn schema_allows_string(schema: &Value) -> bool {
@@ -673,13 +728,60 @@ fn infer_assignment_argument(field: &str, prompt: &str) -> Option<String> {
     let field_lc = field.to_ascii_lowercase();
     let marker = format!("{field_lc}=");
     let start = prompt_lc.find(&marker)? + marker.len();
-    let tail = prompt_lc.get(start..)?;
+    let tail = prompt.get(start..)?;
     let value = tail
         .split(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == ';')
         .next()
         .unwrap_or("")
         .trim_matches(|c| c == '"' || c == '\'' || c == '`');
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn infer_path_like_argument(field: &str, prompt: &str) -> Option<String> {
+    let field = field.to_ascii_lowercase();
+    let wants_path = contains_any(&field, &["path", "file", "url", "uri"]);
+    if !wants_path {
+        return None;
+    }
+
+    prompt
+        .split_whitespace()
+        .map(clean_path_token)
+        .find(|candidate| is_path_like_candidate(candidate, &field))
+}
+
+fn clean_path_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches(['.', ',', ';', ':', ')', ']', '}'])
+        .to_string()
+}
+
+fn is_path_like_candidate(candidate: &str, field: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    if candidate.contains("://") {
+        return field.contains("url") || field.contains("uri") || field.contains("path");
+    }
+    candidate.starts_with('/')
+        || candidate.starts_with("~/")
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+}
+
+fn infer_query_argument(field: &str, prompt: &str) -> Option<String> {
+    let field = field.to_ascii_lowercase();
+    if !matches!(field.as_str(), "q" | "query" | "search" | "search_query") {
+        return None;
+    }
+    let prompt = prompt.trim();
+    (!prompt.is_empty()).then(|| prompt.to_string())
 }
 
 fn tool_parameters<'a>(tool_name: &str, tools: Option<&'a Value>) -> Option<&'a Value> {
@@ -731,8 +833,8 @@ async fn handle_tool_result(
     let hedge_result = hedged_reducer_call(
         &config.backends,
         candidates.clone(),
-        messages,
-        tools,
+        messages.clone(),
+        tools.clone(),
         config.reducer_timeout,
         config.hedge_delay,
         config.enable_thinking,
@@ -740,28 +842,71 @@ async fn handle_tool_result(
     .await;
 
     let mut last_err: Option<String> = None;
-    let (attempts, chosen): (u32, Option<(String, normalize::WorkerOutput)>) = match hedge_result {
-        Ok(reducer::HedgedReducerOk {
-            winner,
-            text,
-            attempts: spawned,
-        }) => {
-            let mut reduced =
-                normalize::normalize_worker_output(&text, &winner, WorkerRole::Reducer, 0);
-            enforce_tool_call_contract(&mut reduced, allowed_tools, session.tools(), &winner);
-            (spawned, Some((winner, reduced)))
-        }
-        Err(reducer::HedgedReducerErr {
-            err,
-            attempts: spawned,
-        }) => {
-            last_err = Some(err);
-            (spawned, None)
-        }
-    };
+    let (attempts, chosen): (u32, Option<(String, normalize::WorkerOutput, bool)>) =
+        match hedge_result {
+            Ok(reducer::HedgedReducerOk {
+                winner,
+                text,
+                attempts: spawned,
+            }) => {
+                let mut reduced =
+                    normalize::normalize_worker_output(&text, &winner, WorkerRole::Reducer, 0);
+                enforce_tool_call_contract(&mut reduced, allowed_tools, session.tools(), &winner);
+                (spawned, Some((winner, reduced, tools_enabled_for_reducer)))
+            }
+            Err(reducer::HedgedReducerErr {
+                err,
+                attempts: spawned,
+            }) => {
+                last_err = Some(err);
+                if tools.is_some() {
+                    let fallback_messages = context::pack_for_tool_result_answer_only(session);
+                    tracing::warn!(
+                        "moa: tool-result reducers failed with native tools; retrying answer-only reducer"
+                    );
+                    match hedged_reducer_call(
+                        &config.backends,
+                        candidates.clone(),
+                        fallback_messages,
+                        None,
+                        config.reducer_timeout,
+                        config.hedge_delay,
+                        config.enable_thinking,
+                    )
+                    .await
+                    {
+                        Ok(reducer::HedgedReducerOk {
+                            winner,
+                            text,
+                            attempts: retry_attempts,
+                        }) => {
+                            let reduced = normalize::normalize_worker_output(
+                                &text,
+                                &winner,
+                                WorkerRole::Reducer,
+                                0,
+                            );
+                            (
+                                spawned.saturating_add(retry_attempts),
+                                Some((winner, reduced, false)),
+                            )
+                        }
+                        Err(reducer::HedgedReducerErr {
+                            err,
+                            attempts: retry_attempts,
+                        }) => {
+                            last_err = Some(err);
+                            (spawned.saturating_add(retry_attempts), None)
+                        }
+                    }
+                } else {
+                    (spawned, None)
+                }
+            }
+        };
 
     let (reducer_name, succeeded, response_body) = match chosen {
-        Some((name, reduced)) => {
+        Some((name, reduced, response_tools_enabled)) => {
             // Be consistent with the fanout/arbiter path: emit a real
             // `tool_calls` response whenever the reducer named a tool,
             // even if `arguments` is missing. The fanout path emits `{}`
@@ -772,7 +917,7 @@ async fn handle_tool_result(
             // missing / non-object arguments to `"{}"`.
             let body = match reduced.kind {
                 normalize::OutputKind::ToolProposal => {
-                    tool_proposal_response(&reduced, tools_enabled_for_reducer)
+                    tool_proposal_response(&reduced, response_tools_enabled)
                 }
                 normalize::OutputKind::Uncertainty => error_response(
                     "MoA reducer returned no usable answer",
@@ -926,7 +1071,10 @@ fn append_tool_loop_answer_instruction(messages: &mut [Value], tool: &str, count
          Answer now from the gathered tool results. Do not call another tool. \
          If the evidence is incomplete, say what can be determined and what is missing."
     );
+    append_system_instruction(messages, &instruction);
+}
 
+fn append_system_instruction(messages: &mut [Value], instruction: &str) {
     let system_content = messages
         .iter_mut()
         .find(|msg| msg.get("role").and_then(Value::as_str) == Some("system"))
@@ -936,7 +1084,7 @@ fn append_tool_loop_answer_instruction(messages: &mut [Value], tool: &str, count
         });
     if let Some((system, content)) = system_content {
         let mut updated = content.to_string();
-        updated.push_str(&instruction);
+        updated.push_str(instruction);
         system["content"] = Value::String(updated);
     }
 }
@@ -1508,7 +1656,121 @@ mod response_builder_tests {
             "Use key=Primary",
         );
 
-        assert_eq!(args, json!({"key": "primary"}));
+        assert_eq!(args, json!({"key": "Primary"}));
+    }
+
+    #[test]
+    fn tool_argument_inference_extracts_absolute_path() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        }]));
+
+        let args = infer_tool_arguments_from_prompt(
+            "read",
+            tools.as_ref(),
+            "Use the read tool to read /tmp/openclaw_moa_probe.txt.",
+        );
+
+        assert_eq!(args, json!({"path": "/tmp/openclaw_moa_probe.txt"}));
+    }
+
+    #[test]
+    fn explicit_single_tool_intent_becomes_required_tool_choice() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        }]));
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use the read tool to read /tmp/openclaw_moa_probe.txt."
+            })],
+            &tools,
+        );
+
+        let selected = vec!["read".to_string()];
+        let required =
+            required_tool_choice_for_intent(&session, &tools, &selected).expect("required tool");
+
+        assert_eq!(required.name, "read");
+        assert_eq!(
+            required.fallback_arguments,
+            json!({"path": "/tmp/openclaw_moa_probe.txt"})
+        );
+    }
+
+    #[tokio::test]
+    async fn inferred_required_tool_intent_short_circuits_workers() {
+        let body = serde_json::json!({
+            "model": VIRTUAL_MODEL_NAME,
+            "messages": [{
+                "role": "user",
+                "content": "Use the read tool to read /tmp/openclaw_moa_probe.txt."
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }
+                }
+            }]
+        });
+        let config = GatewayConfig {
+            backends: Vec::new(),
+            models: Vec::new(),
+            worker_timeout: Duration::from_secs(1),
+            reducer_timeout: Duration::from_secs(1),
+            hedge_delay: Duration::from_millis(10),
+            first_answer_grace: Duration::from_millis(10),
+            enable_thinking: Some(false),
+        };
+
+        let result = handle_turn(&config, &body).await;
+
+        assert_eq!(result.turn_kind, TurnKind::DirectTool);
+        assert!(result.worker_summaries.is_empty());
+        assert!(!result.reducer_used);
+        assert_eq!(
+            result
+                .response_body
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            result
+                .response_body
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("read")
+        );
+        assert_eq!(
+            result
+                .response_body
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"path\":\"/tmp/openclaw_moa_probe.txt\"}")
+        );
     }
 
     #[tokio::test]

@@ -7,8 +7,8 @@
 //! and varies the depth per role:
 //!
 //! - Fast:       system prompt + last user msg + optional tool names
-//! - Specialist: system prompt + last 4 msgs + optional tool summaries/schemas
-//! - Strong:     system prompt + last 10 msgs + optional full tool schemas
+//! - Specialist: system prompt + last 3 msgs + optional tool summaries/schemas
+//! - Strong:     system prompt + last 4 msgs + optional full tool schemas
 //! - Reducer:    system prompt + worker outputs + optional full tool schemas
 
 use crate::normalize::WorkerOutput;
@@ -23,6 +23,13 @@ const TOOL_RESULT_RAW_MAX_CHARS: usize = 2_400;
 const TOOL_RESULT_JSON_MAX_SCALARS: usize = 48;
 const TOOL_RESULT_JSON_MAX_ARRAY_ITEMS: usize = 12;
 const TOOL_RESULT_SCALAR_MAX_CHARS: usize = 180;
+const SYSTEM_CONTEXT_MAX_CHARS: usize = 6_000;
+const FAST_USER_CONTEXT_MAX_CHARS: usize = 3_000;
+const SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS: usize = 2_000;
+const STRONG_MESSAGE_CONTEXT_MAX_CHARS: usize = 2_000;
+const REDUCER_USER_CONTEXT_MAX_CHARS: usize = 6_000;
+const SPECIALIST_CONTEXT_WINDOW: usize = 3;
+const STRONG_CONTEXT_WINDOW: usize = 4;
 
 /// Packed context ready to send to a worker.
 pub struct PackedContext {
@@ -68,7 +75,7 @@ const MOA_PREAMBLE: &str = "\
 Respond with your best answer or tool call. Be direct.]";
 
 fn augmented_system_prompt_for_mode(session: &Session, include_tool_guidance: bool) -> String {
-    match session.system_prompt() {
+    let prompt = match session.system_prompt() {
         Some(sp) => {
             let prompt = if include_tool_guidance {
                 sp
@@ -78,7 +85,8 @@ fn augmented_system_prompt_for_mode(session: &Session, include_tool_guidance: bo
             format!("{MOA_PREAMBLE}\n\n{prompt}")
         }
         None => MOA_PREAMBLE.to_string(),
-    }
+    };
+    compact_text_for_context(&prompt, SYSTEM_CONTEXT_MAX_CHARS)
 }
 
 fn strip_tool_guidance_sections(prompt: &str) -> String {
@@ -147,7 +155,10 @@ fn pack_fast(session: &Session, has_tools: bool, selected_tool_names: &[String])
     PackedContext {
         messages: vec![
             json!({"role": "system", "content": system}),
-            json!({"role": "user", "content": user_text}),
+            json!({
+                "role": "user",
+                "content": compact_text_for_context(&user_text, FAST_USER_CONTEXT_MAX_CHARS),
+            }),
         ],
         max_tokens: 256,
         tools: None, // Fast worker doesn't get tool schemas — just names
@@ -155,7 +166,7 @@ fn pack_fast(session: &Session, has_tools: bool, selected_tool_names: &[String])
 }
 
 // ── Specialist worker ────────────────────────────────────────────────
-// System prompt + last 4 messages + tool name+description summaries.
+// System prompt + last 3 messages + tool name+description summaries.
 
 fn pack_specialist(
     session: &Session,
@@ -168,22 +179,30 @@ fn pack_specialist(
 
     // Recent messages — skip system (already included), skip raw tool results
     // (they'd confuse models that don't have the tool_call context)
-    let recent = session.recent_messages(4);
+    let recent = session.recent_messages(SPECIALIST_CONTEXT_WINDOW);
+    let user_text = session.last_user_text();
+    let mut has_last_user = false;
     for msg in &recent {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "user" || (role == "assistant" && msg.get("tool_calls").is_none()) {
-            messages.push(msg.clone());
+            has_last_user |= role == "user"
+                && msg.get("content").and_then(Value::as_str) == Some(user_text.as_str());
+            messages.push(compact_chat_message(
+                msg,
+                SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS,
+            ));
         }
     }
 
     // Ensure the last message is the current user turn
-    let user_text = session.last_user_text();
-    if messages
-        .last()
-        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-        != Some(&user_text)
-    {
-        messages.push(json!({"role": "user", "content": user_text}));
+    if !has_last_user {
+        messages.push(json!({
+            "role": "user",
+            "content": compact_text_for_context(
+                &user_text,
+                SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS,
+            ),
+        }));
     }
 
     PackedContext {
@@ -194,7 +213,7 @@ fn pack_specialist(
 }
 
 // ── Strong worker ────────────────────────────────────────────────────
-// System prompt + last 10 messages + full tool schemas forwarded natively.
+// System prompt + last 4 messages + full tool schemas forwarded natively.
 // This worker gets the deepest context and the actual tool definitions so
 // it can produce native tool_calls if the backend supports it.
 
@@ -209,21 +228,23 @@ fn pack_strong(
 
     // Deep recent history — include tool result messages too since this
     // worker gets full tool schemas and can understand the context
-    let recent = session.recent_messages(10);
+    let recent = session.recent_messages(STRONG_CONTEXT_WINDOW);
+    let user_text = session.last_user_text();
+    let mut has_last_user = false;
     for msg in &recent {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role != "system" && !role.is_empty() {
-            messages.push(msg.clone());
+            has_last_user |= role == "user"
+                && msg.get("content").and_then(Value::as_str) == Some(user_text.as_str());
+            messages.push(compact_chat_message(msg, STRONG_MESSAGE_CONTEXT_MAX_CHARS));
         }
     }
 
-    let user_text = session.last_user_text();
-    if messages
-        .last()
-        .and_then(|m| m.get("content").and_then(|c| c.as_str()))
-        != Some(&user_text)
-    {
-        messages.push(json!({"role": "user", "content": user_text}));
+    if !has_last_user {
+        messages.push(json!({
+            "role": "user",
+            "content": compact_text_for_context(&user_text, STRONG_MESSAGE_CONTEXT_MAX_CHARS),
+        }));
     }
 
     // Forward the real tool schemas — the strong worker can produce native
@@ -296,7 +317,10 @@ pub fn pack_for_reducer_selected(
     (
         vec![
             json!({"role": "system", "content": system_parts.join("\n")}),
-            json!({"role": "user", "content": user_text}),
+            json!({
+                "role": "user",
+                "content": compact_text_for_context(&user_text, REDUCER_USER_CONTEXT_MAX_CHARS),
+            }),
         ],
         tools,
     )
@@ -459,13 +483,58 @@ pub fn pack_for_tool_result_turn_selected(
     for msg in &all[start_idx..] {
         let role = message_role(msg);
         if role != "system" && !role.is_empty() {
-            messages.push(compact_tool_message(msg));
+            messages.push(compact_chat_message(
+                &compact_tool_message(msg),
+                STRONG_MESSAGE_CONTEXT_MAX_CHARS,
+            ));
         }
     }
 
     let tools = selected_tools(session, has_tools, selected_tool_names);
 
     (messages, tools)
+}
+
+/// Build an answer-only context for tool-result fallback.
+///
+/// Some backends reject native OpenAI tool-message grammar even when `tools`
+/// is omitted. This shape preserves completed tool evidence as plain text and
+/// avoids `assistant.tool_calls` / `role: tool` messages entirely.
+pub fn pack_for_tool_result_answer_only(session: &Session) -> Vec<Value> {
+    let mut system = augmented_system_prompt_for_mode(session, false);
+    system.push_str(
+        "\n\nTool result fallback: answer from the completed tool results below. \
+         Do not request another tool call.",
+    );
+
+    let mut user = String::new();
+    let last_user = session.last_user_text();
+    if !last_user.trim().is_empty() {
+        user.push_str("User request:\n");
+        user.push_str(&compact_text_for_context(
+            &last_user,
+            REDUCER_USER_CONTEXT_MAX_CHARS / 2,
+        ));
+        user.push_str("\n\n");
+    }
+
+    user.push_str("Completed tool results:\n");
+    let results = session.recent_tool_results();
+    let start = results.len().saturating_sub(TOOL_EVIDENCE_MAX_RESULTS);
+    for (tool, result) in &results[start..] {
+        let compacted = compact_tool_result_text(result);
+        let compacted = compact_text_for_context(&compacted, TOOL_EVIDENCE_MAX_RESULT_CHARS);
+        user.push_str("- ");
+        user.push_str(tool);
+        user.push_str(": ");
+        user.push_str(&compacted.replace('\n', "\\n"));
+        user.push('\n');
+    }
+
+    vec![
+        json!({"role": "system", "content": system}),
+        json!({"role": "user", "content": user}),
+    ]
 }
 
 fn tool_evidence_message(session: &Session) -> Option<Value> {
@@ -517,6 +586,54 @@ fn compact_tool_message(msg: &Value) -> Value {
         obj.insert("content".to_string(), Value::String(compacted));
     }
     compact
+}
+
+fn compact_chat_message(msg: &Value, max_chars: usize) -> Value {
+    let Some(content) = msg.get("content").and_then(Value::as_str) else {
+        return msg.clone();
+    };
+    let compacted = compact_text_for_context(content, max_chars);
+    if compacted == content {
+        return msg.clone();
+    }
+    let mut compact = msg.clone();
+    if let Some(obj) = compact.as_object_mut() {
+        obj.insert("content".to_string(), Value::String(compacted));
+    }
+    compact
+}
+
+fn compact_text_for_context(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+
+    let marker = format!(
+        "\n\n[MoA compacted this message from {} chars. Middle content was omitted. \
+         The text after this notice is the preserved ending of the original message.]\n\n",
+        text.len()
+    );
+    if marker.len() >= max_chars {
+        return crate::worker::truncate_chars(text, max_chars).to_string();
+    }
+
+    let remaining = max_chars - marker.len();
+    let head_budget = remaining / 3;
+    let tail_budget = remaining.saturating_sub(head_budget);
+    let head = crate::worker::truncate_chars(text, head_budget);
+    let tail_start = tail_start_at_char_boundary(text, tail_budget);
+    format!("{head}{marker}{}", &text[tail_start..])
+}
+
+fn tail_start_at_char_boundary(text: &str, max_tail_bytes: usize) -> usize {
+    if text.len() <= max_tail_bytes {
+        return 0;
+    }
+    let mut start = text.len().saturating_sub(max_tail_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
 }
 
 fn compact_tool_result_text(result: &str) -> String {
@@ -855,6 +972,34 @@ mod tests {
     }
 
     #[test]
+    fn fast_worker_compacts_large_user_context_and_preserves_tail() {
+        let marker = "FINAL_MARKER_VISIBLE";
+        let large = format!(
+            "{}{}",
+            "context-fill abcdefghijklmnopqrstuvwxyz 0123456789\n".repeat(3200),
+            marker
+        );
+        let s = session_with(&[user_msg(&large)], None);
+
+        let packed = pack_for_worker(&s, WorkerRole::Fast, false);
+        let content = packed.messages[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("user content");
+
+        assert!(
+            content.len() <= FAST_USER_CONTEXT_MAX_CHARS + 256,
+            "fast worker content should be bounded, got {} chars",
+            content.len()
+        );
+        assert!(content.contains("MoA compacted this message"));
+        assert!(
+            content.ends_with(marker),
+            "compaction should preserve the user's tail marker"
+        );
+    }
+
+    #[test]
     fn specialist_worker_has_summaries_and_native_tools() {
         let s = session_with(
             &[
@@ -939,15 +1084,52 @@ mod tests {
             packed.tools.is_some(),
             "strong must receive full native tool schemas",
         );
-        // Strong gets up to last 10 messages on top of the system prompt,
-        // so it should see deeper history than the specialist's 4-message window.
+        // Strong keeps a bounded tail on top of the system prompt; it should
+        // preserve the current turn without dragging a full agent transcript
+        // into every worker call.
         assert!(
-            packed.messages.len() >= 6,
-            "strong worker should retain deep history, got {} messages",
+            packed.messages.len() <= STRONG_CONTEXT_WINDOW + 1,
+            "strong worker should keep a bounded tail, got {} messages",
             packed.messages.len(),
         );
         let last = packed.messages.last().unwrap();
         assert_eq!(last.get("content").and_then(|c| c.as_str()), Some("final"));
+    }
+
+    #[test]
+    fn strong_worker_bounds_accumulated_agent_session_context() {
+        let large = "history ".repeat(2_000);
+        let mut msgs = vec![system_msg(&large)];
+        for idx in 0..12 {
+            msgs.push(user_msg(&format!("{large} user {idx}")));
+            msgs.push(assistant_msg(&format!("{large} assistant {idx}")));
+        }
+        msgs.push(user_msg("latest user request"));
+        let s = session_with(&msgs, Some(tools_two()));
+
+        let packed = pack_for_worker(&s, WorkerRole::Strong, false);
+        let total_chars: usize = packed
+            .messages
+            .iter()
+            .map(|msg| msg.to_string().len())
+            .sum();
+
+        assert!(packed.tools.is_none());
+        assert!(packed.messages.len() <= STRONG_CONTEXT_WINDOW + 1);
+        assert!(
+            total_chars
+                <= SYSTEM_CONTEXT_MAX_CHARS
+                    + (STRONG_CONTEXT_WINDOW * (STRONG_MESSAGE_CONTEXT_MAX_CHARS + 512)),
+            "packed context should stay bounded, got {total_chars} chars",
+        );
+        assert_eq!(
+            packed
+                .messages
+                .last()
+                .and_then(|msg| msg.get("content"))
+                .and_then(Value::as_str),
+            Some("latest user request")
+        );
     }
 
     #[test]
