@@ -871,14 +871,17 @@ with SHA-256
 runbook lives at
 `/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/run-evidence-job-path.sh`,
 with SHA-256
-`1a8cd42010389df0d1ac8936b2c3326b1b11c3021a2b741203ef5c3e1fbe299e`. This plan
+`1a0989f5e730c60967affb64a32c4245dd79007d9da1a7b31ee1a8f88f356bca`. This plan
 records `source_run_dir` as the local `/Volumes/External/...` candidate and
 rebases `run_dir`, `package`, `quantized_model`, and `evidence_dir` under
 `/tmp/skippy-quant-evidence/input/mixed-layer-22-20-21-down-gate-up-proxy`,
-with `runbook_cwd=/workspace/mesh-llm`. On Studio, `evidence-status` correctly
-reports this plan as fully missing with toolchain warnings because the target
-paths and binaries are job-environment contracts. It is a handoff artifact, not
-a completed evidence report.
+with `runbook_cwd=/workspace/mesh-llm`. Its generated runbook uses
+`/tmp/skippy-quant-evidence/input/mixed-layer-22-20-21-down-gate-up-proxy/evidence-plan.json`
+as the in-job evidence-status path, so resumed job runs do not depend on the
+local `/Volumes/External/...` planning path. On Studio, `evidence-status`
+correctly reports this plan as fully missing with toolchain warnings because
+the target paths and binaries are job-environment contracts. It is a handoff
+artifact, not a completed evidence report.
 
 The token-length audit is now configured for the evidence lane's real context
 shape rather than the early proxy profiling shape: `ctx_size=8192`,

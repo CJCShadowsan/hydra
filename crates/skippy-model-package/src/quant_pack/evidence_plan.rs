@@ -70,6 +70,8 @@ pub(super) struct QuantPackEvidencePlanArgs {
     out: Option<PathBuf>,
     #[arg(long)]
     script_out: Option<PathBuf>,
+    #[arg(long)]
+    runbook_plan_path: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -127,6 +129,8 @@ pub(super) struct QuantPackEvidencePlanAllArgs {
     out: Option<PathBuf>,
     #[arg(long)]
     script_out: Option<PathBuf>,
+    #[arg(long)]
+    runbook_plan_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,7 +291,7 @@ pub(super) fn run_quant_pack_evidence_plan(args: QuantPackEvidencePlanArgs) -> R
     if let Some(script_out) = args.script_out.as_deref() {
         write_single_evidence_script(
             script_out,
-            args.out.as_deref(),
+            args.runbook_plan_path.as_deref().or(args.out.as_deref()),
             &args.skippy_model_package_bin,
             &report,
         )?;
@@ -363,7 +367,7 @@ pub(super) fn run_quant_pack_evidence_plan_all(args: QuantPackEvidencePlanAllArg
     if let Some(script_out) = args.script_out.as_deref() {
         write_all_evidence_script(
             script_out,
-            args.out.as_deref(),
+            args.runbook_plan_path.as_deref().or(args.out.as_deref()),
             &args.skippy_model_package_bin,
             &report,
         )?;

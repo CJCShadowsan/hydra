@@ -377,6 +377,11 @@ or Hugging Face Job that downloads the candidate bundle under
 at the execution path. The report keeps `source_run_dir` when this rebasing is
 active, so audits can distinguish the local planning source from the runtime
 artifact location.
+When writing a local runbook for a different execution filesystem, pass
+`--runbook-plan-path` with the plan path that will exist in that execution
+environment. The runbook then uses that path for `evidence-status` warning and
+semantic skip checks, instead of the local `--out` path used to write the JSON
+artifact.
 The generated schema-smoke command writes `focused-runtime-schema-smoke.json`
 from the same split, layer-end, context, KV cache, activation-wire, corpus, and
 lab-option arguments as the measured run, but without launching remote stages.

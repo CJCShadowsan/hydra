@@ -64,6 +64,7 @@ fn evidence_plan_uses_candidate_stage_hints_when_splits_omitted() {
         evidence_dir: None,
         out: Some(report_path.clone()),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect("write evidence plan");
 
@@ -120,6 +121,7 @@ fn evidence_plan_uses_candidate_stage_hints_when_splits_omitted() {
 fn evidence_plan_can_target_different_execution_run_dir() {
     let dir = unique_test_dir("evidence-plan-execution-run-dir");
     let execution_run_dir = PathBuf::from("/job/skippy-evidence/input/studio-local");
+    let execution_plan_path = execution_run_dir.join("evidence-plan.json");
     write_candidate_fixture_with_shape(
         &dir,
         "studio-local",
@@ -129,6 +131,7 @@ fn evidence_plan_can_target_different_execution_run_dir() {
         None,
     );
     let report_path = dir.join("evidence-plan.json");
+    let script_path = dir.join("run-evidence-job.sh");
 
     run_quant_pack_evidence_plan(QuantPackEvidencePlanArgs {
         run: dir.clone(),
@@ -156,7 +159,8 @@ fn evidence_plan_can_target_different_execution_run_dir() {
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
         evidence_dir: None,
         out: Some(report_path.clone()),
-        script_out: None,
+        script_out: Some(script_path.clone()),
+        runbook_plan_path: Some(execution_plan_path.clone()),
     })
     .expect("write evidence plan");
 
@@ -198,6 +202,12 @@ fn evidence_plan_can_target_different_execution_run_dir() {
             .expect("local split shell")
             .contains("/job/skippy-evidence/input/studio-local/model.gguf")
     );
+    let script = fs::read_to_string(&script_path).expect("read evidence script");
+    assert!(script.contains("cd /workspace/mesh-llm"));
+    assert!(script.contains(
+        "skippy-model-package quant-pack evidence-status /job/skippy-evidence/input/studio-local/evidence-plan.json"
+    ));
+    assert!(!script.contains(&report_path.display().to_string()));
     fs::remove_dir_all(dir).expect("remove fixture");
 }
 
@@ -240,6 +250,7 @@ fn evidence_plan_cli_splits_override_candidate_stage_hints() {
         evidence_dir: None,
         out: Some(report_path.clone()),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect("write evidence plan");
 
@@ -312,6 +323,7 @@ fn invalid_candidate_stage_hints_fail_evidence_plan() {
         evidence_dir: None,
         out: Some(dir.join("evidence-plan.json")),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect_err("invalid stage hints should fail");
 
@@ -377,6 +389,7 @@ fn evidence_plan_can_include_local_split_chain_evidence() {
         evidence_dir: None,
         out: Some(report_path.clone()),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect("write evidence plan");
 
@@ -456,6 +469,7 @@ fn local_split_chain_evidence_requires_at_least_three_stages() {
         evidence_dir: None,
         out: Some(dir.join("evidence-plan.json")),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect_err("2-stage local split chain should be rejected");
 
@@ -533,6 +547,7 @@ fn evidence_plan_all_filters_candidates_and_inherits_runtime_shape() {
         evidence_root: None,
         out: Some(report_path.clone()),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect("write evidence-plan-all report");
 
@@ -626,6 +641,7 @@ fn evidence_plan_all_selects_top_valid_ranked_candidates() {
         evidence_root: None,
         out: Some(report_path.clone()),
         script_out: None,
+        runbook_plan_path: None,
     })
     .expect("write ranked evidence-plan-all report");
 
