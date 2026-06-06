@@ -861,6 +861,25 @@ Studio-local split-chain proof. The next missing command is the real
 placeholder hosts `host-0,host-1,host-2`, so this step must run on actual lab
 hosts or a Hugging Face job lane before certification can pass.
 
+The same candidate also has a job-path evidence plan generated with
+`--execution-run-dir` so the local planning artifacts can be inspected on
+Studio while the resulting commands target a lab/HF filesystem. The job-path
+plan lives at
+`/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/evidence-plan-job-path.json`,
+with SHA-256
+`79a080170d3712356f3f090f310a1d5addf6cf85e3dbf0d7b15ed7ddc42c7aae`; its
+runbook lives at
+`/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep-mixed-layer-candidates/mixed-layer-22-20-21-down-gate-up-proxy/run-evidence-job-path.sh`,
+with SHA-256
+`1a8cd42010389df0d1ac8936b2c3326b1b11c3021a2b741203ef5c3e1fbe299e`. This plan
+records `source_run_dir` as the local `/Volumes/External/...` candidate and
+rebases `run_dir`, `package`, `quantized_model`, and `evidence_dir` under
+`/tmp/skippy-quant-evidence/input/mixed-layer-22-20-21-down-gate-up-proxy`,
+with `runbook_cwd=/workspace/mesh-llm`. On Studio, `evidence-status` correctly
+reports this plan as fully missing with toolchain warnings because the target
+paths and binaries are job-environment contracts. It is a handoff artifact, not
+a completed evidence report.
+
 The token-length audit is now configured for the evidence lane's real context
 shape rather than the early proxy profiling shape: `ctx_size=8192`,
 `generation_limit=512`, `enable_thinking=false`. It reports `565` corpus rows,

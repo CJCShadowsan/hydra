@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+mod focused_runtime;
+
+use focused_runtime::FocusedRuntimeEvidenceArgs;
+
 const DEFAULT_TOKEN_CORPUS: &str = "target/bench-corpora/long/corpus.jsonl";
 const DEFAULT_CHAT_CORPUS: &str = "target/bench-corpora/coding-loop/corpus.jsonl";
 const DEFAULT_LONG_CONTEXT_CORPUS: &str = "target/bench-corpora/long-context/corpus.jsonl";
@@ -56,6 +60,8 @@ pub(super) struct QuantPackEvidencePlanArgs {
     kv_tool_loop_script: PathBuf,
     #[arg(long)]
     runbook_cwd: Option<PathBuf>,
+    #[arg(long)]
+    execution_run_dir: Option<PathBuf>,
     #[command(flatten)]
     focused_runtime: FocusedRuntimeEvidenceArgs,
     #[arg(long)]
@@ -128,6 +134,8 @@ struct EvidencePlanReport {
     schema_version: u32,
     kind: String,
     runbook_cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_run_dir: Option<String>,
     run_dir: String,
     candidate: String,
     model_id: String,
@@ -157,104 +165,6 @@ struct EvidencePlanReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     commands: Vec<EvidenceCommand>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, clap::Args)]
-struct FocusedRuntimeEvidenceArgs {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    metrics_server_bin: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_server_bin: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    lab_preflight_script: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    lab_preflight_hosts: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    lab_preflight_min_free_gb: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    lab_preflight_ports: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    lab_preflight_ssh_opts: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    work_dir: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    remote_root: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    remote_root_map: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    remote_shared_root_map: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    endpoint_host_map: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    ssh_opts: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    metrics_otlp_grpc_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    remote_bind_host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    first_stage_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    startup_timeout_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_max_inflight: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_reply_credit_limit: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_downstream_wire_delay_ms: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_downstream_wire_mbps: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_telemetry_queue_capacity: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long)]
-    stage_telemetry_level: Option<String>,
-    #[serde(skip_serializing_if = "is_false")]
-    #[arg(long)]
-    rsync_model_artifacts: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    #[arg(long)]
-    keep_remote: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    #[arg(long)]
-    child_logs: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    #[arg(long)]
-    stage_async_prefill_forward: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    #[arg(long)]
-    allow_uneven_stage_ranges: bool,
-}
-
-impl FocusedRuntimeEvidenceArgs {
-    fn is_default(&self) -> bool {
-        self == &Self::default()
-    }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Serialize)]
@@ -344,7 +254,10 @@ struct QuantPlanStageHintInput {
 }
 
 pub(super) fn run_quant_pack_evidence_plan(args: QuantPackEvidencePlanArgs) -> Result<()> {
-    let runbook_cwd = resolve_runbook_cwd(args.runbook_cwd.as_deref())?;
+    let runbook_cwd = resolve_runbook_cwd(
+        args.runbook_cwd.as_deref(),
+        args.execution_run_dir.is_some(),
+    )?;
     let report = build_evidence_plan(EvidencePlanBuildInput {
         run: args.run,
         runbook_cwd: runbook_cwd.clone(),
@@ -369,6 +282,7 @@ pub(super) fn run_quant_pack_evidence_plan(args: QuantPackEvidencePlanArgs) -> R
         attempts: args.attempts,
         focused_runtime: args.focused_runtime,
         evidence_dir: args.evidence_dir,
+        execution_run_dir: args.execution_run_dir,
     })?;
     if let Some(script_out) = args.script_out.as_deref() {
         write_single_evidence_script(
@@ -382,7 +296,7 @@ pub(super) fn run_quant_pack_evidence_plan(args: QuantPackEvidencePlanArgs) -> R
 }
 
 pub(super) fn run_quant_pack_evidence_plan_all(args: QuantPackEvidencePlanAllArgs) -> Result<()> {
-    let runbook_cwd = resolve_runbook_cwd(args.runbook_cwd.as_deref())?;
+    let runbook_cwd = resolve_runbook_cwd(args.runbook_cwd.as_deref(), false)?;
     let manifest_path = build_all_manifest_path(&args.build_all);
     let manifest = read_json::<BuildAllManifestInput>(&manifest_path)?;
     let build_all_dir = manifest_path
@@ -431,6 +345,7 @@ pub(super) fn run_quant_pack_evidence_plan_all(args: QuantPackEvidencePlanAllArg
             attempts: args.attempts,
             focused_runtime: args.focused_runtime.clone(),
             evidence_dir: Some(evidence_dir),
+            execution_run_dir: None,
         })?);
     }
     let final_rank =
@@ -489,6 +404,7 @@ struct EvidencePlanBuildInput {
     attempts: u32,
     focused_runtime: FocusedRuntimeEvidenceArgs,
     evidence_dir: Option<PathBuf>,
+    execution_run_dir: Option<PathBuf>,
 }
 
 fn build_evidence_plan(args: EvidencePlanBuildInput) -> Result<EvidencePlanReport> {
@@ -499,8 +415,12 @@ fn build_evidence_plan(args: EvidencePlanBuildInput) -> Result<EvidencePlanRepor
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let package = resolve_manifest_path(&run_dir, &manifest.package);
-    let quantized_model = resolve_manifest_path(&run_dir, &manifest.quantized_model);
     let package_manifest = read_json::<PackageManifestInput>(&package.join("model-package.json"))?;
+    let execution_run_dir = args.execution_run_dir.unwrap_or_else(|| run_dir.clone());
+    let execution_package =
+        resolve_execution_manifest_path(&run_dir, &execution_run_dir, &manifest.package);
+    let execution_quantized_model =
+        resolve_execution_manifest_path(&run_dir, &execution_run_dir, &manifest.quantized_model);
     let hosts = parse_hosts(&args.hosts)?;
     if hosts.len() != manifest.stages {
         bail!(
@@ -521,7 +441,7 @@ fn build_evidence_plan(args: EvidencePlanBuildInput) -> Result<EvidencePlanRepor
     )?;
     let evidence_dir = args
         .evidence_dir
-        .unwrap_or_else(|| run_dir.join("evidence"));
+        .unwrap_or_else(|| execution_run_dir.join("evidence"));
     let allow_uneven_stage_ranges = split_plan.source.allows_uneven_stage_ranges();
     if args.include_local_split_evidence && parse_split_boundaries(&split_plan.splits)?.len() < 2 {
         bail!(
@@ -533,11 +453,12 @@ fn build_evidence_plan(args: EvidencePlanBuildInput) -> Result<EvidencePlanRepor
         schema_version: 1,
         kind: "skippy_quant_pack_evidence_plan".to_string(),
         runbook_cwd: args.runbook_cwd.display().to_string(),
-        run_dir: run_dir.display().to_string(),
+        source_run_dir: (execution_run_dir != run_dir).then(|| run_dir.display().to_string()),
+        run_dir: execution_run_dir.display().to_string(),
         candidate: manifest.candidate,
         model_id: package_manifest.model_id.clone(),
-        package: package.display().to_string(),
-        quantized_model: quantized_model.display().to_string(),
+        package: execution_package.display().to_string(),
+        quantized_model: execution_quantized_model.display().to_string(),
         evidence_dir: evidence_dir.display().to_string(),
         hosts,
         stage_count: manifest.stages,
@@ -560,10 +481,10 @@ fn build_evidence_plan(args: EvidencePlanBuildInput) -> Result<EvidencePlanRepor
         focused_runtime: args.focused_runtime.clone(),
         warnings,
         commands: evidence_commands(EvidenceCommandInputs {
-            run: &run_dir,
+            run: &execution_run_dir,
             model_id: &package_manifest.model_id,
-            package: &package,
-            quantized_model: &quantized_model,
+            package: &execution_package,
+            quantized_model: &execution_quantized_model,
             evidence_dir: &evidence_dir,
             hosts: &args.hosts,
             splits: &split_plan.splits,
@@ -645,14 +566,14 @@ fn write_report(out: Option<&Path>, report: &impl Serialize, label: &str) -> Res
     Ok(())
 }
 
-fn resolve_runbook_cwd(runbook_cwd: Option<&Path>) -> Result<PathBuf> {
+fn resolve_runbook_cwd(runbook_cwd: Option<&Path>, allow_missing: bool) -> Result<PathBuf> {
     let cwd = env::current_dir().context("read current directory for evidence runbook")?;
     let resolved = match runbook_cwd {
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => cwd.join(path),
         None => cwd,
     };
-    if !resolved.is_dir() {
+    if !allow_missing && !resolved.is_dir() {
         bail!(
             "--runbook-cwd {} must be an existing directory",
             resolved.display()
@@ -1987,6 +1908,21 @@ fn resolve_manifest_path(run_dir: &Path, value: &str) -> PathBuf {
         }
         manifest_relative
     }
+}
+
+fn resolve_execution_manifest_path(
+    source_run_dir: &Path,
+    execution_run_dir: &Path,
+    value: &str,
+) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path
+            .strip_prefix(source_run_dir)
+            .map(|relative| execution_run_dir.join(relative))
+            .unwrap_or(path);
+    }
+    execution_run_dir.join(path)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

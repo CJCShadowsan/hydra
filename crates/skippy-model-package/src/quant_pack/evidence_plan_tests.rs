@@ -57,6 +57,7 @@ fn evidence_plan_uses_candidate_stage_hints_when_splits_omitted() {
         agent_tool_call_script: PathBuf::from(DEFAULT_AGENT_TOOL_CALL_SCRIPT),
         kv_tool_loop_script: PathBuf::from(DEFAULT_KV_TOOL_LOOP_SCRIPT),
         runbook_cwd: Some(dir.clone()),
+        execution_run_dir: None,
         activation_wire_dtype: "f16".to_string(),
         attempts: 2,
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
@@ -116,6 +117,91 @@ fn evidence_plan_uses_candidate_stage_hints_when_splits_omitted() {
 }
 
 #[test]
+fn evidence_plan_can_target_different_execution_run_dir() {
+    let dir = unique_test_dir("evidence-plan-execution-run-dir");
+    let execution_run_dir = PathBuf::from("/job/skippy-evidence/input/studio-local");
+    write_candidate_fixture_with_shape(
+        &dir,
+        "studio-local",
+        "org/qwen-coder:studio-local",
+        28,
+        3,
+        None,
+    );
+    let report_path = dir.join("evidence-plan.json");
+
+    run_quant_pack_evidence_plan(QuantPackEvidencePlanArgs {
+        run: dir.clone(),
+        hosts: "host-a,host-b,host-c".to_string(),
+        splits: Some("10,19".to_string()),
+        base_url: "http://127.0.0.1:9337/v1".to_string(),
+        token_corpus: PathBuf::from("target/bench-corpora/long/corpus.jsonl"),
+        chat_corpus: PathBuf::from("target/bench-corpora/coding-loop/corpus.jsonl"),
+        long_context_corpus: PathBuf::from("target/bench-corpora/long-context/corpus.jsonl"),
+        ctx_size: 8192,
+        n_gpu_layers: 0,
+        cache_type_k: "f16".to_string(),
+        cache_type_v: "f16".to_string(),
+        max_tokens: 512,
+        include_local_split_evidence: true,
+        local_split_prompt: DEFAULT_LOCAL_SPLIT_PROMPT.to_string(),
+        skippy_bench_bin: PathBuf::from("skippy-bench"),
+        skippy_model_package_bin: PathBuf::from("skippy-model-package"),
+        agent_tool_call_script: PathBuf::from(DEFAULT_AGENT_TOOL_CALL_SCRIPT),
+        kv_tool_loop_script: PathBuf::from(DEFAULT_KV_TOOL_LOOP_SCRIPT),
+        runbook_cwd: Some(PathBuf::from("/workspace/mesh-llm")),
+        execution_run_dir: Some(execution_run_dir.clone()),
+        activation_wire_dtype: "f16".to_string(),
+        attempts: 1,
+        focused_runtime: FocusedRuntimeEvidenceArgs::default(),
+        evidence_dir: None,
+        out: Some(report_path.clone()),
+        script_out: None,
+    })
+    .expect("write evidence plan");
+
+    let report = read_json::<serde_json::Value>(&report_path).expect("read report");
+    assert_eq!(report["runbook_cwd"], "/workspace/mesh-llm");
+    assert_eq!(report["source_run_dir"], dir.display().to_string());
+    assert_eq!(report["run_dir"], execution_run_dir.display().to_string());
+    assert_eq!(
+        report["package"],
+        "/job/skippy-evidence/input/studio-local/package"
+    );
+    assert_eq!(
+        report["quantized_model"],
+        "/job/skippy-evidence/input/studio-local/model.gguf"
+    );
+    assert_eq!(
+        report["evidence_dir"],
+        "/job/skippy-evidence/input/studio-local/evidence"
+    );
+    let commands = report["commands"].as_array().expect("commands array");
+    let focused_runtime = commands
+        .iter()
+        .find(|command| command["id"] == "focused-runtime")
+        .expect("focused-runtime command");
+    let shell = focused_runtime["shell"].as_str().expect("shell");
+    assert!(shell.contains("/job/skippy-evidence/input/studio-local/package"));
+    assert!(
+        shell.contains(
+            "/job/skippy-evidence/input/studio-local/evidence/focused-runtime-report.json"
+        )
+    );
+    let local_split = commands
+        .iter()
+        .find(|command| command["id"] == "local-split-chain")
+        .expect("local split command");
+    assert!(
+        local_split["shell"]
+            .as_str()
+            .expect("local split shell")
+            .contains("/job/skippy-evidence/input/studio-local/model.gguf")
+    );
+    fs::remove_dir_all(dir).expect("remove fixture");
+}
+
+#[test]
 fn evidence_plan_cli_splits_override_candidate_stage_hints() {
     let dir = unique_test_dir("evidence-plan-stage-hints-cli");
     write_candidate_fixture_with_plan(
@@ -147,6 +233,7 @@ fn evidence_plan_cli_splits_override_candidate_stage_hints() {
         agent_tool_call_script: PathBuf::from(DEFAULT_AGENT_TOOL_CALL_SCRIPT),
         kv_tool_loop_script: PathBuf::from(DEFAULT_KV_TOOL_LOOP_SCRIPT),
         runbook_cwd: Some(dir.clone()),
+        execution_run_dir: None,
         activation_wire_dtype: "f16".to_string(),
         attempts: 2,
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
@@ -218,6 +305,7 @@ fn invalid_candidate_stage_hints_fail_evidence_plan() {
         agent_tool_call_script: PathBuf::from(DEFAULT_AGENT_TOOL_CALL_SCRIPT),
         kv_tool_loop_script: PathBuf::from(DEFAULT_KV_TOOL_LOOP_SCRIPT),
         runbook_cwd: Some(dir.clone()),
+        execution_run_dir: None,
         activation_wire_dtype: "f16".to_string(),
         attempts: 2,
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
@@ -282,6 +370,7 @@ fn evidence_plan_can_include_local_split_chain_evidence() {
         agent_tool_call_script: PathBuf::from(DEFAULT_AGENT_TOOL_CALL_SCRIPT),
         kv_tool_loop_script: PathBuf::from(DEFAULT_KV_TOOL_LOOP_SCRIPT),
         runbook_cwd: Some(dir.clone()),
+        execution_run_dir: None,
         activation_wire_dtype: "q8".to_string(),
         attempts: 2,
         focused_runtime,
@@ -360,6 +449,7 @@ fn local_split_chain_evidence_requires_at_least_three_stages() {
         agent_tool_call_script: PathBuf::from(DEFAULT_AGENT_TOOL_CALL_SCRIPT),
         kv_tool_loop_script: PathBuf::from(DEFAULT_KV_TOOL_LOOP_SCRIPT),
         runbook_cwd: Some(dir.clone()),
+        execution_run_dir: None,
         activation_wire_dtype: "q8".to_string(),
         attempts: 2,
         focused_runtime: FocusedRuntimeEvidenceArgs::default(),
@@ -812,6 +902,7 @@ fn evidence_script_contains_ordered_plan_commands() {
         schema_version: 1,
         kind: "skippy_quant_pack_evidence_plan".to_string(),
         runbook_cwd: "/tmp/repo".to_string(),
+        source_run_dir: None,
         run_dir: "/tmp/run".to_string(),
         candidate: "middle-compressed".to_string(),
         model_id: "org/repo:middle-compressed".to_string(),
@@ -1029,6 +1120,7 @@ fn test_evidence_report(candidate: &str) -> EvidencePlanReport {
         schema_version: 1,
         kind: "skippy_quant_pack_evidence_plan".to_string(),
         runbook_cwd: "/tmp/repo".to_string(),
+        source_run_dir: None,
         run_dir: format!("/tmp/run/{candidate}"),
         candidate: candidate.to_string(),
         model_id: format!("org/repo:{candidate}"),

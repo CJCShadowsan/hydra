@@ -368,6 +368,15 @@ scripts; when omitted it records the directory where the evidence plan was
 generated. The runbook `cd`s there before warning checks, corpus prep, and
 relative command paths, so it can be launched from another shell directory or a
 background runner without changing behavior.
+Pass `--execution-run-dir` when the candidate is inspected locally but the
+evidence run will execute from a different filesystem root, such as a lab node
+or Hugging Face Job that downloads the candidate bundle under
+`/tmp/skippy-evidence/input/<candidate>`. The planner still reads the local
+`quant-pack-build.json` and package manifest, but generated commands point
+`run_dir`, `package`, `quantized_model`, and the default `evidence/` directory
+at the execution path. The report keeps `source_run_dir` when this rebasing is
+active, so audits can distinguish the local planning source from the runtime
+artifact location.
 The generated schema-smoke command writes `focused-runtime-schema-smoke.json`
 from the same split, layer-end, context, KV cache, activation-wire, corpus, and
 lab-option arguments as the measured run, but without launching remote stages.
