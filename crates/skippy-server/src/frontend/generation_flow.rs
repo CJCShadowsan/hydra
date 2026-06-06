@@ -50,6 +50,39 @@ impl StageOpenAiBackend {
             return Err(OpenAiError::invalid_request("prompt produced no tokens"));
         }
         let max_tokens = max_tokens.resolve(prompt_token_ids.len(), self.ctx_size)?;
+        let _token_budget_reservation = if self.mode.reserves_local_kv_tokens() {
+            let token_admit_timer = PhaseTimer::start();
+            let reservation = self.generation_token_budget.reserve(
+                GenerationTokenBudgetRequest::new(prompt_token_ids.len(), max_tokens),
+                GENERATION_ADMISSION_TIMEOUT,
+            )?;
+            let mut token_admit_attrs = self.openai_attrs(&ids);
+            token_admit_attrs.insert(
+                "llama_stage.prompt_token_count".to_string(),
+                json!(prompt_token_ids.len()),
+            );
+            token_admit_attrs.insert("llama_stage.max_tokens".to_string(), json!(max_tokens));
+            token_admit_attrs.insert(
+                "llama_stage.kv_reserved_tokens".to_string(),
+                json!(reservation.tokens()),
+            );
+            token_admit_attrs.insert(
+                "llama_stage.kv_active_reserved_tokens".to_string(),
+                json!(reservation.active_tokens_after_reservation()),
+            );
+            token_admit_attrs.insert(
+                "llama_stage.kv_capacity_tokens".to_string(),
+                json!(self.generation_token_budget.capacity_tokens()),
+            );
+            self.emit_openai_phase(
+                "stage.openai_generation_token_admit",
+                token_admit_timer,
+                token_admit_attrs,
+            );
+            Some(reservation)
+        } else {
+            None
+        };
         let chat_sampling_metadata = prompt.chat_parse_metadata.as_deref();
 
         let mut collector =
@@ -287,6 +320,7 @@ impl StageOpenAiBackend {
         let mut proactive_eviction_target_tokens = 0_u64;
         let mut proactive_evicted_entries = 0_usize;
         let mut proactive_evicted_tokens = 0_u64;
+        let mut proactive_eviction_error = None;
         if let Some(kv) = self.kv.as_ref() {
             match self.runtime.lock() {
                 Ok(mut runtime) => {
@@ -305,12 +339,16 @@ impl StageOpenAiBackend {
                             proactive_eviction_status = "error";
                             proactive_eviction_error_kind_attr =
                                 Some(proactive_eviction_error_kind(&error));
+                            proactive_eviction_error = Some(error.context(
+                                "evict resident-prefix KV before multimodal OpenAI decode",
+                            ));
                         }
                     }
                 }
                 Err(_) => {
                     proactive_eviction_status = "error";
                     proactive_eviction_error_kind_attr = Some("runtime_lock_poisoned");
+                    proactive_eviction_error = Some(anyhow!("runtime lock poisoned"));
                 }
             }
         }
@@ -324,6 +362,9 @@ impl StageOpenAiBackend {
                 proactive_evicted_tokens,
             ),
         );
+        if let Some(error) = proactive_eviction_error {
+            return Err(openai_backend_error(error));
+        }
 
         let mut collector =
             TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
