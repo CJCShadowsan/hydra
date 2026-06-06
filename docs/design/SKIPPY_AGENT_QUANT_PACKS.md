@@ -704,37 +704,43 @@ Requantized proxy artifact hashes:
 - `c54db85cb7a5d41f8832f49428bf546c10976cf80787fa678d7dbfbfe4b9dadd`
   `evidence/rank-after-local-split.json`
 
-A follow-on Studio-local proxy sweep added two comparable measured runs:
-`baseline-source-quant`, which packages the source Q4_K_M layout unchanged, and
+A follow-on Studio-local proxy sweep added comparable measured runs:
+`baseline-source-quant`, which packages the source Q4_K_M layout unchanged,
 `stage-balanced-proxy`, which lowers layers `19..24` in the largest byte stage
-to Q3_K_M. Each run has the same small local decode profile shape
+to Q3_K_M, and `stage-balanced-ffn-proxy`, which lowers only FFN tensors in
+that same stage band while keeping attention at the source quant. Each run has
+the same small local decode profile shape
 (`existing_kv_tokens=128`, `warmup_samples=1`, `samples=3`) and the same
 local split-chain lane (`splits=10,19`, `ctx_size=1024`, f16 activation wire).
 The rank report lives at
 `/Volumes/External/skippy-quant-packs/qwen25-coder-7b-proxy/sweep/rank-after-proxy-candidates.json`
 with SHA-256
-`722c52bccaff66e57e958751ec9f33fed4e1736986b91cf29e5a4483cd0cc1ed`.
+`e8c73be2da8513ba78d2f4d69424634f0ba30888965c4f3ae5b5af2cf1e4786c`.
 
 | Rank | Candidate | Decode mean ms | Package bytes | Slowest stage bytes | Stage imbalance |
 | ---: | --- | ---: | ---: | ---: | ---: |
 | 1 | `baseline-source-quant` | `14.028069` | `4,872,975,232` | `1,800,450,848` | `1.391920` |
-| 2 | `stage-balanced-proxy` | `14.615736` | `4,682,263,424` | `1,779,022,592` | `1.375354` |
-| 3 | `ffn-compressed-attention-protected` | `15.891708` | `4,209,404,800` | `1,630,182,176` | `1.634234` |
+| 2 | `stage-balanced-ffn-proxy` | `14.498056` | `4,702,706,560` | `1,779,022,592` | `1.375354` |
+| 3 | `stage-balanced-proxy` | `14.615736` | `4,682,263,424` | `1,779,022,592` | `1.375354` |
+| 4 | `ffn-compressed-attention-protected` | `15.891708` | `4,209,404,800` | `1,630,182,176` | `1.634234` |
 
 This is the most important proxy result so far: the unchanged packaged source
 quant still wins on local decode. `stage-balanced-proxy` improves byte pressure
 and stage-balance a little, and `ffn-compressed-attention-protected` saves much
-more space, but neither beats the baseline decode profile. These are still
-valid candidate-pack evidence runs, because they prove the builder, package,
-preflight, split-chain, rank, and audit hash flow. They are not winners.
+more space, but neither beats the baseline decode profile. The FFN-only repair
+does improve over the broad stage-balanced candidate, which is evidence that
+protecting attention matters for this proxy, but it also still fails to beat
+the baseline. These are valid candidate-pack evidence runs, because they prove
+the builder, package, preflight, split-chain, rank, and audit hash flow. They
+are not winners.
 
 The next local proxy candidate should therefore be latency-aware rather than
-byte-only. Good next candidates are narrower tensor repairs around the failed
-layouts: for example, keep attention at source quant, lower only selected FFN
-tensors in the largest stage, or split the broad FFN compression into smaller
-per-stage/per-layer bands. Only candidates that improve or hold decode latency
-while reducing memory pressure should graduate to the expensive agent-quality
-and lab/HF evidence lanes.
+byte-only. The next useful repairs should split FFN compression into smaller
+per-layer or per-tensor groups, for example only `ffn_gate`/`ffn_up`, only
+layers with Q6 source FFN tensors, or a one-layer-at-a-time sensitivity pass.
+Only candidates that improve or hold decode latency while reducing memory
+pressure should graduate to the expensive agent-quality and lab/HF evidence
+lanes.
 
 Additional proxy artifact hashes:
 
@@ -750,6 +756,12 @@ Additional proxy artifact hashes:
   `stage-balanced-proxy/decode-profile.json`
 - `e3345ae08b85ff1c328ec4d9697e06d97c176de1b1f070bddde9bbfebff9946c`
   `stage-balanced-proxy/evidence/local-split-chain.json`
+- `1193892ea3135f8b7bc9b02bd0730eec2c3b3c7cb9fda8db7d1fe5d5d9edaf89`
+  `stage-balanced-ffn-proxy/stage-balanced-ffn-proxy.gguf`
+- `b1186071523765ddefb2fe7761bac223bf04d253a4a4cefc9a9c9a068e358753`
+  `stage-balanced-ffn-proxy/decode-profile.json`
+- `324871217f334c98a9cfcf53c003298117f84d6756f7c4d0ad528e2f0644fba0`
+  `stage-balanced-ffn-proxy/evidence/local-split-chain.json`
 
 Plans should optionally include a lab preflight script before the measured
 focused-runtime command. For Qwen-scale runs this makes SSH reachability, stale

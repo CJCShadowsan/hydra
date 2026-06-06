@@ -257,6 +257,15 @@ fn candidate_layouts(
             stage_hints,
             has_moe,
         ),
+        stage_balanced_ffn_candidate(
+            default_quant,
+            source_quant,
+            combine_groups(boundary_groups.clone(), moe_groups.clone()),
+            protected_width,
+            layer_count,
+            stage_hints,
+            has_moe,
+        ),
         stage_balanced_candidate(
             default_quant,
             source_quant,
@@ -355,11 +364,7 @@ fn stage_balanced_candidate(
     layer_count: u32,
     stage_hints: &[StageQuantHint],
 ) -> QuantLayoutCandidate {
-    if let Some(stage) = stage_hints
-        .iter()
-        .max_by_key(|stage| stage.tensor_bytes)
-        .and_then(|stage| unprotected_stage_selector(stage, protected_width, layer_count))
-    {
+    if let Some(stage) = largest_unprotected_stage(stage_hints, protected_width, layer_count) {
         groups.push(QuantGroup {
             name: format!("stage-{}-balance-band", stage.stage_index),
             quant: compression_quant_for_source(source_quant, "Q3_K_M").to_string(),
@@ -382,6 +387,42 @@ fn stage_balanced_candidate(
         stage_hints: stage_hints.to_vec(),
         notes: vec![
             "Replace byte-proxy lowering with profiler-guided lowering once per-stage decode profiles are attached."
+                .to_string(),
+        ],
+    })
+}
+
+fn stage_balanced_ffn_candidate(
+    default_quant: &str,
+    source_quant: &str,
+    mut groups: Vec<QuantGroup>,
+    protected_width: u32,
+    layer_count: u32,
+    stage_hints: &[StageQuantHint],
+    has_moe: bool,
+) -> QuantLayoutCandidate {
+    if let Some(stage) = largest_unprotected_stage(stage_hints, protected_width, layer_count) {
+        groups.push(QuantGroup {
+            name: format!("stage-{}-ffn-balance-band", stage.stage_index),
+            quant: compression_quant_for_source(source_quant, "Q3_K_M").to_string(),
+            selector: QuantSelector::TensorNamePattern {
+                patterns: stage_ffn_patterns(stage.layer_start, stage.layer_end, has_moe),
+            },
+            reason: "Compresses FFN tensors in the largest byte stage while keeping attention at the source quant tier."
+                .to_string(),
+        });
+    }
+    with_layout_hash(QuantLayoutCandidate {
+        id: "stage-balanced-ffn-proxy".to_string(),
+        layout_hash: String::new(),
+        name: "Byte-proxy stage balance with attention protected".to_string(),
+        status: "experimental".to_string(),
+        strategy: "stage-balanced-ffn-byte-proxy".to_string(),
+        default_quant: default_quant.to_string(),
+        groups,
+        stage_hints: stage_hints.to_vec(),
+        notes: vec![
+            "Narrows the stage-balance experiment to FFN tensors after broad largest-stage compression regressed decode latency."
                 .to_string(),
         ],
     })
@@ -480,6 +521,17 @@ fn unprotected_stage_selector(
         tensor_bytes: stage.tensor_bytes,
         role: stage.role.clone(),
     })
+}
+
+fn largest_unprotected_stage(
+    stage_hints: &[StageQuantHint],
+    protected_width: u32,
+    layer_count: u32,
+) -> Option<StageQuantHint> {
+    stage_hints
+        .iter()
+        .max_by_key(|stage| stage.tensor_bytes)
+        .and_then(|stage| unprotected_stage_selector(stage, protected_width, layer_count))
 }
 
 fn boundary_protection_groups(
@@ -582,6 +634,27 @@ fn ffn_compression_groups(
             "Lower middle-band FFN tensors as a first tensor-aware Skippy latency and memory candidate."
                 .to_string(),
     }]
+}
+
+fn stage_ffn_patterns(start: u32, end: u32, has_moe: bool) -> Vec<String> {
+    if has_moe {
+        vec![
+            stage_tensor_pattern(start, end, "ffn_(gate|up|down)_exps"),
+            stage_tensor_pattern(start, end, "ffn_gate_up_exps"),
+        ]
+    } else {
+        vec![
+            stage_tensor_pattern(start, end, "ffn_.*"),
+            stage_tensor_pattern(start, end, "ffn.*"),
+        ]
+    }
+}
+
+fn stage_tensor_pattern(start: u32, end: u32, suffix: &str) -> String {
+    format!(
+        "blk\\.({})\\.{suffix}\\.weight",
+        layer_regex_range(start, end)
+    )
 }
 
 fn middle_tensor_pattern(protected_width: u32, layer_count: u32, suffix: &str) -> String {
@@ -831,7 +904,7 @@ mod tests {
         assert_eq!(report.source.layer_count, 8);
         assert_eq!(report.stage_count, 2);
         assert_eq!(report.protected_band_width, 1);
-        assert_eq!(report.candidates.len(), 5);
+        assert_eq!(report.candidates.len(), 6);
         assert_eq!(report.candidates[0].id, "baseline-source-quant");
         assert_eq!(report.candidates[1].id, "boundary-protected");
         assert_eq!(report.candidates[2].id, "middle-compressed");
@@ -839,7 +912,8 @@ mod tests {
             report.candidates[3].id,
             "ffn-compressed-attention-protected"
         );
-        assert_eq!(report.candidates[4].id, "stage-balanced-proxy");
+        assert_eq!(report.candidates[4].id, "stage-balanced-ffn-proxy");
+        assert_eq!(report.candidates[5].id, "stage-balanced-proxy");
         assert!(
             report
                 .candidates
@@ -920,6 +994,29 @@ mod tests {
                     QuantSelector::LayerRange { start: 2, end: 3 }
                 )
         }));
+    }
+
+    #[test]
+    fn stage_balanced_ffn_candidate_lowers_largest_byte_stage_ffn_only() {
+        let report = build_quant_plan(test_input_with_heavy_stage()).expect("build quant plan");
+        let balanced = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == "stage-balanced-ffn-proxy")
+            .expect("stage-balanced ffn candidate");
+        let group = balanced
+            .groups
+            .iter()
+            .find(|group| group.name == "stage-1-ffn-balance-band")
+            .expect("stage ffn group");
+
+        let QuantSelector::TensorNamePattern { patterns } = &group.selector else {
+            panic!("stage ffn group should use tensor patterns");
+        };
+        assert!(patterns.iter().any(|pattern| {
+            pattern == r"blk\.(2)\.ffn_.*\.weight" || pattern == r"blk\.(2)\.ffn.*\.weight"
+        }));
+        assert!(!patterns.iter().any(|pattern| pattern.contains("attn")));
     }
 
     #[test]
