@@ -898,6 +898,54 @@ fn matching_certification_subject_is_verified_for_ranking() {
     fs::remove_dir_all(dir).expect("remove fixture");
 }
 
+#[test]
+fn certification_without_topology_is_verified_when_subject_and_shape_match() {
+    let dir = unique_test_dir("verified-certification-without-topology");
+    fs::write(dir.join("quant-pack-build.json"), b"build").expect("write manifest");
+    fs::write(dir.join("agent-pack.json"), b"agent-pack").expect("write agent pack");
+    fs::write(dir.join("preflight.json"), b"preflight").expect("write preflight");
+    fs::write(dir.join("model.gguf"), b"model").expect("write model");
+    fs::create_dir_all(dir.join("package")).expect("create package");
+    fs::write(dir.join("package/model-package.json"), b"package").expect("write package");
+    let manifest = BuildManifestInput {
+        candidate: "middle-compressed".to_string(),
+        agent_pack: "agent-pack.json".to_string(),
+        preflight: "preflight.json".to_string(),
+        package: Some("package".to_string()),
+        quantized_model: Some("model.gguf".to_string()),
+        quantize_run: None,
+        decode_profile: None,
+    };
+    let certification = CertificationInput {
+        status: RankCertificationStatus::MeasurementOnlyCandidate,
+        runtime_shape: Some(matching_certification_runtime_shape()),
+        expected_topology: None,
+        subject: Some(CertificationSubjectInput {
+            build_manifest: Some(hash_ref("build")),
+            agent_pack: Some(hash_ref("agent-pack")),
+            preflight: Some(hash_ref("preflight")),
+            expected_quantized_model: Some(hash_ref("model")),
+            package_manifest: Some(hash_ref("package")),
+            quantize_run: None,
+        }),
+        gates: Vec::new(),
+        skippy_bench_reports: Vec::new(),
+        quality_evidence: Vec::new(),
+    };
+
+    let check = certification_subject_check(
+        &dir,
+        &dir.join("quant-pack-build.json"),
+        &manifest,
+        &certification,
+        &matching_preflight(),
+        matching_rank_runtime_shape(),
+    );
+
+    assert_eq!(check.status, RankCertificationSubjectStatus::Verified);
+    fs::remove_dir_all(dir).expect("remove fixture");
+}
+
 fn ranked_candidate(
     candidate: &str,
     valid: bool,
