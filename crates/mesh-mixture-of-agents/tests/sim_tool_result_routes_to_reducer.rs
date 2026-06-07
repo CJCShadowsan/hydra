@@ -48,6 +48,10 @@ struct RecordingBackend {
     calls: AtomicUsize,
 }
 
+struct AlwaysFailBackend {
+    calls: AtomicUsize,
+}
+
 struct ToolSchemaFailBackend {
     calls_with_tools: AtomicUsize,
     calls_without_tools: AtomicUsize,
@@ -95,6 +99,34 @@ impl InspectingAnswerBackend {
 
     fn native_tool_messages(&self) -> usize {
         self.native_tool_messages.load(Ordering::SeqCst)
+    }
+}
+
+impl AlwaysFailBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl moa::ModelBackend for AlwaysFailBackend {
+    async fn chat_completion(
+        &self,
+        _model: &str,
+        _messages: &[Value],
+        _tools: Option<&Value>,
+        _max_tokens: u32,
+        _timeout: Duration,
+        _sampling: moa::SamplingParams,
+    ) -> Result<Value, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err("remote reducer timed out".to_string())
     }
 }
 
@@ -233,6 +265,21 @@ fn config_with_three_recording_workers() -> (
     (config, fast, mid, strong)
 }
 
+fn exec_tool() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "exec",
+            "description": "Run shell commands",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }
+    }])
+}
+
 fn read_file_tool() -> Value {
     json!([{
         "type": "function",
@@ -275,6 +322,195 @@ fn web_tools() -> Value {
             }
         }
     ])
+}
+
+#[tokio::test]
+async fn github_auth_status_for_pr_prompt_allows_corrective_exec_followup() {
+    let backend = RecordingBackend::new(
+        r#"{"kind":"tool_proposal","confidence":0.9,"tool":"exec","arguments":{"command":"gh pr list --state open --limit 20 --json number,title,updatedAt,url,author","timeout":30}}"#,
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": exec_tool(),
+        "messages": [
+            {"role": "user", "content": "Any new interesting PRs? You have the gh command line I think can use"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_exec",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh auth status\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_exec", "content": "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true\n  - Git operations protocol: https"},
+        ],
+        "max_tokens": 96,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("tool_calls"),
+        "auth status is not PR evidence and should allow a corrective command: {}",
+        result.response_body
+    );
+    let args = result
+        .response_body
+        .pointer("/choices/0/message/tool_calls/0/function/arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        args.contains("gh pr list"),
+        "corrective exec should list PRs: {args}"
+    );
+}
+
+#[tokio::test]
+async fn cli_json_field_error_allows_corrective_exec_followup() {
+    let backend = RecordingBackend::new(
+        r#"{"kind":"tool_proposal","confidence":0.9,"tool":"exec","arguments":{"command":"gh pr list --state open --limit 20 --json number,title,createdAt,url,author,labels","timeout":30}}"#,
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": exec_tool(),
+        "messages": [
+            {"role": "user", "content": "Use gh to list recent open PRs, then tell me one interesting one."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_exec",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh pr list --state open --limit 20 --json number,title,createdAt,headRepositoryName,url,author,labels\",\"timeout\":30}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_exec", "content": "Unknown JSON field: \"headRepositoryName\"\nAvailable fields:\n  additions\n  author\n  title\n  url\n\n(Command exited with code 1)"},
+        ],
+        "max_tokens": 96,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("tool_calls"),
+        "CLI field errors should invite a corrected tool call, not a final answer: {}",
+        result.response_body
+    );
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/message/tool_calls/0/function/name")
+            .and_then(Value::as_str),
+        Some("exec")
+    );
+    let args = result
+        .response_body
+        .pointer("/choices/0/message/tool_calls/0/function/arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        args.contains("gh pr list") && !args.contains("headRepositoryName"),
+        "corrective exec should avoid the invalid gh field: {args}"
+    );
+}
+
+#[tokio::test]
+async fn reducer_failure_after_answerable_exec_result_answers_from_evidence() {
+    let backend = AlwaysFailBackend::new();
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "flaky-reducer".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_millis(100),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": exec_tool(),
+        "messages": [
+            {"role": "user", "content": "Use gh to list recent open PRs, then tell me one interesting one."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_exec",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 20\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_exec", "content": "808\tGeneralize MoA agent tool loops\tfix/openclaw-moa-telegram-timeouts\tOPEN\t2026-06-07T10:20:01Z\n806\tAdd meshllm.cloud website and onboarding docs\tmain\tOPEN\t2026-06-06T19:31:18Z"},
+        ],
+        "max_tokens": 96,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(
+        backend.calls(),
+        1,
+        "answerable exec evidence should suppress another native-tool reducer attempt"
+    );
+    assert!(
+        result.response_body.get("error").is_none(),
+        "answerable tool evidence must survive reducer failure: {}",
+        result.response_body
+    );
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("stop")
+    );
+    let content = result
+        .response_body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        content.contains("808") && content.contains("Generalize MoA agent tool loops"),
+        "fallback answer should be grounded in the completed exec result: {content}"
+    );
+    assert!(
+        !content.contains("Reducer failed") && !content.contains("remote reducer timed out"),
+        "fallback must not surface internal reducer failure text: {content}"
+    );
 }
 
 #[tokio::test]

@@ -1571,8 +1571,10 @@ async fn handle_tool_result(
     if let Some((tool, _)) = repeated_tool.as_ref() {
         selected_tool_names.retain(|name| name != tool);
     }
-    let latest_answerable_tool = latest_completed_tool_result(session)
-        .filter(|(_, result)| tool_result_has_answerable_evidence(result));
+    let latest_user_text = session.last_user_text();
+    let latest_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
+        tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
+    });
     if let Some((tool, _)) = latest_answerable_tool {
         selected_tool_names.retain(|name| name != &tool);
     }
@@ -1598,8 +1600,9 @@ async fn handle_tool_result(
         append_tool_budget_instruction(&mut messages, count);
     }
     let retry_tool = if tools_enabled_for_reducer {
-        latest_completed_tool_result(session)
-            .filter(|(_, result)| !tool_result_has_answerable_evidence(result))
+        latest_completed_tool_result(session).filter(|(_, result)| {
+            !tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
+        })
     } else {
         None
     };
@@ -1741,14 +1744,25 @@ async fn handle_tool_result(
         None => {
             let err = last_err.unwrap_or_else(|| "no reducer candidates".into());
             tracing::warn!("moa: all {attempts} reducer candidates failed");
-            (
-                candidates.first().map(|c| c.0.clone()).unwrap_or_default(),
-                false,
-                error_response(
-                    &format!("Reducer failed (tried {attempts}): {err}"),
-                    MOA_ERR_ALL_REDUCERS_FAILED,
-                ),
-            )
+            if let Some(answer) = answer_from_latest_tool_result(session) {
+                tracing::warn!(
+                    "moa: reducers failed after answerable tool evidence; answering from tool result"
+                );
+                (
+                    candidates.first().map(|c| c.0.clone()).unwrap_or_default(),
+                    false,
+                    chat_response(&answer),
+                )
+            } else {
+                (
+                    candidates.first().map(|c| c.0.clone()).unwrap_or_default(),
+                    false,
+                    error_response(
+                        &format!("Reducer failed (tried {attempts}): {err}"),
+                        MOA_ERR_ALL_REDUCERS_FAILED,
+                    ),
+                )
+            }
         }
     };
 
@@ -1887,7 +1901,7 @@ fn tool_result_answer_from_evidence_response(session: &Session) -> Value {
 
 fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
     let (_, result) = latest_completed_tool_result(session)?;
-    if !tool_result_has_answerable_evidence(&result) {
+    if !tool_result_has_answerable_evidence_for_prompt(&result, &session.last_user_text()) {
         return None;
     }
 
@@ -2076,14 +2090,85 @@ fn tool_result_has_answerable_evidence(result: &str) -> bool {
     !plain_text_tool_result_looks_like_error(trimmed)
 }
 
+fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) -> bool {
+    if !tool_result_has_answerable_evidence(result) {
+        return false;
+    }
+    if prompt_asks_for_github_work_items(prompt)
+        && plain_text_tool_result_looks_like_github_auth_status(result)
+    {
+        return false;
+    }
+    !(prompt_asks_for_pull_requests(prompt)
+        && plain_text_tool_result_looks_like_github_repo_list(result))
+}
+
+fn prompt_asks_for_github_work_items(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    let asks_github = lower.contains("gh ")
+        || lower.contains("github")
+        || lower.contains("pull request")
+        || prompt_has_word(&lower, "pr")
+        || lower.contains("issue");
+    let asks_work_items = prompt_has_word(&lower, "pr")
+        || lower.contains("pull request")
+        || lower.contains("issue")
+        || lower.contains("interesting")
+        || lower.contains("recent")
+        || lower.contains("open");
+    asks_github && asks_work_items
+}
+
+fn prompt_asks_for_pull_requests(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    prompt_has_word(&lower, "pr")
+        || prompt_has_word(&lower, "prs")
+        || lower.contains("pull request")
+}
+
+fn prompt_has_word(prompt: &str, needle: &str) -> bool {
+    prompt
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == needle)
+}
+
+fn plain_text_tool_result_looks_like_github_auth_status(result: &str) -> bool {
+    let normalized = result.replace('\r', "");
+    let lower = normalized.trim_start().to_ascii_lowercase();
+    let first_line = lower.lines().next().unwrap_or("").trim();
+    first_line == "github.com"
+        && lower.contains("logged in to github.com")
+        && lower.contains("active account:")
+}
+
+fn plain_text_tool_result_looks_like_github_repo_list(result: &str) -> bool {
+    let rows = result
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let mut columns = line.split('\t').map(str::trim);
+            Some((columns.next()?, columns.next()?, columns.next()?))
+        });
+    rows.take(3).any(|(repo, _description, visibility)| {
+        repo.contains('/')
+            && !repo.contains(char::is_whitespace)
+            && (visibility.contains("public") || visibility.contains("private"))
+    })
+}
+
 fn plain_text_tool_result_looks_like_error(result: &str) -> bool {
     let normalized = result.replace('\r', "");
     let lower = normalized.trim_start().to_ascii_lowercase();
     let first_line = lower.lines().next().unwrap_or("").trim();
     first_line.starts_with("unknown flag:")
+        || first_line.starts_with("unknown json field:")
         || first_line.starts_with("unknown command")
+        || first_line == "no git remotes found"
+        || first_line.contains("not available or not authenticated")
         || first_line.starts_with("error:")
         || first_line.starts_with("fatal:")
+        || (first_line.starts_with("unknown ") && lower.contains("\navailable fields:"))
         || (lower.contains("\nusage:") && lower.lines().take(3).any(cli_error_line))
 }
 
@@ -4398,6 +4483,80 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn cli_json_field_error_is_not_answerable_tool_evidence() {
+        let result = "Unknown JSON field: \"headRepositoryName\"\nAvailable fields:\n  additions\n  author\n  title\n\n(Command exited with code 1)";
+
+        assert!(!tool_result_has_answerable_evidence(result));
+        assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
+    fn cli_missing_git_remote_is_not_answerable_tool_evidence() {
+        let result = "no git remotes found\n\n(Command exited with code 1)";
+
+        assert!(!tool_result_has_answerable_evidence(result));
+        assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
+    fn cli_synthetic_unavailable_message_is_not_answerable_tool_evidence() {
+        let result = "gh search not available or not authenticated";
+
+        assert!(!tool_result_has_answerable_evidence(result));
+        assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
+    fn github_auth_status_is_not_pr_request_evidence() {
+        let result = "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true\n  - Git operations protocol: https";
+        let prompt = "Any new interesting PRs? You have the gh command line I think can use";
+
+        assert!(tool_result_has_answerable_evidence(result));
+        assert!(!tool_result_has_answerable_evidence_for_prompt(
+            result, prompt
+        ));
+        assert!(
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, result))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn github_auth_status_can_answer_auth_prompt() {
+        let result = "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true";
+        let prompt = "Check whether gh is authenticated.";
+
+        assert!(tool_result_has_answerable_evidence_for_prompt(
+            result, prompt
+        ));
+    }
+
+    #[test]
+    fn github_repo_list_is_not_pr_request_evidence() {
+        let result = "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z\nmichaelneale/ollama\tRun models\tpublic, fork\t2026-06-05T00:42:49Z";
+        let prompt = "Any new interesting PRs? You have the gh command line I think can use";
+
+        assert!(tool_result_has_answerable_evidence(result));
+        assert!(!tool_result_has_answerable_evidence_for_prompt(
+            result, prompt
+        ));
+        assert!(
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, result))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn github_repo_list_can_answer_repo_prompt() {
+        let result = "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z";
+        let prompt = "List interesting GitHub repos.";
+
+        assert!(tool_result_has_answerable_evidence_for_prompt(
+            result, prompt
+        ));
+    }
+
+    #[test]
     fn normal_tabular_cli_output_is_answerable_tool_evidence() {
         let result = "808\tStabilize tool loops through MoA\tOPEN";
 
@@ -4705,10 +4864,14 @@ mod response_builder_tests {
     }
 
     fn session_with_tool_result(result: &str) -> Session {
+        session_with_user_and_tool_result("run command", result)
+    }
+
+    fn session_with_user_and_tool_result(prompt: &str, result: &str) -> Session {
         let mut session = Session::new();
         session.ingest(
             &[
-                serde_json::json!({"role": "user", "content": "run command"}),
+                serde_json::json!({"role": "user", "content": prompt}),
                 tool_call_msg("call_1", "exec"),
                 tool_result_msg("call_1", result),
             ],
