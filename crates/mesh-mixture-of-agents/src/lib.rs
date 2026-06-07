@@ -1811,6 +1811,14 @@ struct TabularToolRow {
     title: String,
 }
 
+#[derive(Debug)]
+struct StructuredToolRow {
+    id: Option<String>,
+    title: String,
+    url: Option<String>,
+    details: Vec<String>,
+}
+
 fn repair_tabular_tool_result_answer(session: &Session, answer: &str) -> Option<String> {
     let (_, result) = latest_completed_tool_result(session)?;
     let rows = tabular_tool_result_rows(&result);
@@ -1901,8 +1909,13 @@ fn tool_result_answer_from_evidence_response(session: &Session) -> Value {
 
 fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
     let (_, result) = latest_completed_tool_result(session)?;
-    if !tool_result_has_answerable_evidence_for_prompt(&result, &session.last_user_text()) {
+    let prompt = session.last_user_text();
+    if !tool_result_has_answerable_evidence_for_prompt(&result, &prompt) {
         return None;
+    }
+
+    if let Some(answer) = answer_from_structured_tool_result(&result, &prompt) {
+        return Some(answer);
     }
 
     let mut lines = result
@@ -1926,6 +1939,147 @@ fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
     }
 
     Some(truncate_for_tool_result_answer(&answer))
+}
+
+fn answer_from_structured_tool_result(result: &str, prompt: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(result.trim()).ok()?;
+    let rows = structured_tool_result_rows(&parsed, prompt);
+    let first = rows.first()?;
+    let mut answer = format!(
+        "From the tool result, one relevant entry is: {}",
+        format_structured_tool_row(first, prompt)
+    );
+    let rest = rows
+        .iter()
+        .skip(1)
+        .take(2)
+        .map(|row| format_structured_tool_row(row, prompt))
+        .collect::<Vec<_>>();
+    if !rest.is_empty() {
+        answer.push_str("\n\nOther returned entries include:\n");
+        for row in rest {
+            answer.push_str("- ");
+            answer.push_str(&row);
+            answer.push('\n');
+        }
+        answer = answer.trim_end().to_string();
+    }
+
+    Some(truncate_for_tool_result_answer(&answer))
+}
+
+fn structured_tool_result_rows(value: &Value, prompt: &str) -> Vec<StructuredToolRow> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(|value| structured_tool_row(value, prompt))
+            .collect(),
+        Value::Object(map) => {
+            if let Some(row) = structured_tool_row(value, prompt) {
+                return vec![row];
+            }
+            [
+                "items",
+                "results",
+                "nodes",
+                "data",
+                "pullRequests",
+                "issues",
+            ]
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .flat_map(|value| structured_tool_result_rows(value, prompt))
+            .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn structured_tool_row(value: &Value, prompt: &str) -> Option<StructuredToolRow> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+
+    let title = first_string_field(map, &["title", "name", "subject", "summary"])?;
+    let id = first_identifier_field(map, &["number", "id", "key"]);
+    let url = first_string_field(map, &["url", "html_url", "web_url", "permalink"]);
+    if id.is_none() && url.is_none() && !prompt_asks_for_github_work_items(prompt) {
+        return None;
+    }
+
+    Some(StructuredToolRow {
+        id,
+        title,
+        url,
+        details: structured_tool_row_details(map),
+    })
+}
+
+fn first_string_field(map: &serde_json::Map<String, Value>, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| map.get(*field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn first_identifier_field(map: &serde_json::Map<String, Value>, fields: &[&str]) -> Option<String> {
+    fields.iter().find_map(|field| {
+        let value = map.get(*field)?;
+        match value {
+            Value::Number(number) => Some(number.to_string()),
+            Value::String(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            _ => None,
+        }
+    })
+}
+
+fn structured_tool_row_details(map: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(state) = first_string_field(map, &["state", "status"]) {
+        details.push(state);
+    }
+    if let Some(author) = map
+        .get("author")
+        .or_else(|| map.get("user"))
+        .and_then(|value| value.get("login").or_else(|| value.get("name")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        details.push(format!("by {author}"));
+    }
+    if let Some(created) = first_string_field(map, &["createdAt", "created_at", "updatedAt"]) {
+        details.push(created);
+    }
+    details
+}
+
+fn format_structured_tool_row(row: &StructuredToolRow, prompt: &str) -> String {
+    let mut text = match row.id.as_deref() {
+        Some(id)
+            if prompt_asks_for_pull_requests(prompt)
+                && id.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            format!("#{id} - {}", row.title)
+        }
+        Some(id) => format!("{id} - {}", row.title),
+        None => row.title.clone(),
+    };
+    if !row.details.is_empty() {
+        text.push_str(" (");
+        text.push_str(&row.details.join(", "));
+        text.push(')');
+    }
+    if let Some(url) = &row.url {
+        text.push_str(" - ");
+        text.push_str(url);
+    }
+    truncate_for_tool_result_answer(&text)
 }
 
 fn truncate_for_tool_result_answer(text: &str) -> String {
@@ -4692,6 +4846,36 @@ mod response_builder_tests {
                 "prompt {prompt:?} should synthesize from {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn pr_prompt_summarizes_json_array_rows() {
+        let prompt = "Any new interesting PRs? You have the gh command line I think can use";
+        let result = serde_json::json!([
+            {
+                "number": 809,
+                "title": "feat: distributed mesh with PagedKV and Continuous Batching",
+                "url": "https://github.com/Mesh-LLM/mesh-llm/pull/809",
+                "createdAt": "2026-06-06T21:40:44Z",
+                "author": {"login": "Jackson57279"}
+            },
+            {
+                "number": 808,
+                "title": "Stabilize OpenClaw tool loops through MoA",
+                "url": "https://github.com/Mesh-LLM/mesh-llm/pull/808",
+                "author": {"login": "michaelneale"}
+            }
+        ])
+        .to_string();
+
+        let answer =
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, &result))
+                .expect("JSON PR array should synthesize a usable answer");
+
+        assert!(answer.contains("#809 - feat: distributed mesh"), "{answer}");
+        assert!(answer.contains("https://github.com/Mesh-LLM/mesh-llm/pull/809"));
+        assert!(answer.contains("#808 - Stabilize OpenClaw"), "{answer}");
+        assert!(!answer.contains("one relevant entry is: ["), "{answer}");
     }
 
     #[test]
