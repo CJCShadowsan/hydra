@@ -1571,7 +1571,7 @@ async fn handle_tool_result(
     if let Some((tool, _)) = repeated_tool.as_ref() {
         selected_tool_names.retain(|name| name != tool);
     }
-    let latest_user_text = session.last_user_text();
+    let latest_user_text = session.active_user_text();
     let latest_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
         tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
     });
@@ -1599,10 +1599,11 @@ async fn handle_tool_result(
         tracing::info!("moa: forcing answer after {count} completed tool calls");
         append_tool_budget_instruction(&mut messages, count);
     }
+    let latest_non_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
+        !tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
+    });
     let retry_tool = if tools_enabled_for_reducer {
-        latest_completed_tool_result(session).filter(|(_, result)| {
-            !tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
-        })
+        latest_non_answerable_tool.clone()
     } else {
         None
     };
@@ -1730,6 +1731,31 @@ async fn handle_tool_result(
                 ),
                 _ => {
                     let repaired = repair_tool_result_answer(session, &reduced.payload);
+                    match latest_non_answerable_tool.as_ref() {
+                        Some((tool, result))
+                            if answer_appears_to_use_non_answerable_tool_result(
+                                &repaired, result,
+                            ) =>
+                        {
+                            let answer = non_answerable_tool_result_answer(session, tool, result);
+                            return TurnResult {
+                                response_body: chat_response(&answer),
+                                worker_summaries: vec![WorkerSummary {
+                                    model: name,
+                                    role: WorkerRole::Reducer,
+                                    succeeded: false,
+                                    elapsed_ms: start.elapsed().as_millis() as u64,
+                                    output_kind: None,
+                                    confidence: None,
+                                }],
+                                reducer_used: true,
+                                reducer_attempts: attempts,
+                                turn_kind: TurnKind::ToolResult,
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                            };
+                        }
+                        _ => {}
+                    }
                     chat_or_schema_command_tool_response(
                         &repaired,
                         session.tools(),
@@ -1909,7 +1935,7 @@ fn tool_result_answer_from_evidence_response(session: &Session) -> Value {
 
 fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
     let (_, result) = latest_completed_tool_result(session)?;
-    let prompt = session.last_user_text();
+    let prompt = session.active_user_text();
     if !tool_result_has_answerable_evidence_for_prompt(&result, &prompt) {
         return None;
     }
@@ -1939,6 +1965,40 @@ fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
     }
 
     Some(truncate_for_tool_result_answer(&answer))
+}
+
+fn answer_appears_to_use_non_answerable_tool_result(answer: &str, result: &str) -> bool {
+    let answer_lower = answer.to_ascii_lowercase();
+    if answer_lower.contains("from the tool result") || answer_lower.contains("one relevant entry")
+    {
+        return true;
+    }
+
+    result
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .any(|line| line.len() >= 12 && answer.contains(line))
+}
+
+fn non_answerable_tool_result_answer(session: &Session, tool: &str, result: &str) -> String {
+    let prompt = session.active_user_text();
+    if prompt_asks_for_pull_requests(&prompt)
+        && plain_text_tool_result_looks_like_github_repo_list(result)
+    {
+        return "The latest tool result listed repositories, not pull requests, so I can't answer the PR request from that output. I need the target repository or a corrected PR-list result before I can pick an interesting PR.".to_string();
+    }
+
+    let first_line = result
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("empty output");
+    format!(
+        "The latest `{tool}` result is not answer evidence for the request: {}. I need a corrected tool result before I can answer.",
+        truncate_for_tool_result_answer(first_line)
+    )
 }
 
 fn answer_from_structured_tool_result(result: &str, prompt: &str) -> Option<String> {

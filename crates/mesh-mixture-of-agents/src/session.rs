@@ -228,6 +228,37 @@ impl Session {
             .unwrap_or_default()
     }
 
+    /// The user request that owns the active tool chain.
+    ///
+    /// Agent transports may wrap tool results in `role: user` content
+    /// blocks, and some clients append small user nudges after a tool
+    /// result. During a tool-result turn, prompt-aware guards need the
+    /// request that caused the latest assistant tool call, not the latest
+    /// transport-level user wrapper.
+    pub fn active_user_text(&self) -> String {
+        let Some(latest_tool_idx) = self
+            .messages
+            .iter()
+            .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        else {
+            return self.last_user_text();
+        };
+
+        let Some(tool_call_idx) = self.messages[..latest_tool_idx].iter().rposition(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("tool_calls").is_some()
+        }) else {
+            return self.last_user_text();
+        };
+
+        self.messages[..tool_call_idx]
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .and_then(extract_text_content)
+            .unwrap_or_else(|| self.last_user_text())
+    }
+
     /// System prompt (first system message).
     pub fn system_prompt(&self) -> Option<String> {
         self.messages
@@ -774,6 +805,7 @@ mod tests {
         );
 
         assert_eq!(s.classify_turn(), TurnType::ToolResult);
+        assert_eq!(s.active_user_text(), "List recent PRs");
 
         let messages = s.all_messages();
         assert_eq!(
@@ -832,6 +864,8 @@ mod tests {
         );
 
         assert_eq!(s.classify_turn(), TurnType::ToolResult);
+        assert_eq!(s.last_user_text(), "Please answer briefly.");
+        assert_eq!(s.active_user_text(), "Read and summarize");
         let messages = s.all_messages();
         assert_eq!(messages.len(), 5);
         assert_eq!(

@@ -460,6 +460,76 @@ async fn pr_prompt_retries_after_bad_tool_result_permutations() {
 }
 
 #[tokio::test]
+async fn goose_repo_list_tool_result_is_not_final_pr_evidence() {
+    let backend = RecordingBackend::new(
+        "From the tool result, one relevant entry is: michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z",
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": exec_tool(),
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Any new interesting PRs? You have the gh command line I think can use. Use tools if useful."}]},
+            {"role": "assistant", "content": [{
+                "type": "toolRequest",
+                "id": "call_exec",
+                "toolCall": {
+                    "status": "success",
+                    "value": {
+                        "name": "exec",
+                        "arguments": {"command": "gh repo list --limit 20"}
+                    }
+                }
+            }]},
+            {"role": "user", "content": [{
+                "type": "toolResponse",
+                "id": "call_exec",
+                "toolResult": {
+                    "status": "success",
+                    "value": {
+                        "content": [{
+                            "type": "text",
+                            "text": "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z\nmichaelneale/ollama\tRun models\tpublic, fork\t2026-06-05T00:42:49Z"
+                        }]
+                    }
+                }
+            }]},
+        ],
+        "max_tokens": 96,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+    let answer = result
+        .response_body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert!(
+        answer.contains("listed repositories, not pull requests"),
+        "{answer}"
+    );
+    assert!(
+        !answer.contains("michaelneale/sprout"),
+        "repo rows must not escape as a final PR answer: {answer}"
+    );
+}
+
+#[tokio::test]
 async fn github_auth_status_for_pr_prompt_allows_corrective_exec_followup() {
     let backend = RecordingBackend::new(
         r#"{"kind":"tool_proposal","confidence":0.9,"tool":"exec","arguments":{"command":"gh pr list --state open --limit 20 --json number,title,updatedAt,url,author","timeout":30}}"#,
