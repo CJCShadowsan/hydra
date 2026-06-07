@@ -50,18 +50,21 @@ pub(crate) use tool_guard::enforce_tool_call_contract;
 
 use backend::call_backend;
 use fanout::{GraceMode, gather_workers_incremental};
-use mesh_llm_guardrails::{sanitize_tool_arguments_for_tool, tool_arguments_wire_string};
+use mesh_llm_guardrails::{
+    extract_tool_name_and_arguments, normalize_tool_arguments, sanitize_tool_arguments_for_tool,
+    tool_arguments_wire_string,
+};
 use normalize::WorkerOutput;
 use reducer::{hedged_reducer_call, reducer_candidates};
 use serde_json::{Value, json};
 use session::Session;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use worker::WorkerRole;
 pub use worker::{strip_thinking, truncate_chars};
 
 const SAME_TOOL_FORCE_ANSWER_THRESHOLD: usize = 3;
-const WEB_RESEARCH_FORCE_ANSWER_THRESHOLD: usize = 6;
-const WEB_RESEARCH_TOOLS: &[&str] = &["web_search", "web_fetch"];
+const TOOL_BUDGET_FORCE_ANSWER_THRESHOLD: usize = 6;
 
 /// The virtual model name that triggers MoA routing.
 pub const VIRTUAL_MODEL_NAME: &str = "mesh";
@@ -172,6 +175,7 @@ struct DecisionResolution<'a> {
     selected_tool_names: &'a [String],
     forced_tool: Option<&'a ForcedToolChoice>,
     allowed_tools: &'a [String],
+    prompt_tool_profiles: &'a [PromptToolProfile],
 }
 
 // ─── Gateway entry point ─────────────────────────────────────────────
@@ -184,34 +188,44 @@ pub async fn handle_turn(config: &GatewayConfig, body: &Value) -> TurnResult {
     let start = Instant::now();
 
     let mut session = Session::new();
-    let incoming_messages = body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let incoming_messages = incoming_chat_messages(body);
     let tools = body.get("tools").cloned();
-    let has_tools = tools
+    let has_native_tools = tools
         .as_ref()
         .and_then(|t| t.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
 
     session.ingest(&incoming_messages, &tools);
+    let prompt_tool_profiles = if has_native_tools {
+        Vec::new()
+    } else {
+        prompt_declared_tool_profiles(&session)
+    };
+    let allowed_tools = declared_tool_names(&session, &prompt_tool_profiles);
+    let has_tools = !allowed_tools.is_empty();
 
     let turn_type = session.classify_turn();
-    let forced_tool = forced_tool_choice(body, &session, &tools);
+    let forced_tool = forced_tool_choice(body, &session, &tools, &allowed_tools);
     tracing::info!(
-        "moa: turn={:?}, {} models, tools={}",
+        "moa: turn={:?}, {} models, tools={}, native_tools={}",
         turn_type,
         config.models.len(),
         has_tools,
+        has_native_tools,
     );
-
-    let allowed_tools = session.tool_names();
 
     match turn_type {
         session::TurnType::ToolResult => {
-            handle_tool_result(config, &session, has_tools, &allowed_tools, start).await
+            handle_tool_result(
+                config,
+                &session,
+                has_tools,
+                &allowed_tools,
+                &prompt_tool_profiles,
+                start,
+            )
+            .await
         }
         session::TurnType::Fresh => {
             handle_query(
@@ -219,12 +233,61 @@ pub async fn handle_turn(config: &GatewayConfig, body: &Value) -> TurnResult {
                 &session,
                 has_tools,
                 &allowed_tools,
+                &prompt_tool_profiles,
                 forced_tool.as_ref(),
                 start,
             )
             .await
         }
     }
+}
+
+fn incoming_chat_messages(body: &Value) -> Vec<Value> {
+    let mut messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let completion_prompt = messages
+        .is_empty()
+        .then(|| completion_prompt_text(body.get("prompt")))
+        .flatten();
+    if let Some(prompt) = completion_prompt {
+        messages.push(json!({"role": "user", "content": prompt}));
+    }
+
+    let missing_system = !messages
+        .iter()
+        .any(|message| message_role(message) == "system");
+    let system_prompt = missing_system
+        .then(|| top_level_system_prompt(body))
+        .flatten();
+    if let Some(system) = system_prompt {
+        messages.insert(0, json!({"role": "system", "content": system}));
+    }
+
+    messages
+}
+
+fn top_level_system_prompt(body: &Value) -> Option<String> {
+    ["systemPrompt", "system_prompt", "system"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn completion_prompt_text(prompt: Option<&Value>) -> Option<String> {
+    match prompt? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(values) => {
+            let texts: Vec<&str> = values.iter().filter_map(Value::as_str).collect();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
+    }
+    .filter(|text| !text.trim().is_empty())
 }
 
 // ─── Query handling ──────────────────────────────────────────────────
@@ -234,16 +297,27 @@ async fn handle_query(
     session: &Session,
     has_tools: bool,
     allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
     forced_tool: Option<&ForcedToolChoice>,
     start: Instant,
 ) -> TurnResult {
     let assignments = worker::assign_roles(&config.models);
-    let grace_mode = grace_mode_for_turn(session, has_tools);
-    let query_uses_tools = forced_tool.is_some() || matches!(grace_mode, GraceMode::Tool);
+    let grace_mode = grace_mode_for_turn(session, has_tools, prompt_tool_profiles);
+    let continuation_tool = prior_shell_command_tool_choice(
+        session,
+        &tools_value(session),
+        allowed_tools,
+        prompt_tool_profiles,
+    );
+    let query_uses_tools = forced_tool.is_some()
+        || continuation_tool.is_some()
+        || matches!(grace_mode, GraceMode::Tool);
     let selected_tool_names = if let Some(tool) = forced_tool {
         vec![tool.name.clone()]
+    } else if let Some(tool) = continuation_tool.as_ref() {
+        vec![tool.name.clone()]
     } else if query_uses_tools {
-        selected_tool_names_for_turn(session, allowed_tools)
+        selected_tool_names_for_turn(session, allowed_tools, prompt_tool_profiles)
     } else {
         Vec::new()
     };
@@ -252,7 +326,9 @@ async fn handle_query(
     } else {
         None
     };
-    let required_tool = forced_tool.or(intent_required_tool.as_ref());
+    let required_tool = forced_tool
+        .or(continuation_tool.as_ref())
+        .or(intent_required_tool.as_ref());
     if let Some(tool) = required_tool.filter(|_| has_tools) {
         tracing::info!(
             "moa: direct tool call for explicit {} intent",
@@ -352,6 +428,7 @@ async fn handle_query(
             selected_tool_names: &selected_tool_names,
             forced_tool: required_tool,
             allowed_tools,
+            prompt_tool_profiles,
         },
     )
     .await;
@@ -376,19 +453,23 @@ async fn handle_query(
     }
 }
 
-fn grace_mode_for_turn(session: &Session, has_tools: bool) -> GraceMode {
+fn grace_mode_for_turn(
+    session: &Session,
+    has_tools: bool,
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> GraceMode {
     if !has_tools {
         return GraceMode::Answer;
     }
-    if looks_like_tool_intent(&session.last_user_text()) {
+    if looks_like_tool_intent(session, prompt_tool_profiles) {
         GraceMode::Tool
     } else {
         GraceMode::Answer
     }
 }
 
-fn looks_like_tool_intent(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
+fn looks_like_tool_intent(session: &Session, prompt_tool_profiles: &[PromptToolProfile]) -> bool {
+    let text = session.last_user_text().to_ascii_lowercase();
     if contains_any(
         &text,
         &[
@@ -396,51 +477,188 @@ fn looks_like_tool_intent(text: &str) -> bool {
             "without tool",
             "do not use tool",
             "don't use tool",
-            "no web",
-            "without web",
-            "do not browse",
-            "don't browse",
-            "no lookup",
-            "without lookup",
         ],
     ) {
         return false;
     }
 
-    let tool_intent_phrases = [
-        "use a tool",
-        "using a tool",
-        "read ",
-        "inspect ",
-        "open ",
-        "fetch ",
-        "search ",
-        "look up",
-        "browse",
-        "web",
-        "url",
-        "http://",
-        "https://",
-        "file",
-        "directory",
-        "folder",
-        "list ",
-        "run ",
-        "execute",
-        "terminal",
-        "shell",
-        "github",
-        "issue",
-        "pull request",
-        "pr ",
-        "weather",
-    ];
-    tool_intent_phrases
-        .iter()
-        .any(|phrase| text.contains(phrase))
+    if contains_any(
+        &text,
+        &[
+            "use a tool",
+            "using a tool",
+            "call a tool",
+            "use the tool",
+            "call the tool",
+        ],
+    ) {
+        return true;
+    }
+
+    let available = session.tool_names();
+    if !explicitly_requested_tool_names(&available, &text).is_empty() {
+        return true;
+    }
+    if !command_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles)
+        .is_empty()
+    {
+        return true;
+    }
+    if !schema_matched_tool_names(session.tools(), &available, &text, prompt_tool_profiles)
+        .is_empty()
+    {
+        return true;
+    }
+    extract_shell_command_block(&text)
+        .and_then(|command| {
+            command_tool_choice_from_command(
+                &command,
+                session.tools(),
+                &available,
+                prompt_tool_profiles,
+            )
+        })
+        .is_some()
 }
 
-fn selected_tool_names_for_turn(session: &Session, allowed_tools: &[String]) -> Vec<String> {
+fn prior_shell_command_tool_choice(
+    session: &Session,
+    tools: &Option<Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<ForcedToolChoice> {
+    if !looks_like_prior_tool_confirmation(&session.last_user_text()) {
+        return None;
+    }
+    let assistant = previous_assistant_text(session)?;
+    let command = extract_shell_command_block(&assistant)?;
+    command_tool_choice_from_command(
+        &command,
+        tools.as_ref(),
+        allowed_tools,
+        prompt_tool_profiles,
+    )
+}
+
+fn looks_like_prior_tool_confirmation(text: &str) -> bool {
+    let text = latest_user_request_tail(text).to_ascii_lowercase();
+    if contains_any(
+        &text,
+        &[
+            "don't do that",
+            "do not do that",
+            "dont do that",
+            "don't run",
+            "do not run",
+            "dont run",
+        ],
+    ) || contains_word(&text, "no")
+    {
+        return false;
+    }
+
+    contains_any(
+        &text,
+        &[
+            "do that",
+            "do it",
+            "go ahead",
+            "please do",
+            "run it",
+            "run that",
+            "execute it",
+            "execute that",
+        ],
+    ) || ["ok", "okay", "yes", "yeah", "yep"]
+        .iter()
+        .any(|word| contains_word(&text, word))
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
+fn latest_user_request_tail(text: &str) -> &str {
+    text.rsplit_once("\n\n")
+        .map(|(_, tail)| tail.trim())
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or_else(|| text.trim())
+}
+
+fn previous_assistant_text(session: &Session) -> Option<String> {
+    let mut seen_latest_user = false;
+    for message in session.messages().iter().rev() {
+        match message_role(message) {
+            "user" if !seen_latest_user => seen_latest_user = true,
+            "assistant" if seen_latest_user => {
+                return message_text_content(message).filter(|text| !text.trim().is_empty());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn message_text_content(message: &Value) -> Option<String> {
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let parts = message.get("content").and_then(Value::as_array)?;
+    let texts: Vec<&str> = parts
+        .iter()
+        .filter_map(|part| {
+            if part.get("type").and_then(Value::as_str) == Some("text") {
+                part.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+fn extract_shell_command_block(text: &str) -> Option<String> {
+    let mut in_block = false;
+    let mut is_shell = false;
+    let mut lines = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(lang) = trimmed.strip_prefix("```") {
+            if in_block {
+                if is_shell {
+                    let command = lines.join("\n").trim().to_string();
+                    if !command.is_empty() {
+                        return Some(command);
+                    }
+                }
+                in_block = false;
+                is_shell = false;
+                lines.clear();
+                continue;
+            }
+            let lang = lang.trim().to_ascii_lowercase();
+            in_block = true;
+            is_shell = matches!(
+                lang.as_str(),
+                "" | "bash" | "sh" | "shell" | "zsh" | "console"
+            );
+            continue;
+        }
+        if in_block && is_shell {
+            lines.push(line);
+        }
+    }
+
+    None
+}
+
+fn selected_tool_names_for_turn(
+    session: &Session,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
     let available = if allowed_tools.is_empty() {
         session.tool_names()
     } else {
@@ -456,13 +674,14 @@ fn selected_tool_names_for_turn(session: &Session, allowed_tools: &[String]) -> 
         return with_recent_tool_chain_names(session, &available, explicit);
     }
 
-    let mut selected = Vec::new();
-    for tool in &available {
-        let tool_lc = tool.to_ascii_lowercase();
-        if tool_is_relevant_to_text(&tool_lc, &text) {
-            selected.push(tool.clone());
-        }
+    let command_intent =
+        command_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles);
+    if !command_intent.is_empty() {
+        return with_recent_tool_chain_names(session, &available, command_intent);
     }
+
+    let selected =
+        schema_matched_tool_names(session.tools(), &available, &text, prompt_tool_profiles);
 
     with_recent_tool_chain_names(session, &available, selected)
 }
@@ -498,31 +717,601 @@ fn tool_name_is_explicitly_requested(tool: &str, text: &str) -> bool {
         return false;
     }
 
-    let spaced = tool.replace('_', " ");
-    let patterns = [
-        format!("use {tool}"),
-        format!("use the {tool}"),
-        format!("{tool} tool"),
-        format!("tool {tool}"),
-        format!("call {tool}"),
-        format!("call the {tool}"),
-        format!("use {spaced}"),
-        format!("use the {spaced}"),
-        format!("{spaced} tool"),
-        format!("tool {spaced}"),
-        format!("call {spaced}"),
-        format!("call the {spaced}"),
-        format!("or {tool}"),
-        format!("and {tool}"),
-        format!("or {spaced}"),
-        format!("and {spaced}"),
-    ];
+    let text_tokens = lexical_tokens(text);
+    let tool_tokens = lexical_tokens(&tool.replace('_', " "));
+    if tool_tokens.is_empty() {
+        return false;
+    }
 
-    patterns.iter().any(|pattern| text.contains(pattern))
+    token_sequence_matches(&text_tokens, &["use"], &tool_tokens)
+        || token_sequence_matches(&text_tokens, &["use", "the"], &tool_tokens)
+        || token_sequence_matches(&text_tokens, &["call"], &tool_tokens)
+        || token_sequence_matches(&text_tokens, &["call", "the"], &tool_tokens)
+        || token_sequence_matches(&text_tokens, &["tool"], &tool_tokens)
+        || token_sequence_matches_suffix(&text_tokens, &tool_tokens, &["tool"])
+        || token_sequence_matches(&text_tokens, &["or"], &tool_tokens)
+        || token_sequence_matches(&text_tokens, &["and"], &tool_tokens)
+}
+
+fn token_sequence_matches(text: &[String], prefix: &[&str], target: &[String]) -> bool {
+    if text.len() < prefix.len() + target.len() {
+        return false;
+    }
+    text.windows(prefix.len() + target.len()).any(|window| {
+        prefix
+            .iter()
+            .enumerate()
+            .all(|(idx, token)| window[idx] == *token)
+            && target
+                .iter()
+                .enumerate()
+                .all(|(idx, token)| window[prefix.len() + idx] == *token)
+    })
+}
+
+fn token_sequence_matches_suffix(text: &[String], target: &[String], suffix: &[&str]) -> bool {
+    if text.len() < target.len() + suffix.len() {
+        return false;
+    }
+    text.windows(target.len() + suffix.len()).any(|window| {
+        target
+            .iter()
+            .enumerate()
+            .all(|(idx, token)| window[idx] == *token)
+            && suffix
+                .iter()
+                .enumerate()
+                .all(|(idx, token)| window[target.len() + idx] == *token)
+    })
 }
 
 fn tools_value(session: &Session) -> Option<Value> {
     session.tools().cloned()
+}
+
+#[derive(Debug)]
+struct ToolSchemaProfile {
+    name: String,
+    tokens: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptToolProfile {
+    name: String,
+    tokens: HashSet<String>,
+}
+
+fn declared_tool_names(
+    session: &Session,
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
+    let native = session.tool_names();
+    if !native.is_empty() {
+        native
+    } else {
+        prompt_tool_profiles
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect()
+    }
+}
+
+fn prompt_declared_tool_profiles(session: &Session) -> Vec<PromptToolProfile> {
+    let Some(prompt) = prompt_tool_catalog_source(session) else {
+        return Vec::new();
+    };
+    let mut in_tooling_section = false;
+    let mut profiles = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") {
+            in_tooling_section = prompt_tool_heading(trimmed);
+            continue;
+        }
+        if !in_tooling_section {
+            continue;
+        }
+        let Some(profile) = parse_prompt_tool_line(trimmed) else {
+            continue;
+        };
+        if seen.insert(profile.name.clone()) {
+            profiles.push(profile);
+        }
+    }
+
+    profiles
+}
+
+fn prompt_tool_catalog_source(session: &Session) -> Option<String> {
+    if let Some(system) = session
+        .system_prompt()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        return Some(system);
+    }
+
+    let parts: Vec<String> = session
+        .messages()
+        .iter()
+        .filter_map(message_text_content)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn prompt_tool_heading(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "## Tooling" | "## Tools" | "## Available Tools"
+    )
+}
+
+fn parse_prompt_tool_line(line: &str) -> Option<PromptToolProfile> {
+    let rest = line.strip_prefix("- ")?;
+    let (name, description) = rest.split_once(':')?;
+    let name = name.trim();
+    let description = description.trim();
+    if !valid_prompt_tool_name(name) || description.is_empty() {
+        return None;
+    }
+
+    let mut tokens = text_tokens(name);
+    tokens.extend(text_tokens(description));
+    Some(PromptToolProfile {
+        name: name.to_string(),
+        tokens,
+    })
+}
+
+fn valid_prompt_tool_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 120 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn schema_matched_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
+    let profiles = tool_text_profiles(tools, available, prompt_tool_profiles);
+    if profiles.is_empty() {
+        return Vec::new();
+    }
+    let user_tokens = text_tokens(user_text);
+    if user_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored: Vec<(String, usize)> = profiles
+        .iter()
+        .map(|profile| {
+            let overlap = user_tokens
+                .iter()
+                .filter(|token| profile.tokens.contains(*token))
+                .count();
+            (profile.name.clone(), overlap)
+        })
+        .filter(|(_, score)| *score >= 2)
+        .collect();
+    scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+
+    let Some((_, top_score)) = scored.first() else {
+        return Vec::new();
+    };
+    let top_score = *top_score;
+    let runner_up = scored.get(1).map(|(_, score)| *score).unwrap_or(0);
+    if top_score < 2 || runner_up + 2 > top_score {
+        return Vec::new();
+    }
+
+    scored
+        .into_iter()
+        .filter_map(|(name, score)| (score == top_score).then_some(name))
+        .collect()
+}
+
+fn tool_text_profiles(
+    tools: Option<&Value>,
+    available: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<ToolSchemaProfile> {
+    let schema_profiles = tool_schema_profiles(tools, available);
+    if !schema_profiles.is_empty() {
+        return schema_profiles;
+    }
+
+    let available: HashSet<&str> = available.iter().map(String::as_str).collect();
+    prompt_tool_profiles
+        .iter()
+        .filter(|profile| available.is_empty() || available.contains(profile.name.as_str()))
+        .map(|profile| ToolSchemaProfile {
+            name: profile.name.clone(),
+            tokens: profile.tokens.clone(),
+        })
+        .collect()
+}
+
+fn tool_schema_profiles(tools: Option<&Value>, available: &[String]) -> Vec<ToolSchemaProfile> {
+    let available: HashSet<&str> = available.iter().map(String::as_str).collect();
+    tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if !available.contains(name) {
+                return None;
+            }
+            let mut tokens = HashSet::new();
+            collect_tool_schema_tokens(tool, &mut tokens);
+            Some(ToolSchemaProfile {
+                name: name.to_string(),
+                tokens,
+            })
+        })
+        .collect()
+}
+
+fn collect_tool_schema_tokens(value: &Value, tokens: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => tokens.extend(text_tokens(text)),
+        Value::Array(values) => {
+            for value in values {
+                collect_tool_schema_tokens(value, tokens);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                tokens.extend(text_tokens(key));
+                collect_tool_schema_tokens(value, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn text_tokens(text: &str) -> HashSet<String> {
+    lexical_tokens(text)
+        .into_iter()
+        .filter(|token| token.len() >= 3)
+        .filter(|token| !schema_match_stopword(token))
+        .collect()
+}
+
+fn lexical_tokens(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            (!token.is_empty()).then_some(token)
+        })
+        .collect()
+}
+
+fn schema_match_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "for"
+            | "the"
+            | "and"
+            | "use"
+            | "using"
+            | "with"
+            | "from"
+            | "into"
+            | "this"
+            | "that"
+            | "type"
+            | "function"
+            | "name"
+            | "description"
+            | "parameters"
+            | "properties"
+            | "required"
+            | "string"
+            | "object"
+            | "array"
+            | "boolean"
+            | "integer"
+            | "number"
+    )
+}
+
+fn command_tool_choice_from_command(
+    command: &str,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<ForcedToolChoice> {
+    let candidates = command_tool_candidates(tools, allowed_tools, prompt_tool_profiles);
+    let [candidate] = candidates.as_slice() else {
+        tracing::info!(
+            "moa: shell command block found but command-like declared tool candidates={} (need exactly one)",
+            candidates.len()
+        );
+        return None;
+    };
+
+    let arguments = json!({ candidate.field.clone(): command });
+    match sanitize_tool_arguments_for_tool(&candidate.name, &arguments, tools) {
+        Ok(arguments) => Some(ForcedToolChoice {
+            name: candidate.name.clone(),
+            fallback_arguments: arguments,
+        }),
+        Err(err) => {
+            tracing::info!(
+                "moa: command block could not be used as {} args: {err}",
+                candidate.name
+            );
+            None
+        }
+    }
+}
+
+fn command_intent_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
+    let candidates = command_tool_candidates(tools, available, prompt_tool_profiles);
+    let [candidate] = candidates.as_slice() else {
+        return Vec::new();
+    };
+
+    if user_text_suggests_command_tool(user_text, &candidate.tokens) {
+        vec![candidate.name.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn user_text_suggests_command_tool(user_text: &str, schema_tokens: &HashSet<String>) -> bool {
+    let user_tokens = lexical_tokens(user_text);
+    if user_tokens
+        .iter()
+        .filter(|token| !schema_match_stopword(token))
+        .any(|token| schema_tokens.contains(token))
+    {
+        return true;
+    }
+
+    command_execution_pattern_matches(&user_tokens)
+}
+
+fn command_execution_pattern_matches(tokens: &[String]) -> bool {
+    tokens.windows(3).any(|window| {
+        matches!(window[0].as_str(), "use" | "using")
+            && executable_token(&window[1])
+            && window[2] == "to"
+    }) || tokens.windows(2).any(|window| {
+        matches!(window[0].as_str(), "run" | "execute") && executable_token(&window[1])
+    })
+}
+
+fn executable_token(token: &str) -> bool {
+    if !(2..=40).contains(&token.len()) {
+        return false;
+    }
+    !matches!(
+        token,
+        "it" | "that" | "this" | "the" | "a" | "an" | "tool" | "command"
+    ) && token.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+#[derive(Debug)]
+struct CommandToolCandidate {
+    name: String,
+    field: String,
+    tokens: HashSet<String>,
+}
+
+fn command_tool_candidates(
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<CommandToolCandidate> {
+    let schema_candidates = command_schema_tool_candidates(tools, allowed_tools);
+    if !schema_candidates.is_empty() {
+        return clear_command_tool_candidates(schema_candidates);
+    }
+
+    clear_command_tool_candidates(prompt_command_tool_candidates(
+        allowed_tools,
+        prompt_tool_profiles,
+    ))
+}
+
+fn clear_command_tool_candidates(
+    candidates: Vec<CommandToolCandidate>,
+) -> Vec<CommandToolCandidate> {
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+
+    let mut scored: Vec<(usize, CommandToolCandidate)> = candidates
+        .into_iter()
+        .map(|candidate| (command_tool_candidate_score(&candidate), candidate))
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+            .then_with(|| left.1.field.cmp(&right.1.field))
+    });
+
+    let [(score, _candidate), rest @ ..] = scored.as_slice() else {
+        return Vec::new();
+    };
+    let runner_up = rest.first().map(|(score, _)| *score).unwrap_or(0);
+    if *score >= runner_up + 3 {
+        vec![scored.remove(0).1]
+    } else {
+        scored.into_iter().map(|(_, candidate)| candidate).collect()
+    }
+}
+
+fn command_tool_candidate_score(candidate: &CommandToolCandidate) -> usize {
+    command_field_score(&candidate.field, &candidate.tokens)
+}
+
+fn command_schema_tool_candidates(
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+) -> Vec<CommandToolCandidate> {
+    let allowed: HashSet<&str> = allowed_tools.iter().map(String::as_str).collect();
+    tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if !allowed.is_empty() && !allowed.contains(name) {
+                return None;
+            }
+            let params = tool.pointer("/function/parameters")?;
+            let (field, tokens) = command_like_string_field(params)?;
+            Some(CommandToolCandidate {
+                name: name.to_string(),
+                field,
+                tokens,
+            })
+        })
+        .collect()
+}
+
+fn prompt_command_tool_candidates(
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<CommandToolCandidate> {
+    let allowed: HashSet<&str> = allowed_tools.iter().map(String::as_str).collect();
+    prompt_tool_profiles
+        .iter()
+        .filter(|profile| allowed.is_empty() || allowed.contains(profile.name.as_str()))
+        .filter(|profile| prompt_profile_looks_command_executor(profile))
+        .map(|profile| CommandToolCandidate {
+            name: profile.name.clone(),
+            field: "command".to_string(),
+            tokens: profile.tokens.clone(),
+        })
+        .collect()
+}
+
+fn prompt_profile_looks_command_executor(profile: &PromptToolProfile) -> bool {
+    let tokens = &profile.tokens;
+    let has_execute = tokens.contains("run") || tokens.contains("execute");
+    let has_command_target = ["command", "commands", "shell", "terminal", "cli", "clis"]
+        .iter()
+        .any(|token| tokens.contains(*token));
+    let looks_like_existing_process = (tokens.contains("manage") || tokens.contains("background"))
+        && (tokens.contains("session") || tokens.contains("sessions"))
+        && (tokens.contains("running") || tokens.contains("started"));
+
+    has_execute && has_command_target && !looks_like_existing_process
+}
+
+fn command_like_string_field(parameters: &Value) -> Option<(String, HashSet<String>)> {
+    let properties = parameters.get("properties").and_then(Value::as_object)?;
+    let required_matches = command_like_fields(
+        parameters
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+        properties,
+    );
+    if let Some(field) = clear_command_like_field(required_matches) {
+        return Some(field);
+    }
+
+    clear_command_like_field(command_like_fields(
+        properties.keys().map(String::as_str),
+        properties,
+    ))
+}
+
+fn command_like_fields<'a>(
+    fields: impl Iterator<Item = &'a str>,
+    properties: &serde_json::Map<String, Value>,
+) -> Vec<(String, HashSet<String>)> {
+    let mut matches = Vec::new();
+    for field in fields {
+        let Some(schema) = properties.get(field) else {
+            continue;
+        };
+        if !schema_allows_string(schema) {
+            continue;
+        }
+        let mut tokens = text_tokens(field);
+        collect_tool_schema_tokens(schema, &mut tokens);
+        if schema_tokens_look_command_like(&tokens) {
+            matches.push((field.to_string(), tokens));
+        }
+    }
+    matches
+}
+
+fn clear_command_like_field(
+    matches: Vec<(String, HashSet<String>)>,
+) -> Option<(String, HashSet<String>)> {
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.len() == 1 {
+        let (field, tokens) = matches.into_iter().next()?;
+        return Some((field, tokens));
+    };
+
+    let mut scored: Vec<(usize, String, HashSet<String>)> = matches
+        .into_iter()
+        .map(|(field, tokens)| (command_field_score(&field, &tokens), field, tokens))
+        .filter(|(score, _, _)| *score >= 4)
+        .collect();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    let [(score, field, tokens), rest @ ..] = scored.as_slice() else {
+        return None;
+    };
+    let runner_up = rest.first().map(|(score, _, _)| *score).unwrap_or(0);
+    if *score >= runner_up + 3 {
+        Some((field.clone(), tokens.clone()))
+    } else {
+        None
+    }
+}
+
+fn command_field_score(field: &str, tokens: &HashSet<String>) -> usize {
+    let field_tokens = text_tokens(field);
+    let mut score = 0;
+    for token in &field_tokens {
+        score += match token.as_str() {
+            "command" | "commands" => 8,
+            "cmd" => 6,
+            _ => 0,
+        };
+    }
+    for token in tokens {
+        score += match token.as_str() {
+            "command" | "commands" => 2,
+            "cmd" => 1,
+            _ => 0,
+        };
+    }
+    score
+}
+
+fn schema_tokens_look_command_like(tokens: &HashSet<String>) -> bool {
+    tokens.contains("command") || tokens.contains("commands") || tokens.contains("cmd")
 }
 
 fn required_tool_choice_for_intent(
@@ -530,17 +1319,25 @@ fn required_tool_choice_for_intent(
     tools: &Option<Value>,
     selected_tool_names: &[String],
 ) -> Option<ForcedToolChoice> {
+    let tools = tools.as_ref()?;
     let [name] = selected_tool_names else {
         return None;
     };
 
-    let inferred =
-        infer_tool_arguments_from_prompt(name, tools.as_ref(), &session.last_user_text());
-    match sanitize_tool_arguments_for_tool(name, &inferred, tools.as_ref()) {
-        Ok(arguments) => Some(ForcedToolChoice {
-            name: name.clone(),
-            fallback_arguments: arguments,
-        }),
+    let inferred = infer_tool_arguments_from_prompt(name, Some(tools), &session.last_user_text());
+    match sanitize_tool_arguments_for_tool(name, &inferred, Some(tools)) {
+        Ok(arguments) => {
+            if is_empty_command_tool_arguments(name, tools, &arguments) {
+                tracing::info!(
+                    "moa: explicit command-tool intent selected {name}, but no command arguments were inferred"
+                );
+                return None;
+            }
+            Some(ForcedToolChoice {
+                name: name.clone(),
+                fallback_arguments: arguments,
+            })
+        }
         Err(err) => {
             tracing::info!(
                 "moa: explicit tool intent selected {name}, but arguments could not be inferred: {err}"
@@ -548,6 +1345,14 @@ fn required_tool_choice_for_intent(
             None
         }
     }
+}
+
+fn is_empty_command_tool_arguments(name: &str, tools: &Value, arguments: &Value) -> bool {
+    let candidates = command_schema_tool_candidates(Some(tools), &[name.to_string()]);
+    let [_candidate] = candidates.as_slice() else {
+        return false;
+    };
+    arguments.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 fn recent_tool_chain_names(session: &Session) -> Vec<String> {
@@ -586,70 +1391,6 @@ fn message_role(msg: &Value) -> &str {
     msg.get("role").and_then(Value::as_str).unwrap_or("")
 }
 
-fn tool_is_relevant_to_text(tool_name: &str, text: &str) -> bool {
-    if text.contains(tool_name) {
-        return true;
-    }
-
-    match tool_name {
-        "read" | "read_file" | "file_fetch" => contains_any(
-            text,
-            &["read ", "open ", "inspect ", "fetch file", "show file"],
-        ),
-        "edit" | "edit_file" | "file_write" | "write" => {
-            contains_any(text, &["edit ", "change ", "modify ", "write ", "create "])
-        }
-        "exec" | "run_command" | "process" => contains_any(
-            text,
-            &[
-                "run ", "execute ", "shell", "terminal", "command", "process",
-            ],
-        ),
-        "web_search" => contains_any(
-            text,
-            &[
-                "search ",
-                "look up",
-                "lookup",
-                "web",
-                "google",
-                "github",
-                "issue",
-                "pull request",
-                "pr ",
-                "weather",
-                "forecast",
-                "current",
-                "latest",
-                "today",
-                "tomorrow",
-            ],
-        ),
-        "web_fetch" => contains_any(
-            text,
-            &[
-                "fetch ",
-                "browse",
-                "url",
-                "http://",
-                "https://",
-                "github",
-                "github.com/",
-                "issue",
-                "pull request",
-                "pr ",
-            ],
-        ),
-        "dir_list" | "dir_fetch" | "list_files" => {
-            contains_any(text, &["list ", "directory", "folder", "dir "])
-        }
-        "image" | "image_generate" => contains_any(text, &["image", "picture", "generate"]),
-        "pdf" => text.contains("pdf"),
-        "memory_search" | "memory_get" => text.contains("memory"),
-        _ => false,
-    }
-}
-
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
@@ -658,13 +1399,14 @@ fn forced_tool_choice(
     body: &Value,
     session: &Session,
     tools: &Option<Value>,
+    allowed_tools: &[String],
 ) -> Option<ForcedToolChoice> {
     let name = body
         .get("tool_choice")?
         .get("function")?
         .get("name")?
         .as_str()?;
-    if name.is_empty() || !session.tool_names().iter().any(|tool| tool == name) {
+    if name.is_empty() || !allowed_tools.iter().any(|tool| tool == name) {
         return None;
     }
 
@@ -783,6 +1525,10 @@ fn is_path_like_candidate(candidate: &str, field: &str) -> bool {
         || candidate.starts_with("~/")
         || candidate.starts_with("./")
         || candidate.starts_with("../")
+        || ((field.contains("path") || field.contains("file"))
+            && candidate.contains('.')
+            && !candidate.starts_with('.')
+            && !candidate.ends_with('.'))
 }
 
 fn infer_query_argument(field: &str, prompt: &str) -> Option<String> {
@@ -813,22 +1559,26 @@ async fn handle_tool_result(
     session: &Session,
     has_tools: bool,
     allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
     start: Instant,
 ) -> TurnResult {
     let candidates = reducer_candidates(config);
     let candidate_count = candidates.len();
     let repeated_tool = repeated_same_tool_results(session);
-    let web_budget_exhausted = web_research_tool_budget_exhausted(session);
-    let mut selected_tool_names = selected_tool_names_for_turn(session, allowed_tools);
+    let tool_budget_exhausted = tool_budget_exhausted(session);
+    let mut selected_tool_names =
+        selected_tool_names_for_turn(session, allowed_tools, prompt_tool_profiles);
     if let Some((tool, _)) = repeated_tool.as_ref() {
         selected_tool_names.retain(|name| name != tool);
     }
-    if web_budget_exhausted.is_some() {
-        selected_tool_names.retain(|name| !is_web_research_tool(name));
+    let latest_answerable_tool = latest_completed_tool_result(session)
+        .filter(|(_, result)| tool_result_has_answerable_evidence(result));
+    if let Some((tool, _)) = latest_answerable_tool {
+        selected_tool_names.retain(|name| name != &tool);
     }
     let tools_enabled_for_reducer =
-        has_tools && !selected_tool_names.is_empty() && web_budget_exhausted.is_none();
-    let (mut messages, tools) = if web_budget_exhausted.is_some() {
+        has_tools && !selected_tool_names.is_empty() && tool_budget_exhausted.is_none();
+    let (mut messages, tools) = if tool_budget_exhausted.is_some() {
         (context::pack_for_tool_result_answer_only(session), None)
     } else {
         context::pack_for_tool_result_turn_selected(
@@ -843,9 +1593,18 @@ async fn handle_tool_result(
         );
         append_tool_loop_answer_instruction(&mut messages, tool, *count);
     }
-    if let Some(count) = web_budget_exhausted {
-        tracing::info!("moa: forcing answer after {count} completed web research tool calls");
-        append_web_research_budget_instruction(&mut messages, count);
+    if let Some(count) = tool_budget_exhausted {
+        tracing::info!("moa: forcing answer after {count} completed tool calls");
+        append_tool_budget_instruction(&mut messages, count);
+    }
+    if tools_enabled_for_reducer
+        && let Some((tool, _)) = latest_completed_tool_result(session)
+            .filter(|(_, result)| !tool_result_has_answerable_evidence(result))
+    {
+        tracing::info!(
+            "moa: latest {tool} tool result looks like error/usage output; asking reducer to retry"
+        );
+        append_tool_error_retry_instruction(&mut messages, &tool);
     }
 
     // Hedged ladder: start candidate 0, hedge to candidate 1 after hedge_delay
@@ -930,23 +1689,49 @@ async fn handle_tool_result(
 
     let (reducer_name, succeeded, response_body) = match chosen {
         Some((name, reduced, response_tools_enabled)) => {
-            // Be consistent with the fanout/arbiter path: emit a real
-            // `tool_calls` response whenever the reducer named a tool,
-            // even if `arguments` is missing. The fanout path emits `{}`
-            // for empty arguments; this path used to fall back to a
-            // chat_response carrying the reducer's prose, which broke
-            // agent harnesses (Goose, OpenCode) that only act on
-            // `tool_calls`. `tool_call_response` already collapses
-            // missing / non-object arguments to `"{}"`.
+            let empty_tools: &[String] = &[];
+            let empty_profiles: &[PromptToolProfile] = &[];
+            let response_allowed_tools = if response_tools_enabled {
+                allowed_tools
+            } else {
+                empty_tools
+            };
+            let response_prompt_profiles = if response_tools_enabled {
+                prompt_tool_profiles
+            } else {
+                empty_profiles
+            };
+            // When tools remain enabled, be consistent with the
+            // fanout/arbiter path and emit a real `tool_calls` response for
+            // valid reducer proposals. When tools are disabled, never pass
+            // tool-call-shaped text through as chat content; answer from the
+            // completed tool result instead.
             let body = match reduced.kind {
-                normalize::OutputKind::ToolProposal => {
-                    tool_proposal_response(&reduced, response_tools_enabled)
+                normalize::OutputKind::ToolProposal if !response_tools_enabled => {
+                    tool_result_answer_from_evidence_response(session)
                 }
+                normalize::OutputKind::ToolProposal => tool_proposal_response(
+                    &reduced,
+                    response_tools_enabled,
+                    session.tools(),
+                    response_allowed_tools,
+                    response_prompt_profiles,
+                    Some(&session.last_user_text()),
+                ),
                 normalize::OutputKind::Uncertainty => error_response(
                     "MoA reducer returned no usable answer",
                     MOA_ERR_NO_USABLE_ANSWER,
                 ),
-                _ => chat_response(&repair_tool_result_answer(session, &reduced.payload)),
+                _ => {
+                    let repaired = repair_tool_result_answer(session, &reduced.payload);
+                    chat_or_schema_command_tool_response(
+                        &repaired,
+                        session.tools(),
+                        response_allowed_tools,
+                        response_prompt_profiles,
+                        Some(&session.last_user_text()),
+                    )
+                }
             };
             (name, true, body)
         }
@@ -982,20 +1767,19 @@ async fn handle_tool_result(
 }
 
 fn repair_tool_result_answer(session: &Session, answer: &str) -> String {
-    if let Some(github_answer) = grounded_github_tool_answer(session) {
-        return github_answer;
-    }
+    let repaired_rows =
+        repair_tabular_tool_result_answer(session, answer).unwrap_or_else(|| answer.to_string());
 
     if !tool_evidence_should_be_preserved(&session.last_user_text()) {
-        return answer.to_string();
+        return repaired_rows;
     }
 
-    let missing = missing_tool_evidence_values(session, answer);
+    let missing = missing_tool_evidence_values(session, &repaired_rows);
     if missing.is_empty() {
-        return answer.to_string();
+        return repaired_rows;
     }
 
-    let mut repaired = answer.trim().to_string();
+    let mut repaired = repaired_rows.trim().to_string();
     if !repaired.is_empty() {
         repaired.push_str("\n\n");
     }
@@ -1004,127 +1788,138 @@ fn repair_tool_result_answer(session: &Session, answer: &str) -> String {
     repaired
 }
 
-fn grounded_github_tool_answer(session: &Session) -> Option<String> {
-    let user_text = session.last_user_text();
-    if !github_evidence_should_ground_answer(&user_text) {
-        return None;
-    }
+#[derive(Debug)]
+struct TabularToolRow {
+    id: String,
+    title: String,
+}
 
-    let rows = github_tool_evidence_rows(session);
+fn repair_tabular_tool_result_answer(session: &Session, answer: &str) -> Option<String> {
+    let (_, result) = latest_completed_tool_result(session)?;
+    let rows = tabular_tool_result_rows(&result);
     if rows.is_empty() {
         return None;
     }
 
-    let selected = select_relevant_github_rows(&user_text, &rows);
-    let heading = if selected.len() == 1 {
-        "Grounded GitHub evidence from the fetched tool result:"
-    } else {
-        "Grounded GitHub evidence from the fetched tool results:"
-    };
-    let mut answer = String::from(heading);
-    for row in selected {
-        answer.push_str("\n- ");
-        answer.push_str(row);
-    }
-    if user_text.to_ascii_lowercase().contains("nick") {
-        answer.push_str(
-            "\n\nI do not see a `Nick` author/login in those fetched rows; use the author/login shown above.",
-        );
-    }
-    Some(answer)
-}
-
-fn github_evidence_should_ground_answer(user_text: &str) -> bool {
-    let text = user_text.to_ascii_lowercase();
-    contains_any(
-        &text,
-        &[
-            "github",
-            "pull request",
-            "pr ",
-            "pr#",
-            "issue",
-            "status",
-            "review",
-        ],
-    )
-}
-
-fn github_tool_evidence_rows(session: &Session) -> Vec<String> {
-    let mut rows = Vec::new();
-    for (_, result) in session.recent_tool_results() {
-        rows.extend(context::github_evidence_rows_from_tool_result(&result));
-    }
-    let mut deduped = Vec::new();
-    for row in rows {
-        if !deduped.iter().any(|seen| seen == &row) {
-            deduped.push(row);
-        }
-    }
-    deduped
-}
-
-fn select_relevant_github_rows<'a>(user_text: &str, rows: &'a [String]) -> Vec<&'a String> {
-    let text = user_text.to_ascii_lowercase();
-    let explicit_numbers = github_pr_numbers_from_text(&text);
-    if !explicit_numbers.is_empty() {
-        let matches = rows
-            .iter()
-            .filter(|row| explicit_numbers.iter().any(|number| row.contains(number)))
-            .collect::<Vec<_>>();
-        if !matches.is_empty() {
-            return matches;
+    for row in &rows {
+        let has_id = answer_has_row_id(answer, &row.id);
+        let has_title = answer_contains_text(answer, &row.title);
+        if has_id && !has_title {
+            let exact_id_answer = answer
+                .trim()
+                .trim_start_matches('#')
+                .chars()
+                .all(|ch| ch.is_ascii_digit());
+            let row_text = format!("#{} - {}", row.id, row.title);
+            if exact_id_answer {
+                return Some(row_text);
+            }
+            return Some(append_tool_rows(answer, &[row_text]));
         }
     }
 
-    let keywords = github_relevance_keywords(&text);
-    if !keywords.is_empty() {
-        let matches = rows
-            .iter()
-            .filter(|row| {
-                let row = row.to_ascii_lowercase();
-                keywords.iter().any(|keyword| row.contains(keyword))
-            })
-            .collect::<Vec<_>>();
-        if !matches.is_empty() {
-            return matches;
-        }
-    }
-
-    rows.iter().take(5).collect()
-}
-
-fn github_pr_numbers_from_text(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '#')
-        .filter_map(|token| {
-            let number = token.strip_prefix('#').unwrap_or(token);
-            (number.len() >= 2 && number.chars().all(|c| c.is_ascii_digit()))
-                .then(|| format!("#{number}"))
+    let missing_rows: Vec<String> = rows
+        .iter()
+        .filter(|row| {
+            answer_contains_text(answer, &row.title) && !answer_has_row_id(answer, &row.id)
         })
-        .collect()
+        .map(|row| format!("#{} - {}", row.id, row.title))
+        .collect();
+    if missing_rows.is_empty() {
+        None
+    } else {
+        Some(append_tool_rows(answer, &missing_rows))
+    }
 }
 
-fn github_relevance_keywords(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-        .filter(|word| word.len() >= 4)
-        .filter(|word| {
-            !matches!(
-                *word,
-                "github"
-                    | "pull"
-                    | "request"
-                    | "status"
-                    | "review"
-                    | "opened"
-                    | "what"
-                    | "about"
-                    | "please"
-                    | "quality"
-                    | "quick"
+fn tabular_tool_result_rows(result: &str) -> Vec<TabularToolRow> {
+    result
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split('\t').map(str::trim);
+            let id = columns.next()?.trim_start_matches('#');
+            let title = columns.next()?;
+            (!id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) && !title.is_empty()).then(
+                || TabularToolRow {
+                    id: id.to_string(),
+                    title: title.to_string(),
+                },
             )
         })
-        .map(str::to_string)
         .collect()
+}
+
+fn answer_has_row_id(answer: &str, id: &str) -> bool {
+    answer.contains(&format!("#{id}"))
+        || answer
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == id)
+}
+
+fn answer_contains_text(answer: &str, text: &str) -> bool {
+    answer
+        .to_ascii_lowercase()
+        .contains(&text.to_ascii_lowercase())
+}
+
+fn append_tool_rows(answer: &str, rows: &[String]) -> String {
+    let mut repaired = answer.trim().to_string();
+    if !repaired.is_empty() {
+        repaired.push_str("\n\n");
+    }
+    repaired.push_str("Tool rows: ");
+    repaired.push_str(&rows.join(", "));
+    repaired
+}
+
+fn tool_result_answer_from_evidence_response(session: &Session) -> Value {
+    match answer_from_latest_tool_result(session) {
+        Some(answer) => chat_response(&answer),
+        None => error_response(
+            "MoA reducer requested another tool after tools were disabled",
+            MOA_ERR_NO_USABLE_ANSWER,
+        ),
+    }
+}
+
+fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
+    let (_, result) = latest_completed_tool_result(session)?;
+    if !tool_result_has_answerable_evidence(&result) {
+        return None;
+    }
+
+    let mut lines = result
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    let mut answer = format!(
+        "From the tool result, one relevant entry is: {}",
+        truncate_for_tool_result_answer(first)
+    );
+    let rest = lines.take(2).collect::<Vec<_>>();
+    if !rest.is_empty() {
+        answer.push_str("\n\nOther returned entries include:\n");
+        for line in rest {
+            answer.push_str("- ");
+            answer.push_str(&truncate_for_tool_result_answer(line));
+            answer.push('\n');
+        }
+        answer = answer.trim_end().to_string();
+    }
+
+    Some(truncate_for_tool_result_answer(&answer))
+}
+
+fn truncate_for_tool_result_answer(text: &str) -> String {
+    const LIMIT: usize = 900;
+    if text.chars().count() <= LIMIT {
+        return text.to_string();
+    }
+
+    let mut truncated = text.chars().take(LIMIT).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn tool_evidence_should_be_preserved(user_text: &str) -> bool {
@@ -1212,13 +2007,9 @@ fn repeated_same_tool_results(session: &Session) -> Option<(String, usize)> {
     (count >= SAME_TOOL_FORCE_ANSWER_THRESHOLD).then(|| (tool_name.clone(), count))
 }
 
-fn web_research_tool_budget_exhausted(session: &Session) -> Option<usize> {
-    let count = completed_tool_names_since_latest_user_before_tool_result(session)
-        .iter()
-        .filter(|name| is_web_research_tool(name))
-        .count();
-
-    (count >= WEB_RESEARCH_FORCE_ANSWER_THRESHOLD).then_some(count)
+fn tool_budget_exhausted(session: &Session) -> Option<usize> {
+    let count = completed_tool_names_since_latest_user_before_tool_result(session).len();
+    (count >= TOOL_BUDGET_FORCE_ANSWER_THRESHOLD).then_some(count)
 }
 
 fn completed_tool_names_since_latest_user_before_tool_result(session: &Session) -> Vec<String> {
@@ -1265,10 +2056,59 @@ fn completed_tool_names_since_latest_user_before_tool_result(session: &Session) 
     completed
 }
 
-fn is_web_research_tool(name: &str) -> bool {
-    WEB_RESEARCH_TOOLS
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+fn latest_completed_tool_result(session: &Session) -> Option<(String, String)> {
+    session.recent_tool_results().into_iter().last()
+}
+
+fn tool_result_has_answerable_evidence(result: &str) -> bool {
+    let trimmed = result.trim();
+    if trimmed.is_empty() || matches!(trimmed, "{}" | "[]") {
+        return false;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        return json_value_has_answerable_evidence(&parsed);
+    }
+
+    !plain_text_tool_result_looks_like_error(trimmed)
+}
+
+fn plain_text_tool_result_looks_like_error(result: &str) -> bool {
+    let normalized = result.replace('\r', "");
+    let lower = normalized.trim_start().to_ascii_lowercase();
+    let first_line = lower.lines().next().unwrap_or("").trim();
+    first_line.starts_with("unknown flag:")
+        || first_line.starts_with("unknown command")
+        || first_line.starts_with("error:")
+        || first_line.starts_with("fatal:")
+        || (lower.contains("\nusage:") && lower.lines().take(3).any(cli_error_line))
+}
+
+fn cli_error_line(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("unknown ")
+        || line.starts_with("error:")
+        || line.starts_with("fatal:")
+        || line.contains("invalid")
+}
+
+fn json_value_has_answerable_evidence(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(_) | Value::Number(_) => true,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(values) => values.iter().any(json_value_has_answerable_evidence),
+        Value::Object(map) => {
+            if map
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("error"))
+            {
+                return false;
+            }
+            map.values().any(json_value_has_answerable_evidence)
+        }
+    }
 }
 
 fn append_tool_loop_answer_instruction(messages: &mut [Value], tool: &str, count: usize) {
@@ -1281,13 +2121,22 @@ fn append_tool_loop_answer_instruction(messages: &mut [Value], tool: &str, count
     append_system_instruction(messages, &instruction);
 }
 
-fn append_web_research_budget_instruction(messages: &mut [Value], count: usize) {
+fn append_tool_budget_instruction(messages: &mut [Value], count: usize) {
     let instruction = format!(
-        "\n\nWeb research budget guard: {count} completed web_search/web_fetch calls are already \
-         in context. Do not call web_search or web_fetch again. Answer now from the gathered \
-         evidence. For GitHub/web results, only use exact numbers, titles, authors, statuses, \
-         and URLs present in the evidence. If the evidence is incomplete, ambiguous, or conflicts \
-         with the user's premise, say that directly instead of inventing missing facts."
+        "\n\nTool budget guard: {count} completed tool calls are already in context. \
+         Do not call another tool unless the declared tool schema and current evidence make \
+         the next call clearly necessary. Prefer answering now from gathered tool results; \
+         if evidence is incomplete, ambiguous, or conflicts with the user's premise, say that \
+         directly instead of inventing missing facts."
+    );
+    append_system_instruction(messages, &instruction);
+}
+
+fn append_tool_error_retry_instruction(messages: &mut [Value], tool: &str) {
+    let instruction = format!(
+        "\n\nTool retry guard: the latest `{tool}` result appears to be command error or usage text, \
+         not answer evidence. If the user's request still needs data, call a corrected tool once. \
+         Do not answer from usage or error text."
     );
     append_system_instruction(messages, &instruction);
 }
@@ -1322,22 +2171,35 @@ async fn resolve_decision(
         selected_tool_names,
         forced_tool,
         allowed_tools,
+        prompt_tool_profiles,
     } = request;
+    let tools_available = !allowed_tools.is_empty();
+    let response_tool_names = response_tool_names(selected_tool_names, allowed_tools);
 
     match decision {
         arbiter::Decision::Answer(text) => {
-            if let Some(tool) = forced_tool.filter(|_| has_tools) {
+            if let Some(tool) = forced_tool.filter(|_| tools_available) {
                 (
                     tool_call_response(&tool.name, &tool.fallback_arguments),
                     false,
                     0,
                 )
             } else {
-                (chat_response(&text), false, 0)
+                (
+                    chat_or_schema_command_tool_response(
+                        &text,
+                        session.tools(),
+                        response_tool_names,
+                        prompt_tool_profiles,
+                        Some(&session.last_user_text()),
+                    ),
+                    false,
+                    0,
+                )
             }
         }
         arbiter::Decision::ToolCall { name, arguments } => {
-            if has_tools {
+            if tools_available {
                 (tool_call_response(&name, &arguments), false, 0)
             } else {
                 (
@@ -1383,7 +2245,7 @@ async fn resolve_decision(
                         normalize::normalize_worker_output(&text, &winner, WorkerRole::Reducer, 0);
                     enforce_tool_call_contract(
                         &mut reduced,
-                        allowed_tools,
+                        response_tool_names,
                         session.tools(),
                         &winner,
                     );
@@ -1406,28 +2268,59 @@ async fn resolve_decision(
                         // previous "both name AND args required" gate would
                         // silently fall back to a chat_response and break
                         // the calling agent's tool loop.
-                        (tool_proposal_response(&reduced, has_tools), true, attempts)
+                        (
+                            tool_proposal_response(
+                                &reduced,
+                                tools_available,
+                                session.tools(),
+                                response_tool_names,
+                                prompt_tool_profiles,
+                                Some(&session.last_user_text()),
+                            ),
+                            true,
+                            attempts,
+                        )
                     }
                     normalize::OutputKind::Uncertainty => {
-                        if let Some(tool) = forced_tool.filter(|_| has_tools) {
+                        if let Some(tool) = forced_tool.filter(|_| tools_available) {
                             (
                                 tool_call_response(&tool.name, &tool.fallback_arguments),
                                 true,
                                 attempts,
                             )
                         } else {
-                            (fallback_worker_response(outputs), true, attempts)
+                            (
+                                fallback_worker_response(
+                                    outputs,
+                                    session,
+                                    session.tools(),
+                                    response_tool_names,
+                                    prompt_tool_profiles,
+                                ),
+                                true,
+                                attempts,
+                            )
                         }
                     }
                     _ => {
-                        if let Some(tool) = forced_tool.filter(|_| has_tools) {
+                        if let Some(tool) = forced_tool.filter(|_| tools_available) {
                             (
                                 tool_call_response(&tool.name, &tool.fallback_arguments),
                                 true,
                                 attempts,
                             )
                         } else {
-                            (chat_response(&reduced.payload), true, attempts)
+                            (
+                                chat_or_schema_command_tool_response(
+                                    &reduced.payload,
+                                    session.tools(),
+                                    response_tool_names,
+                                    prompt_tool_profiles,
+                                    Some(&session.last_user_text()),
+                                ),
+                                true,
+                                attempts,
+                            )
                         }
                     }
                 },
@@ -1437,14 +2330,24 @@ async fn resolve_decision(
                     // produce the output we're returning — we fell back to
                     // a worker. attempts still reflects what was spawned so
                     // observability can see "we tried N times and all failed".
-                    if let Some(tool) = forced_tool.filter(|_| has_tools) {
+                    if let Some(tool) = forced_tool.filter(|_| tools_available) {
                         (
                             tool_call_response(&tool.name, &tool.fallback_arguments),
                             false,
                             attempts,
                         )
                     } else {
-                        (fallback_worker_response(outputs), false, attempts)
+                        (
+                            fallback_worker_response(
+                                outputs,
+                                session,
+                                session.tools(),
+                                response_tool_names,
+                                prompt_tool_profiles,
+                            ),
+                            false,
+                            attempts,
+                        )
                     }
                 }
             }
@@ -1471,7 +2374,13 @@ fn best_answer(outputs: &[WorkerOutput]) -> String {
         .unwrap_or_default()
 }
 
-fn fallback_worker_response(outputs: &[WorkerOutput]) -> Value {
+fn fallback_worker_response(
+    outputs: &[WorkerOutput],
+    session: &Session,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Value {
     let answer = best_answer(outputs);
     if answer.is_empty() {
         error_response(
@@ -1479,14 +2388,47 @@ fn fallback_worker_response(outputs: &[WorkerOutput]) -> Value {
             MOA_ERR_NO_USABLE_ANSWER,
         )
     } else {
-        chat_response(&answer)
+        chat_or_schema_command_tool_response(
+            &answer,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+            Some(&session.last_user_text()),
+        )
     }
 }
 
-fn tool_proposal_response(output: &WorkerOutput, has_tools: bool) -> Value {
+fn response_tool_names<'a>(
+    selected_tool_names: &'a [String],
+    allowed_tools: &'a [String],
+) -> &'a [String] {
+    if selected_tool_names.is_empty() {
+        allowed_tools
+    } else {
+        selected_tool_names
+    }
+}
+
+fn tool_proposal_response(
+    output: &WorkerOutput,
+    has_tools: bool,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+    user_text: Option<&str>,
+) -> Value {
     if let (true, Some(name)) = (has_tools, output.tool_name.as_ref()) {
         let args = output.tool_arguments.as_ref().unwrap_or(&Value::Null);
-        return tool_call_response(name, args);
+        match validate_response_tool_arguments(
+            name,
+            args,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+        ) {
+            Ok(arguments) => return tool_call_response(name, &arguments),
+            Err(err) => tracing::info!("moa: tool proposal {name} rejected: {err}"),
+        }
     }
 
     if output.payload.trim().is_empty() || normalize::is_silent_reply_sentinel(&output.payload) {
@@ -1496,7 +2438,396 @@ fn tool_proposal_response(output: &WorkerOutput, has_tools: bool) -> Value {
         );
     }
 
+    if has_tools {
+        return chat_or_schema_command_tool_response(
+            &output.payload,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+            user_text,
+        );
+    }
+
     chat_response(&output.payload)
+}
+
+fn chat_or_schema_command_tool_response(
+    content: &str,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+    user_text: Option<&str>,
+) -> Value {
+    let command_tool = if fenced_command_tool_conversion_allowed(user_text) {
+        extract_shell_command_block(content).and_then(|command| {
+            command_tool_choice_from_command(&command, tools, allowed_tools, prompt_tool_profiles)
+        })
+    } else {
+        None
+    };
+    if let Some(tool) = command_tool {
+        return tool_call_response(&tool.name, &tool.fallback_arguments);
+    }
+    if let Some(tool) =
+        inline_json_tool_choice_from_text(content, tools, allowed_tools, prompt_tool_profiles)
+    {
+        return tool_call_response(&tool.name, &tool.fallback_arguments);
+    }
+    if let Some(tool) =
+        xml_tool_choice_from_text(content, tools, allowed_tools, prompt_tool_profiles)
+    {
+        return tool_call_response(&tool.name, &tool.fallback_arguments);
+    }
+    if let Some(tool) =
+        explicitly_named_tool_choice_from_text(content, tools, allowed_tools, prompt_tool_profiles)
+    {
+        return tool_call_response(&tool.name, &tool.fallback_arguments);
+    }
+
+    chat_response(content)
+}
+
+fn fenced_command_tool_conversion_allowed(user_text: Option<&str>) -> bool {
+    let Some(user_text) = user_text else {
+        return false;
+    };
+    let text = latest_user_request_tail(user_text).to_ascii_lowercase();
+    if contains_any(
+        &text,
+        &[
+            "don't run",
+            "do not run",
+            "dont run",
+            "don't execute",
+            "do not execute",
+            "dont execute",
+            "don't use",
+            "do not use",
+            "dont use",
+        ],
+    ) {
+        return false;
+    }
+
+    let tokens = lexical_tokens(&text);
+    command_execution_pattern_matches(&tokens)
+        || contains_any(
+            &text,
+            &[
+                "run the command",
+                "run this command",
+                "run that command",
+                "execute the command",
+                "execute this command",
+                "execute that command",
+                "use the command",
+                "use this command",
+                "use that command",
+            ],
+        )
+}
+
+fn inline_json_tool_choice_from_text(
+    content: &str,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<ForcedToolChoice> {
+    for json_text in embedded_json_object_candidates(content) {
+        let Ok(value) = serde_json::from_str::<Value>(&json_text) else {
+            continue;
+        };
+        let Some((name, raw_arguments)) = extract_tool_name_and_arguments(&value) else {
+            continue;
+        };
+        if !declared_response_tool_names(tools, allowed_tools, prompt_tool_profiles)
+            .iter()
+            .any(|tool| tool == name)
+        {
+            continue;
+        }
+        let arguments = normalize_tool_arguments(raw_arguments)
+            .map(Value::Object)
+            .unwrap_or_else(|| json!({}));
+        match validate_response_tool_arguments(
+            name,
+            &arguments,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+        ) {
+            Ok(arguments) => {
+                return Some(ForcedToolChoice {
+                    name: name.to_string(),
+                    fallback_arguments: arguments,
+                });
+            }
+            Err(err) => {
+                tracing::info!("moa: inline JSON tool {name} could not be sanitized: {err}");
+            }
+        }
+    }
+    None
+}
+
+fn xml_tool_choice_from_text(
+    content: &str,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<ForcedToolChoice> {
+    let invoke_start = content.find("<invoke ")?;
+    let invoke_tag_end = content[invoke_start..].find('>')? + invoke_start;
+    let invoke_tag = &content[invoke_start..=invoke_tag_end];
+    let name = xml_attr_value(invoke_tag, "name")?;
+    if !declared_response_tool_names(tools, allowed_tools, prompt_tool_profiles)
+        .iter()
+        .any(|tool| tool == &name)
+    {
+        return None;
+    }
+
+    let body_start = invoke_tag_end + 1;
+    let body_end = content[body_start..]
+        .find("</invoke>")
+        .map(|idx| body_start + idx)
+        .unwrap_or(content.len());
+    let arguments = xml_parameter_arguments(&content[body_start..body_end]);
+    match validate_response_tool_arguments(
+        &name,
+        &arguments,
+        tools,
+        allowed_tools,
+        prompt_tool_profiles,
+    ) {
+        Ok(arguments) => Some(ForcedToolChoice {
+            name,
+            fallback_arguments: arguments,
+        }),
+        Err(err) => {
+            tracing::info!("moa: XML tool choice could not be sanitized: {err}");
+            None
+        }
+    }
+}
+
+fn xml_attr_value(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let value_start = tag.find(&needle)? + needle.len();
+    let value_end = tag[value_start..].find('"')? + value_start;
+    Some(xml_text_unescape(&tag[value_start..value_end]))
+}
+
+fn xml_parameter_arguments(body: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    let mut cursor = 0;
+    while let Some(parameter_rel) = body[cursor..].find("<parameter ") {
+        let parameter_start = cursor + parameter_rel;
+        let Some(tag_end_rel) = body[parameter_start..].find('>') else {
+            break;
+        };
+        let tag_end = parameter_start + tag_end_rel;
+        let tag = &body[parameter_start..=tag_end];
+        let Some(name) = xml_attr_value(tag, "name") else {
+            cursor = tag_end + 1;
+            continue;
+        };
+
+        let value_start = tag_end + 1;
+        let value_end = xml_parameter_value_end(body, value_start, &name);
+        let value = xml_text_unescape(body[value_start..value_end].trim());
+        map.insert(name, Value::String(value));
+        cursor = value_end;
+    }
+
+    Value::Object(map)
+}
+
+fn xml_parameter_value_end(body: &str, value_start: usize, name: &str) -> usize {
+    let named_close = format!("</{name}>");
+    ["</parameter>", named_close.as_str(), "<parameter "]
+        .iter()
+        .filter_map(|needle| {
+            body[value_start..]
+                .find(needle)
+                .map(|idx| value_start + idx)
+        })
+        .min()
+        .unwrap_or(body.len())
+}
+
+fn xml_text_unescape(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn embedded_json_object_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut stack = 0usize;
+    let mut start = None;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '{' => {
+                if stack == 0 {
+                    start = Some(idx);
+                }
+                stack += 1;
+            }
+            '}' if stack > 0 => {
+                stack -= 1;
+                if stack == 0 {
+                    let Some(start_idx) = start.take() else {
+                        continue;
+                    };
+                    candidates.push(text[start_idx..idx + ch.len_utf8()].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates
+}
+
+fn explicitly_named_tool_choice_from_text(
+    content: &str,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<ForcedToolChoice> {
+    let lower = content.to_ascii_lowercase();
+    if contains_any(
+        &lower,
+        &[
+            "cannot use",
+            "can't use",
+            "will not use",
+            "would not use",
+            "do not use",
+            "don't use",
+        ],
+    ) {
+        return None;
+    }
+
+    let available = declared_response_tool_names(tools, allowed_tools, prompt_tool_profiles);
+    let selected = explicitly_requested_tool_names(&available, &lower);
+    let [name] = selected.as_slice() else {
+        return None;
+    };
+
+    let inferred = infer_tool_arguments_from_prompt(name, tools, content);
+    match validate_response_tool_arguments(
+        name,
+        &inferred,
+        tools,
+        allowed_tools,
+        prompt_tool_profiles,
+    ) {
+        Ok(arguments) => Some(ForcedToolChoice {
+            name: name.clone(),
+            fallback_arguments: arguments,
+        }),
+        Err(err) => {
+            tracing::info!("moa: explicit prose tool {name} could not be sanitized: {err}");
+            None
+        }
+    }
+}
+
+fn validate_response_tool_arguments(
+    name: &str,
+    arguments: &Value,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Result<Value, String> {
+    if tool_names_from_schemas(tools, allowed_tools)
+        .iter()
+        .any(|schema_name| schema_name == name)
+    {
+        return sanitize_tool_arguments_for_tool(name, arguments, tools)
+            .map_err(|err| err.to_string());
+    }
+
+    validate_prompt_tool_arguments(name, arguments, allowed_tools, prompt_tool_profiles)
+}
+
+fn validate_prompt_tool_arguments(
+    name: &str,
+    arguments: &Value,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Result<Value, String> {
+    let allowed: HashSet<&str> = allowed_tools.iter().map(String::as_str).collect();
+    let declared = prompt_tool_profiles
+        .iter()
+        .any(|profile| profile.name == name && (allowed.is_empty() || allowed.contains(name)));
+    if !declared {
+        return Err(format!("tool {name} is not prompt-declared"));
+    }
+
+    let Some(arguments) = arguments.as_object() else {
+        return Err(format!(
+            "prompt-declared tool {name} requires object arguments"
+        ));
+    };
+    if arguments.is_empty() {
+        return Err(format!("prompt-declared tool {name} requires arguments"));
+    }
+
+    let candidates = prompt_command_tool_candidates(allowed_tools, prompt_tool_profiles);
+    if let Some(candidate) = candidates.iter().find(|candidate| candidate.name == name) {
+        let valid_command = arguments
+            .get(&candidate.field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !valid_command {
+            return Err(format!(
+                "prompt-declared command tool {name} requires non-empty {}",
+                candidate.field
+            ));
+        }
+    }
+
+    Ok(Value::Object(arguments.clone()))
+}
+
+fn declared_response_tool_names(
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
+    let schema_names = tool_names_from_schemas(tools, allowed_tools);
+    if !schema_names.is_empty() {
+        return schema_names;
+    }
+    let allowed: HashSet<&str> = allowed_tools.iter().map(String::as_str).collect();
+    prompt_tool_profiles
+        .iter()
+        .filter(|profile| allowed.is_empty() || allowed.contains(profile.name.as_str()))
+        .map(|profile| profile.name.clone())
+        .collect()
+}
+
+fn tool_names_from_schemas(tools: Option<&Value>, allowed_tools: &[String]) -> Vec<String> {
+    let allowed: HashSet<&str> = allowed_tools.iter().map(String::as_str).collect();
+    tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if allowed.is_empty() || allowed.contains(name) {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Build a response body that signals MoA-level failure to the client.
@@ -1673,7 +3004,8 @@ mod response_builder_tests {
     #[test]
     fn fallback_worker_response_errors_when_only_silent_sentinel_remains() {
         let outputs = vec![answer("a", 0.99, "NO_REPLY")];
-        let resp = fallback_worker_response(&outputs);
+        let session = Session::new();
+        let resp = fallback_worker_response(&outputs, &session, None, &[], &[]);
         assert_eq!(
             resp.pointer("/error/code").and_then(Value::as_str),
             Some(MOA_ERR_NO_USABLE_ANSWER)
@@ -1698,9 +3030,33 @@ mod response_builder_tests {
         }
     }
 
+    fn read_file_tool_schema() -> Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        }])
+    }
+
     #[test]
     fn tool_proposal_response_emits_tool_call_when_tools_enabled() {
-        let resp = tool_proposal_response(&tool_proposal("Need to read."), true);
+        let tools = read_file_tool_schema();
+        let allowed_tools = ["read_file".to_string()];
+        let resp = tool_proposal_response(
+            &tool_proposal("Need to read."),
+            true,
+            Some(&tools),
+            &allowed_tools,
+            &[],
+            None,
+        );
         assert_eq!(
             resp.pointer("/choices/0/message/tool_calls/0/function/name")
                 .and_then(Value::as_str),
@@ -1709,8 +3065,125 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn tool_proposal_response_rejects_undeclared_tool() {
+        let resp =
+            tool_proposal_response(&tool_proposal("Need to read."), true, None, &[], &[], None);
+
+        assert!(
+            resp.pointer("/choices/0/message/tool_calls").is_none(),
+            "undeclared worker tool proposals must not become tool calls: {resp}"
+        );
+        assert_eq!(
+            resp.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("Need to read.")
+        );
+    }
+
+    #[test]
+    fn tool_proposal_response_rejects_prompt_tool_without_args() {
+        let (session, profiles, allowed) =
+            prompt_tool_session("Use gh to list recent open PRs for mesh-LLM/mesh-llm.");
+        let output = WorkerOutput {
+            kind: normalize::OutputKind::ToolProposal,
+            confidence: 0.8,
+            tool_name: Some("exec".to_string()),
+            tool_arguments: Some(json!({})),
+            payload: "I will use the exec tool.".to_string(),
+            model: "worker".to_string(),
+            role: WorkerRole::Fast,
+            elapsed_ms: 1,
+        };
+
+        let resp = tool_proposal_response(
+            &output,
+            true,
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert!(
+            resp.pointer("/choices/0/message/tool_calls").is_none(),
+            "prompt-declared command tools require a command argument: {resp}"
+        );
+        assert_eq!(
+            resp.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("I will use the exec tool.")
+        );
+    }
+
+    #[test]
+    fn rejected_tool_proposal_repairs_fenced_command_with_user_intent() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }]);
+        let allowed_tools = ["exec".to_string()];
+        let output = WorkerOutput {
+            kind: normalize::OutputKind::ToolProposal,
+            confidence: 0.8,
+            tool_name: Some("exec".to_string()),
+            tool_arguments: Some(json!({})),
+            payload: "I'll check it.\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\n```".to_string(),
+            model: "reducer".to_string(),
+            role: WorkerRole::Reducer,
+            elapsed_ms: 1,
+        };
+
+        let resp = tool_proposal_response(
+            &output,
+            true,
+            Some(&tools),
+            &allowed_tools,
+            &[],
+            Some(
+                "Use gh to list recent open PRs for mesh-LLM/mesh-llm, then tell me one interesting one.",
+            ),
+        );
+
+        assert_eq!(
+            resp.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            resp.pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            resp.pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\"}")
+        );
+    }
+
+    #[test]
     fn tool_proposal_response_does_not_emit_tool_call_when_tools_disabled() {
-        let resp = tool_proposal_response(&tool_proposal("I need to read README.md."), false);
+        let resp = tool_proposal_response(
+            &tool_proposal("I need to read README.md."),
+            false,
+            None,
+            &[],
+            &[],
+            None,
+        );
         assert!(
             resp.pointer("/choices/0/message/tool_calls").is_none(),
             "disabled tools must not leak tool_calls: {resp}"
@@ -1812,6 +3285,47 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn incoming_chat_messages_synthesizes_completion_prompt_and_system_prompt() {
+        let messages = incoming_chat_messages(&serde_json::json!({
+            "model": "mesh",
+            "systemPrompt": "## Tooling\n- exec: Run shell commands",
+            "prompt": "Use gh to list recent PRs."
+        }));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            messages[0].get("content").and_then(Value::as_str),
+            Some("## Tooling\n- exec: Run shell commands")
+        );
+        assert_eq!(
+            messages[1].get("content").and_then(Value::as_str),
+            Some("Use gh to list recent PRs.")
+        );
+    }
+
+    #[test]
+    fn incoming_chat_messages_adds_top_level_system_to_existing_messages() {
+        let messages = incoming_chat_messages(&serde_json::json!({
+            "systemPrompt": "system",
+            "messages": [{"role": "user", "content": "hello"}],
+        }));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            messages[1].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+    }
+
+    #[test]
     fn forced_tool_choice_infers_enum_argument_from_prompt() {
         let body = serde_json::json!({
             "tool_choice": {
@@ -1848,7 +3362,9 @@ mod response_builder_tests {
             .unwrap();
         session.ingest(&messages, &tools);
 
-        let forced = forced_tool_choice(&body, &session, &tools).expect("forced tool");
+        let allowed_tools = session.tool_names();
+        let forced =
+            forced_tool_choice(&body, &session, &tools, &allowed_tools).expect("forced tool");
 
         assert_eq!(forced.name, "lookup_probe_fact");
         assert_eq!(forced.fallback_arguments, json!({"key": "primary"}));
@@ -1992,6 +3508,107 @@ mod response_builder_tests {
     }
 
     #[tokio::test]
+    async fn approval_of_prior_shell_proposal_short_circuits_to_exec() {
+        let body = serde_json::json!({
+            "model": VIRTUAL_MODEL_NAME,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Any new interesting PRs? You have the gh command line I think can use"
+                },
+                {
+                    "role": "assistant",
+                    "content": "I can use the `gh` CLI. Let me fetch the list.\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open --sort=updated --direction desc --limit 20\n```"
+                },
+                {
+                    "role": "user",
+                    "content": "Conversation context (untrusted): prior messages\n\nOk you want to do that?"
+                }
+            ],
+            "tools": [{
+                "name": "exec",
+                "description": "Execute shell commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }]
+        });
+        let config = GatewayConfig {
+            backends: Vec::new(),
+            models: Vec::new(),
+            worker_timeout: Duration::from_secs(1),
+            reducer_timeout: Duration::from_secs(1),
+            hedge_delay: Duration::from_millis(10),
+            first_answer_grace: Duration::from_millis(10),
+            enable_thinking: Some(false),
+        };
+
+        let result = handle_turn(&config, &body).await;
+
+        assert_eq!(result.turn_kind, TurnKind::DirectTool);
+        assert!(result.worker_summaries.is_empty());
+        assert_eq!(
+            result
+                .response_body
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            result
+                .response_body
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            result
+                .response_body
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some(
+                "{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --sort=updated --direction desc --limit 20\"}"
+            )
+        );
+    }
+
+    #[test]
+    fn look_is_not_prior_shell_proposal_confirmation() {
+        let tools = Some(serde_json::json!([{
+            "name": "exec",
+            "description": "Execute shell commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }]));
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({
+                    "role": "user",
+                    "content": "Any new interesting PRs?"
+                }),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "I can check with:\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open\n```"
+                }),
+                serde_json::json!({
+                    "role": "user",
+                    "content": "look at that first"
+                }),
+            ],
+            &tools,
+        );
+        let allowed_tools = ["exec".to_string()];
+
+        assert!(prior_shell_command_tool_choice(&session, &tools, &allowed_tools, &[]).is_none());
+    }
+
+    #[tokio::test]
     async fn forced_tool_choice_overrides_answer_decision() {
         let mut session = Session::new();
         session.ingest(
@@ -2029,6 +3646,7 @@ mod response_builder_tests {
                 selected_tool_names: &selected_tool_names,
                 forced_tool: Some(&forced_tool),
                 allowed_tools: &allowed_tools,
+                prompt_tool_profiles: &[],
             },
         )
         .await;
@@ -2069,7 +3687,7 @@ mod response_builder_tests {
             &[serde_json::json!({"role": "user", "content": "How are you?"})],
             &Some(serde_json::json!([{"type": "function", "function": {"name": "read"}}])),
         );
-        assert_eq!(grace_mode_for_turn(&session, true), GraceMode::Answer);
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Answer);
     }
 
     #[test]
@@ -2082,7 +3700,7 @@ mod response_builder_tests {
             })],
             &Some(serde_json::json!([{"type": "function", "function": {"name": "read"}}])),
         );
-        assert_eq!(grace_mode_for_turn(&session, true), GraceMode::Tool);
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
     }
 
     #[test]
@@ -2091,11 +3709,11 @@ mod response_builder_tests {
         session.ingest(
             &[serde_json::json!({
                 "role": "user",
-                "content": "Plain check with no web lookup: reply OK",
+                "content": "Plain check with no tool use: reply OK",
             })],
             &Some(serde_json::json!([{"type": "function", "function": {"name": "web_search"}}])),
         );
-        assert_eq!(grace_mode_for_turn(&session, true), GraceMode::Answer);
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Answer);
     }
 
     #[test]
@@ -2105,7 +3723,7 @@ mod response_builder_tests {
             &[serde_json::json!({"role": "user", "content": "Reply OK"})],
             &None,
         );
-        assert_eq!(grace_mode_for_turn(&session, false), GraceMode::Answer);
+        assert_eq!(grace_mode_for_turn(&session, false, &[]), GraceMode::Answer);
     }
 
     #[test]
@@ -2114,19 +3732,27 @@ mod response_builder_tests {
         session.ingest(
             &[serde_json::json!({"role": "user", "content": "Read /tmp/file.txt"})],
             &Some(serde_json::json!([
-                {"type": "function", "function": {"name": "read"}},
-                {"type": "function", "function": {"name": "web_search"}},
-                {"type": "function", "function": {"name": "exec"}}
+                {"type": "function", "function": {
+                    "name": "read",
+                    "description": "Read file contents from a path",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string", "description": "File path to read"}},
+                        "required": ["path"]
+                    }
+                }},
+                {"type": "function", "function": {"name": "web_search", "description": "Search online sources"}},
+                {"type": "function", "function": {"name": "exec", "description": "Run shell commands"}}
             ])),
         );
         assert_eq!(
-            selected_tool_names_for_turn(&session, &[]),
+            selected_tool_names_for_turn(&session, &[], &[]),
             vec!["read".to_string()]
         );
     }
 
     #[test]
-    fn weather_prompt_selects_web_search_tool() {
+    fn schema_description_selects_weather_tool() {
         let mut session = Session::new();
         session.ingest(
             &[serde_json::json!({
@@ -2134,14 +3760,400 @@ mod response_builder_tests {
                 "content": "Check the current Melbourne weather forecast for today",
             })],
             &Some(serde_json::json!([
-                {"type": "function", "function": {"name": "read"}},
-                {"type": "function", "function": {"name": "web_search"}},
-                {"type": "function", "function": {"name": "exec"}}
+                {"type": "function", "function": {"name": "read", "description": "Read local files"}},
+                {"type": "function", "function": {"name": "lookup", "description": "Search current weather forecast information"}},
+                {"type": "function", "function": {"name": "runner", "description": "Run shell commands"}}
             ])),
         );
         assert_eq!(
-            selected_tool_names_for_turn(&session, &[]),
-            vec!["web_search".to_string()]
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["lookup".to_string()]
+        );
+    }
+
+    #[test]
+    fn executable_request_selects_command_schema_not_directory_tool() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use gh to list recent open PRs for mesh-LLM/mesh-llm."
+            })],
+            &Some(serde_json::json!([
+                {"type": "function", "function": {
+                    "name": "dir_list",
+                    "description": "List directory entries for a local filesystem path",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string", "description": "Directory path"}},
+                        "required": ["path"]
+                    }
+                }},
+                {"type": "function", "function": {
+                    "name": "exec",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+                        "required": ["command"]
+                    }
+                }}
+            ])),
+        );
+
+        assert_eq!(
+            session.tool_names(),
+            vec!["dir_list".to_string(), "exec".to_string()]
+        );
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_intent_stays_unselected_when_command_schemas_are_ambiguous() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use gh to list recent open PRs for mesh-LLM/mesh-llm."
+            })],
+            &Some(serde_json::json!([
+                {"type": "function", "function": {
+                    "name": "exec",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+                        "required": ["command"]
+                    }
+                }},
+                {"type": "function", "function": {
+                    "name": "remote_exec",
+                    "description": "Run terminal commands on a remote host",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string", "description": "Terminal command to run"}},
+                        "required": ["command"]
+                    }
+                }}
+            ])),
+        );
+
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn command_schema_can_use_single_optional_command_field() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use gh to list recent open PRs for mesh-LLM/mesh-llm."
+            })],
+            &Some(serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "exec",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "Shell command to execute"},
+                            "cwd": {"type": "string", "description": "Working directory"},
+                            "timeout_ms": {"type": "integer"}
+                        }
+                    }
+                }
+            }])),
+        );
+
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn command_schema_selects_clear_command_field_with_optional_metadata_fields() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use gh to list recent open PRs for mesh-LLM/mesh-llm."
+            })],
+            &Some(serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "exec",
+                    "description": "Run shell commands (pty available for TTY-required CLIs)",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "Shell command to execute"},
+                            "workdir": {"type": "string", "description": "Working directory (defaults to cwd)"},
+                            "env": {"type": "object"},
+                            "yieldMs": {"type": "number", "description": "Milliseconds to wait before backgrounding"},
+                            "background": {"type": "boolean", "description": "Run in background immediately"},
+                            "timeout": {"type": "number", "description": "Timeout in seconds"},
+                            "pty": {"type": "boolean", "description": "Run in a pseudo-terminal"},
+                            "elevated": {"type": "boolean", "description": "Run on the host with elevated permissions"},
+                            "host": {"type": "string", "description": "Exec host/target (auto|sandbox|gateway|node)."},
+                            "security": {"type": "string", "description": "Ignored for normal calls; exec security is set by tools.exec.security and host approvals."},
+                            "ask": {"type": "string", "description": "Exec ask mode (off|on-miss|always)."},
+                            "node": {"type": "string", "description": "Node id/name for host=node."}
+                        }
+                    }
+                }
+            }])),
+        );
+
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["exec".to_string()]
+        );
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+    }
+
+    #[test]
+    fn optional_command_schema_intent_does_not_emit_empty_direct_tool_call() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Run shell commands (pty available for TTY-required CLIs)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to execute"},
+                        "host": {"type": "string", "description": "Exec host/target"},
+                        "ask": {"type": "string", "description": "Exec ask mode"}
+                    }
+                }
+            }
+        }]);
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use gh to list recent open PRs for mesh-LLM/mesh-llm."
+            })],
+            &Some(tools.clone()),
+        );
+        let selected = selected_tool_names_for_turn(&session, &[], &[]);
+
+        assert_eq!(selected, vec!["exec".to_string()]);
+        assert!(required_tool_choice_for_intent(&session, &Some(tools), &selected).is_none());
+    }
+
+    #[test]
+    fn command_intent_selects_exec_from_openclaw_like_tool_catalog() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use gh to list recent open PRs for mesh-LLM/mesh-llm."
+            })],
+            &Some(serde_json::json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "description": "Run shell commands (pty available for TTY-required CLIs)",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string", "description": "Shell command to execute"},
+                                "host": {"type": "string", "description": "Exec host/target (auto|sandbox|gateway|node)."},
+                                "ask": {"type": "string", "description": "Exec ask mode (off|on-miss|always)."}
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "process",
+                        "description": "Manage background exec sessions",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "description": "Process action (list|poll|log|write|send-keys|submit|paste|kill|clear|remove)"},
+                                "sessionId": {"type": "string", "description": "Session id for actions other than list"},
+                                "text": {"type": "string", "description": "Text to paste for paste"}
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "gateway",
+                        "description": "Restart, apply config, or run updates on the running process",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "description": "Gateway action to run"},
+                                "path": {"type": "string", "description": "Config path"}
+                            }
+                        }
+                    }
+                }
+            ])),
+        );
+
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["exec".to_string()]
+        );
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+    }
+
+    #[test]
+    fn command_schema_ignores_ambiguous_optional_command_fields() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "runner",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command to execute"},
+                        "fallback_command": {"type": "string", "description": "Alternative shell command"}
+                    }
+                }
+            }
+        }]);
+
+        assert_eq!(
+            command_schema_tool_candidates(Some(&tools), &["runner".to_string()]).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn command_schema_ignores_tied_optional_command_fields() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "runner",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "primary_command": {"type": "string", "description": "Shell command to execute"},
+                        "fallback_command": {"type": "string", "description": "Shell command to execute if the primary command fails"}
+                    }
+                }
+            }
+        }]);
+
+        assert_eq!(
+            command_schema_tool_candidates(Some(&tools), &["runner".to_string()]).len(),
+            0
+        );
+    }
+
+    fn prompt_tool_catalog() -> String {
+        [
+            "You are an agent.",
+            "",
+            "## Tooling",
+            "- read: Read file contents",
+            "- exec: Run shell commands (pty available for TTY-required CLIs)",
+            "- process: Manage background exec sessions for commands already started",
+            "- dir_list: List directory entries for a local filesystem path",
+            "",
+            "## Tool Call Style",
+            "First-class tool exists: use it.",
+        ]
+        .join("\n")
+    }
+
+    fn prompt_tool_session(user_text: &str) -> (Session, Vec<PromptToolProfile>, Vec<String>) {
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "system", "content": prompt_tool_catalog()}),
+                serde_json::json!({"role": "user", "content": user_text}),
+            ],
+            &None,
+        );
+        let profiles = prompt_declared_tool_profiles(&session);
+        let allowed = declared_tool_names(&session, &profiles);
+        (session, profiles, allowed)
+    }
+
+    #[test]
+    fn prompt_tool_catalog_extracts_declared_names() {
+        let (session, profiles, allowed) = prompt_tool_session("hello");
+
+        assert!(session.tool_names().is_empty());
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "exec", "process", "dir_list"]
+        );
+        assert_eq!(allowed, vec!["read", "exec", "process", "dir_list"]);
+    }
+
+    #[test]
+    fn prompt_tool_catalog_extracts_from_flattened_prompt_when_no_system_message() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "{}\n\n[Sun 2026-06-07 13:54 GMT+10] Use gh to list recent open PRs.",
+                    prompt_tool_catalog()
+                )
+            })],
+            &None,
+        );
+
+        let profiles = prompt_declared_tool_profiles(&session);
+
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "exec", "process", "dir_list"]
+        );
+    }
+
+    #[test]
+    fn prompt_catalog_command_intent_prefers_run_shell_over_process_management() {
+        let (session, profiles, allowed) =
+            prompt_tool_session("Use gh to list recent open PRs for mesh-LLM/mesh-llm.");
+
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &allowed, &profiles),
+            vec!["exec".to_string()]
+        );
+        assert_eq!(
+            grace_mode_for_turn(&session, !allowed.is_empty(), &profiles),
+            GraceMode::Tool
+        );
+    }
+
+    #[test]
+    fn prompt_only_command_intent_does_not_invent_empty_direct_tool_call() {
+        let (session, profiles, allowed) =
+            prompt_tool_session("Use gh to list recent open PRs for mesh-LLM/mesh-llm.");
+        let selected = selected_tool_names_for_turn(&session, &allowed, &profiles);
+
+        assert_eq!(selected, vec!["exec".to_string()]);
+        assert!(
+            required_tool_choice_for_intent(&session, &None, &selected).is_none(),
+            "prompt-only command intent must wait for an actual proposed command"
         );
     }
 
@@ -2174,7 +4186,7 @@ mod response_builder_tests {
         );
 
         assert_eq!(
-            selected_tool_names_for_turn(&session, &[]),
+            selected_tool_names_for_turn(&session, &[], &[]),
             vec!["exec".to_string()]
         );
     }
@@ -2195,7 +4207,7 @@ mod response_builder_tests {
         );
 
         assert_eq!(
-            selected_tool_names_for_turn(&session, &[]),
+            selected_tool_names_for_turn(&session, &[], &[]),
             vec!["exec".to_string()]
         );
     }
@@ -2216,7 +4228,7 @@ mod response_builder_tests {
         );
 
         assert_eq!(
-            selected_tool_names_for_turn(&session, &[]),
+            selected_tool_names_for_turn(&session, &[], &[]),
             vec!["exec".to_string(), "read".to_string()]
         );
     }
@@ -2324,61 +4336,349 @@ mod response_builder_tests {
     }
 
     #[test]
-    fn repair_tool_result_answer_grounds_github_pr_rows() {
-        let github_json = serde_json::json!([
-            {
-                "number": 806,
-                "title": "Add meshllm.cloud website, catalog viewer, and onboarding docs",
-                "state": "open",
-                "html_url": "https://github.com/Mesh-LLM/mesh-llm/pull/806",
-                "updated_at": "2026-06-06T07:18:23Z",
-                "body": "x".repeat(8_000),
-                "user": {"login": "ndizazzo"},
-                "requested_reviewers": [{"login": "michaelneale"}, {"login": "i386"}]
-            },
-            {
-                "number": 709,
-                "title": "Use combined hf-hub fork for model downloads",
-                "state": "open",
-                "html_url": "https://github.com/Mesh-LLM/mesh-llm/pull/709",
-                "updated_at": "2026-05-27T11:26:00Z",
-                "user": {"login": "i386"}
-            }
-        ])
-        .to_string();
-        let wrapped = serde_json::json!({
-            "url": "https://api.github.com/repos/Mesh-LLM/mesh-llm/pulls?state=open",
-            "status": 200,
-            "text": format!(
-                "SECURITY NOTICE\n\n<<<EXTERNAL_UNTRUSTED_CONTENT id=\"x\">>>\nSource: Web Fetch\n---\n{github_json}\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id=\"x\">>>"
-            )
-        })
-        .to_string();
+    fn repair_tool_result_answer_adds_title_for_tabular_row_id() {
         let mut session = Session::new();
         session.ingest(
             &[
+                serde_json::json!({"role": "user", "content": "list rows"}),
+                tool_call_msg("call_1", "exec"),
+                tool_result_msg(
+                    "call_1",
+                    "808\tStabilize OpenClaw tool loops through MoA\tfix/openclaw-moa-telegram-timeouts\tOPEN\n806\tAdd meshllm.cloud website, catalog viewer, and onboarding docs\tfeature/new-public-website\tOPEN",
+                ),
                 serde_json::json!({
                     "role": "user",
-                    "content": "What is the status of the new website PR opened by Nick?"
+                    "content": "Answer with exactly one interesting PR number and title from the command output."
                 }),
-                tool_call_msg("call_1", "web_fetch"),
-                tool_result_msg("call_1", &wrapped),
+            ],
+            &None,
+        );
+
+        let repaired = repair_tool_result_answer(&session, "#808");
+
+        assert_eq!(repaired, "#808 - Stabilize OpenClaw tool loops through MoA");
+    }
+
+    #[test]
+    fn repair_tool_result_answer_adds_missing_row_id_for_tabular_title() {
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "user", "content": "list rows"}),
+                tool_call_msg("call_1", "exec"),
+                tool_result_msg(
+                    "call_1",
+                    "793\tLet clients mark stable prompt anchors for Skippy cache\tcodex/skippy-prompt-anchor-cache\tDRAFT",
+                ),
+                serde_json::json!({
+                    "role": "user",
+                    "content": "Tell me one interesting row from the command output."
+                }),
             ],
             &None,
         );
 
         let repaired = repair_tool_result_answer(
             &session,
-            "The website PR is #806 by i386 and was updated in May.",
+            "#805 - Let clients mark stable prompt anchors for Skippy cache",
         );
 
-        assert!(repaired.contains("#806"));
-        assert!(repaired.contains("website, catalog viewer"));
-        assert!(repaired.contains("author=\"ndizazzo\""));
-        assert!(repaired.contains("updated_at=\"2026-06-06T07:18:23Z\""));
-        assert!(repaired.contains("I do not see a `Nick` author/login"));
-        assert!(!repaired.contains("#709"));
-        assert!(!repaired.contains("updated in May"));
+        assert!(repaired.contains("#793 - Let clients mark stable prompt anchors"));
+    }
+
+    #[test]
+    fn cli_usage_error_is_not_answerable_tool_evidence() {
+        let result = "unknown flag: --since\r\n\r\nUsage:  gh pr list [flags]\r\n\r\nFlags:";
+
+        assert!(!tool_result_has_answerable_evidence(result));
+        assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
+    fn normal_tabular_cli_output_is_answerable_tool_evidence() {
+        let result = "808\tStabilize OpenClaw tool loops through MoA\tOPEN";
+
+        assert!(tool_result_has_answerable_evidence(result));
+    }
+
+    #[test]
+    fn fenced_command_answer_becomes_schema_declared_tool_call() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "runner",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }]));
+        let allowed_tools = ["runner".to_string()];
+
+        let response = chat_or_schema_command_tool_response(
+            "I will check it.\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open\n```",
+            tools.as_ref(),
+            &allowed_tools,
+            &[],
+            Some("Use gh to list recent open PRs for mesh-LLM/mesh-llm."),
+        );
+
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("runner")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open\"}")
+        );
+    }
+
+    #[test]
+    fn fenced_command_answer_uses_selected_tool_subset_when_catalog_is_ambiguous() {
+        let tools = Some(serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec",
+                    "description": "Run shell commands",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "Shell command to execute"}
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "remote_exec",
+                    "description": "Run terminal commands remotely",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "Terminal command to run"}
+                        }
+                    }
+                }
+            }
+        ]));
+        let allowed_tools = ["exec".to_string(), "remote_exec".to_string()];
+        let selected_tools = ["exec".to_string()];
+        let content =
+            "I will check it.\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open\n```";
+
+        let ambiguous_response = chat_or_schema_command_tool_response(
+            content,
+            tools.as_ref(),
+            &allowed_tools,
+            &[],
+            Some("Use gh to list recent open PRs for mesh-LLM/mesh-llm."),
+        );
+        assert!(
+            ambiguous_response
+                .pointer("/choices/0/message/tool_calls")
+                .is_none(),
+            "full ambiguous catalog should not pick a command tool arbitrarily: {ambiguous_response}"
+        );
+
+        let selected_response = chat_or_schema_command_tool_response(
+            content,
+            tools.as_ref(),
+            response_tool_names(&selected_tools, &allowed_tools),
+            &[],
+            Some("Use gh to list recent open PRs for mesh-LLM/mesh-llm."),
+        );
+        assert_eq!(
+            selected_response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+    }
+
+    #[test]
+    fn fenced_command_answer_becomes_prompt_declared_tool_call_without_native_tools() {
+        let (session, profiles, allowed) =
+            prompt_tool_session("Use gh to list recent open PRs for mesh-LLM/mesh-llm.");
+
+        let response = chat_or_schema_command_tool_response(
+            "I will check it.\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\n```",
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\"}")
+        );
+    }
+
+    #[test]
+    fn fenced_command_answer_stays_chat_when_user_did_not_request_execution() {
+        let (session, profiles, allowed) = prompt_tool_session("look at that first");
+
+        let response = chat_or_schema_command_tool_response(
+            "The prior command was:\n\n```bash\ngh pr list --repo mesh-LLM/mesh-llm --state open\n```",
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert!(
+            response.pointer("/choices/0/message/tool_calls").is_none(),
+            "non-execution turns must not be corrected into a tool call: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn inline_json_tool_choice_uses_declared_schema() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }
+        }]));
+        let allowed_tools = ["read_file".to_string()];
+
+        let choice = inline_json_tool_choice_from_text(
+            r#"I'll read the README. {"function": "read_file", "arguments": {"path": "README.md"}}"#,
+            tools.as_ref(),
+            &allowed_tools,
+            &[],
+        )
+        .expect("inline tool choice");
+
+        assert_eq!(choice.name, "read_file");
+        assert_eq!(choice.fallback_arguments, json!({"path": "README.md"}));
+    }
+
+    #[test]
+    fn prompt_catalog_rejects_unknown_inline_tool() {
+        let (session, profiles, allowed) = prompt_tool_session("hello");
+
+        let response = chat_or_schema_command_tool_response(
+            r#"{"function": "delete_everything", "arguments": {"path": "/"}}"#,
+            session.tools(),
+            &allowed,
+            &profiles,
+            None,
+        );
+
+        assert!(
+            response.pointer("/choices/0/message/tool_calls").is_none(),
+            "unknown prompt-only tools must stay as chat text: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some(r#"{"function": "delete_everything", "arguments": {"path": "/"}}"#)
+        );
+    }
+
+    #[test]
+    fn prompt_catalog_rejects_empty_explicit_tool_args() {
+        let (session, profiles, allowed) =
+            prompt_tool_session("Use gh to list recent open PRs for mesh-LLM/mesh-llm.");
+
+        let response = chat_or_schema_command_tool_response(
+            "I will use the `exec` tool to check.",
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert!(
+            response.pointer("/choices/0/message/tool_calls").is_none(),
+            "prompt-declared tools must not emit empty argument calls: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("I will use the `exec` tool to check.")
+        );
+    }
+
+    #[test]
+    fn prompt_catalog_accepts_malformed_xml_parameter_close() {
+        let (session, profiles, allowed) =
+            prompt_tool_session("Use gh to list recent open PRs for mesh-LLM/mesh-llm.");
+
+        let response = chat_or_schema_command_tool_response(
+            "<minimax:tool_call>\n<invoke name=\"exec\">\n<parameter name=\"command\">gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10</command>\n</invoke>\n</minimax:tool_call>",
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\"}")
+        );
     }
 
     fn tool_call_msg(id: &str, name: &str) -> Value {
@@ -2401,6 +4701,19 @@ mod response_builder_tests {
         })
     }
 
+    fn session_with_tool_result(result: &str) -> Session {
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "user", "content": "run command"}),
+                tool_call_msg("call_1", "exec"),
+                tool_result_msg("call_1", result),
+            ],
+            &None,
+        );
+        session
+    }
+
     #[test]
     fn ordinary_prompt_selects_no_tools() {
         let mut session = Session::new();
@@ -2412,7 +4725,7 @@ mod response_builder_tests {
             ])),
         );
         assert_eq!(
-            selected_tool_names_for_turn(&session, &[]),
+            selected_tool_names_for_turn(&session, &[], &[]),
             Vec::<String>::new()
         );
     }

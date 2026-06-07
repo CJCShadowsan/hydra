@@ -365,6 +365,38 @@ mod tests {
     }
 
     #[test]
+    fn extract_text_keeps_only_first_native_tool_call() {
+        let resp: Value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "exec",
+                                "arguments": "{\"command\":\"pwd\"}"
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": "{\"path\":\"USER.md\"}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+
+        let text = extract_text_from_response(&resp).expect("tool proposal text");
+
+        assert!(text.contains("tool: exec"), "{text}");
+        assert!(text.contains("arguments: {\"command\":\"pwd\"}"), "{text}");
+        assert!(!text.contains("tool: read"), "{text}");
+    }
+
+    #[test]
     fn worker_sampling_high_diversity() {
         let s = SamplingParams::worker();
         assert!(s.temperature > 0.5, "workers need high temp for diversity");

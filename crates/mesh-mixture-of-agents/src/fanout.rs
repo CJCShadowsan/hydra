@@ -137,6 +137,7 @@ pub(crate) async fn gather_workers_incremental(
 
                 if let Some(decision) =
                     arbiter::try_early_decision(&outputs, total_workers, total_finished, has_tools)
+                        .filter(|decision| early_decision_allowed_for_mode(decision, grace_mode))
                 {
                     drain_after_early_exit(join_set, &mut summaries).await;
                     reconcile_dispatched(dispatched, &mut summaries);
@@ -163,6 +164,7 @@ pub(crate) async fn gather_workers_incremental(
 
                 if let Some(decision) =
                     arbiter::try_early_decision(&outputs, total_workers, total_finished, has_tools)
+                        .filter(|decision| early_decision_allowed_for_mode(decision, grace_mode))
                 {
                     drain_after_early_exit(join_set, &mut summaries).await;
                     reconcile_dispatched(dispatched, &mut summaries);
@@ -182,6 +184,13 @@ pub(crate) async fn gather_workers_incremental(
 
     reconcile_dispatched(dispatched, &mut summaries);
     (outputs, summaries, None)
+}
+
+fn early_decision_allowed_for_mode(decision: &arbiter::Decision, grace_mode: GraceMode) -> bool {
+    !matches!(
+        (grace_mode, decision),
+        (GraceMode::Tool, arbiter::Decision::Answer(_))
+    )
 }
 
 fn grace_answer_decision(outputs: &[WorkerOutput]) -> arbiter::Decision {
@@ -527,6 +536,69 @@ mod tests {
                 assert_eq!(arguments["path"], "/tmp/openclaw-tool-baseline.txt");
             }
             other => panic!("expected tool call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_grace_blocks_generic_answer_early_exit() {
+        let mut js = tokio::task::JoinSet::new();
+        let dispatched = vec![
+            spawn_worker(
+                &mut js,
+                "refusal",
+                WorkerRole::Fast,
+                10,
+                Ok(answer_text("I cannot run commands from here.", 0.8)),
+            ),
+            spawn_worker(
+                &mut js,
+                "tool_worker",
+                WorkerRole::Specialist,
+                80,
+                Ok(tool_text("exec", 0.85)),
+            ),
+            spawn_worker(
+                &mut js,
+                "slow",
+                WorkerRole::Strong,
+                5_000,
+                Ok(answer_text("manual instructions", 0.7)),
+            ),
+        ];
+
+        let started = std::time::Instant::now();
+        let (outputs, _summaries, decision) = gather_workers_incremental(
+            &mut js,
+            &dispatched,
+            true,
+            &["exec".to_string()],
+            None,
+            Duration::from_millis(30),
+            GraceMode::Tool,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(70),
+            "tool-intent turns must not accept the first plain answer; got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "tool proposal should still short-circuit the slow tail; got {elapsed:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.kind == normalize::OutputKind::ToolProposal),
+            "expected to wait for the tool proposal; got {outputs:?}"
+        );
+        match decision.expect("tool-intent turn should not return a plain answer") {
+            arbiter::Decision::Answer(answer) => {
+                panic!("tool-intent early exit must not return answer: {answer}")
+            }
+            arbiter::Decision::ToolCall { name, .. } => assert_eq!(name, "exec"),
+            arbiter::Decision::NeedsReducer { .. } => {}
         }
     }
 

@@ -23,8 +23,6 @@ const TOOL_RESULT_RAW_MAX_CHARS: usize = 2_400;
 const TOOL_RESULT_JSON_MAX_SCALARS: usize = 48;
 const TOOL_RESULT_JSON_MAX_ARRAY_ITEMS: usize = 12;
 const TOOL_RESULT_SCALAR_MAX_CHARS: usize = 180;
-const TOOL_RESULT_GITHUB_MAX_ROWS: usize = 8;
-const TOOL_RESULT_GITHUB_MAX_REVIEWERS: usize = 4;
 const SYSTEM_CONTEXT_MAX_CHARS: usize = 6_000;
 const FAST_USER_CONTEXT_MAX_CHARS: usize = 3_000;
 const SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS: usize = 2_000;
@@ -117,10 +115,16 @@ fn system_with_tool_names(
     selected_tool_names: &[String],
 ) -> String {
     let mut prompt = augmented_system_prompt_for_mode(session, has_tools);
+    append_selected_tool_focus(&mut prompt, selected_tool_names);
     let tools = selected_tools(session, has_tools, selected_tool_names);
     let names = tool_names_from(tools.as_ref());
     if !names.is_empty() {
         prompt.push_str(&format!("\n\nAvailable tools: {}", names.join(", ")));
+    } else if !selected_tool_names.is_empty() {
+        prompt.push_str(&format!(
+            "\n\nAvailable tools: {}",
+            selected_tool_names.join(", ")
+        ));
     }
     prompt
 }
@@ -131,6 +135,7 @@ fn system_with_tool_summaries(
     selected_tool_names: &[String],
 ) -> String {
     let mut prompt = augmented_system_prompt_for_mode(session, has_tools);
+    append_selected_tool_focus(&mut prompt, selected_tool_names);
     let tools = selected_tools(session, has_tools, selected_tool_names);
     let summaries = tool_summaries_from(tools.as_ref());
     if !summaries.is_empty() {
@@ -138,8 +143,25 @@ fn system_with_tool_summaries(
         for s in &summaries {
             prompt.push_str(&format!("\n  - {s}"));
         }
+    } else if !selected_tool_names.is_empty() {
+        prompt.push_str("\n\nAvailable tools:");
+        for name in selected_tool_names {
+            prompt.push_str(&format!("\n  - {name}"));
+        }
     }
     prompt
+}
+
+fn append_selected_tool_focus(prompt: &mut String, selected_tool_names: &[String]) {
+    if selected_tool_names.is_empty() {
+        return;
+    }
+    prompt.push_str(&format!(
+        "\n\nSelected tools for this turn: {}.\n\
+         If the user asked for an action that requires one of these tools, \
+         return a structured tool call instead of prose or a command block.",
+        selected_tool_names.join(", ")
+    ));
 }
 
 // ── Fast worker ──────────────────────────────────────────────────────
@@ -224,7 +246,8 @@ fn pack_strong(
     has_tools: bool,
     selected_tool_names: &[String],
 ) -> PackedContext {
-    let system = augmented_system_prompt_for_mode(session, has_tools);
+    let mut system = augmented_system_prompt_for_mode(session, has_tools);
+    append_selected_tool_focus(&mut system, selected_tool_names);
 
     let mut messages = vec![json!({"role": "system", "content": system})];
 
@@ -506,9 +529,10 @@ pub fn pack_for_tool_result_answer_only(session: &Session) -> Vec<Value> {
     let mut system = augmented_system_prompt_for_mode(session, false);
     system.push_str(
         "\n\nTool result fallback: answer from the completed tool results below. \
-         Do not request another tool call. For GitHub/web results, use exact PR numbers, \
-         titles, authors, statuses, and URLs from the evidence. If the evidence is incomplete \
-         or contradicts the user's premise, say that directly instead of inventing missing facts.",
+         Do not request another tool call unless the declared tool schemas and existing evidence \
+         make the next call clearly necessary. Use exact values present in the evidence. If the \
+         evidence is incomplete or contradicts the user's premise, say that directly instead of \
+         inventing missing facts.",
     );
 
     let mut user = String::new();
@@ -548,7 +572,7 @@ fn tool_evidence_message(session: &Session) -> Option<Value> {
     }
 
     let mut lines = vec![
-        "Completed tool results. Preserve exact short values from these results when the user asks to include, recall, or return tool facts. For GitHub/web results, use exact numbers, titles, authors, statuses, and URLs from evidence; if the user's premise conflicts with evidence, say so instead of inventing a fit."
+        "Completed tool results. Preserve exact short values from these results when the user asks to include, recall, or return tool facts. Use exact values from evidence; if the user's premise conflicts with evidence, say so instead of inventing a fit."
             .to_string(),
     ];
     for (idx, (name, result)) in results
@@ -662,7 +686,6 @@ fn compact_json_tool_result(original_len: usize, value: &Value) -> String {
         "Tool result compacted from {original_len} chars; original was JSON."
     )];
     append_json_shape(value, &mut lines);
-    append_structured_json_summaries(value, &mut lines);
     append_embedded_json_summaries(value, &mut lines);
     let mut scalars = Vec::new();
     collect_json_scalars(value, "$", &mut scalars, 0);
@@ -677,31 +700,6 @@ fn compact_json_tool_result(original_len: usize, value: &Value) -> String {
     lines.join("\n")
 }
 
-pub(crate) fn github_evidence_rows_from_tool_result(result: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(result) else {
-        return Vec::new();
-    };
-    let mut rows = github_item_rows(&value);
-
-    if let Some(text) = value.get("text").and_then(Value::as_str)
-        && let Some(embedded) = parse_embedded_json_text(text)
-    {
-        rows.extend(github_item_rows(&embedded));
-    }
-
-    dedupe_preserving_order(rows)
-}
-
-fn dedupe_preserving_order(rows: Vec<String>) -> Vec<String> {
-    let mut deduped = Vec::new();
-    for row in rows {
-        if !deduped.iter().any(|seen| seen == &row) {
-            deduped.push(row);
-        }
-    }
-    deduped
-}
-
 fn append_embedded_json_summaries(value: &Value, lines: &mut Vec<String>) {
     let Some(text) = value.get("text").and_then(Value::as_str) else {
         return;
@@ -710,9 +708,14 @@ fn append_embedded_json_summaries(value: &Value, lines: &mut Vec<String>) {
         return;
     };
 
-    lines.push("Embedded JSON extracted from web_fetch text:".to_string());
+    lines.push("Embedded JSON extracted from tool result text:".to_string());
     append_json_shape(&embedded, lines);
-    append_structured_json_summaries(&embedded, lines);
+    let mut scalars = Vec::new();
+    collect_json_scalars(&embedded, "embedded", &mut scalars, 0);
+    if !scalars.is_empty() {
+        lines.push("Embedded JSON scalar fields:".to_string());
+        lines.extend(scalars.into_iter().map(|line| format!("- {line}")));
+    }
 }
 
 fn parse_embedded_json_text(text: &str) -> Option<Value> {
@@ -731,120 +734,6 @@ fn parse_embedded_json_text(text: &str) -> Option<Value> {
     }
 
     serde_json::from_str(payload).ok()
-}
-
-fn append_structured_json_summaries(value: &Value, lines: &mut Vec<String>) {
-    let github_rows = github_item_rows(value);
-    if !github_rows.is_empty() {
-        lines.push("GitHub item summaries:".to_string());
-        lines.extend(github_rows.into_iter().map(|row| format!("- {row}")));
-    }
-
-    let file_rows = github_file_rows(value);
-    if !file_rows.is_empty() {
-        lines.push("GitHub file summaries:".to_string());
-        lines.extend(file_rows.into_iter().map(|row| format!("- {row}")));
-    }
-}
-
-fn github_item_rows(value: &Value) -> Vec<String> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .take(TOOL_RESULT_GITHUB_MAX_ROWS)
-            .filter_map(github_item_row)
-            .collect(),
-        Value::Object(_) => github_item_row(value).into_iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn github_item_row(value: &Value) -> Option<String> {
-    let map = value.as_object()?;
-    let number = map.get("number").and_then(Value::as_i64)?;
-    let title = map.get("title").and_then(Value::as_str)?;
-
-    let mut fields = vec![
-        format!("#{number}"),
-        format!("title=\"{}\"", crate::worker::truncate_chars(title, 120)),
-    ];
-    push_named_scalar(map, "state", &mut fields);
-    push_nested_named_scalar(map, "author", "user", "login", &mut fields);
-    push_named_scalar(map, "draft", &mut fields);
-    push_named_scalar(map, "updated_at", &mut fields);
-    push_named_scalar(map, "html_url", &mut fields);
-    push_reviewer_logins(map, &mut fields);
-
-    Some(fields.join(", "))
-}
-
-fn github_file_rows(value: &Value) -> Vec<String> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .take(TOOL_RESULT_GITHUB_MAX_ROWS)
-            .filter_map(github_file_row)
-            .collect(),
-        Value::Object(_) => github_file_row(value).into_iter().collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn github_file_row(value: &Value) -> Option<String> {
-    let map = value.as_object()?;
-    let filename = map.get("filename").and_then(Value::as_str)?;
-    let mut fields = vec![format!(
-        "filename=\"{}\"",
-        crate::worker::truncate_chars(filename, 160)
-    )];
-    push_named_scalar(map, "status", &mut fields);
-    push_named_scalar(map, "additions", &mut fields);
-    push_named_scalar(map, "deletions", &mut fields);
-    push_named_scalar(map, "changes", &mut fields);
-    Some(fields.join(", "))
-}
-
-fn push_named_scalar(
-    map: &serde_json::Map<String, Value>,
-    key: &'static str,
-    fields: &mut Vec<String>,
-) {
-    let Some(value) = map.get(key).and_then(scalar_to_string) else {
-        return;
-    };
-    fields.push(format!("{key}={value}"));
-}
-
-fn push_nested_named_scalar(
-    map: &serde_json::Map<String, Value>,
-    label: &'static str,
-    object_key: &'static str,
-    scalar_key: &'static str,
-    fields: &mut Vec<String>,
-) {
-    let Some(value) = map
-        .get(object_key)
-        .and_then(Value::as_object)
-        .and_then(|nested| nested.get(scalar_key))
-        .and_then(scalar_to_string)
-    else {
-        return;
-    };
-    fields.push(format!("{label}={value}"));
-}
-
-fn push_reviewer_logins(map: &serde_json::Map<String, Value>, fields: &mut Vec<String>) {
-    let Some(reviewers) = map.get("requested_reviewers").and_then(Value::as_array) else {
-        return;
-    };
-    let logins = reviewers
-        .iter()
-        .filter_map(|reviewer| reviewer.get("login").and_then(Value::as_str))
-        .take(TOOL_RESULT_GITHUB_MAX_REVIEWERS)
-        .collect::<Vec<_>>();
-    if !logins.is_empty() {
-        fields.push(format!("requested_reviewers={}", logins.join(",")));
-    }
 }
 
 fn append_json_shape(value: &Value, lines: &mut Vec<String>) {
@@ -1243,6 +1132,37 @@ mod tests {
     }
 
     #[test]
+    fn prompt_only_tool_selection_is_visible_to_workers() {
+        let s = session_with(
+            &[
+                system_msg(
+                    "Agent.\n## Tooling\n- exec: Run shell commands\n- process: Manage background exec sessions",
+                ),
+                user_msg("Use gh to list recent open PRs."),
+            ],
+            None,
+        );
+        let selected = vec!["exec".to_string()];
+
+        let fast = pack_for_worker_selected(&s, WorkerRole::Fast, true, &selected);
+        let strong = pack_for_worker_selected(&s, WorkerRole::Strong, true, &selected);
+
+        for packed in [&fast, &strong] {
+            let system = system_text(&packed.messages);
+            assert!(
+                system.contains("Selected tools for this turn: exec."),
+                "selected prompt-only tool should be explicit in system prompt: {system}"
+            );
+            assert!(
+                system.contains("return a structured tool call"),
+                "tool-intent prompt should discourage prose-only answers: {system}"
+            );
+        }
+        assert!(fast.tools.is_none());
+        assert!(strong.tools.is_none());
+    }
+
+    #[test]
     fn strong_worker_has_deep_history_and_native_tools() {
         // Build a session with many turns so we can verify depth.
         let mut msgs = vec![system_msg("Agent ST.")];
@@ -1484,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_github_api_json_preserves_pr_rows() {
+    fn wrapped_embedded_json_preserves_generic_scalar_rows() {
         let noisy_body = "x".repeat(8_000);
         let github_json = json!([
             {
@@ -1544,12 +1464,11 @@ mod tests {
             .and_then(Value::as_str)
             .expect("compacted content");
 
-        assert!(content.contains("Embedded JSON extracted from web_fetch text"));
-        assert!(content.contains("GitHub item summaries"));
-        assert!(content.contains("#806"));
-        assert!(content.contains("author=\"ndizazzo\""));
-        assert!(content.contains("requested_reviewers=michaelneale,i386"));
-        assert!(content.contains("#709"));
+        assert!(content.contains("Embedded JSON extracted from tool result text"));
+        assert!(content.contains("Embedded JSON scalar fields"));
+        assert!(content.contains("embedded[0]: number=806"));
+        assert!(content.contains("title=\"Add meshllm.cloud website"));
+        assert!(content.contains("embedded[1]: number=709"));
         assert!(content.contains("Use combined hf-hub fork for model downloads"));
         assert!(
             !content.contains(&"x".repeat(512)),

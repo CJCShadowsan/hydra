@@ -278,7 +278,7 @@ fn web_tools() -> Value {
 }
 
 #[tokio::test]
-async fn exhausted_web_research_budget_forces_answer_only_context() {
+async fn exhausted_tool_budget_forces_answer_only_context() {
     let backend = InspectingAnswerBackend::new();
     let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
     let config = moa::GatewayConfig {
@@ -345,7 +345,7 @@ async fn exhausted_web_research_budget_forces_answer_only_context() {
     assert_eq!(
         backend.calls_with_tools(),
         0,
-        "web budget exhaustion must stop forwarding web tool schemas"
+        "tool budget exhaustion must stop forwarding tool schemas"
     );
     assert_eq!(backend.calls_without_tools(), 1);
     assert_eq!(
@@ -365,7 +365,7 @@ async fn exhausted_web_research_budget_forces_answer_only_context() {
             .response_body
             .pointer("/choices/0/message/tool_calls")
             .is_none(),
-        "budget exhaustion must produce an answer, not another web tool call"
+        "budget exhaustion must produce an answer, not another tool call"
     );
 }
 
@@ -449,6 +449,85 @@ async fn repeated_tool_guard_allows_different_tool_from_minimax_xml() {
 }
 
 #[tokio::test]
+async fn non_empty_tool_result_suppresses_same_tool_followup() {
+    let backend = RecordingBackend::new(
+        r#"{"kind":"tool_proposal","confidence":0.9,"tool":"exec","arguments":{"command":"gh pr view 806 --repo mesh-LLM/mesh-llm"}}"#,
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }
+        }],
+        "messages": [
+            {"role": "user", "content": "Use gh to list recent open PRs, then tell me one interesting one."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_exec",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_exec", "content": "#806 Add meshllm.cloud website and onboarding docs"},
+        ],
+        "max_tokens": 64,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("stop")
+    );
+    assert!(
+        result
+            .response_body
+            .pointer("/choices/0/message/tool_calls")
+            .is_none(),
+        "same tool must not be emitted again after answerable evidence: {}",
+        result.response_body
+    );
+    let content = result
+        .response_body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        content.contains("#806 Add meshllm.cloud website and onboarding docs"),
+        "answer should be grounded in the completed tool result: {content}"
+    );
+    assert!(
+        !content.contains("tool_proposal") && !content.contains("gh pr view"),
+        "suppressed tool proposals must not leak as assistant text: {content}"
+    );
+}
+
+#[tokio::test]
 async fn tool_result_retries_answer_only_when_schema_reducer_fails() {
     let backend = ToolSchemaFailBackend::new();
     let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
@@ -479,7 +558,7 @@ async fn tool_result_retries_answer_only_when_schema_reducer_fails() {
                     "function": {"name": "read_file", "arguments": "{\"path\":\"/tmp\"}"}
                 }]
             },
-            {"role": "tool", "tool_call_id": "call_1", "content": "file_a.log\nfile_b.log\n"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "{}"},
         ],
         "max_tokens": 64,
     });
