@@ -2123,6 +2123,7 @@ fn prompt_asks_for_pull_requests(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
     prompt_has_word(&lower, "pr")
         || prompt_has_word(&lower, "prs")
+        || prompt_has_word(&lower, "pulls")
         || lower.contains("pull request")
 }
 
@@ -4554,6 +4555,62 @@ mod response_builder_tests {
         assert!(tool_result_has_answerable_evidence_for_prompt(
             result, prompt
         ));
+    }
+
+    #[test]
+    fn pr_prompt_rejects_bad_or_wrong_domain_tool_result_permutations() {
+        let pr_prompts = [
+            "Any new interesting PRs? You have the gh command line I think can use",
+            "Use gh to find recent open pulls.",
+            "Find important GitHub pull requests.",
+        ];
+        let non_evidence_results = [
+            "unknown flag: --sort\n\nUsage: gh pr list [flags]",
+            "UNKNOWN JSON FIELD: \"repository\"\nAvailable fields:\n  author\n  title",
+            "  no git remotes found\n\n(Command exited with code 1)",
+            "gh search not available or not authenticated",
+            "search failed: gh search not available or not authenticated",
+            "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true",
+            "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z",
+        ];
+
+        for prompt in pr_prompts {
+            for result in non_evidence_results {
+                assert!(
+                    !tool_result_has_answerable_evidence_for_prompt(result, prompt),
+                    "prompt {prompt:?} should not accept tool output {result:?} as PR evidence"
+                );
+                assert!(
+                    answer_from_latest_tool_result(&session_with_user_and_tool_result(
+                        prompt, result
+                    ))
+                    .is_none(),
+                    "prompt {prompt:?} should not synthesize from {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pr_prompt_accepts_pr_row_permutations() {
+        let prompt = "Use gh to list recent open PRs for mesh-LLM/mesh-llm.";
+        let pr_results = [
+            "808\tStabilize OpenClaw tool loops through MoA\tOPEN\t2026-06-06T06:17:33Z",
+            "#808\tStabilize OpenClaw tool loops through MoA\tOPEN",
+            "808\tStabilize OpenClaw tool loops through MoA",
+        ];
+
+        for result in pr_results {
+            assert!(
+                tool_result_has_answerable_evidence_for_prompt(result, prompt),
+                "prompt {prompt:?} should accept PR output {result:?}"
+            );
+            assert!(
+                answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, result))
+                    .is_some(),
+                "prompt {prompt:?} should synthesize from {result:?}"
+            );
+        }
     }
 
     #[test]
