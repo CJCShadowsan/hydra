@@ -325,6 +325,72 @@ fn web_tools() -> Value {
 }
 
 #[tokio::test]
+async fn different_exec_commands_do_not_trigger_same_tool_loop_guard() {
+    let backend = RecordingBackend::new(
+        r#"{"kind":"tool_proposal","confidence":0.9,"tool":"exec","arguments":{"command":"gh pr list --repo Mesh-LLM/mesh-llm --state open --limit 20","timeout":30}}"#,
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": exec_tool(),
+        "messages": [
+            {"role": "user", "content": "Any new interesting PRs? You have the gh command line I think can use"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh pr list --repo AAIF/mesh-llm --state open --sort updated --limit 20\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "unknown flag: --sort\n\nUsage: gh pr list [flags]\n\nCommand exited with code 1"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh pr list --repo AAIF/mesh-llm --state open --limit 20\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "GraphQL: Could not resolve to a Repository with the name 'AAIF/mesh-llm'. (repository)\n\nCommand exited with code 1"},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_3",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"git remote -v\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_3", "content": "origin\tgit@github.com:Mesh-LLM/mesh-llm.git (fetch)\norigin\tgit@github.com:Mesh-LLM/mesh-llm.git (push)"},
+        ],
+        "max_tokens": 96,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("tool_calls"),
+        "different exec commands should not be suppressed as a repeated exact tool loop: {}",
+        result.response_body
+    );
+    let args = result
+        .response_body
+        .pointer("/choices/0/message/tool_calls/0/function/arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(args.contains("Mesh-LLM/mesh-llm"), "{args}");
+}
+
+#[tokio::test]
 async fn pr_prompt_retries_after_bad_tool_result_permutations() {
     let bad_results = [
         "unknown flag: --sort\n\nUsage: gh pr list [flags]",

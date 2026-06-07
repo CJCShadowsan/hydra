@@ -2013,15 +2013,15 @@ fn short_exact_value(value: &str) -> bool {
 }
 
 fn repeated_same_tool_results(session: &Session) -> Option<(String, usize)> {
-    let calls = completed_tool_names_since_latest_user_before_tool_result(session);
-    let tool_name = calls.last()?;
+    let calls = completed_tool_calls_since_latest_user_before_tool_result(session);
+    let latest = calls.last()?;
     let count = calls
         .iter()
         .rev()
-        .take_while(|name| *name == tool_name)
+        .take_while(|call| call.same_signature(latest))
         .count();
 
-    (count >= SAME_TOOL_FORCE_ANSWER_THRESHOLD).then(|| (tool_name.clone(), count))
+    (count >= SAME_TOOL_FORCE_ANSWER_THRESHOLD).then(|| (latest.name.clone(), count))
 }
 
 fn tool_budget_exhausted(session: &Session) -> Option<usize> {
@@ -2030,6 +2030,27 @@ fn tool_budget_exhausted(session: &Session) -> Option<usize> {
 }
 
 fn completed_tool_names_since_latest_user_before_tool_result(session: &Session) -> Vec<String> {
+    completed_tool_calls_since_latest_user_before_tool_result(session)
+        .into_iter()
+        .map(|call| call.name)
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct CompletedToolCall {
+    name: String,
+    arguments: String,
+}
+
+impl CompletedToolCall {
+    fn same_signature(&self, other: &Self) -> bool {
+        self.name == other.name && self.arguments == other.arguments
+    }
+}
+
+fn completed_tool_calls_since_latest_user_before_tool_result(
+    session: &Session,
+) -> Vec<CompletedToolCall> {
     let all = session.all_messages();
     let Some(latest_tool_idx) = all.iter().rposition(|msg| message_role(msg) == "tool") else {
         return Vec::new();
@@ -2039,7 +2060,7 @@ fn completed_tool_names_since_latest_user_before_tool_result(session: &Session) 
         .rposition(|msg| message_role(msg) == "user")
         .unwrap_or(0);
 
-    let mut call_names = std::collections::HashMap::new();
+    let mut call_signatures = std::collections::HashMap::new();
     let mut completed = Vec::new();
     for msg in &all[start_idx..=latest_tool_idx] {
         match message_role(msg) {
@@ -2055,15 +2076,25 @@ fn completed_tool_names_since_latest_user_before_tool_result(session: &Session) 
                     else {
                         continue;
                     };
-                    call_names.insert(id.to_string(), name.to_string());
+                    let arguments = tool_call
+                        .pointer("/function/arguments")
+                        .map(tool_call_arguments_signature)
+                        .unwrap_or_default();
+                    call_signatures.insert(
+                        id.to_string(),
+                        CompletedToolCall {
+                            name: name.to_string(),
+                            arguments,
+                        },
+                    );
                 }
             }
             "tool" => {
                 let Some(id) = msg.get("tool_call_id").and_then(Value::as_str) else {
                     continue;
                 };
-                if let Some(name) = call_names.get(id) {
-                    completed.push(name.clone());
+                if let Some(call) = call_signatures.get(id) {
+                    completed.push(call.clone());
                 }
             }
             _ => {}
@@ -2071,6 +2102,13 @@ fn completed_tool_names_since_latest_user_before_tool_result(session: &Session) 
     }
 
     completed
+}
+
+fn tool_call_arguments_signature(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn latest_completed_tool_result(session: &Session) -> Option<(String, String)> {
@@ -2096,6 +2134,11 @@ fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) ->
     }
     if prompt_asks_for_github_work_items(prompt)
         && plain_text_tool_result_looks_like_github_auth_status(result)
+    {
+        return false;
+    }
+    if prompt_asks_for_pull_requests(prompt)
+        && plain_text_tool_result_looks_like_git_remotes(result)
     {
         return false;
     }
@@ -2155,6 +2198,16 @@ fn plain_text_tool_result_looks_like_github_repo_list(result: &str) -> bool {
         repo.contains('/')
             && !repo.contains(char::is_whitespace)
             && (visibility.contains("public") || visibility.contains("private"))
+    })
+}
+
+fn plain_text_tool_result_looks_like_git_remotes(result: &str) -> bool {
+    result.lines().map(str::trim).any(|line| {
+        let mut columns = line.split('\t').map(str::trim);
+        matches!(columns.next(), Some("origin" | "upstream"))
+            && columns.next().is_some_and(|remote| {
+                remote.contains("github.com:") || remote.contains("github.com/")
+            })
     })
 }
 
@@ -4559,6 +4612,31 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn git_remote_listing_is_not_pr_request_evidence() {
+        let result = "origin\tgit@github.com:Mesh-LLM/mesh-llm.git (fetch)\norigin\tgit@github.com:Mesh-LLM/mesh-llm.git (push)";
+        let prompt = "Any new interesting PRs? You have the gh command line I think can use";
+
+        assert!(tool_result_has_answerable_evidence(result));
+        assert!(!tool_result_has_answerable_evidence_for_prompt(
+            result, prompt
+        ));
+        assert!(
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, result))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn git_remote_listing_can_answer_remote_prompt() {
+        let result = "origin\tgit@github.com:Mesh-LLM/mesh-llm.git (fetch)";
+        let prompt = "What git remote is configured?";
+
+        assert!(tool_result_has_answerable_evidence_for_prompt(
+            result, prompt
+        ));
+    }
+
+    #[test]
     fn pr_prompt_rejects_bad_or_wrong_domain_tool_result_permutations() {
         let pr_prompts = [
             "Any new interesting PRs? You have the gh command line I think can use",
@@ -4574,6 +4652,7 @@ mod response_builder_tests {
             "GraphQL: Could not resolve to a Repository with the name 'micn/mesh-llm'. (repository)",
             "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true",
             "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z",
+            "origin\tgit@github.com:Mesh-LLM/mesh-llm.git (fetch)\norigin\tgit@github.com:Mesh-LLM/mesh-llm.git (push)",
         ];
 
         for prompt in pr_prompts {
