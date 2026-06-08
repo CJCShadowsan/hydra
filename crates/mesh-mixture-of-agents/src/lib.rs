@@ -2445,13 +2445,9 @@ fn parse_json_prefix_with_escaped_string_controls(input: &str) -> Option<Value> 
 
 fn prompt_asks_for_check_or_review_status(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "ci", "check", "checks", "green", "status", "copilot", "feedback", "comment",
-            "comments", "review", "reviews",
-        ],
-    )
+    prompt_asks_for_ci_status(prompt)
+        || prompt_asks_for_feedback(prompt)
+        || contains_any(&lower, &["status", "green"])
 }
 
 fn answer_from_structured_status_feedback_value(value: &Value, prompt: &str) -> Option<String> {
@@ -2550,7 +2546,7 @@ fn structured_feedback_summary_from_value(value: &Value, prompt: &str) -> Option
 
 fn structured_check_summary(checks: &[Value]) -> Option<String> {
     if checks.is_empty() {
-        return Some("CI/checks: no check runs were returned.".to_string());
+        return None;
     }
 
     let mut failing = Vec::new();
@@ -6200,6 +6196,31 @@ mod response_builder_tests {
         assert!(
             answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, &result))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn weather_check_prompt_does_not_trigger_ci_status_summary() {
+        let prompt =
+            "Use the weather lookup tool to check Sydney. Now answer in one short sentence.";
+        let result = serde_json::json!({
+            "city": "Sydney",
+            "condition": "clear",
+            "temperature_c": 21
+        })
+        .to_string();
+        let session = session_with_user_and_tool_result(prompt, &result);
+
+        assert_eq!(
+            answer_from_prompt_specific_structured_tool_result(&result, prompt),
+            None
+        );
+        let answer = answer_from_latest_tool_result(&session).expect("weather JSON is evidence");
+        assert!(answer.contains("Sydney"), "{answer}");
+        assert!(!answer.contains("CI/checks"), "{answer}");
+        assert_eq!(
+            repair_tool_result_answer(&session, "Sydney is clear at 21C."),
+            "Sydney is clear at 21C."
         );
     }
 
