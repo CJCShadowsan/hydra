@@ -1405,7 +1405,7 @@ fn recent_tool_chain_names(session: &Session) -> Vec<String> {
     };
     let start_idx = all[..=latest_tool_idx]
         .iter()
-        .rposition(|msg| message_role(msg) == "user")
+        .rposition(message_is_task_user)
         .unwrap_or(0);
 
     let mut names = Vec::new();
@@ -1432,6 +1432,32 @@ fn recent_tool_chain_names(session: &Session) -> Vec<String> {
 
 fn message_role(msg: &Value) -> &str {
     msg.get("role").and_then(Value::as_str).unwrap_or("")
+}
+
+fn message_is_task_user(msg: &Value) -> bool {
+    message_role(msg) == "user" && !message_is_synthetic_user(msg)
+}
+
+fn message_is_synthetic_user(msg: &Value) -> bool {
+    message_text(msg).is_some_and(|text| text.trim_start().starts_with("<info-msg>"))
+}
+
+fn message_text(msg: &Value) -> Option<String> {
+    if let Some(text) = msg.get("content").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let text = msg
+        .get("content")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
@@ -2987,7 +3013,7 @@ fn completed_tool_calls_since_latest_user_before_tool_result(
     };
     let start_idx = all[..=latest_tool_idx]
         .iter()
-        .rposition(|msg| message_role(msg) == "user")
+        .rposition(message_is_task_user)
         .unwrap_or(0);
 
     let mut call_signatures = std::collections::HashMap::new();
@@ -6545,6 +6571,40 @@ mod response_builder_tests {
         );
 
         assert!(prompt_requests_additional_tool_step(
+            &session.active_user_text(),
+            &session
+        ));
+    }
+
+    #[test]
+    fn goose_info_message_does_not_reset_multi_step_tool_count() {
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({
+                    "role": "user",
+                    "content": "Actually use the shell/developer tool. Run pwd, then run ls -1 | head -5, then answer."
+                }),
+                tool_call_msg_with_args("call_1", "shell", r#"{"command":"pwd"}"#),
+                tool_result_msg("call_1", "/tmp/workspace"),
+                serde_json::json!({
+                    "role": "user",
+                    "content": "<info-msg>\nWorking directory: /tmp/workspace\n</info-msg>"
+                }),
+                tool_call_msg_with_args("call_2", "shell", r#"{"command":"ls -1 | head -5"}"#),
+                tool_result_msg("call_2", "AGENTS.md\nCargo.toml"),
+            ],
+            &None,
+        );
+
+        let completed = completed_tool_calls_since_latest_user_before_tool_result(&session);
+
+        assert_eq!(completed.len(), 2);
+        assert_eq!(
+            session.active_user_text(),
+            "Actually use the shell/developer tool. Run pwd, then run ls -1 | head -5, then answer."
+        );
+        assert!(!prompt_requests_additional_tool_step(
             &session.active_user_text(),
             &session
         ));

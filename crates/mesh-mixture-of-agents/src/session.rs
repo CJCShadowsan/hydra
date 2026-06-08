@@ -223,7 +223,7 @@ impl Session {
         self.messages
             .iter()
             .rev()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .find(|m| is_task_user_message(m))
             .and_then(extract_text_content)
             .unwrap_or_default()
     }
@@ -254,7 +254,7 @@ impl Session {
         self.messages[..tool_call_idx]
             .iter()
             .rev()
-            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+            .find(|m| is_task_user_message(m))
             .and_then(extract_text_content)
             .unwrap_or_else(|| self.last_user_text())
     }
@@ -599,6 +599,14 @@ fn extract_text_content(msg: &Value) -> Option<String> {
     None
 }
 
+fn is_task_user_message(msg: &Value) -> bool {
+    msg.get("role").and_then(Value::as_str) == Some("user") && !is_synthetic_user_message(msg)
+}
+
+fn is_synthetic_user_message(msg: &Value) -> bool {
+    extract_text_content(msg).is_some_and(|text| text.trim_start().starts_with("<info-msg>"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +836,41 @@ mod tests {
             pairs[0].1.contains("unknown flag: --sort"),
             "tool-result text must be available to reducer retry logic: {pairs:?}"
         );
+    }
+
+    #[test]
+    fn goose_info_user_message_does_not_replace_active_task() {
+        let mut s = Session::new();
+        s.ingest(
+            &[
+                json!({"role": "user", "content": "Run pwd, then run ls, then answer."}),
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_pwd",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"command\":\"pwd\"}"}
+                    }]
+                }),
+                json!({"role": "tool", "tool_call_id": "call_pwd", "content": "/tmp/project"}),
+                json!({"role": "user", "content": "<info-msg>\nWorking directory: /tmp/project\n</info-msg>"}),
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_ls",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"command\":\"ls -1\"}"}
+                    }]
+                }),
+                json!({"role": "tool", "tool_call_id": "call_ls", "content": "AGENTS.md"}),
+            ],
+            &None,
+        );
+
+        assert_eq!(s.last_user_text(), "Run pwd, then run ls, then answer.");
+        assert_eq!(s.active_user_text(), "Run pwd, then run ls, then answer.");
     }
 
     #[test]
