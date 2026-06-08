@@ -1988,6 +1988,12 @@ async fn handle_tool_result(
                     retry_tool_result_response_if_plain(
                         body,
                         retry_tool_call.as_ref(),
+                        latest_non_answerable_tool
+                            .as_ref()
+                            .map(|(_, result)| result.as_str()),
+                        session.tools(),
+                        response_allowed_tools,
+                        response_prompt_profiles,
                         response_tools_enabled,
                     )
                 }
@@ -1995,7 +2001,17 @@ async fn handle_tool_result(
                     if response_tools_enabled {
                         retry_tool_call
                             .as_ref()
-                            .map(retry_tool_call_response)
+                            .and_then(|call| {
+                                retry_tool_call_response(
+                                    call,
+                                    latest_non_answerable_tool
+                                        .as_ref()
+                                        .map(|(_, result)| result.as_str()),
+                                    session.tools(),
+                                    response_allowed_tools,
+                                    response_prompt_profiles,
+                                )
+                            })
                             .unwrap_or_else(|| {
                                 error_response(
                                     "MoA reducer returned no usable answer",
@@ -2046,6 +2062,12 @@ async fn handle_tool_result(
                     retry_tool_result_response_if_plain(
                         body,
                         retry_tool_call.as_ref(),
+                        latest_non_answerable_tool
+                            .as_ref()
+                            .map(|(_, result)| result.as_str()),
+                        session.tools(),
+                        response_allowed_tools,
+                        response_prompt_profiles,
                         response_tools_enabled,
                     )
                 }
@@ -2105,6 +2127,10 @@ fn repair_tool_result_answer(session: &Session, answer: &str) -> String {
         return answer;
     }
 
+    if let Some(answer) = repair_structured_tool_result_answer(session, answer) {
+        return answer;
+    }
+
     let repaired_rows =
         repair_tabular_tool_result_answer(session, answer).unwrap_or_else(|| answer.to_string());
 
@@ -2149,6 +2175,110 @@ fn answer_from_recent_prompt_specific_structured_tool_results(session: &Session)
     parts.push(checks?);
     parts.push(feedback?);
     Some(truncate_for_tool_result_answer(&parts.join("\n")))
+}
+
+fn repair_structured_tool_result_answer(session: &Session, answer: &str) -> Option<String> {
+    let (_, result) = latest_completed_tool_result(session)?;
+    let prompt = session.active_user_text();
+    let parsed = parse_tool_result_json(result.trim())?;
+    let rows = structured_tool_result_rows(&parsed, &prompt);
+    if rows.is_empty() {
+        return None;
+    }
+
+    if prompt_asks_for_work_items(&prompt)
+        && !rows
+            .iter()
+            .any(|row| structured_tool_row_is_referenced(answer, row))
+    {
+        return answer_from_structured_tool_result(&result, &prompt);
+    }
+
+    if let (true, Some(trimmed)) = (
+        prompt_asks_for_work_items(&prompt),
+        trim_unrelated_prefix_before_structured_row(answer, &rows),
+    ) {
+        return Some(trimmed);
+    }
+
+    let missing_rows = rows
+        .iter()
+        .take(3)
+        .filter_map(|row| structured_tool_row_missing_reference(answer, row, &prompt))
+        .collect::<Vec<_>>();
+    if missing_rows.is_empty() {
+        None
+    } else {
+        Some(append_tool_rows(answer, &missing_rows))
+    }
+}
+
+fn structured_tool_row_is_referenced(answer: &str, row: &StructuredToolRow) -> bool {
+    answer_contains_text(answer, &row.title)
+        || row
+            .id
+            .as_deref()
+            .is_some_and(|id| answer_has_row_id(answer, id))
+        || row
+            .url
+            .as_deref()
+            .is_some_and(|url| answer_contains_text(answer, url))
+}
+
+fn structured_tool_row_missing_reference(
+    answer: &str,
+    row: &StructuredToolRow,
+    prompt: &str,
+) -> Option<String> {
+    let has_title = answer_contains_text(answer, &row.title);
+    let has_id = row
+        .id
+        .as_deref()
+        .is_some_and(|id| answer_has_row_id(answer, id));
+    ((has_id && !has_title) || (has_title && row.id.is_some() && !has_id))
+        .then(|| format_structured_tool_row(row, prompt))
+}
+
+fn trim_unrelated_prefix_before_structured_row(
+    answer: &str,
+    rows: &[StructuredToolRow],
+) -> Option<String> {
+    const MIN_PREFIX_CHARS: usize = 240;
+    let first_ref = rows
+        .iter()
+        .filter_map(|row| first_structured_row_reference_index(answer, row))
+        .min()?;
+    if answer[..first_ref].chars().count() < MIN_PREFIX_CHARS {
+        return None;
+    }
+    let start = answer[..first_ref]
+        .rfind('\n')
+        .map_or(first_ref, |index| index + 1);
+    let trimmed = answer[start..].trim_start();
+    (!trimmed.is_empty() && trimmed.len() < answer.trim_start().len()).then(|| trimmed.to_string())
+}
+
+fn first_structured_row_reference_index(answer: &str, row: &StructuredToolRow) -> Option<usize> {
+    let mut candidates = Vec::new();
+    if let Some(id) = row.id.as_deref() {
+        candidates.extend([
+            answer.find(&format!("#{id}")),
+            answer.find(&format!(" {id} ")),
+            answer.find(&format!("PR {id}")),
+            answer.find(&format!("issue {id}")),
+        ]);
+    }
+    candidates.push(case_insensitive_find(answer, &row.title));
+    if let Some(url) = row.url.as_deref() {
+        candidates.push(answer.find(url));
+    }
+    candidates.into_iter().flatten().min()
+}
+
+fn case_insensitive_find(haystack: &str, needle: &str) -> Option<usize> {
+    let haystack_lower = haystack.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    haystack_lower.find(&needle_lower)
 }
 
 #[derive(Debug)]
@@ -2308,6 +2438,11 @@ fn non_answerable_tool_result_answer(session: &Session, tool: &str, result: &str
         && plain_text_tool_result_looks_like_repository_list(result)
     {
         return "The latest tool result listed repositories, not the requested work items, so I can't answer from that output. I need a corrected work-item result before I can pick an item.".to_string();
+    }
+    if prompt_asks_for_work_items(&prompt)
+        && plain_text_tool_result_looks_like_git_repository_metadata(result)
+    {
+        return "The latest tool result listed git repository metadata, not the requested work items, so I can't answer from that output. I need a corrected work-item result before I can pick an item.".to_string();
     }
 
     let first_line = result
@@ -3109,22 +3244,324 @@ fn latest_completed_tool_call(session: &Session) -> Option<CompletedToolCall> {
 fn retry_tool_result_response_if_plain(
     body: Value,
     retry_tool_call: Option<&CompletedToolCall>,
+    latest_tool_result: Option<&str>,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
     tools_enabled: bool,
 ) -> Value {
-    if !tools_enabled || response_contains_tool_call(&body) {
+    if !tools_enabled {
+        return body;
+    }
+    match (first_response_tool_call(&body), retry_tool_call) {
+        (Some(response_call), Some(retry_call))
+            if response_call.same_signature(retry_call)
+                && !same_tool_call_retry_allowed(latest_tool_result) =>
+        {
+            if let Some(corrected) = corrected_retry_tool_call(
+                retry_call,
+                latest_tool_result,
+                tools,
+                allowed_tools,
+                prompt_tool_profiles,
+            ) {
+                let arguments = Value::String(corrected.arguments);
+                return tool_call_response(&corrected.name, &arguments);
+            }
+            tracing::info!(
+                "moa: suppressing repeated failing {} tool call with unchanged arguments",
+                retry_call.name
+            );
+            return error_response(
+                "MoA refused to repeat an identical failing tool call",
+                MOA_ERR_NO_USABLE_ANSWER,
+            );
+        }
+        _ => {}
+    }
+    if response_contains_tool_call(&body) {
         return body;
     }
     retry_tool_call
-        .map(retry_tool_call_response)
+        .and_then(|call| {
+            retry_tool_call_response(
+                call,
+                latest_tool_result,
+                tools,
+                allowed_tools,
+                prompt_tool_profiles,
+            )
+        })
         .unwrap_or(body)
 }
 
-fn retry_tool_call_response(call: &CompletedToolCall) -> Value {
+fn retry_tool_call_response(
+    call: &CompletedToolCall,
+    latest_tool_result: Option<&str>,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<Value> {
+    if let Some(corrected) = corrected_retry_tool_call(
+        call,
+        latest_tool_result,
+        tools,
+        allowed_tools,
+        prompt_tool_profiles,
+    ) {
+        tracing::info!(
+            "moa: reducer returned plain text after non-answerable {}; retrying corrected tool call",
+            call.name
+        );
+        let arguments = Value::String(corrected.arguments);
+        return Some(tool_call_response(&corrected.name, &arguments));
+    }
+
+    if !same_tool_call_retry_allowed(latest_tool_result) {
+        tracing::info!(
+            "moa: reducer returned plain text after non-answerable {}; not retrying identical failing call",
+            call.name
+        );
+        return None;
+    }
+
     tracing::info!(
         "moa: reducer returned plain text after non-answerable {}; retrying same tool call",
         call.name
     );
-    tool_call_response(&call.name, &Value::String(call.arguments.clone()))
+    Some(tool_call_response(
+        &call.name,
+        &Value::String(call.arguments.clone()),
+    ))
+}
+
+fn same_tool_call_retry_allowed(latest_tool_result: Option<&str>) -> bool {
+    latest_tool_result.is_some_and(|result| plain_text_tool_result_looks_empty(result.trim()))
+}
+
+fn corrected_retry_tool_call(
+    call: &CompletedToolCall,
+    latest_tool_result: Option<&str>,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<CompletedToolCall> {
+    let result = latest_tool_result?;
+    let candidates = command_tool_candidates(tools, allowed_tools, prompt_tool_profiles);
+    let candidate = candidates
+        .iter()
+        .find(|candidate| candidate.name == call.name)?;
+    let mut arguments = serde_json::from_str::<Value>(&call.arguments).ok()?;
+    let command = arguments
+        .get(&candidate.field)
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let corrected = tool_result_is_shell_parse_error(result)
+        .then(|| quote_unquoted_shell_metachar_tokens(&command))
+        .flatten()
+        .or_else(|| remove_unknown_cli_flags_from_command(&command, result))?;
+    if corrected == command {
+        return None;
+    }
+    arguments[&candidate.field] = Value::String(corrected);
+    let sanitized = sanitize_tool_arguments_for_tool(&call.name, &arguments, tools).ok()?;
+    let wire = tool_arguments_wire_string(&sanitized);
+    if wire == call.arguments {
+        return None;
+    }
+    Some(CompletedToolCall {
+        name: call.name.clone(),
+        arguments: wire,
+    })
+}
+
+fn tool_result_is_shell_parse_error(result: &str) -> bool {
+    let lower = result.to_ascii_lowercase();
+    lower.contains("parse error near") || lower.contains("syntax error near")
+}
+
+fn remove_unknown_cli_flags_from_command(command: &str, result: &str) -> Option<String> {
+    let allowed = allowed_cli_long_flags_from_usage(result)?;
+    let tokens = split_shell_tokens(command)?;
+    let mut changed = false;
+    let mut filtered = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        match shell_long_flag_name(token) {
+            Some(flag) if !allowed.contains(flag) => {
+                changed = true;
+                index += unknown_flag_token_span(&tokens, index);
+                continue;
+            }
+            _ => {}
+        }
+        filtered.push(token.clone());
+        index += 1;
+    }
+    changed.then(|| join_shell_tokens(&filtered))
+}
+
+fn allowed_cli_long_flags_from_usage(result: &str) -> Option<HashSet<String>> {
+    let lower = result.to_ascii_lowercase();
+    if !lower
+        .lines()
+        .take(4)
+        .any(|line| line.contains("unknown flag:"))
+        || !lower.contains("\nusage:")
+    {
+        return None;
+    }
+
+    let flags_section = result
+        .lines()
+        .skip_while(|line| line.trim() != "Flags:")
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let allowed = flags_section
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | '('))
+        .filter_map(|token| token.strip_prefix("--"))
+        .map(|token| {
+            token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
+        })
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    (!allowed.is_empty()).then_some(allowed)
+}
+
+fn shell_long_flag_name(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("--")
+        .map(|flag| flag.split_once('=').map_or(flag, |(name, _)| name))
+        .filter(|flag| !flag.is_empty())
+}
+
+fn unknown_flag_token_span(tokens: &[String], index: usize) -> usize {
+    let token = &tokens[index];
+    if token.contains('=') {
+        return 1;
+    }
+    let Some(next) = tokens.get(index + 1) else {
+        return 1;
+    };
+    if next.starts_with('-') { 1 } else { 2 }
+}
+
+fn split_shell_tokens(command: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in command.chars() {
+        match ch {
+            '\'' | '"' if quote == Some(ch) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            ch if ch.is_whitespace() && quote.is_none() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            _ => token.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn join_shell_tokens(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| {
+            if shell_token_needs_join_quotes(token) {
+                format!("'{}'", token.replace('\'', r#"'"'"'"#))
+            } else {
+                token.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_token_needs_join_quotes(token: &str) -> bool {
+    token.is_empty()
+        || token
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '&' | '|' | ';' | '<' | '>' | '(' | ')'))
+}
+
+fn quote_unquoted_shell_metachar_tokens(command: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(command.len() + 8);
+    let mut token = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in command.chars() {
+        match ch {
+            '\'' | '"' if quote == Some(ch) => {
+                quote = None;
+                token.push(ch);
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(ch);
+                token.push(ch);
+            }
+            ch if ch.is_whitespace() && quote.is_none() => {
+                flush_shell_token(&mut out, &mut token, &mut changed);
+                out.push(ch);
+            }
+            _ => token.push(ch),
+        }
+    }
+    flush_shell_token(&mut out, &mut token, &mut changed);
+
+    changed.then_some(out)
+}
+
+fn flush_shell_token(out: &mut String, token: &mut String, changed: &mut bool) {
+    if token.is_empty() {
+        return;
+    }
+    if shell_token_needs_single_quotes(token) {
+        *changed = true;
+        out.push('\'');
+        out.push_str(&token.replace('\'', r#"'"'"'"#));
+        out.push('\'');
+    } else {
+        out.push_str(token);
+    }
+    token.clear();
+}
+
+fn shell_token_needs_single_quotes(token: &str) -> bool {
+    token.contains('&') && !shell_token_already_quoted(token)
+}
+
+fn shell_token_already_quoted(token: &str) -> bool {
+    (token.starts_with('\'') && token.ends_with('\''))
+        || (token.starts_with('"') && token.ends_with('"'))
+}
+
+fn first_response_tool_call(body: &Value) -> Option<CompletedToolCall> {
+    let call = body
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)?
+        .first()?;
+    let name = call.pointer("/function/name").and_then(Value::as_str)?;
+    let arguments = call
+        .pointer("/function/arguments")
+        .map(tool_call_arguments_signature)
+        .unwrap_or_default();
+    Some(CompletedToolCall {
+        name: name.to_string(),
+        arguments,
+    })
 }
 
 fn response_contains_tool_call(body: &Value) -> bool {
@@ -3163,6 +3600,11 @@ fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) ->
         return false;
     }
     if prompt_asks_for_work_items(prompt) && plain_text_tool_result_looks_like_git_remotes(result) {
+        return false;
+    }
+    if prompt_asks_for_work_items(prompt)
+        && plain_text_tool_result_looks_like_git_repository_metadata(result)
+    {
         return false;
     }
     if plain_text_tool_result_looks_like_repository_list(result)
@@ -3412,6 +3854,62 @@ fn plain_text_tool_result_looks_like_git_remotes(result: &str) -> bool {
     })
 }
 
+fn plain_text_tool_result_looks_like_git_repository_metadata(result: &str) -> bool {
+    let lines: Vec<&str> = result
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(12)
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let fetch_or_ref_lines = lines
+        .iter()
+        .filter(|line| git_metadata_status_line(line) || git_ref_listing_line(line))
+        .count();
+    let revision_lines = lines
+        .iter()
+        .filter(|line| git_revision_listing_line(line))
+        .count();
+    fetch_or_ref_lines > 0 || revision_lines >= 2 || revision_lines == lines.len()
+}
+
+fn git_metadata_status_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower == "already up to date."
+        || lower.contains("fetch_head")
+        || lower.starts_with("from https://")
+        || lower.starts_with("from http://")
+        || lower.starts_with("from git@")
+        || lower.starts_with("* branch ")
+}
+
+fn git_ref_listing_line(line: &str) -> bool {
+    let mut columns = line.split('\t').map(str::trim);
+    let Some(first) = columns.next() else {
+        return false;
+    };
+    let Some(second) = columns.next() else {
+        return false;
+    };
+    first.len() >= 7
+        && first.chars().all(|ch| ch.is_ascii_hexdigit())
+        && (second.starts_with("refs/heads/")
+            || second.starts_with("refs/tags/")
+            || second.starts_with("refs/remotes/"))
+}
+
+fn git_revision_listing_line(line: &str) -> bool {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let Some(revision) = parts.next() else {
+        return false;
+    };
+    parts.next().is_some_and(|rest| !rest.trim().is_empty())
+        && (7..=40).contains(&revision.len())
+        && revision.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 fn looks_like_git_remote_location(remote: &str) -> bool {
     remote.contains("://")
         || remote.contains('@')
@@ -3427,6 +3925,8 @@ fn plain_text_tool_result_looks_like_error(result: &str) -> bool {
     first_line.starts_with("unknown flag:")
         || first_line.starts_with("unknown json field:")
         || first_line.starts_with("unknown command")
+        || first_line.contains("parse error")
+        || first_line.contains("syntax error")
         || first_line == "no git remotes found"
         || first_line.contains("not available or not authenticated")
         || first_line.starts_with("error:")
@@ -3987,9 +4487,7 @@ fn resolve_response_tool_name(
     let [candidate] = candidates.as_slice() else {
         return None;
     };
-    if candidate.field != "command"
-        && let Some(map) = arguments.as_object_mut()
-    {
+    if let (true, Some(map)) = (candidate.field != "command", arguments.as_object_mut()) {
         map.insert(candidate.field.clone(), Value::String(command));
     }
     Some(candidate.name.clone())
@@ -5910,6 +6408,50 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn repair_tool_result_answer_replaces_unrelated_answer_with_structured_work_item() {
+        let prompt = "Use shell/developer tool to look for recent important open GitHub issues or PRs in Mesh-LLM/mesh-llm. Inspect the results with a command, then reply with one specific issue or PR number/title and why it matters. Do not answer from memory.";
+        let result = serde_json::json!([{
+            "number": 808,
+            "title": "Stabilize OpenClaw tool loops through MoA",
+            "html_url": "https://github.com/Mesh-LLM/mesh-llm/pull/808",
+            "state": "open",
+            "body": "OpenClaw/Gateway users can now route Telegram-style agent turns through model=mesh without small-context workers or slow peers turning ordinary tool loops into timeouts."
+        }])
+        .to_string();
+        let session = session_with_user_and_tool_result(prompt, &result);
+
+        let repaired =
+            repair_tool_result_answer(&session, "Hey. I just came online. Who am I? Who are you?");
+
+        assert!(repaired.contains("#808 - Stabilize OpenClaw tool loops through MoA"));
+        assert!(repaired.contains("https://github.com/Mesh-LLM/mesh-llm/pull/808"));
+        assert!(!repaired.contains("Who am I"));
+    }
+
+    #[test]
+    fn repair_tool_result_answer_trims_identity_preamble_before_work_item() {
+        let prompt = "Use shell/developer tool to look for recent important open GitHub issues or PRs in Mesh-LLM/mesh-llm. Inspect the results with a command, then reply with one specific issue or PR number/title and why it matters. Do not answer from memory.";
+        let result = serde_json::json!([{
+            "number": 808,
+            "title": "Stabilize OpenClaw tool loops through MoA",
+            "html_url": "https://github.com/Mesh-LLM/mesh-llm/pull/808",
+            "state": "open"
+        }])
+        .to_string();
+        let session = session_with_user_and_tool_result(prompt, &result);
+        let unrelated_prefix = "Hey. I just came online. Who am I? Who are you?\n\nI'm your personal assistant, running inside OpenClaw. I'm here to help you navigate the code, track down those tricky bugs, and maybe even find a little joy in the chaos of development. My vibe is collaborative, curious, and ready to dive into the weeds.\n\nNow, about that GitHub request. I dug into the recent activity.\n\n";
+        let answer = format!(
+            "{unrelated_prefix}**PR #808: Stabilize OpenClaw tool loops through MoA**\n\nThis matters because it targets agent tool-loop stability."
+        );
+
+        let repaired = repair_tool_result_answer(&session, &answer);
+
+        assert!(repaired.starts_with("**PR #808"));
+        assert!(!repaired.contains("Who am I"));
+        assert!(repaired.contains("tool-loop stability"));
+    }
+
+    #[test]
     fn cli_usage_error_is_not_answerable_tool_evidence() {
         let result = "unknown flag: --since\r\n\r\nUsage:  gh pr list [flags]\r\n\r\nFlags:";
 
@@ -5920,6 +6462,14 @@ mod response_builder_tests {
     #[test]
     fn cli_json_field_error_is_not_answerable_tool_evidence() {
         let result = "Unknown JSON field: \"headRepositoryName\"\nAvailable fields:\n  additions\n  author\n  title\n\n(Command exited with code 1)";
+
+        assert!(!tool_result_has_answerable_evidence(result));
+        assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
+    fn shell_parse_error_is_not_answerable_tool_evidence() {
+        let result = "(eval):1: parse error near `&'\n\n(Command exited with code 1)";
 
         assert!(!tool_result_has_answerable_evidence(result));
         assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
@@ -6053,6 +6603,8 @@ mod response_builder_tests {
             "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true",
             "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z",
             "origin\tgit@github.com:Mesh-LLM/mesh-llm.git (fetch)\norigin\tgit@github.com:Mesh-LLM/mesh-llm.git (push)",
+            "From https://github.com/Mesh-LLM/mesh-llm\n * branch            main       -> FETCH_HEAD\nAlready up to date.\n536f30a Reuse Skippy decode wire messages\nced32cc8e662a1433d51217787eb304da9121844\trefs/heads/acp-agent-pooling",
+            "536f30a Reuse Skippy decode wire messages\n70cbe09 Stabilize OpenClaw tool loops\nbfe8012 Refresh docs",
         ];
 
         for prompt in pr_prompts {
@@ -6727,6 +7279,26 @@ mod response_builder_tests {
         })
     }
 
+    fn command_tool_schema(name: &str) -> Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }])
+    }
+
     fn session_with_tool_result(result: &str) -> Session {
         session_with_user_and_tool_result("run command", result)
     }
@@ -6745,7 +7317,7 @@ mod response_builder_tests {
     }
 
     #[test]
-    fn non_answerable_tool_result_plain_answer_retries_same_tool_call() {
+    fn empty_tool_result_plain_answer_retries_same_tool_call() {
         let command =
             r#"{"command":"gh pr list --repo Mesh-LLM/mesh-llm --state open --limit 10"}"#;
         let mut session = Session::new();
@@ -6765,6 +7337,10 @@ mod response_builder_tests {
         let body = retry_tool_result_response_if_plain(
             chat_response("I could not retrieve any pull requests."),
             Some(&retry),
+            Some("(no output)"),
+            None,
+            &[],
+            &[],
             true,
         );
 
@@ -6782,6 +7358,82 @@ mod response_builder_tests {
             body.pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn shell_parse_error_retries_schema_corrected_command_tool_call() {
+        let tools = command_tool_schema("exec");
+        let allowed = ["exec".to_string()];
+        let command = r#"{"command":"gh api repos/Mesh-LLM/mesh-llm/issues?state=open&sort=updated&direction=desc --jq '.items[0:1]'"}"#;
+        let retry = CompletedToolCall {
+            name: "exec".to_string(),
+            arguments: command.to_string(),
+        };
+
+        let body = retry_tool_result_response_if_plain(
+            chat_response("The GitHub API command failed."),
+            Some(&retry),
+            Some("(eval):1: parse error near `&'\n\n(Command exited with code 1)"),
+            Some(&tools),
+            &allowed,
+            &[],
+            true,
+        );
+
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        let args = body
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("tool args");
+        assert_eq!(
+            args.get("command").and_then(Value::as_str),
+            Some(
+                "gh api 'repos/Mesh-LLM/mesh-llm/issues?state=open&sort=updated&direction=desc' --jq '.items[0:1]'"
+            )
+        );
+    }
+
+    #[test]
+    fn cli_unknown_flag_error_retries_schema_corrected_command_tool_call() {
+        let tools = command_tool_schema("exec");
+        let allowed = ["exec".to_string()];
+        let command =
+            r#"{"command":"gh api repos/Mesh-LLM/mesh-llm/issues --state open --limit 1"}"#;
+        let retry = CompletedToolCall {
+            name: "exec".to_string(),
+            arguments: command.to_string(),
+        };
+        let result = "unknown flag: --state\n\nUsage:  gh api <endpoint> [flags]\n\nFlags:\n      --cache duration        Cache the response\n  -H, --header key:value      Add a HTTP request header\n      --paginate              Make additional HTTP requests\n\n(Command exited with code 1)";
+
+        let body = retry_tool_result_response_if_plain(
+            chat_response("Let me try again with a corrected command."),
+            Some(&retry),
+            Some(result),
+            Some(&tools),
+            &allowed,
+            &[],
+            true,
+        );
+
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        let args = body
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("tool args");
+        assert_eq!(
+            args.get("command").and_then(Value::as_str),
+            Some("gh api repos/Mesh-LLM/mesh-llm/issues")
         );
     }
 
