@@ -3851,23 +3851,24 @@ fn xml_tool_choice_from_text(
     allowed_tools: &[String],
     prompt_tool_profiles: &[PromptToolProfile],
 ) -> Option<ForcedToolChoice> {
-    let invoke_start = content.find("<invoke ")?;
+    let invoke_start = content.find("<invoke")?;
     let invoke_tag_end = content[invoke_start..].find('>')? + invoke_start;
     let invoke_tag = &content[invoke_start..=invoke_tag_end];
-    let name = xml_attr_value(invoke_tag, "name")?;
-    if !declared_response_tool_names(tools, allowed_tools, prompt_tool_profiles)
-        .iter()
-        .any(|tool| tool == &name)
-    {
-        return None;
-    }
-
     let body_start = invoke_tag_end + 1;
     let body_end = content[body_start..]
         .find("</invoke>")
         .map(|idx| body_start + idx)
         .unwrap_or(content.len());
-    let arguments = xml_parameter_arguments(&content[body_start..body_end]);
+    let body = &content[body_start..body_end];
+    let mut arguments = xml_parameter_arguments(body);
+    let raw_name = xml_attr_value(invoke_tag, "name").or_else(|| xml_body_tool_name(body))?;
+    let name = resolve_response_tool_name(
+        &raw_name,
+        &mut arguments,
+        tools,
+        allowed_tools,
+        prompt_tool_profiles,
+    )?;
     match validate_response_tool_arguments(
         &name,
         &arguments,
@@ -3886,6 +3887,48 @@ fn xml_tool_choice_from_text(
     }
 }
 
+fn resolve_response_tool_name(
+    raw_name: &str,
+    arguments: &mut Value,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Option<String> {
+    let declared = declared_response_tool_names(tools, allowed_tools, prompt_tool_profiles);
+    if declared.iter().any(|tool| tool == raw_name) {
+        return Some(raw_name.to_string());
+    }
+
+    let command = arguments
+        .get("command")
+        .and_then(Value::as_str)?
+        .to_string();
+    if command.trim().is_empty() {
+        return None;
+    }
+    let candidates = command_tool_candidates(tools, allowed_tools, prompt_tool_profiles);
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    if candidate.field != "command"
+        && let Some(map) = arguments.as_object_mut()
+    {
+        map.insert(candidate.field.clone(), Value::String(command));
+    }
+    Some(candidate.name.clone())
+}
+
+fn xml_body_tool_name(body: &str) -> Option<String> {
+    let marker = "tool:";
+    let marker_start = body.find(marker)? + marker.len();
+    let rest = body[marker_start..].trim_start();
+    let name: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
 fn xml_attr_value(tag: &str, attr: &str) -> Option<String> {
     let needle = format!("{attr}=\"");
     let value_start = tag.find(&needle)? + needle.len();
@@ -3896,7 +3939,7 @@ fn xml_attr_value(tag: &str, attr: &str) -> Option<String> {
 fn xml_parameter_arguments(body: &str) -> Value {
     let mut map = serde_json::Map::new();
     let mut cursor = 0;
-    while let Some(parameter_rel) = body[cursor..].find("<parameter ") {
+    while let Some((parameter_rel, tag_prefix)) = next_xml_parameter_tag(&body[cursor..]) {
         let parameter_start = cursor + parameter_rel;
         let Some(tag_end_rel) = body[parameter_start..].find('>') else {
             break;
@@ -3909,7 +3952,7 @@ fn xml_parameter_arguments(body: &str) -> Value {
         };
 
         let value_start = tag_end + 1;
-        let value_end = xml_parameter_value_end(body, value_start, &name);
+        let value_end = xml_parameter_value_end(body, value_start, &name, tag_prefix);
         let value = xml_text_unescape(body[value_start..value_end].trim());
         map.insert(name, Value::String(value));
         cursor = value_end;
@@ -3918,17 +3961,32 @@ fn xml_parameter_arguments(body: &str) -> Value {
     Value::Object(map)
 }
 
-fn xml_parameter_value_end(body: &str, value_start: usize, name: &str) -> usize {
+fn next_xml_parameter_tag(body: &str) -> Option<(usize, &'static str)> {
+    [("<parameter ", "parameter"), ("<param ", "param")]
+        .into_iter()
+        .filter_map(|(needle, tag_prefix)| body.find(needle).map(|idx| (idx, tag_prefix)))
+        .min_by_key(|(idx, _)| *idx)
+}
+
+fn xml_parameter_value_end(body: &str, value_start: usize, name: &str, tag_prefix: &str) -> usize {
     let named_close = format!("</{name}>");
-    ["</parameter>", named_close.as_str(), "<parameter "]
-        .iter()
-        .filter_map(|needle| {
-            body[value_start..]
-                .find(needle)
-                .map(|idx| value_start + idx)
-        })
-        .min()
-        .unwrap_or(body.len())
+    let tag_close = format!("</{tag_prefix}>");
+    [
+        "</parameter>",
+        "</param>",
+        tag_close.as_str(),
+        named_close.as_str(),
+        "<parameter ",
+        "<param ",
+    ]
+    .iter()
+    .filter_map(|needle| {
+        body[value_start..]
+            .find(needle)
+            .map(|idx| value_start + idx)
+    })
+    .min()
+    .unwrap_or(body.len())
 }
 
 fn xml_text_unescape(text: &str) -> String {
@@ -6462,6 +6520,53 @@ mod response_builder_tests {
                 .pointer("/choices/0/message/tool_calls/0/function/arguments")
                 .and_then(Value::as_str),
             Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\"}")
+        );
+    }
+
+    #[test]
+    fn body_style_xml_tool_call_maps_to_single_command_tool() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Execute shell commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }]));
+        let response = chat_or_schema_command_tool_response(
+            "I'll use the developer tool.\n<tool_call>\n<invoke>tool: developer, args: {\\n<param name=\"command\">pwd</param>}\n</tool_call>",
+            tools.as_ref(),
+            &["shell".to_string()],
+            &[],
+            Some("Run pwd."),
+        );
+
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("shell")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"pwd\"}")
         );
     }
 
