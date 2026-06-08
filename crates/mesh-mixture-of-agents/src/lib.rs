@@ -509,6 +509,9 @@ fn looks_like_tool_intent(session: &Session, prompt_tool_profiles: &[PromptToolP
     {
         return true;
     }
+    if looks_like_live_status_followup_tool_intent(session, &text) {
+        return true;
+    }
     extract_shell_command_block(&text)
         .and_then(|command| {
             command_tool_choice_from_command(
@@ -519,6 +522,33 @@ fn looks_like_tool_intent(session: &Session, prompt_tool_profiles: &[PromptToolP
             )
         })
         .is_some()
+}
+
+fn looks_like_live_status_followup_tool_intent(session: &Session, text: &str) -> bool {
+    if recent_tool_chain_names(session).is_empty() {
+        return false;
+    }
+
+    contains_any(
+        text,
+        &[
+            "now",
+            "current",
+            "currently",
+            "latest",
+            "status",
+            "still",
+            "updated",
+            "ci",
+            "check",
+            "checks",
+            "green",
+            "feedback",
+            "comment",
+            "comments",
+            "review",
+        ],
+    )
 }
 
 fn prior_shell_command_tool_choice(
@@ -890,6 +920,9 @@ fn schema_matched_tool_names(
     if user_tokens.is_empty() {
         return Vec::new();
     }
+    let explicit_tool_use = user_text_mentions_tool_use(user_text);
+    let minimum_score = if explicit_tool_use { 1 } else { 2 };
+    let required_margin = if explicit_tool_use { 1 } else { 2 };
 
     let mut scored: Vec<(String, usize)> = profiles
         .iter()
@@ -900,7 +933,7 @@ fn schema_matched_tool_names(
                 .count();
             (profile.name.clone(), overlap)
         })
-        .filter(|(_, score)| *score >= 2)
+        .filter(|(_, score)| *score >= minimum_score)
         .collect();
     scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
@@ -909,7 +942,7 @@ fn schema_matched_tool_names(
     };
     let top_score = *top_score;
     let runner_up = scored.get(1).map(|(_, score)| *score).unwrap_or(0);
-    if top_score < 2 || runner_up + 2 > top_score {
+    if top_score < minimum_score || runner_up + required_margin > top_score {
         return Vec::new();
     }
 
@@ -917,6 +950,16 @@ fn schema_matched_tool_names(
         .into_iter()
         .filter_map(|(name, score)| (score == top_score).then_some(name))
         .collect()
+}
+
+fn user_text_mentions_tool_use(user_text: &str) -> bool {
+    let tokens = lexical_tokens(user_text);
+    tokens
+        .iter()
+        .any(|token| token == "use" || token == "using" || token == "call")
+        && tokens
+            .iter()
+            .any(|token| token == "tool" || token == "tools")
 }
 
 fn tool_text_profiles(
@@ -1453,6 +1496,7 @@ fn infer_string_argument(field: &str, schema: &Value, prompt: &str) -> Option<St
         .or_else(|| infer_assignment_argument(field, prompt))
         .or_else(|| infer_path_like_argument(field, prompt))
         .or_else(|| infer_query_argument(field, prompt))
+        .or_else(|| infer_named_argument(field, schema, prompt))
 }
 
 fn schema_allows_string(schema: &Value) -> bool {
@@ -1540,6 +1584,159 @@ fn infer_query_argument(field: &str, prompt: &str) -> Option<String> {
     (!prompt.is_empty()).then(|| prompt.to_string())
 }
 
+fn infer_named_argument(field: &str, schema: &Value, prompt: &str) -> Option<String> {
+    let mut schema_tokens = text_tokens(field);
+    collect_tool_schema_tokens(schema, &mut schema_tokens);
+    if schema_tokens_look_command_like(&schema_tokens) {
+        return None;
+    }
+
+    infer_quoted_argument(prompt)
+        .or_else(|| infer_preposition_argument(prompt, &schema_tokens))
+        .or_else(|| infer_entity_like_argument(prompt, &schema_tokens))
+}
+
+fn infer_quoted_argument(prompt: &str) -> Option<String> {
+    for quote in ['"', '\'', '`'] {
+        let mut parts = prompt.split(quote);
+        while let Some(_before) = parts.next() {
+            let Some(value) = parts.next() else {
+                break;
+            };
+            let value = value.trim();
+            if usable_named_argument(value) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn infer_preposition_argument(prompt: &str, schema_tokens: &HashSet<String>) -> Option<String> {
+    let words = prompt_words(prompt);
+    for (idx, word) in words.iter().enumerate() {
+        if !matches!(
+            word.lower.as_str(),
+            "in" | "for" | "about" | "near" | "at" | "to"
+        ) {
+            continue;
+        }
+        let mut phrase = Vec::new();
+        for next in words.iter().skip(idx + 1).take(5) {
+            if named_argument_boundary(&next.lower) {
+                break;
+            }
+            phrase.push(next.clean.clone());
+        }
+        let value = phrase.join(" ");
+        if usable_named_argument_for_schema(&value, schema_tokens) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn infer_entity_like_argument(prompt: &str, schema_tokens: &HashSet<String>) -> Option<String> {
+    let words = prompt_words(prompt);
+    let mut idx = 0;
+    while idx < words.len() {
+        if !word_looks_entity_like(&words[idx]) {
+            idx += 1;
+            continue;
+        }
+        let mut phrase = vec![words[idx].clean.clone()];
+        idx += 1;
+        while idx < words.len() && word_looks_entity_like(&words[idx]) {
+            phrase.push(words[idx].clean.clone());
+            idx += 1;
+        }
+        let value = phrase.join(" ");
+        if usable_named_argument_for_schema(&value, schema_tokens) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+#[derive(Debug)]
+struct PromptWord {
+    clean: String,
+    lower: String,
+}
+
+fn prompt_words(prompt: &str) -> Vec<PromptWord> {
+    prompt
+        .split_whitespace()
+        .map(clean_named_argument_token)
+        .filter(|token| !token.is_empty())
+        .map(|clean| PromptWord {
+            lower: clean.to_ascii_lowercase(),
+            clean,
+        })
+        .collect()
+}
+
+fn clean_named_argument_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches(['.', ',', ';', ':', '?', '!', ')', ']', '}'])
+        .to_string()
+}
+
+fn named_argument_boundary(token: &str) -> bool {
+    matches!(
+        token,
+        "right"
+            | "now"
+            | "today"
+            | "currently"
+            | "please"
+            | "use"
+            | "using"
+            | "with"
+            | "the"
+            | "a"
+            | "an"
+            | "tool"
+            | "tools"
+            | "available"
+    )
+}
+
+fn usable_named_argument_for_schema(value: &str, schema_tokens: &HashSet<String>) -> bool {
+    usable_named_argument(value)
+        && !text_tokens(value)
+            .iter()
+            .any(|token| schema_tokens.contains(token))
+}
+
+fn usable_named_argument(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 120
+        && !value.contains('\n')
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "what" | "which" | "when" | "where" | "why" | "how" | "please"
+        )
+}
+
+fn word_looks_entity_like(word: &PromptWord) -> bool {
+    let Some(first) = word.clean.chars().next() else {
+        return false;
+    };
+    first.is_ascii_uppercase()
+        && !matches!(
+            word.lower.as_str(),
+            "what" | "which" | "when" | "where" | "why" | "how" | "use"
+        )
+}
+
 fn tool_parameters<'a>(tool_name: &str, tools: Option<&'a Value>) -> Option<&'a Value> {
     tools?
         .as_array()?
@@ -1572,11 +1769,19 @@ async fn handle_tool_result(
         selected_tool_names.retain(|name| name != tool);
     }
     let latest_user_text = session.active_user_text();
+    let prompt_requests_more_tool_steps =
+        prompt_requests_additional_tool_step(&latest_user_text, session);
     let latest_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
         tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
     });
-    if let Some((tool, _)) = latest_answerable_tool {
+    if let Some((tool, _)) = latest_answerable_tool.filter(|_| !prompt_requests_more_tool_steps) {
         selected_tool_names.retain(|name| name != &tool);
+    }
+    let latest_non_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
+        !tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
+    });
+    if let Some((tool, _)) = latest_non_answerable_tool.as_ref() {
+        selected_tool_names.retain(|name| name == tool);
     }
     let tools_enabled_for_reducer =
         has_tools && !selected_tool_names.is_empty() && tool_budget_exhausted.is_none();
@@ -1599,14 +1804,14 @@ async fn handle_tool_result(
         tracing::info!("moa: forcing answer after {count} completed tool calls");
         append_tool_budget_instruction(&mut messages, count);
     }
-    let latest_non_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
-        !tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
-    });
     let retry_tool = if tools_enabled_for_reducer {
         latest_non_answerable_tool.clone()
     } else {
         None
     };
+    let retry_tool_call = retry_tool.as_ref().and_then(|(tool, _)| {
+        latest_completed_tool_call(session).filter(|call| &call.name == tool)
+    });
     if let Some((tool, _)) = retry_tool {
         tracing::info!(
             "moa: latest {tool} tool result looks like error/usage output; asking reducer to retry"
@@ -1717,18 +1922,39 @@ async fn handle_tool_result(
                 normalize::OutputKind::ToolProposal if !response_tools_enabled => {
                     tool_result_answer_from_evidence_response(session)
                 }
-                normalize::OutputKind::ToolProposal => tool_proposal_response(
-                    &reduced,
-                    response_tools_enabled,
-                    session.tools(),
-                    response_allowed_tools,
-                    response_prompt_profiles,
-                    Some(&session.last_user_text()),
-                ),
-                normalize::OutputKind::Uncertainty => error_response(
-                    "MoA reducer returned no usable answer",
-                    MOA_ERR_NO_USABLE_ANSWER,
-                ),
+                normalize::OutputKind::ToolProposal => {
+                    let body = tool_proposal_response(
+                        &reduced,
+                        response_tools_enabled,
+                        session.tools(),
+                        response_allowed_tools,
+                        response_prompt_profiles,
+                        Some(&session.last_user_text()),
+                    );
+                    retry_tool_result_response_if_plain(
+                        body,
+                        retry_tool_call.as_ref(),
+                        response_tools_enabled,
+                    )
+                }
+                normalize::OutputKind::Uncertainty => {
+                    if response_tools_enabled {
+                        retry_tool_call
+                            .as_ref()
+                            .map(retry_tool_call_response)
+                            .unwrap_or_else(|| {
+                                error_response(
+                                    "MoA reducer returned no usable answer",
+                                    MOA_ERR_NO_USABLE_ANSWER,
+                                )
+                            })
+                    } else {
+                        error_response(
+                            "MoA reducer returned no usable answer",
+                            MOA_ERR_NO_USABLE_ANSWER,
+                        )
+                    }
+                }
                 _ => {
                     let repaired = repair_tool_result_answer(session, &reduced.payload);
                     match latest_non_answerable_tool.as_ref() {
@@ -1756,12 +1982,17 @@ async fn handle_tool_result(
                         }
                         _ => {}
                     }
-                    chat_or_schema_command_tool_response(
+                    let body = chat_or_schema_command_tool_response(
                         &repaired,
                         session.tools(),
                         response_allowed_tools,
                         response_prompt_profiles,
                         Some(&session.last_user_text()),
+                    );
+                    retry_tool_result_response_if_plain(
+                        body,
+                        retry_tool_call.as_ref(),
+                        response_tools_enabled,
                     )
                 }
             };
@@ -1810,6 +2041,16 @@ async fn handle_tool_result(
 }
 
 fn repair_tool_result_answer(session: &Session, answer: &str) -> String {
+    if let Some(answer) = answer_from_recent_prompt_specific_structured_tool_results(session) {
+        return answer;
+    }
+
+    if let Some(answer) = latest_completed_tool_result(session).and_then(|(_, result)| {
+        answer_from_prompt_specific_structured_tool_result(&result, &session.active_user_text())
+    }) {
+        return answer;
+    }
+
     let repaired_rows =
         repair_tabular_tool_result_answer(session, answer).unwrap_or_else(|| answer.to_string());
 
@@ -1829,6 +2070,31 @@ fn repair_tool_result_answer(session: &Session, answer: &str) -> String {
     repaired.push_str("Tool facts: ");
     repaired.push_str(&missing.join(", "));
     repaired
+}
+
+fn answer_from_recent_prompt_specific_structured_tool_results(session: &Session) -> Option<String> {
+    let prompt = session.active_user_text();
+    if !(prompt_asks_for_ci_status(&prompt) && prompt_asks_for_copilot_feedback(&prompt)) {
+        return None;
+    }
+
+    let mut title = None;
+    let mut checks = None;
+    let mut feedback = None;
+    for (_, result) in session.recent_tool_results() {
+        let Some(value) = parse_tool_result_json(result.trim()) else {
+            continue;
+        };
+        title = title.or_else(|| github_title_state_summary(&value));
+        checks = checks.or_else(|| github_check_summary_from_value(&value));
+        feedback = feedback.or_else(|| github_feedback_summary_from_value(&value, &prompt));
+    }
+
+    let mut parts = Vec::new();
+    parts.extend(title);
+    parts.push(checks?);
+    parts.push(feedback?);
+    Some(truncate_for_tool_result_answer(&parts.join("\n")))
 }
 
 #[derive(Debug)]
@@ -2002,7 +2268,11 @@ fn non_answerable_tool_result_answer(session: &Session, tool: &str, result: &str
 }
 
 fn answer_from_structured_tool_result(result: &str, prompt: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(result.trim()).ok()?;
+    let parsed = parse_tool_result_json(result.trim())?;
+    if let Some(answer) = answer_from_prompt_specific_structured_value(&parsed, prompt) {
+        return Some(answer);
+    }
+
     let rows = structured_tool_result_rows(&parsed, prompt);
     let first = rows.first()?;
     let mut answer = format!(
@@ -2026,6 +2296,305 @@ fn answer_from_structured_tool_result(result: &str, prompt: &str) -> Option<Stri
     }
 
     Some(truncate_for_tool_result_answer(&answer))
+}
+
+fn answer_from_prompt_specific_structured_tool_result(
+    result: &str,
+    prompt: &str,
+) -> Option<String> {
+    let parsed = parse_tool_result_json(result.trim())?;
+    answer_from_prompt_specific_structured_value(&parsed, prompt)
+}
+
+fn answer_from_prompt_specific_structured_value(value: &Value, prompt: &str) -> Option<String> {
+    if prompt_asks_for_check_or_review_status(prompt) {
+        return answer_from_github_pr_detail_value(value, prompt);
+    }
+    None
+}
+
+fn parse_tool_result_json(result: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(result)
+        .ok()
+        .or_else(|| parse_concatenated_json_values(result))
+        .or_else(|| parse_json_prefix_with_escaped_string_controls(result))
+}
+
+fn parse_concatenated_json_values(input: &str) -> Option<Value> {
+    let mut values = Vec::new();
+    let stream = serde_json::Deserializer::from_str(input).into_iter::<Value>();
+    for value in stream {
+        values.push(value.ok()?);
+    }
+    (values.len() > 1).then_some(Value::Array(values))
+}
+
+fn parse_json_prefix_with_escaped_string_controls(input: &str) -> Option<Value> {
+    let mut out = String::new();
+    let mut started = false;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+
+    for ch in input.chars() {
+        if !started {
+            if matches!(ch, '{' | '[') {
+                started = true;
+                depth = 1;
+                out.push(ch);
+            }
+            continue;
+        }
+
+        if in_string {
+            match ch {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '"' if !escaped => {
+                    in_string = false;
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+            escaped = ch == '\\' && !escaped;
+            if ch != '\\' {
+                escaped = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                depth = depth.saturating_add(1);
+                out.push(ch);
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                out.push(ch);
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    (started && depth == 0)
+        .then(|| serde_json::from_str::<Value>(&out).ok())
+        .flatten()
+}
+
+fn prompt_asks_for_check_or_review_status(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "ci", "check", "checks", "green", "status", "copilot", "feedback", "comment",
+            "comments", "review", "reviews",
+        ],
+    )
+}
+
+fn answer_from_github_pr_detail_value(value: &Value, prompt: &str) -> Option<String> {
+    if let Value::Array(_) = value {
+        return github_check_summary(Some(value)).filter(|_| prompt_asks_for_ci_status(prompt));
+    }
+
+    let map = value.as_object()?;
+    let mut parts = Vec::new();
+    let prompt_lower = prompt.to_ascii_lowercase();
+    if let Some(title) = first_string_field(map, &["title", "name"]) {
+        let state = first_string_field(map, &["state", "status"]);
+        parts.push(match state {
+            Some(state) => format!("{title} ({state})"),
+            None => title,
+        });
+    }
+
+    if contains_any(&prompt_lower, &["ci", "check", "checks", "green", "status"]) {
+        parts.extend(github_check_summary(map.get("statusCheckRollup")));
+    }
+
+    if contains_any(
+        &prompt_lower,
+        &[
+            "copilot", "feedback", "comment", "comments", "review", "reviews",
+        ],
+    ) {
+        parts.extend(github_feedback_summary(
+            map.get("comments"),
+            map.get("reviews"),
+            prompt_lower.contains("copilot"),
+        ));
+    }
+
+    (!parts.is_empty()).then(|| truncate_for_tool_result_answer(&parts.join("\n")))
+}
+
+fn github_title_state_summary(value: &Value) -> Option<String> {
+    let map = value.as_object()?;
+    let title = first_string_field(map, &["title", "name"])?;
+    let state = first_string_field(map, &["state", "status"]);
+    Some(match state {
+        Some(state) => format!("{title} ({state})"),
+        None => title,
+    })
+}
+
+fn github_check_summary_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => github_check_summary(map.get("statusCheckRollup")),
+        Value::Array(_) => github_check_summary(Some(value)),
+        _ => None,
+    }
+}
+
+fn github_feedback_summary_from_value(value: &Value, prompt: &str) -> Option<String> {
+    if !json_value_has_copilot_feedback_evidence(value) {
+        return None;
+    }
+
+    let copilot_only = prompt.to_ascii_lowercase().contains("copilot");
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("comments") || map.contains_key("reviews") {
+                return github_feedback_summary(
+                    map.get("comments"),
+                    map.get("reviews"),
+                    copilot_only,
+                );
+            }
+            github_feedback_summary(None, Some(&Value::Array(vec![value.clone()])), copilot_only)
+        }
+        Value::Array(_) => github_feedback_summary(None, Some(value), copilot_only),
+        _ => None,
+    }
+}
+
+fn github_check_summary(value: Option<&Value>) -> Option<String> {
+    let checks = value?.as_array()?;
+    if checks.is_empty() {
+        return Some("CI/checks: no check runs were returned.".to_string());
+    }
+
+    let mut failing = Vec::new();
+    let mut pending = Vec::new();
+    for check in checks.iter().filter_map(Value::as_object) {
+        let name = first_string_field(check, &["name", "workflowName"]).unwrap_or_else(|| {
+            check
+                .get("__typename")
+                .and_then(Value::as_str)
+                .unwrap_or("check")
+                .to_string()
+        });
+        let conclusion = first_string_field(check, &["conclusion"]);
+        let status = first_string_field(check, &["status"]);
+        match conclusion.as_deref() {
+            Some("SUCCESS" | "SKIPPED" | "NEUTRAL") => {}
+            Some(other) => failing.push(format!("{name}: {other}")),
+            None if !matches!(status.as_deref(), Some("COMPLETED")) => {
+                pending.push(format!(
+                    "{name}: {}",
+                    status.unwrap_or_else(|| "pending".to_string())
+                ));
+            }
+            None => {}
+        }
+    }
+
+    if failing.is_empty() && pending.is_empty() {
+        Some(format!(
+            "CI/checks: all {} returned checks are green.",
+            checks.len()
+        ))
+    } else {
+        let mut text = String::from("CI/checks: not all green.");
+        if !failing.is_empty() {
+            text.push_str(" Failing: ");
+            text.push_str(&failing.into_iter().take(3).collect::<Vec<_>>().join("; "));
+            text.push('.');
+        }
+        if !pending.is_empty() {
+            text.push_str(" Pending: ");
+            text.push_str(&pending.into_iter().take(3).collect::<Vec<_>>().join("; "));
+            text.push('.');
+        }
+        Some(text)
+    }
+}
+
+fn github_feedback_summary(
+    comments: Option<&Value>,
+    reviews: Option<&Value>,
+    copilot_only: bool,
+) -> Option<String> {
+    let mut entries = Vec::new();
+    collect_github_feedback_entries(comments, "comment", copilot_only, &mut entries);
+    collect_github_feedback_entries(reviews, "review", copilot_only, &mut entries);
+
+    if entries.is_empty() {
+        if copilot_only {
+            return Some(
+                "Copilot feedback: no Copilot-authored comments or reviews were returned."
+                    .to_string(),
+            );
+        }
+        return Some("Feedback: no comments or reviews were returned.".to_string());
+    }
+
+    Some(format!(
+        "{}: {}",
+        if copilot_only {
+            "Copilot feedback"
+        } else {
+            "Feedback"
+        },
+        entries.into_iter().take(3).collect::<Vec<_>>().join("; ")
+    ))
+}
+
+fn collect_github_feedback_entries(
+    value: Option<&Value>,
+    kind: &str,
+    copilot_only: bool,
+    entries: &mut Vec<String>,
+) {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for item in items.iter().filter_map(Value::as_object) {
+        let author = item
+            .get("author")
+            .and_then(|author| author.get("login").or_else(|| author.get("name")))
+            .or_else(|| item.get("author"))
+            .or_else(|| item.get("user").and_then(|user| user.get("login")))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let body = first_string_field(item, &["body"]).unwrap_or_default();
+        let author_or_body_mentions_copilot = author.to_ascii_lowercase().contains("copilot")
+            || body.to_ascii_lowercase().contains("copilot");
+        if copilot_only && !author_or_body_mentions_copilot {
+            continue;
+        }
+        let state = first_string_field(item, &["state"]);
+        let body_summary = first_non_empty_line(&body).unwrap_or_else(|| "(no body)".to_string());
+        entries.push(match state {
+            Some(state) => format!("{kind} by {author} ({state}): {body_summary}"),
+            None => format!("{kind} by {author}: {body_summary}"),
+        });
+    }
+}
+
+fn first_non_empty_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(truncate_for_tool_result_answer)
 }
 
 fn structured_tool_result_rows(value: &Value, prompt: &str) -> Vec<StructuredToolRow> {
@@ -2238,6 +2807,28 @@ fn repeated_same_tool_results(session: &Session) -> Option<(String, usize)> {
     (count >= SAME_TOOL_FORCE_ANSWER_THRESHOLD).then(|| (latest.name.clone(), count))
 }
 
+fn prompt_requests_additional_tool_step(prompt: &str, session: &Session) -> bool {
+    let completed = completed_tool_calls_since_latest_user_before_tool_result(session).len();
+    if completed == 0 || completed >= 2 {
+        return false;
+    }
+
+    let text = prompt.to_ascii_lowercase();
+    contains_any(
+        &text,
+        &[
+            "then run",
+            "then execute",
+            "then use",
+            "then call",
+            "after that run",
+            "afterwards run",
+            "also run",
+            "and run",
+        ],
+    )
+}
+
 fn tool_budget_exhausted(session: &Session) -> Option<usize> {
     let count = completed_tool_names_since_latest_user_before_tool_result(session).len();
     (count >= TOOL_BUDGET_FORCE_ANSWER_THRESHOLD).then_some(count)
@@ -2329,9 +2920,45 @@ fn latest_completed_tool_result(session: &Session) -> Option<(String, String)> {
     session.recent_tool_results().into_iter().last()
 }
 
+fn latest_completed_tool_call(session: &Session) -> Option<CompletedToolCall> {
+    completed_tool_calls_since_latest_user_before_tool_result(session)
+        .into_iter()
+        .last()
+}
+
+fn retry_tool_result_response_if_plain(
+    body: Value,
+    retry_tool_call: Option<&CompletedToolCall>,
+    tools_enabled: bool,
+) -> Value {
+    if !tools_enabled || response_contains_tool_call(&body) {
+        return body;
+    }
+    retry_tool_call
+        .map(retry_tool_call_response)
+        .unwrap_or(body)
+}
+
+fn retry_tool_call_response(call: &CompletedToolCall) -> Value {
+    tracing::info!(
+        "moa: reducer returned plain text after non-answerable {}; retrying same tool call",
+        call.name
+    );
+    tool_call_response(&call.name, &Value::String(call.arguments.clone()))
+}
+
+fn response_contains_tool_call(body: &Value) -> bool {
+    body.pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
 fn tool_result_has_answerable_evidence(result: &str) -> bool {
     let trimmed = result.trim();
     if trimmed.is_empty() || matches!(trimmed, "{}" | "[]") {
+        return false;
+    }
+    if plain_text_tool_result_looks_empty(trimmed) {
         return false;
     }
 
@@ -2344,6 +2971,14 @@ fn tool_result_has_answerable_evidence(result: &str) -> bool {
 
 fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) -> bool {
     if !tool_result_has_answerable_evidence(result) {
+        return false;
+    }
+    if prompt_asks_for_ci_status(prompt) && !tool_result_has_ci_status_evidence(result) {
+        return false;
+    }
+    if prompt_asks_for_copilot_feedback(prompt)
+        && !tool_result_has_copilot_feedback_evidence(result)
+    {
         return false;
     }
     if prompt_asks_for_github_work_items(prompt)
@@ -2362,6 +2997,121 @@ fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) ->
         return false;
     }
     true
+}
+
+fn prompt_asks_for_ci_status(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "ci",
+            "checks",
+            "green",
+            "status check",
+            "check run",
+            "check suite",
+            "build status",
+        ],
+    )
+}
+
+fn prompt_asks_for_copilot_feedback(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("copilot")
+        && contains_any(
+            &lower,
+            &["feedback", "comment", "comments", "review", "reviews"],
+        )
+}
+
+fn tool_result_has_ci_status_evidence(result: &str) -> bool {
+    if let Some(parsed) = parse_tool_result_json(result.trim()) {
+        return json_value_has_ci_status_evidence(&parsed);
+    }
+
+    let lower = result.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "statuscheckrollup",
+            "checkrun",
+            "check suite",
+            "checks:",
+            "ci/",
+            "\tpass",
+            "\tfail",
+            "\tsuccess",
+            "\tfailure",
+            " pending",
+            " queued",
+            " in_progress",
+        ],
+    )
+}
+
+fn tool_result_has_copilot_feedback_evidence(result: &str) -> bool {
+    if let Some(parsed) = parse_tool_result_json(result.trim()) {
+        return json_value_has_copilot_feedback_evidence(&parsed);
+    }
+
+    let lower = result.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "copilot feedback",
+            "github-copilot",
+            "copilot-pull-request-reviewer",
+            "no copilot",
+            "copilot-authored",
+        ],
+    )
+}
+
+fn json_value_has_ci_status_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("statusCheckRollup")
+                .and_then(Value::as_array)
+                .is_some_and(|checks| !checks.is_empty())
+            {
+                return true;
+            }
+            let has_check_fields = map.contains_key("conclusion")
+                || (map.contains_key("status")
+                    && (map.contains_key("workflowName") || map.contains_key("detailsUrl")));
+            has_check_fields || map.values().any(json_value_has_ci_status_evidence)
+        }
+        Value::Array(values) => values.iter().any(json_value_has_ci_status_evidence),
+        _ => false,
+    }
+}
+
+fn json_value_has_copilot_feedback_evidence(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("comments") || map.contains_key("reviews") {
+                return true;
+            }
+            map.values().any(json_value_has_copilot_feedback_evidence)
+        }
+        Value::Array(values) => values.iter().any(json_value_has_copilot_feedback_evidence),
+        Value::String(text) => text.to_ascii_lowercase().contains("copilot"),
+        _ => false,
+    }
+}
+
+fn plain_text_tool_result_looks_empty(result: &str) -> bool {
+    let normalized = result.replace('\r', "");
+    let lines: Vec<&str> = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    matches!(
+        lines.as_slice(),
+        ["(no output)" | "(empty output)" | "no output" | "empty output"]
+    )
 }
 
 fn prompt_asks_for_github_work_items(prompt: &str) -> bool {
@@ -4121,6 +4871,53 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn live_status_followup_after_tool_chain_uses_tool_grace() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }
+        }]));
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "user", "content": "Any new interesting PRs?"}),
+                tool_call_msg("call_1", "exec"),
+                tool_result_msg(
+                    "call_1",
+                    "808\tStabilize OpenClaw tool loops through MoA\tOPEN",
+                ),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "PR 808 looks relevant."
+                }),
+                serde_json::json!({
+                    "role": "user",
+                    "content": "The stabilise one, PR 808 - is CI all green now? Any Copilot feedback?"
+                }),
+            ],
+            &tools,
+        );
+
+        let allowed = declared_tool_names(&session, &[]);
+
+        assert_eq!(
+            grace_mode_for_turn(&session, !allowed.is_empty(), &[]),
+            GraceMode::Tool
+        );
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &allowed, &[]),
+            vec!["exec"]
+        );
+    }
+
+    #[test]
     fn schema_description_selects_weather_tool() {
         let mut session = Session::new();
         session.ingest(
@@ -4137,6 +4934,49 @@ mod response_builder_tests {
         assert_eq!(
             selected_tool_names_for_turn(&session, &[], &[]),
             vec!["lookup".to_string()]
+        );
+    }
+
+    #[test]
+    fn schema_description_selects_available_weather_tool_phrase() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read workspace file contents",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "File path"}},
+                    "required": ["path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "weather_lookup",
+                "description": "Look up current weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "description": "City to check"}},
+                    "required": ["city"]
+                }
+            }}
+        ]);
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "What is the weather in Sydney right now? Use the available weather tool."
+            })],
+            &Some(tools.clone()),
+        );
+
+        let selected = selected_tool_names_for_turn(&session, &[], &[]);
+
+        assert_eq!(selected, vec!["weather_lookup".to_string()]);
+        let forced =
+            required_tool_choice_for_intent(&session, &Some(tools), &selected).expect("tool");
+        assert_eq!(forced.name, "weather_lookup");
+        assert_eq!(
+            forced.fallback_arguments,
+            serde_json::json!({"city": "Sydney"})
         );
     }
 
@@ -4788,6 +5628,14 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn empty_tool_output_sentinel_is_not_answerable_tool_evidence() {
+        let result = "(no output)";
+
+        assert!(!tool_result_has_answerable_evidence(result));
+        assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
     fn github_auth_status_is_not_pr_request_evidence() {
         let result = "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true\n  - Git operations protocol: https";
         let prompt = "Any new interesting PRs? You have the gh command line I think can use";
@@ -4887,6 +5735,7 @@ mod response_builder_tests {
             "gh search not available or not authenticated",
             "search failed: gh search not available or not authenticated",
             "GraphQL: Could not resolve to a Repository with the name 'micn/mesh-llm'. (repository)",
+            "(no output)",
             "github.com\n  ✓ Logged in to github.com account user (keyring)\n  - Active account: true",
             "michaelneale/sprout\tA hive mind communication platform\tpublic, fork\t2026-06-06T05:22:29Z",
             "origin\tgit@github.com:Mesh-LLM/mesh-llm.git (fetch)\norigin\tgit@github.com:Mesh-LLM/mesh-llm.git (push)",
@@ -4959,6 +5808,156 @@ mod response_builder_tests {
         assert!(answer.contains("https://github.com/Mesh-LLM/mesh-llm/pull/809"));
         assert!(answer.contains("#808 - Stabilize OpenClaw"), "{answer}");
         assert!(!answer.contains("one relevant entry is: ["), "{answer}");
+    }
+
+    #[test]
+    fn pr_status_prompt_summarizes_checks_and_copilot_feedback_json() {
+        let prompt = "The stabilise one, PR 808 - is CI all green now? Any Copilot feedback?";
+        let result = serde_json::json!({
+            "title": "Stabilize OpenClaw tool loops through MoA",
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {
+                    "name": "Linux tests (skippy-smoke)",
+                    "conclusion": "FAILURE",
+                    "status": "COMPLETED"
+                },
+                {
+                    "name": "Linux CPU",
+                    "conclusion": "SUCCESS",
+                    "status": "COMPLETED"
+                }
+            ],
+            "comments": [
+                {
+                    "author": {"login": "github-copilot[bot]"},
+                    "body": "Copilot reviewed this and requested a small error handling change."
+                }
+            ],
+            "reviews": []
+        })
+        .to_string()
+            + "\n[... truncated]";
+
+        let answer =
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, &result))
+                .expect("PR detail JSON should answer status prompt");
+
+        assert!(answer.contains("Stabilize OpenClaw"), "{answer}");
+        assert!(answer.contains("not all green"), "{answer}");
+        assert!(
+            answer.contains("Linux tests (skippy-smoke): FAILURE"),
+            "{answer}"
+        );
+        assert!(answer.contains("Copilot feedback"), "{answer}");
+        assert!(answer.contains("github-copilot[bot]"), "{answer}");
+    }
+
+    #[test]
+    fn pr_status_prompt_rejects_comments_only_json_without_checks() {
+        let prompt = "The stabilise one, PR 808 - is CI all green now? Any Copilot feedback?";
+        let result = serde_json::json!({
+            "title": "Stabilize OpenClaw tool loops through MoA",
+            "state": "OPEN",
+            "comments": [
+                {
+                    "author": {"login": "github-copilot[bot]"},
+                    "body": "Copilot reviewed this PR."
+                }
+            ],
+            "reviews": [
+                {
+                    "author": {"login": "copilot-pull-request-reviewer"},
+                    "state": "COMMENTED",
+                    "body": "Pull request overview"
+                }
+            ]
+        })
+        .to_string();
+
+        assert!(
+            !tool_result_has_answerable_evidence_for_prompt(result.as_str(), prompt),
+            "CI prompt should not accept comments-only PR detail JSON"
+        );
+        assert!(
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, &result))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pr_status_prompt_summarizes_jsonl_check_output() {
+        let prompt = "Please check PR 808 checks/CI status.";
+        let result = r#"{"name":"changes","status":"COMPLETED","conclusion":"SUCCESS"}
+{"name":"Linux tests (skippy-smoke)","status":"COMPLETED","conclusion":"FAILURE"}
+{"name":"two_node_split_smoke","status":"COMPLETED","conclusion":"SUCCESS"}"#;
+
+        let answer =
+            answer_from_latest_tool_result(&session_with_user_and_tool_result(prompt, result))
+                .expect("JSONL check output should answer CI prompt");
+
+        assert!(answer.contains("CI/checks: not all green"), "{answer}");
+        assert!(
+            answer.contains("Linux tests (skippy-smoke): FAILURE"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn pr_status_and_copilot_prompt_rejects_checks_only_output() {
+        let prompt = "PR 808 - is CI all green now? Any Copilot feedback?";
+        let result = "Linux tests (skippy-smoke)\tfail\t1m39s\thttps://example.invalid/job";
+
+        assert!(
+            !tool_result_has_answerable_evidence_for_prompt(result, prompt),
+            "checks-only output should not satisfy Copilot feedback prompt"
+        );
+    }
+
+    #[test]
+    fn pr_status_and_copilot_prompt_combines_recent_structured_tool_results() {
+        let prompt = "PR 808 - is CI all green now? Any Copilot feedback?";
+        let status_result = serde_json::json!({
+            "title": "Stabilize OpenClaw tool loops through MoA",
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {
+                    "name": "Linux tests (skippy-smoke)",
+                    "conclusion": "FAILURE",
+                    "status": "COMPLETED"
+                }
+            ]
+        })
+        .to_string();
+        let review_result = serde_json::json!({
+            "author": "copilot-pull-request-reviewer[bot]",
+            "body": "## Pull request overview\n\nCopilot reviewed this PR.",
+            "state": "COMMENTED"
+        })
+        .to_string();
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "user", "content": prompt}),
+                tool_call_msg_with_args("call_1", "exec", r#"{"command":"gh pr view"}"#),
+                tool_result_msg("call_1", &status_result),
+                tool_call_msg_with_args("call_2", "exec", r#"{"command":"gh api reviews"}"#),
+                tool_result_msg("call_2", &review_result),
+            ],
+            &None,
+        );
+
+        let repaired = repair_tool_result_answer(&session, "CI/checks: pending.");
+
+        assert!(
+            repaired.contains("Linux tests (skippy-smoke): FAILURE"),
+            "{repaired}"
+        );
+        assert!(repaired.contains("Copilot feedback"), "{repaired}");
+        assert!(
+            repaired.contains("copilot-pull-request-reviewer[bot]"),
+            "{repaired}"
+        );
     }
 
     #[test]
@@ -5260,6 +6259,18 @@ mod response_builder_tests {
         })
     }
 
+    fn tool_call_msg_with_args(id: &str, name: &str, arguments: &str) -> Value {
+        serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments}
+            }]
+        })
+    }
+
     fn tool_result_msg(id: &str, text: &str) -> Value {
         serde_json::json!({
             "role": "tool",
@@ -5283,6 +6294,68 @@ mod response_builder_tests {
             &None,
         );
         session
+    }
+
+    #[test]
+    fn non_answerable_tool_result_plain_answer_retries_same_tool_call() {
+        let command =
+            r#"{"command":"gh pr list --repo Mesh-LLM/mesh-llm --state open --limit 10"}"#;
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({
+                    "role": "user",
+                    "content": "Use exec to list recent open PRs, then tell me one interesting one."
+                }),
+                tool_call_msg_with_args("call_1", "exec", command),
+                tool_result_msg("call_1", "(no output)"),
+            ],
+            &None,
+        );
+
+        let retry = latest_completed_tool_call(&session).expect("completed tool call");
+        let body = retry_tool_result_response_if_plain(
+            chat_response("I could not retrieve any pull requests."),
+            Some(&retry),
+            true,
+        );
+
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            body.pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some(command)
+        );
+        assert!(
+            body.pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_multi_step_tool_prompt_keeps_tool_available_after_first_result() {
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({
+                    "role": "user",
+                    "content": "Actually use the shell tool. Run pwd, then run ls -1 | head -5."
+                }),
+                tool_call_msg_with_args("call_1", "exec", r#"{"command":"pwd"}"#),
+                tool_result_msg("call_1", "/tmp/workspace"),
+            ],
+            &None,
+        );
+
+        assert!(prompt_requests_additional_tool_step(
+            &session.active_user_text(),
+            &session
+        ));
     }
 
     #[test]

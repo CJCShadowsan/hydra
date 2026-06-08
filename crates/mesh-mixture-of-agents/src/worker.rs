@@ -108,7 +108,7 @@ pub fn assign_roles(models: &[ModelEntry]) -> Vec<Assignment> {
 ///
 /// Mirrors `pick_model_classified`'s sizing heuristic in the main
 /// router so MoA picks the same "strong" model as `auto` would.
-pub(crate) fn is_single_digit_b_name(name: &str) -> bool {
+pub fn is_single_digit_b_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     for i in 0..bytes.len() {
         let c = bytes[i];

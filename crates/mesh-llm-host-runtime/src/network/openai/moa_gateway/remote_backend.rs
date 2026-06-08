@@ -66,6 +66,9 @@ fn build_chat_completion_request(
         body.as_object_mut()
             .expect("chat completion body should be an object")
             .insert("tools".to_string(), tools.clone());
+        body.as_object_mut()
+            .expect("chat completion body should be an object")
+            .insert("parallel_tool_calls".to_string(), serde_json::json!(false));
     }
     moa::apply_enable_thinking(&mut body, sampling.enable_thinking);
     let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("serialize: {e}"))?;

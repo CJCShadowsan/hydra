@@ -13,6 +13,7 @@
 use crate::inference::election;
 use crate::mesh;
 use crate::network::openai::transport as proxy;
+use crate::network::router;
 use context_budget::moa_required_tokens;
 use mesh_mixture_of_agents as moa;
 use progress::ProgressContinuation;
@@ -63,8 +64,11 @@ pub async fn try_handle_moa(
     let enable_thinking = effective_enable_thinking_for_moa(&body_json);
 
     let required_tokens = moa_required_tokens(&body_json, required_tokens);
+    let prefer_strong_workers = router::classify(&body_json).needs_tools;
     let _inflight = node.begin_inflight_request();
-    let Some(mut config) = build_moa_config(node, targets, required_tokens).await else {
+    let Some(mut config) =
+        build_moa_config(node, targets, required_tokens, prefer_strong_workers).await
+    else {
         let _ = proxy::send_503(tcp_stream, "MoA requires ≥2 models available in the mesh").await;
         return None;
     };
@@ -378,6 +382,7 @@ pub async fn build_moa_config(
     node: &mesh::Node,
     targets: Option<&election::ModelTargets>,
     required_tokens: Option<u32>,
+    prefer_strong_workers: bool,
 ) -> Option<moa::GatewayConfig> {
     let http = reqwest::Client::new();
     let mut backends: Vec<std::sync::Arc<dyn moa::ModelBackend>> = Vec::new();
@@ -388,6 +393,7 @@ pub async fn build_moa_config(
         targets,
         http: &http,
         required_tokens,
+        prefer_strong_workers,
     };
 
     let total_groups =
@@ -471,6 +477,7 @@ async fn add_ranked_worker_backends(
     let groups = rank_worker_groups(
         resolution.node,
         resolution.targets,
+        resolution.prefer_strong_workers,
         group_aliases_by_canonical_base(all_models, resolution.targets),
     )
     .await;
@@ -592,6 +599,7 @@ struct WorkerGroupRank {
     aliases: Vec<String>,
     has_local: bool,
     is_near: bool,
+    is_small: bool,
     best_context: Option<u32>,
     best_latency_ms: Option<u32>,
 }
@@ -599,13 +607,14 @@ struct WorkerGroupRank {
 async fn rank_worker_groups(
     node: &mesh::Node,
     targets: Option<&election::ModelTargets>,
+    prefer_strong_workers: bool,
     groups: Vec<Vec<String>>,
 ) -> Vec<Vec<String>> {
     let mut ranked = Vec::with_capacity(groups.len());
     for aliases in groups {
         ranked.push(worker_group_rank(node, targets, aliases).await);
     }
-    ranked.sort_by(compare_worker_groups);
+    ranked.sort_by(|left, right| compare_worker_groups(left, right, prefer_strong_workers));
     ranked.into_iter().map(|rank| rank.aliases).collect()
 }
 
@@ -617,6 +626,9 @@ async fn worker_group_rank(
     let mut has_local = false;
     let mut best_context = None;
     let mut best_latency_ms = None;
+    let is_small = aliases
+        .iter()
+        .all(|alias| moa::worker::is_single_digit_b_name(alias));
 
     for alias in &aliases {
         if is_locally_served(alias, targets) {
@@ -641,12 +653,27 @@ async fn worker_group_rank(
         has_local,
         is_near: has_local
             || best_latency_ms.is_some_and(|latency| latency <= MOA_NEAR_PEER_LATENCY_MS),
+        is_small,
         best_context,
         best_latency_ms,
     }
 }
 
-fn compare_worker_groups(left: &WorkerGroupRank, right: &WorkerGroupRank) -> std::cmp::Ordering {
+fn compare_worker_groups(
+    left: &WorkerGroupRank,
+    right: &WorkerGroupRank,
+    prefer_strong_workers: bool,
+) -> std::cmp::Ordering {
+    if prefer_strong_workers {
+        let strong_order = left
+            .is_small
+            .cmp(&right.is_small)
+            .then_with(|| right.best_context.cmp(&left.best_context));
+        if strong_order != std::cmp::Ordering::Equal {
+            return strong_order;
+        }
+    }
+
     right
         .is_near
         .cmp(&left.is_near)
@@ -704,6 +731,7 @@ struct WorkerBackendResolution<'a> {
     targets: Option<&'a election::ModelTargets>,
     http: &'a reqwest::Client,
     required_tokens: Option<u32>,
+    prefer_strong_workers: bool,
 }
 
 async fn add_worker_backend(
@@ -919,6 +947,9 @@ impl moa::ModelBackend for LocalModelBackend {
             body.as_object_mut()
                 .unwrap()
                 .insert("tools".to_string(), tools.clone());
+            body.as_object_mut()
+                .unwrap()
+                .insert("parallel_tool_calls".to_string(), serde_json::json!(false));
         }
         moa::apply_enable_thinking(&mut body, sampling.enable_thinking);
         let resp = self
@@ -1448,6 +1479,7 @@ mod tests {
             aliases: vec!["unsloth/Qwen3.5-9B-GGUF:Q4_K_M".to_string()],
             has_local: false,
             is_near: true,
+            is_small: true,
             best_context: Some(32_768),
             best_latency_ms: Some(2),
         };
@@ -1455,14 +1487,40 @@ mod tests {
             aliases: vec!["unsloth/MiniMax-M2.5-GGUF:Q4_K_M".to_string()],
             has_local: false,
             is_near: false,
+            is_small: false,
             best_context: Some(131_072),
             best_latency_ms: Some(350),
         };
         let mut groups = [distant_large, near];
 
-        groups.sort_by(compare_worker_groups);
+        groups.sort_by(|left, right| compare_worker_groups(left, right, false));
 
         assert_eq!(groups[0].aliases[0], "unsloth/Qwen3.5-9B-GGUF:Q4_K_M");
+    }
+
+    #[test]
+    fn worker_group_ranking_prefers_stronger_context_for_tool_turns() {
+        let local_small = WorkerGroupRank {
+            aliases: vec!["unsloth/Qwen3.5-9B-GGUF:Q4_K_M".to_string()],
+            has_local: true,
+            is_near: true,
+            is_small: true,
+            best_context: Some(32_768),
+            best_latency_ms: Some(0),
+        };
+        let remote_large = WorkerGroupRank {
+            aliases: vec!["unsloth/MiniMax-M2.5-GGUF:Q4_K_M".to_string()],
+            has_local: false,
+            is_near: true,
+            is_small: false,
+            best_context: Some(131_072),
+            best_latency_ms: Some(8),
+        };
+        let mut groups = [local_small, remote_large];
+
+        groups.sort_by(|left, right| compare_worker_groups(left, right, true));
+
+        assert_eq!(groups[0].aliases[0], "unsloth/MiniMax-M2.5-GGUF:Q4_K_M");
     }
 
     #[test]
