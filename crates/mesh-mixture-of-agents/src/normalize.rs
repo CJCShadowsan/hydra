@@ -415,16 +415,18 @@ fn heuristic_classify(raw: &str, model: &str, role: WorkerRole, elapsed_ms: u64)
     // Check for tool call patterns
     if looks_like_tool_proposal(&lower, raw) {
         let (name, args) = extract_tool_proposal(raw);
-        return WorkerOutput {
-            kind: OutputKind::ToolProposal,
-            confidence: 0.6,
-            tool_name: name,
-            tool_arguments: args,
-            payload: raw.to_string(),
-            model: model.to_string(),
-            role,
-            elapsed_ms,
-        };
+        if name.is_some() || args.is_some() {
+            return WorkerOutput {
+                kind: OutputKind::ToolProposal,
+                confidence: 0.6,
+                tool_name: name,
+                tool_arguments: args,
+                payload: raw.to_string(),
+                model: model.to_string(),
+                role,
+                elapsed_ms,
+            };
+        }
     }
 
     // Check for critique patterns
@@ -538,6 +540,9 @@ fn extract_tool_proposal(raw: &str) -> (Option<String>, Option<Value>) {
 }
 
 fn extract_xml_tool_call(raw: &str) -> Option<(String, serde_json::Map<String, Value>)> {
+    if !starts_with_xml_tool_call_wrapper(raw) {
+        return None;
+    }
     if !raw.contains("<invoke") || !raw.contains("<parameter") {
         return None;
     }
@@ -564,6 +569,22 @@ fn extract_xml_tool_call(raw: &str) -> Option<(String, serde_json::Map<String, V
     }
 
     Some((tool_name, arguments))
+}
+
+fn starts_with_xml_tool_call_wrapper(raw: &str) -> bool {
+    let Some(rest) = raw.trim_start().strip_prefix('<') else {
+        return false;
+    };
+    if matches!(rest.chars().next(), Some('/' | '!' | '?')) {
+        return false;
+    }
+    let tag = rest
+        .split(|c: char| c == '>' || c.is_ascii_whitespace())
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
+    let tag = tag.to_ascii_lowercase();
+    tag == "tool_call" || tag.ends_with(":tool_call")
 }
 
 fn xml_parameter_close(value_tail: &str, parameter_name: &str) -> Option<(usize, usize)> {
@@ -916,6 +937,37 @@ mod tests {
             out.tool_arguments.expect("args")["url"],
             "https://github.com/Mesh-LLM/mesh-llm/issues?q=is%3Aissue+is%3Aopen+label%3Abug&sort=updated"
         );
+    }
+
+    #[test]
+    fn namespaced_xml_tool_call_uses_local_rescue() {
+        let raw = r#"<minimax:tool_call>
+<invoke name="web_fetch">
+<parameter name="url">https://github.com/Mesh-LLM/mesh-llm/pull/808</parameter>
+</invoke>
+</minimax:tool_call>"#;
+        let out = normalize_worker_output(raw, "minimax", WorkerRole::Reducer, 100);
+        assert_eq!(out.kind, OutputKind::ToolProposal);
+        assert_eq!(out.tool_name.as_deref(), Some("web_fetch"));
+        assert_eq!(
+            out.tool_arguments.expect("args")["url"],
+            "https://github.com/Mesh-LLM/mesh-llm/pull/808"
+        );
+    }
+
+    #[test]
+    fn explanatory_xml_tool_call_text_stays_answer() {
+        let raw = r#"Use this XML shape when calling a tool:
+<tool_call>
+<invoke name="web_fetch">
+<parameter name="url">https://example.com</parameter>
+</invoke>
+</tool_call>"#;
+        let out = normalize_worker_output(raw, "xml-worker", WorkerRole::Reducer, 100);
+        assert_eq!(out.kind, OutputKind::Answer);
+        assert_eq!(out.tool_name, None);
+        assert_eq!(out.tool_arguments, None);
+        assert!(out.payload.contains("Use this XML shape"));
     }
 
     #[test]

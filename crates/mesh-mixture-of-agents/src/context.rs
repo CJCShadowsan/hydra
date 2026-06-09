@@ -18,16 +18,16 @@ use serde_json::{Value, json};
 
 const TOOL_RESULT_CONTEXT_WINDOW: usize = 10;
 const TOOL_EVIDENCE_MAX_RESULTS: usize = 8;
-const TOOL_EVIDENCE_MAX_RESULT_CHARS: usize = 800;
-const TOOL_RESULT_RAW_MAX_CHARS: usize = 2_400;
+const TOOL_EVIDENCE_MAX_RESULT_BYTES: usize = 800;
+const TOOL_RESULT_RAW_MAX_BYTES: usize = 2_400;
 const TOOL_RESULT_JSON_MAX_SCALARS: usize = 48;
 const TOOL_RESULT_JSON_MAX_ARRAY_ITEMS: usize = 12;
-const TOOL_RESULT_SCALAR_MAX_CHARS: usize = 180;
-const SYSTEM_CONTEXT_MAX_CHARS: usize = 6_000;
-const FAST_USER_CONTEXT_MAX_CHARS: usize = 3_000;
-const SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS: usize = 2_000;
-const STRONG_MESSAGE_CONTEXT_MAX_CHARS: usize = 2_000;
-const REDUCER_USER_CONTEXT_MAX_CHARS: usize = 6_000;
+const TOOL_RESULT_SCALAR_MAX_BYTES: usize = 180;
+const SYSTEM_CONTEXT_MAX_BYTES: usize = 6_000;
+const FAST_USER_CONTEXT_MAX_BYTES: usize = 3_000;
+const SPECIALIST_MESSAGE_CONTEXT_MAX_BYTES: usize = 2_000;
+const STRONG_MESSAGE_CONTEXT_MAX_BYTES: usize = 2_000;
+const REDUCER_USER_CONTEXT_MAX_BYTES: usize = 6_000;
 const SPECIALIST_CONTEXT_WINDOW: usize = 3;
 const STRONG_CONTEXT_WINDOW: usize = 4;
 
@@ -86,7 +86,7 @@ fn augmented_system_prompt_for_mode(session: &Session, include_tool_guidance: bo
         }
         None => MOA_PREAMBLE.to_string(),
     };
-    compact_text_for_context(&prompt, SYSTEM_CONTEXT_MAX_CHARS)
+    compact_text_for_context(&prompt, SYSTEM_CONTEXT_MAX_BYTES)
 }
 
 fn strip_tool_guidance_sections(prompt: &str) -> String {
@@ -181,7 +181,7 @@ fn pack_fast(session: &Session, has_tools: bool, selected_tool_names: &[String])
             json!({"role": "system", "content": system}),
             json!({
                 "role": "user",
-                "content": compact_text_for_context(&user_text, FAST_USER_CONTEXT_MAX_CHARS),
+                "content": compact_text_for_context(&user_text, FAST_USER_CONTEXT_MAX_BYTES),
             }),
         ],
         max_tokens: 256,
@@ -213,7 +213,7 @@ fn pack_specialist(
                 && message_text_content(msg).is_some_and(|text| text == user_text.as_str());
             messages.push(compact_chat_message(
                 msg,
-                SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS,
+                SPECIALIST_MESSAGE_CONTEXT_MAX_BYTES,
             ));
         }
     }
@@ -224,7 +224,7 @@ fn pack_specialist(
             "role": "user",
             "content": compact_text_for_context(
                 &user_text,
-                SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS,
+                SPECIALIST_MESSAGE_CONTEXT_MAX_BYTES,
             ),
         }));
     }
@@ -261,14 +261,14 @@ fn pack_strong(
         if role != "system" && !role.is_empty() {
             has_last_user |= role == "user"
                 && message_text_content(msg).is_some_and(|text| text == user_text.as_str());
-            messages.push(compact_chat_message(msg, STRONG_MESSAGE_CONTEXT_MAX_CHARS));
+            messages.push(compact_chat_message(msg, STRONG_MESSAGE_CONTEXT_MAX_BYTES));
         }
     }
 
     if !has_last_user {
         messages.push(json!({
             "role": "user",
-            "content": compact_text_for_context(&user_text, STRONG_MESSAGE_CONTEXT_MAX_CHARS),
+            "content": compact_text_for_context(&user_text, STRONG_MESSAGE_CONTEXT_MAX_BYTES),
         }));
     }
 
@@ -344,7 +344,7 @@ pub fn pack_for_reducer_selected(
             json!({"role": "system", "content": system_parts.join("\n")}),
             json!({
                 "role": "user",
-                "content": compact_text_for_context(&user_text, REDUCER_USER_CONTEXT_MAX_CHARS),
+                "content": compact_text_for_context(&user_text, REDUCER_USER_CONTEXT_MAX_BYTES),
             }),
         ],
         tools,
@@ -514,7 +514,7 @@ pub fn pack_for_tool_result_turn_selected(
             } else {
                 messages.push(compact_chat_message(
                     &compacted,
-                    STRONG_MESSAGE_CONTEXT_MAX_CHARS,
+                    STRONG_MESSAGE_CONTEXT_MAX_BYTES,
                 ));
             }
         }
@@ -546,7 +546,7 @@ pub fn pack_for_tool_result_answer_only(session: &Session) -> Vec<Value> {
         user.push_str("User request:\n");
         user.push_str(&compact_text_for_context(
             &last_user,
-            REDUCER_USER_CONTEXT_MAX_CHARS / 2,
+            REDUCER_USER_CONTEXT_MAX_BYTES / 2,
         ));
         user.push_str("\n\n");
     }
@@ -556,7 +556,7 @@ pub fn pack_for_tool_result_answer_only(session: &Session) -> Vec<Value> {
     let start = results.len().saturating_sub(TOOL_EVIDENCE_MAX_RESULTS);
     for (tool, result) in &results[start..] {
         let compacted = compact_tool_result_text(result);
-        let compacted = compact_text_for_context(&compacted, TOOL_EVIDENCE_MAX_RESULT_CHARS);
+        let compacted = compact_text_for_context(&compacted, TOOL_EVIDENCE_MAX_RESULT_BYTES);
         user.push_str("- ");
         user.push_str(tool);
         user.push_str(": ");
@@ -587,10 +587,10 @@ fn tool_evidence_message(session: &Session) -> Option<Value> {
         .enumerate()
     {
         let compacted = compact_tool_result_text(result);
-        let result = if compacted.len() > TOOL_EVIDENCE_MAX_RESULT_CHARS {
+        let result = if compacted.len() > TOOL_EVIDENCE_MAX_RESULT_BYTES {
             format!(
                 "{}...",
-                crate::worker::truncate_chars(&compacted, TOOL_EVIDENCE_MAX_RESULT_CHARS - 3)
+                crate::worker::truncate_chars(&compacted, TOOL_EVIDENCE_MAX_RESULT_BYTES - 3)
             )
         } else {
             compacted
@@ -705,8 +705,8 @@ fn text_from_content_block(part: &Value) -> Option<&str> {
         .flatten()
 }
 
-fn compact_text_for_context(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+fn compact_text_for_context(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
         return text.to_string();
     }
 
@@ -715,11 +715,11 @@ fn compact_text_for_context(text: &str, max_chars: usize) -> String {
          The text after this notice is the preserved ending of the original message.]\n\n",
         text.len()
     );
-    if marker.len() >= max_chars {
-        return crate::worker::truncate_chars(text, max_chars).to_string();
+    if marker.len() >= max_bytes {
+        return crate::worker::truncate_chars(text, max_bytes).to_string();
     }
 
-    let remaining = max_chars - marker.len();
+    let remaining = max_bytes - marker.len();
     let head_budget = remaining / 3;
     let tail_budget = remaining.saturating_sub(head_budget);
     let head = crate::worker::truncate_chars(text, head_budget);
@@ -739,7 +739,7 @@ fn tail_start_at_char_boundary(text: &str, max_tail_bytes: usize) -> usize {
 }
 
 fn compact_tool_result_text(result: &str) -> String {
-    if result.len() <= TOOL_RESULT_RAW_MAX_CHARS {
+    if result.len() <= TOOL_RESULT_RAW_MAX_BYTES {
         return result.to_string();
     }
 
@@ -748,16 +748,16 @@ fn compact_tool_result_text(result: &str) -> String {
     }
 
     format!(
-        "Tool result compacted from {} chars; original was plain text.\n\
+        "Tool result compacted from {} bytes; original was plain text.\n\
          Text preview:\n{}...",
         result.len(),
-        crate::worker::truncate_chars(result, TOOL_RESULT_RAW_MAX_CHARS - 96)
+        crate::worker::truncate_chars(result, TOOL_RESULT_RAW_MAX_BYTES - 96)
     )
 }
 
 fn compact_json_tool_result(original_len: usize, value: &Value) -> String {
     let mut lines = vec![format!(
-        "Tool result compacted from {original_len} chars; original was JSON."
+        "Tool result compacted from {original_len} bytes; original was JSON."
     )];
     append_json_shape(value, &mut lines);
     append_embedded_json_summaries(value, &mut lines);
@@ -912,7 +912,7 @@ fn scalar_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(format!(
             "\"{}\"",
-            crate::worker::truncate_chars(text, TOOL_RESULT_SCALAR_MAX_CHARS)
+            crate::worker::truncate_chars(text, TOOL_RESULT_SCALAR_MAX_BYTES)
         )),
         Value::Number(n) => Some(n.to_string()),
         Value::Bool(b) => Some(b.to_string()),
@@ -1127,8 +1127,8 @@ mod tests {
             .expect("user content");
 
         assert!(
-            content.len() <= FAST_USER_CONTEXT_MAX_CHARS + 256,
-            "fast worker content should be bounded, got {} chars",
+            content.len() <= FAST_USER_CONTEXT_MAX_BYTES + 256,
+            "fast worker content should be bounded, got {} bytes",
             content.len()
         );
         assert!(content.contains("MoA compacted this message"));
@@ -1342,7 +1342,7 @@ mod tests {
         let s = session_with(&msgs, Some(tools_two()));
 
         let packed = pack_for_worker(&s, WorkerRole::Strong, false);
-        let total_chars: usize = packed
+        let total_bytes: usize = packed
             .messages
             .iter()
             .map(|msg| msg.to_string().len())
@@ -1351,10 +1351,10 @@ mod tests {
         assert!(packed.tools.is_none());
         assert!(packed.messages.len() <= STRONG_CONTEXT_WINDOW + 1);
         assert!(
-            total_chars
-                <= SYSTEM_CONTEXT_MAX_CHARS
-                    + (STRONG_CONTEXT_WINDOW * (STRONG_MESSAGE_CONTEXT_MAX_CHARS + 512)),
-            "packed context should stay bounded, got {total_chars} chars",
+            total_bytes
+                <= SYSTEM_CONTEXT_MAX_BYTES
+                    + (STRONG_CONTEXT_WINDOW * (STRONG_MESSAGE_CONTEXT_MAX_BYTES + 512)),
+            "packed context should stay bounded, got {total_bytes} bytes",
         );
         assert_eq!(
             packed
@@ -1498,7 +1498,7 @@ mod tests {
             }
         ])
         .to_string();
-        assert!(result.len() > TOOL_RESULT_RAW_MAX_CHARS);
+        assert!(result.len() > TOOL_RESULT_RAW_MAX_BYTES);
 
         let s = session_with(
             &[
@@ -1531,8 +1531,8 @@ mod tests {
         assert!(content.contains("$[2]: number=799"));
         assert!(content.contains("Reuse Skippy decode wire messages"));
         assert!(
-            content.len() <= TOOL_RESULT_RAW_MAX_CHARS,
-            "compacted tool content should be small, got {} chars:\n{content}",
+            content.len() <= TOOL_RESULT_RAW_MAX_BYTES,
+            "compacted tool content should be small, got {} bytes:\n{content}",
             content.len()
         );
         assert!(
@@ -1577,7 +1577,7 @@ mod tests {
             )
         })
         .to_string();
-        assert!(result.len() > TOOL_RESULT_RAW_MAX_CHARS);
+        assert!(result.len() > TOOL_RESULT_RAW_MAX_BYTES);
 
         let s = session_with(
             &[
