@@ -1,6 +1,7 @@
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fmt;
+use url::Url;
 
 use crate::{request_contract::GuardrailRequestContract, structured::StructuredOutputSpec};
 
@@ -55,8 +56,9 @@ pub fn model_param_size_b(name: &str) -> Option<f32> {
         if unit != b'b' && unit != b'B' {
             continue;
         }
-        if let Some(&after) = bytes.get(end + 1)
-            && after.is_ascii_digit()
+        if bytes
+            .get(end + 1)
+            .is_some_and(|after| after.is_ascii_digit())
         {
             continue;
         }
@@ -244,7 +246,8 @@ fn high_confidence_property_match<'a>(
     let mut matches = properties
         .iter()
         .filter(|(name, schema)| {
-            argument_value_matches_schema(value, schema) && (required.contains(name.as_str()))
+            argument_value_matches_schema(value, schema, Some(name))
+                && (required.contains(name.as_str()))
         })
         .filter_map(|(name, _)| property_match_score(raw_key, name).map(|score| (score, name)))
         .collect::<Vec<_>>();
@@ -336,14 +339,20 @@ fn sanitize_object_for_schema(arguments: &mut Value, schema: &Value) {
         let Some(property_schema) = properties.get(key) else {
             return allow_additional;
         };
-        argument_value_matches_schema(value, property_schema)
+        argument_value_matches_schema(value, property_schema, Some(key))
     });
 }
 
-fn argument_value_matches_schema(value: &Value, schema: &Value) -> bool {
-    if let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
-        && !enum_values.iter().any(|allowed| allowed == value)
-    {
+fn argument_value_matches_schema(
+    value: &Value,
+    schema: &Value,
+    property_name: Option<&str>,
+) -> bool {
+    match schema.get("enum").and_then(Value::as_array) {
+        Some(enum_values) if !enum_values.iter().any(|allowed| allowed == value) => return false,
+        _ => {}
+    }
+    if !string_value_matches_declared_format(value, schema, property_name) {
         return false;
     }
 
@@ -358,6 +367,41 @@ fn argument_value_matches_schema(value: &Value, schema: &Value) -> bool {
     types
         .iter()
         .any(|schema_type| value_matches_type(value, schema_type))
+}
+
+fn string_value_matches_declared_format(
+    value: &Value,
+    schema: &Value,
+    property_name: Option<&str>,
+) -> bool {
+    let Some(text) = value.as_str() else {
+        return true;
+    };
+    if !schema_or_name_looks_url_like(schema, property_name) {
+        return true;
+    }
+
+    let Ok(url) = Url::parse(text.trim()) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+}
+
+fn schema_or_name_looks_url_like(schema: &Value, property_name: Option<&str>) -> bool {
+    schema
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| {
+            matches!(
+                format.to_ascii_lowercase().as_str(),
+                "url" | "uri" | "uri-reference"
+            )
+        })
+        || property_name.is_some_and(|name| {
+            identifier_tokens(name)
+                .iter()
+                .any(|token| matches!(token.as_str(), "url" | "uri"))
+        })
 }
 
 fn value_matches_type(value: &Value, schema_type: &str) -> bool {
@@ -514,6 +558,66 @@ mod tests {
                 fields: vec!["path".into()]
             }
         );
+    }
+
+    #[test]
+    fn schema_sanitizer_rejects_invalid_required_url_argument() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"}
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }
+            }
+        }]);
+
+        let err = sanitize_tool_arguments_for_tool(
+            "web_fetch",
+            &json!({"url": "s internal feedback directly."}),
+            Some(&tools),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ToolArgumentSchemaError::MissingRequired {
+                tool_name: "web_fetch".into(),
+                fields: vec!["url".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn schema_sanitizer_preserves_valid_uri_format_argument() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "fetch",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "format": "uri"}
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }
+            }
+        }]);
+
+        let cleaned = sanitize_tool_arguments_for_tool(
+            "fetch",
+            &json!({"target": "https://example.com/path?q=1"}),
+            Some(&tools),
+        )
+        .unwrap();
+
+        assert_eq!(cleaned, json!({"target": "https://example.com/path?q=1"}));
     }
 
     #[test]

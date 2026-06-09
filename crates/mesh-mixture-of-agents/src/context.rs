@@ -749,9 +749,9 @@ fn compact_tool_result_text(result: &str) -> String {
 
     format!(
         "Tool result compacted from {} bytes; original was plain text.\n\
-         Text preview:\n{}...",
+         Plain text excerpt with head and tail preserved:\n{}",
         result.len(),
-        crate::worker::truncate_chars(result, TOOL_RESULT_RAW_MAX_BYTES - 96)
+        compact_text_for_context(result, TOOL_RESULT_RAW_MAX_BYTES - 120)
     )
 }
 
@@ -1135,6 +1135,39 @@ mod tests {
         assert!(
             content.ends_with(marker),
             "compaction should preserve the user's tail marker"
+        );
+    }
+
+    #[test]
+    fn tool_result_compaction_preserves_plain_text_tail_evidence() {
+        let marker = "AGENTS.md";
+        let large_result = format!(
+            "{}\n{}",
+            "nested/path/that/fills/context\n".repeat(400),
+            marker
+        );
+        let s = session_with(
+            &[
+                user_msg(
+                    "Use tools to list the current directory and say whether AGENTS.md exists.",
+                ),
+                assistant_tool_msg("call_1", "tree", json!({"path": "."})),
+                tool_result_msg("call_1", &large_result),
+            ],
+            Some(tools_two()),
+        );
+
+        let (messages, _) = pack_for_tool_result_turn(&s, false);
+        let evidence = messages
+            .iter()
+            .filter_map(|msg| msg.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(evidence.contains("MoA compacted this message"));
+        assert!(
+            evidence.contains(marker),
+            "compacted tool-result context must retain tail evidence: {evidence}"
         );
     }
 

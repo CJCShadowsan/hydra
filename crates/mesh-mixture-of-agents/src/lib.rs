@@ -334,8 +334,16 @@ async fn handle_query(
             "moa: direct tool call for explicit {} intent",
             tool.name.as_str()
         );
+        let arguments = corrected_response_tool_arguments_for_prompt(
+            &tool.name,
+            &tool.fallback_arguments,
+            session.tools(),
+            &selected_tool_names,
+            prompt_tool_profiles,
+            Some(&session.last_user_text()),
+        );
         return TurnResult {
-            response_body: tool_call_response(&tool.name, &tool.fallback_arguments),
+            response_body: tool_call_response(&tool.name, &arguments),
             worker_summaries: Vec::new(),
             reducer_used: false,
             reducer_attempts: 0,
@@ -494,6 +502,9 @@ fn looks_like_tool_intent(session: &Session, prompt_tool_profiles: &[PromptToolP
     ) {
         return true;
     }
+    if text_mentions_available_tools(&text) {
+        return true;
+    }
 
     let available = session.tool_names();
     if !explicitly_requested_tool_names(&available, &text).is_empty() {
@@ -505,6 +516,22 @@ fn looks_like_tool_intent(session: &Session, prompt_tool_profiles: &[PromptToolP
         return true;
     }
     if !schema_matched_tool_names(session.tools(), &available, &text, prompt_tool_profiles)
+        .is_empty()
+    {
+        return true;
+    }
+    if !url_intent_tool_names(session.tools(), &available, &text).is_empty() {
+        return true;
+    }
+    if !search_intent_tool_names(session.tools(), &available, &text).is_empty() {
+        return true;
+    }
+    if !file_read_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles)
+        .is_empty()
+    {
+        return true;
+    }
+    if !directory_list_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles)
         .is_empty()
     {
         return true;
@@ -708,6 +735,28 @@ fn selected_tool_names_for_turn(
         command_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles);
     if !command_intent.is_empty() {
         return with_recent_tool_chain_names(session, &available, command_intent);
+    }
+
+    let url_intent = url_intent_tool_names(session.tools(), &available, &text);
+    if !url_intent.is_empty() {
+        return with_recent_tool_chain_names(session, &available, url_intent);
+    }
+
+    let search_intent = search_intent_tool_names(session.tools(), &available, &text);
+    if !search_intent.is_empty() {
+        return with_recent_tool_chain_names(session, &available, search_intent);
+    }
+
+    let file_read_intent =
+        file_read_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles);
+    if !file_read_intent.is_empty() {
+        return with_recent_tool_chain_names(session, &available, file_read_intent);
+    }
+
+    let directory_list_intent =
+        directory_list_intent_tool_names(session.tools(), &available, &text, prompt_tool_profiles);
+    if !directory_list_intent.is_empty() {
+        return with_recent_tool_chain_names(session, &available, directory_list_intent);
     }
 
     let selected =
@@ -1022,6 +1071,508 @@ fn tool_schema_profiles(tools: Option<&Value>, available: &[String]) -> Vec<Tool
             })
         })
         .collect()
+}
+
+fn url_intent_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+) -> Vec<String> {
+    if !text_contains_http_url(user_text) {
+        return Vec::new();
+    }
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    let available: HashSet<&str> = available.iter().map(String::as_str).collect();
+
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if !available.contains(name) || tool_url_fields(tool).is_empty() {
+                return None;
+            }
+            let inferred = infer_tool_arguments_from_prompt(name, Some(tools), user_text);
+            sanitize_tool_arguments_for_tool(name, &inferred, Some(tools))
+                .ok()
+                .filter(|arguments| arguments_has_url_field(arguments, tool))
+                .map(|_| name.to_string())
+        })
+        .collect()
+}
+
+fn text_contains_http_url(text: &str) -> bool {
+    text.split_whitespace()
+        .map(clean_path_token)
+        .any(|token| token.starts_with("http://") || token.starts_with("https://"))
+}
+
+fn tool_url_fields(tool: &Value) -> Vec<String> {
+    let Some(properties) = tool
+        .pointer("/function/parameters/properties")
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    properties
+        .iter()
+        .filter(|(field, schema)| {
+            schema_allows_string(schema) && schema_or_field_looks_url_like(schema, field)
+        })
+        .map(|(field, _)| field.clone())
+        .collect()
+}
+
+fn schema_or_field_looks_url_like(schema: &Value, field: &str) -> bool {
+    schema
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| {
+            matches!(
+                format.to_ascii_lowercase().as_str(),
+                "url" | "uri" | "uri-reference"
+            )
+        })
+        || text_tokens(field)
+            .iter()
+            .any(|token| matches!(token.as_str(), "url" | "uri"))
+}
+
+fn arguments_has_url_field(arguments: &Value, tool: &Value) -> bool {
+    let Some(arguments) = arguments.as_object() else {
+        return false;
+    };
+    tool_url_fields(tool).iter().any(|field| {
+        arguments
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with("http://") || value.starts_with("https://"))
+    })
+}
+
+fn search_intent_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+) -> Vec<String> {
+    if !text_suggests_search_intent(user_text) {
+        return Vec::new();
+    }
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    let available: HashSet<&str> = available.iter().map(String::as_str).collect();
+
+    let mut scored = tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if !available.contains(name) || !tool_looks_like_searcher(tool) {
+                return None;
+            }
+            let inferred = infer_tool_arguments_from_prompt(name, Some(tools), user_text);
+            let arguments = sanitize_tool_arguments_for_tool(name, &inferred, Some(tools)).ok()?;
+            if arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+                return None;
+            }
+            Some((search_tool_score(tool, user_text), name.to_string()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    let Some((score, _)) = scored.first() else {
+        return Vec::new();
+    };
+    let top_score = *score;
+    let runner_up = scored.get(1).map(|(score, _)| *score).unwrap_or(0);
+    if top_score < 8 || top_score < runner_up + 2 {
+        return Vec::new();
+    }
+
+    scored
+        .into_iter()
+        .filter_map(|(score, name)| (score == top_score).then_some(name))
+        .collect()
+}
+
+fn text_suggests_search_intent(user_text: &str) -> bool {
+    let tokens = lexical_tokens(user_text);
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "search" | "find" | "lookup" | "research"))
+    {
+        return true;
+    }
+
+    tokens
+        .windows(2)
+        .any(|window| matches!(window[0].as_str(), "look" | "looking") && window[1] == "for")
+}
+
+fn tool_looks_like_searcher(tool: &Value) -> bool {
+    let mut tokens = HashSet::new();
+    collect_tool_schema_tokens(tool, &mut tokens);
+    let has_search_action = ["search", "find", "lookup", "research", "query"]
+        .iter()
+        .any(|token| tokens.contains(*token));
+    let has_query_target = ["query", "q", "search", "term", "terms", "keywords", "topic"]
+        .iter()
+        .any(|token| tokens.contains(*token));
+    has_search_action && has_query_target
+}
+
+fn search_tool_score(tool: &Value, user_text: &str) -> usize {
+    let mut tokens = HashSet::new();
+    if let Some(name) = tool.pointer("/function/name").and_then(Value::as_str) {
+        tokens.extend(text_tokens(name));
+    }
+    if let Some(description) = tool
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+    {
+        tokens.extend(text_tokens(description));
+    }
+
+    let user_tokens = text_tokens(user_text);
+    let external_prompt = prompt_looks_external_search(&user_tokens);
+    let local_prompt = user_tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "memory" | "memories" | "session" | "sessions"
+        )
+    });
+
+    let mut score = 0;
+    for token in &tokens {
+        score += match token.as_str() {
+            "search" | "lookup" => 6,
+            "find" | "research" | "query" => 4,
+            "web" | "internet" | "online" | "browser" | "http" | "https" => 5,
+            "memory" | "memories" | "session" | "sessions" => 3,
+            _ => 0,
+        };
+    }
+    if external_prompt
+        && tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "web" | "internet" | "online" | "browser" | "http" | "https"
+            )
+        })
+    {
+        score += 6;
+    }
+    if local_prompt
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "memory" | "memories"))
+    {
+        score += 6;
+    }
+    score
+}
+
+fn prompt_looks_external_search(tokens: &HashSet<String>) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "web"
+                | "internet"
+                | "online"
+                | "issue"
+                | "issues"
+                | "discussion"
+                | "discussions"
+                | "current"
+                | "recent"
+                | "latest"
+        )
+    })
+}
+
+fn file_read_intent_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
+    if !text_suggests_file_read_intent(user_text) {
+        return Vec::new();
+    }
+
+    let direct = direct_file_read_tool_names(tools, available, user_text);
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    let candidates = command_tool_candidates(tools, available, prompt_tool_profiles);
+    let [candidate] = candidates.as_slice() else {
+        return Vec::new();
+    };
+    vec![candidate.name.clone()]
+}
+
+fn directory_list_intent_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+    prompt_tool_profiles: &[PromptToolProfile],
+) -> Vec<String> {
+    if !text_suggests_directory_list_intent(user_text) {
+        return Vec::new();
+    }
+    let direct = direct_directory_list_tool_names(tools, available, user_text);
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    let candidates = command_tool_candidates(tools, available, prompt_tool_profiles);
+    let [candidate] = candidates.as_slice() else {
+        return Vec::new();
+    };
+    vec![candidate.name.clone()]
+}
+
+fn text_suggests_directory_list_intent(user_text: &str) -> bool {
+    let tokens = lexical_tokens(user_text);
+    let has_list_action = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "list" | "show" | "view" | "inspect" | "tree" | "ls"
+        )
+    });
+    has_list_action
+        && (prompt_mentions_current_directory(user_text)
+            || tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "directory" | "directories" | "folder" | "folders" | "files"
+                )
+            }))
+}
+
+fn direct_directory_list_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+) -> Vec<String> {
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    let available: HashSet<&str> = available.iter().map(String::as_str).collect();
+    let local_directory_prompt =
+        prompt_mentions_current_directory(user_text) && !prompt_mentions_remote_target(user_text);
+
+    let mut scored = tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if !available.contains(name) || !tool_looks_like_directory_lister(tool) {
+                return None;
+            }
+            let inferred = infer_tool_arguments_from_prompt(name, Some(tools), user_text);
+            let arguments = sanitize_tool_arguments_for_tool(name, &inferred, Some(tools)).ok()?;
+            if arguments.as_object().is_some_and(serde_json::Map::is_empty) {
+                return None;
+            }
+            if local_directory_prompt && arguments_have_remote_target(&arguments) {
+                return None;
+            }
+            Some((directory_lister_score(tool), name.to_string()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+
+    let Some((score, _)) = scored.first() else {
+        return Vec::new();
+    };
+    let top_score = *score;
+    let runner_up = scored.get(1).map(|(score, _)| *score).unwrap_or(0);
+    if top_score < runner_up + 2 {
+        return Vec::new();
+    }
+
+    scored
+        .into_iter()
+        .filter_map(|(score, name)| (score == top_score).then_some(name))
+        .collect()
+}
+
+fn prompt_mentions_remote_target(text: &str) -> bool {
+    let tokens = lexical_tokens(text);
+    tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "remote"
+                | "node"
+                | "nodes"
+                | "peer"
+                | "peers"
+                | "host"
+                | "hosts"
+                | "machine"
+                | "machines"
+                | "server"
+                | "servers"
+        )
+    })
+}
+
+fn arguments_have_remote_target(arguments: &Value) -> bool {
+    arguments.as_object().is_some_and(|map| {
+        map.keys().any(|key| {
+            text_tokens(key).iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "node"
+                        | "nodes"
+                        | "host"
+                        | "hosts"
+                        | "peer"
+                        | "peers"
+                        | "target"
+                        | "machine"
+                        | "machines"
+                        | "server"
+                        | "servers"
+                )
+            })
+        })
+    })
+}
+
+fn tool_looks_like_directory_lister(tool: &Value) -> bool {
+    let mut tokens = HashSet::new();
+    collect_tool_schema_tokens(tool, &mut tokens);
+    let has_directory_target = [
+        "dir",
+        "dirs",
+        "directory",
+        "directories",
+        "folder",
+        "folders",
+        "tree",
+        "entries",
+    ]
+    .iter()
+    .any(|token| tokens.contains(*token));
+    let has_listing_action = ["list", "show", "view", "inspect", "tree", "entries", "ls"]
+        .iter()
+        .any(|token| tokens.contains(*token));
+    has_directory_target && has_listing_action
+}
+
+fn directory_lister_score(tool: &Value) -> usize {
+    let mut tokens = HashSet::new();
+    if let Some(name) = tool.pointer("/function/name").and_then(Value::as_str) {
+        tokens.extend(text_tokens(name));
+    }
+    if let Some(description) = tool
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+    {
+        tokens.extend(text_tokens(description));
+    }
+
+    let mut score = 0;
+    for token in tokens {
+        score += match token.as_str() {
+            "list" | "ls" => 6,
+            "entries" => 5,
+            "tree" => 4,
+            "show" | "view" | "inspect" => 3,
+            "directory" | "directories" | "folder" | "folders" | "dir" | "dirs" => 2,
+            "fetch" => 1,
+            _ => 0,
+        };
+    }
+    score
+}
+
+fn text_suggests_file_read_intent(user_text: &str) -> bool {
+    let tokens = lexical_tokens(user_text);
+    if !tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "read"
+                | "show"
+                | "open"
+                | "view"
+                | "inspect"
+                | "cat"
+                | "head"
+                | "tail"
+                | "excerpt"
+                | "summarize"
+                | "summarise"
+        )
+    }) {
+        return false;
+    }
+
+    text_contains_path_like_reference(user_text)
+}
+
+fn text_contains_path_like_reference(user_text: &str) -> bool {
+    user_text
+        .split_whitespace()
+        .map(clean_path_token)
+        .any(|candidate| is_path_like_candidate(&candidate, "path"))
+}
+
+fn direct_file_read_tool_names(
+    tools: Option<&Value>,
+    available: &[String],
+    user_text: &str,
+) -> Vec<String> {
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    let available: HashSet<&str> = available.iter().map(String::as_str).collect();
+
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.pointer("/function/name")?.as_str()?;
+            if !available.contains(name) || !tool_looks_like_file_reader(tool) {
+                return None;
+            }
+            let inferred = infer_tool_arguments_from_prompt(name, Some(tools), user_text);
+            sanitize_tool_arguments_for_tool(name, &inferred, Some(tools))
+                .ok()
+                .filter(|arguments| !arguments.as_object().is_some_and(serde_json::Map::is_empty))
+                .map(|_| name.to_string())
+        })
+        .collect()
+}
+
+fn tool_looks_like_file_reader(tool: &Value) -> bool {
+    let mut tokens = HashSet::new();
+    collect_tool_schema_tokens(tool, &mut tokens);
+    let has_read_action = [
+        "read", "fetch", "open", "view", "inspect", "cat", "head", "tail",
+    ]
+    .iter()
+    .any(|token| tokens.contains(*token));
+    let has_file_target = ["file", "files", "path", "contents", "content"]
+        .iter()
+        .any(|token| tokens.contains(*token));
+    let looks_directory_only = ["dir", "directory", "directories", "entries"]
+        .iter()
+        .any(|token| tokens.contains(*token))
+        && !tokens.contains("file")
+        && !tokens.contains("files");
+
+    has_read_action && has_file_target && !looks_directory_only
 }
 
 fn collect_tool_schema_tokens(value: &Value, tokens: &mut HashSet<String>) {
@@ -1560,11 +2111,45 @@ fn infer_string_argument(field: &str, schema: &Value, prompt: &str) -> Option<St
         return None;
     }
 
-    infer_enum_argument(schema, prompt)
+    infer_command_argument(field, schema, prompt)
+        .or_else(|| infer_enum_argument(schema, prompt))
         .or_else(|| infer_assignment_argument(field, prompt))
-        .or_else(|| infer_path_like_argument(field, prompt))
+        .or_else(|| infer_path_like_argument(field, schema, prompt))
         .or_else(|| infer_query_argument(field, prompt))
         .or_else(|| infer_named_argument(field, schema, prompt))
+}
+
+fn infer_command_argument(field: &str, schema: &Value, prompt: &str) -> Option<String> {
+    let mut schema_tokens = text_tokens(field);
+    collect_tool_schema_tokens(schema, &mut schema_tokens);
+    if !schema_tokens_look_command_like(&schema_tokens) {
+        return None;
+    }
+
+    if text_suggests_directory_list_intent(prompt) {
+        let path = if prompt_mentions_current_directory(prompt) {
+            ".".to_string()
+        } else {
+            prompt
+                .split_whitespace()
+                .map(clean_path_token)
+                .find(|candidate| is_path_like_candidate(candidate, "path"))
+                .unwrap_or_else(|| ".".to_string())
+        };
+        return Some(format!("ls -la {}", shell_quote_path(&path)));
+    }
+
+    None
+}
+
+fn shell_quote_path(path: &str) -> String {
+    if path
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | '~'))
+    {
+        return path.to_string();
+    }
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 fn schema_allows_string(schema: &Value) -> bool {
@@ -1601,17 +2186,53 @@ fn infer_assignment_argument(field: &str, prompt: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-fn infer_path_like_argument(field: &str, prompt: &str) -> Option<String> {
+fn infer_path_like_argument(field: &str, schema: &Value, prompt: &str) -> Option<String> {
     let field = field.to_ascii_lowercase();
     let wants_path = contains_any(&field, &["path", "file", "url", "uri"]);
     if !wants_path {
         return None;
+    }
+    if schema_or_field_looks_directory_like(schema, &field)
+        && prompt_mentions_current_directory(prompt)
+    {
+        return Some(".".to_string());
     }
 
     prompt
         .split_whitespace()
         .map(clean_path_token)
         .find(|candidate| is_path_like_candidate(candidate, &field))
+}
+
+fn schema_or_field_looks_directory_like(schema: &Value, field: &str) -> bool {
+    let mut tokens = text_tokens(field);
+    collect_tool_schema_tokens(schema, &mut tokens);
+    [
+        "dir",
+        "dirs",
+        "directory",
+        "directories",
+        "folder",
+        "folders",
+        "tree",
+    ]
+    .iter()
+    .any(|token| tokens.contains(*token))
+}
+
+fn prompt_mentions_current_directory(prompt: &str) -> bool {
+    let prompt = prompt.to_ascii_lowercase();
+    contains_any(
+        &prompt,
+        &[
+            "current directory",
+            "current folder",
+            "working directory",
+            "cwd",
+            "this directory",
+            "this folder",
+        ],
+    )
 }
 
 fn clean_path_token(token: &str) -> String {
@@ -1648,8 +2269,65 @@ fn infer_query_argument(field: &str, prompt: &str) -> Option<String> {
     if !matches!(field.as_str(), "q" | "query" | "search" | "search_query") {
         return None;
     }
-    let prompt = prompt.trim();
-    (!prompt.is_empty()).then(|| prompt.to_string())
+    let query = search_query_from_prompt(prompt);
+    (!query.is_empty()).then_some(query)
+}
+
+fn search_query_from_prompt(prompt: &str) -> String {
+    let prompt = strip_leading_timestamp(prompt).trim();
+    let lower = prompt.to_ascii_lowercase();
+    let search_markers = [
+        "look for ",
+        "search for ",
+        "search online for ",
+        "search the web for ",
+        "search ",
+        "find ",
+        "lookup ",
+        "look up ",
+        "research ",
+    ];
+    let mut query = search_markers
+        .iter()
+        .find_map(|marker| {
+            lower
+                .find(marker)
+                .and_then(|index| prompt.get(index + marker.len()..))
+        })
+        .unwrap_or(prompt)
+        .trim();
+
+    for separator in [
+        ", then ",
+        " then ",
+        ", and tell ",
+        " and tell ",
+        ", and summarize ",
+        " and summarize ",
+        ", and summarise ",
+        " and summarise ",
+    ] {
+        if let Some(index) = query.to_ascii_lowercase().find(separator) {
+            query = query[..index].trim();
+        }
+    }
+
+    query
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '.' | ',' | ';' | ':'))
+        .trim()
+        .to_string()
+}
+
+fn strip_leading_timestamp(prompt: &str) -> &str {
+    let trimmed = prompt.trim_start();
+    if !trimmed.starts_with('[') {
+        return trimmed;
+    }
+    let Some(end) = trimmed.find(']') else {
+        return trimmed;
+    };
+    let after = trimmed[end + 1..].trim_start();
+    if after.is_empty() { trimmed } else { after }
 }
 
 fn infer_named_argument(field: &str, schema: &Value, prompt: &str) -> Option<String> {
@@ -1815,15 +2493,46 @@ fn word_looks_entity_like(word: &PromptWord) -> bool {
 }
 
 fn tool_parameters<'a>(tool_name: &str, tools: Option<&'a Value>) -> Option<&'a Value> {
-    tools?
-        .as_array()?
-        .iter()
-        .find(|tool| {
-            tool.pointer("/function/name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name == tool_name)
-        })?
-        .pointer("/function/parameters")
+    tool_by_name(tool_name, tools)?.pointer("/function/parameters")
+}
+
+fn tool_by_name<'a>(tool_name: &str, tools: Option<&'a Value>) -> Option<&'a Value> {
+    tools?.as_array()?.iter().find(|tool| {
+        tool.pointer("/function/name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name == tool_name)
+    })
+}
+
+fn tool_parameters_from_tool(tool: &Value) -> Option<&Value> {
+    tool.pointer("/function/parameters")
+}
+
+fn tool_name_and_description_look_directory_like(tool: &Value) -> bool {
+    let mut tokens = HashSet::new();
+    if let Some(name) = tool.pointer("/function/name").and_then(Value::as_str) {
+        tokens.extend(text_tokens(name));
+    }
+    if let Some(description) = tool
+        .pointer("/function/description")
+        .and_then(Value::as_str)
+    {
+        tokens.extend(text_tokens(description));
+    }
+    tokens.contains("tree")
+        || ["list", "show", "view", "inspect"]
+            .iter()
+            .any(|token| tokens.contains(*token))
+            && [
+                "dir",
+                "dirs",
+                "directory",
+                "directories",
+                "folder",
+                "folders",
+            ]
+            .iter()
+            .any(|token| tokens.contains(*token))
 }
 
 // ─── Tool result handling ────────────────────────────────────────────
@@ -1858,7 +2567,11 @@ async fn handle_tool_result(
     let latest_non_answerable_tool = latest_completed_tool_result(session).filter(|(_, result)| {
         !tool_result_has_answerable_evidence_for_prompt(result, &latest_user_text)
     });
-    if let Some((tool, _)) = latest_non_answerable_tool.as_ref() {
+    if let Some((tool, _)) = latest_non_answerable_tool.as_ref().filter(|(tool, _)| {
+        repeated_tool
+            .as_ref()
+            .is_none_or(|(repeated, _)| repeated != tool)
+    }) {
         selected_tool_names.retain(|name| name == tool);
     }
     let tools_enabled_for_reducer =
@@ -2043,10 +2756,14 @@ async fn handle_tool_result(
                                 )
                             })
                     } else {
-                        error_response(
-                            "MoA reducer returned no usable answer",
-                            MOA_ERR_NO_USABLE_ANSWER,
-                        )
+                        answer_from_latest_tool_result(session)
+                            .map(|answer| chat_response(&answer))
+                            .unwrap_or_else(|| {
+                                error_response(
+                                    "MoA reducer returned no usable answer",
+                                    MOA_ERR_NO_USABLE_ANSWER,
+                                )
+                            })
                     }
                 }
                 _ => {
@@ -2054,7 +2771,9 @@ async fn handle_tool_result(
                     match latest_non_answerable_tool.as_ref() {
                         Some((tool, result))
                             if answer_appears_to_use_non_answerable_tool_result(
-                                &repaired, result,
+                                &repaired,
+                                result,
+                                &session.active_user_text(),
                             ) =>
                         {
                             let answer = non_answerable_tool_result_answer(session, tool, result);
@@ -2146,6 +2865,12 @@ async fn handle_tool_result(
 
 fn repair_tool_result_answer(session: &Session, answer: &str) -> String {
     if let Some(answer) = answer_from_recent_prompt_specific_structured_tool_results(session) {
+        return answer;
+    }
+
+    if let Some(answer) = latest_completed_tool_result(session).and_then(|(_, result)| {
+        answer_from_prompt_specific_plain_text_tool_result(&result, &session.active_user_text())
+    }) {
         return answer;
     }
 
@@ -2314,7 +3039,7 @@ struct TabularToolRow {
     title: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StructuredToolRow {
     id: Option<String>,
     title: String,
@@ -2417,6 +3142,10 @@ fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
         return None;
     }
 
+    if let Some(answer) = answer_from_prompt_specific_plain_text_tool_result(&result, &prompt) {
+        return Some(answer);
+    }
+
     if let Some(answer) = answer_from_structured_tool_result(&result, &prompt) {
         return Some(answer);
     }
@@ -2444,9 +3173,19 @@ fn answer_from_latest_tool_result(session: &Session) -> Option<String> {
     Some(truncate_for_tool_result_answer(&answer))
 }
 
-fn answer_appears_to_use_non_answerable_tool_result(answer: &str, result: &str) -> bool {
+fn answer_appears_to_use_non_answerable_tool_result(
+    answer: &str,
+    result: &str,
+    prompt: &str,
+) -> bool {
     let answer_lower = answer.to_ascii_lowercase();
     if answer_lower.contains("from the tool result") || answer_lower.contains("one relevant entry")
+    {
+        return true;
+    }
+
+    if prompt_asks_for_work_items(prompt)
+        && answer_mentions_non_specific_work_item_collection(answer, result, prompt)
     {
         return true;
     }
@@ -2459,8 +3198,39 @@ fn answer_appears_to_use_non_answerable_tool_result(answer: &str, result: &str) 
         .any(|line| line.len() >= 12 && answer.contains(line))
 }
 
+fn answer_mentions_non_specific_work_item_collection(
+    answer: &str,
+    result: &str,
+    prompt: &str,
+) -> bool {
+    let Some(parsed) = parse_tool_result_json(result.trim()) else {
+        return false;
+    };
+    if !json_value_has_structured_result_collection(&parsed) {
+        return false;
+    }
+    let rows = structured_tool_result_rows_unfiltered(&parsed, prompt);
+    !rows.is_empty()
+        && !rows
+            .iter()
+            .any(structured_row_looks_like_specific_work_item)
+        && rows
+            .iter()
+            .any(|row| structured_tool_row_is_referenced(answer, row))
+}
+
 fn non_answerable_tool_result_answer(session: &Session, tool: &str, result: &str) -> String {
     let prompt = session.active_user_text();
+    if prompt_asks_for_work_items(&prompt)
+        && parse_tool_result_json(result.trim()).is_some_and(|value| {
+            json_value_has_structured_result_collection(&value)
+                && structured_tool_result_rows(&value, &prompt).is_empty()
+        })
+    {
+        return format!(
+            "The latest `{tool}` result only listed generic collection/search pages, not a specific requested item, so I can't answer from that output."
+        );
+    }
     if prompt_asks_for_work_items(&prompt)
         && plain_text_tool_result_looks_like_repository_list(result)
     {
@@ -2515,6 +3285,79 @@ fn answer_from_structured_tool_result(result: &str, prompt: &str) -> Option<Stri
     }
 
     Some(truncate_for_tool_result_answer(&answer))
+}
+
+fn answer_from_prompt_specific_plain_text_tool_result(
+    result: &str,
+    prompt: &str,
+) -> Option<String> {
+    let requested = requested_path_existence_targets(prompt);
+    if requested.is_empty() {
+        return None;
+    }
+
+    let found = requested
+        .into_iter()
+        .filter(|path| plain_text_tool_result_contains_path(result, path))
+        .collect::<Vec<_>>();
+    match found.as_slice() {
+        [] => None,
+        [path] => Some(format!("`{path}` exists in the tool result.")),
+        paths => Some(format!(
+            "These requested paths exist in the tool result: {}.",
+            paths
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn requested_path_existence_targets(prompt: &str) -> Vec<String> {
+    let lower = prompt.to_ascii_lowercase();
+    if text_suggests_file_read_intent(&lower) {
+        return Vec::new();
+    }
+    if !contains_any(
+        &lower,
+        &[
+            "exist",
+            "exists",
+            "present",
+            "visible",
+            "whether",
+            "is there",
+            "are there",
+        ],
+    ) {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    prompt
+        .split_whitespace()
+        .map(clean_path_token)
+        .filter(|candidate| is_path_like_candidate(candidate, "path"))
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect()
+}
+
+fn plain_text_tool_result_contains_path(result: &str, path: &str) -> bool {
+    result.lines().any(|line| {
+        line.split_whitespace()
+            .map(clean_path_token)
+            .any(|candidate| path_token_matches(&candidate, path))
+    })
+}
+
+fn path_token_matches(candidate: &str, requested: &str) -> bool {
+    if candidate == requested {
+        return true;
+    }
+    candidate
+        .rsplit_once('/')
+        .is_some_and(|(_, tail)| tail == requested)
 }
 
 fn answer_from_prompt_specific_structured_tool_result(
@@ -3005,6 +3848,13 @@ fn first_non_empty_line(text: &str) -> Option<String> {
 }
 
 fn structured_tool_result_rows(value: &Value, prompt: &str) -> Vec<StructuredToolRow> {
+    filter_structured_rows_for_prompt(
+        structured_tool_result_rows_unfiltered(value, prompt),
+        prompt,
+    )
+}
+
+fn structured_tool_result_rows_unfiltered(value: &Value, prompt: &str) -> Vec<StructuredToolRow> {
     match value {
         Value::Array(values) => values
             .iter()
@@ -3029,11 +3879,63 @@ fn structured_tool_result_rows(value: &Value, prompt: &str) -> Vec<StructuredToo
             ]
             .iter()
             .filter_map(|key| map.get(*key))
-            .flat_map(|value| structured_tool_result_rows(value, prompt))
+            .flat_map(|value| structured_tool_result_rows_unfiltered(value, prompt))
             .collect()
         }
         _ => Vec::new(),
     }
+}
+
+fn filter_structured_rows_for_prompt(
+    rows: Vec<StructuredToolRow>,
+    prompt: &str,
+) -> Vec<StructuredToolRow> {
+    if !prompt_asks_for_work_items(prompt) {
+        return rows;
+    }
+    let specific = rows
+        .iter()
+        .filter(|row| structured_row_looks_like_specific_work_item(row))
+        .cloned()
+        .collect::<Vec<_>>();
+    if specific.is_empty() {
+        Vec::new()
+    } else {
+        specific
+    }
+}
+
+fn structured_row_looks_like_specific_work_item(row: &StructuredToolRow) -> bool {
+    if row
+        .id
+        .as_deref()
+        .is_some_and(|id| id.chars().any(|ch| ch.is_ascii_digit()))
+    {
+        return true;
+    }
+    let title = row.title.to_ascii_lowercase();
+    if title.contains("issue #")
+        || title.contains("pull request #")
+        || title.contains("pr #")
+        || title.contains("ticket #")
+    {
+        return true;
+    }
+    row.url
+        .as_deref()
+        .is_some_and(url_looks_like_specific_work_item)
+}
+
+fn url_looks_like_specific_work_item(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    ["/issues/", "/pull/", "/pulls/", "/merge_requests/"]
+        .iter()
+        .any(|marker| {
+            lower
+                .split_once(marker)
+                .and_then(|(_, tail)| tail.split(['/', '?', '#']).next())
+                .is_some_and(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
+        })
 }
 
 fn structured_tool_row(value: &Value, prompt: &str) -> Option<StructuredToolRow> {
@@ -3060,9 +3962,26 @@ fn first_string_field(map: &serde_json::Map<String, Value>, fields: &[&str]) -> 
     fields
         .iter()
         .find_map(|field| map.get(*field).and_then(Value::as_str))
-        .map(str::trim)
+        .map(clean_structured_text_field)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
+}
+
+fn clean_structured_text_field(value: &str) -> String {
+    let trimmed = value.trim();
+    if !trimmed.contains("<<<EXTERNAL_UNTRUSTED_CONTENT") {
+        return trimmed.to_string();
+    }
+
+    let payload = trimmed
+        .split_once("\n---\n")
+        .map(|(_, tail)| tail)
+        .unwrap_or(trimmed);
+    payload
+        .split_once("\n<<<END_EXTERNAL_UNTRUSTED_CONTENT")
+        .map(|(head, _)| head)
+        .unwrap_or(payload)
+        .trim()
+        .to_string()
 }
 
 fn first_identifier_field(map: &serde_json::Map<String, Value>, fields: &[&str]) -> Option<String> {
@@ -3210,13 +4129,30 @@ fn short_exact_value(value: &str) -> bool {
 fn repeated_same_tool_results(session: &Session) -> Option<(String, usize)> {
     let calls = completed_tool_calls_since_latest_user_before_tool_result(session);
     let latest = calls.last()?;
-    let count = calls
+    let same_signature_count = calls
         .iter()
         .rev()
         .take_while(|call| call.same_signature(latest))
         .count();
+    let same_name_count = if tool_name_looks_search_like(&latest.name) {
+        calls
+            .iter()
+            .rev()
+            .take_while(|call| call.name == latest.name)
+            .count()
+    } else {
+        0
+    };
 
+    let count = same_signature_count.max(same_name_count);
     (count >= SAME_TOOL_FORCE_ANSWER_THRESHOLD).then(|| (latest.name.clone(), count))
+}
+
+fn tool_name_looks_search_like(name: &str) -> bool {
+    let tokens = text_tokens(name);
+    tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "search" | "lookup" | "research"))
 }
 
 fn prompt_requests_additional_tool_step(prompt: &str, session: &Session) -> bool {
@@ -3470,6 +4406,7 @@ fn corrected_retry_tool_call(
     let corrected = tool_result_suggests_unquoted_shell_token_error(result)
         .then(|| quote_unquoted_shell_metachar_tokens(&command))
         .flatten()
+        .or_else(|| remove_unknown_json_fields_from_command(&command, result))
         .or_else(|| remove_unknown_cli_flags_from_command(&command, result))
         .or_else(|| unescape_single_quoted_shell_double_quotes(&command, result))?;
     if corrected == command {
@@ -3530,6 +4467,67 @@ fn tool_result_suggests_shell_quoting_issue(result: &str) -> bool {
     let lower = result.to_ascii_lowercase();
     lower.contains("unix shell quoting issues")
         || (lower.contains("syntax error") && lower.contains("jq:"))
+}
+
+fn remove_unknown_json_fields_from_command(command: &str, result: &str) -> Option<String> {
+    let unknown = unknown_json_field_from_tool_result(result)?;
+    let tokens = split_shell_tokens(command)?;
+    let mut changed = false;
+    let mut filtered = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if let Some(value) = token.strip_prefix("--json=") {
+            changed = true;
+            if let Some(updated) = remove_field_from_csv(value, &unknown) {
+                filtered.push(format!("--json={updated}"));
+            }
+            index += 1;
+            continue;
+        }
+        if token == "--json" {
+            let Some(value) = tokens.get(index + 1) else {
+                filtered.push(token.clone());
+                index += 1;
+                continue;
+            };
+            if let Some(updated) = remove_field_from_csv(value, &unknown) {
+                filtered.push(token.clone());
+                filtered.push(updated);
+            }
+            changed = true;
+            index += 2;
+            continue;
+        }
+        filtered.push(token.clone());
+        index += 1;
+    }
+    changed.then(|| join_shell_tokens(&filtered))
+}
+
+fn unknown_json_field_from_tool_result(result: &str) -> Option<String> {
+    result.lines().take(4).find_map(|line| {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let rest = lower
+            .strip_prefix("unknown json field:")
+            .map(|_| &trimmed["unknown json field:".len()..])?;
+        let field = rest
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ':' | ' '));
+        (!field.is_empty()).then(|| field.to_string())
+    })
+}
+
+fn remove_field_from_csv(value: &str, unknown: &str) -> Option<String> {
+    let fields = value
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .filter(|field| *field != unknown)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!fields.is_empty()).then(|| fields.join(","))
 }
 
 fn remove_unknown_cli_flags_from_command(command: &str, result: &str) -> Option<String> {
@@ -3743,6 +4741,16 @@ fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) ->
     if prompt_asks_for_feedback(prompt) && !tool_result_has_feedback_evidence(result, prompt) {
         return false;
     }
+    let structured_rows = structured_tool_result_rows_from_result(result, prompt);
+    if !structured_rows.is_empty() {
+        return true;
+    }
+    if prompt_asks_for_work_items(prompt)
+        && parse_tool_result_json(result.trim())
+            .is_some_and(|value| json_value_has_structured_result_collection(&value))
+    {
+        return false;
+    }
     if prompt_asks_for_work_items(prompt) && plain_text_tool_result_looks_like_auth_status(result) {
         return false;
     }
@@ -3764,18 +4772,18 @@ fn tool_result_has_answerable_evidence_for_prompt(result: &str, prompt: &str) ->
 
 fn prompt_asks_for_ci_status(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
-    contains_any(
-        &lower,
-        &[
-            "ci",
-            "checks",
-            "green",
-            "status check",
-            "check run",
-            "check suite",
-            "build status",
-        ],
-    )
+    prompt_has_word(&lower, "ci")
+        || contains_any(
+            &lower,
+            &[
+                "checks",
+                "green",
+                "status check",
+                "check run",
+                "check suite",
+                "build status",
+            ],
+        )
 }
 
 fn prompt_asks_for_feedback(prompt: &str) -> bool {
@@ -3867,6 +4875,35 @@ fn json_value_has_feedback_evidence(value: &Value, prompt: &str) -> bool {
         Value::String(text) => focus
             .as_deref()
             .is_some_and(|focus| text.to_ascii_lowercase().contains(focus)),
+        _ => false,
+    }
+}
+
+fn json_value_has_structured_result_collection(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            [
+                "items",
+                "results",
+                "nodes",
+                "data",
+                "pullRequests",
+                "mergeRequests",
+                "issues",
+                "tickets",
+                "tasks",
+                "workItems",
+                "work_items",
+            ]
+            .iter()
+            .any(|key| map.get(*key).is_some_and(Value::is_array))
+                || map
+                    .values()
+                    .any(json_value_has_structured_result_collection)
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(json_value_has_structured_result_collection),
         _ => false,
     }
 }
@@ -4134,9 +5171,10 @@ fn append_tool_budget_instruction(messages: &mut [Value], count: usize) {
 
 fn append_tool_error_retry_instruction(messages: &mut [Value], tool: &str) {
     let instruction = format!(
-        "\n\nTool retry guard: the latest `{tool}` result appears to be command error or usage text, \
-         not answer evidence. If the user's request still needs data, call a corrected tool once. \
-         Do not answer from usage or error text."
+        "\n\nTool retry guard: the latest `{tool}` result is not answer evidence for the user's \
+         request. If the request still needs data, call a corrected or different declared tool \
+         once. Do not answer from error text, usage text, generic collection pages, or unrelated \
+         metadata."
     );
     append_system_instruction(messages, &instruction);
 }
@@ -4179,27 +5217,50 @@ async fn resolve_decision(
     match decision {
         arbiter::Decision::Answer(text) => {
             if let Some(tool) = forced_tool.filter(|_| tools_available) {
-                (
-                    tool_call_response(&tool.name, &tool.fallback_arguments),
-                    false,
-                    0,
-                )
+                let arguments = corrected_response_tool_arguments_for_prompt(
+                    &tool.name,
+                    &tool.fallback_arguments,
+                    session.tools(),
+                    response_tool_names,
+                    prompt_tool_profiles,
+                    Some(&session.last_user_text()),
+                );
+                (tool_call_response(&tool.name, &arguments), false, 0)
             } else {
-                (
-                    chat_or_schema_command_tool_response(
-                        &text,
+                let response = chat_or_schema_command_tool_response(
+                    &text,
+                    session.tools(),
+                    response_tool_names,
+                    prompt_tool_profiles,
+                    Some(&session.last_user_text()),
+                );
+                let response = if response_is_invalid_pseudo_tool_failure(&response) {
+                    tracing::warn!(
+                        "moa: arbiter answer contained malformed tool text; falling back to best worker answer"
+                    );
+                    fallback_worker_response(
+                        outputs,
+                        session,
                         session.tools(),
                         response_tool_names,
                         prompt_tool_profiles,
-                        Some(&session.last_user_text()),
-                    ),
-                    false,
-                    0,
-                )
+                    )
+                } else {
+                    response
+                };
+                (response, false, 0)
             }
         }
         arbiter::Decision::ToolCall { name, arguments } => {
             if tools_available {
+                let arguments = corrected_response_tool_arguments_for_prompt(
+                    &name,
+                    &arguments,
+                    session.tools(),
+                    response_tool_names,
+                    prompt_tool_profiles,
+                    Some(&session.last_user_text()),
+                );
                 (tool_call_response(&name, &arguments), false, 0)
             } else {
                 (
@@ -4283,11 +5344,15 @@ async fn resolve_decision(
                     }
                     normalize::OutputKind::Uncertainty => {
                         if let Some(tool) = forced_tool.filter(|_| tools_available) {
-                            (
-                                tool_call_response(&tool.name, &tool.fallback_arguments),
-                                true,
-                                attempts,
-                            )
+                            let arguments = corrected_response_tool_arguments_for_prompt(
+                                &tool.name,
+                                &tool.fallback_arguments,
+                                session.tools(),
+                                response_tool_names,
+                                prompt_tool_profiles,
+                                Some(&session.last_user_text()),
+                            );
+                            (tool_call_response(&tool.name, &arguments), true, attempts)
                         } else {
                             (
                                 fallback_worker_response(
@@ -4304,23 +5369,38 @@ async fn resolve_decision(
                     }
                     _ => {
                         if let Some(tool) = forced_tool.filter(|_| tools_available) {
-                            (
-                                tool_call_response(&tool.name, &tool.fallback_arguments),
-                                true,
-                                attempts,
-                            )
+                            let arguments = corrected_response_tool_arguments_for_prompt(
+                                &tool.name,
+                                &tool.fallback_arguments,
+                                session.tools(),
+                                response_tool_names,
+                                prompt_tool_profiles,
+                                Some(&session.last_user_text()),
+                            );
+                            (tool_call_response(&tool.name, &arguments), true, attempts)
                         } else {
-                            (
-                                chat_or_schema_command_tool_response(
-                                    &reduced.payload,
+                            let response = chat_or_schema_command_tool_response(
+                                &reduced.payload,
+                                session.tools(),
+                                response_tool_names,
+                                prompt_tool_profiles,
+                                Some(&session.last_user_text()),
+                            );
+                            let response = if response_is_invalid_pseudo_tool_failure(&response) {
+                                tracing::warn!(
+                                    "moa: reducer returned malformed tool text; falling back to best worker answer"
+                                );
+                                fallback_worker_response(
+                                    outputs,
+                                    session,
                                     session.tools(),
                                     response_tool_names,
                                     prompt_tool_profiles,
-                                    Some(&session.last_user_text()),
-                                ),
-                                true,
-                                attempts,
-                            )
+                                )
+                            } else {
+                                response
+                            };
+                            (response, true, attempts)
                         }
                     }
                 },
@@ -4331,11 +5411,15 @@ async fn resolve_decision(
                     // a worker. attempts still reflects what was spawned so
                     // observability can see "we tried N times and all failed".
                     if let Some(tool) = forced_tool.filter(|_| tools_available) {
-                        (
-                            tool_call_response(&tool.name, &tool.fallback_arguments),
-                            false,
-                            attempts,
-                        )
+                        let arguments = corrected_response_tool_arguments_for_prompt(
+                            &tool.name,
+                            &tool.fallback_arguments,
+                            session.tools(),
+                            response_tool_names,
+                            prompt_tool_profiles,
+                            Some(&session.last_user_text()),
+                        );
+                        (tool_call_response(&tool.name, &arguments), false, attempts)
                     } else {
                         (
                             fallback_worker_response(
@@ -4363,6 +5447,7 @@ fn best_answer(outputs: &[WorkerOutput]) -> String {
         .filter(|o| {
             matches!(o.kind, normalize::OutputKind::Answer)
                 && !normalize::is_silent_reply_sentinel(&o.payload)
+                && !looks_like_unusable_pseudo_tool_text(&o.payload)
         })
         // `total_cmp` is total over all f32 (including NaN/Inf); `partial_cmp`
         // can return `None` on NaN, which would panic on `unwrap`.
@@ -4372,6 +5457,38 @@ fn best_answer(outputs: &[WorkerOutput]) -> String {
         .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
         .map(|o| o.payload.clone())
         .unwrap_or_default()
+}
+
+fn looks_like_unusable_pseudo_tool_text(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    starts_with_tool_call_envelope(trimmed)
+        || contains_pseudo_tool_markup(trimmed)
+        || is_tool_error_content(trimmed)
+}
+
+fn contains_pseudo_tool_markup(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    trimmed.starts_with("tool_code")
+        || trimmed.starts_with("tool code")
+        || lower.contains("<tool_code")
+        || lower.contains("</tool_code")
+        || lower.contains("<tool_call")
+        || lower.contains("</tool_call")
+        || lower.contains("[tool_call]")
+        || lower.contains("[/tool_call]")
+        || lower.contains("<function=")
+}
+
+fn is_tool_error_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.starts_with("[error: MoA reducer returned")
+        || trimmed.starts_with("MoA reducer returned an invalid tool call")
+        || trimmed.starts_with("MoA reducer returned an undeclared or invalid tool call")
 }
 
 fn fallback_worker_response(
@@ -4419,12 +5536,13 @@ fn tool_proposal_response(
 ) -> Value {
     if let (true, Some(name)) = (has_tools, output.tool_name.as_ref()) {
         let args = output.tool_arguments.as_ref().unwrap_or(&Value::Null);
-        match validate_response_tool_arguments(
+        match validate_response_tool_arguments_for_prompt(
             name,
             args,
             tools,
             allowed_tools,
             prompt_tool_profiles,
+            user_text,
         ) {
             Ok(arguments) => return tool_call_response(name, &arguments),
             Err(err) => tracing::info!("moa: tool proposal {name} rejected: {err}"),
@@ -4466,7 +5584,15 @@ fn chat_or_schema_command_tool_response(
         None
     };
     if let Some(tool) = command_tool {
-        return tool_call_response(&tool.name, &tool.fallback_arguments);
+        let arguments = corrected_response_tool_arguments_for_prompt(
+            &tool.name,
+            &tool.fallback_arguments,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+            user_text,
+        );
+        return tool_call_response(&tool.name, &arguments);
     }
     if let Some(response) = rescued_tool_call_response(content, tools, allowed_tools) {
         return response;
@@ -4474,20 +5600,68 @@ fn chat_or_schema_command_tool_response(
     if let Some(tool) =
         inline_json_tool_choice_from_text(content, tools, allowed_tools, prompt_tool_profiles)
     {
-        return tool_call_response(&tool.name, &tool.fallback_arguments);
+        let arguments = corrected_response_tool_arguments_for_prompt(
+            &tool.name,
+            &tool.fallback_arguments,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+            user_text,
+        );
+        return tool_call_response(&tool.name, &arguments);
     }
     if let Some(tool) =
         xml_tool_choice_from_text(content, tools, allowed_tools, prompt_tool_profiles)
     {
-        return tool_call_response(&tool.name, &tool.fallback_arguments);
+        let arguments = corrected_response_tool_arguments_for_prompt(
+            &tool.name,
+            &tool.fallback_arguments,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+            user_text,
+        );
+        return tool_call_response(&tool.name, &arguments);
     }
     if let Some(tool) =
         explicitly_named_tool_choice_from_text(content, tools, allowed_tools, prompt_tool_profiles)
     {
-        return tool_call_response(&tool.name, &tool.fallback_arguments);
+        let arguments = corrected_response_tool_arguments_for_prompt(
+            &tool.name,
+            &tool.fallback_arguments,
+            tools,
+            allowed_tools,
+            prompt_tool_profiles,
+            user_text,
+        );
+        return tool_call_response(&tool.name, &arguments);
+    }
+    if looks_like_unusable_pseudo_tool_text(content) {
+        return error_response(
+            "MoA could not turn malformed tool text into a valid declared tool call",
+            MOA_ERR_NO_USABLE_ANSWER,
+        );
     }
 
     chat_response(content)
+}
+
+fn response_is_invalid_pseudo_tool_failure(response: &Value) -> bool {
+    let Some(code) = response.pointer("/error/code").and_then(Value::as_str) else {
+        return false;
+    };
+    if code != MOA_ERR_NO_USABLE_ANSWER {
+        return false;
+    }
+
+    response
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| {
+            content.contains("malformed tool text")
+                || content.contains("invalid tool call")
+                || content.contains("undeclared or invalid tool call")
+        })
 }
 
 fn rescued_tool_call_response(
@@ -4564,6 +5738,7 @@ fn fenced_command_tool_conversion_allowed(user_text: Option<&str>) -> bool {
 
     let tokens = lexical_tokens(&text);
     command_execution_pattern_matches(&tokens)
+        || text_mentions_available_tools(&text)
         || contains_any(
             &text,
             &[
@@ -4578,6 +5753,20 @@ fn fenced_command_tool_conversion_allowed(user_text: Option<&str>) -> bool {
                 "use that command",
             ],
         )
+}
+
+fn text_mentions_available_tools(text: &str) -> bool {
+    contains_any(
+        text,
+        &[
+            "available tool",
+            "available tools",
+            "with tool",
+            "with tools",
+            "using tool",
+            "using tools",
+        ],
+    )
 }
 
 fn inline_json_tool_choice_from_text(
@@ -4868,15 +6057,137 @@ fn validate_response_tool_arguments(
     allowed_tools: &[String],
     prompt_tool_profiles: &[PromptToolProfile],
 ) -> Result<Value, String> {
+    validate_response_tool_arguments_for_prompt(
+        name,
+        arguments,
+        tools,
+        allowed_tools,
+        prompt_tool_profiles,
+        None,
+    )
+}
+
+fn validate_response_tool_arguments_for_prompt(
+    name: &str,
+    arguments: &Value,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+    user_text: Option<&str>,
+) -> Result<Value, String> {
     if tool_names_from_schemas(tools, allowed_tools)
         .iter()
         .any(|schema_name| schema_name == name)
     {
-        return sanitize_tool_arguments_for_tool(name, arguments, tools)
-            .map_err(|err| err.to_string());
+        let mut arguments = sanitize_tool_arguments_for_tool(name, arguments, tools)
+            .map_err(|err| err.to_string())?;
+        if let Some(user_text) = user_text {
+            correct_directory_path_argument_for_prompt(name, &mut arguments, tools, user_text);
+        }
+        return Ok(arguments);
     }
 
-    validate_prompt_tool_arguments(name, arguments, allowed_tools, prompt_tool_profiles)
+    validate_prompt_tool_arguments(
+        name,
+        arguments,
+        allowed_tools,
+        prompt_tool_profiles,
+        user_text,
+    )
+}
+
+fn corrected_response_tool_arguments_for_prompt(
+    name: &str,
+    arguments: &Value,
+    tools: Option<&Value>,
+    allowed_tools: &[String],
+    prompt_tool_profiles: &[PromptToolProfile],
+    user_text: Option<&str>,
+) -> Value {
+    let mut corrected = arguments.clone();
+    if let Some(user_text) = user_text {
+        correct_directory_path_argument_for_prompt(name, &mut corrected, tools, user_text);
+        correct_prompt_directory_path_argument_for_prompt(
+            name,
+            &mut corrected,
+            prompt_tool_profiles,
+            user_text,
+        );
+        correct_tool_name_directory_path_argument_for_prompt(name, &mut corrected, user_text);
+    }
+    let _ = allowed_tools;
+    corrected
+}
+
+fn correct_tool_name_directory_path_argument_for_prompt(
+    name: &str,
+    arguments: &mut Value,
+    user_text: &str,
+) {
+    if !prompt_mentions_current_directory(user_text) || !tool_name_looks_directory_lister(name) {
+        return;
+    }
+    let Some(arguments) = arguments.as_object_mut() else {
+        return;
+    };
+    let Some(value) = arguments.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    if value != "." && is_path_like_candidate(value, "path") {
+        arguments.insert("path".to_string(), Value::String(".".to_string()));
+    }
+}
+
+fn tool_name_looks_directory_lister(name: &str) -> bool {
+    let tokens = text_tokens(name);
+    tokens.contains("tree")
+        || (["list", "ls"].iter().any(|token| tokens.contains(*token))
+            && [
+                "dir",
+                "dirs",
+                "directory",
+                "directories",
+                "folder",
+                "folders",
+            ]
+            .iter()
+            .any(|token| tokens.contains(*token)))
+}
+
+fn correct_directory_path_argument_for_prompt(
+    name: &str,
+    arguments: &mut Value,
+    tools: Option<&Value>,
+    user_text: &str,
+) {
+    if !prompt_mentions_current_directory(user_text) {
+        return;
+    }
+    let Some(tool) = tool_by_name(name, tools) else {
+        return;
+    };
+    let tool_looks_directory_like = tool_name_and_description_look_directory_like(tool);
+    let Some(parameters) = tool_parameters_from_tool(tool) else {
+        return;
+    };
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(arguments) = arguments.as_object_mut() else {
+        return;
+    };
+
+    for (field, schema) in properties {
+        if !tool_looks_directory_like && !schema_or_field_looks_directory_like(schema, field) {
+            continue;
+        }
+        let Some(value) = arguments.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if value != "." && is_path_like_candidate(value, "path") {
+            arguments.insert(field.clone(), Value::String(".".to_string()));
+        }
+    }
 }
 
 fn validate_prompt_tool_arguments(
@@ -4884,6 +6195,7 @@ fn validate_prompt_tool_arguments(
     arguments: &Value,
     allowed_tools: &[String],
     prompt_tool_profiles: &[PromptToolProfile],
+    user_text: Option<&str>,
 ) -> Result<Value, String> {
     let allowed: HashSet<&str> = allowed_tools.iter().map(String::as_str).collect();
     let declared = prompt_tool_profiles
@@ -4916,7 +6228,66 @@ fn validate_prompt_tool_arguments(
         }
     }
 
-    Ok(Value::Object(arguments.clone()))
+    let mut arguments = Value::Object(arguments.clone());
+    if let Some(user_text) = user_text {
+        correct_prompt_directory_path_argument_for_prompt(
+            name,
+            &mut arguments,
+            prompt_tool_profiles,
+            user_text,
+        );
+    }
+    Ok(arguments)
+}
+
+fn correct_prompt_directory_path_argument_for_prompt(
+    name: &str,
+    arguments: &mut Value,
+    prompt_tool_profiles: &[PromptToolProfile],
+    user_text: &str,
+) {
+    if !prompt_mentions_current_directory(user_text) {
+        return;
+    }
+    let Some(profile) = prompt_tool_profiles
+        .iter()
+        .find(|profile| profile.name == name)
+    else {
+        return;
+    };
+    if !prompt_profile_looks_directory_lister(profile) {
+        return;
+    }
+    let Some(arguments) = arguments.as_object_mut() else {
+        return;
+    };
+    for field in ["path", "dir", "directory", "folder"] {
+        let Some(value) = arguments.get(field).and_then(Value::as_str) else {
+            continue;
+        };
+        if value != "." && is_path_like_candidate(value, "path") {
+            arguments.insert(field.to_string(), Value::String(".".to_string()));
+        }
+    }
+}
+
+fn prompt_profile_looks_directory_lister(profile: &PromptToolProfile) -> bool {
+    let tokens = &profile.tokens;
+    let has_listing_action = ["list", "tree", "show", "view", "inspect"]
+        .iter()
+        .any(|token| tokens.contains(*token));
+    let has_directory_target = [
+        "dir",
+        "dirs",
+        "directory",
+        "directories",
+        "folder",
+        "folders",
+        "tree",
+    ]
+    .iter()
+    .any(|token| tokens.contains(*token));
+    has_listing_action && has_directory_target
 }
 
 fn declared_response_tool_names(
@@ -5084,6 +6455,7 @@ mod response_builder_tests {
     use super::*;
     use crate::normalize::{OutputKind, WorkerOutput};
     use crate::worker::WorkerRole;
+    use std::sync::Arc;
 
     fn answer(model: &str, confidence: f32, payload: &str) -> WorkerOutput {
         WorkerOutput {
@@ -5125,6 +6497,24 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn best_answer_ignores_pseudo_tool_markup() {
+        let outputs = vec![
+            answer("a", 0.99, "I will check it.\n\n<tool_code>\n</tool_code>"),
+            answer("b", 0.6, "Here is a real response."),
+        ];
+        assert_eq!(best_answer(&outputs), "Here is a real response.");
+    }
+
+    #[test]
+    fn best_answer_ignores_bare_tool_code_text() {
+        let outputs = vec![
+            answer("a", 0.99, "tool_code\nprint(list_files('.'))"),
+            answer("b", 0.6, "Here is a real response."),
+        ];
+        assert_eq!(best_answer(&outputs), "Here is a real response.");
+    }
+
+    #[test]
     fn fallback_worker_response_errors_when_only_silent_sentinel_remains() {
         let outputs = vec![answer("a", 0.99, "NO_REPLY")];
         let session = Session::new();
@@ -5138,6 +6528,277 @@ mod response_builder_tests {
                 .and_then(Value::as_str),
             Some("error")
         );
+    }
+
+    struct InvalidPseudoToolReducer;
+
+    #[async_trait::async_trait]
+    impl ModelBackend for InvalidPseudoToolReducer {
+        async fn chat_completion(
+            &self,
+            _model: &str,
+            _messages: &[Value],
+            _tools: Option<&Value>,
+            _max_tokens: u32,
+            _timeout: Duration,
+            _sampling: SamplingParams,
+        ) -> Result<Value, String> {
+            Ok(json!({
+                "choices": [{
+                    "message": {
+                        "content": "[TOOL_CALL]\n{tool => \"undeclared_tool\", args => {}}\n[/TOOL_CALL]"
+                    }
+                }]
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn reducer_invalid_pseudo_tool_falls_back_to_worker_answer() {
+        let mut session = Session::new();
+        session.ingest(
+            &[json!({
+                "role": "user",
+                "content": "Use the available tools if needed, but answer safely."
+            })],
+            &None,
+        );
+        let outputs = vec![
+            answer("small", 0.99, "<tool_code>\n</tool_code>"),
+            answer("better", 0.6, "I can answer from the available context."),
+        ];
+        let allowed = vec!["exec".to_string()];
+        let profiles = vec![PromptToolProfile {
+            name: "exec".to_string(),
+            tokens: text_tokens("Run shell commands"),
+        }];
+        let backend: Arc<dyn ModelBackend> = Arc::new(InvalidPseudoToolReducer);
+        let config = GatewayConfig {
+            backends: vec![backend],
+            models: vec![ModelEntry {
+                name: "reducer-30b".to_string(),
+                backend_index: 0,
+            }],
+            worker_timeout: Duration::from_secs(1),
+            reducer_timeout: Duration::from_secs(1),
+            hedge_delay: Duration::from_millis(10),
+            first_answer_grace: Duration::ZERO,
+            enable_thinking: Some(false),
+        };
+
+        let (response, reducer_used, attempts) = resolve_decision(
+            &config,
+            DecisionResolution {
+                session: &session,
+                decision: arbiter::Decision::NeedsReducer {
+                    reason: "conflicting outputs".to_string(),
+                },
+                outputs: &outputs,
+                has_tools: true,
+                selected_tool_names: &[],
+                forced_tool: None,
+                allowed_tools: &allowed,
+                prompt_tool_profiles: &profiles,
+            },
+        )
+        .await;
+
+        assert!(reducer_used);
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("I can answer from the available context.")
+        );
+        assert!(
+            response.pointer("/error").is_none(),
+            "invalid reducer pseudo-tool must not poison the whole turn: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbiter_pseudo_tool_answer_falls_back_to_worker_answer() {
+        let mut session = Session::new();
+        session.ingest(
+            &[json!({
+                "role": "user",
+                "content": "Check the current status using tools if needed."
+            })],
+            &None,
+        );
+        let outputs = vec![
+            answer(
+                "small",
+                0.99,
+                "I will check it.\n\n<tool_code>\n</tool_code>",
+            ),
+            answer(
+                "better",
+                0.6,
+                "Current status is not available from the supplied context.",
+            ),
+        ];
+        let allowed = vec!["exec".to_string()];
+        let profiles = vec![PromptToolProfile {
+            name: "exec".to_string(),
+            tokens: text_tokens("Run shell commands"),
+        }];
+        let backend: Arc<dyn ModelBackend> = Arc::new(InvalidPseudoToolReducer);
+        let config = GatewayConfig {
+            backends: vec![backend],
+            models: vec![ModelEntry {
+                name: "reducer-30b".to_string(),
+                backend_index: 0,
+            }],
+            worker_timeout: Duration::from_secs(1),
+            reducer_timeout: Duration::from_secs(1),
+            hedge_delay: Duration::from_millis(10),
+            first_answer_grace: Duration::ZERO,
+            enable_thinking: Some(false),
+        };
+
+        let (response, reducer_used, attempts) = resolve_decision(
+            &config,
+            DecisionResolution {
+                session: &session,
+                decision: arbiter::Decision::Answer(
+                    "I will check it.\n\n<tool_code>\n</tool_code>".to_string(),
+                ),
+                outputs: &outputs,
+                has_tools: true,
+                selected_tool_names: &[],
+                forced_tool: None,
+                allowed_tools: &allowed,
+                prompt_tool_profiles: &profiles,
+            },
+        )
+        .await;
+
+        assert!(!reducer_used);
+        assert_eq!(attempts, 0);
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("Current status is not available from the supplied context.")
+        );
+        assert!(
+            response.pointer("/error").is_none(),
+            "invalid arbiter pseudo-tool must not poison the whole turn: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbiter_tool_call_corrects_prompt_directory_path_for_current_directory() {
+        let config = GatewayConfig {
+            backends: Vec::new(),
+            models: Vec::new(),
+            worker_timeout: Duration::from_secs(1),
+            reducer_timeout: Duration::from_secs(1),
+            hedge_delay: Duration::from_millis(10),
+            first_answer_grace: Duration::ZERO,
+            enable_thinking: Some(false),
+        };
+        let mut session = Session::new();
+        session.ingest(
+            &[json!({
+                "role": "user",
+                "content": "Use your tools to list the current directory, then say whether AGENTS.md exists."
+            })],
+            &None,
+        );
+        let profiles = vec![PromptToolProfile {
+            name: "tree".to_string(),
+            tokens: text_tokens("tree: List directory tree for a path"),
+        }];
+        let allowed = vec!["tree".to_string()];
+        let (response, reducer_used, attempts) = resolve_decision(
+            &config,
+            DecisionResolution {
+                session: &session,
+                decision: arbiter::Decision::ToolCall {
+                    name: "tree".to_string(),
+                    arguments: json!({"path": "AGENTS.md"}),
+                },
+                outputs: &[],
+                has_tools: true,
+                selected_tool_names: &allowed,
+                forced_tool: None,
+                allowed_tools: &allowed,
+                prompt_tool_profiles: &profiles,
+            },
+        )
+        .await;
+
+        assert!(!reducer_used);
+        assert_eq!(attempts, 0);
+        let args = response
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("tool arguments");
+        assert_eq!(args, json!({"path": "."}));
+    }
+
+    #[tokio::test]
+    async fn arbiter_tool_call_corrects_directory_path_from_tool_name_without_schema() {
+        let config = GatewayConfig {
+            backends: Vec::new(),
+            models: Vec::new(),
+            worker_timeout: Duration::from_secs(1),
+            reducer_timeout: Duration::from_secs(1),
+            hedge_delay: Duration::from_millis(10),
+            first_answer_grace: Duration::ZERO,
+            enable_thinking: Some(false),
+        };
+        let mut session = Session::new();
+        session.ingest(
+            &[json!({
+                "role": "user",
+                "content": "Use your tools to list the current directory, then say whether AGENTS.md exists."
+            })],
+            &None,
+        );
+        let allowed = vec!["tree".to_string()];
+        let (response, reducer_used, attempts) = resolve_decision(
+            &config,
+            DecisionResolution {
+                session: &session,
+                decision: arbiter::Decision::ToolCall {
+                    name: "tree".to_string(),
+                    arguments: json!({"path": "AGENTS.md"}),
+                },
+                outputs: &[],
+                has_tools: true,
+                selected_tool_names: &allowed,
+                forced_tool: None,
+                allowed_tools: &allowed,
+                prompt_tool_profiles: &[],
+            },
+        )
+        .await;
+
+        assert!(!reducer_used);
+        assert_eq!(attempts, 0);
+        let args = response
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("tool arguments");
+        assert_eq!(args, json!({"path": "."}));
     }
 
     fn tool_proposal(payload: &str) -> WorkerOutput {
@@ -5201,6 +6862,131 @@ mod response_builder_tests {
                 .and_then(Value::as_str),
             Some("Need to read.")
         );
+    }
+
+    #[test]
+    fn tool_proposal_response_rejects_invalid_required_url() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch a URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }
+            }
+        }]);
+        let output = WorkerOutput {
+            kind: normalize::OutputKind::ToolProposal,
+            confidence: 0.8,
+            tool_name: Some("web_fetch".to_string()),
+            tool_arguments: Some(json!({"url": "s internal feedback directly."})),
+            payload: "I need a valid URL before web_fetch can be used.".to_string(),
+            model: "worker".to_string(),
+            role: WorkerRole::Fast,
+            elapsed_ms: 1,
+        };
+
+        let resp = tool_proposal_response(
+            &output,
+            true,
+            Some(&tools),
+            &["web_fetch".to_string()],
+            &[],
+            Some("Fetch the details with available tools if needed."),
+        );
+
+        assert!(
+            resp.pointer("/choices/0/message/tool_calls").is_none(),
+            "invalid URL arguments must not become executable tool calls: {resp}"
+        );
+        assert_eq!(
+            resp.pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some("I need a valid URL before web_fetch can be used.")
+        );
+    }
+
+    #[test]
+    fn tool_proposal_response_corrects_directory_path_for_current_directory_prompt() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "tree",
+                "description": "List a directory tree",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Path to list"}},
+                    "required": ["path"]
+                }
+            }
+        }]);
+        let output = WorkerOutput {
+            kind: normalize::OutputKind::ToolProposal,
+            confidence: 0.8,
+            tool_name: Some("tree".to_string()),
+            tool_arguments: Some(json!({"path": "AGENTS.md"})),
+            payload: "I'll list the directory.".to_string(),
+            model: "worker".to_string(),
+            role: WorkerRole::Specialist,
+            elapsed_ms: 1,
+        };
+
+        let resp = tool_proposal_response(
+            &output,
+            true,
+            Some(&tools),
+            &["tree".to_string()],
+            &[],
+            Some(
+                "Use your tools to list the current directory, then say whether AGENTS.md exists.",
+            ),
+        );
+
+        let args = resp
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("tool arguments");
+        assert_eq!(args, json!({"path": "."}));
+    }
+
+    #[test]
+    fn prompt_tool_proposal_corrects_directory_path_for_current_directory_prompt() {
+        let profiles = vec![PromptToolProfile {
+            name: "tree".to_string(),
+            tokens: text_tokens("tree: List directory tree for a path"),
+        }];
+        let output = WorkerOutput {
+            kind: normalize::OutputKind::ToolProposal,
+            confidence: 0.8,
+            tool_name: Some("tree".to_string()),
+            tool_arguments: Some(json!({"path": "AGENTS.md"})),
+            payload: "I'll list the directory.".to_string(),
+            model: "worker".to_string(),
+            role: WorkerRole::Specialist,
+            elapsed_ms: 1,
+        };
+
+        let resp = tool_proposal_response(
+            &output,
+            true,
+            None,
+            &["tree".to_string()],
+            &profiles,
+            Some(
+                "Use your tools to list the current directory, then say whether AGENTS.md exists.",
+            ),
+        );
+
+        let args = resp
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("tool arguments");
+        assert_eq!(args, json!({"path": "."}));
     }
 
     #[test]
@@ -5853,6 +7639,19 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn available_tools_phrase_uses_tool_grace() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Check the PR feedback with available tools if needed.",
+            })],
+            &Some(serde_json::json!([{"type": "function", "function": {"name": "exec", "description": "Run shell commands"}}])),
+        );
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+    }
+
+    #[test]
     fn negated_web_prompt_uses_answer_grace() {
         let mut session = Session::new();
         session.ingest(
@@ -5897,6 +7696,211 @@ mod response_builder_tests {
         assert_eq!(
             selected_tool_names_for_turn(&session, &[], &[]),
             vec!["read".to_string()]
+        );
+    }
+
+    #[test]
+    fn file_read_prompt_uses_tool_grace_with_direct_read_tool() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Read the first 8 lines of AGENTS.md and summarize them."
+            })],
+            &Some(serde_json::json!([
+                {"type": "function", "function": {
+                    "name": "read",
+                    "description": "Read file contents from a path",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string", "description": "File path to read"}},
+                        "required": ["path"]
+                    }
+                }},
+                {"type": "function", "function": {"name": "web_search", "description": "Search online sources"}},
+                {"type": "function", "function": {"name": "exec", "description": "Run shell commands"}}
+            ])),
+        );
+
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["read".to_string()]
+        );
+    }
+
+    #[test]
+    fn file_read_prompt_falls_back_to_command_tool_when_file_tool_needs_unknown_node() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "file_fetch",
+                "description": "Fetch a file from a paired node",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "Paired node name"},
+                        "path": {"type": "string", "description": "Remote file path"}
+                    },
+                    "required": ["node", "path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "dir_list",
+                "description": "List directory entries for a local filesystem path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Directory path"}},
+                    "required": ["path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+                    "required": ["command"]
+                }
+            }}
+        ]);
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "user", "content": "Use available tools to run pwd and then ls -la. Tell me whether AGENTS.md is visible."}),
+                tool_call_msg("call_1", "exec"),
+                tool_result_msg(
+                    "call_1",
+                    "/tmp/workspace\n-rw------- 1 me staff 7874 Jun 9 18:14 AGENTS.md",
+                ),
+                serde_json::json!({"role": "assistant", "content": "Yes, AGENTS.md is visible."}),
+                serde_json::json!({"role": "user", "content": "Read the first 8 lines of AGENTS.md if it is visible and tell me what instruction appears first."}),
+            ],
+            &Some(tools),
+        );
+
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+        assert_eq!(
+            selected_tool_names_for_turn(&session, &[], &[]),
+            vec!["exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn directory_list_prompt_selects_declared_lister_over_directory_fetcher() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "read",
+                "description": "Read file contents from a path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "File path to read"}},
+                    "required": ["path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+                    "required": ["command"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "dir_list",
+                "description": "List directory entries for a local filesystem path",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Directory path"}},
+                    "required": ["path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "dir_fetch",
+                "description": "Fetch directory or file tree contents from a paired node",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "Paired node name"},
+                        "path": {"type": "string", "description": "Directory path"}
+                    },
+                    "required": ["node", "path"]
+                }
+            }}
+        ]);
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use your tools to list the current directory, then say whether AGENTS.md exists."
+            })],
+            &Some(tools.clone()),
+        );
+
+        let selected = selected_tool_names_for_turn(&session, &[], &[]);
+
+        assert_eq!(selected, vec!["dir_list".to_string()]);
+        let forced =
+            required_tool_choice_for_intent(&session, &Some(tools), &selected).expect("tool");
+        assert_eq!(forced.name, "dir_list");
+        assert_eq!(forced.fallback_arguments, serde_json::json!({"path": "."}));
+    }
+
+    #[test]
+    fn local_directory_prompt_uses_command_tool_when_directory_tools_need_node() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "exec",
+                "description": "Run shell commands",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string", "description": "Shell command to execute"}},
+                    "required": ["command"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "dir_list",
+                "description": "Retrieve a structured directory listing from a paired node",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "Node id, name, or IP"},
+                        "path": {"type": "string", "description": "Absolute path to the directory on the node"}
+                    },
+                    "required": ["node", "path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "dir_fetch",
+                "description": "Retrieve a directory tree from a paired node",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "Node id, name, or IP"},
+                        "path": {"type": "string", "description": "Absolute path to the directory on the node"}
+                    },
+                    "required": ["node", "path"]
+                }
+            }}
+        ]);
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use your tools to list the current directory, then say whether AGENTS.md exists."
+            })],
+            &Some(tools.clone()),
+        );
+
+        let selected = selected_tool_names_for_turn(&session, &[], &[]);
+
+        assert_eq!(selected, vec!["exec".to_string()]);
+        let forced =
+            required_tool_choice_for_intent(&session, &Some(tools), &selected).expect("tool");
+        assert_eq!(forced.name, "exec");
+        assert_eq!(
+            forced.fallback_arguments,
+            serde_json::json!({"command": "ls -la ."})
         );
     }
 
@@ -6011,6 +8015,142 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn literal_url_prompt_selects_url_tool_not_file_node_tool() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "file_fetch",
+                "description": "Fetch a file from a paired node",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node": {"type": "string", "description": "Paired node name"},
+                        "path": {"type": "string", "description": "Remote file path"}
+                    },
+                    "required": ["node", "path"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "web_fetch",
+                "description": "Fetch an HTTP URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string", "description": "HTTP URL to fetch"}},
+                    "required": ["url"]
+                }
+            }}
+        ]);
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Fetch https://example.com and summarize the main heading."
+            })],
+            &Some(tools.clone()),
+        );
+
+        let selected = selected_tool_names_for_turn(&session, &[], &[]);
+
+        assert_eq!(selected, vec!["web_fetch".to_string()]);
+        let forced =
+            required_tool_choice_for_intent(&session, &Some(tools), &selected).expect("tool");
+        assert_eq!(forced.name, "web_fetch");
+        assert_eq!(
+            forced.fallback_arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
+    }
+
+    #[test]
+    fn literal_url_prompt_uses_tool_grace_with_url_tool() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Fetch https://example.com and summarize it."
+            })],
+            &Some(serde_json::json!([{"type": "function", "function": {
+                "name": "web_fetch",
+                "description": "Fetch an HTTP URL",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }
+            }}])),
+        );
+
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+    }
+
+    #[test]
+    fn external_search_prompt_selects_declared_web_search_over_memory_search() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "memory_search",
+                "description": "Search stored local memories",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "Memory search query"}},
+                    "required": ["query"]
+                }
+            }},
+            {"type": "function", "function": {
+                "name": "web_search",
+                "description": "Search online web sources",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "Web search query"}},
+                    "required": ["query"]
+                }
+            }}
+        ]);
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Use available tools to look for open issues or recent discussion about mesh-LLM/mesh-llm on GitHub, then tell me one specific item."
+            })],
+            &Some(tools.clone()),
+        );
+
+        let selected = selected_tool_names_for_turn(&session, &[], &[]);
+
+        assert_eq!(selected, vec!["web_search".to_string()]);
+        let forced =
+            required_tool_choice_for_intent(&session, &Some(tools), &selected).expect("tool");
+        assert_eq!(forced.name, "web_search");
+        assert_eq!(
+            forced
+                .fallback_arguments
+                .pointer("/query")
+                .and_then(Value::as_str),
+            Some("open issues or recent discussion about mesh-LLM/mesh-llm on GitHub")
+        );
+    }
+
+    #[test]
+    fn external_search_prompt_uses_tool_grace_with_search_tool() {
+        let mut session = Session::new();
+        session.ingest(
+            &[serde_json::json!({
+                "role": "user",
+                "content": "Search online for recent discussion about the project."
+            })],
+            &Some(serde_json::json!([{"type": "function", "function": {
+                "name": "search",
+                "description": "Search online sources",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }}])),
+        );
+
+        assert_eq!(grace_mode_for_turn(&session, true, &[]), GraceMode::Tool);
+    }
+
+    #[test]
     fn named_argument_inference_skips_intent_verbs_after_prepositions() {
         let tools = serde_json::json!([
             {"type": "function", "function": {
@@ -6031,6 +8171,41 @@ mod response_builder_tests {
         );
 
         assert_eq!(args, serde_json::json!({"city": "Sydney"}));
+    }
+
+    #[test]
+    fn search_query_inference_strips_instruction_scaffolding() {
+        let query = search_query_from_prompt(
+            "[Tue 2026-06-09 19:21 GMT+10] Use available tools to look for open issues or recent discussion about mesh-LLM/mesh-llm on GitHub, then tell me one specific item.",
+        );
+
+        assert_eq!(
+            query,
+            "open issues or recent discussion about mesh-LLM/mesh-llm on GitHub"
+        );
+    }
+
+    #[test]
+    fn directory_path_inference_prefers_current_directory_over_mentioned_file() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {
+                "name": "tree",
+                "description": "List a directory tree",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "Directory path to list"}},
+                    "required": ["path"]
+                }
+            }}
+        ]);
+
+        let args = infer_tool_arguments_from_prompt(
+            "tree",
+            Some(&tools),
+            "Use your tools to list the current directory, then say whether AGENTS.md exists.",
+        );
+
+        assert_eq!(args, serde_json::json!({"path": "."}));
     }
 
     #[test]
@@ -6536,6 +8711,30 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn three_same_tool_name_results_force_answer_even_with_refined_arguments() {
+        let mut session = Session::new();
+        session.ingest(
+            &[
+                serde_json::json!({"role": "user", "content": "search"}),
+                tool_call_msg_with_args("call_1", "web_search", r#"{"query":"alpha"}"#),
+                tool_result_msg("call_1", "result 1"),
+                tool_call_msg_with_args("call_2", "web_search", r#"{"query":"beta"}"#),
+                tool_result_msg("call_2", "result 2"),
+                tool_call_msg_with_args("call_3", "web_search", r#"{"query":"gamma"}"#),
+                tool_result_msg("call_3", "result 3"),
+            ],
+            &Some(serde_json::json!([
+                {"type": "function", "function": {"name": "web_search"}}
+            ])),
+        );
+
+        assert_eq!(
+            repeated_same_tool_results(&session),
+            Some(("web_search".to_string(), 3))
+        );
+    }
+
+    #[test]
     fn repeated_tool_suppression_keeps_alternate_declared_tools_available() {
         let selected = suppress_repeated_tool_from_selection(
             vec!["web_search".to_string()],
@@ -6781,6 +8980,162 @@ mod response_builder_tests {
 
         assert!(!tool_result_has_answerable_evidence(result));
         assert!(answer_from_latest_tool_result(&session_with_tool_result(result)).is_none());
+    }
+
+    #[test]
+    fn path_existence_prompt_answers_from_plain_text_tool_evidence() {
+        let prompt =
+            "Use your tools to list the current directory, then say whether AGENTS.md exists.";
+        let result = format!(
+            "{}\nAGENTS.md  [541]\nCargo.toml  [112]",
+            "nested/file.txt\n".repeat(300)
+        );
+        let session = session_with_user_and_tool_result(prompt, &result);
+
+        let answer = answer_from_latest_tool_result(&session).expect("path evidence answer");
+
+        assert_eq!(answer, "`AGENTS.md` exists in the tool result.");
+    }
+
+    #[test]
+    fn repair_tool_result_answer_corrects_false_missing_path_claim() {
+        let prompt =
+            "Use your tools to list the current directory, then say whether AGENTS.md exists.";
+        let result = "crates/\ndocs/\nAGENTS.md  [541]\nCargo.toml  [112]";
+        let session = session_with_user_and_tool_result(prompt, result);
+
+        let repaired =
+            repair_tool_result_answer(&session, "I do not see a file named `AGENTS.md`.");
+
+        assert_eq!(repaired, "`AGENTS.md` exists in the tool result.");
+    }
+
+    #[test]
+    fn read_prompt_with_existence_precondition_does_not_become_existence_answer() {
+        let prompt = "Read the first 8 lines of AGENTS.md if it exists and tell me what instruction appears first.";
+        let result = "ALWAYS respond to every message.\nNever reply NO_REPLY.\nStay in character.";
+        let session = session_with_user_and_tool_result(prompt, result);
+
+        let answer = answer_from_latest_tool_result(&session).expect("read evidence answer");
+
+        assert!(answer.contains("ALWAYS respond"), "{answer}");
+        assert!(!answer.contains("exists in the tool result"), "{answer}");
+    }
+
+    #[test]
+    fn web_search_result_json_can_answer_research_prompt_from_evidence() {
+        let prompt = "Use available tools to look for open issues or recent discussion about mesh-LLM/mesh-llm on GitHub, then tell me one specific item you found with a short reason it matters.";
+        let result = serde_json::json!({
+            "query": "\"mesh-llm\" \"issue\" GitHub",
+            "provider": "duckduckgo",
+            "count": 2,
+            "results": [
+                {
+                    "title": "Issues - Mesh-LLM/mesh-llm - GitHub",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm/issues/",
+                    "snippet": "Mesh-LLM / mesh-llm Public is:issue state:open"
+                },
+                {
+                    "title": "skipped branch prediction exploration - Issue #803 - Mesh-LLM/mesh-llm",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm/issues/803",
+                    "snippet": "Explore a Skippy-style branch prediction architecture for decode."
+                }
+            ]
+        })
+        .to_string();
+        let session = session_with_user_and_tool_result(prompt, &result);
+
+        assert!(tool_result_has_answerable_evidence(&result));
+        let rows = structured_tool_result_rows_from_result(&result, prompt);
+        assert!(
+            !rows.is_empty(),
+            "structured rows should include search results"
+        );
+        assert!(tool_result_has_answerable_evidence_for_prompt(
+            &result, prompt
+        ));
+        let answer = answer_from_latest_tool_result(&session).expect("search result evidence");
+
+        assert!(answer.contains("Issue #803"), "{answer}");
+    }
+
+    #[test]
+    fn wrapped_web_search_title_is_cleaned_in_structured_answer() {
+        let prompt = "Find one specific open issue for mesh-LLM/mesh-llm.";
+        let result = serde_json::json!({
+            "results": [
+                {
+                    "title": "\n<<<EXTERNAL_UNTRUSTED_CONTENT id=\"x\">>>\nSource: Web Search\n---\nskippy: decode failed - Issue #652 - GitHub\n<<<END_EXTERNAL_UNTRUSTED_CONTENT id=\"x\">>>",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm/issues/652",
+                    "snippet": "Memory slot failure"
+                }
+            ]
+        })
+        .to_string();
+        let session = session_with_user_and_tool_result(prompt, &result);
+
+        let answer = answer_from_latest_tool_result(&session).expect("specific issue evidence");
+
+        assert!(answer.contains("Issue #652"), "{answer}");
+        assert!(!answer.contains("EXTERNAL_UNTRUSTED_CONTENT"), "{answer}");
+        assert!(!answer.contains("Source: Web Search"), "{answer}");
+    }
+
+    #[test]
+    fn generic_issues_index_is_not_specific_work_item_evidence() {
+        let prompt = "Find one specific open issue for mesh-LLM/mesh-llm.";
+        let result = serde_json::json!({
+            "results": [
+                {
+                    "title": "Issues - Mesh-LLM/mesh-llm - GitHub",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm/issues/",
+                    "snippet": "is:issue state:open"
+                },
+                {
+                    "title": "GitHub - Mesh-LLM/mesh-llm",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm",
+                    "snippet": "Distributed AI/LLM for the people."
+                }
+            ]
+        })
+        .to_string();
+
+        assert!(!tool_result_has_answerable_evidence_for_prompt(
+            &result, prompt
+        ));
+    }
+
+    #[test]
+    fn generic_discussions_index_answer_is_not_specific_work_item_evidence() {
+        let prompt = "Use available tools to look for open issues or recent discussion about mesh-LLM/mesh-llm on GitHub, then tell me one specific item you found.";
+        let result = serde_json::json!({
+            "results": [
+                {
+                    "title": "Issues · Mesh-LLM/mesh-llm · GitHub",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm/issues/",
+                    "snippet": "Distributed AI/LLM for the people. - Issues · Mesh-LLM/mesh-llm"
+                },
+                {
+                    "title": "Mesh-LLM mesh-llm · Discussions · GitHub",
+                    "url": "https://github.com/Mesh-LLM/mesh-llm/discussions",
+                    "snippet": "Explore the GitHub Discussions forum."
+                }
+            ]
+        })
+        .to_string();
+        let answer = "I found a specific item: the Discussions tab at https://github.com/Mesh-LLM/mesh-llm/discussions.";
+        let session = session_with_user_and_tool_result(prompt, &result);
+
+        assert!(!tool_result_has_answerable_evidence_for_prompt(
+            &result, prompt
+        ));
+        assert!(answer_appears_to_use_non_answerable_tool_result(
+            answer, &result, prompt
+        ));
+        assert!(
+            non_answerable_tool_result_answer(&session, "web_search", &result)
+                .contains("generic collection/search pages")
+        );
     }
 
     #[test]
@@ -7347,6 +9702,40 @@ mod response_builder_tests {
                 .pointer("/choices/0/message/tool_calls/0/function/arguments")
                 .and_then(Value::as_str),
             Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\"}")
+        );
+    }
+
+    #[test]
+    fn fenced_command_answer_uses_prompt_tool_when_user_mentions_available_tools() {
+        let (session, profiles, allowed) = prompt_tool_session(
+            "Check the release status with available tools if needed, and summarize it.",
+        );
+
+        let response = chat_or_schema_command_tool_response(
+            "I will check it.\n\n```bash\ngh pr view 808 --json comments,reviewComments\n```",
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"gh pr view 808 --json comments,reviewComments\"}")
         );
     }
 

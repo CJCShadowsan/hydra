@@ -652,6 +652,64 @@ async fn cli_json_field_error_allows_corrective_exec_followup() {
 }
 
 #[tokio::test]
+async fn cli_json_field_error_with_plain_reducer_answer_retries_corrected_exec() {
+    let backend = RecordingBackend::new(
+        "I was unable to retrieve the requested feedback because the latest command used an unknown JSON field.",
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+
+    let body = json!({
+        "model": "mesh",
+        "tools": exec_tool(),
+        "messages": [
+            {"role": "user", "content": "The PR 808 - how much review feedback is there? Check it with available tools if needed."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_exec",
+                "type": "function",
+                "function": {"name": "exec", "arguments": "{\"command\":\"gh pr view 808 --json feedbacks\"}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_exec", "content": "Unknown JSON field: \"feedbacks\"\nAvailable fields:\n  additions\n  author\n  comments\n  reviews\n  statusCheckRollup\n  title\n  url\n\n(Command exited with code 1)"},
+        ],
+        "max_tokens": 96,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(backend.calls(), 1);
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("tool_calls"),
+        "plain reducer text after CLI field errors should become a corrected tool call: {}",
+        result.response_body
+    );
+    let args = result
+        .response_body
+        .pointer("/choices/0/message/tool_calls/0/function/arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        args.contains("gh pr view 808") && !args.contains("feedbacks") && !args.contains("--json"),
+        "corrective exec should strip the unusable JSON field list: {args}"
+    );
+}
+
+#[tokio::test]
 async fn reducer_failure_after_answerable_exec_result_answers_from_evidence() {
     let backend = AlwaysFailBackend::new();
     let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
@@ -1034,6 +1092,97 @@ async fn tool_result_retries_answer_only_when_schema_reducer_fails() {
             .unwrap_or("")
             .contains("file_a.log")
     );
+}
+
+#[tokio::test]
+async fn exhausted_search_loop_uncertainty_answers_from_latest_evidence() {
+    let backend = RecordingBackend::new(
+        r#"{"kind":"uncertainty","confidence":0.2,"payload":"Need more search results."}"#,
+    );
+    let backends: Vec<Arc<dyn moa::ModelBackend>> = vec![backend.clone()];
+    let config = moa::GatewayConfig {
+        backends,
+        models: vec![moa::ModelEntry {
+            name: "strong-32b".into(),
+            backend_index: 0,
+        }],
+        worker_timeout: Duration::from_secs(2),
+        hedge_delay: Duration::from_millis(50),
+        reducer_timeout: Duration::from_secs(2),
+        first_answer_grace: Duration::ZERO,
+        enable_thinking: None,
+    };
+    let search_result = json!({
+        "query": "\"mesh-llm\" \"issue\" GitHub",
+        "provider": "duckduckgo",
+        "count": 2,
+        "results": [
+            {
+                "title": "Issues - Mesh-LLM/mesh-llm - GitHub",
+                "url": "https://github.com/Mesh-LLM/mesh-llm/issues/",
+                "snippet": "Mesh-LLM / mesh-llm Public is:issue state:open"
+            },
+            {
+                "title": "skipped branch prediction exploration - Issue #803 - Mesh-LLM/mesh-llm",
+                "url": "https://github.com/Mesh-LLM/mesh-llm/issues/803",
+                "snippet": "Explore a Skippy-style branch prediction architecture for decode."
+            }
+        ]
+    })
+    .to_string();
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": "Use available tools to look for open issues or recent discussion about mesh-LLM/mesh-llm on GitHub, then tell me one specific item you found."
+    })];
+    for idx in 1..=6 {
+        let call_id = format!("call_{idx}");
+        messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "arguments": format!(r#"{{"query":"mesh-llm issue {idx}"}}"#)
+                }
+            }]
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": format!("call_{idx}"),
+            "content": search_result
+        }));
+    }
+    let body = json!({
+        "model": "mesh",
+        "tools": web_tools(),
+        "messages": messages,
+        "max_tokens": 128,
+    });
+
+    let result = moa::handle_turn(&config, &body).await;
+
+    assert_eq!(result.turn_kind, moa::TurnKind::ToolResult);
+    assert_eq!(backend.calls(), 1);
+    assert!(
+        result.response_body.get("error").is_none(),
+        "uncertain reducer after answerable search evidence must not surface a MoA error: {}",
+        result.response_body
+    );
+    assert_eq!(
+        result
+            .response_body
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str),
+        Some("stop")
+    );
+    let content = result
+        .response_body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(content.contains("Issue #803"), "{content}");
 }
 
 #[tokio::test]
