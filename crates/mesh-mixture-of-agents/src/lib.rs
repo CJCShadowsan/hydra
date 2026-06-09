@@ -826,6 +826,27 @@ fn declared_tool_names(
     }
 }
 
+fn suppress_repeated_tool_from_selection(
+    mut selected_tool_names: Vec<String>,
+    declared_tool_names: &[String],
+    repeated_tool: Option<&str>,
+) -> Vec<String> {
+    let Some(tool) = repeated_tool else {
+        return selected_tool_names;
+    };
+
+    selected_tool_names.retain(|name| name != tool);
+    if selected_tool_names.is_empty() {
+        selected_tool_names.extend(
+            declared_tool_names
+                .iter()
+                .filter(|name| name.as_str() != tool)
+                .cloned(),
+        );
+    }
+    selected_tool_names
+}
+
 fn prompt_declared_tool_profiles(session: &Session) -> Vec<PromptToolProfile> {
     let Some(prompt) = prompt_tool_catalog_source(session) else {
         return Vec::new();
@@ -1819,11 +1840,12 @@ async fn handle_tool_result(
     let candidate_count = candidates.len();
     let repeated_tool = repeated_same_tool_results(session);
     let tool_budget_exhausted = tool_budget_exhausted(session);
-    let mut selected_tool_names =
-        selected_tool_names_for_turn(session, allowed_tools, prompt_tool_profiles);
-    if let Some((tool, _)) = repeated_tool.as_ref() {
-        selected_tool_names.retain(|name| name != tool);
-    }
+    let declared_tool_names = declared_tool_names(session, prompt_tool_profiles);
+    let mut selected_tool_names = suppress_repeated_tool_from_selection(
+        selected_tool_names_for_turn(session, allowed_tools, prompt_tool_profiles),
+        &declared_tool_names,
+        repeated_tool.as_ref().map(|(tool, _)| tool.as_str()),
+    );
     let latest_user_text = session.active_user_text();
     let prompt_requests_more_tool_steps =
         prompt_requests_additional_tool_step(&latest_user_text, session);
@@ -6458,6 +6480,36 @@ mod response_builder_tests {
             repeated_same_tool_results(&session),
             Some(("web_search".to_string(), 3))
         );
+    }
+
+    #[test]
+    fn repeated_tool_suppression_keeps_alternate_declared_tools_available() {
+        let selected = suppress_repeated_tool_from_selection(
+            vec!["web_search".to_string()],
+            &[
+                "web_search".to_string(),
+                "read_file".to_string(),
+                "exec".to_string(),
+            ],
+            Some("web_search"),
+        );
+
+        assert_eq!(selected, vec!["read_file".to_string(), "exec".to_string()]);
+    }
+
+    #[test]
+    fn repeated_tool_suppression_keeps_non_repeated_selection() {
+        let selected = suppress_repeated_tool_from_selection(
+            vec!["web_search".to_string(), "read_file".to_string()],
+            &[
+                "web_search".to_string(),
+                "read_file".to_string(),
+                "exec".to_string(),
+            ],
+            Some("web_search"),
+        );
+
+        assert_eq!(selected, vec!["read_file".to_string()]);
     }
 
     #[test]
