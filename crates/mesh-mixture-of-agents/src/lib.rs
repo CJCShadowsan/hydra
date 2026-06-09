@@ -4629,9 +4629,13 @@ fn xml_body_tool_name(body: &str) -> Option<String> {
 }
 
 fn xml_attr_value(tag: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
+    xml_quoted_attr_value(tag, attr, '"').or_else(|| xml_quoted_attr_value(tag, attr, '\''))
+}
+
+fn xml_quoted_attr_value(tag: &str, attr: &str, quote: char) -> Option<String> {
+    let needle = format!("{attr}={quote}");
     let value_start = tag.find(&needle)? + needle.len();
-    let value_end = tag[value_start..].find('"')? + value_start;
+    let value_end = tag[value_start..].find(quote)? + value_start;
     Some(xml_text_unescape(&tag[value_start..value_end]))
 }
 
@@ -4689,12 +4693,22 @@ fn xml_parameter_value_end(body: &str, value_start: usize, name: &str, tag_prefi
 }
 
 fn xml_text_unescape(text: &str) -> String {
-    text.replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    let mut decoded = text.to_string();
+    for _ in 0..3 {
+        let next = decoded
+            .replace("&quot;", "\"")
+            .replace("&#34;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        if next == decoded {
+            break;
+        }
+        decoded = next;
+    }
+    decoded
 }
 
 fn embedded_json_object_candidates(text: &str) -> Vec<String> {
@@ -7360,6 +7374,38 @@ mod response_builder_tests {
                 .pointer("/choices/0/message/tool_calls/0/function/arguments")
                 .and_then(Value::as_str),
             Some("{\"command\":\"gh pr list --repo mesh-LLM/mesh-llm --state open --limit 10\"}")
+        );
+    }
+
+    #[test]
+    fn prompt_catalog_xml_accepts_single_quotes_and_double_escaped_entities() {
+        let (session, profiles, allowed) = prompt_tool_session("Use printf with the exec tool.");
+
+        let response = chat_or_schema_command_tool_response(
+            "<tool_call>\n<invoke name='exec'>\n<parameter name='command'>printf &amp;quot;hello&#34;</parameter>\n</invoke>\n</tool_call>",
+            session.tools(),
+            &allowed,
+            &profiles,
+            Some(&session.last_user_text()),
+        );
+
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/name")
+                .and_then(Value::as_str),
+            Some("exec")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                .and_then(Value::as_str),
+            Some("{\"command\":\"printf \\\"hello\\\"\"}")
         );
     }
 

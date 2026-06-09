@@ -796,7 +796,8 @@ async fn try_add_local_worker(
     let context_length = resolution.node.local_model_context_length(name).await;
     let remote_context =
         context_selection::best_remote_context_length(resolution.node, name, remote_hosts).await;
-    if should_skip_local_for_inflight(name, resolution.node.inflight_requests()) {
+    let peer_inflight = resolution.node.inflight_requests().saturating_sub(1);
+    if should_skip_local_for_inflight(name, peer_inflight) {
         return false;
     }
     if should_skip_local_for_remote_context(name, context_length, remote_context) {
@@ -1537,6 +1538,18 @@ mod tests {
         assert_eq!(max_optional_context(None, Some(32)), Some(32));
         assert_eq!(min_optional_latency(Some(300), Some(2)), Some(2));
         assert_eq!(min_optional_latency(None, Some(2)), Some(2));
+    }
+
+    #[test]
+    fn local_inflight_skip_starts_at_soft_limit() {
+        assert!(!should_skip_local_for_inflight(
+            "local",
+            MOA_LOCAL_INFLIGHT_SOFT_LIMIT - 1
+        ));
+        assert!(should_skip_local_for_inflight(
+            "local",
+            MOA_LOCAL_INFLIGHT_SOFT_LIMIT
+        ));
     }
 
     #[test]
