@@ -519,11 +519,7 @@ fn canonicalize_tool_response_blocks(msg: &Value) -> Option<Vec<Value>> {
 }
 
 fn canonical_tool_result_from_block(part: &Value) -> Option<Value> {
-    let id = part
-        .get("id")
-        .and_then(Value::as_str)
-        .or_else(|| part.pointer("/toolResult/id").and_then(Value::as_str))
-        .filter(|id| !id.is_empty())?;
+    let id = tool_result_call_id(part)?;
     let content = tool_result_text(part);
 
     Some(serde_json::json!({
@@ -531,6 +527,24 @@ fn canonical_tool_result_from_block(part: &Value) -> Option<Value> {
         "tool_call_id": id,
         "content": content,
     }))
+}
+
+fn tool_result_call_id(part: &Value) -> Option<&str> {
+    [
+        "/id",
+        "/tool_use_id",
+        "/toolUseId",
+        "/tool_call_id",
+        "/toolCallId",
+        "/toolResult/id",
+        "/toolResult/tool_use_id",
+        "/toolResult/toolUseId",
+        "/toolResult/tool_call_id",
+        "/toolResult/toolCallId",
+    ]
+    .into_iter()
+    .find_map(|pointer| part.pointer(pointer).and_then(Value::as_str))
+    .filter(|id| !id.is_empty())
 }
 
 fn tool_result_text(part: &Value) -> String {
@@ -996,6 +1010,44 @@ mod tests {
         assert_eq!(
             messages[4],
             json!({"role": "user", "content": "Please answer briefly."})
+        );
+    }
+
+    #[test]
+    fn tool_result_block_accepts_tool_use_id_alias() {
+        let mut s = Session::new();
+        s.ingest(
+            &[
+                json!({"role": "user", "content": "Read and summarize"}),
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+                    }]
+                }),
+                json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Tool finished."},
+                        {
+                            "type": "toolResult",
+                            "tool_use_id": "call_read",
+                            "content": "# Mesh LLM"
+                        }
+                    ]
+                }),
+            ],
+            &None,
+        );
+
+        assert_eq!(s.classify_turn(), TurnType::ToolResult);
+        let messages = s.all_messages();
+        assert_eq!(
+            messages[3],
+            json!({"role": "tool", "tool_call_id": "call_read", "content": "# Mesh LLM"})
         );
     }
 }
