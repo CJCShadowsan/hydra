@@ -210,7 +210,7 @@ fn pack_specialist(
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "user" || (role == "assistant" && msg.get("tool_calls").is_none()) {
             has_last_user |= role == "user"
-                && msg.get("content").and_then(Value::as_str) == Some(user_text.as_str());
+                && message_text_content(msg).is_some_and(|text| text == user_text.as_str());
             messages.push(compact_chat_message(
                 msg,
                 SPECIALIST_MESSAGE_CONTEXT_MAX_CHARS,
@@ -260,7 +260,7 @@ fn pack_strong(
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role != "system" && !role.is_empty() {
             has_last_user |= role == "user"
-                && msg.get("content").and_then(Value::as_str) == Some(user_text.as_str());
+                && message_text_content(msg).is_some_and(|text| text == user_text.as_str());
             messages.push(compact_chat_message(msg, STRONG_MESSAGE_CONTEXT_MAX_CHARS));
         }
     }
@@ -536,7 +536,7 @@ pub fn pack_for_tool_result_answer_only(session: &Session) -> Vec<Value> {
     );
 
     let mut user = String::new();
-    let last_user = session.last_user_text();
+    let last_user = session.active_user_text();
     if !last_user.trim().is_empty() {
         user.push_str("User request:\n");
         user.push_str(&compact_text_for_context(
@@ -617,8 +617,8 @@ fn compact_tool_message(msg: &Value) -> Value {
 }
 
 fn compact_chat_message(msg: &Value, max_chars: usize) -> Value {
-    let Some(content) = msg.get("content").and_then(Value::as_str) else {
-        return msg.clone();
+    let Some(content) = message_string_content(msg) else {
+        return compact_multipart_text_message(msg, max_chars);
     };
     let compacted = compact_text_for_context(content, max_chars);
     if compacted == content {
@@ -631,13 +631,82 @@ fn compact_chat_message(msg: &Value, max_chars: usize) -> Value {
     compact
 }
 
+fn compact_multipart_text_message(msg: &Value, max_chars: usize) -> Value {
+    let Some(parts) = msg.get("content").and_then(Value::as_array) else {
+        return msg.clone();
+    };
+    if parts
+        .iter()
+        .all(|part| text_from_content_block(part).is_some())
+    {
+        let content = parts
+            .iter()
+            .filter_map(text_from_content_block)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut compact = msg.clone();
+        if let Some(obj) = compact.as_object_mut() {
+            obj.insert(
+                "content".to_string(),
+                Value::String(compact_text_for_context(&content, max_chars)),
+            );
+        }
+        return compact;
+    }
+
+    let mut compact = msg.clone();
+    let Some(compact_parts) = compact.get_mut("content").and_then(Value::as_array_mut) else {
+        return compact;
+    };
+    for part in compact_parts {
+        let text = text_from_content_block(part).map(str::to_string);
+        if let (Some(text), Some(obj)) = (text, part.as_object_mut()) {
+            obj.insert(
+                "text".to_string(),
+                Value::String(compact_text_for_context(&text, max_chars)),
+            );
+        }
+    }
+    compact
+}
+
+fn message_string_content(message: &Value) -> Option<&str> {
+    message.get("content").and_then(Value::as_str)
+}
+
+fn message_text_content(message: &Value) -> Option<String> {
+    if let Some(text) = message_string_content(message) {
+        return Some(text.to_string());
+    }
+    let parts = message.get("content").and_then(Value::as_array)?;
+    let text = parts
+        .iter()
+        .filter_map(text_from_content_block)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn text_from_content_block(part: &Value) -> Option<&str> {
+    let kind = part
+        .get("type")
+        .and_then(Value::as_str)?
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    (kind == "text")
+        .then(|| part.get("text").and_then(Value::as_str))
+        .flatten()
+}
+
 fn compact_text_for_context(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();
     }
 
     let marker = format!(
-        "\n\n[MoA compacted this message from {} chars. Middle content was omitted. \
+        "\n\n[MoA compacted this message from {} bytes. Middle content was omitted. \
          The text after this notice is the preserved ending of the original message.]\n\n",
         text.len()
     );
@@ -1099,6 +1168,44 @@ mod tests {
     }
 
     #[test]
+    fn specialist_worker_does_not_duplicate_multipart_last_user() {
+        let s = session_with(
+            &[
+                system_msg("Agent SP."),
+                user_msg("m1"),
+                assistant_msg("r1"),
+                json!({
+                    "role": "user",
+                    "content": [{"type": "Text", "text": "m2 multipart"}]
+                }),
+            ],
+            Some(tools_two()),
+        );
+
+        let packed = pack_for_worker(&s, WorkerRole::Specialist, true);
+        let user_messages = packed
+            .messages
+            .iter()
+            .filter(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
+            .collect::<Vec<_>>();
+        let matching = user_messages
+            .iter()
+            .filter(|msg| msg.get("content").and_then(Value::as_str) == Some("m2 multipart"))
+            .count();
+
+        assert_eq!(
+            matching, 1,
+            "multipart last user should not be appended twice"
+        );
+        assert!(
+            user_messages
+                .iter()
+                .any(|msg| msg.get("content").and_then(Value::as_str) == Some("m2 multipart")),
+            "multipart all-text content should be normalized into bounded string content"
+        );
+    }
+
+    #[test]
     fn ordinary_chat_omits_tool_summaries_and_native_tools() {
         let s = session_with(
             &[system_msg("Agent SP."), user_msg("What can you help with?")],
@@ -1190,6 +1297,32 @@ mod tests {
         );
         let last = packed.messages.last().unwrap();
         assert_eq!(last.get("content").and_then(|c| c.as_str()), Some("final"));
+    }
+
+    #[test]
+    fn answer_only_tool_result_context_uses_active_user_request() {
+        let s = session_with(
+            &[
+                user_msg("Find the current release notes and summarize the blocker."),
+                assistant_tool_msg(
+                    "call_1",
+                    "web_search",
+                    json!({"query": "mesh llm release notes"}),
+                ),
+                tool_result_msg("call_1", "release note result"),
+                user_msg("Please answer from that result."),
+            ],
+            Some(weather_tools()),
+        );
+
+        let packed = pack_for_tool_result_answer_only(&s);
+        let user_content = packed[1]
+            .get("content")
+            .and_then(Value::as_str)
+            .expect("answer-only user content");
+
+        assert!(user_content.contains("Find the current release notes"));
+        assert!(!user_content.contains("Please answer from that result."));
     }
 
     #[test]

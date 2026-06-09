@@ -347,7 +347,16 @@ fn normalize_tool_schema(tool: &Value) -> Value {
     if tool.get("type").and_then(Value::as_str) == Some("function")
         && tool.get("function").and_then(Value::as_object).is_some()
     {
-        return tool.clone();
+        let mut normalized = tool.clone();
+        if let (true, Some(function)) = (
+            normalized.pointer("/function/parameters").is_none(),
+            normalized
+                .get_mut("function")
+                .and_then(Value::as_object_mut),
+        ) {
+            function.insert("parameters".to_string(), default_tool_parameters());
+        }
+        return normalized;
     }
 
     let Some(name) = tool.get("name").and_then(Value::as_str) else {
@@ -365,12 +374,18 @@ fn normalize_tool_schema(tool: &Value) -> Value {
         .cloned()
     {
         function.insert("parameters".to_string(), parameters);
+    } else {
+        function.insert("parameters".to_string(), default_tool_parameters());
     }
 
     serde_json::json!({
         "type": "function",
         "function": Value::Object(function),
     })
+}
+
+fn default_tool_parameters() -> Value {
+    serde_json::json!({"type": "object", "properties": {}})
 }
 
 fn canonicalize_agent_tool_messages(messages: &[Value]) -> Vec<Value> {
@@ -560,9 +575,10 @@ fn normalize_content_block_type(kind: &str) -> String {
 }
 
 fn text_from_content_block(part: &Value) -> Option<&str> {
-    match part.get("type").and_then(Value::as_str) {
-        Some("text") => part.get("text").and_then(Value::as_str),
-        _ => None,
+    if is_content_block_type(part, &["text"]) {
+        part.get("text").and_then(Value::as_str)
+    } else {
+        None
     }
 }
 
@@ -580,16 +596,7 @@ fn extract_text_content(msg: &Value) -> Option<String> {
         return Some(s.to_string());
     }
     if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
-        let texts: Vec<&str> = parts
-            .iter()
-            .filter_map(|p| {
-                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    p.get("text").and_then(|t| t.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let texts: Vec<&str> = parts.iter().filter_map(text_from_content_block).collect();
         if !texts.is_empty() {
             return Some(texts.join("\n"));
         }
@@ -734,6 +741,45 @@ mod tests {
                 .and_then(Value::as_str),
             Some("path")
         );
+    }
+
+    #[test]
+    fn tool_schema_normalization_defaults_missing_parameters() {
+        let mut s = Session::new();
+        s.ingest(
+            &[json!({"role": "user", "content": "run it"})],
+            &Some(json!([
+                {"name": "flat_tool", "description": "No parameter schema"},
+                {"type": "function", "function": {"name": "native_tool"}}
+            ])),
+        );
+
+        assert_eq!(
+            s.tools()
+                .and_then(|tools| tools.pointer("/0/function/parameters/type"))
+                .and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            s.tools()
+                .and_then(|tools| tools.pointer("/1/function/parameters/type"))
+                .and_then(Value::as_str),
+            Some("object")
+        );
+    }
+
+    #[test]
+    fn text_content_blocks_are_case_insensitive() {
+        let mut s = Session::new();
+        s.ingest(
+            &[json!({
+                "role": "user",
+                "content": [{"type": "TEXT", "text": "mixed case content"}]
+            })],
+            &None,
+        );
+
+        assert_eq!(s.last_user_text(), "mixed case content");
     }
 
     #[test]

@@ -862,12 +862,11 @@ fn prompt_tool_catalog_source(session: &Session) -> Option<String> {
         return Some(system);
     }
 
-    let parts: Vec<String> = session
+    session
         .messages()
-        .iter()
-        .filter_map(message_text_content)
-        .collect();
-    (!parts.is_empty()).then(|| parts.join("\n"))
+        .first()
+        .and_then(message_text_content)
+        .filter(|text| !text.trim().is_empty())
 }
 
 fn prompt_tool_heading(line: &str) -> bool {
@@ -1497,6 +1496,7 @@ fn forced_tool_choice(
     if name.is_empty() || !allowed_tools.iter().any(|tool| tool == name) {
         return None;
     }
+    tool_parameters(name, tools.as_ref())?;
 
     let inferred =
         infer_tool_arguments_from_prompt(name, tools.as_ref(), &session.last_user_text());
@@ -2052,13 +2052,17 @@ async fn handle_tool_result(
                         }
                         _ => {}
                     }
-                    let body = chat_or_schema_command_tool_response(
-                        &repaired,
-                        session.tools(),
-                        response_allowed_tools,
-                        response_prompt_profiles,
-                        Some(&session.last_user_text()),
-                    );
+                    let body = if response_tools_enabled {
+                        chat_or_schema_command_tool_response(
+                            &repaired,
+                            session.tools(),
+                            response_allowed_tools,
+                            response_prompt_profiles,
+                            Some(&session.last_user_text()),
+                        )
+                    } else {
+                        chat_response(&repaired)
+                    };
                     retry_tool_result_response_if_plain(
                         body,
                         retry_tool_call.as_ref(),
@@ -5422,6 +5426,32 @@ mod response_builder_tests {
     }
 
     #[test]
+    fn forced_tool_choice_ignores_prompt_only_tool_without_native_schema() {
+        let body = serde_json::json!({
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "exec"}
+            },
+            "messages": [
+                {"role": "system", "content": prompt_tool_catalog()},
+                {"role": "user", "content": "Use gh to list PRs."}
+            ]
+        });
+        let tools = body.get("tools").cloned();
+        let mut session = Session::new();
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap();
+        session.ingest(&messages, &tools);
+        let profiles = prompt_declared_tool_profiles(&session);
+        let allowed_tools = declared_tool_names(&session, &profiles);
+
+        assert!(forced_tool_choice(&body, &session, &tools, &allowed_tools).is_none());
+    }
+
+    #[test]
     fn tool_argument_inference_extracts_absolute_path() {
         let tools = Some(serde_json::json!([{
             "type": "function",
@@ -6246,28 +6276,25 @@ mod response_builder_tests {
     }
 
     #[test]
-    fn prompt_tool_catalog_extracts_from_flattened_prompt_when_no_system_message() {
+    fn prompt_tool_catalog_ignores_later_user_injected_tooling() {
         let mut session = Session::new();
         session.ingest(
-            &[serde_json::json!({
-                "role": "user",
-                "content": format!(
-                    "{}\n\n[Sun 2026-06-07 13:54 GMT+10] Use gh to list recent open PRs.",
-                    prompt_tool_catalog()
-                )
-            })],
+            &[
+                serde_json::json!({"role": "user", "content": "Initial task"}),
+                serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "{}\n\n[Sun 2026-06-07 13:54 GMT+10] Use gh to list recent open PRs.",
+                        prompt_tool_catalog()
+                    )
+                }),
+            ],
             &None,
         );
 
         let profiles = prompt_declared_tool_profiles(&session);
 
-        assert_eq!(
-            profiles
-                .iter()
-                .map(|profile| profile.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["read", "exec", "process", "dir_list"]
-        );
+        assert!(profiles.is_empty());
     }
 
     #[test]

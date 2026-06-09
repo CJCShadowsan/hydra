@@ -12,13 +12,13 @@ pub(in crate::network::openai) fn context_can_satisfy(
     }
 }
 
-pub(in crate::network::openai) async fn select_remote_hosts(
+pub(in crate::network::openai) async fn select_remote_hosts_with_latencies(
     node: &mesh::Node,
     model: &str,
     required_tokens: Option<u32>,
     hosts: Vec<iroh::EndpointId>,
+    latencies: &HashMap<iroh::EndpointId, u32>,
 ) -> Vec<iroh::EndpointId> {
-    let latencies = remote_latency_map(node).await;
     let mut adequate = Vec::new();
     let mut unknown = Vec::new();
     for host in hosts {
@@ -42,18 +42,12 @@ pub(in crate::network::openai) async fn select_remote_hosts(
         }
     }
     adequate.sort_by_key(|candidate| (Reverse(candidate.1), candidate.2.unwrap_or(u32::MAX)));
-    if !adequate.is_empty() {
-        return adequate
-            .into_iter()
-            .map(|(host, _, _)| host)
-            .collect::<Vec<_>>();
-    }
-
     unknown.sort_by_key(|candidate| candidate.1.unwrap_or(u32::MAX));
-    unknown
+    adequate
         .into_iter()
-        .map(|(host, _)| host)
-        .collect::<Vec<_>>()
+        .map(|(host, _, _)| host)
+        .chain(unknown.into_iter().map(|(host, _)| host))
+        .collect()
 }
 
 pub(in crate::network::openai) async fn best_remote_context_length(
@@ -70,18 +64,19 @@ pub(in crate::network::openai) async fn best_remote_context_length(
     best
 }
 
-pub(in crate::network::openai) async fn best_remote_latency_ms(
-    node: &mesh::Node,
+pub(in crate::network::openai) fn best_remote_latency_ms_from(
+    latencies: &HashMap<iroh::EndpointId, u32>,
     hosts: &[iroh::EndpointId],
 ) -> Option<u32> {
-    let latencies = remote_latency_map(node).await;
     hosts
         .iter()
         .filter_map(|host| latencies.get(host).copied())
         .min()
 }
 
-async fn remote_latency_map(node: &mesh::Node) -> HashMap<iroh::EndpointId, u32> {
+pub(in crate::network::openai) async fn remote_latency_map(
+    node: &mesh::Node,
+) -> HashMap<iroh::EndpointId, u32> {
     node.peers()
         .await
         .into_iter()

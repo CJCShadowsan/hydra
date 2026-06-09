@@ -32,12 +32,34 @@ fn moa_context_reserve_tokens(body: &serde_json::Value) -> u32 {
 fn body_has_tool_result(body: &serde_json::Value) -> bool {
     body.get("messages")
         .and_then(serde_json::Value::as_array)
-        .map(|messages| {
-            messages.iter().any(|message| {
-                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
-            })
-        })
+        .map(|messages| messages.iter().any(message_has_tool_result))
         .unwrap_or(false)
+}
+
+fn message_has_tool_result(message: &serde_json::Value) -> bool {
+    message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+        || message
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|parts| parts.iter().any(content_block_is_tool_result))
+            .unwrap_or(false)
+}
+
+fn content_block_is_tool_result(part: &serde_json::Value) -> bool {
+    let Some(kind) = part.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    matches!(
+        normalize_content_block_type(kind).as_str(),
+        "toolresult" | "toolresponse"
+    )
+}
+
+fn normalize_content_block_type(kind: &str) -> String {
+    kind.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn body_has_tools(body: &serde_json::Value) -> bool {
@@ -118,6 +140,31 @@ mod tests {
             "messages": [
                 {"role": "user", "content": "read"},
                 {"role": "tool", "content": "large output"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        });
+
+        assert_eq!(
+            moa_required_tokens(&body, Some(2000)),
+            Some(
+                2000 + MOA_DEFAULT_COMPLETION_BUDGET_TOKENS
+                    + MOA_TOOL_RESULT_CONTEXT_RESERVE_TOKENS
+            )
+        );
+    }
+
+    #[test]
+    fn moa_required_tokens_detects_user_wrapped_tool_result_blocks() {
+        let body = serde_json::json!({
+            "model": "mesh",
+            "messages": [
+                {"role": "user", "content": "read"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "toolResult", "id": "call_1", "toolResult": {"value": "large output"}}
+                    ]
+                }
             ],
             "tools": [{"type": "function", "function": {"name": "read_file"}}],
         });

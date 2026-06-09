@@ -18,6 +18,7 @@ use context_budget::moa_required_tokens;
 use mesh_mixture_of_agents as moa;
 use progress::ProgressContinuation;
 use remote_backend::RemoteModelBackend;
+use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -388,12 +389,14 @@ pub async fn build_moa_config(
     let mut backends: Vec<std::sync::Arc<dyn moa::ModelBackend>> = Vec::new();
     let mut models: Vec<moa::ModelEntry> = Vec::new();
     let mut local_count = 0usize;
+    let remote_latencies = context_selection::remote_latency_map(node).await;
     let resolution = WorkerBackendResolution {
         node,
         targets,
         http: &http,
         required_tokens,
         prefer_strong_workers,
+        remote_latencies,
     };
 
     let total_groups =
@@ -478,6 +481,7 @@ async fn add_ranked_worker_backends(
         resolution.node,
         resolution.targets,
         resolution.prefer_strong_workers,
+        &resolution.remote_latencies,
         group_aliases_by_canonical_base(all_models, resolution.targets),
     )
     .await;
@@ -608,11 +612,12 @@ async fn rank_worker_groups(
     node: &mesh::Node,
     targets: Option<&election::ModelTargets>,
     prefer_strong_workers: bool,
+    remote_latencies: &HashMap<iroh::EndpointId, u32>,
     groups: Vec<Vec<String>>,
 ) -> Vec<Vec<String>> {
     let mut ranked = Vec::with_capacity(groups.len());
     for aliases in groups {
-        ranked.push(worker_group_rank(node, targets, aliases).await);
+        ranked.push(worker_group_rank(node, targets, remote_latencies, aliases).await);
     }
     ranked.sort_by(|left, right| compare_worker_groups(left, right, prefer_strong_workers));
     ranked.into_iter().map(|rank| rank.aliases).collect()
@@ -621,6 +626,7 @@ async fn rank_worker_groups(
 async fn worker_group_rank(
     node: &mesh::Node,
     targets: Option<&election::ModelTargets>,
+    remote_latencies: &HashMap<iroh::EndpointId, u32>,
     aliases: Vec<String>,
 ) -> WorkerGroupRank {
     let mut has_local = false;
@@ -644,7 +650,7 @@ async fn worker_group_rank(
         );
         best_latency_ms = min_optional_latency(
             best_latency_ms,
-            context_selection::best_remote_latency_ms(node, &remote_hosts).await,
+            context_selection::best_remote_latency_ms_from(remote_latencies, &remote_hosts),
         );
     }
 
@@ -732,6 +738,7 @@ struct WorkerBackendResolution<'a> {
     http: &'a reqwest::Client,
     required_tokens: Option<u32>,
     prefer_strong_workers: bool,
+    remote_latencies: HashMap<iroh::EndpointId, u32>,
 }
 
 async fn add_worker_backend(
@@ -741,11 +748,12 @@ async fn add_worker_backend(
     models: &mut Vec<moa::ModelEntry>,
     local_count: &mut usize,
 ) -> bool {
-    let remote_hosts = context_selection::select_remote_hosts(
+    let remote_hosts = context_selection::select_remote_hosts_with_latencies(
         resolution.node,
         name,
         resolution.required_tokens,
         resolution.node.hosts_for_model(name).await,
+        &resolution.remote_latencies,
     )
     .await;
 
