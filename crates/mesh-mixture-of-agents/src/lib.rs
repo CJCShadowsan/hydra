@@ -302,34 +302,46 @@ async fn handle_query(
     start: Instant,
 ) -> TurnResult {
     let assignments = worker::assign_roles(&config.models);
-    let grace_mode = grace_mode_for_turn(session, has_tools, prompt_tool_profiles);
+    let tools_blocked = user_text_blocks_any_tool_conversion(&session.active_user_text());
+    if tools_blocked && has_tools {
+        tracing::info!("moa: active user turn explicitly disables tools");
+    }
+    let active_has_tools = has_tools && !tools_blocked;
+    let active_allowed_tools = if tools_blocked { &[] } else { allowed_tools };
+    let active_prompt_tool_profiles = if tools_blocked {
+        &[]
+    } else {
+        prompt_tool_profiles
+    };
+    let active_forced_tool = forced_tool.filter(|_| !tools_blocked);
+    let grace_mode = grace_mode_for_turn(session, active_has_tools, active_prompt_tool_profiles);
     let continuation_tool = prior_shell_command_tool_choice(
         session,
         &tools_value(session),
-        allowed_tools,
-        prompt_tool_profiles,
+        active_allowed_tools,
+        active_prompt_tool_profiles,
     );
-    let query_uses_tools = forced_tool.is_some()
+    let query_uses_tools = active_forced_tool.is_some()
         || continuation_tool.is_some()
         || matches!(grace_mode, GraceMode::Tool);
-    let selected_tool_names = if let Some(tool) = forced_tool {
+    let selected_tool_names = if let Some(tool) = active_forced_tool {
         vec![tool.name.clone()]
     } else if let Some(tool) = continuation_tool.as_ref() {
         vec![tool.name.clone()]
     } else if query_uses_tools {
-        selected_tool_names_for_turn(session, allowed_tools, prompt_tool_profiles)
+        selected_tool_names_for_turn(session, active_allowed_tools, active_prompt_tool_profiles)
     } else {
         Vec::new()
     };
-    let intent_required_tool = if forced_tool.is_none() && query_uses_tools {
+    let intent_required_tool = if active_forced_tool.is_none() && query_uses_tools {
         required_tool_choice_for_intent(session, &tools_value(session), &selected_tool_names)
     } else {
         None
     };
-    let required_tool = forced_tool
+    let required_tool = active_forced_tool
         .or(continuation_tool.as_ref())
         .or(intent_required_tool.as_ref());
-    if let Some(tool) = required_tool.filter(|_| has_tools) {
+    if let Some(tool) = required_tool.filter(|_| active_has_tools) {
         tracing::info!(
             "moa: direct tool call for explicit {} intent",
             tool.name.as_str()
@@ -339,7 +351,7 @@ async fn handle_query(
             &tool.fallback_arguments,
             session.tools(),
             &selected_tool_names,
-            prompt_tool_profiles,
+            active_prompt_tool_profiles,
             Some(&session.last_user_text()),
         );
         return TurnResult {
@@ -404,7 +416,7 @@ async fn handle_query(
         &mut join_set,
         &dispatched,
         query_uses_tools,
-        allowed_tools,
+        active_allowed_tools,
         session.tools(),
         config.first_answer_grace,
         grace_mode,
@@ -435,8 +447,8 @@ async fn handle_query(
             has_tools: query_uses_tools,
             selected_tool_names: &selected_tool_names,
             forced_tool: required_tool,
-            allowed_tools,
-            prompt_tool_profiles,
+            allowed_tools: active_allowed_tools,
+            prompt_tool_profiles: active_prompt_tool_profiles,
         },
     )
     .await;
@@ -5571,6 +5583,19 @@ fn tool_proposal_response(
     prompt_tool_profiles: &[PromptToolProfile],
     user_text: Option<&str>,
 ) -> Value {
+    if !response_text_tool_conversion_allowed(user_text) {
+        if output.payload.trim().is_empty()
+            || normalize::is_silent_reply_sentinel(&output.payload)
+            || looks_like_unusable_pseudo_tool_text(&output.payload)
+        {
+            return error_response(
+                "MoA reducer returned no usable answer",
+                MOA_ERR_NO_USABLE_ANSWER,
+            );
+        }
+        return chat_response(&output.payload);
+    }
+
     if let (true, Some(name)) = (has_tools, output.tool_name.as_ref()) {
         let args = output.tool_arguments.as_ref().unwrap_or(&Value::Null);
         match validate_response_tool_arguments_for_prompt(
@@ -5631,6 +5656,9 @@ fn chat_or_schema_command_tool_response(
         );
         return tool_call_response(&tool.name, &arguments);
     }
+    if !response_text_tool_conversion_allowed(user_text) {
+        return chat_response(content);
+    }
     if let Some(response) = rescued_tool_call_response(content, tools, allowed_tools) {
         return response;
     }
@@ -5681,6 +5709,33 @@ fn chat_or_schema_command_tool_response(
     }
 
     chat_response(content)
+}
+
+fn response_text_tool_conversion_allowed(user_text: Option<&str>) -> bool {
+    !user_text.is_some_and(user_text_blocks_any_tool_conversion)
+}
+
+fn user_text_blocks_any_tool_conversion(user_text: &str) -> bool {
+    let text = latest_user_request_tail(user_text).to_ascii_lowercase();
+    contains_any(
+        &text,
+        &[
+            "don't call tools",
+            "do not call tools",
+            "dont call tools",
+            "don't call any tools",
+            "do not call any tools",
+            "dont call any tools",
+            "don't use tools",
+            "do not use tools",
+            "dont use tools",
+            "don't use any tools",
+            "do not use any tools",
+            "dont use any tools",
+            "no tools",
+            "without tools",
+        ],
+    )
 }
 
 fn response_is_invalid_pseudo_tool_failure(response: &Value) -> bool {
@@ -6799,6 +6854,30 @@ mod response_builder_tests {
             resp.pointer("/choices/0/message/tool_calls/0/function/name")
                 .and_then(Value::as_str),
             Some("read_file")
+        );
+    }
+
+    #[test]
+    fn tool_proposal_response_respects_user_no_tools_instruction() {
+        let tools = read_file_tool_schema();
+        let allowed_tools = ["read_file".to_string()];
+        let resp = tool_proposal_response(
+            &tool_proposal("This is only an example."),
+            true,
+            Some(&tools),
+            &allowed_tools,
+            &[],
+            Some("Do not call any tools. Explain the example."),
+        );
+
+        assert!(
+            resp.pointer("/choices/0/message/tool_calls").is_none(),
+            "no-tools user turns must not emit native tool calls: {resp}"
+        );
+        assert_eq!(
+            resp.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
         );
     }
 
@@ -10413,6 +10492,87 @@ mod response_builder_tests {
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str),
             Some(content)
+        );
+    }
+
+    #[test]
+    fn negated_tool_request_does_not_repair_xml_envelope_into_tool_call() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Execute shell commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }]));
+        let content = "<tool_call><invoke name=\"shell\"><parameter name=\"command\">pwd</parameter></invoke></tool_call>";
+        let response = chat_or_schema_command_tool_response(
+            content,
+            tools.as_ref(),
+            &["shell".to_string()],
+            &[],
+            Some("Do not call any tools. Explain this example."),
+        );
+
+        assert!(
+            response.pointer("/choices/0/message/tool_calls").is_none(),
+            "negated tool turns must not be repaired into tool calls: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn negated_tool_request_does_not_repair_json_example_into_tool_call() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Execute shell commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }]));
+        let content =
+            r#"This is only an example: {"function":"shell","arguments":{"command":"pwd"}}"#;
+        let response = chat_or_schema_command_tool_response(
+            content,
+            tools.as_ref(),
+            &["shell".to_string()],
+            &[],
+            Some("Do not call any tools. Explain this JSON example."),
+        );
+
+        assert!(
+            response.pointer("/choices/0/message/tool_calls").is_none(),
+            "negated JSON examples must not be repaired into tool calls: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
         );
     }
 
