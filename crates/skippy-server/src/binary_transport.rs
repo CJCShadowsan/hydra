@@ -29,7 +29,7 @@ use skippy_protocol::{
         StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage,
         WireActivationDType, WireMessageKind, WireReplyKind,
         activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
-        send_reply_ack, send_reply_ack_with_stats, state_flags,
+        send_reply_ack, send_reply_ack_with_stats, state_flags, write_stage_message,
     },
 };
 use skippy_runtime::{
@@ -38,6 +38,7 @@ use skippy_runtime::{
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+mod activation_stripes;
 pub(crate) mod direct_return;
 pub(crate) mod forwarding;
 mod kv_eviction;
@@ -45,6 +46,7 @@ mod options;
 mod socket;
 mod wire;
 
+use self::activation_stripes::{ActivationStripeFrameKey, ActivationStripeHub};
 pub use self::direct_return::PredictionReturnHub;
 pub use self::direct_return::PredictionReturnListener;
 pub(crate) use self::direct_return::PredictionReturnReceiver;
@@ -58,9 +60,40 @@ use self::kv_eviction::{
 pub use self::options::{BinaryStageOptions, EmbeddedOpenAiStageOptions, parse_wire_dtype};
 use self::socket::*;
 pub use self::wire::WireCondition;
-pub(crate) use self::wire::write_stage_message_conditioned;
+pub(crate) use self::wire::{
+    should_stripe_activation, write_stage_message_conditioned, write_stage_message_striped_tcp,
+};
 
 static BINARY_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy)]
+struct DownstreamActivationStripeConfig {
+    stream_count: usize,
+    max_chunk_bytes: usize,
+}
+
+impl DownstreamActivationStripeConfig {
+    fn new(stream_count: usize, chunk_mib: usize) -> Result<Self> {
+        if stream_count == 0 {
+            bail!("downstream activation stripe stream count must be greater than zero");
+        }
+        let max_chunk_bytes = chunk_mib
+            .checked_mul(1024)
+            .and_then(|value| value.checked_mul(1024))
+            .context("downstream activation stripe chunk size overflow")?;
+        if max_chunk_bytes == 0 {
+            bail!("downstream activation stripe chunk size must be greater than zero");
+        }
+        Ok(Self {
+            stream_count,
+            max_chunk_bytes,
+        })
+    }
+
+    fn enabled(self) -> bool {
+        self.stream_count > 1
+    }
+}
 
 #[derive(Default)]
 struct BinaryKvLookupResult {
@@ -190,9 +223,15 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         reply_credit_limit,
         async_prefill_forward,
         downstream_wire_condition,
+        downstream_activation_stripes,
+        downstream_activation_stripe_chunk_mib,
         downstream_connect_timeout_secs,
         openai,
     } = options;
+    let downstream_activation_stripe_config = DownstreamActivationStripeConfig::new(
+        downstream_activation_stripes,
+        downstream_activation_stripe_chunk_mib,
+    )?;
     validate_config(&config, topology.as_ref())?;
     let max_inflight = config.lane_count as usize;
     let telemetry = Telemetry::new(
@@ -232,6 +271,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
     }
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
     let prediction_returns = Arc::new(PredictionReturnHub::default());
+    let activation_stripes = ActivationStripeHub::default();
     let listener = TcpListener::bind(bind_addr)?;
     listener.set_nonblocking(true)?;
     if let Some(openai_options) = openai {
@@ -304,6 +344,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         let kv = kv.clone();
         let telemetry = telemetry.clone();
         let prediction_returns = prediction_returns.clone();
+        let activation_stripes = activation_stripes.clone();
         thread::spawn(move || {
             let connection_result = (|| -> Result<()> {
                 send_ready(&mut upstream).context("failed to send binary ready")?;
@@ -312,6 +353,9 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                     Err(error) => return Err(error.into()),
                 };
+                if first_message.kind == WireMessageKind::ActivationStripeOpen {
+                    return activation_stripes.push_stream_chunks(upstream);
+                }
                 if first_message.kind == WireMessageKind::PredictionReturnOpen {
                     return prediction_returns.handle_return_connection(first_message, upstream);
                 }
@@ -331,8 +375,10 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     reply_credit_limit,
                     async_prefill_forward,
                     downstream_wire_condition,
+                    downstream_activation_stripe_config,
                     downstream_connect_timeout_secs,
                     first_message,
+                    &activation_stripes,
                 )
             })()
             .context("binary stage connection failed");
@@ -373,13 +419,26 @@ fn handle_binary_connection(
     reply_credit_limit: Option<usize>,
     async_prefill_forward: bool,
     downstream_wire_condition: WireCondition,
+    downstream_activation_stripe_config: DownstreamActivationStripeConfig,
     downstream_connect_timeout_secs: u64,
     first_message: StageWireMessage,
+    activation_stripes: &ActivationStripeHub,
 ) -> Result<()> {
     if let Some(downstream) = downstream.as_mut() {
         skippy_protocol::binary::recv_ready(&mut *downstream)
             .context("downstream binary stage did not become ready")?;
     }
+    let stripe_frame_counter = Arc::new(AtomicU64::new(1));
+    let mut downstream_activation_stripe_streams = if downstream.is_some() {
+        open_downstream_activation_stripe_streams(
+            config,
+            downstream_connect_timeout_secs,
+            wire_dtype,
+            downstream_activation_stripe_config.stream_count,
+        )?
+    } else {
+        Vec::new()
+    };
 
     let connection_session_id = BINARY_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let max_deferred_prefill_replies =
@@ -393,7 +452,17 @@ fn handle_binary_connection(
     let mut async_forwarder = if async_prefill_forward {
         downstream
             .as_ref()
-            .map(|downstream| AsyncForwarder::new(downstream, telemetry.clone()))
+            .map(|downstream| {
+                AsyncForwarder::new(
+                    downstream,
+                    config,
+                    wire_dtype,
+                    downstream_connect_timeout_secs,
+                    downstream_activation_stripe_config,
+                    stripe_frame_counter.clone(),
+                    telemetry.clone(),
+                )
+            })
             .transpose()
             .context("create async activation forwarder")?
     } else {
@@ -418,6 +487,15 @@ fn handle_binary_connection(
                 Err(error) => return Err(error).context("read binary stage message"),
             }
         };
+        if message.state.uses_striped_activation() {
+            let frame_id = striped_activation_frame_id(&message)?;
+            message.activation = activation_stripes
+                .take_complete(
+                    ActivationStripeFrameKey::new(message.request_id, message.session_id, frame_id),
+                    Duration::from_secs(300),
+                )
+                .context("reassemble striped activation frame")?;
+        }
         let recv_end_unix_nanos = now_unix_nanos() as u64;
         let recv_read_ms = elapsed_ms(recv_started);
         let message_start_unix_nanos = now_unix_nanos() as u64;
@@ -1142,8 +1220,11 @@ fn handle_binary_connection(
                 }
                 let downstream_write_start_unix_nanos = now_unix_nanos() as u64;
                 let downstream_write_started = Instant::now();
-                write_stage_message_conditioned(
-                    &mut *downstream,
+                let striped_chunks = write_forwarded_activation_downstream(
+                    downstream,
+                    &mut downstream_activation_stripe_streams,
+                    &stripe_frame_counter,
+                    downstream_activation_stripe_config,
                     &forwarded.message,
                     wire_dtype,
                     downstream_wire_condition,
@@ -1151,6 +1232,10 @@ fn handle_binary_connection(
                 .context("forward activation frame downstream")?;
                 let downstream_write_end_unix_nanos = now_unix_nanos() as u64;
                 if telemetry.is_debug_enabled() {
+                    downstream_write_attrs.insert(
+                        "llama_stage.forward_striped_activation_chunks".to_string(),
+                        json!(striped_chunks),
+                    );
                     downstream_write_attrs.insert(
                         "llama_stage.forward_write_ms".to_string(),
                         json!(elapsed_ms(downstream_write_started)),
@@ -2940,17 +3025,35 @@ struct AsyncForwardJob {
 }
 
 impl AsyncForwarder {
-    fn new(downstream: &TcpStream, telemetry: Telemetry) -> Result<Self> {
+    fn new(
+        downstream: &TcpStream,
+        config: &StageConfig,
+        wire_dtype: WireActivationDType,
+        downstream_connect_timeout_secs: u64,
+        stripe_config: DownstreamActivationStripeConfig,
+        stripe_frame_counter: Arc<AtomicU64>,
+        telemetry: Telemetry,
+    ) -> Result<Self> {
         let mut writer = downstream
             .try_clone()
             .context("clone downstream stream for async activation forwarding")?;
+        let mut stripe_writers = open_downstream_activation_stripe_streams(
+            config,
+            downstream_connect_timeout_secs,
+            wire_dtype,
+            stripe_config.stream_count,
+        )
+        .context("open async activation stripe streams")?;
         let (sender, receiver) = mpsc::sync_channel::<AsyncForwardJob>(1);
         thread::spawn(move || {
             while let Ok(job) = receiver.recv() {
                 let write_start_unix_nanos = now_unix_nanos() as u64;
                 let write_started = Instant::now();
-                let result = write_stage_message_conditioned(
+                let result = write_forwarded_activation_downstream(
                     &mut writer,
+                    &mut stripe_writers,
+                    &stripe_frame_counter,
+                    stripe_config,
                     &job.message,
                     job.wire_dtype,
                     job.condition,
@@ -2962,13 +3065,19 @@ impl AsyncForwarder {
                     "llama_stage.forward_write_ms".to_string(),
                     json!(elapsed_ms(write_started)),
                 );
+                if let Ok(striped_chunks) = result.as_ref() {
+                    attrs.insert(
+                        "llama_stage.forward_striped_activation_chunks".to_string(),
+                        json!(striped_chunks),
+                    );
+                }
                 telemetry.emit_debug_span(
                     "stage.binary_downstream_write",
                     attrs,
                     write_start_unix_nanos,
                     write_end_unix_nanos,
                 );
-                let _ = job.done.send(result);
+                let _ = job.done.send(result.map(|_| ()));
             }
         });
         Ok(Self {
@@ -3252,6 +3361,73 @@ pub(crate) fn connect_binary_downstream(
         )))
 }
 
+fn open_downstream_activation_stripe_streams(
+    config: &StageConfig,
+    timeout_secs: u64,
+    wire_dtype: WireActivationDType,
+    count: usize,
+) -> Result<Vec<TcpStream>> {
+    if count <= 1 || config.downstream.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let mut streams = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut stream =
+            connect_binary_downstream(config, timeout_secs)?.context("stage has no downstream")?;
+        skippy_protocol::binary::recv_ready(&mut stream)
+            .context("downstream activation stripe did not become ready")?;
+        let open = StageWireMessage {
+            kind: WireMessageKind::ActivationStripeOpen,
+            pos_start: 0,
+            token_count: 0,
+            state: StageStateHeader::new(WireMessageKind::ActivationStripeOpen, wire_dtype),
+            request_id: 0,
+            session_id: 0,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+        write_stage_message(&mut stream, &open, wire_dtype).context("open activation stripe")?;
+        streams.push(stream);
+    }
+    Ok(streams)
+}
+
+fn write_forwarded_activation_downstream(
+    downstream: &mut TcpStream,
+    stripe_streams: &mut [TcpStream],
+    stripe_frame_counter: &AtomicU64,
+    stripe_config: DownstreamActivationStripeConfig,
+    message: &StageWireMessage,
+    wire_dtype: WireActivationDType,
+    downstream_wire_condition: WireCondition,
+) -> Result<usize> {
+    if stripe_config.enabled()
+        && !stripe_streams.is_empty()
+        && should_stripe_activation(message, stripe_config.max_chunk_bytes)
+    {
+        let frame_id = stripe_frame_counter.fetch_add(1, Ordering::Relaxed);
+        return write_stage_message_striped_tcp(
+            downstream,
+            stripe_streams,
+            message,
+            wire_dtype,
+            frame_id,
+            stripe_config.max_chunk_bytes,
+            downstream_wire_condition,
+        )
+        .context("write striped activation frame downstream");
+    }
+
+    write_stage_message_conditioned(downstream, message, wire_dtype, downstream_wire_condition)
+        .context("write inline activation frame downstream")?;
+    Ok(0)
+}
+
 pub(crate) fn run_binary_stage_message(
     runtime: &mut RuntimeState,
     session_id: &str,
@@ -3327,7 +3503,8 @@ pub(crate) fn run_binary_stage_message(
         | WireMessageKind::RestorePrefill
         | WireMessageKind::TryRestorePrefill
         | WireMessageKind::TryRestorePrefillDecode
-        | WireMessageKind::PredictionReturnOpen => {
+        | WireMessageKind::PredictionReturnOpen
+        | WireMessageKind::ActivationStripeOpen => {
             bail!("message kind is not executable")
         }
     }
@@ -3388,6 +3565,13 @@ fn input_activation_frame(
         },
         payload,
     }))
+}
+
+fn striped_activation_frame_id(message: &StageWireMessage) -> Result<u64> {
+    if message.state.checkpoint_generation < 0 {
+        bail!("striped activation frame id must not be negative");
+    }
+    Ok(message.state.checkpoint_generation as u64)
 }
 
 fn empty_activation_frame(config: &StageConfig, message: &StageWireMessage) -> ActivationFrame {

@@ -1,12 +1,11 @@
-use std::{io, thread, time::Duration};
+use std::{io, net::TcpStream, thread, time::Duration};
 
 use anyhow::{Result, bail};
-use skippy_protocol::binary::{StageWireMessage, WireActivationDType, write_stage_message};
-
-#[cfg(test)]
 use skippy_protocol::binary::{
-    state_flags, stripe_activation_payload, write_activation_stripe_chunk,
+    StageWireMessage, WireActivationDType, state_flags, stripe_activation_payload,
+    write_activation_stripe_chunk, write_stage_message,
 };
+use std::io::Error;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WireCondition {
@@ -48,16 +47,58 @@ pub(crate) fn write_stage_message_conditioned(
     write_stage_message(writer, message, dtype)
 }
 
-#[cfg(test)]
-fn should_stripe_activation(message: &StageWireMessage, threshold_bytes: usize) -> bool {
+pub(crate) fn should_stripe_activation(message: &StageWireMessage, threshold_bytes: usize) -> bool {
     threshold_bytes > 0
         && message.kind.is_prefill()
         && message.state.source_stage_index >= 0
         && message.activation.len() >= threshold_bytes
 }
 
+pub(crate) fn write_stage_message_striped_tcp(
+    control_writer: &mut TcpStream,
+    stripe_writers: &mut [TcpStream],
+    message: &StageWireMessage,
+    dtype: WireActivationDType,
+    frame_id: u64,
+    max_chunk_bytes: usize,
+    condition: WireCondition,
+) -> io::Result<usize> {
+    if stripe_writers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "striped activation requires at least one stripe writer",
+        ));
+    }
+    let (control, chunks) = striped_control_and_chunks(message, frame_id, max_chunk_bytes)?;
+    write_stage_message_conditioned(control_writer, &control, dtype, condition)?;
+
+    let mut groups = vec![Vec::new(); stripe_writers.len()];
+    for (index, chunk) in chunks.iter().cloned().enumerate() {
+        let writer_index = index % stripe_writers.len();
+        groups[writer_index].push(chunk);
+    }
+    thread::scope(|scope| -> io::Result<()> {
+        let mut handles = Vec::with_capacity(stripe_writers.len());
+        for (writer, group) in stripe_writers.iter_mut().zip(groups) {
+            handles.push(scope.spawn(move || -> io::Result<()> {
+                for chunk in &group {
+                    write_activation_stripe_chunk(&mut *writer, chunk)?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| Error::other("activation stripe writer panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(chunks.len())
+}
+
 #[cfg(test)]
-fn write_stage_message_striped(
+fn write_stage_message_striped_buffered(
     control_writer: &mut dyn io::Write,
     stripe_writers: &mut [&mut dyn io::Write],
     message: &StageWireMessage,
@@ -72,6 +113,24 @@ fn write_stage_message_striped(
             "striped activation requires at least one stripe writer",
         ));
     }
+    let (control, chunks) = striped_control_and_chunks(message, frame_id, max_chunk_bytes)?;
+    write_stage_message_conditioned(control_writer, &control, dtype, condition)?;
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        let writer_index = index % stripe_writers.len();
+        write_activation_stripe_chunk(&mut stripe_writers[writer_index], chunk)?;
+    }
+    Ok(chunks.len())
+}
+
+fn striped_control_and_chunks(
+    message: &StageWireMessage,
+    frame_id: u64,
+    max_chunk_bytes: usize,
+) -> io::Result<(
+    StageWireMessage,
+    Vec<skippy_protocol::binary::StageActivationStripeChunk>,
+)> {
     let chunks = stripe_activation_payload(
         message.request_id,
         message.session_id,
@@ -82,13 +141,9 @@ fn write_stage_message_striped(
     let mut control = message.clone();
     control.activation.clear();
     control.state.flags |= state_flags::STRIPED_ACTIVATION;
-    write_stage_message_conditioned(control_writer, &control, dtype, condition)?;
-
-    for (index, chunk) in chunks.iter().enumerate() {
-        let writer_index = index % stripe_writers.len();
-        write_activation_stripe_chunk(&mut stripe_writers[writer_index], chunk)?;
-    }
-    Ok(chunks.len())
+    control.state.checkpoint_generation = i32::try_from(frame_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "stripe frame id exceeds i32"))?;
+    Ok((control, chunks))
 }
 
 #[cfg(test)]
@@ -141,7 +196,7 @@ mod tests {
         let mut stripe_b = Vec::new();
         let mut writers: Vec<&mut dyn io::Write> = vec![&mut stripe_a, &mut stripe_b];
 
-        let chunk_count = write_stage_message_striped(
+        let chunk_count = write_stage_message_striped_buffered(
             &mut control,
             &mut writers,
             &message,
@@ -155,6 +210,7 @@ mod tests {
         assert_eq!(chunk_count, 4);
         let control_message = read_stage_message(Cursor::new(control), 4).unwrap();
         assert!(control_message.state.uses_striped_activation());
+        assert_eq!(control_message.state.checkpoint_generation, 99);
         assert!(control_message.activation.is_empty());
         assert_eq!(control_message.tokens, vec![1, 2, 3, 4]);
 

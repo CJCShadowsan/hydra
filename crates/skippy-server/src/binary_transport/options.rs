@@ -21,6 +21,8 @@ pub struct BinaryStageOptions {
     pub reply_credit_limit: Option<usize>,
     pub async_prefill_forward: bool,
     pub downstream_wire_condition: WireCondition,
+    pub downstream_activation_stripes: usize,
+    pub downstream_activation_stripe_chunk_mib: usize,
     pub downstream_connect_timeout_secs: u64,
     pub openai: Option<EmbeddedOpenAiStageOptions>,
 }
@@ -57,6 +59,12 @@ impl BinaryStageOptions {
         let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
         let downstream_wire_condition =
             WireCondition::new(args.downstream_wire_delay_ms, args.downstream_wire_mbps)?;
+        if args.downstream_activation_stripes == 0 {
+            bail!("--downstream-activation-stripes must be greater than zero");
+        }
+        if args.downstream_activation_stripe_chunk_mib == 0 {
+            bail!("--downstream-activation-stripe-chunk-mib must be greater than zero");
+        }
         let config = load_json::<StageConfig>(&args.config)
             .with_context(|| format!("load stage config {}", args.config.display()))?;
         let topology = match args.topology.as_ref() {
@@ -98,6 +106,8 @@ impl BinaryStageOptions {
             reply_credit_limit: args.reply_credit_limit,
             async_prefill_forward: args.async_prefill_forward || !args.no_async_prefill_forward,
             downstream_wire_condition,
+            downstream_activation_stripes: args.downstream_activation_stripes,
+            downstream_activation_stripe_chunk_mib: args.downstream_activation_stripe_chunk_mib,
             downstream_connect_timeout_secs: args.downstream_connect_timeout_secs,
             openai,
         })

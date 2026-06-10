@@ -78,6 +78,18 @@ pub struct ServeBinaryArgs {
         help = "Artificial downstream activation bandwidth cap in megabits per second."
     )]
     pub downstream_wire_mbps: Option<f64>,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Number of downstream activation stripe streams. 1 keeps inline activation frames."
+    )]
+    pub downstream_activation_stripes: usize,
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Maximum downstream activation stripe chunk size in MiB."
+    )]
+    pub downstream_activation_stripe_chunk_mib: usize,
     #[arg(long, default_value_t = 60)]
     pub downstream_connect_timeout_secs: u64,
     #[arg(

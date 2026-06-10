@@ -1242,6 +1242,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
             reply_credit_limit: None,
             async_prefill_forward: false,
             downstream_wire_condition: WireCondition::new(0.0, None)?,
+            downstream_activation_stripes: 1,
+            downstream_activation_stripe_chunk_mib: 4,
             downstream_connect_timeout_secs: 5,
             openai: None,
         });

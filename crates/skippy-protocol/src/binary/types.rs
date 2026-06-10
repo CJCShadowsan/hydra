@@ -64,6 +64,7 @@ pub enum WireMessageKind {
     TryRestorePrefillDecode = 18,
     TrimSession = 19,
     PredictionReturnOpen = 20,
+    ActivationStripeOpen = 21,
 }
 
 impl WireMessageKind {
@@ -145,6 +146,7 @@ impl TryFrom<i32> for WireMessageKind {
             18 => Ok(Self::TryRestorePrefillDecode),
             19 => Ok(Self::TrimSession),
             20 => Ok(Self::PredictionReturnOpen),
+            21 => Ok(Self::ActivationStripeOpen),
             _ => Err(invalid_data("unknown stage message kind")),
         }
     }
@@ -322,7 +324,9 @@ impl StageStateHeader {
     pub fn matches_kind(self, kind: WireMessageKind) -> bool {
         if matches!(
             kind,
-            WireMessageKind::StateImport | WireMessageKind::StateExport
+            WireMessageKind::StateImport
+                | WireMessageKind::StateExport
+                | WireMessageKind::ActivationStripeOpen
         ) || kind.is_session_control()
             || kind.is_generation_control()
         {
@@ -658,7 +662,9 @@ fn expected_phase(kind: WireMessageKind) -> WireStagePhase {
     if kind.is_prefill()
         || matches!(
             kind,
-            WireMessageKind::StateImport | WireMessageKind::StateExport
+            WireMessageKind::StateImport
+                | WireMessageKind::StateExport
+                | WireMessageKind::ActivationStripeOpen
         )
         || kind.is_session_control()
         || kind.is_generation_control()

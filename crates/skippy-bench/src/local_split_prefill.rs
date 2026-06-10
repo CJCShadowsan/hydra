@@ -1,15 +1,16 @@
 use std::{
-    fs,
+    fs, io,
     process::Command,
+    thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 use skippy_protocol::binary::{
-    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind, recv_reply,
-    write_stage_message,
+    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind, recv_reply, state_flags,
+    stripe_activation_payload, write_activation_stripe_chunk, write_stage_message,
 };
 use skippy_runtime::{RuntimeConfig, RuntimeLoadMode, StageModel};
 
@@ -37,6 +38,7 @@ struct PrefillTotals {
     runtime_payload_bytes: u64,
     max_wire_payload_bytes: usize,
     max_runtime_payload_bytes: u64,
+    stripe_chunk_count: usize,
 }
 
 #[derive(Serialize)]
@@ -54,6 +56,9 @@ struct PrefillRunReport {
     runtime_payload_bytes: u64,
     max_chunk_wire_payload_bytes: usize,
     max_chunk_runtime_payload_bytes: u64,
+    transport_mode: String,
+    activation_stripes: usize,
+    stripe_chunk_count: usize,
 }
 
 #[derive(Serialize)]
@@ -68,6 +73,9 @@ struct PrefillSummary {
     mean_wire_payload_bytes: f64,
     max_chunk_wire_payload_bytes: usize,
     max_chunk_runtime_payload_bytes: u64,
+    transport_mode: String,
+    activation_stripes: usize,
+    stripe_chunk_count: usize,
 }
 
 pub fn local_split_prefill_binary(args: LocalSplitPrefillBinaryArgs) -> Result<()> {
@@ -122,6 +130,8 @@ pub fn local_split_prefill_binary(args: LocalSplitPrefillBinaryArgs) -> Result<(
             "activation_width": activation_width,
             "wire_dtype": args.activation_wire_dtype,
             "prefill_chunk_size": args.prefill_chunk_size,
+            "activation_stripes": args.activation_stripes,
+            "activation_stripe_chunk_mib": args.activation_stripe_chunk_mib,
             "repetitions": args.repetitions,
             "results": runs,
             "summary": summaries,
@@ -145,6 +155,12 @@ fn validate_args(args: &LocalSplitPrefillBinaryArgs) -> Result<()> {
     }
     if args.repetitions == 0 {
         bail!("repetitions must be greater than zero");
+    }
+    if args.activation_stripes == 0 {
+        bail!("activation_stripes must be greater than zero");
+    }
+    if args.activation_stripe_chunk_mib == 0 {
+        bail!("activation_stripe_chunk_mib must be greater than zero");
     }
     Ok(())
 }
@@ -304,6 +320,16 @@ fn run_prefill_case(
         token_ids.len(),
     )
     .context("send prefill generation config")?;
+    let mut stripe_streams = if args.activation_stripes > 1 {
+        open_activation_stripe_streams(
+            args.stage1_bind_addr,
+            args.startup_timeout_secs,
+            wire_dtype,
+            args.activation_stripes,
+        )?
+    } else {
+        Vec::new()
+    };
 
     let started = Instant::now();
     let mut totals = PrefillTotals::default();
@@ -342,9 +368,22 @@ fn run_prefill_case(
             .max_runtime_payload_bytes
             .max(boundary.desc.payload_bytes);
 
+        let frame_id = u64::try_from(chunk_index + 1).context("stripe frame id overflow")?;
         let write_started = Instant::now();
-        write_stage_message(&mut stream, &message, wire_dtype)
-            .context("send real split prefill activation")?;
+        if stripe_streams.is_empty() {
+            write_stage_message(&mut stream, &message, wire_dtype)
+                .context("send real split prefill activation")?;
+        } else {
+            totals.stripe_chunk_count += write_striped_stage_message(
+                &mut stream,
+                &mut stripe_streams,
+                &message,
+                wire_dtype,
+                frame_id,
+                args.activation_stripe_chunk_mib * 1024 * 1024,
+            )
+            .context("send real split striped prefill activation")?;
+        }
         totals.write += write_started.elapsed();
         let ack_started = Instant::now();
         let reply = recv_reply(&mut stream).context("receive real split prefill ACK")?;
@@ -374,7 +413,91 @@ fn run_prefill_case(
         runtime_payload_bytes: totals.runtime_payload_bytes,
         max_chunk_wire_payload_bytes: totals.max_wire_payload_bytes,
         max_chunk_runtime_payload_bytes: totals.max_runtime_payload_bytes,
+        transport_mode: if stripe_streams.is_empty() {
+            "inline".to_string()
+        } else {
+            "striped".to_string()
+        },
+        activation_stripes: args.activation_stripes,
+        stripe_chunk_count: totals.stripe_chunk_count,
     })
+}
+
+fn open_activation_stripe_streams(
+    addr: std::net::SocketAddr,
+    timeout_secs: u64,
+    wire_dtype: skippy_protocol::binary::WireActivationDType,
+    count: usize,
+) -> Result<Vec<std::net::TcpStream>> {
+    let mut streams = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut stream = connect_ready(addr, timeout_secs).context("connect activation stripe")?;
+        let open = StageWireMessage {
+            kind: WireMessageKind::ActivationStripeOpen,
+            pos_start: 0,
+            token_count: 0,
+            state: StageStateHeader::new(WireMessageKind::ActivationStripeOpen, wire_dtype),
+            request_id: 0,
+            session_id: 0,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: Vec::new(),
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+        write_stage_message(&mut stream, &open, wire_dtype).context("open activation stripe")?;
+        streams.push(stream);
+    }
+    Ok(streams)
+}
+
+fn write_striped_stage_message(
+    control_stream: &mut std::net::TcpStream,
+    stripe_streams: &mut [std::net::TcpStream],
+    message: &StageWireMessage,
+    wire_dtype: skippy_protocol::binary::WireActivationDType,
+    frame_id: u64,
+    max_chunk_bytes: usize,
+) -> Result<usize> {
+    let chunks = stripe_activation_payload(
+        message.request_id,
+        message.session_id,
+        frame_id,
+        &message.activation,
+        max_chunk_bytes,
+    )?;
+    let mut control = message.clone();
+    control.activation.clear();
+    control.state.flags |= state_flags::STRIPED_ACTIVATION;
+    control.state.checkpoint_generation =
+        i32::try_from(frame_id).context("stripe frame id exceeds i32")?;
+    write_stage_message(control_stream, &control, wire_dtype).context("send stripe control")?;
+
+    let mut groups = vec![Vec::new(); stripe_streams.len()];
+    for (index, chunk) in chunks.iter().cloned().enumerate() {
+        let stream_index = index % stripe_streams.len();
+        groups[stream_index].push(chunk);
+    }
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(stripe_streams.len());
+        for (stream, group) in stripe_streams.iter_mut().zip(groups) {
+            handles.push(scope.spawn(move || -> io::Result<()> {
+                for chunk in &group {
+                    write_activation_stripe_chunk(&mut *stream, chunk)?;
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow!("activation stripe writer panicked"))?
+                .context("write activation stripe chunks")?;
+        }
+        Ok(())
+    })?;
+    Ok(chunks.len())
 }
 
 struct PrefillBoundaryMessageArgs<'a> {
@@ -509,6 +632,15 @@ fn summarize_token_count(runs: &[PrefillRunReport], token_count: usize) -> Optio
             .map(|run| run.max_chunk_runtime_payload_bytes)
             .max()
             .unwrap_or_default(),
+        transport_mode: matches
+            .first()
+            .map(|run| run.transport_mode.clone())
+            .unwrap_or_default(),
+        activation_stripes: matches
+            .first()
+            .map(|run| run.activation_stripes)
+            .unwrap_or_default(),
+        stripe_chunk_count: matches.iter().map(|run| run.stripe_chunk_count).sum(),
     })
 }
 

@@ -434,6 +434,18 @@ pub struct LocalSplitPrefillBinaryArgs {
     pub prefill_chunk_size: usize,
     #[arg(long, default_value_t = 1)]
     pub repetitions: usize,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Number of live activation stripe streams. 1 keeps the inline path."
+    )]
+    pub activation_stripes: usize,
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Maximum activation stripe chunk size in MiB."
+    )]
+    pub activation_stripe_chunk_mib: usize,
     #[arg(long, default_value = "127.0.0.1:19041")]
     pub stage1_bind_addr: SocketAddr,
     #[arg(long, default_value = "f16")]
