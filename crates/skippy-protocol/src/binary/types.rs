@@ -189,6 +189,7 @@ pub mod state_flags {
     pub const CHAT_SAMPLING_METADATA: i32 = 1 << 5;
     pub const RWKV7_V_FIRST_SIDEBAND: i32 = 1 << 6;
     pub const GEMMA3N_ALTUP_SIDEBAND: i32 = 1 << 7;
+    pub const STRIPED_ACTIVATION: i32 = 1 << 8;
 }
 
 pub const ACTIVATION_FLAG_RWKV7_V_FIRST: u64 = 1 << 0;
@@ -312,6 +313,10 @@ impl StageStateHeader {
 
     pub fn dtype(self) -> io::Result<WireActivationDType> {
         WireActivationDType::try_from(self.reserved)
+    }
+
+    pub fn uses_striped_activation(self) -> bool {
+        (self.flags & state_flags::STRIPED_ACTIVATION) != 0
     }
 
     pub fn matches_kind(self, kind: WireMessageKind) -> bool {

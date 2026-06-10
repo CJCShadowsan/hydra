@@ -174,6 +174,14 @@ pub fn write_stage_message(
     for position in &message.positions {
         write_i32(&mut writer, *position)?;
     }
+    if state.uses_striped_activation() {
+        if !message.activation.is_empty() {
+            return Err(invalid_input(
+                "striped activation control message must not carry inline activation bytes",
+            ));
+        }
+        return Ok(());
+    }
     writer.write_all(&message.activation)?;
     Ok(())
 }
@@ -276,12 +284,14 @@ pub fn read_stage_message(mut reader: impl Read, n_embd: i32) -> io::Result<Stag
     for _ in 0..position_sideband_count {
         positions.push(read_i32(&mut reader)?);
     }
-    let activation_bytes =
-        if state.source_stage_index < 0 || kind.is_activationless_prefix_cache_control() {
-            0
-        } else {
-            activation_wire_bytes_with_state_flags(dtype, token_count, n_embd, state.flags)?
-        };
+    let activation_bytes = if state.source_stage_index < 0
+        || kind.is_activationless_prefix_cache_control()
+        || state.uses_striped_activation()
+    {
+        0
+    } else {
+        activation_wire_bytes_with_state_flags(dtype, token_count, n_embd, state.flags)?
+    };
     if activation_bytes > MAX_STAGE_ACTIVATION_BYTES {
         return Err(invalid_data(
             "activation payload byte count exceeds maximum",

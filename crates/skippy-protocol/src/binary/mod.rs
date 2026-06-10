@@ -1,5 +1,6 @@
 mod activation;
 mod codec;
+mod striping;
 mod types;
 
 pub use activation::{
@@ -11,6 +12,12 @@ pub use codec::{
     read_stage_message, recv_ready, recv_reply, send_ready, send_reply_ack,
     send_reply_ack_with_stats, send_reply_predicted, send_reply_predicted_tokens_with_stats,
     send_reply_predicted_with_stats, write_stage_message,
+};
+pub use striping::{
+    ACTIVATION_STRIPE_CHUNK_MAGIC, ACTIVATION_STRIPE_CHUNK_VERSION,
+    MAX_STAGE_ACTIVATION_STRIPE_CHUNK_BYTES, MAX_STAGE_ACTIVATION_STRIPE_CHUNKS,
+    StageActivationStripeChunk, StageActivationStripeReassembler, read_activation_stripe_chunk,
+    stripe_activation_payload, write_activation_stripe_chunk,
 };
 pub use types::{
     ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_RWKV7_V_FIRST, LLAMA_TOKEN_NULL,
@@ -242,6 +249,67 @@ mod tests {
                 + 2
                 + 3 * std::mem::size_of::<i32>()
                 + 16
+        );
+    }
+
+    #[test]
+    fn striped_activation_control_message_round_trips_without_inline_activation() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::PrefillEmbd, WireActivationDType::F32);
+        state.source_stage_index = 0;
+        state.flags |= state_flags::STRIPED_ACTIVATION;
+        let message = StageWireMessage {
+            kind: WireMessageKind::PrefillEmbd,
+            pos_start: 0,
+            token_count: 2,
+            state,
+            request_id: 7,
+            session_id: 11,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![1, 2],
+            positions: Vec::new(),
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        };
+
+        let mut bytes = Vec::new();
+        write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
+        let decoded = read_stage_message(Cursor::new(bytes), 2).unwrap();
+
+        assert!(decoded.state.uses_striped_activation());
+        assert_eq!(decoded.tokens, vec![1, 2]);
+        assert!(decoded.activation.is_empty());
+    }
+
+    #[test]
+    fn striped_activation_control_rejects_inline_activation_payload() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::PrefillEmbd, WireActivationDType::F32);
+        state.source_stage_index = 0;
+        state.flags |= state_flags::STRIPED_ACTIVATION;
+        let message = StageWireMessage {
+            kind: WireMessageKind::PrefillEmbd,
+            pos_start: 0,
+            token_count: 2,
+            state,
+            request_id: 7,
+            session_id: 11,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![1, 2],
+            positions: Vec::new(),
+            activation: vec![1; 8],
+            raw_bytes: Vec::new(),
+        };
+
+        let mut bytes = Vec::new();
+        let error = write_stage_message(&mut bytes, &message, WireActivationDType::F32)
+            .expect_err("striped control must not inline activation bytes");
+
+        assert_eq!(
+            error.to_string(),
+            "striped activation control message must not carry inline activation bytes"
         );
     }
 

@@ -1,3 +1,4 @@
+mod activation_striping;
 mod chat_corpus;
 mod cli;
 mod direct_return;
@@ -12,6 +13,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::{
+    activation_striping::activation_striping,
     chat_corpus::chat_corpus,
     cli::{Cli, CommandKind},
     distributed::{focused_runtime, run_distributed},
@@ -29,6 +31,7 @@ fn main() -> Result<()> {
         CommandKind::LocalSplitBinary(args) => local_split_binary(args),
         CommandKind::LocalSplitCompare(args) => local_split_compare(args),
         CommandKind::LocalSplitChainBinary(args) => local_split_chain_binary(args),
+        CommandKind::ActivationStriping(args) => activation_striping(args),
         CommandKind::ChatCorpus(args) => chat_corpus(args),
         CommandKind::TokenLengths(args) => token_lengths(args),
         CommandKind::FocusedRuntime(args) => focused_runtime(args),

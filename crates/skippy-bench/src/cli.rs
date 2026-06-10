@@ -20,6 +20,8 @@ pub enum CommandKind {
     LocalSplitBinary(LocalSplitBinaryArgs),
     LocalSplitCompare(LocalSplitCompareArgs),
     LocalSplitChainBinary(LocalSplitChainBinaryArgs),
+    #[command(name = "activation-striping")]
+    ActivationStriping(ActivationStripingArgs),
     #[command(name = "chat-corpus")]
     ChatCorpus(ChatCorpusArgs),
     #[command(name = "token-lengths")]
@@ -27,6 +29,58 @@ pub enum CommandKind {
     #[command(name = "focused-runtime")]
     FocusedRuntime(FocusedRuntimeArgs),
     Run(RunArgs),
+}
+
+#[derive(Parser)]
+pub struct ActivationStripingArgs {
+    #[arg(
+        long,
+        help = "Optional GGUF model path. When set, skippy-bench derives activation shapes from the model embedding_length."
+    )]
+    pub model_path: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Display name for --model-path derived rows. Defaults to the GGUF filename stem."
+    )]
+    pub model_name: Option<String>,
+    #[arg(
+        long,
+        default_value = "512,2048,8192",
+        help = "Comma-separated token counts used for --model-path derived activation shapes."
+    )]
+    pub model_token_counts: String,
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Bytes per activation element used for --model-path derived shapes. f16 is 2, f32 is 4."
+    )]
+    pub model_bytes_per_element: usize,
+    #[arg(
+        long,
+        default_value = "qwen3-0.6b-512tok-f16:512:1024:2,llama-8b-512tok-f16:512:4096:2,llama-8b-2048tok-f16:2048:4096:2,llama-8b-8192tok-f16:8192:4096:2",
+        help = "Comma-separated NAME:TOKENS:HIDDEN_SIZE:BYTES_PER_ELEMENT activation shapes."
+    )]
+    pub activation_shapes: String,
+    #[arg(
+        long,
+        default_value = "1,2,4,8",
+        help = "Comma-separated stripe counts. 1 is always treated as the baseline."
+    )]
+    pub stripes: String,
+    #[arg(
+        long,
+        default_value_t = 1000.0,
+        help = "Synthetic per-stream bandwidth cap in megabits per second."
+    )]
+    pub per_stream_mbps: f64,
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Maximum activation stripe chunk size in MiB."
+    )]
+    pub chunk_mib: usize,
+    #[arg(long, default_value_t = 1, help = "Timed repetitions per scenario.")]
+    pub repetitions: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
