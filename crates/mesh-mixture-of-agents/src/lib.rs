@@ -5866,17 +5866,19 @@ fn xml_tool_choice_from_text(
     allowed_tools: &[String],
     prompt_tool_profiles: &[PromptToolProfile],
 ) -> Option<ForcedToolChoice> {
-    let invoke_start = content.find("<invoke")?;
-    let invoke_tag_end = content[invoke_start..].find('>')? + invoke_start;
-    let invoke_tag = &content[invoke_start..=invoke_tag_end];
+    let body = xml_tool_call_envelope_body(content)?;
+    let invoke_start = body.find("<invoke")?;
+    let invoke_tag_end = body[invoke_start..].find('>')? + invoke_start;
+    let invoke_tag = &body[invoke_start..=invoke_tag_end];
     let body_start = invoke_tag_end + 1;
-    let body_end = content[body_start..]
+    let body_end = body[body_start..]
         .find("</invoke>")
         .map(|idx| body_start + idx)
-        .unwrap_or(content.len());
-    let body = &content[body_start..body_end];
-    let mut arguments = xml_parameter_arguments(body);
-    let raw_name = xml_attr_value(invoke_tag, "name").or_else(|| xml_body_tool_name(body))?;
+        .unwrap_or(body.len());
+    let invoke_body = &body[body_start..body_end];
+    let mut arguments = xml_parameter_arguments(invoke_body);
+    let raw_name =
+        xml_attr_value(invoke_tag, "name").or_else(|| xml_body_tool_name(invoke_body))?;
     let name = resolve_response_tool_name(
         &raw_name,
         &mut arguments,
@@ -5900,6 +5902,43 @@ fn xml_tool_choice_from_text(
             None
         }
     }
+}
+
+fn xml_tool_call_envelope_body(content: &str) -> Option<&str> {
+    let (tag_end, tag_name) = first_xml_tool_call_open_tag(content)?;
+    let body_start = tag_end + 1;
+    let body = &content[body_start..];
+    let close = format!("</{tag_name}>");
+    let body_end = body.find(&close).unwrap_or(content.len() - body_start);
+    Some(&body[..body_end])
+}
+
+fn first_xml_tool_call_open_tag(content: &str) -> Option<(usize, &str)> {
+    let mut offset = 0;
+    while let Some(relative_start) = content[offset..].find('<') {
+        let tag_start = offset + relative_start;
+        let after_open = &content[tag_start + 1..];
+        if matches!(after_open.chars().next(), Some('/' | '!' | '?')) {
+            offset = tag_start + 1;
+            continue;
+        }
+        let tag_end = after_open.find('>')? + tag_start + 1;
+        let raw_tag = &content[tag_start + 1..tag_end];
+        let tag_name = raw_tag
+            .split(|c: char| c == '>' || c.is_ascii_whitespace())
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let local_name = tag_name
+            .rsplit_once(':')
+            .map_or(tag_name, |(_, local)| local)
+            .to_ascii_lowercase();
+        if local_name == "tool_call" {
+            return Some((tag_end, tag_name));
+        }
+        offset = tag_start + 1;
+    }
+    None
 }
 
 fn resolve_response_tool_name(
@@ -10328,6 +10367,52 @@ mod response_builder_tests {
                 .pointer("/choices/0/message/tool_calls/0/function/arguments")
                 .and_then(Value::as_str),
             Some("{\"command\":\"printf \\\"hello\\\"\"}")
+        );
+    }
+
+    #[test]
+    fn bare_xml_in_answer_stays_chat_even_with_matching_tool_schema() {
+        let tools = Some(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Execute shell commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }
+            }
+        }]));
+        let content = "This is only an XML example: <invoke name=\"shell\"><parameter name=\"command\">pwd</parameter></invoke>";
+        let response = chat_or_schema_command_tool_response(
+            content,
+            tools.as_ref(),
+            &["shell".to_string()],
+            &[],
+            Some("Do not call tools. Explain the XML example."),
+        );
+
+        assert!(
+            response.pointer("/choices/0/message/tool_calls").is_none(),
+            "bare XML examples must not be corrected into tool calls: {response}"
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str),
+            Some("stop")
+        );
+        assert_eq!(
+            response
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str),
+            Some(content)
         );
     }
 
