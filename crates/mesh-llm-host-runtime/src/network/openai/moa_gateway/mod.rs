@@ -800,10 +800,15 @@ async fn try_add_local_worker(
     if should_skip_local_for_inflight(name, peer_inflight) {
         return false;
     }
-    if should_skip_local_for_remote_context(name, context_length, remote_context) {
+    if should_skip_local_for_required_context(name, resolution.required_tokens, context_length) {
         return false;
     }
-    if should_skip_local_for_required_context(name, resolution.required_tokens, context_length) {
+    if should_skip_local_for_remote_context(
+        name,
+        context_length,
+        remote_context,
+        resolution.prefer_strong_workers,
+    ) {
         return false;
     }
 
@@ -858,7 +863,11 @@ fn should_skip_local_for_remote_context(
     name: &str,
     local_context: Option<u32>,
     remote_context: Option<u32>,
+    prefer_strong_workers: bool,
 ) -> bool {
+    if !prefer_strong_workers {
+        return false;
+    }
     if should_prefer_remote_worker(local_context, remote_context) {
         tracing::info!(
             "MoA: preferring remote worker {name}; remote context {:?} is better than local context {:?}",
@@ -1549,6 +1558,26 @@ mod tests {
         assert!(should_skip_local_for_inflight(
             "local",
             MOA_LOCAL_INFLIGHT_SOFT_LIMIT
+        ));
+    }
+
+    #[test]
+    fn local_worker_not_skipped_for_larger_remote_context_without_strong_bias() {
+        assert!(!should_skip_local_for_remote_context(
+            "local",
+            Some(32_768),
+            Some(131_072),
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_worker_skipped_for_larger_remote_context_with_strong_bias() {
+        assert!(should_skip_local_for_remote_context(
+            "local",
+            Some(32_768),
+            Some(131_072),
+            true,
         ));
     }
 

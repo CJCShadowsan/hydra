@@ -30,19 +30,44 @@ fn moa_context_reserve_tokens(body: &serde_json::Value) -> u32 {
 }
 
 fn body_has_tool_result(body: &serde_json::Value) -> bool {
-    body.get("messages")
+    if body
+        .get("messages")
         .and_then(serde_json::Value::as_array)
         .map(|messages| messages.iter().any(message_has_tool_result))
         .unwrap_or(false)
+    {
+        return true;
+    }
+
+    ["output", "items", "input"]
+        .into_iter()
+        .filter_map(|key| body.get(key))
+        .any(value_has_tool_result)
 }
 
 fn message_has_tool_result(message: &serde_json::Value) -> bool {
     message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+        || content_block_is_tool_result(message)
         || message
             .get("content")
             .and_then(serde_json::Value::as_array)
-            .map(|parts| parts.iter().any(content_block_is_tool_result))
+            .map(|parts| parts.iter().any(value_has_tool_result))
             .unwrap_or(false)
+        || message.get("content").is_some_and(value_has_tool_result)
+}
+
+fn value_has_tool_result(value: &serde_json::Value) -> bool {
+    if content_block_is_tool_result(value) {
+        return true;
+    }
+    match value {
+        serde_json::Value::Array(values) => values.iter().any(value_has_tool_result),
+        serde_json::Value::Object(map) => {
+            map.values().any(value_has_tool_result)
+                || map.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+        }
+        _ => false,
+    }
 }
 
 fn content_block_is_tool_result(part: &serde_json::Value) -> bool {
@@ -51,7 +76,7 @@ fn content_block_is_tool_result(part: &serde_json::Value) -> bool {
     };
     matches!(
         normalize_content_block_type(kind).as_str(),
-        "toolresult" | "toolresponse"
+        "functioncalloutput" | "tooloutput" | "toolresult" | "toolresponse"
     )
 }
 
@@ -164,6 +189,30 @@ mod tests {
                     "content": [
                         {"type": "toolResult", "id": "call_1", "toolResult": {"value": "large output"}}
                     ]
+                }
+            ],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        });
+
+        assert_eq!(
+            moa_required_tokens(&body, Some(2000)),
+            Some(
+                2000 + MOA_DEFAULT_COMPLETION_BUDGET_TOKENS
+                    + MOA_TOOL_RESULT_CONTEXT_RESERVE_TOKENS
+            )
+        );
+    }
+
+    #[test]
+    fn moa_required_tokens_detects_responses_tool_outputs() {
+        let body = serde_json::json!({
+            "model": "mesh",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Need tool."}]},
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "large output"
                 }
             ],
             "tools": [{"type": "function", "function": {"name": "read_file"}}],

@@ -377,31 +377,42 @@ fn string_value_matches_declared_format(
     let Some(text) = value.as_str() else {
         return true;
     };
-    if !schema_or_name_looks_url_like(schema, property_name) {
-        return true;
+    let text = text.trim();
+    match declared_string_format(schema).as_deref() {
+        Some("uri") => Url::parse(text).is_ok(),
+        Some("uri-reference") => uri_reference_is_valid(text),
+        Some("url") => http_url_is_valid(text),
+        _ if property_name_looks_url_like(property_name) => http_url_is_valid(text),
+        _ => true,
     }
-
-    let Ok(url) = Url::parse(text.trim()) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
 }
 
-fn schema_or_name_looks_url_like(schema: &Value, property_name: Option<&str>) -> bool {
+fn declared_string_format(schema: &Value) -> Option<String> {
     schema
         .get("format")
         .and_then(Value::as_str)
-        .is_some_and(|format| {
-            matches!(
-                format.to_ascii_lowercase().as_str(),
-                "url" | "uri" | "uri-reference"
-            )
-        })
-        || property_name.is_some_and(|name| {
-            identifier_tokens(name)
-                .iter()
-                .any(|token| matches!(token.as_str(), "url" | "uri"))
-        })
+        .map(|format| format.to_ascii_lowercase())
+}
+
+fn property_name_looks_url_like(property_name: Option<&str>) -> bool {
+    property_name.is_some_and(|name| {
+        identifier_tokens(name)
+            .iter()
+            .any(|token| matches!(token.as_str(), "url" | "uri"))
+    })
+}
+
+fn http_url_is_valid(text: &str) -> bool {
+    Url::parse(text).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+fn uri_reference_is_valid(text: &str) -> bool {
+    if Url::parse(text).is_ok() {
+        return true;
+    }
+    Url::parse("https://example.invalid/")
+        .and_then(|base| base.join(text))
+        .is_ok()
 }
 
 fn value_matches_type(value: &Value, schema_type: &str) -> bool {
@@ -618,6 +629,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(cleaned, json!({"target": "https://example.com/path?q=1"}));
+    }
+
+    #[test]
+    fn schema_sanitizer_accepts_non_http_uri_format_argument() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "open_uri",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "format": "uri"}
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }
+            }
+        }]);
+
+        let cleaned = sanitize_tool_arguments_for_tool(
+            "open_uri",
+            &json!({"target": "mailto:user@example.com"}),
+            Some(&tools),
+        )
+        .unwrap();
+
+        assert_eq!(cleaned, json!({"target": "mailto:user@example.com"}));
+    }
+
+    #[test]
+    fn schema_sanitizer_accepts_relative_uri_reference_argument() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "open_reference",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "format": "uri-reference"}
+                    },
+                    "required": ["target"],
+                    "additionalProperties": false
+                }
+            }
+        }]);
+
+        let cleaned = sanitize_tool_arguments_for_tool(
+            "open_reference",
+            &json!({"target": "../docs/readme.md#intro"}),
+            Some(&tools),
+        )
+        .unwrap();
+
+        assert_eq!(cleaned, json!({"target": "../docs/readme.md#intro"}));
     }
 
     #[test]

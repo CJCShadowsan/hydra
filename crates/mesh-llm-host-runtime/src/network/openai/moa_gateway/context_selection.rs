@@ -28,7 +28,12 @@ pub(in crate::network::openai) async fn select_remote_hosts_with_latencies(
                     .map(|required| context >= required)
                     .unwrap_or(true)
                 {
-                    adequate.push((host, context, latencies.get(&host).copied()));
+                    adequate.push((
+                        host,
+                        context,
+                        latencies.get(&host).copied(),
+                        host.to_string(),
+                    ));
                 } else if let Some(required_tokens) = required_tokens {
                     tracing::info!(
                         "MoA: skipping remote worker {model} on {}; context {context} cannot fit {required_tokens} required tokens",
@@ -37,16 +42,22 @@ pub(in crate::network::openai) async fn select_remote_hosts_with_latencies(
                 }
             }
             None => {
-                unknown.push((host, latencies.get(&host).copied()));
+                unknown.push((host, latencies.get(&host).copied(), host.to_string()));
             }
         }
     }
-    adequate.sort_by_key(|candidate| (Reverse(candidate.1), candidate.2.unwrap_or(u32::MAX)));
-    unknown.sort_by_key(|candidate| candidate.1.unwrap_or(u32::MAX));
+    adequate.sort_by_key(|candidate| {
+        (
+            Reverse(candidate.1),
+            candidate.2.unwrap_or(u32::MAX),
+            candidate.3.clone(),
+        )
+    });
+    unknown.sort_by_key(|candidate| (candidate.1.unwrap_or(u32::MAX), candidate.2.clone()));
     adequate
         .into_iter()
-        .map(|(host, _, _)| host)
-        .chain(unknown.into_iter().map(|(host, _)| host))
+        .map(|(host, _, _, _)| host)
+        .chain(unknown.into_iter().map(|(host, _, _)| host))
         .collect()
 }
 

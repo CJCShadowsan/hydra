@@ -744,7 +744,8 @@ fn compact_tool_result_text(result: &str) -> String {
     }
 
     if let Ok(json) = serde_json::from_str::<Value>(result) {
-        return compact_json_tool_result(result.len(), &json);
+        let summary = compact_json_tool_result(result.len(), &json);
+        return compact_text_for_context(&summary, TOOL_RESULT_RAW_MAX_BYTES);
     }
 
     format!(

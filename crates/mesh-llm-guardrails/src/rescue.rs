@@ -332,6 +332,7 @@ fn sentinel_tool_call_body(content: &str) -> Option<&str> {
     let trimmed = content.trim_start();
     let after_start = trimmed.strip_prefix("<|tool_call>")?;
     let end_index = [
+        "<|tool_call|>",
         "<tool_call|>",
         "<|/tool_call|>",
         "</tool_call>",
@@ -794,6 +795,18 @@ mod tests {
             calls[0].arguments["query"],
             "Mesh-LLM #808 Harden OpenClaw/MoA Telegram timeouts"
         );
+    }
+
+    #[test]
+    fn rescues_fully_delimited_sentinel_tool_call() {
+        let calls = rescue_tool_call_from_text(
+            r#"<|tool_call>call:web_search{query:<|"|>Mesh-LLM #808<|"|>}<|tool_call|>"#,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments["query"], "Mesh-LLM #808");
     }
 
     #[test]

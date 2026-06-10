@@ -151,9 +151,17 @@ impl Session {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if let Some(pending) =
-                        self.pending_tools.iter_mut().find(|p| p.call_id == call_id)
+                    if let Some(idx) = self
+                        .pending_tools
+                        .iter()
+                        .rposition(|p| p.call_id == call_id && p.result.is_none())
+                        .or_else(|| {
+                            self.pending_tools
+                                .iter()
+                                .rposition(|p| p.call_id == call_id)
+                        })
                     {
+                        let pending = &mut self.pending_tools[idx];
                         pending.result = Some(content);
                         tracing::info!(
                             "moa session: tool result received for {}({})",
@@ -678,6 +686,31 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "get_weather");
         assert_eq!(pairs[0].1, "22°C, sunny");
+    }
+
+    #[test]
+    fn repeated_tool_call_ids_pair_with_latest_unresolved_call() {
+        let mut s = Session::new();
+        s.ingest(
+            &[
+                json!({"role": "user", "content": "first"}),
+                json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_repeat", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"first\"}"}}]}),
+                json!({"role": "tool", "tool_call_id": "call_repeat", "content": "first result"}),
+                json!({"role": "user", "content": "second"}),
+                json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call_repeat", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"second\"}"}}]}),
+                json!({"role": "tool", "tool_call_id": "call_repeat", "content": "second result"}),
+            ],
+            &Some(json!([{"type": "function", "function": {"name": "lookup", "description": "Lookup", "parameters": {}}}])),
+        );
+
+        let pairs = s.recent_tool_results();
+        assert_eq!(
+            pairs,
+            vec![
+                ("lookup".to_string(), "first result".to_string()),
+                ("lookup".to_string(), "second result".to_string())
+            ]
+        );
     }
 
     #[test]
