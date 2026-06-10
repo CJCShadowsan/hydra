@@ -52,6 +52,10 @@ crates/mesh-mlx/       safe Rust API: arrays, NN ops, distributed group/
                        collectives, model zoo (Llama/Qwen…), safetensors
                        loader, tokenizer, generate, OpenAI server, and the
                        mesh-facing backend (latency-aware planner + transport)
+
+mesh-llm-host-runtime/src/inference/mlx.rs   the backend integration: loads a
+                       model and serves OpenAI on a local port; MlxModelHandle
+                       mirrors the Skippy handle so mesh routes to it identically
 ```
 
 ### `mesh-mlx-sys`
@@ -140,13 +144,28 @@ Done (code-complete):
 - Latency-aware planner + transport plan + `MlxOrchestrator` (mesh-facing
   decision surface). All pure logic unit-tested.
 
+Wired into mesh (usable as a backend):
+- `mesh-llm-host-runtime` depends on `mesh-mlx` and has an
+  `inference::mlx::MlxModelHandle` that loads a model and serves the OpenAI API
+  on an ephemeral local port (mirrors the Skippy HTTP handle: `port()` +
+  `shutdown()`).
+- `LocalRuntimeBackendHandle::Mlx` is a first-class backend variant; all handle
+  methods (`pid`, `shutdown`, status, guardrails) handle it.
+- `runtime::local::start_runtime_local_model` routes to
+  `start_runtime_mlx_model` when `MlxModelHandle::available()` (Apple Silicon +
+  `mlx-backend` feature) **and** the model is a safetensors directory
+  (`is_mlx_safetensors_model`). GGUF / layer packages fall through to Skippy.
+- Gated by the host-runtime `mlx-backend` feature → `mesh-mlx/link-mlx`. Without
+  it the backend reports unavailable and mesh uses the Skippy lane; the
+  selection code still compiles (no Metal build in normal CI).
+
 Pending (needs multi-node hardware, mechanical otherwise):
 - Run the pipeline/tensor paths across a live 2+ node `Group` (Ethernet ring /
   Thunderbolt JACCL) and validate throughput. The code paths exist and are
   unit-tested for the planning/assignment logic; execution needs a rig.
-- Host-runtime call site: mesh invokes `MlxOrchestrator` + spawns `mlx-serve`
-  and routes to its endpoint. The seam is the orchestrator API; final wiring
-  into the host-runtime inference selector is a small, isolated change.
+- Multi-node group formation calls `inference::mlx::plan_parallelism` (exposed +
+  unit-tested) to pick tensor-vs-pipeline + transport; single-node serving is
+  fully wired and live.
 
 Polish (non-blocking):
 - Full Jinja `chat_template` (currently a ChatML-compatible framing that works

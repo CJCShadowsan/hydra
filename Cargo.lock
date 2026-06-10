@@ -4060,6 +4060,7 @@ dependencies = [
  "mesh-llm-types",
  "mesh-llm-ui",
  "mesh-mixture-of-agents",
+ "mesh-mlx",
  "model-artifact",
  "model-hf",
  "model-package",

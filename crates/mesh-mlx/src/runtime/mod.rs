@@ -6,7 +6,7 @@ mod server;
 mod tokenizer;
 
 pub use generate::{generate_distributed, generate_local};
-pub use server::{ServerState, router, serve};
+pub use server::{ServerHandle, ServerState, router, serve, spawn};
 pub use tokenizer::{Tokenizer, apply_chat_template};
 
 use crate::Result;

@@ -54,6 +54,56 @@ pub async fn serve(state: ServerState, addr: std::net::SocketAddr) -> std::io::R
         .map_err(std::io::Error::other)
 }
 
+/// A running server: the bound address (with the real port when `:0` was used)
+/// plus a shutdown trigger.
+pub struct ServerHandle {
+    pub addr: std::net::SocketAddr,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ServerHandle {
+    /// The bound local address (host:port).
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// The bound port.
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    /// Signal shutdown and wait for the server task to finish.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.task.await;
+    }
+}
+
+/// Bind and spawn the server in the background, returning a handle with the
+/// real bound address. Pass `127.0.0.1:0` to get an ephemeral port (the pattern
+/// mesh's local backends use).
+pub async fn spawn(
+    state: ServerState,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<ServerHandle> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(state))
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    Ok(ServerHandle {
+        addr: bound,
+        shutdown: tx,
+        task,
+    })
+}
+
 // ---- OpenAI wire types (minimal subset) ----
 
 #[derive(Debug, Deserialize)]

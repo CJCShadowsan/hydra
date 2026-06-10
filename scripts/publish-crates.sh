@@ -435,6 +435,7 @@ unpublished_registry_deps() {
                 mesh-llm-types \
                 mesh-llm-ui \
                 mesh-mixture-of-agents \
+                mesh-mlx \
                 model-artifact \
                 model-hf \
                 model-package \
@@ -446,6 +447,10 @@ unpublished_registry_deps() {
                 skippy-runtime \
                 skippy-server \
                 skippy-topology
+            ;;
+        mesh-mlx)
+            printf '%s\n' \
+                mesh-mlx-sys
             ;;
         mesh-llm-sdk)
             printf '%s\n' \
@@ -526,6 +531,8 @@ publish_crates=(
     mesh-mixture-of-agents
     mesh-llm-system
     mesh-llm-runtime-install
+    mesh-mlx-sys
+    mesh-mlx
     mesh-llm-host-runtime
     mesh-llm-embedded-runtime
     mesh-llm-sdk

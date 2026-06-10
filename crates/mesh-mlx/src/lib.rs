@@ -45,7 +45,7 @@ pub use mesh::{
     ParallelismPlanner, TransportPlan, mlx_supported,
 };
 pub use models::{Family, ModelConfig};
-pub use runtime::{Engine, ServerState, router, serve};
+pub use runtime::{Engine, ServerHandle, ServerState, router, serve, spawn};
 
 /// Errors from the MLX runtime.
 #[derive(Debug, thiserror::Error)]

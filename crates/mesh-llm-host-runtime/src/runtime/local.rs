@@ -11,7 +11,7 @@ use super::split_planning::{
 #[cfg(test)]
 use super::split_planning::{format_aggregate_split_capacity_error, validate_split_capacity};
 use crate::api;
-use crate::inference::{election, skippy};
+use crate::inference::{election, mlx, skippy};
 use crate::mesh::{self, NodeRole};
 use crate::models;
 use crate::network::router;
@@ -64,10 +64,21 @@ pub(super) enum RuntimeEvent {
     },
 }
 
+// The Skippy variant carries the full embedded-runtime handle (~880B); the MLX
+// variant is boxed. Boxing Skippy would churn many match sites for no real
+// benefit (one handle exists per loaded model), so allow the size difference.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum LocalRuntimeBackendHandle {
     Skippy {
         model: skippy::SkippyModelHandle,
         http: skippy::SkippyHttpHandle,
+        _death_tx: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Native MLX backend (Apple Silicon): a `mesh-mlx` OpenAI server on a
+    /// local port. The host routes OpenAI traffic to `port` like any other
+    /// local backend. Boxed to keep the enum's variants similarly sized.
+    Mlx {
+        handle: Box<mlx::MlxModelHandle>,
         _death_tx: tokio::sync::oneshot::Sender<()>,
     },
 }
@@ -85,6 +96,8 @@ impl LocalRuntimeModelHandle {
     pub(super) fn pid(&self) -> u32 {
         match &self.inner {
             LocalRuntimeBackendHandle::Skippy { .. } => std::process::id(),
+            // MLX runs in-process (the OpenAI server is a task in this process).
+            LocalRuntimeBackendHandle::Mlx { .. } => std::process::id(),
         }
     }
 
@@ -93,12 +106,16 @@ impl LocalRuntimeModelHandle {
             LocalRuntimeBackendHandle::Skippy { model, .. } => {
                 Some(model.status().max_session_tokens)
             }
+            // MLX does not expose per-session token accounting yet.
+            LocalRuntimeBackendHandle::Mlx { .. } => None,
         }
     }
 
     pub(super) fn openai_guardrails(&self) -> Option<skippy::SkippyOpenAiGuardrailsStatus> {
         match &self.inner {
             LocalRuntimeBackendHandle::Skippy { model, .. } => model.openai_guardrails(),
+            // MLX backend has no Skippy guardrail surface.
+            LocalRuntimeBackendHandle::Mlx { .. } => None,
         }
     }
 
@@ -110,6 +127,10 @@ impl LocalRuntimeModelHandle {
             LocalRuntimeBackendHandle::Skippy { model, .. } => {
                 model.set_openai_guardrail_mode(mode)
             }
+            LocalRuntimeBackendHandle::Mlx { .. } => {
+                let _ = mode;
+                None
+            }
         }
     }
 
@@ -119,6 +140,7 @@ impl LocalRuntimeModelHandle {
         instance_id: Option<&str>,
     ) -> Option<RuntimeLlamaSlotsSnapshot> {
         match &self.inner {
+            LocalRuntimeBackendHandle::Mlx { .. } => None,
             LocalRuntimeBackendHandle::Skippy { model, .. } => {
                 let status = model.status();
                 let ctx_size = status.ctx_size as u64;
@@ -160,6 +182,9 @@ impl LocalRuntimeModelHandle {
             LocalRuntimeBackendHandle::Skippy { model, http, .. } => {
                 let _ = http.shutdown().await;
                 model.shutdown();
+            }
+            LocalRuntimeBackendHandle::Mlx { handle, .. } => {
+                let _ = handle.shutdown().await;
             }
         }
     }
@@ -550,6 +575,14 @@ pub(super) async fn start_runtime_local_model(
 )> {
     let model_name = runtime_model_name.to_string();
     let package_ref = spec.model_path.to_string_lossy().to_string();
+
+    // MLX lane: on Apple Silicon with the `mlx-backend` feature, a safetensors
+    // model directory is served natively by `mesh-mlx` (no Python, no Swift, no
+    // llama.cpp). GGUF files and layer packages fall through to the Skippy lane.
+    if mlx::MlxModelHandle::available() && is_mlx_safetensors_model(spec.model_path) {
+        return start_runtime_mlx_model(spec, model_name).await;
+    }
+
     let layer_package = if skippy::is_layer_package_ref(&package_ref) {
         let package_ref_for_identity = package_ref.clone();
         Some(
@@ -638,6 +671,102 @@ pub(super) async fn start_runtime_local_model(
     } else {
         start_runtime_skippy_model(spec, model_name, plan).await
     }
+}
+
+/// Whether `model_path` is a safetensors model the MLX backend can serve: a
+/// directory containing `config.json` + at least one `*.safetensors` file (and
+/// not a GGUF file or a layer-package reference).
+fn is_mlx_safetensors_model(model_path: &Path) -> bool {
+    let package_ref = model_path.to_string_lossy().to_string();
+    if skippy::is_layer_package_ref(&package_ref) {
+        return false;
+    }
+    if !model_path.is_dir() {
+        return false;
+    }
+    if !model_path.join("config.json").is_file() {
+        return false;
+    }
+    std::fs::read_dir(model_path)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("safetensors"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Start the native MLX backend for a local safetensors model: load it into the
+/// MLX engine and serve the OpenAI API on an ephemeral local port. Produces the
+/// same `LocalRuntimeModelHandle` shape as the Skippy lane so the rest of the
+/// host routes to it identically.
+async fn start_runtime_mlx_model(
+    spec: LocalRuntimeModelStartSpec<'_>,
+    model_name: String,
+) -> Result<(
+    String,
+    LocalRuntimeModelHandle,
+    tokio::sync::oneshot::Receiver<()>,
+)> {
+    // MLX loads from a HF repo id. Prefer the configured model id; fall back to
+    // the directory name (mesh stores HF snapshots under the repo path).
+    let model_id = spec
+        .config_model_id
+        .map(str::to_string)
+        .unwrap_or_else(|| model_name.clone());
+
+    let _ = emit_event(OutputEvent::ModelLoading {
+        model: model_name.clone(),
+        source: None,
+    });
+
+    let options = mlx::MlxModelLoadOptions::new(model_id);
+    let handle = mlx::MlxModelHandle::load(options)
+        .await
+        .context("load MLX backend model")?;
+
+    let _ = emit_event(OutputEvent::ModelLoaded {
+        model: model_name.clone(),
+        bytes: None,
+    });
+
+    tracing::info!(
+        model = %model_name,
+        endpoint = %handle.base_url(),
+        backend = "mlx",
+        "MLX backend ready"
+    );
+
+    let port = handle.port();
+    let ctx_size = spec.ctx_size_override.unwrap_or(4096);
+    let capabilities = models::runtime_verified_model_capabilities(
+        &model_name,
+        spec.model_path,
+        models::RuntimeMediaCapabilityEvidence {
+            vision_projector_loaded: false,
+        },
+    );
+    let (death_tx, death_rx) = tokio::sync::oneshot::channel();
+
+    Ok((
+        model_name,
+        LocalRuntimeModelHandle {
+            port,
+            backend: "mlx".into(),
+            context_length: ctx_size,
+            slots: spec.parallel_override.unwrap_or(1),
+            capabilities,
+            inner: LocalRuntimeBackendHandle::Mlx {
+                handle: Box::new(handle),
+                _death_tx: death_tx,
+            },
+        },
+        death_rx,
+    ))
 }
 
 /// Try to extract GGUF architecture metadata from a layer package's shared
