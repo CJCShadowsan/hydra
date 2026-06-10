@@ -204,6 +204,48 @@ mod tests {
     }
 
     #[test]
+    fn stage_message_estimates_full_wire_transfer_bytes() {
+        let message = StageWireMessage {
+            kind: WireMessageKind::PrefillEmbd,
+            pos_start: 0,
+            token_count: 2,
+            state: StageStateHeader::new(WireMessageKind::PrefillEmbd, WireActivationDType::F32),
+            request_id: 7,
+            session_id: 11,
+            sampling: Some(StageSamplingConfig {
+                flags: 1,
+                logit_bias: vec![
+                    StageLogitBias {
+                        token_id: 1,
+                        bias: -1.0,
+                    },
+                    StageLogitBias {
+                        token_id: 2,
+                        bias: 1.0,
+                    },
+                ],
+                ..StageSamplingConfig::default()
+            }),
+            chat_sampling_metadata: Some("{}".to_string()),
+            tokens: vec![1, 2],
+            positions: vec![0],
+            activation: vec![0; 16],
+            raw_bytes: Vec::new(),
+        };
+
+        assert_eq!(
+            message.estimated_wire_bytes(),
+            STAGE_WIRE_FIXED_HEADER_BYTES
+                + STAGE_SAMPLING_CONFIG_BASE_BYTES
+                + 2 * STAGE_LOGIT_BIAS_WIRE_BYTES
+                + std::mem::size_of::<u32>()
+                + 2
+                + 3 * std::mem::size_of::<i32>()
+                + 16
+        );
+    }
+
+    #[test]
     fn generation_config_round_trips_sampling_metadata() {
         let message = StageWireMessage::configure_generation(
             WireActivationDType::F32,

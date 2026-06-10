@@ -360,6 +360,36 @@ pub struct StageWireMessage {
 }
 
 impl StageWireMessage {
+    pub fn estimated_wire_bytes(&self) -> usize {
+        let sampling_bytes = self.sampling.as_ref().map_or(0, |sampling| {
+            STAGE_SAMPLING_CONFIG_BASE_BYTES
+                + sampling.logit_bias.len().min(MAX_STAGE_LOGIT_BIAS) * STAGE_LOGIT_BIAS_WIRE_BYTES
+        });
+        let chat_metadata_bytes = self
+            .chat_sampling_metadata
+            .as_ref()
+            .map_or(0, |metadata| std::mem::size_of::<u32>() + metadata.len());
+        STAGE_WIRE_FIXED_HEADER_BYTES
+            .saturating_add(sampling_bytes)
+            .saturating_add(chat_metadata_bytes)
+            .saturating_add(self.payload_wire_bytes())
+    }
+
+    fn payload_wire_bytes(&self) -> usize {
+        if self.kind == WireMessageKind::StateImport {
+            return self.raw_bytes.len();
+        }
+        self.tokens
+            .len()
+            .saturating_mul(std::mem::size_of::<i32>())
+            .saturating_add(
+                self.positions
+                    .len()
+                    .saturating_mul(std::mem::size_of::<i32>()),
+            )
+            .saturating_add(self.activation.len())
+    }
+
     pub fn stop(dtype: WireActivationDType) -> Self {
         Self::stop_with_identity(dtype, 0, 0)
     }
