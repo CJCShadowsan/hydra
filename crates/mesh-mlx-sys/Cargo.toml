@@ -1,0 +1,21 @@
+[package]
+name = "mesh-mlx-sys"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Raw FFI bindings to the MLX C API (mlx-c) for the native Rust MLX runtime"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+build = "build.rs"
+links = "mlxc"
+
+[features]
+default = []
+# Build and link the MLX C++/Metal engine + mlx-c. Off by default so the
+# bindings type-check in CI without the (long) native Metal build. Turn on for
+# real inference on Apple Silicon.
+link-mlx = []
+
+[dependencies]
+
+[build-dependencies]
