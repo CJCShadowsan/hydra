@@ -159,13 +159,29 @@ Wired into mesh (usable as a backend):
   it the backend reports unavailable and mesh uses the Skippy lane; the
   selection code still compiles (no Metal build in normal CI).
 
-Pending (needs multi-node hardware, mechanical otherwise):
-- Run the pipeline/tensor paths across a live 2+ node `Group` (Ethernet ring /
-  Thunderbolt JACCL) and validate throughput. The code paths exist and are
-  unit-tested for the planning/assignment logic; execution needs a rig.
-- Multi-node group formation calls `inference::mlx::plan_parallelism` (exposed +
-  unit-tested) to pick tensor-vs-pipeline + transport; single-node serving is
-  fully wired and live.
+Discovery → MLX handoff (wired):
+- `inference::mlx::plan_group_from_peers(node)` turns mesh's gossiped peer list
+  into an MLX group: it filters to Apple-Silicon, directly-routable peers
+  (`is_soc`/`gpu_name` + non-loopback `EndpointAddr` IPs), reads mesh's measured
+  `current_direct_rtt_ms()` into `LatencySample`s, assigns a stable rank order
+  (local = rank 0, peers sorted by id), and produces the rank-ordered hostfile
+  (`ip:MLX_RING_BASE_PORT`) + parallelism/transport plan. mesh *finds and
+  selects* the peers; MLX then opens its **own** TCP ring / JACCL to those
+  addresses — mesh traffic never carries MLX data.
+- `start_runtime_mlx_model` consults it: when a distributed group is found it
+  passes the setup via `MlxModelLoadOptions::with_group`.
+- `MlxModelHandle::load_distributed` → `mesh_mlx::DistributedEngine::join`:
+  writes the hostfile, sets `MLX_HOSTFILE`/`MLX_RANK` (read by the ring/jaccl
+  backends), inits the `Group`, and loads the model sharded per mode (pipeline =
+  this stage's layers; tensor = sliced projections). The OpenAI server's chat
+  path drives the group in lock-step.
+
+Pending (needs multi-node hardware):
+- Validate the pipeline/tensor execution across a live 2+ node `Group` (Ethernet
+  ring / Thunderbolt JACCL) — throughput + correctness. All the upstream
+  machinery (discovery, planning, hostfile, group init, sharded load, generate
+  loops) is implemented and unit-tested; the rank-0 fan-out / non-rank-0 worker
+  coordination is the piece that can only be exercised on a real rig.
 
 Polish (non-blocking):
 - Full Jinja `chat_template` (currently a ChatML-compatible framing that works

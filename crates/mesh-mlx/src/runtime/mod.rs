@@ -11,7 +11,7 @@ pub use tokenizer::{Tokenizer, apply_chat_template};
 
 use crate::Result;
 use crate::array::Stream;
-use crate::distributed::{Group, Pipeline};
+use crate::distributed::{Backend, Group, Pipeline};
 use crate::download::{self, ModelRef};
 use crate::loader;
 use crate::mesh::ParallelismMode;
@@ -63,6 +63,30 @@ impl Engine {
             pipeline,
             stream,
         })
+    }
+
+    /// Load a model into a **distributed** group, choosing pipeline or tensor
+    /// parallelism per `mode`.
+    ///
+    /// The caller must have already initialised the MLX distributed environment
+    /// (hostfile + rank + backend); see [`DistributedEngine::join`], which wires
+    /// the env, inits the [`Group`], and calls this. Pipeline mode shards by
+    /// layers (each rank downloads only its stage); tensor mode loads the full
+    /// repo and slices each projection per rank.
+    pub async fn load_distributed(
+        model: &ModelRef,
+        group: &Group,
+        mode: ParallelismMode,
+    ) -> Result<Self> {
+        match mode {
+            ParallelismMode::Tensor => Self::load_tensor_parallel(model, group).await,
+            ParallelismMode::Pipeline => {
+                let total = 0; // re-planned from config inside load_with_pipeline
+                let pipeline = Pipeline::plan(group.rank(), group.size(), total);
+                Self::load_with_pipeline(model, pipeline).await
+            }
+            ParallelismMode::Single => Self::load_single(model).await,
+        }
     }
 
     /// Load a model for tensor-parallel serving across a live [`Group`]. The
@@ -171,4 +195,77 @@ impl Engine {
 /// once the layer count is known. The caller passes total layers from config.
 pub fn group_pipeline(group: &Group, total_layers: usize) -> Pipeline {
     Pipeline::from_group(group, total_layers)
+}
+
+/// A distributed MLX node: a live [`Group`] plus the model [`Engine`] loaded for
+/// this rank. Holding both together keeps the group alive for the engine's
+/// lifetime (collectives borrow the group).
+///
+/// Construction ([`DistributedEngine::join`]) performs the full discovery →
+/// serving handoff: it writes the rank-ordered hostfile, sets the MLX
+/// environment (`MLX_HOSTFILE`, `MLX_RANK`) that the ring/jaccl backends read,
+/// initialises the [`Group`], and loads the model sharded per the chosen
+/// [`ParallelismMode`]. MLX then opens its own TCP ring / RDMA mesh to the
+/// hostfile peers — mesh only supplied the addresses.
+pub struct DistributedEngine {
+    pub group: Group,
+    pub engine: Engine,
+    pub mode: ParallelismMode,
+}
+
+/// Parameters for joining a distributed MLX group.
+pub struct JoinParams {
+    /// Rank-ordered hostfile JSON (MLX `load_nodes` format).
+    pub hostfile_json: String,
+    /// This node's rank in the ring.
+    pub rank: usize,
+    /// Which MLX backend to initialise (ring/jaccl/mpi).
+    pub backend: Backend,
+    /// The parallelism mode (pipeline/tensor).
+    pub mode: ParallelismMode,
+}
+
+impl DistributedEngine {
+    /// Join an MLX distributed group and load the model for this rank.
+    ///
+    /// Writes `hostfile_json` to a temp file, points `MLX_HOSTFILE`/`MLX_RANK`
+    /// at it, initialises the group on `backend`, and loads the model per
+    /// `mode`. The hostfile path is kept alive for the process lifetime.
+    pub async fn join(model: &ModelRef, params: JoinParams) -> Result<Self> {
+        use std::io::Write;
+
+        // Persist the hostfile and expose it to the MLX backend via env. The
+        // file is intentionally leaked (kept for the process lifetime) because
+        // MLX re-reads it lazily during collective setup.
+        let mut path = std::env::temp_dir();
+        path.push(format!("mesh-mlx-hosts-{}.json", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path)
+                .map_err(|e| crate::MlxError::Distributed(format!("write hostfile: {e}")))?;
+            f.write_all(params.hostfile_json.as_bytes())
+                .map_err(|e| crate::MlxError::Distributed(format!("write hostfile: {e}")))?;
+        }
+        // SAFETY: set before any MLX distributed init on this process; the
+        // runtime is single-threaded at this point in startup.
+        unsafe {
+            std::env::set_var("MLX_HOSTFILE", &path);
+            std::env::set_var("MLX_RANK", params.rank.to_string());
+        }
+
+        let group = Group::init(params.backend, true)?;
+        let engine = Engine::load_distributed(model, &group, params.mode).await?;
+        Ok(DistributedEngine {
+            group,
+            engine,
+            mode: params.mode,
+        })
+    }
+
+    /// Generate a completion across the group (all ranks call in lock-step).
+    pub fn chat(&self, system: Option<&str>, user: &str, max_tokens: usize) -> Result<String> {
+        let prompt = apply_chat_template(system, user);
+        let ids = self.engine.tokenizer.encode(&prompt)?;
+        self.engine
+            .complete_ids(&ids, max_tokens, Some(&self.group))
+    }
 }

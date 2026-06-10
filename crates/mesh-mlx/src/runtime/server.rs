@@ -21,17 +21,45 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Shared server state: the loaded engine (serialised) + the served model id.
+/// The inference backend behind the server: single-node or a distributed group.
+enum Backend {
+    Single(Engine),
+    Distributed(crate::runtime::DistributedEngine),
+}
+
+impl Backend {
+    fn chat(&self, system: Option<&str>, user: &str, max_tokens: usize) -> crate::Result<String> {
+        match self {
+            Backend::Single(e) => e.chat(system, user, max_tokens),
+            Backend::Distributed(d) => d.chat(system, user, max_tokens),
+        }
+    }
+}
+
+/// Shared server state: the loaded backend (serialised) + the served model id.
 #[derive(Clone)]
 pub struct ServerState {
-    engine: Arc<Mutex<Engine>>,
+    backend: Arc<Mutex<Backend>>,
     model_id: String,
 }
 
 impl ServerState {
+    /// Single-node backend.
     pub fn new(engine: Engine, model_id: impl Into<String>) -> Self {
         ServerState {
-            engine: Arc::new(Mutex::new(engine)),
+            backend: Arc::new(Mutex::new(Backend::Single(engine))),
+            model_id: model_id.into(),
+        }
+    }
+
+    /// Distributed backend (this node's rank participates in a group). The
+    /// chat path drives the group in lock-step.
+    pub fn distributed(
+        engine: crate::runtime::DistributedEngine,
+        model_id: impl Into<String>,
+    ) -> Self {
+        ServerState {
+            backend: Arc::new(Mutex::new(Backend::Distributed(engine))),
             model_id: model_id.into(),
         }
     }
@@ -191,9 +219,9 @@ async fn chat_completions(
         .map(|m| m.content.clone())
         .unwrap_or_default();
 
-    let engine = state.engine.lock().await;
-    let result = engine.chat(system.as_deref(), &user, req.max_tokens);
-    drop(engine);
+    let backend = state.backend.lock().await;
+    let result = backend.chat(system.as_deref(), &user, req.max_tokens);
+    drop(backend);
 
     match result {
         Ok(text) => Json(ChatResponse {

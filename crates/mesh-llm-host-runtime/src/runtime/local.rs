@@ -719,12 +719,31 @@ async fn start_runtime_mlx_model(
         .map(str::to_string)
         .unwrap_or_else(|| model_name.clone());
 
+    // Discovery → MLX handoff: ask mesh for the set of MLX-eligible, directly
+    // routable peers and the latency-derived parallelism + transport plan. When
+    // a real group is found, MLX joins it (TCP ring / JACCL) using the
+    // rank-ordered hostfile mesh produced; otherwise we serve single-node.
+    let group_plan = mlx::plan_group_from_peers(spec.node).await;
+    let mut options = mlx::MlxModelLoadOptions::new(model_id);
+    if let Some(plan) = group_plan.as_ref().filter(|p| p.is_distributed()) {
+        tracing::info!(
+            model = %model_name,
+            ranks = plan.endpoints.len(),
+            mode = ?plan.parallelism.mode,
+            backend = ?plan.transport.backend,
+            rtt_samples = plan.samples.len(),
+            worst_rtt = ?plan.parallelism.worst_rtt,
+            reason = %plan.parallelism.reason,
+            "MLX forming distributed group from mesh peers"
+        );
+        options = options.with_group(plan);
+    }
+
     let _ = emit_event(OutputEvent::ModelLoading {
         model: model_name.clone(),
         source: None,
     });
 
-    let options = mlx::MlxModelLoadOptions::new(model_id);
     let handle = mlx::MlxModelHandle::load(options)
         .await
         .context("load MLX backend model")?;
