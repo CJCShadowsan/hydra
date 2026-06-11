@@ -101,6 +101,43 @@ MLX is SPMD: every node in the group runs the same lock-step generation, but onl
 
 This is why a single mesh-advertised model id works across the group: clients only ever talk to the leader's endpoint.
 
+### Enabling distributed MLX (opt-in)
+
+An MLX group is a *fixed* formation decided at startup, not a demand-driven pool, so distributed mode is **off by default** and must be enabled explicitly. You launch the **same model** on each Apple Silicon node (the `mlx.launch` model), and the nodes converge on the same group:
+
+| Variable | Meaning |
+|---|---|
+| `MESH_LLM_MLX_DISTRIBUTED=1` | Opt into forming a multi-node MLX group. Off → always single-node. |
+| `MESH_LLM_MLX_GROUP_SIZE=N` | Expected total node count. A node waits for this many group members before forming, so all nodes start together. |
+| `MESH_LLM_MLX_RENDEZVOUS_SECS=30` | How long to wait for peers to appear via gossip before forming the group with whoever is present. |
+
+Each node must be on the same private mesh and able to reach the others directly (MLX opens its own TCP ring / RDMA sockets — it does not use mesh QUIC). Example, two Macs serving the same model over the Ethernet ring:
+
+```bash
+# Node A and Node B both run (same model, same mesh):
+MESH_LLM_MLX_DISTRIBUTED=1 \
+MESH_LLM_MLX_GROUP_SIZE=2 \
+MESH_LLM_MLX_PARALLELISM=pipeline \
+MESH_LLM_MLX_TRANSPORT=ring \
+./target/release/mesh-llm serve \
+  --discover my-mesh \
+  --model mlx-community/Qwen2.5-0.5B-Instruct-bf16 \
+  --log-format json
+```
+
+Only the leader (rank 0) exposes the OpenAI endpoint; route inference there.
+
+### Validating without two machines
+
+The two-rank ring path is exercised end-to-end on a single machine (two processes on localhost) by an opt-in test:
+
+```bash
+MLX_TWO_NODE_RING=1 cargo test -p mesh-mlx --features link-mlx \
+  --test live_two_node_ring -- --nocapture
+```
+
+It proves group rendezvous, the request broadcast, the worker loop, and lock-step pipeline generation produce a correct completion without deadlock. CI runs it on the macOS native lane.
+
 ### Parallelism mode
 
 Use `MESH_LLM_MLX_PARALLELISM` to choose how the model is split:

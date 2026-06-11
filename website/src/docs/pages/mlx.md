@@ -101,6 +101,32 @@ MLX is SPMD: every node in the group runs the same lock-step generation, but onl
 
 This is why a single mesh-advertised model id works across the group: clients only ever talk to the leader's endpoint.
 
+### Enabling distributed MLX (opt-in)
+
+An MLX group is a fixed formation decided at startup, not a demand-driven pool, so distributed mode is **off by default**. Launch the **same model** on each Apple Silicon node and opt in:
+
+| Variable | Meaning |
+|---|---|
+| `MESH_LLM_MLX_DISTRIBUTED=1` | Opt into forming a multi-node MLX group. Off → always single-node. |
+| `MESH_LLM_MLX_GROUP_SIZE=N` | Expected total node count; a node waits for this many members before forming the group. |
+| `MESH_LLM_MLX_RENDEZVOUS_SECS=30` | How long to wait for peers via gossip before forming with whoever is present. |
+
+Each node must be on the same private mesh and directly reachable (MLX opens its own TCP ring / RDMA sockets — not mesh QUIC). Two Macs over the Ethernet ring:
+
+```bash
+# Node A and Node B both run (same model, same mesh):
+MESH_LLM_MLX_DISTRIBUTED=1 \
+MESH_LLM_MLX_GROUP_SIZE=2 \
+MESH_LLM_MLX_PARALLELISM=pipeline \
+MESH_LLM_MLX_TRANSPORT=ring \
+./target/release/mesh-llm serve \
+  --discover my-mesh \
+  --model mlx-community/Qwen2.5-0.5B-Instruct-bf16 \
+  --log-format json
+```
+
+Only the leader (rank 0) exposes the OpenAI endpoint; route inference there.
+
 ### Parallelism mode
 
 Use `MESH_LLM_MLX_PARALLELISM` to choose how the model is split:

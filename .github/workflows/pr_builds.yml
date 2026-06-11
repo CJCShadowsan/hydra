@@ -1010,6 +1010,15 @@ jobs:
           key: ${{ env.CACHE_NAMESPACE }}-github-macos-15-mlx-c-${{ hashFiles('crates/mesh-mlx-sys/build.rs', 'crates/mesh-mlx-sys/src/**', '.github/cache-version.txt') }}
       - name: Native MLX end-to-end generation
         run: cargo test -p mesh-mlx --features link-mlx --test live_single_node -- --nocapture
+      - name: Native MLX two-rank ring (distributed, localhost)
+        # Two processes join a TCP ring on localhost: rank 0 leads + generates,
+        # rank 1 runs the worker loop. Proves the distributed leader/worker
+        # rendezvous, request broadcast, and lock-step generation actually work
+        # (catches hostfile-format, group-init, and CPU-comm-stream regressions
+        # that single-node cannot). Loads the model twice, so it is opt-in.
+        env:
+          MLX_TWO_NODE_RING: "1"
+        run: cargo test -p mesh-mlx --features link-mlx --test live_two_node_ring -- --nocapture
 
   windows_targets:
     needs: changes

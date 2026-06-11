@@ -4843,6 +4843,25 @@ impl Node {
         self.endpoint.id()
     }
 
+    /// This node's own directly-routable IP socket addresses, exactly as it
+    /// advertises them to peers (honouring any `bind_ip` filter). Loopback is
+    /// excluded. Used by the MLX group planner so the local node's hostfile row
+    /// carries the same real address every peer sees — the MLX ring backend
+    /// needs one shared, identical hostfile across all ranks (a `0.0.0.0` self
+    /// row would not be reachable by peers).
+    pub fn self_direct_ips(&self) -> Vec<std::net::SocketAddr> {
+        let mut addr = self.endpoint_addr_for_advertisement();
+        if let Some(pub_addr) = self.public_addr
+            && !endpoint_addr_has_public_ipv4(&addr)
+        {
+            addr.addrs.insert(TransportAddr::Ip(pub_addr));
+        }
+        addr.ip_addrs()
+            .copied()
+            .filter(|sa| !sa.ip().is_loopback())
+            .collect()
+    }
+
     pub async fn role(&self) -> NodeRole {
         self.role.lock().await.clone()
     }

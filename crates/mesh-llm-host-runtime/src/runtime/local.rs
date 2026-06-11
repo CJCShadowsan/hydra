@@ -738,10 +738,11 @@ async fn start_runtime_mlx_model(
         .unwrap_or_else(|| model_name.clone());
 
     // Discovery → MLX handoff: ask mesh for the set of MLX-eligible, directly
-    // routable peers and the latency-derived parallelism + transport plan. When
-    // a real group is found, MLX joins it (TCP ring / JACCL) using the
-    // rank-ordered hostfile mesh produced; otherwise we serve single-node.
-    let group_plan = mlx::plan_group_from_peers(spec.node).await;
+    // routable peers (sharing this model) and the latency-derived parallelism +
+    // transport plan. When a real group is found, MLX joins it (TCP ring /
+    // JACCL) using the rank-ordered hostfile mesh produced; otherwise we serve
+    // single-node. Distributed MLX is opt-in (MESH_LLM_MLX_DISTRIBUTED).
+    let group_plan = mlx::plan_group_from_peers(spec.node, &model_id).await;
     let mut options = mlx::MlxModelLoadOptions::new(model_id);
     if let Some(plan) = group_plan.as_ref().filter(|p| p.is_distributed()) {
         tracing::info!(

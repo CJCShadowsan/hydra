@@ -42,9 +42,25 @@ pub struct MlxGroupPlan {
 }
 
 impl MlxGroupPlan {
-    /// Render the rank-ordered JSON hostfile MLX's `load_nodes()` consumes.
+    /// Render the rank-ordered ring hostfile MLX's `load_nodes()` consumes
+    /// (`[["ip:port", ...], ...]`).
     pub fn hostfile(&self) -> String {
         self.transport.render_hostfile()
+    }
+
+    /// Render the JACCL NxN devices-matrix JSON (the `MLX_IBV_DEVICES` file),
+    /// when the backend is JACCL and every node advertises a complete RDMA row.
+    pub fn jaccl_devices(&self) -> Option<String> {
+        if self.transport.backend != MlxBackendKind::Jaccl {
+            return None;
+        }
+        self.transport.render_jaccl_devices()
+    }
+
+    /// The rank-0 coordinator address JACCL bootstraps over: the first IP of
+    /// the rank-0 endpoint. `None` if rank 0 has no advertised IP.
+    pub fn coordinator(&self) -> Option<String> {
+        self.endpoints.first().and_then(|e| e.ips.first().cloned())
     }
 
     /// Whether this is a real multi-node group (vs. a single local node).
@@ -66,17 +82,50 @@ pub fn plan_parallelism(
 }
 
 /// Whether a discovered peer is eligible to join an MLX group: Apple Silicon
-/// (so it can run the Metal engine) and directly routable (has at least one
+/// (so it can run the Metal engine), directly routable (has at least one
 /// non-loopback IP address — MLX opens its own TCP/RDMA sockets and cannot use
-/// mesh's relay/QUIC transport).
-fn peer_is_mlx_eligible(peer: &PeerInfo) -> bool {
+/// mesh's relay/QUIC transport), **and** sharing interest in the same model.
+///
+/// The model check is what keeps the group correct: an MLX group is a fixed
+/// formation where every member must be running the *same* model. A peer that
+/// is Apple-Silicon but serving a different model (or a GGUF on Skippy) must
+/// not be pulled into the group, or the leader would block at `Group::init`
+/// waiting for a rank that never joins. We treat a peer as a group member when
+/// it is serving, has requested, or has explicit interest in `model_id` — i.e.
+/// the operator launched the same model on it (the `mlx.launch` model).
+fn peer_is_mlx_eligible(peer: &PeerInfo, model_id: &str) -> bool {
     let apple_silicon = peer.is_soc == Some(true)
         || peer
             .gpu_name
             .as_deref()
             .map(|g| g.contains("Apple"))
             .unwrap_or(false);
-    apple_silicon && peer_direct_ips(peer).next().is_some()
+    apple_silicon && peer_direct_ips(peer).next().is_some() && peer_shares_model(peer, model_id)
+}
+
+/// Whether `peer` is running (or wants to run) the same model, by any of the
+/// gossiped model-interest signals.
+fn peer_shares_model(peer: &PeerInfo, model_id: &str) -> bool {
+    peer.serving_models
+        .iter()
+        .chain(peer.requested_models.iter())
+        .chain(peer.explicit_model_interests.iter())
+        .chain(peer.models.iter())
+        .any(|m| model_ids_match(m, model_id))
+}
+
+/// Whether two model references denote the same model, compared
+/// case-insensitively against the full id and the trailing repo/name component
+/// so `org/Repo` and `Repo` agree (mesh stores HF snapshots under repo paths,
+/// so a peer may advertise either form).
+fn model_ids_match(a: &str, b: &str) -> bool {
+    let a = a.to_ascii_lowercase();
+    let b = b.to_ascii_lowercase();
+    if a == b {
+        return true;
+    }
+    let tail = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
+    tail(&a) == tail(&b)
 }
 
 /// This peer's directly-routable IPs (loopback filtered out).
@@ -112,14 +161,113 @@ fn peer_endpoint(ssh: String, ips: impl Iterator<Item = std::net::IpAddr>) -> No
 /// are sorted together by node id, so every node computes the identical rank
 /// order and the rings agree. `local_rank` is this node's position in that
 /// shared order.
-pub async fn plan_group_from_peers(node: &mesh::Node) -> Option<MlxGroupPlan> {
+/// Whether the operator opted into distributed MLX (`MESH_LLM_MLX_DISTRIBUTED`).
+///
+/// Off by default: forming a fixed tensor/pipeline group is an explicit
+/// operator decision (you launch the same model on each Apple-Silicon node),
+/// not something to trigger from demand. Accepts `1`/`true`/`yes`/`on`.
+fn distributed_mlx_enabled() -> bool {
+    matches!(
+        std::env::var("MESH_LLM_MLX_DISTRIBUTED")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// The rendezvous window: how long a node waits for its expected MLX peers to
+/// appear via gossip before forming the group. Override the expected peer count
+/// with `MESH_LLM_MLX_GROUP_SIZE` (total nodes including self); otherwise the
+/// node forms a group with whatever eligible peers it can see after the wait.
+fn mlx_rendezvous() -> (std::time::Duration, Option<usize>) {
+    let secs = std::env::var("MESH_LLM_MLX_RENDEZVOUS_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    let expected = std::env::var("MESH_LLM_MLX_GROUP_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n >= 2);
+    (std::time::Duration::from_secs(secs), expected)
+}
+
+/// Wait up to the rendezvous window for MLX-eligible peers to appear.
+///
+/// If `MESH_LLM_MLX_GROUP_SIZE` is set, returns as soon as that many total
+/// nodes (self + eligible peers) are visible, or when the window elapses.
+/// Without it, polls until at least one eligible peer is seen (then returns)
+/// or the window elapses. Returns the eligible peers found (empty → single-node).
+async fn wait_for_mlx_peers(node: &mesh::Node, model_id: &str) -> Vec<PeerInfo> {
+    let (window, expected) = mlx_rendezvous();
+    let deadline = std::time::Instant::now() + window;
+    let poll = std::time::Duration::from_millis(500);
+    loop {
+        let eligible: Vec<PeerInfo> = node
+            .peers()
+            .await
+            .into_iter()
+            .filter(|p| peer_is_mlx_eligible(p, model_id))
+            .collect();
+        let have = eligible.len() + 1; // + self
+        match expected {
+            Some(n) if have >= n => return eligible,
+            None if !eligible.is_empty() => return eligible,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            if !eligible.is_empty() {
+                tracing::warn!(
+                    found = eligible.len() + 1,
+                    expected = ?expected,
+                    "MLX rendezvous window elapsed; forming group with peers seen so far"
+                );
+            }
+            return eligible;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+pub async fn plan_group_from_peers(node: &mesh::Node, model_id: &str) -> Option<MlxGroupPlan> {
     if !MlxModelHandle::available() {
         return None;
     }
 
-    let peers = node.peers().await;
-    let eligible: Vec<&PeerInfo> = peers.iter().filter(|p| peer_is_mlx_eligible(p)).collect();
-    if eligible.is_empty() {
+    // Distributed MLX is opt-in. An MLX group is a *fixed* tensor/pipeline
+    // formation decided at init — it is not a demand-driven, dynamically-joined
+    // pool. So a node only forms a group when the operator explicitly asked for
+    // it (and is expected to start the same model on each Apple-Silicon node,
+    // the `mlx.launch` model). Default off → always serve single-node, no
+    // surprise multi-node formation.
+    if !distributed_mlx_enabled() {
+        return None;
+    }
+
+    // Rendezvous window: the operator launches the same model on each node, but
+    // gossip discovery is asynchronous, so a node may reach here before it has
+    // seen its peers. Wait briefly for the expected peers (sharing this model)
+    // to appear so all nodes converge on the same group rather than racing to
+    // serve single-node.
+    let eligible_owned = wait_for_mlx_peers(node, model_id).await;
+    if eligible_owned.is_empty() {
+        return None;
+    }
+    let eligible: Vec<&PeerInfo> = eligible_owned.iter().collect();
+
+    // The MLX ring backend needs ONE hostfile, identical on every rank, with
+    // each node's real routable address. So the local node must contribute the
+    // same IP its peers see — not 0.0.0.0. If we have no routable IP, we cannot
+    // be reached for a ring/JACCL group, so fall back to single-node.
+    let local_ips: Vec<std::net::IpAddr> = node
+        .self_direct_ips()
+        .into_iter()
+        .map(|sa| sa.ip())
+        .collect();
+    if local_ips.is_empty() {
+        tracing::warn!(
+            "MLX: no routable local IP to advertise for a distributed group; serving single-node"
+        );
         return None;
     }
 
@@ -135,12 +283,9 @@ pub async fn plan_group_from_peers(node: &mesh::Node) -> Option<MlxGroupPlan> {
     let mut samples = Vec::new();
     for (rank, (id, peer)) in members.iter().enumerate() {
         match peer {
-            // The local node binds its ring port on all interfaces; only this
-            // node reads its own row, so 0.0.0.0 is a listen address here.
-            None => endpoints.push(peer_endpoint(
-                id.clone(),
-                std::iter::once(std::net::IpAddr::from([0, 0, 0, 0])),
-            )),
+            // The local node advertises its real routable IP(s) — the same
+            // address peers see — so the shared hostfile is consistent.
+            None => endpoints.push(peer_endpoint(id.clone(), local_ips.iter().copied())),
             Some(p) => {
                 let ips: Vec<std::net::IpAddr> = peer_direct_ips(p).map(|sa| sa.ip()).collect();
                 endpoints.push(peer_endpoint(id.clone(), ips.into_iter()));
@@ -267,6 +412,17 @@ pub struct MlxDistributedSetup {
     pub rank: usize,
     pub backend: MlxBackendKind,
     pub mode: ParallelismMode,
+    /// JACCL NxN devices-matrix JSON + rank-0 coordinator `ip:port`. `None` for
+    /// the ring backend.
+    pub jaccl: Option<MlxJacclSetup>,
+}
+
+/// JACCL-specific distributed inputs (only present for the JACCL backend).
+#[cfg_attr(not(feature = "mlx-backend"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct MlxJacclSetup {
+    pub devices_json: String,
+    pub coordinator: String,
 }
 
 /// Options for loading an MLX model as a local backend.
@@ -294,11 +450,23 @@ impl MlxModelLoadOptions {
     /// Attach a distributed setup derived from an [`MlxGroupPlan`].
     pub fn with_group(mut self, plan: &MlxGroupPlan) -> Self {
         if plan.is_distributed() {
+            // For JACCL, carry the NxN devices matrix + coordinator. If the
+            // matrix can't be rendered (incomplete RDMA mesh) the setup falls
+            // back to no JACCL inputs — `Group::init` would then fail loudly
+            // rather than run on a half-configured fabric.
+            let jaccl = match (plan.jaccl_devices(), plan.coordinator()) {
+                (Some(devices_json), Some(coordinator)) => Some(MlxJacclSetup {
+                    devices_json,
+                    coordinator,
+                }),
+                _ => None,
+            };
             self.distributed = Some(MlxDistributedSetup {
                 hostfile_json: plan.hostfile(),
                 rank: plan.local_rank,
                 backend: plan.transport.backend,
                 mode: plan.parallelism.mode,
+                jaccl,
             });
         }
         self
@@ -412,10 +580,16 @@ impl MlxModelHandle {
         options: MlxModelLoadOptions,
         dist: MlxDistributedSetup,
     ) -> Result<Self> {
-        use mesh_mlx::{DistributedEngine, JoinParams, ModelRef, ServerState, WorkerHandle, spawn};
+        use mesh_mlx::{
+            DistributedEngine, JacclParams, JoinParams, ModelRef, ServerState, WorkerHandle, spawn,
+        };
 
         let join = JoinParams {
             hostfile_json: dist.hostfile_json,
+            jaccl: dist.jaccl.map(|j| JacclParams {
+                devices_json: j.devices_json,
+                coordinator: j.coordinator,
+            }),
             rank: dist.rank,
             backend: dist.backend.to_backend(),
             mode: dist.mode,
@@ -518,6 +692,27 @@ mod tests {
         let o = MlxModelLoadOptions::new("mlx-community/Qwen2.5-0.5B-Instruct-4bit");
         assert_eq!(o.bind_addr.port(), 0);
         assert!(o.bind_addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn model_ids_match_full_and_tail_case_insensitive() {
+        // Exact and case-insensitive.
+        assert!(model_ids_match(
+            "mlx-community/Qwen2.5-0.5B",
+            "MLX-Community/qwen2.5-0.5b"
+        ));
+        // Repo-path vs bare name (mesh stores HF snapshots under repo paths).
+        assert!(model_ids_match(
+            "mlx-community/Qwen2.5-0.5B-Instruct-bf16",
+            "Qwen2.5-0.5B-Instruct-bf16"
+        ));
+        // Different models do not match.
+        assert!(!model_ids_match(
+            "mlx-community/Qwen2.5-0.5B",
+            "mlx-community/Llama-3.2-3B"
+        ));
+        // Same tail, different org still matches (tail is the identity we have).
+        assert!(model_ids_match("org-a/Model-X", "org-b/Model-X"));
     }
 
     #[test]
@@ -640,6 +835,14 @@ mod tests {
         assert_eq!(plan.parallelism.mode, ParallelismMode::Pipeline);
         let hf = plan.hostfile();
         assert!(hf.contains("10.0.0.2"));
+        // Ring hostfile is the MLX runtime format: array of arrays of ip:port,
+        // one row per rank — not the {ssh,ips,rdma} launch-tooling shape.
+        let rows: Vec<Vec<String>> = serde_json::from_str(&hf).expect("ring hostfile parses");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].iter().any(|s| s.contains("10.0.0.2:5680")));
+        assert!(!hf.contains("ssh"));
+        // Ring backend → no JACCL devices matrix.
+        assert!(plan.jaccl_devices().is_none());
 
         let opts = MlxModelLoadOptions::new("m").with_group(&plan);
         let dist = opts.distributed.expect("multi-node attaches setup");

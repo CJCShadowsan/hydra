@@ -43,12 +43,12 @@ pub use download::ModelRef;
 pub use mesh::{
     LatencySample, MlxBackendKind, MlxOrchestrator, NodeEndpoint, ParallelismMode, ParallelismPlan,
     ParallelismPlanner, ParallelismPreference, TransportPlan, TransportPreference,
-    detect_rdma_devices, jaccl_env, mlx_supported,
+    detect_rdma_devices, mlx_supported,
 };
 pub use models::{Family, ModelConfig};
 pub use runtime::{
-    ChatTurn, DistributedEngine, Engine, JoinParams, ServerHandle, ServerState, WorkerHandle,
-    render_chat, router, serve, spawn,
+    ChatTurn, DistributedEngine, Engine, JacclParams, JoinParams, ServerHandle, ServerState,
+    WorkerHandle, render_chat, router, serve, spawn,
 };
 
 /// Errors from the MLX runtime.

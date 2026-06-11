@@ -210,23 +210,44 @@ Transport selection (ring vs JACCL/RDMA) — ergonomics:
   (`rdma_en*`). JACCL also needs macOS 26.2+, `rdma_ctl enable` in recovery
   mode, and a Thunderbolt-5 mesh — these can't be auto-provisioned, hence the
   opt-in.
-- When JACCL is selected, the hostfile carries the per-node `rdma` mesh field
-  (N-length array, `null` on the diagonal) and `jaccl_env()` provides the env
-  MLX reads (`MLX_IBV_DEVICES`, `MLX_JACCL_COORDINATOR`, `MLX_RANK`).
-- **Known gap:** `PeerInfo` has no RDMA field yet, so peers' device maps aren't
-  gossiped. We detect/populate the local (rank 0) row; a *complete* auto JACCL
-  mesh needs a gossiped per-peer RDMA capability (additive protobuf change).
-  Until then JACCL engages reliably only when device maps are supplied; `auto`
-  safely falls back to ring.
+- Wire formats MLX actually reads at runtime (verified against the mlx/mlx-c
+  source, not the launch tooling):
+  - **Ring** `MLX_HOSTFILE` is `[["ip:port", …], …]` — an array, in rank order,
+    of arrays of address strings (`render_hostfile`). The local node advertises
+    its **real routable IP** (the same one peers see, via `Node::self_direct_ips`),
+    not `0.0.0.0`, so the single shared hostfile is consistent on every rank.
+  - **JACCL** reads `MLX_IBV_DEVICES` as a **path to an NxN devices-matrix JSON
+    file** (`render_jaccl_devices`: diagonal empty, every off-diagonal populated)
+    plus `MLX_JACCL_COORDINATOR` (rank-0 `ip:port`) and `MLX_RANK`. `join` writes
+    the matrix to a temp file and points the env at it.
+- **Comm stream:** MLX's ring/MPI collectives have no GPU kernel and force the
+  CPU device internally — but a concrete GPU stream overrides that default, so
+  the `Group` owns a CPU stream and dispatches every collective on it
+  (`AllReduce::eval_gpu` would otherwise fail). MLX moves operands to/from the
+  GPU as needed.
+- **Known gap:** `PeerInfo` has no gossiped RDMA device field yet, so JACCL's
+  auto-formed device matrix is only complete when each node's row is otherwise
+  available; a *complete* auto JACCL mesh needs a gossiped per-peer RDMA
+  capability (additive protobuf change). `auto` safely falls back to ring, and
+  the **ring/pipeline path over Ethernet is the validated multi-node lane**.
 
-Pending (needs multi-node hardware):
-- Validate the pipeline/tensor execution across a live 2+ node `Group` (Ethernet
-  ring / Thunderbolt JACCL) — throughput + correctness. The full path is now
-  implemented and unit-tested: discovery, identical rank ordering across nodes,
-  hostfile, group init, sharded load, the leader request-broadcast, the worker
-  lock-step loop, and the generate loops. What remains is end-to-end timing and
-  correctness measurement on a real 2+ node rig — the code path no longer has a
-  known coordination gap, only unverified real-hardware behavior.
+Validated:
+- **Two-rank ring inference works end-to-end** (`tests/live_two_node_ring.rs`,
+  gated by `MLX_TWO_NODE_RING=1` under `link-mlx`, and run in CI). Two processes
+  join a TCP ring on localhost: rank 0 leads and generates, rank 1 runs the
+  worker loop. They rendezvous at group init, the leader broadcasts the request,
+  both ranks run the pipeline in lock-step, and the leader returns a correct
+  completion ("…Paris."), with the worker exiting cleanly on the shutdown
+  sentinel. This exercises the real hostfile format, group-init rendezvous,
+  request broadcast, worker loop, CPU comm stream, and pipeline send/recv —
+  the parts unit tests cannot cover.
+
+Pending (needs multi-machine hardware):
+- Throughput/correctness on a real 2+ **machine** rig over Ethernet (ring) and
+  Thunderbolt (JACCL), and tensor-parallel validation. The control + data path
+  is implemented and the localhost two-rank ring proves the coordination; what
+  remains is cross-machine networking, JACCL/RDMA on real Thunderbolt, and
+  performance measurement.
 
 Polish (non-blocking):
 - Full Jinja `chat_template` (currently a multi-turn ChatML-compatible framing,

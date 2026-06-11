@@ -311,31 +311,65 @@ impl TransportPlan {
         Ok(TransportPlan { backend, nodes })
     }
 
-    /// Render the JSON hostfile MLX launch consumes (`[{ssh, ips, rdma?}]`).
+    /// Render the `MLX_HOSTFILE` JSON the MLX **ring** backend reads at runtime.
+    ///
+    /// This is *not* the `{ssh, ips, rdma}` launch-tooling shape (that is what
+    /// `mlx.distributed_config` consumes to SSH-launch and generate hosts). The
+    /// ring backend's `load_nodes()` expects an array, in rank order, of arrays
+    /// of `"ip:port"` strings — one inner array per node, one entry per
+    /// connection:
+    ///
+    /// ```json
+    /// [
+    ///   ["10.0.0.1:5680"],
+    ///   ["10.0.0.2:5680"]
+    /// ]
+    /// ```
+    ///
+    /// Each node's row carries its own `ips` (the addresses it binds/accepts on
+    /// for its rank, and that peers connect to for the others).
     pub fn render_hostfile(&self) -> String {
-        let entries: Vec<serde_json::Value> = self
-            .nodes
-            .iter()
-            .map(|n| {
-                let mut obj = serde_json::Map::new();
-                obj.insert("ssh".into(), n.ssh.clone().into());
-                obj.insert("ips".into(), n.ips.clone().into());
-                if !n.rdma.is_empty() {
-                    let rdma: Vec<serde_json::Value> = n
-                        .rdma
-                        .iter()
-                        .map(|d| match d {
-                            Some(s) => serde_json::Value::String(s.clone()),
-                            None => serde_json::Value::Null,
-                        })
-                        .collect();
-                    obj.insert("rdma".into(), rdma.into());
+        let rows: Vec<Vec<String>> = self.nodes.iter().map(|n| n.ips.clone()).collect();
+        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Render the JACCL devices matrix JSON that `MLX_IBV_DEVICES` points to.
+    ///
+    /// JACCL's `parse_devices_json` reads this file as an NxN matrix: row `i`,
+    /// column `j` is the list of RDMA device name(s) rank `i` uses to reach
+    /// rank `j`. The diagonal (`i == j`) is empty; every off-diagonal cell must
+    /// be populated and all cells must have the same connection count. Returns
+    /// `None` unless every node advertises a complete row (so we never write an
+    /// invalid matrix that JACCL would reject).
+    ///
+    /// Shape (2 nodes, single connection each):
+    /// ```json
+    /// [
+    ///   [[], ["rdma_en2"]],
+    ///   [["rdma_en2"], []]
+    /// ]
+    /// ```
+    pub fn render_jaccl_devices(&self) -> Option<String> {
+        let n = self.nodes.len();
+        if n == 0 {
+            return None;
+        }
+        let mut matrix: Vec<Vec<Vec<String>>> = Vec::with_capacity(n);
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.rdma.len() != n {
+                return None;
+            }
+            let mut row = Vec::with_capacity(n);
+            for (j, dev) in node.rdma.iter().enumerate() {
+                match (i == j, dev) {
+                    (true, _) => row.push(Vec::new()),
+                    (false, Some(d)) => row.push(vec![d.clone()]),
+                    (false, None) => return None,
                 }
-                serde_json::Value::Object(obj)
-            })
-            .collect();
-        serde_json::to_string_pretty(&serde_json::Value::Array(entries))
-            .unwrap_or_else(|_| "[]".into())
+            }
+            matrix.push(row);
+        }
+        serde_json::to_string_pretty(&matrix).ok()
     }
 }
 
@@ -370,26 +404,6 @@ pub fn detect_rdma_devices() -> Vec<String> {
         .filter(|tok| tok.starts_with("rdma_") || tok.starts_with("rdma"))
         .map(|s| s.to_string())
         .collect()
-}
-
-/// Build the JACCL environment for a node, given the per-peer RDMA device map
-/// (the row of the mesh matrix for this rank) and the coordinator `ip:port`.
-///
-/// Returns the env vars MLX's JACCL backend reads at init:
-/// `MLX_IBV_DEVICES` (device file/list), `MLX_JACCL_COORDINATOR`, `MLX_RANK`.
-pub fn jaccl_env(
-    rank: usize,
-    rdma_row: &[Option<String>],
-    coordinator: &str,
-) -> Vec<(String, String)> {
-    // MLX_IBV_DEVICES is a comma-separated list of this node's devices used to
-    // reach each peer (null entries — self — are skipped).
-    let devices: Vec<&str> = rdma_row.iter().filter_map(|d| d.as_deref()).collect();
-    vec![
-        ("MLX_RANK".to_string(), rank.to_string()),
-        ("MLX_IBV_DEVICES".to_string(), devices.join(",")),
-        ("MLX_JACCL_COORDINATOR".to_string(), coordinator.to_string()),
-    ]
 }
 
 /// The mesh-facing orchestration surface for an MLX node.
@@ -570,9 +584,15 @@ mod tests {
         let plan = TransportPlan::recommend(ParallelismMode::Pipeline, plain(2));
         assert_eq!(plan.backend, MlxBackendKind::Ring);
         let hf = plan.render_hostfile();
-        assert!(hf.contains("10.0.0.1"));
-        assert!(hf.contains("mac-0"));
+        // Ring hostfile is the MLX runtime format: array of arrays of ip:port.
+        let parsed: Vec<Vec<String>> = serde_json::from_str(&hf).unwrap();
+        assert_eq!(parsed, vec![vec!["10.0.0.1"], vec!["10.0.0.2"]]);
+        // No launch-tooling fields in the runtime hostfile.
+        assert!(!hf.contains("mac-0"));
+        assert!(!hf.contains("ssh"));
         assert!(!hf.contains("rdma"));
+        // No JACCL devices matrix without an RDMA mesh.
+        assert!(plan.render_jaccl_devices().is_none());
     }
 
     /// Two nodes each advertising an RDMA device map (a complete Thunderbolt
@@ -653,22 +673,31 @@ mod tests {
     }
 
     #[test]
-    fn jaccl_renders_rdma_field_and_env() {
+    fn jaccl_renders_ring_hostfile_and_devices_matrix() {
         let plan = TransportPlan::recommend_with(
             ParallelismMode::Tensor,
             rdma_pair(),
             TransportPreference::Jaccl,
         )
         .unwrap();
-        let hf = plan.render_hostfile();
-        assert!(hf.contains("rdma_en5"));
-        assert!(hf.contains("rdma")); // the rdma field is present
 
-        let env = jaccl_env(0, &plan.nodes[0].rdma, "10.0.0.1:6000");
-        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(map["MLX_RANK"], "0");
-        assert_eq!(map["MLX_IBV_DEVICES"], "rdma_en5");
-        assert_eq!(map["MLX_JACCL_COORDINATOR"], "10.0.0.1:6000");
+        // The ring hostfile is the runtime format MLX parses: an array of
+        // arrays of "ip:port" — no objects, no rdma field.
+        let hf = plan.render_hostfile();
+        let parsed: Vec<Vec<String>> = serde_json::from_str(&hf).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].iter().all(|s| s.contains(':')));
+        assert!(!hf.contains("rdma"));
+        assert!(!hf.contains("ssh"));
+
+        // The JACCL devices matrix is a separate NxN file: diagonal empty,
+        // off-diagonal populated with device name(s).
+        let devices = plan.render_jaccl_devices().expect("complete rdma mesh");
+        let matrix: Vec<Vec<Vec<String>>> = serde_json::from_str(&devices).unwrap();
+        assert_eq!(matrix.len(), 2);
+        assert!(matrix[0][0].is_empty(), "diagonal is empty");
+        assert!(!matrix[0][1].is_empty(), "off-diagonal populated");
+        assert_eq!(matrix[1][0], vec!["rdma_en5".to_string()]);
     }
 
     #[test]

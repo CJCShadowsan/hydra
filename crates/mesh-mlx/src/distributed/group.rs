@@ -44,10 +44,18 @@ impl Backend {
 }
 
 /// A distributed process group. Owns the underlying `mlx_distributed_group`.
+///
+/// Holds its own **CPU stream**: MLX's ring/MPI distributed collectives have no
+/// GPU kernel (`AllReduce::eval_gpu` is unimplemented) and internally force the
+/// communication stream to the CPU device. If we hand them a GPU stream, MLX
+/// keeps it (a concrete stream overrides the CPU default) and the collective
+/// fails at eval. So every collective on this group is dispatched on the CPU
+/// stream; MLX moves the operand to/from the GPU as needed.
 pub struct Group {
     raw: sys::mlx_distributed_group,
     rank: i32,
     size: i32,
+    comm_stream: Stream,
 }
 
 // SAFETY: an `mlx_distributed_group` is a reference-counted handle; engine
@@ -75,7 +83,12 @@ impl Group {
         }
         let rank = unsafe { sys::mlx_distributed_group_rank(raw) };
         let size = unsafe { sys::mlx_distributed_group_size(raw) };
-        Ok(Group { raw, rank, size })
+        Ok(Group {
+            raw,
+            rank,
+            size,
+            comm_stream: Stream::cpu(),
+        })
     }
 
     /// 0-based rank of this process within the group.
@@ -95,38 +108,58 @@ impl Group {
     }
 
     /// All-reduce (sum) `x` across the group. Every rank receives the total.
-    pub fn all_sum(&self, x: &Array, s: &Stream) -> Result<Array> {
+    ///
+    /// `_s` is accepted for call-site symmetry with GPU ops but intentionally
+    /// ignored: the collective runs on the group's CPU stream (the ring/MPI
+    /// backends have no GPU collective kernel — see [`Group`]).
+    pub fn all_sum(&self, x: &Array, _s: &Stream) -> Result<Array> {
         let mut res = unsafe { sys::mlx_array_new() };
-        let rc = unsafe { sys::mlx_distributed_all_sum(&mut res, x.raw, self.raw, s.raw) };
+        let rc = unsafe {
+            sys::mlx_distributed_all_sum(&mut res, x.raw, self.raw, self.comm_stream.raw)
+        };
         // Take ownership before the check so the handle is freed on error.
         let res = Array::from_raw(res);
         check(rc, "all_sum")?;
         Ok(res)
     }
 
-    /// All-gather `x` across the group along axis 0.
-    pub fn all_gather(&self, x: &Array, s: &Stream) -> Result<Array> {
+    /// All-gather `x` across the group along axis 0. Runs on the CPU comm
+    /// stream (see [`Group`]); `_s` is ignored.
+    pub fn all_gather(&self, x: &Array, _s: &Stream) -> Result<Array> {
         let mut res = unsafe { sys::mlx_array_new() };
-        let rc = unsafe { sys::mlx_distributed_all_gather(&mut res, x.raw, self.raw, s.raw) };
+        let rc = unsafe {
+            sys::mlx_distributed_all_gather(&mut res, x.raw, self.raw, self.comm_stream.raw)
+        };
         let res = Array::from_raw(res);
         check(rc, "all_gather")?;
         Ok(res)
     }
 
-    /// Send `x` to `dst`. Returns the (dependency) array MLX produces.
-    pub fn send(&self, x: &Array, dst: i32, s: &Stream) -> Result<Array> {
+    /// Send `x` to `dst`. Returns the (dependency) array MLX produces. Runs on
+    /// the CPU comm stream (see [`Group`]); `_s` is ignored.
+    pub fn send(&self, x: &Array, dst: i32, _s: &Stream) -> Result<Array> {
         let mut res = unsafe { sys::mlx_array_new() };
-        let rc = unsafe { sys::mlx_distributed_send(&mut res, x.raw, dst, self.raw, s.raw) };
+        let rc = unsafe {
+            sys::mlx_distributed_send(&mut res, x.raw, dst, self.raw, self.comm_stream.raw)
+        };
         let res = Array::from_raw(res);
         check(rc, "send")?;
         Ok(res)
     }
 
-    /// Receive an array shaped like `template` from `src`.
-    pub fn recv_like(&self, template: &Array, src: i32, s: &Stream) -> Result<Array> {
+    /// Receive an array shaped like `template` from `src`. Runs on the CPU comm
+    /// stream (see [`Group`]); `_s` is ignored.
+    pub fn recv_like(&self, template: &Array, src: i32, _s: &Stream) -> Result<Array> {
         let mut res = unsafe { sys::mlx_array_new() };
-        let rc =
-            unsafe { sys::mlx_distributed_recv_like(&mut res, template.raw, src, self.raw, s.raw) };
+        let rc = unsafe {
+            sys::mlx_distributed_recv_like(
+                &mut res,
+                template.raw,
+                src,
+                self.raw,
+                self.comm_stream.raw,
+            )
+        };
         let res = Array::from_raw(res);
         check(rc, "recv_like")?;
         Ok(res)

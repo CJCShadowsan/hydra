@@ -243,8 +243,13 @@ pub struct DistributedEngine {
 
 /// Parameters for joining a distributed MLX group.
 pub struct JoinParams {
-    /// Rank-ordered hostfile JSON (MLX `load_nodes` format).
+    /// Rank-ordered ring hostfile JSON (MLX `load_nodes` format:
+    /// `[["ip:port", ...], ...]`). Used by the ring backend; for JACCL the ring
+    /// hostfile still provides the TCP coordinator bootstrap addresses.
     pub hostfile_json: String,
+    /// JACCL devices-matrix JSON (NxN `MLX_IBV_DEVICES` file) and the rank-0
+    /// coordinator `ip:port`. `None` for the ring backend.
+    pub jaccl: Option<JacclParams>,
     /// This node's rank in the ring.
     pub rank: usize,
     /// Which MLX backend to initialise (ring/jaccl/mpi).
@@ -253,22 +258,44 @@ pub struct JoinParams {
     pub mode: ParallelismMode,
 }
 
+/// JACCL-specific join inputs: the devices matrix and the coordinator address.
+pub struct JacclParams {
+    /// NxN devices-matrix JSON written to a file that `MLX_IBV_DEVICES` points
+    /// at (JACCL parses it as a file path, not an inline list).
+    pub devices_json: String,
+    /// Rank-0 `ip:port` JACCL uses to bootstrap the mesh
+    /// (`MLX_JACCL_COORDINATOR`).
+    pub coordinator: String,
+}
+
 impl DistributedEngine {
     /// Join an MLX distributed group and load the model for this rank.
     ///
-    /// Writes `hostfile_json` to a temp file, points `MLX_HOSTFILE`/`MLX_RANK`
-    /// at it, initialises the group on `backend`, and loads the model per
-    /// `mode`. The hostfile path is kept alive for the process lifetime.
+    /// Writes the ring hostfile and (for JACCL) the devices-matrix file, points
+    /// the matching env vars at them, initialises the group on `backend`, and
+    /// loads the model per `mode`. The temp files are kept for the process
+    /// lifetime because MLX re-reads them lazily during collective setup.
     pub async fn join(model: &ModelRef, params: JoinParams) -> Result<Self> {
-        // Persist the hostfile and expose it to the MLX backend via env. The
-        // file is intentionally leaked (kept for the process lifetime) because
-        // MLX re-reads it lazily during collective setup.
-        let path = write_hostfile(&params.hostfile_json)?;
+        // Persist the ring hostfile and expose it to the MLX backend via env.
+        let host_path = write_temp_json("mesh-mlx-hosts", &params.hostfile_json)?;
+
+        // For JACCL, write the NxN devices matrix to a file and point
+        // MLX_IBV_DEVICES at the *path* (the JACCL backend opens it as a file),
+        // plus the coordinator address the mesh bootstraps over.
+        let jaccl_dev_path = match &params.jaccl {
+            Some(j) => Some(write_temp_json("mesh-mlx-jaccl-devices", &j.devices_json)?),
+            None => None,
+        };
+
         // SAFETY: set before any MLX distributed init on this process; the
         // runtime is single-threaded at this point in startup.
         unsafe {
-            std::env::set_var("MLX_HOSTFILE", &path);
+            std::env::set_var("MLX_HOSTFILE", &host_path);
             std::env::set_var("MLX_RANK", params.rank.to_string());
+            if let (Some(dev_path), Some(j)) = (jaccl_dev_path.as_ref(), params.jaccl.as_ref()) {
+                std::env::set_var("MLX_IBV_DEVICES", dev_path);
+                std::env::set_var("MLX_JACCL_COORDINATOR", &j.coordinator);
+            }
         }
 
         let group = Group::init(params.backend, true)?;
@@ -441,10 +468,11 @@ impl WorkRequest {
     }
 }
 
-/// Write the hostfile to a fresh, exclusively created temp file with an
-/// unguessable name. `create_new` fails closed if the path already exists, so a
-/// pre-created file or symlink in the shared temp directory cannot be reused.
-fn write_hostfile(hostfile_json: &str) -> Result<std::path::PathBuf> {
+/// Write `contents` to a fresh, exclusively created temp file with an
+/// unguessable name and the given `prefix`. `create_new` fails closed if the
+/// path already exists, so a pre-created file or symlink in the shared temp
+/// directory cannot be reused.
+fn write_temp_json(prefix: &str, contents: &str) -> Result<std::path::PathBuf> {
     use std::io::Write;
 
     let nonce = {
@@ -457,19 +485,16 @@ fn write_hostfile(hostfile_json: &str) -> Result<std::path::PathBuf> {
         h.finish()
     };
     let mut path = std::env::temp_dir();
-    path.push(format!(
-        "mesh-mlx-hosts-{}-{nonce:016x}.json",
-        std::process::id()
-    ));
+    path.push(format!("{prefix}-{}-{nonce:016x}.json", std::process::id()));
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .map_err(|e| {
-            crate::MlxError::Distributed(format!("create hostfile {}: {e}", path.display()))
+            crate::MlxError::Distributed(format!("create {prefix} {}: {e}", path.display()))
         })?;
-    f.write_all(hostfile_json.as_bytes())
-        .map_err(|e| crate::MlxError::Distributed(format!("write hostfile: {e}")))?;
+    f.write_all(contents.as_bytes())
+        .map_err(|e| crate::MlxError::Distributed(format!("write {prefix}: {e}")))?;
     Ok(path)
 }
 
