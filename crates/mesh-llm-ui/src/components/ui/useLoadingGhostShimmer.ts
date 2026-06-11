@@ -1,33 +1,38 @@
 import { useEffect, useRef, type RefObject } from 'react'
-import { animate, createScope, stagger, type Scope } from 'animejs'
 
 const LOADING_GHOST_SHIMMER_SELECTOR = '[data-loading-ghost-shimmer]'
 
 export function useLoadingGhostShimmer<TElement extends HTMLElement>(rootRef: RefObject<TElement | null>) {
-  const scopeRef = useRef<Scope | null>(null)
+  const animationsRef = useRef<Animation[]>([])
 
   useEffect(() => {
     const prefersReducedMotion =
       typeof window !== 'undefined' &&
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches
-    if (prefersReducedMotion) return undefined
+    const root = rootRef.current
+    if (prefersReducedMotion || !root || typeof Element.prototype.animate !== 'function') return undefined
 
-    scopeRef.current = createScope({ root: rootRef }).add(() => {
-      animate(LOADING_GHOST_SHIMMER_SELECTOR, {
-        translateX: ['-130%', '260%'],
-        opacity: [0, 0.42, 0],
-        duration: 2400,
-        delay: stagger(70),
-        loop: true,
-        loopDelay: 280,
-        ease: 'inOutSine'
-      })
-    })
+    const shimmerElements = Array.from(root.querySelectorAll<HTMLElement>(LOADING_GHOST_SHIMMER_SELECTOR))
+    animationsRef.current = shimmerElements.map((element, index) =>
+      element.animate(
+        [
+          { opacity: 0, transform: 'translateX(-130%)' },
+          { opacity: 0.42, offset: 0.5, transform: 'translateX(65%)' },
+          { opacity: 0, transform: 'translateX(260%)' }
+        ],
+        {
+          delay: index * 70,
+          duration: 2400,
+          easing: 'ease-in-out',
+          iterations: Number.POSITIVE_INFINITY
+        }
+      )
+    )
 
     return () => {
-      scopeRef.current?.revert()
-      scopeRef.current = null
+      animationsRef.current.forEach((animation) => animation.cancel())
+      animationsRef.current = []
     }
   }, [rootRef])
 }

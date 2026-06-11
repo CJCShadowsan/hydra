@@ -729,7 +729,7 @@ function UtilityActions({
 
 export function TopNav(props: TopNavProps) {
   return (
-    <header className="surface-chrome sticky top-0 z-30 flex flex-nowrap items-center gap-[var(--topnav-gap)] border-b border-border-soft px-[var(--topnav-pad-x)] py-[var(--topnav-pad-y)]">
+    <header className="surface-chrome sticky top-0 z-30 flex flex-nowrap items-center gap-[var(--topnav-gap)] border-b border-border-soft px-[var(--topnav-pad-x)] pb-[var(--topnav-pad-y)] pt-[calc(var(--topnav-pad-y)+var(--topnav-safe-pad-top,0px))]">
       <BrandCluster version={props.version} renderLogo={props.renderLogo} brand={props.brand} />
       <PrimaryTabs
         enabledTabs={props.enabledTabs}

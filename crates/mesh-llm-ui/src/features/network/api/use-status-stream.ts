@@ -6,6 +6,7 @@ import { env } from '@/lib/env'
 
 const MIN_BACKOFF = 1000
 const MAX_BACKOFF = 15_000
+const MIN_STATUS_COMMIT_MS = 500
 
 export function useStatusStream(options?: { enabled?: boolean }) {
   const queryClient = useQueryClient()
@@ -13,6 +14,9 @@ export function useStatusStream(options?: { enabled?: boolean }) {
   const esRef = useRef<EventSource | null>(null)
   const backoffRef = useRef<number>(MIN_BACKOFF)
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const commitTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const lastCommitRef = useRef(0)
+  const pendingStatusRef = useRef<StatusPayload | undefined>(undefined)
 
   useEffect(() => {
     if (!enabled) return
@@ -22,6 +26,35 @@ export function useStatusStream(options?: { enabled?: boolean }) {
       if (timerRef.current === undefined) return
       clearTimeout(timerRef.current)
       timerRef.current = undefined
+    }
+
+    function clearCommitTimer() {
+      if (commitTimerRef.current === undefined) return
+      clearTimeout(commitTimerRef.current)
+      commitTimerRef.current = undefined
+    }
+
+    function flushPendingStatus() {
+      if (!active || pendingStatusRef.current === undefined) return
+      queryClient.setQueryData(statusKeys.detail(), pendingStatusRef.current)
+      pendingStatusRef.current = undefined
+      lastCommitRef.current = Date.now()
+    }
+
+    function scheduleStatusCommit(payload: StatusPayload) {
+      pendingStatusRef.current = payload
+      const elapsed = Date.now() - lastCommitRef.current
+      if (elapsed >= MIN_STATUS_COMMIT_MS) {
+        clearCommitTimer()
+        flushPendingStatus()
+        return
+      }
+
+      if (commitTimerRef.current !== undefined) return
+      commitTimerRef.current = setTimeout(() => {
+        commitTimerRef.current = undefined
+        flushPendingStatus()
+      }, MIN_STATUS_COMMIT_MS - elapsed)
     }
 
     function closeEventSource() {
@@ -61,8 +94,7 @@ export function useStatusStream(options?: { enabled?: boolean }) {
       es.onmessage = (event: MessageEvent) => {
         if (!active) return
         try {
-          const payload = JSON.parse(event.data as string) as StatusPayload
-          queryClient.setQueryData(statusKeys.detail(), payload)
+          scheduleStatusCommit(JSON.parse(event.data as string) as StatusPayload)
         } catch (_) {
           void _
         }
@@ -83,6 +115,8 @@ export function useStatusStream(options?: { enabled?: boolean }) {
     return () => {
       active = false
       clearReconnectTimer()
+      clearCommitTimer()
+      pendingStatusRef.current = undefined
       closeEventSource()
     }
   }, [queryClient, enabled])

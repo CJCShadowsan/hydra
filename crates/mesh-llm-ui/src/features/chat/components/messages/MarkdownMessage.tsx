@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
 import remarkGfm from 'remark-gfm'
@@ -7,7 +8,7 @@ import { cn } from '@/lib/utils'
 import { KaTeXBlock } from '@/features/chat/components/messages/KaTeXBlock'
 import { MermaidBlock } from '@/features/chat/components/messages/MermaidBlock'
 
-export function MarkdownMessage({ content, streaming }: { content: string; streaming?: boolean }) {
+function MarkdownMessageImpl({ content, streaming }: { content: string; streaming?: boolean }) {
   return (
     <div
       className={cn(
@@ -53,3 +54,5 @@ export function MarkdownMessage({ content, streaming }: { content: string; strea
     </div>
   )
 }
+
+export const MarkdownMessage = memo(MarkdownMessageImpl)

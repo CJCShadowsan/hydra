@@ -19,7 +19,18 @@ describe('MessageRow', () => {
     const article = container.querySelector('article')
 
     expect(article).toBeInTheDocument()
-    expect(article).toHaveClass('relative', '-mx-2', 'mb-5', 'block', 'w-[calc(100%+16px)]', 'select-none')
+    expect(article).toHaveClass(
+      'chat-message-row',
+      'relative',
+      '-mx-1',
+      'mb-4',
+      'block',
+      'w-[calc(100%+8px)]',
+      'sm:-mx-2',
+      'sm:mb-5',
+      'sm:w-[calc(100%+16px)]',
+      'select-none'
+    )
     expect(article).not.toHaveClass('focus-visible:outline-accent')
     expect(article).toHaveTextContent('Static response from the mesh')
     expect(container.querySelector('button')).not.toBeInTheDocument()
@@ -84,7 +95,18 @@ describe('MessageRow', () => {
     const article = container.querySelector('article')
     const button = screen.getByRole('button', { name: 'Inspect mesh route' })
 
-    expect(article).toHaveClass('relative', '-mx-2', 'mb-5', 'block', 'w-[calc(100%+16px)]', 'select-none')
+    expect(article).toHaveClass(
+      'chat-message-row',
+      'relative',
+      '-mx-1',
+      'mb-4',
+      'block',
+      'w-[calc(100%+8px)]',
+      'sm:-mx-2',
+      'sm:mb-5',
+      'sm:w-[calc(100%+16px)]',
+      'select-none'
+    )
     expect(button).not.toHaveClass('w-[calc(100%+16px)]')
     expect(article).toHaveTextContent('Inspectable response from the mesh')
 

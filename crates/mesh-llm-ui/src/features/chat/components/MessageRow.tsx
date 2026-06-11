@@ -1,4 +1,4 @@
-import type { CSSProperties } from 'react'
+import { memo, type CSSProperties } from 'react'
 import {
   BrainCircuit,
   Eye,
@@ -75,7 +75,15 @@ function AttachmentIcon({ kind }: { kind: MessageAttachmentAction['kind'] }) {
   return <FileIcon className="size-3.5" aria-hidden={true} />
 }
 
-function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled: boolean }) {
+// Memoized so historical assistant messages skip re-parsing markdown on every
+// streaming token flush; props are scalars, so the shallow compare is exact.
+const AssistantMarkdown = memo(function AssistantMarkdown({
+  text,
+  linksEnabled
+}: {
+  text: string
+  linksEnabled: boolean
+}) {
   return (
     <div className="block select-text break-words [&_code]:rounded-[calc(var(--radius)-2px)] [&_code]:bg-panel-strong [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.93em] [&_em]:text-fg-dim [&_strong]:font-semibold [&_strong]:text-foreground">
       <ReactMarkdown
@@ -228,9 +236,9 @@ function AssistantMarkdown({ text, linksEnabled }: { text: string; linksEnabled:
       </ReactMarkdown>
     </div>
   )
-}
+})
 
-function AssistantMessageContent({
+const AssistantMessageContent = memo(function AssistantMessageContent({
   body,
   linksEnabled,
   streaming
@@ -282,9 +290,9 @@ function AssistantMessageContent({
       })}
     </div>
   )
-}
+})
 
-export function MessageRow({
+function MessageRowImpl({
   messageRole,
   body,
   timestamp,
@@ -315,7 +323,7 @@ export function MessageRow({
   const routeMetadata = showRouteMetadata && ((isUser && routeNode) || (isResponse && route))
   const displayModel = isQueued ? 'Queued' : model
   const rowClassName =
-    'relative -mx-2 mb-5 block w-[calc(100%+16px)] select-none rounded-[var(--radius-lg)] border-0 bg-transparent px-2 py-1 text-left transition-[background,box-shadow] duration-150'
+    'chat-message-row relative -mx-1 mb-4 block w-[calc(100%+8px)] select-none rounded-[var(--radius-lg)] border-0 bg-transparent px-1 py-1 text-left transition-[background,box-shadow] duration-150 sm:-mx-2 sm:mb-5 sm:w-[calc(100%+16px)] sm:px-2'
   const rowStyle: CSSProperties = {
     ...(inspected ? { background: 'color-mix(in oklab, var(--color-accent) 4%, transparent)' } : {})
   }
@@ -325,8 +333,7 @@ export function MessageRow({
       ? '1px solid var(--color-bad)'
       : isQueued
         ? '1px solid color-mix(in oklab, var(--color-fg-faint) 42%, var(--color-border))'
-        : '1px solid var(--color-accent)',
-    padding: '8px 12px 8px 14px'
+        : '1px solid var(--color-accent)'
   }
   const errorContentStyle: CSSProperties = {
     ...userContentStyle,
@@ -408,9 +415,11 @@ export function MessageRow({
         ) : null}
       </div>
       <div
-        className="block select-text text-[length:var(--density-type-body-lg)] leading-[1.55]"
+        className={cn(
+          'block select-text text-[length:var(--density-type-body-lg)] leading-[1.55]',
+          isUser || isError ? 'py-1.5 pl-3 sm:pl-3.5' : 'px-0 py-2 sm:px-4 sm:py-3'
+        )}
         style={{
-          padding: isUser || isError ? '6px 0 6px 14px' : '12px 16px',
           background: 'transparent',
           border: isUser || isError ? '0 solid transparent' : '1px solid transparent',
           maxWidth: isUser || isError ? 720 : 'none'
@@ -466,7 +475,7 @@ export function MessageRow({
     </div>
   ) : isUser ? (
     <div
-      className={cn('relative block', hasAttachmentActions && 'flex items-center justify-between gap-4')}
+      className={cn('relative block px-3 py-2 sm:px-3 sm:py-2', hasAttachmentActions && 'flex items-center justify-between gap-4')}
       style={userContentStyle}
     >
       <div className="min-w-0">{messageContent}</div>
@@ -515,3 +524,39 @@ export function MessageRow({
     </article>
   )
 }
+
+function sameAttachments(prev: MessageAttachmentAction[] | undefined, next: MessageAttachmentAction[] | undefined) {
+  const prevAttachments = prev ?? []
+  const nextAttachments = next ?? []
+  if (prevAttachments.length !== nextAttachments.length) return false
+  return prevAttachments.every((attachment, index) => {
+    const nextAttachment = nextAttachments[index]
+    return (
+      attachment.id === nextAttachment.id &&
+      attachment.label === nextAttachment.label &&
+      attachment.kind === nextAttachment.kind &&
+      attachment.fileName === nextAttachment.fileName
+    )
+  })
+}
+
+function sameMessageRowProps(prev: MessageRowProps, next: MessageRowProps) {
+  return (
+    prev.messageRole === next.messageRole &&
+    prev.body === next.body &&
+    prev.timestamp === next.timestamp &&
+    prev.model === next.model &&
+    prev.state === next.state &&
+    prev.route === next.route &&
+    prev.tokens === next.tokens &&
+    prev.inspectLabel === next.inspectLabel &&
+    prev.inspected === next.inspected &&
+    prev.routeNode === next.routeNode &&
+    prev.showRouteMetadata === next.showRouteMetadata &&
+    prev.tokPerSec === next.tokPerSec &&
+    prev.ttft === next.ttft &&
+    sameAttachments(prev.attachments, next.attachments)
+  )
+}
+
+export const MessageRow = memo(MessageRowImpl, sameMessageRowProps)

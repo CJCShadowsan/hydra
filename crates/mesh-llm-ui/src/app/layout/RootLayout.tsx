@@ -16,6 +16,7 @@ import { useStatusQuery } from '@/features/network/api/use-status-query'
 import { useUIPreferences } from '@/features/shell/hooks/useUiPreferences'
 import { SHELL_HARNESS } from '@/features/app-tabs/data'
 import { env, hrefWithBasePath, stripBasePath } from '@/lib/env'
+import { cn } from '@/lib/cn'
 import { useDataMode } from '@/lib/data-mode'
 import { useBooleanFeatureFlag } from '@/lib/feature-flags'
 import type { ShellHarnessData, AppTab } from '@/features/app-tabs/types'
@@ -137,7 +138,7 @@ export function RootLayout({ data = SHELL_HARNESS }: RootLayoutProps = {}) {
     <>
       <HeadContent />
       <LiveStatusConnector />
-      <div className="flex h-dvh flex-col overflow-hidden">
+      <div className={cn('flex h-dvh flex-col overflow-hidden', activeTab === 'chat' && 'route-chat')}>
         <TopNav
           enabledTabs={enabledTabs}
           tab={visibleActiveTab}

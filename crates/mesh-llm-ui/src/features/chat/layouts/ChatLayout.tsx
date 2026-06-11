@@ -177,14 +177,14 @@ export function ChatLayout({
     >
       {showDesktopSidebar ? <div className="min-h-0 min-w-0 overflow-hidden [&>*]:h-full">{sidebar}</div> : null}
       <section className="panel-shell flex min-h-0 min-w-0 select-none flex-col overflow-hidden rounded-[var(--radius-lg)] border border-border bg-panel">
-        <header className="flex min-h-[58px] flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border-soft px-4 py-2 md:flex-nowrap">
-          <div className="flex min-w-0 shrink-0 flex-col justify-center">
+        <header className="flex min-h-[48px] flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-border-soft px-3 py-2 sm:min-h-[58px] sm:gap-x-4 sm:gap-y-2 sm:px-4 md:flex-nowrap">
+          <div className="flex min-w-0 flex-1 flex-col justify-center sm:shrink-0 sm:flex-none">
             {subtitle ? (
               <>
                 <span className="text-[length:var(--density-type-label)] font-medium uppercase tracking-[0.08em] text-fg-faint">
                   {title}
                 </span>
-                <h1 className="truncate text-[length:var(--density-type-title)] font-semibold leading-snug tracking-[-0.01em]">
+                <h1 className="truncate text-[length:var(--density-type-control-lg)] font-semibold leading-snug tracking-[-0.01em] sm:text-[length:var(--density-type-title)]">
                   {subtitle}
                 </h1>
               </>
@@ -197,7 +197,7 @@ export function ChatLayout({
         <div className="flex min-h-0 flex-1 flex-col">
           <div
             ref={messageListRef}
-            className="chat-message-scrollbar min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-4 sm:px-[26px] sm:py-5"
+            className="chat-message-scrollbar min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-3 py-3 sm:px-[26px] sm:py-5"
             data-testid="chat-message-list"
             onPointerDown={handleMessageAreaPointerDown}
           >
