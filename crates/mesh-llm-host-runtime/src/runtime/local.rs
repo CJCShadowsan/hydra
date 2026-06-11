@@ -700,6 +700,24 @@ fn is_mlx_safetensors_model(model_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the model's context length from a safetensors `config.json`.
+///
+/// Honours the common HF field names (`max_position_embeddings`, then
+/// `n_positions` / `n_ctx`). Returns `None` if the file is missing/unreadable or
+/// the field is absent, so the caller can fall back to a default.
+fn mlx_config_context_length(model_path: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(model_path.join("config.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    for key in ["max_position_embeddings", "n_positions", "n_ctx"] {
+        if let Some(v) = json.get(key).and_then(|v| v.as_u64())
+            && v > 0
+        {
+            return Some(v.min(u32::MAX as u64) as u32);
+        }
+    }
+    None
+}
+
 /// Start the native MLX backend for a local safetensors model: load it into the
 /// MLX engine and serve the OpenAI API on an ephemeral local port. Produces the
 /// same `LocalRuntimeModelHandle` shape as the Skippy lane so the rest of the
@@ -761,14 +779,25 @@ async fn start_runtime_mlx_model(
     );
 
     let port = handle.port();
-    let ctx_size = spec.ctx_size_override.unwrap_or(4096);
+    // Prefer the model's own context length (config.json) over a fixed default
+    // so context planning/routing is accurate; fall back to 4096 only if it is
+    // absent or unreadable.
+    let ctx_size = spec
+        .ctx_size_override
+        .or_else(|| mlx_config_context_length(spec.model_path))
+        .unwrap_or(4096);
+    // The MLX runtime is text-only and non-streaming with no tool calling, so
+    // clamp inferred capabilities to what it actually honours before the mesh
+    // advertises this model (otherwise agents could route tool/vision traffic
+    // to a backend that silently drops it).
     let capabilities = models::runtime_verified_model_capabilities(
         &model_name,
         spec.model_path,
         models::RuntimeMediaCapabilityEvidence {
             vision_projector_loaded: false,
         },
-    );
+    )
+    .clamped_for_mlx_runtime();
     let (death_tx, death_rx) = tokio::sync::oneshot::channel();
 
     Ok((

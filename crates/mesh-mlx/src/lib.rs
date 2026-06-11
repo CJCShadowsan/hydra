@@ -47,7 +47,8 @@ pub use mesh::{
 };
 pub use models::{Family, ModelConfig};
 pub use runtime::{
-    DistributedEngine, Engine, JoinParams, ServerHandle, ServerState, router, serve, spawn,
+    ChatTurn, DistributedEngine, Engine, JoinParams, ServerHandle, ServerState, WorkerHandle,
+    render_chat, router, serve, spawn,
 };
 
 /// Errors from the MLX runtime.

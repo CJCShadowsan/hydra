@@ -305,12 +305,31 @@ impl MlxModelLoadOptions {
     }
 }
 
-/// A running MLX backend: an OpenAI server on a local port.
+/// A running MLX backend.
+///
+/// On a single node or the distributed **leader** (rank 0) this owns the OpenAI
+/// server. On a distributed **worker** (rank != 0) there is no server — the
+/// node owns a [`mesh_mlx::WorkerHandle`] running the lock-step worker loop, and
+/// mesh routes inference to the leader, not here.
 pub struct MlxModelHandle {
     #[cfg(feature = "mlx-backend")]
-    server: mesh_mlx::ServerHandle,
+    role: MlxNodeRole,
     port: u16,
     model_id: String,
+}
+
+/// The serving role of an MLX node within its (possibly single-node) group.
+#[cfg(feature = "mlx-backend")]
+enum MlxNodeRole {
+    /// Single node or distributed leader: owns the OpenAI server. The optional
+    /// `ServerState` clone is present for a distributed leader so shutdown can
+    /// broadcast the worker-exit sentinel before stopping the server.
+    Leader {
+        server: mesh_mlx::ServerHandle,
+        state: Option<mesh_mlx::ServerState>,
+    },
+    /// Distributed worker: owns the lock-step worker loop, no HTTP server.
+    Worker(mesh_mlx::WorkerHandle),
 }
 
 impl MlxModelHandle {
@@ -366,7 +385,10 @@ impl MlxModelHandle {
             "MLX backend serving OpenAI API"
         );
         Ok(Self {
-            server,
+            role: MlxNodeRole::Leader {
+                server,
+                state: None,
+            },
             port,
             model_id: options.model_id,
         })
@@ -376,16 +398,21 @@ impl MlxModelHandle {
     /// sets `MLX_HOSTFILE`/`MLX_RANK`, inits the ring/JACCL backend) and loads
     /// the sharded model for this rank.
     ///
-    /// Rank 0 serves the OpenAI API; the chat path drives the group in
-    /// lock-step so the other ranks participate in every generation. (The
-    /// multi-rank worker loop and rank-0 fan-out are the piece that needs a
-    /// live 2+ node rig to validate end to end.)
+    /// **Leader (rank 0)** serves the OpenAI API; its chat path broadcasts each
+    /// request to the workers and then drives the lock-step generation.
+    ///
+    /// **Workers (rank != 0)** do not serve OpenAI. They run the lock-step
+    /// worker loop ([`mesh_mlx::WorkerHandle`]), parked until the leader
+    /// broadcasts a request, then running the matching generation so the
+    /// group's collectives stay synchronised. Without this, the leader would
+    /// deadlock on its first request waiting for workers that never entered the
+    /// collectives.
     #[cfg(feature = "mlx-backend")]
     async fn load_distributed(
         options: MlxModelLoadOptions,
         dist: MlxDistributedSetup,
     ) -> Result<Self> {
-        use mesh_mlx::{DistributedEngine, JoinParams, ModelRef, ServerState, spawn};
+        use mesh_mlx::{DistributedEngine, JoinParams, ModelRef, ServerState, WorkerHandle, spawn};
 
         let join = JoinParams {
             hostfile_json: dist.hostfile_json,
@@ -397,11 +424,30 @@ impl MlxModelHandle {
             .await
             .map_err(|e| anyhow::anyhow!("join MLX group for {}: {e}", options.model_id))?;
 
-        // The distributed engine owns the live group; the server's chat path
-        // drives the group in lock-step. Every rank's process holds the engine
-        // so collectives stay synchronised.
+        // Worker ranks run the lock-step loop and never serve OpenAI; mesh
+        // routes inference to the leader. Use a fixed sentinel port so the
+        // handle has a stable (unused) value.
+        if !dengine.is_leader() {
+            let rank = dengine.rank();
+            tracing::info!(
+                model = %options.model_id,
+                rank,
+                mode = ?dist.mode,
+                "MLX distributed worker running lock-step loop (no local OpenAI server)"
+            );
+            let worker = WorkerHandle::spawn(dengine);
+            return Ok(Self {
+                role: MlxNodeRole::Worker(worker),
+                port: 0,
+                model_id: options.model_id,
+            });
+        }
+
+        // Leader: serve OpenAI. The chat path broadcasts each request to the
+        // workers and drives the group in lock-step. Keep a `ServerState` clone
+        // so shutdown can broadcast the worker-exit sentinel.
         let state = ServerState::distributed(dengine, options.model_id.clone());
-        let server = spawn(state, options.bind_addr)
+        let server = spawn(state.clone(), options.bind_addr)
             .await
             .map_err(|e| anyhow::anyhow!("start MLX OpenAI server: {e}"))?;
         let port = server.port();
@@ -410,10 +456,13 @@ impl MlxModelHandle {
             rank = dist.rank,
             mode = ?dist.mode,
             port,
-            "MLX distributed backend serving OpenAI API"
+            "MLX distributed leader serving OpenAI API"
         );
         Ok(Self {
-            server,
+            role: MlxNodeRole::Leader {
+                server,
+                state: Some(state),
+            },
             port,
             model_id: options.model_id,
         })
@@ -430,10 +479,25 @@ impl MlxModelHandle {
         )
     }
 
-    /// Stop the OpenAI server.
+    /// Stop the backend. A distributed leader first broadcasts the worker-exit
+    /// sentinel so worker ranks leave their lock-step loop cleanly, then stops
+    /// its OpenAI server. A worker waits for its loop to finish.
     #[cfg(feature = "mlx-backend")]
     pub async fn shutdown(self) -> Result<()> {
-        self.server.shutdown().await;
+        match self.role {
+            MlxNodeRole::Leader { server, state } => {
+                if let Some(state) = state {
+                    state.signal_worker_shutdown().await;
+                }
+                server.shutdown().await;
+            }
+            MlxNodeRole::Worker(worker) => {
+                // The leader's sentinel (or its exit) ends the loop; join it.
+                if let Err(e) = worker.join().await {
+                    tracing::warn!("MLX worker loop ended with error: {e}");
+                }
+            }
+        }
         Ok(())
     }
 

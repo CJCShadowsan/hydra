@@ -50,18 +50,52 @@ impl Tokenizer {
     }
 }
 
-/// Apply a minimal chat template. Many MLX-community repos ship a Jinja
-/// template; supporting full Jinja is out of scope for the first cut, so we use
-/// the widely-compatible ChatML-ish framing and fall back to raw text. The
-/// runtime can be extended to honour the repo's `chat_template` later.
-pub fn apply_chat_template(system: Option<&str>, user: &str) -> String {
-    let mut out = String::new();
-    if let Some(sys) = system {
-        out.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+/// A single chat turn fed to [`render_chat`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTurn {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatTurn {
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+        }
     }
-    out.push_str(&format!("<|im_start|>user\n{user}<|im_end|>\n"));
+}
+
+/// Render a full multi-turn conversation with the widely-compatible ChatML
+/// framing, preserving message order so context and prior assistant turns are
+/// not dropped.
+///
+/// Many MLX-community repos ship a Jinja `chat_template`; honouring the repo's
+/// own template is a later refinement. ChatML framing works for the
+/// Qwen/Llama-style families this runtime currently transcribes. Unknown roles
+/// are passed through verbatim so tool/other roles are at least visible to the
+/// model rather than silently discarded.
+pub fn render_chat(turns: &[ChatTurn]) -> String {
+    let mut out = String::new();
+    for turn in turns {
+        out.push_str("<|im_start|>");
+        out.push_str(&turn.role);
+        out.push('\n');
+        out.push_str(&turn.content);
+        out.push_str("<|im_end|>\n");
+    }
     out.push_str("<|im_start|>assistant\n");
     out
+}
+
+/// Convenience wrapper for the common system + single-user shape.
+pub fn apply_chat_template(system: Option<&str>, user: &str) -> String {
+    let mut turns = Vec::new();
+    if let Some(sys) = system {
+        turns.push(ChatTurn::new("system", sys));
+    }
+    turns.push(ChatTurn::new("user", user));
+    render_chat(&turns)
 }
 
 fn resolve_eos_ids(dir: &Path, tok: &HfTokenizer) -> Vec<u32> {
@@ -118,5 +152,40 @@ mod tests {
         collect_eos(&serde_json::json!(2), &mut v);
         collect_eos(&serde_json::json!([100, 101]), &mut v);
         assert_eq!(v, vec![2, 100, 101]);
+    }
+
+    #[test]
+    fn render_chat_preserves_multi_turn_order() {
+        // Full history must survive: system, prior user/assistant turns, then
+        // the latest user turn — not just the last message.
+        let turns = vec![
+            ChatTurn::new("system", "be brief"),
+            ChatTurn::new("user", "hi"),
+            ChatTurn::new("assistant", "hello"),
+            ChatTurn::new("user", "and now?"),
+        ];
+        let p = render_chat(&turns);
+        let sys = p.find("system\nbe brief").expect("system present");
+        let first_user = p.find("user\nhi").expect("first user present");
+        let asst = p.find("assistant\nhello").expect("assistant turn present");
+        let last_user = p.find("user\nand now?").expect("last user present");
+        // Order is preserved.
+        assert!(sys < first_user && first_user < asst && asst < last_user);
+        // Generation prompt is appended.
+        assert!(p.trim_end().ends_with("assistant"));
+    }
+
+    #[test]
+    fn render_chat_passes_unknown_roles_through() {
+        let turns = vec![ChatTurn::new("tool", "result: 42")];
+        let p = render_chat(&turns);
+        assert!(p.contains("tool\nresult: 42"));
+    }
+
+    #[test]
+    fn apply_chat_template_matches_render_chat() {
+        let a = apply_chat_template(Some("s"), "u");
+        let b = render_chat(&[ChatTurn::new("system", "s"), ChatTurn::new("user", "u")]);
+        assert_eq!(a, b);
     }
 }

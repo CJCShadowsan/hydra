@@ -173,8 +173,28 @@ Discovery → MLX handoff (wired):
 - `MlxModelHandle::load_distributed` → `mesh_mlx::DistributedEngine::join`:
   writes the hostfile, sets `MLX_HOSTFILE`/`MLX_RANK` (read by the ring/jaccl
   backends), inits the `Group`, and loads the model sharded per mode (pipeline =
-  this stage's layers; tensor = sliced projections). The OpenAI server's chat
-  path drives the group in lock-step.
+  this stage's layers; tensor = sliced projections).
+- **Leader/worker coordination (implemented).** MLX is SPMD: every rank runs the
+  same lock-step generation, but only one node receives the OpenAI request. So:
+  - **Rank 0 (leader)** serves the OpenAI API. Per request it broadcasts the
+    rendered prompt + token budget to the workers
+    (`Group::broadcast_bytes`, the length-prefixed additive-reduce pattern
+    MLX's own distributed server uses), then runs the generation.
+  - **Ranks != 0 (workers)** do **not** serve OpenAI. They run
+    `DistributedEngine::run_worker_loop` (via `WorkerHandle` on a blocking
+    task), parked until the leader broadcasts a request, then running the
+    identical generation so the group's collectives stay in step. Each rank
+    tokenizes the shared prompt locally and greedy sampling is deterministic, so
+    no per-token broadcast is needed — the EOS/length stop decision agrees on
+    every rank. A zero-length broadcast is the shutdown sentinel; the leader
+    sends it on teardown so workers exit cleanly.
+
+  This closes the previous deadlock gap (the leader's first collective would
+  block on workers that never entered the group). Multi-turn history is
+  preserved end to end (`render_chat`), and the MLX backend's advertised
+  capabilities are clamped (`clamped_for_mlx_runtime`: no tool calls, no
+  vision/audio, non-streaming) so the mesh never routes traffic the MLX server
+  would silently drop.
 
 Transport selection (ring vs JACCL/RDMA) — ergonomics:
 - `MESH_LLM_MLX_TRANSPORT` = `auto` (default) | `ring` | `jaccl`.
@@ -201,14 +221,21 @@ Transport selection (ring vs JACCL/RDMA) — ergonomics:
 
 Pending (needs multi-node hardware):
 - Validate the pipeline/tensor execution across a live 2+ node `Group` (Ethernet
-  ring / Thunderbolt JACCL) — throughput + correctness. All the upstream
-  machinery (discovery, planning, hostfile, group init, sharded load, generate
-  loops) is implemented and unit-tested; the rank-0 fan-out / non-rank-0 worker
-  coordination is the piece that can only be exercised on a real rig.
+  ring / Thunderbolt JACCL) — throughput + correctness. The full path is now
+  implemented and unit-tested: discovery, identical rank ordering across nodes,
+  hostfile, group init, sharded load, the leader request-broadcast, the worker
+  lock-step loop, and the generate loops. What remains is end-to-end timing and
+  correctness measurement on a real 2+ node rig — the code path no longer has a
+  known coordination gap, only unverified real-hardware behavior.
 
 Polish (non-blocking):
-- Full Jinja `chat_template` (currently a ChatML-compatible framing that works
-  for Qwen/Llama-style models).
+- Full Jinja `chat_template` (currently a multi-turn ChatML-compatible framing,
+  `render_chat`, that preserves the whole conversation and works for
+  Qwen/Llama-style models; honouring each repo's own Jinja template is the
+  refinement).
+- Streaming responses and tool-call support (the OpenAI surface is non-streaming
+  and text-only today; capabilities are clamped accordingly so the mesh does not
+  route streaming/tool/multimodal traffic to the MLX backend).
 - Sampling beyond greedy (temperature / top-p).
 - Quantized row-parallel tensor sharding (currently dense-only; quantized
   models shard column-parallel projections only — correct, less memory saving).

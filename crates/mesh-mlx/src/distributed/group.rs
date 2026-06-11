@@ -131,6 +131,49 @@ impl Group {
         check(rc, "recv_like")?;
         Ok(res)
     }
+
+    /// Broadcast a byte payload from `root` to every rank, returning the bytes
+    /// on all ranks.
+    ///
+    /// This is the same length-prefixed additive-reduce pattern MLX's own
+    /// distributed server uses to deliver a request to worker ranks: only the
+    /// root contributes the real values and the others contribute zeros, so the
+    /// `all_sum` reduces to the root's payload on every rank. Two reductions are
+    /// used — first the length (so workers can size their buffer), then the
+    /// bytes. A zero length is a valid empty/sentinel broadcast.
+    ///
+    /// All ranks must call this in lock-step with the same `root`.
+    pub fn broadcast_bytes(&self, root: i32, payload: &[u8], s: &Stream) -> Result<Vec<u8>> {
+        let is_root = self.rank == root;
+
+        // Step 1: agree on the length.
+        let len_val: i32 = if is_root {
+            i32::try_from(payload.len())
+                .map_err(|_| MlxError::Distributed("broadcast payload too large".into()))?
+        } else {
+            0
+        };
+        let len_arr = Array::from_i32(&[len_val], &[1])?;
+        let len_sum = self.all_sum(&len_arr, s)?;
+        let len = *len_sum.to_vec_i32()?.first().unwrap_or(&0);
+        if len <= 0 {
+            return Ok(Vec::new());
+        }
+        let len = len as usize;
+
+        // Step 2: agree on the bytes. Encode as i32 (the FFI's integer array
+        // dtype) so the additive reduce is exact; non-root ranks send zeros.
+        let mut buf = vec![0i32; len];
+        if is_root {
+            for (dst, b) in buf.iter_mut().zip(payload.iter()) {
+                *dst = *b as i32;
+            }
+        }
+        let arr = Array::from_i32(&buf, &[len as i32])?;
+        let summed = self.all_sum(&arr, s)?;
+        let vals = summed.to_vec_i32()?;
+        Ok(vals.iter().map(|v| (*v & 0xff) as u8).collect())
+    }
 }
 
 impl Drop for Group {

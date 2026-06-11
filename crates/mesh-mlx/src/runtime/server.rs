@@ -9,7 +9,7 @@
 //! behind a mutex — one MLX node serves one request at a time (correct, simple;
 //! batching is a later optimisation).
 
-use crate::runtime::Engine;
+use crate::runtime::{ChatTurn, Engine};
 use axum::{
     Json, Router,
     extract::State,
@@ -28,10 +28,13 @@ enum Backend {
 }
 
 impl Backend {
-    fn chat(&self, system: Option<&str>, user: &str, max_tokens: usize) -> crate::Result<String> {
+    /// Generate a reply for the full conversation. The distributed path drives
+    /// the worker ranks (which are parked in their worker loop) via the
+    /// leader's per-request broadcast.
+    fn chat(&self, turns: &[ChatTurn], max_tokens: usize) -> crate::Result<String> {
         match self {
-            Backend::Single(e) => e.chat(system, user, max_tokens),
-            Backend::Distributed(d) => d.chat(system, user, max_tokens),
+            Backend::Single(e) => e.chat_turns(turns, max_tokens),
+            Backend::Distributed(d) => d.chat_turns(turns, max_tokens),
         }
     }
 }
@@ -62,6 +65,19 @@ impl ServerState {
             backend: Arc::new(Mutex::new(Backend::Distributed(engine))),
             model_id: model_id.into(),
         }
+    }
+
+    /// Broadcast the worker shutdown sentinel so distributed worker ranks exit
+    /// their loop cleanly. No-op for a single-node backend. Called by the
+    /// leader during teardown, before stopping the HTTP server.
+    pub async fn signal_worker_shutdown(&self) {
+        let backend = self.backend.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Backend::Distributed(d) = &*backend.blocking_lock() {
+                d.signal_shutdown();
+            }
+        })
+        .await;
     }
 }
 
@@ -204,29 +220,23 @@ async fn chat_completions(
     State(state): State<ServerState>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    // Split the most recent user message + any system message for our minimal
-    // chat template.
-    let system = req
+    // Preserve the full multi-turn conversation (system + prior assistant/user
+    // turns), not just the last user message, so context is not dropped.
+    let turns: Vec<ChatTurn> = req
         .messages
         .iter()
-        .find(|m| m.role == "system")
-        .map(|m| m.content.clone());
-    let user = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
+        .map(|m| ChatTurn::new(m.role.clone(), m.content.clone()))
+        .collect();
 
     // Generation is synchronous native work that can run for the full
     // completion; run it on the blocking pool so Tokio workers stay free. The
     // mutex is acquired inside the blocking task so the async handler never
     // holds it across the generation.
     let backend = state.backend.clone();
+    let max_tokens = req.max_tokens;
     let result = tokio::task::spawn_blocking(move || {
         let backend = backend.blocking_lock();
-        backend.chat(system.as_deref(), &user, req.max_tokens)
+        backend.chat(&turns, max_tokens)
     })
     .await
     .unwrap_or_else(|e| Err(crate::MlxError::Engine(format!("generation task: {e}"))));

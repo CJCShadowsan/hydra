@@ -10,7 +10,7 @@ What works today:
 
 - Single-node Apple Silicon serving for MLX/safetensors model repos.
 - Native MLX C/Metal linking through `mesh-mlx-sys` (`link-mlx`).
-- A minimal OpenAI-compatible local server used by mesh routing.
+- A multi-turn OpenAI-compatible local server (full message history preserved) used by mesh routing.
 - Latency-aware distributed planning for directly-routable Mac peers.
 - MLX TCP ring (`ring`) transport over Ethernet/Wi-Fi.
 - JACCL/RDMA hostfile support when every node advertises complete RDMA device rows.
@@ -20,7 +20,7 @@ Important limitations:
 
 - Multi-node MLX needs real hardware validation before it should be treated as production-ready.
 - MLX distributed traffic does **not** use mesh QUIC tunnels. MLX opens its own TCP/RDMA sockets and therefore requires direct node-to-node reachability.
-- The OpenAI surface is minimal: non-streaming chat completions, no tool calls, and a simple chat template.
+- The OpenAI surface is non-streaming and text-only (no tool calls, no vision/audio), with a multi-turn ChatML-style template. The MLX backend's advertised capabilities are clamped to match, so the mesh never routes tool/streaming/multimodal traffic to it.
 - MLX models are safetensors/MLX-style Hugging Face repos, not GGUF layer packages.
 - Mixed MLX + Skippy stages in one split are not supported.
 
@@ -91,6 +91,15 @@ When MLX is enabled, mesh can form an MLX group from Apple Silicon peers that ha
 - `jaccl`: RDMA over Thunderbolt/JACCL, requires the OS and hardware setup MLX expects.
 
 Mesh deliberately does not tunnel MLX traffic over QUIC because the latency profile would defeat MLX distributed's purpose.
+
+### How distributed serving works
+
+MLX is SPMD: every node in the group runs the same lock-step generation, but only one node receives the OpenAI request.
+
+- **Rank 0 (leader)** serves the OpenAI API. Every node in the group computes the same rank order from the shared peer set, so all nodes agree on who the leader is. For each request the leader broadcasts the rendered prompt and token budget to the workers, then runs the generation.
+- **Other ranks (workers)** do not serve OpenAI. They run a lock-step worker loop, parked until the leader broadcasts a request, then run the identical generation so the group's collectives stay in step. Greedy decoding is deterministic, so every rank derives the same token and stops on the same step. When the leader shuts down it broadcasts a sentinel so workers exit cleanly.
+
+This is why a single mesh-advertised model id works across the group: clients only ever talk to the leader's endpoint.
 
 ### Parallelism mode
 

@@ -34,6 +34,22 @@ impl Default for ModelCapabilities {
 }
 
 impl ModelCapabilities {
+    /// Clamp capabilities to what the native MLX runtime actually honours.
+    ///
+    /// The MLX OpenAI server is text-only and non-streaming, applies a plain
+    /// chat template, and does **not** implement tool calling or media input.
+    /// Advertising `tool_use`/vision/audio for an MLX-served model would let the
+    /// mesh route tool/multimodal traffic to a backend that silently drops it,
+    /// breaking agent clients. Reasoning (pure text) is preserved. Apply this
+    /// when serving a model through the MLX backend.
+    pub fn clamped_for_mlx_runtime(mut self) -> Self {
+        self.tool_use = CapabilityLevel::None;
+        self.vision = CapabilityLevel::None;
+        self.audio = CapabilityLevel::None;
+        self.multimodal = false;
+        self
+    }
+
     pub fn supports_multimodal_runtime(self) -> bool {
         self.multimodal || self.supports_vision_runtime() || self.supports_audio_runtime()
     }
@@ -558,7 +574,7 @@ fn json_contains_tool_use_tokens(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityLevel, merge_name_signals};
+    use super::{CapabilityLevel, ModelCapabilities, merge_name_signals};
 
     #[test]
     fn qwen3vl_name_signal_is_supported_vision() {
@@ -571,5 +587,28 @@ mod tests {
         );
         assert_eq!(caps.vision, CapabilityLevel::Supported);
         assert!(caps.multimodal);
+    }
+
+    #[test]
+    fn mlx_clamp_drops_unsupported_capabilities() {
+        // A model whose name suggests vision + tools, served through the MLX
+        // text-only runtime, must not advertise those — only reasoning (text)
+        // survives so the mesh never routes tool/vision traffic to it.
+        let caps = ModelCapabilities {
+            multimodal: true,
+            vision: CapabilityLevel::Supported,
+            audio: CapabilityLevel::Supported,
+            reasoning: CapabilityLevel::Supported,
+            tool_use: CapabilityLevel::Supported,
+            moe: true,
+        }
+        .clamped_for_mlx_runtime();
+        assert_eq!(caps.tool_use, CapabilityLevel::None);
+        assert_eq!(caps.vision, CapabilityLevel::None);
+        assert_eq!(caps.audio, CapabilityLevel::None);
+        assert!(!caps.multimodal);
+        // Text-only signals are preserved.
+        assert_eq!(caps.reasoning, CapabilityLevel::Supported);
+        assert!(caps.moe);
     }
 }
