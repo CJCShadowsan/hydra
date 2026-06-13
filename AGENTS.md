@@ -331,7 +331,7 @@ When making changes that touch gossip, routing, proxy, election, or capability a
 
 For changes that affect routing, MoA, gossip, the OpenAI surface, agent harnesses, or anything multi-node, validate with these three shapes before declaring a branch ready:
 
-1. **2-node private mesh** — in the two-machine lab, start `micstudio` first and use it as the seed/invite source, then start `studio54` second. This order works around current macOS networking failures with non-notarised binaries. Start one node with `mesh-llm serve --model <big> --port 9337 --console 3131`, grab its invite token from the JSON log, and start the second node with `mesh-llm serve --gguf <small.gguf> --port 9447 --console 3145 --join <token>`. Confirm peers=1 on both consoles and `/v1/models` returns the union. Exercises QUIC tunnelling and cross-node routing.
+1. **2-node private mesh** — start one node with `mesh-llm serve --model <big> --port 9337 --console 3131`, grab its invite token from the JSON log, and start the second node with `mesh-llm serve --gguf <small.gguf> --port 9447 --console 3145 --join <token>`. Confirm peers=1 on both consoles and `/v1/models` returns the union. Exercises QUIC tunnelling and cross-node routing.
 2. **Public mesh as a client** — `mesh-llm client --auto` from a workstation. Confirm `discovery_joined` + `Client ready` in the log and an inference call against a mesh-advertised model returns. Exercises the read-only routing path agent users hit.
 3. **Agent harness** — run ≥ 1 of the harnesses (“mini-agent” Python loops at `/tmp/mini-agent*.py`, Goose, OpenCode) against the local proxy with both `model=auto` and `model=mesh` to catch tool-call and reducer regressions that simple curl checks miss.
 
@@ -476,11 +476,6 @@ bash -c './target/debug/mesh-llm serve --model "..." --auto > /tmp/mesh.log 2>&1
 4. Verify clean — `ps -eo pid,args | grep -E 'mesh-llm' | grep -v grep` must be empty.
 5. Deploy bundle — scp + tar + codesign on remote nodes.
 6. Verify version — `mesh-llm --version` on every node.
-
-Lab startup order: when deploying to the two-machine lab, start `micstudio`
-first and `studio54` second. Use `micstudio` as the seed/invite source. This
-is a notarisation workaround for current networking issues with non-notarised
-binaries.
 
 ### After starting nodes
 7. Verify exactly 1 mesh-llm process per node.
