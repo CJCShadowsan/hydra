@@ -1593,11 +1593,9 @@ where
             Err(err) => {
                 drop(startup_load_guard);
                 let err_msg = format!("{err:#}");
-                let is_participant_shortage = err_msg.contains("at least two participating nodes")
-                    || err_msg.contains("at least two stage participants");
-                if is_participant_shortage {
+                if startup_split_launch_error_should_retry(&err_msg) {
                     let _ = emit_event(OutputEvent::Info {
-                        message: format!("Split waiting for peers: {err_msg}"),
+                        message: format!("Split waiting for eligible stage path: {err_msg}"),
                         context: Some(format!("model={model_name}")),
                     });
                 } else {
@@ -1638,6 +1636,15 @@ where
             }
         }
     }
+}
+
+fn startup_split_launch_error_should_retry(err_msg: &str) -> bool {
+    err_msg.contains("at least two participating nodes")
+        || err_msg.contains("at least two stage participants")
+        || err_msg.contains("missing_stage_path")
+        || err_msg.contains("stage_path_relay_only")
+        || err_msg.contains("stage_path_too_slow")
+        || err_msg.contains("persistent downstream lane did not become ready")
 }
 
 async fn startup_start_local_runtime_once<'a, F>(
@@ -10173,6 +10180,33 @@ mod tests {
         let result = build_serving_list(&resolved, "local-gguf/sha256-abcdef0123456789");
         assert_eq!(result, vec!["local-gguf/sha256-abcdef0123456789"]);
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn startup_split_launch_retries_stage_path_readiness_errors() {
+        for err in [
+            "at least two participating nodes are required",
+            "at least two stage participants are required",
+            "stage transport path to abc is not eligible: missing_stage_path",
+            "stage transport path to abc is not eligible: stage_path_relay_only",
+            "stage transport path to abc is not eligible: stage_path_too_slow",
+            "create embedded OpenAI persistent downstream lanes: persistent downstream lane did not become ready: failed to fill whole buffer",
+        ] {
+            assert!(
+                startup_split_launch_error_should_retry(err),
+                "expected retryable startup split error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_split_launch_does_not_retry_unrelated_errors() {
+        assert!(!startup_split_launch_error_should_retry(
+            "failed to inspect model: invalid gguf header"
+        ));
+        assert!(!startup_split_launch_error_should_retry(
+            "construct skippy stage 0 OpenAI backend: unsupported tokenizer"
+        ));
     }
 
     #[test]
