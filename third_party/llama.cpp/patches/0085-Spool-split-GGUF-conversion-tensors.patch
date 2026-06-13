@@ -1,0 +1,88 @@
+From cf73e68413d7d647e4f13a889e9c3c765b9c2d99 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 13 Jun 2026 16:21:30 +1000
+Subject: [PATCH] Spool split GGUF conversion tensors
+
+---
+ convert_hf_to_gguf.py       |  6 +++---
+ gguf-py/gguf/gguf_writer.py | 40 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index 85527553..a87945b1 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -203,9 +203,9 @@ def main() -> None:
+     }
+ 
+     is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
+-    if args.use_temp_file and is_split:
+-        logger.error("Error: Cannot use temp file when splitting")
+-        sys.exit(1)
++    if is_split and not args.use_temp_file:
++        logger.info("Split output requested; using a temporary tensor spool to avoid retaining all tensors in memory")
++        args.use_temp_file = True
+ 
+     if args.outfile is not None:
+         fname_out = args.outfile
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index e94b47ba..a0164bf7 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -403,6 +403,16 @@ class GGUFWriter:
+         if pad != 0:
+             fp.write(bytes([0] * pad))
+ 
++    @staticmethod
++    def copy_n_bytes(src: IO[bytes], dst: IO[bytes], n: int) -> None:
++        remaining = n
++        while remaining > 0:
++            chunk = src.read(min(1024 * 1024, remaining))
++            if not chunk:
++                raise EOFError("Unexpected end of temporary tensor spool")
++            dst.write(chunk)
++            remaining -= len(chunk)
++
+     def write_tensor_data(self, tensor: np.ndarray[Any, Any], tensor_endianess: GGUFEndian | None = None) -> None:
+         if self.state is not WriterState.TI_DATA and self.state is not WriterState.WEIGHTS:
+             raise ValueError(f'Expected output file to contain tensor info or weights, got {self.state}')
+@@ -476,7 +486,35 @@ class GGUFWriter:
+         else:
+             self.temp_file.seek(0)
+ 
+-            shutil.copyfileobj(self.temp_file, self.fout[0 if not self.small_first_shard else 1])
++            if len(self.fout) == 1:
++                shutil.copyfileobj(self.temp_file, self.fout[0 if not self.small_first_shard else 1])
++            else:
++                shard_bar = None
++                bar = None
++
++                if progress:
++                    from tqdm import tqdm
++
++                    total_bytes = sum(ti.nbytes for t in self.tensors for ti in t.values())
++                    shard_bar = tqdm(desc=f"Shard (0/{len(self.fout)})", total=None, unit="byte", unit_scale=True)
++                    bar = tqdm(desc="Writing", total=total_bytes, unit="byte", unit_scale=True)
++
++                for i, (fout, tensors) in enumerate(zip(self.fout, self.tensors)):
++                    if shard_bar is not None:
++                        shard_bar.set_description(f"Shard ({i + 1}/{len(self.fout)})")
++                        total = sum(ti.nbytes for ti in tensors.values())
++                        shard_bar.reset(total=(total if total > 0 else None))
++
++                    for ti in tensors.values():
++                        self.copy_n_bytes(self.temp_file, fout, ti.nbytes)
++                        if shard_bar is not None:
++                            shard_bar.update(ti.nbytes)
++                        if bar is not None:
++                            bar.update(ti.nbytes)
++
++                        pad = GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment) - ti.nbytes
++                        self.copy_n_bytes(self.temp_file, fout, pad)
++
+             self.flush()
+             self.temp_file.close()
+ 
+-- 
+2.54.0 (Apple Git-156)
+
