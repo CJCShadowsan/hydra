@@ -77,6 +77,13 @@ pub fn initialize_host_runtime() -> Result<()> {
             libraries = ?runtime.libraries,
             "Loaded MeshLLM native runtime"
         );
+        let _ = mesh_llm_events::emit_event(mesh_llm_events::OutputEvent::Info {
+            message: "Loaded MeshLLM native runtime".to_string(),
+            context: Some(format!(
+                "native_runtime_id={} libraries={:?}",
+                runtime.native_runtime_id, runtime.libraries
+            )),
+        });
     }
     Ok(())
 }

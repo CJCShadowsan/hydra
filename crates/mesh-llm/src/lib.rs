@@ -31,9 +31,17 @@ async fn run_cli_entrypoint() -> anyhow::Result<()> {
     );
     let explicit_surface = normalized_args.explicit_surface.map(map_runtime_surface);
 
-    mesh_llm_host_runtime::initialize_host_runtime()?;
-    if commands::dispatch(&cli).await? {
+    if command_runs_before_host_runtime_init(cli.command.as_ref())
+        && commands::dispatch(&cli).await?
+    {
         return Ok(());
+    }
+
+    if cli.command.is_some() {
+        mesh_llm_host_runtime::initialize_host_runtime()?;
+        if commands::dispatch(&cli).await? {
+            return Ok(());
+        }
     }
     mesh_llm_tui::output::OutputManager::init_global(
         cli.log_format,
@@ -41,6 +49,7 @@ async fn run_cli_entrypoint() -> anyhow::Result<()> {
     );
     mesh_llm_tui::install_terminal_panic_hook();
 
+    mesh_llm_host_runtime::initialize_host_runtime()?;
     mesh_llm_host_runtime::run_runtime_initialized(
         runtime_options_from_cli(cli),
         explicit_surface,
@@ -171,6 +180,20 @@ fn command_uses_machine_output(command: Option<&mesh_llm_cli::Command>) -> bool 
     )
 }
 
+fn command_runs_before_host_runtime_init(command: Option<&mesh_llm_cli::Command>) -> bool {
+    matches!(
+        command,
+        Some(mesh_llm_cli::Command::Runtime {
+            command: Some(
+                mesh_llm_cli::runtime::RuntimeCommand::List { .. }
+                    | mesh_llm_cli::runtime::RuntimeCommand::Install { .. }
+                    | mesh_llm_cli::runtime::RuntimeCommand::Remove { .. }
+                    | mesh_llm_cli::runtime::RuntimeCommand::Prune { .. },
+            ),
+        })
+    )
+}
+
 fn map_runtime_surface(
     surface: mesh_llm_cli::RuntimeSurface,
 ) -> mesh_llm_host_runtime::RuntimeSurface {
@@ -233,5 +256,35 @@ fn map_trust_policy(
         mesh_llm_cli::TrustPolicy::Allowlist => {
             mesh_llm_host_runtime::crypto::TrustPolicy::Allowlist
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh_llm_cli::{Command, runtime::RuntimeCommand};
+
+    #[test]
+    fn native_runtime_management_runs_before_host_runtime_init() {
+        let command = Command::Runtime {
+            command: Some(RuntimeCommand::Install {
+                runtime: None,
+                manifest: None,
+                bundle_dirs: Vec::new(),
+                cache_dir: None,
+                json: true,
+            }),
+        };
+
+        assert!(command_runs_before_host_runtime_init(Some(&command)));
+    }
+
+    #[test]
+    fn runtime_control_commands_keep_host_runtime_init() {
+        let command = Command::Runtime {
+            command: Some(RuntimeCommand::Status { port: 3131 }),
+        };
+
+        assert!(!command_runs_before_host_runtime_init(Some(&command)));
     }
 }
