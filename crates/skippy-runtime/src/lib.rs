@@ -17,9 +17,9 @@ use skippy_ffi::{
     ChatMessage as RawChatMessage, Error as RawError,
     GenerationSignalWindow as RawGenerationSignalWindow, KvPageDesc as RawKvPageDesc, LoadMode,
     LogitBias as RawLogitBias, Model as RawModel, ModelInfo as RawModelInfo,
-    RuntimeConfig as RawRuntimeConfig, SamplingConfig as RawSamplingConfig, Session as RawSession,
-    SlicePlan as RawSlicePlan, Status, TensorInfo as RawTensorInfo, TensorRole,
-    TokenSignal as RawTokenSignal,
+    NativeMtpDraft as RawNativeMtpDraft, RuntimeConfig as RawRuntimeConfig,
+    SamplingConfig as RawSamplingConfig, Session as RawSession, SlicePlan as RawSlicePlan, Status,
+    TensorInfo as RawTensorInfo, TensorRole, TokenSignal as RawTokenSignal,
 };
 use tokio::sync::mpsc;
 
@@ -1223,6 +1223,21 @@ pub struct DecodeFrameBatchRequest<'a> {
 pub struct DecodeFrameBatchOutput {
     pub predicted_token: i32,
     pub output: ActivationFrame,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeMtpDraft {
+    pub token_id: i32,
+    pub proposal_compute_us: i64,
+}
+
+impl NativeMtpDraft {
+    fn from_raw(raw: RawNativeMtpDraft) -> Option<Self> {
+        raw.available.then_some(Self {
+            token_id: raw.token_id,
+            proposal_compute_us: raw.proposal_compute_us,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2959,6 +2974,25 @@ impl StageSession {
         ))
     }
 
+    pub fn decode_step_frame_sampled_mtp_n1(
+        &mut self,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
+        let (predicted_token, mtp_draft, output_desc, output_payload) =
+            self.decode_step_frame_mtp_n1_raw(token_id, sampling, input, output_capacity)?;
+        Ok((
+            predicted_token,
+            mtp_draft,
+            ActivationFrame {
+                desc: output_desc.into(),
+                payload: output_payload,
+            },
+        ))
+    }
+
     fn decode_step_frame_raw(
         &mut self,
         token_id: i32,
@@ -3017,6 +3051,73 @@ impl StageSession {
             .checked_add(1)
             .context("session token count overflow")?;
         Ok((predicted_token, output_desc, output_payload))
+    }
+
+    fn decode_step_frame_mtp_n1_raw(
+        &mut self,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(i32, Option<NativeMtpDraft>, RawActivationDesc, Vec<u8>)> {
+        let input_desc = input.map(|frame| frame.desc.as_raw());
+        let input_desc_ptr = input_desc
+            .as_ref()
+            .map_or(ptr::null(), |desc| desc as *const RawActivationDesc);
+        let input_payload_ptr = input.map_or(ptr::null(), |frame| frame.payload.as_ptr().cast());
+        let mut output_desc = RawActivationDesc {
+            version: 0,
+            dtype: ActivationDType::Unknown,
+            layout: ActivationLayout::Opaque,
+            producer_stage_index: -1,
+            layer_start: 0,
+            layer_end: 0,
+            token_count: 0,
+            sequence_count: 0,
+            payload_bytes: 0,
+            flags: 0,
+        };
+        let mut output_payload = vec![0_u8; output_capacity];
+        let mut output_bytes = 0usize;
+        let mut predicted_token = 0_i32;
+        let mut mtp_draft = RawNativeMtpDraft::default();
+        let mut error = ptr::null_mut();
+        let raw_sampling = sampling.map(SamplingConfig::as_raw);
+        let sampling_ptr = raw_sampling
+            .as_ref()
+            .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
+        let status = unsafe {
+            skippy_ffi::skippy_decode_step_frame_sampled_mtp_n1(
+                self.raw,
+                token_id,
+                sampling_ptr,
+                input_desc_ptr,
+                input_payload_ptr,
+                &mut output_desc,
+                output_payload.as_mut_ptr().cast(),
+                output_payload.len(),
+                &mut output_bytes,
+                &mut predicted_token,
+                &mut mtp_draft,
+                &mut error,
+            )
+        };
+        if status == Status::BufferTooSmall && output_bytes > output_payload.len() {
+            free_error(error);
+            return self.decode_step_frame_mtp_n1_raw(token_id, sampling, input, output_bytes);
+        }
+        ensure_ok(status, error)?;
+        output_payload.truncate(output_bytes);
+        self.token_count = self
+            .token_count
+            .checked_add(1)
+            .context("session token count overflow")?;
+        Ok((
+            predicted_token,
+            NativeMtpDraft::from_raw(mtp_draft),
+            output_desc,
+            output_payload,
+        ))
     }
 
     pub fn decode_step_frame_batch_sampled(
