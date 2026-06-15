@@ -22,9 +22,23 @@ pub struct BoundaryReport {
 pub struct SplitReport {
     pub token_id: i32,
     pub predicted_token: i32,
+    pub native_mtp: NativeMtpSidebandReport,
     pub activation_width: i32,
     pub wire_dtype: String,
     pub boundary: BoundaryReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeMtpSidebandReport {
+    pub sideband_present: bool,
+    pub predicted_token_count: usize,
+    pub authoritative_matches_reply: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoritative_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_compute_us: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +72,7 @@ pub struct ChainReport {
     pub baseline: BaselineReport,
     pub token_id: i32,
     pub predicted_token: i32,
+    pub native_mtp: NativeMtpSidebandReport,
     pub activation_width: i32,
     pub wire_dtype: String,
     pub stages: Vec<ChainStageReport>,

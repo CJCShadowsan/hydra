@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use skippy_protocol::binary::{
-    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind,
+    StageReply, StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind,
     activation_state_flags_from_frame_flags, read_stage_message, recv_reply, state_flags,
     write_stage_message,
 };
@@ -34,9 +34,9 @@ use crate::{
     direct_return::CorrectnessDirectReturnServer,
     report::{
         BaselineReport, BoundaryReport, ChainReport, ChainStageReport, DtypeMatrixReport,
-        PackagePartReport, PackageStageReport, SingleStepReport, SplitReport, SplitScanReport,
-        StageModelReport, StateHandoffReport, StatePayloadBlockDigestReport,
-        StatePayloadDigestReport,
+        NativeMtpSidebandReport, PackagePartReport, PackageStageReport, SingleStepReport,
+        SplitReport, SplitScanReport, StageModelReport, StateHandoffReport,
+        StatePayloadBlockDigestReport, StatePayloadDigestReport,
     },
     support::{
         ChildGuard, activation_width, connect_ready, generate_run_id, parse_wire_dtype,
@@ -72,6 +72,7 @@ struct BinarySplitConfig {
 struct BinarySplitResult {
     token_id: i32,
     predicted_token: i32,
+    native_mtp: NativeMtpSidebandReport,
     activation_width: i32,
     wire_dtype: String,
     boundary_producer_stage_index: i32,
@@ -108,6 +109,7 @@ struct BinaryChainConfig {
 struct BinaryChainResult {
     token_id: i32,
     predicted_token: i32,
+    native_mtp: NativeMtpSidebandReport,
     activation_width: i32,
     wire_dtype: String,
     stage0_wire_payload_bytes: usize,
@@ -330,7 +332,8 @@ pub fn chain(args: ChainArgs) -> Result<()> {
         startup_timeout_secs: args.server.startup_timeout_secs,
         model_identity: model_identity.clone(),
     })?;
-    let matches = baseline.predicted_token == chain.predicted_token;
+    let matches = baseline.predicted_token == chain.predicted_token
+        && chain.native_mtp.authoritative_matches_reply;
     let report = ChainReport {
         mode: "chain",
         status: status(matches),
@@ -339,6 +342,7 @@ pub fn chain(args: ChainArgs) -> Result<()> {
         baseline: baseline_report(baseline),
         token_id: chain.token_id,
         predicted_token: chain.predicted_token,
+        native_mtp: chain.native_mtp,
         activation_width: chain.activation_width,
         wire_dtype: chain.wire_dtype,
         stages: vec![
@@ -593,7 +597,8 @@ fn run_single_step_with_baseline(
         startup_timeout_secs: server.startup_timeout_secs,
         model_identity: model_identity.clone(),
     })?;
-    let matches = baseline.predicted_token == split.predicted_token;
+    let matches = baseline.predicted_token == split.predicted_token
+        && split.native_mtp.authoritative_matches_reply;
     let stage_models = split.stage_models.clone();
     Ok(SingleStepReport {
         mode: "single-step",
@@ -846,6 +851,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     Ok(BinarySplitResult {
         token_id,
         predicted_token: reply.predicted,
+        native_mtp: native_mtp_sideband_report(&reply),
         activation_width,
         wire_dtype: args.activation_wire_dtype,
         boundary_producer_stage_index: boundary.desc.producer_stage_index,
@@ -1150,6 +1156,7 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
     Ok(BinaryChainResult {
         token_id,
         predicted_token: reply.predicted,
+        native_mtp: native_mtp_sideband_report(&reply),
         activation_width,
         wire_dtype: args.activation_wire_dtype,
         stage0_wire_payload_bytes: message.activation.len(),
@@ -2631,6 +2638,7 @@ fn split_report(result: BinarySplitResult) -> SplitReport {
     SplitReport {
         token_id: result.token_id,
         predicted_token: result.predicted_token,
+        native_mtp: result.native_mtp,
         activation_width: result.activation_width,
         wire_dtype: result.wire_dtype,
         boundary: BoundaryReport {
@@ -2644,20 +2652,97 @@ fn split_report(result: BinarySplitResult) -> SplitReport {
     }
 }
 
+fn native_mtp_sideband_report(reply: &StageReply) -> NativeMtpSidebandReport {
+    let authoritative_token = reply.predicted_tokens.first().copied();
+    let draft_token = reply.predicted_tokens.get(1).copied();
+    let proposal_compute_us = reply
+        .predicted_tokens
+        .get(2)
+        .copied()
+        .map(|value| i64::from(value.max(0)));
+    NativeMtpSidebandReport {
+        sideband_present: draft_token.is_some(),
+        predicted_token_count: reply.predicted_tokens.len(),
+        authoritative_matches_reply: authoritative_token
+            .is_none_or(|token| token == reply.predicted),
+        authoritative_token,
+        draft_token,
+        proposal_compute_us,
+    }
+}
+
 fn emit_report<T: Serialize>(report: &T, report_out: Option<&Path>) -> Result<()> {
     let json = serde_json::to_string_pretty(report)?;
     println!("{json}");
     if let Some(path) = report_out {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create report directory {}", parent.display()))?;
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create report directory {}", parent.display()))?;
+            }
+            _ => {}
         }
         fs::write(path, format!("{json}\n"))
             .with_context(|| format!("write correctness report {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use skippy_protocol::binary::{StageReplyStats, WireReplyKind};
+
+    use super::*;
+
+    fn predicted_reply(predicted: i32, predicted_tokens: Vec<i32>) -> StageReply {
+        StageReply {
+            kind: WireReplyKind::PredictedToken,
+            predicted,
+            predicted_tokens,
+            stats: StageReplyStats::default(),
+        }
+    }
+
+    #[test]
+    fn native_mtp_report_treats_plain_authoritative_token_as_no_draft() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+
+        assert!(!report.sideband_present);
+        assert_eq!(report.predicted_token_count, 1);
+        assert!(report.authoritative_matches_reply);
+        assert_eq!(report.authoritative_token, Some(11));
+        assert_eq!(report.draft_token, None);
+        assert_eq!(report.proposal_compute_us, None);
+    }
+
+    #[test]
+    fn native_mtp_report_extracts_draft_sideband() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, 34]));
+
+        assert!(report.sideband_present);
+        assert_eq!(report.predicted_token_count, 3);
+        assert!(report.authoritative_matches_reply);
+        assert_eq!(report.authoritative_token, Some(11));
+        assert_eq!(report.draft_token, Some(12));
+        assert_eq!(report.proposal_compute_us, Some(34));
+    }
+
+    #[test]
+    fn native_mtp_report_flags_authoritative_sideband_mismatch() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![10, 12, 34]));
+
+        assert!(report.sideband_present);
+        assert!(!report.authoritative_matches_reply);
+        assert_eq!(report.authoritative_token, Some(10));
+        assert_eq!(report.draft_token, Some(12));
+    }
+
+    #[test]
+    fn native_mtp_report_clamps_negative_proposal_time() {
+        let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, -34]));
+
+        assert_eq!(report.proposal_compute_us, Some(0));
+    }
 }
 
 #[derive(Clone, Copy)]
