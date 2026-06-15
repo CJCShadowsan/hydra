@@ -57,9 +57,8 @@ use tokio::{
 
 use crate::{
     binary_transport::{
-        DecodeFrameBatcher, PredictionReturnHub, PredictionReturnReceiver, WireCondition,
-        connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
-        run_binary_stage_message, write_stage_message_conditioned,
+        DecodeFrameBatcher, WireCondition, connect_binary_downstream, forwarded_stage_message,
+        forwarded_stage_message_timed, run_binary_stage_message, write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
@@ -230,7 +229,6 @@ pub struct EmbeddedOpenAiArgs {
     pub reply_credit_limit: Option<usize>,
     pub downstream_connect_timeout_secs: u64,
     pub downstream_wire_condition: WireCondition,
-    pub prediction_returns: Option<Arc<PredictionReturnHub>>,
     pub telemetry: Telemetry,
     pub hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     pub openai_guardrails: Option<OpenAiGuardrailsConfig>,
@@ -506,7 +504,6 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         downstream_wire_condition: args.downstream_wire_condition,
         prefill_reply_credit_limit,
         lane_pool,
-        prediction_returns: args.prediction_returns.clone(),
     };
     args.telemetry
         .emit("stage.openai_server_start", lifecycle_attrs(&args.config));
@@ -818,7 +815,6 @@ enum OpenAiBackendMode {
         downstream_wire_condition: WireCondition,
         prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
-        prediction_returns: Option<Arc<PredictionReturnHub>>,
     },
 }
 
@@ -1705,7 +1701,6 @@ struct EmbeddedStageZeroGeneration<'a> {
     downstream_wire_condition: WireCondition,
     prefill_reply_credit_limit: usize,
     lane_pool: Option<Arc<PersistentStageLanePool>>,
-    prediction_return: Option<PredictionReturnReceiver>,
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
@@ -1731,7 +1726,6 @@ struct SplitMultimodalGeneration<'a> {
     activation_width: i32,
     downstream_wire_condition: WireCondition,
     lane_pool: Arc<PersistentStageLanePool>,
-    prediction_return: Option<PredictionReturnReceiver>,
 }
 
 struct EmbeddedLocalOutput {

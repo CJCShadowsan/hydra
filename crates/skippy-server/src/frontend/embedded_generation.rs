@@ -1359,15 +1359,14 @@ impl StageOpenAiBackend {
                 let forward_write_ms = write_timer.elapsed_ms();
                 decode_forward_write_ms += forward_write_ms;
                 let wait_timer = PhaseTimer::start();
-                let reply = request
-                    .prediction_return
-                    .as_ref()
-                    .ok_or_else(|| {
-                        OpenAiError::backend("missing direct prediction return receiver")
-                    })?
-                    .recv_expected(WireReplyKind::PredictedToken)
-                    .map_err(openai_backend_error)?;
+                let reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
                 let downstream_wait_ms = wait_timer.elapsed_ms();
+                if reply.kind != WireReplyKind::PredictedToken {
+                    return Err(OpenAiError::backend(format!(
+                        "expected decode PredictedToken reply from downstream, got {:?}",
+                        reply.kind
+                    )));
+                }
                 decode_downstream_wait_ms += downstream_wait_ms;
                 if records_replay_checkpoint
                     && super::prefix_cache::request_allows_exact_replay(&request)

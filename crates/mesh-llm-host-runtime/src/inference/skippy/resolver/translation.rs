@@ -412,7 +412,6 @@ impl ResolvedEmbeddedOpenAiArgs {
                 0.0, None,
             )
             .expect("static downstream wire condition should construct"),
-            prediction_returns: None,
             telemetry,
             hook_policy,
             openai_guardrails: None,

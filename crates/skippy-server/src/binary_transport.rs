@@ -31,7 +31,8 @@ use skippy_protocol::{
         STAGE_WIRE_FIXED_HEADER_BYTES, StageReply, StageReplyStats, StageSamplingConfig,
         StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
         activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
-        send_reply_ack, send_reply_ack_with_stats, state_flags,
+        send_reply_ack, send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
+        send_reply_predicted_with_tokens_and_stats, state_flags,
     },
 };
 use skippy_runtime::{
@@ -49,8 +50,6 @@ mod wire;
 
 pub(crate) use self::decode_batcher::DecodeFrameBatcher;
 pub use self::direct_return::PredictionReturnHub;
-pub use self::direct_return::PredictionReturnListener;
-pub(crate) use self::direct_return::PredictionReturnReceiver;
 pub(crate) use self::forwarding::{forwarded_stage_message, forwarded_stage_message_timed};
 pub use self::options::{BinaryStageOptions, EmbeddedOpenAiStageOptions, parse_wire_dtype};
 use self::socket::*;
@@ -230,7 +229,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         telemetry.emit("stage.binary_runtime_prewarm", attrs);
     }
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
-    let prediction_returns = Arc::new(PredictionReturnHub::default());
+    let prediction_returns = Arc::new(PredictionReturnHub);
     let listener = TcpListener::bind(bind_addr)?;
     listener.set_nonblocking(true)?;
     if let Some(openai_options) = openai {
@@ -240,7 +239,6 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         let openai_config = config.clone();
         let openai_runtime = runtime.clone();
         let openai_telemetry = telemetry.clone();
-        let openai_prediction_returns = prediction_returns.clone();
         tokio::spawn(async move {
             if let Err(error) = frontend::serve_embedded_openai(EmbeddedOpenAiArgs {
                 bind_addr: openai_options.bind_addr,
@@ -265,7 +263,6 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 reply_credit_limit,
                 downstream_connect_timeout_secs,
                 downstream_wire_condition,
-                prediction_returns: Some(openai_prediction_returns),
                 telemetry: openai_telemetry,
                 hook_policy: None,
                 openai_guardrails: Some(frontend::OpenAiGuardrailsConfig::disabled_for_skippy()),
@@ -345,7 +342,6 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                     reply_credit_limit,
                     async_prefill_forward,
                     downstream_wire_condition,
-                    downstream_connect_timeout_secs,
                     first_message,
                 )
             })()
@@ -388,7 +384,6 @@ fn handle_binary_connection(
     reply_credit_limit: Option<usize>,
     async_prefill_forward: bool,
     downstream_wire_condition: WireCondition,
-    downstream_connect_timeout_secs: u64,
     first_message: StageWireMessage,
 ) -> Result<()> {
     if let Some(downstream) = downstream.as_mut() {
@@ -403,7 +398,6 @@ fn handle_binary_connection(
     let mut pending_reply_stats = StageReplyStats::default();
     let mut request_summary = BinaryRequestSummary::default();
     let mut accumulated_prefill_tokens: BTreeMap<String, Vec<i32>> = BTreeMap::new();
-    let mut prediction_return_streams: BTreeMap<(u64, u64), TcpStream> = BTreeMap::new();
     let mut next_message = Some(first_message);
     let mut async_forwarder = if async_prefill_forward {
         downstream
@@ -680,15 +674,6 @@ fn handle_binary_connection(
                         )
                         .context("configure binary stage generation")?;
                 }
-                let stream = direct_return::open_prediction_return_stream(
-                    config,
-                    topology,
-                    message.request_id,
-                    message.session_id,
-                    wire_dtype,
-                    downstream_connect_timeout_secs,
-                )?;
-                prediction_return_streams.insert((message.request_id, message.session_id), stream);
             }
             send_reply_ack_with_stats(&mut *upstream, generation_stats)
                 .context("generation config ack")?;
@@ -725,8 +710,7 @@ fn handle_binary_connection(
                     activation_width,
                     control_started,
                     control_stats,
-                    &mut prediction_return_streams,
-                    downstream_connect_timeout_secs,
+                    upstream,
                 )
                 .context("handle restore-prefill-decode control")?;
                 continue;
@@ -1185,6 +1169,68 @@ fn handle_binary_connection(
                     pending_prefill_replies -= 1;
                     deferred_prefill_replies_drained += 1;
                 }
+                let wait_start_unix_nanos = now_unix_nanos() as u64;
+                downstream_wait_start_unix_nanos.get_or_insert(wait_start_unix_nanos);
+                let wait_started = Instant::now();
+                let reply = recv_reply(&mut *downstream).context("downstream predicted reply")?;
+                downstream_wait_end_unix_nanos = Some(now_unix_nanos() as u64);
+                downstream_wait_ms += elapsed_ms(wait_started);
+                let expected = predicted_reply_kind(message.kind);
+                if reply.kind != expected {
+                    bail!(
+                        "expected downstream {expected:?} for {:?}, got {:?}",
+                        message.kind,
+                        reply.kind
+                    );
+                }
+                record_prefill_edge_transport(
+                    &mut message_reply_stats,
+                    config,
+                    &message,
+                    forward_write_ms,
+                    downstream_wait_ms,
+                    forward_activation_bytes,
+                );
+                message_reply_stats.merge(pending_reply_stats);
+                pending_reply_stats = StageReplyStats::default();
+                message_reply_stats.merge(reply.stats);
+                record_verify_span_timing(
+                    &mut message_reply_stats,
+                    &message,
+                    compute_ms,
+                    forward_write_ms,
+                    downstream_wait_ms,
+                );
+                let reply_start_unix_nanos = now_unix_nanos() as u64;
+                upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
+                let reply_started = Instant::now();
+                let predicted_token_count =
+                    predicted_reply_token_count(message.kind, &reply.predicted_tokens);
+                send_stage_reply(
+                    &mut *upstream,
+                    StageReply {
+                        stats: message_reply_stats,
+                        ..reply
+                    },
+                )
+                .context("relay predicted reply")?;
+                upstream_reply_end_unix_nanos = Some(now_unix_nanos() as u64);
+                let reply_write_ms = elapsed_ms(reply_started);
+                upstream_reply_ms += reply_write_ms;
+                emit_upstream_reply_write_span(
+                    telemetry,
+                    config,
+                    session_id,
+                    &message,
+                    UpstreamReplyWriteSpan {
+                        reply_kind: expected,
+                        predicted_token_count,
+                        start_unix_nanos: reply_start_unix_nanos,
+                        end_unix_nanos: upstream_reply_end_unix_nanos
+                            .unwrap_or(reply_start_unix_nanos),
+                        write_ms: reply_write_ms,
+                    },
+                );
             } else if max_deferred_prefill_replies == 0 {
                 let wait_start_unix_nanos = now_unix_nanos() as u64;
                 downstream_wait_start_unix_nanos.get_or_insert(wait_start_unix_nanos);
@@ -1295,21 +1341,19 @@ fn handle_binary_connection(
             } else {
                 predicted_tokens.len().max(1)
             };
-            let return_stream = prediction_return_streams
-                .get_mut(&(message.request_id, message.session_id))
-                .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
             let reply_start_unix_nanos = now_unix_nanos() as u64;
             upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
             let reply_started = Instant::now();
-            direct_return::send_direct_prediction_return(
-                return_stream,
+            send_stage_reply(
+                &mut *upstream,
                 StageReply {
                     kind: reply_kind,
                     predicted: predicted_token,
                     predicted_tokens,
                     stats: message_reply_stats,
                 },
-            )?;
+            )
+            .context("send predicted reply")?;
             upstream_reply_end_unix_nanos = Some(now_unix_nanos() as u64);
             let reply_write_ms = elapsed_ms(reply_started);
             upstream_reply_ms += reply_write_ms;
@@ -2105,8 +2149,7 @@ fn handle_binary_restore_prefill_decode_control(
     activation_width: i32,
     control_started: Instant,
     mut control_stats: StageReplyStats,
-    prediction_return_streams: &mut BTreeMap<(u64, u64), TcpStream>,
-    downstream_connect_timeout_secs: u64,
+    upstream: &mut TcpStream,
 ) -> Result<()> {
     let (prefix_tokens, current_token) = restore_decode_sideband(&message)?;
     let local = maybe_prefix_cache_control(
@@ -2127,19 +2170,16 @@ fn handle_binary_restore_prefill_decode_control(
             json!(elapsed_ms(control_started)),
         );
         telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-        send_one_off_direct_return(
-            config,
-            topology,
-            &message,
-            wire_dtype,
-            downstream_connect_timeout_secs,
+        send_stage_reply(
+            upstream,
             StageReply {
                 kind: WireReplyKind::Ack,
                 predicted: 0,
                 predicted_tokens: Vec::new(),
                 stats: control_stats,
             },
-        )?;
+        )
+        .context("send restore-decode miss ACK")?;
         return Ok(());
     }
 
@@ -2215,6 +2255,23 @@ fn handle_binary_restore_prefill_decode_control(
             json!(forwarded.activation_encode_ms),
         );
         telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
+        let downstream_reply =
+            recv_reply(&mut *downstream).context("restore-decode downstream reply")?;
+        if downstream_reply.kind != WireReplyKind::PredictedToken {
+            bail!(
+                "restore-decode expected downstream PredictedToken, got {:?}",
+                downstream_reply.kind
+            );
+        }
+        control_stats.merge(downstream_reply.stats);
+        send_stage_reply(
+            upstream,
+            StageReply {
+                stats: control_stats,
+                ..downstream_reply
+            },
+        )
+        .context("relay restore-decode predicted reply")?;
         return Ok(());
     }
 
@@ -2247,38 +2304,60 @@ fn handle_binary_restore_prefill_decode_control(
         json!(runtime_lock_hold_ms),
     );
     telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-    let return_stream = prediction_return_streams
-        .get_mut(&(message.request_id, message.session_id))
-        .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
-    direct_return::send_direct_prediction_return(
-        return_stream,
+    send_stage_reply(
+        upstream,
         StageReply {
             kind: WireReplyKind::PredictedToken,
             predicted: predicted_token,
             predicted_tokens: vec![predicted_token],
             stats: control_stats,
         },
-    )?;
+    )
+    .context("send restore-decode predicted reply")?;
     Ok(())
 }
 
-fn send_one_off_direct_return(
-    config: &StageConfig,
-    topology: Option<&StageTopology>,
-    message: &StageWireMessage,
-    wire_dtype: WireActivationDType,
-    downstream_connect_timeout_secs: u64,
-    reply: StageReply,
-) -> Result<()> {
-    let mut stream = direct_return::open_prediction_return_stream(
-        config,
-        topology,
-        message.request_id,
-        message.session_id,
-        wire_dtype,
-        downstream_connect_timeout_secs,
-    )?;
-    direct_return::send_direct_prediction_return(&mut stream, reply)
+fn predicted_reply_kind(kind: WireMessageKind) -> WireReplyKind {
+    if kind == WireMessageKind::VerifySpan {
+        WireReplyKind::PredictedTokens
+    } else {
+        WireReplyKind::PredictedToken
+    }
+}
+
+fn predicted_reply_token_count(kind: WireMessageKind, predicted_tokens: &[i32]) -> usize {
+    if kind == WireMessageKind::VerifySpan {
+        predicted_tokens.len()
+    } else {
+        predicted_tokens.len().max(1)
+    }
+}
+
+fn send_stage_reply(stream: &mut TcpStream, reply: StageReply) -> Result<()> {
+    match reply.kind {
+        WireReplyKind::Ack => {
+            send_reply_ack_with_stats(stream, reply.stats).context("send stage ACK reply")
+        }
+        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
+            stream,
+            reply.predicted,
+            &stage_reply_prediction_tokens(&reply),
+            reply.stats,
+        )
+        .context("send stage predicted-token reply"),
+        WireReplyKind::PredictedTokens => {
+            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
+                .context("send stage predicted-tokens reply")
+        }
+    }
+}
+
+fn stage_reply_prediction_tokens(reply: &StageReply) -> Vec<i32> {
+    if reply.predicted_tokens.is_empty() {
+        vec![reply.predicted]
+    } else {
+        reply.predicted_tokens.clone()
+    }
 }
 
 fn restore_decode_sideband(message: &StageWireMessage) -> Result<(&[i32], i32)> {
