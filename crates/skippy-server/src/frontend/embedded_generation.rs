@@ -601,6 +601,7 @@ impl StageOpenAiBackend {
             let mut exact_replay_tokens = Vec::new();
             let mut fused_reached_stop = false;
             let mut native_mtp = NativeMtpN1Verifier::default();
+            let native_mtp_batched_verify = native_mtp_batched_verify_enabled();
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -794,7 +795,8 @@ impl StageOpenAiBackend {
                 let token_timer = PhaseTimer::start();
                 let native_mtp_remaining =
                     (request.max_tokens as usize).saturating_sub(decoded_tokens);
-                if draft_guard.is_none()
+                if native_mtp_batched_verify
+                    && draft_guard.is_none()
                     && native_mtp_remaining >= 2
                     && let Some(native_mtp_draft_token) = native_mtp.take_pending_draft()
                 {

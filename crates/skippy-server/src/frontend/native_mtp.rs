@@ -2,6 +2,19 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
+const BATCHED_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_BATCHED_VERIFY";
+
+pub(super) fn native_mtp_batched_verify_enabled() -> bool {
+    native_mtp_batched_verify_enabled_from(std::env::var(BATCHED_VERIFY_ENV).ok().as_deref())
+}
+
+fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "off" | "disable" | "disabled" | "no")
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct NativeMtpDraft {
     pub(super) token: i32,
@@ -410,5 +423,15 @@ mod tests {
             attrs.get("llama_stage.native_mtp.accept_rate"),
             Some(&json!(1.0))
         );
+    }
+
+    #[test]
+    fn batched_verify_flag_defaults_on_and_accepts_false_values() {
+        assert!(native_mtp_batched_verify_enabled_from(None));
+        assert!(native_mtp_batched_verify_enabled_from(Some("1")));
+        assert!(native_mtp_batched_verify_enabled_from(Some("true")));
+        assert!(!native_mtp_batched_verify_enabled_from(Some("0")));
+        assert!(!native_mtp_batched_verify_enabled_from(Some("false")));
+        assert!(!native_mtp_batched_verify_enabled_from(Some(" disabled ")));
     }
 }
