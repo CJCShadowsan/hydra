@@ -12,6 +12,52 @@ Do not treat it as the architecture for this work. The new path should start
 from native MTP proposal semantics and add batching only after one-token
 correctness is proven.
 
+## Current GLM-5.1 Evidence
+
+HF metadata checked on 2026-06-15 shows `zai-org/GLM-5.1` is a checkpoint repo,
+not a GGUF repo:
+
+- `model_type = "glm_moe_dsa"`;
+- `architectures = ["GlmMoeDsaForCausalLM"]`;
+- `num_hidden_layers = 78`;
+- `hidden_size = 6144`;
+- `max_position_embeddings = 202752`;
+- `num_nextn_predict_layers = 1`;
+- the checkpoint has MTP tensors at layer `78`:
+  - `model.layers.78.eh_proj.weight`;
+  - `model.layers.78.enorm.weight`;
+  - `model.layers.78.hnorm.weight`.
+
+That tensor shape matches the native `n=1` sidecar direction: there are 78
+authoritative target layers plus one NextN/MTP prediction layer. The local
+llama.cpp patch queue currently expects those `eh_proj`, `enorm`, and `hnorm`
+MTP tensors and builds the GLM-DSA MTP graph through the DeepSeek2-style MTP
+graph path.
+
+The current Skippy parity catalog has runnable GLM-family GGUFs for GLM4,
+GLM-4.7 Flash, and GLM4-MoE, but the `glm_dsa` row is still
+`no_public_gguf_candidate`. Therefore the first real GLM-5.1 proof requires a
+HF-side GGUF conversion and layer package before local Skippy correctness can
+exercise native MTP against the target model.
+
+The model-backed Step 1 gate should use the correctness harness with a required
+draft sideband:
+
+```bash
+skippy-correctness chain \
+  --model /path/to/glm-5.1.gguf \
+  --model-id mesh-llm/GLM-5.1-<quant>-GGUF:<quant> \
+  --layer-end 79 \
+  --splits 26,52 \
+  --activation-wire-dtype f16 \
+  --require-native-mtp-draft
+```
+
+The exact split points should come from the layer package topology, not this
+example. The important invariant is that the report must show
+`matches = true`, `native_mtp.sideband_present = true`, and
+`native_mtp.authoritative_matches_reply = true`.
+
 ## Runtime Shape
 
 Native MTP is a proposer sidecar attached to the target runtime. It is not a
