@@ -48,6 +48,8 @@ GGUF metadata reports `general.architecture = "deepseek2"` and
 tensors, but the public GGUF appears to have dropped them. Phase 1 therefore
 needs a custom GLM-4.7 GGUF quantization from checkpoint that preserves the
 layer-47 MTP tensors, then a Skippy layer package built from that GGUF.
+The target Hub repo for that custom artifact is
+`meshllm/GLM-4.7-Flash-MTP-GGUF`.
 
 The model-backed Step 1 gate should use the correctness harness with a required
 draft sideband:
@@ -55,7 +57,7 @@ draft sideband:
 ```bash
 skippy-correctness chain \
   --model /path/to/GLM-4.7-Flash-Q4_K_M-mtp.gguf \
-  --model-id mesh-llm/GLM-4.7-Flash-Q4_K_M-MTP-GGUF:Q4_K_M \
+  --model-id meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M \
   --layer-end 48 \
   --splits 15,31 \
   --activation-wire-dtype f16 \
