@@ -735,6 +735,7 @@ impl StageOpenAiBackend {
                 adaptive_window_enabled: request.adaptive_speculative_window,
                 ..OpenAiSpeculativeStats::default()
             };
+            let mut native_mtp = NativeMtpN1Verifier::default();
             let mut draft_guard = match request.draft.as_ref() {
                 Some(draft) if request.speculative_window > 0 => {
                     let draft_reset_timer = PhaseTimer::start();
@@ -1190,6 +1191,8 @@ impl StageOpenAiBackend {
                     )?;
                 }
                 current = reply.predicted;
+                let native_mtp_decision =
+                    native_mtp.observe_target_token(current, ms_to_us(downstream_wait_ms), None);
                 decoded_tokens += 1;
                 exact_replay_tokens.push(current);
                 context_tokens.push(current);
@@ -1241,6 +1244,10 @@ impl StageOpenAiBackend {
                 );
                 token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
                 token_attrs.insert("llama_stage.message_kind".to_string(), json!("DecodeEmbd"));
+                token_attrs.insert(
+                    "llama_stage.native_mtp.verification".to_string(),
+                    json!(native_mtp_decision.label()),
+                );
                 self.emit_openai_phase("stage.openai_decode_token", token_timer, token_attrs);
                 if on_token(current)? == TokenControl::Stop {
                     break;
@@ -1304,6 +1311,7 @@ impl StageOpenAiBackend {
                 json!(decode_downstream_wait_ms),
             );
             speculative_stats.insert_attrs(&mut decode_attrs);
+            native_mtp.stats().insert_attrs(&mut decode_attrs);
             self.emit_openai_phase("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();

@@ -74,6 +74,7 @@ mod embedded_execution;
 mod embedded_generation;
 mod generation_flow;
 mod local_generation;
+mod native_mtp;
 mod prefill;
 mod prefix_cache;
 mod prompting;
@@ -83,7 +84,7 @@ mod util;
 mod wire_messages;
 
 use self::{
-    decode_batcher::DecodeBatcher, prefill::*, request::*, speculative::*, util::*,
+    decode_batcher::DecodeBatcher, native_mtp::*, prefill::*, request::*, speculative::*, util::*,
     wire_messages::*,
 };
 
