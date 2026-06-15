@@ -6,6 +6,8 @@ pub use model_artifact::ModelIdentity;
 pub struct BaselineReport {
     pub token_id: i32,
     pub predicted_token: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_predicted_token: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -22,7 +24,11 @@ pub struct BoundaryReport {
 pub struct SplitReport {
     pub token_id: i32,
     pub predicted_token: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_predicted_token: Option<i32>,
     pub native_mtp: NativeMtpSidebandReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_mtp_n1: Option<NativeMtpN1VerificationReport>,
     pub activation_width: i32,
     pub wire_dtype: String,
     pub boundary: BoundaryReport,
@@ -39,6 +45,27 @@ pub struct NativeMtpSidebandReport {
     pub draft_token: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposal_compute_us: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeMtpN1VerificationReport {
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
+    pub rejected_tokens: u64,
+    pub pending_tokens: u64,
+    pub verification_count: u64,
+    pub accept_rate: f64,
+    pub byte_identical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_target_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_baseline_token: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_compute_us: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_compute_us: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,7 +101,11 @@ pub struct ChainReport {
     pub baseline: BaselineReport,
     pub token_id: i32,
     pub predicted_token: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub second_predicted_token: Option<i32>,
     pub native_mtp: NativeMtpSidebandReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_mtp_n1: Option<NativeMtpN1VerificationReport>,
     pub activation_width: i32,
     pub wire_dtype: String,
     pub stages: Vec<ChainStageReport>,
