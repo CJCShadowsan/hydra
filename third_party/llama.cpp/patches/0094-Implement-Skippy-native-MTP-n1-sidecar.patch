@@ -1,14 +1,14 @@
-From 139be3529e6662202f5dc3424cfa7e63916bb0ed Mon Sep 17 00:00:00 2001
+From 28a45e51cc660889e3dcba53896c758ceff20cfe Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Mon, 15 Jun 2026 19:04:12 +1000
-Subject: [PATCH] Implement Skippy native MTP n1 sidecar
+Subject: [PATCH 94/96] Implement Skippy native MTP n1 sidecar
 
 ---
- src/skippy.cpp | 233 ++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 229 insertions(+), 4 deletions(-)
+ src/skippy.cpp | 241 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 236 insertions(+), 5 deletions(-)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 41a03145..7d22f43d 100644
+index a3bd91b2..45003371 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
 @@ -6,6 +6,7 @@
@@ -37,7 +37,7 @@ index 41a03145..7d22f43d 100644
  };
  
  struct skippy_tensor_meta {
-@@ -977,6 +982,113 @@ static enum skippy_status skippy_decode_batch(
+@@ -1224,6 +1229,113 @@ static enum skippy_status skippy_decode_batch(
      return skippy_success(out_error);
  }
  
@@ -114,7 +114,7 @@ index 41a03145..7d22f43d 100644
 +            if (src_i == 0) {
 +                std::memcpy(dst, session->mtp_pending_h.data(), row_bytes);
 +            } else {
-+                const float * h_prev = llama_get_embeddings_pre_norm_ith(session->ctx, static_cast<int32_t>(src_i - 1));
++                const float * h_prev = llama_get_embeddings_nextn_ith(session->ctx, static_cast<int32_t>(src_i - 1));
 +                if (h_prev == nullptr) {
 +                    std::free(batch.token);
 +                    batch.token = nullptr;
@@ -138,7 +138,7 @@ index 41a03145..7d22f43d 100644
 +        session->mtp_next_pos = token_start + static_cast<int32_t>(token_count);
 +    }
 +
-+    const float * h_last = llama_get_embeddings_pre_norm_ith(session->ctx, static_cast<int32_t>(token_count - 1));
++    const float * h_last = llama_get_embeddings_nextn_ith(session->ctx, static_cast<int32_t>(token_count - 1));
 +    if (h_last == nullptr) {
 +        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "target pre-norm hidden row was not available");
 +        return SKIPPY_STATUS_RUNTIME_ERROR;
@@ -151,7 +151,7 @@ index 41a03145..7d22f43d 100644
  static void skippy_record_tokens(
          skippy_session * session,
          const llama_token * token_ids,
-@@ -1027,12 +1139,16 @@ static enum skippy_status skippy_decode_tokens(
+@@ -1274,12 +1386,16 @@ static enum skippy_status skippy_decode_tokens(
              /*logits   =*/ &logits,
          };
          enum skippy_status status = skippy_decode_batch(session, batch, 1, out_error);
@@ -168,7 +168,7 @@ index 41a03145..7d22f43d 100644
      llama_batch batch = llama_batch_init(n_tokens, 0, 1);
      batch.n_tokens = n_tokens;
      for (int32_t i = 0; i < n_tokens; ++i) {
-@@ -1045,6 +1161,9 @@ static enum skippy_status skippy_decode_tokens(
+@@ -1292,6 +1408,9 @@ static enum skippy_status skippy_decode_tokens(
  
      enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
      llama_batch_free(batch);
@@ -178,7 +178,7 @@ index 41a03145..7d22f43d 100644
      if (status == SKIPPY_STATUS_OK) {
          skippy_record_tokens(session, token_ids, token_count);
      }
-@@ -1085,10 +1204,16 @@ static enum skippy_status skippy_verify_token_batch(
+@@ -1332,10 +1451,16 @@ static enum skippy_status skippy_verify_token_batch(
      return status;
  }
  
@@ -198,7 +198,7 @@ index 41a03145..7d22f43d 100644
      if (logits == nullptr) {
          return 0;
      }
-@@ -1105,6 +1230,10 @@ static llama_token skippy_greedy_sample_ith(skippy_session * session, int32_t in
+@@ -1352,6 +1477,10 @@ static llama_token skippy_greedy_sample_ith(skippy_session * session, int32_t in
      return best;
  }
  
@@ -209,7 +209,7 @@ index 41a03145..7d22f43d 100644
  static llama_token skippy_greedy_sample(skippy_session * session) {
      return skippy_greedy_sample_ith(session, -1);
  }
-@@ -1501,6 +1630,64 @@ static llama_token skippy_sample_token(
+@@ -1748,6 +1877,64 @@ static llama_token skippy_sample_token(
      return skippy_sample_token_ith(session, sampling, -1);
  }
  
@@ -274,7 +274,7 @@ index 41a03145..7d22f43d 100644
  static enum skippy_status skippy_prepare_empty_activation_frame(
          skippy_session * session,
          size_t token_count,
-@@ -1689,7 +1876,11 @@ static enum skippy_status skippy_decode_activation_frame(
+@@ -1936,7 +2123,11 @@ static enum skippy_status skippy_decode_activation_frame(
      skippy_activation_tokens_scope activation_tokens_scope(token_ids, token_count);
      skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
      skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
@@ -286,7 +286,7 @@ index 41a03145..7d22f43d 100644
      return status;
  }
  
-@@ -1726,6 +1917,7 @@ static enum skippy_status skippy_verify_activation_frame(
+@@ -1944,6 +2135,7 @@ static enum skippy_status skippy_verify_activation_frame(
          skippy_session * session,
          const skippy_activation_desc * input_desc,
          const void * input_payload,
@@ -294,7 +294,8 @@ index 41a03145..7d22f43d 100644
          size_t token_count,
          struct skippy_error ** out_error) {
      if (session == nullptr || session->ctx == nullptr || input_desc == nullptr || input_payload == nullptr || token_count == 0) {
-@@ -1757,6 +1949,10 @@ static enum skippy_status skippy_verify_activation_frame(
+@@ -1972,8 +2164,12 @@ static enum skippy_status skippy_verify_activation_frame(
+ 
      skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
      skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
 +    const llama_pos token_start = session->n_past;
@@ -305,14 +306,15 @@ index 41a03145..7d22f43d 100644
 +    }
      return status;
  }
-@@ -2027,6 +2218,24 @@ static enum skippy_status skippy_finish_model_open(
-         skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to create llama context");
+ 
+@@ -2300,6 +2496,25 @@ static enum skippy_status skippy_finish_model_open(
+         skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, message);
          return SKIPPY_STATUS_RUNTIME_ERROR;
      }
 +
 +    if (config != nullptr &&
 +        config->include_output &&
-+        model->hparams.nextn_predict_layers > 0) {
++        model->hparams.n_layer_nextn > 0) {
 +        llama_context_params mtp_params = params;
 +        mtp_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
 +        mtp_params.embeddings = false;
@@ -321,16 +323,17 @@ index 41a03145..7d22f43d 100644
 +            stage_model->mtp_ctx = llama_init_from_model(model, mtp_params);
 +        }
 +        if (stage_model->mtp_ctx != nullptr) {
-+            llama_set_embeddings_pre_norm(stage_model->ctx, true, false);
-+            llama_set_embeddings_pre_norm(stage_model->mtp_ctx, true, true);
++            llama_set_embeddings_nextn(stage_model->ctx, true, false);
++            llama_set_embeddings_nextn(stage_model->mtp_ctx, true, true);
 +        } else {
 +            fprintf(stderr, "skippy: native MTP sidecar unavailable for this final stage; continuing without drafts\n");
 +        }
 +    }
++
      stage_model->lane_in_use.assign(stage_model->lane_count, false);
      stage_model->lane_resident_prefix_tokens.resize(stage_model->lane_count);
  
-@@ -2149,6 +2358,9 @@ enum skippy_status skippy_model_free(
+@@ -2513,6 +2728,9 @@ enum skippy_status skippy_model_free(
          struct skippy_model * model,
          struct skippy_error ** out_error) {
      if (model != nullptr) {
@@ -340,7 +343,7 @@ index 41a03145..7d22f43d 100644
          if (model->ctx != nullptr) {
              llama_free(model->ctx);
          }
-@@ -2196,6 +2408,11 @@ enum skippy_status skippy_session_create(
+@@ -2560,6 +2778,11 @@ enum skippy_status skippy_session_create(
      session->n_past = 0;
      session->checkpoint_valid = false;
      session->checkpoint_n_past = 0;
@@ -352,7 +355,7 @@ index 41a03145..7d22f43d 100644
      *out_session = session;
      if (static_cast<size_t>(seq_id) < model->lane_resident_prefix_tokens.size()) {
          model->lane_resident_prefix_tokens[static_cast<size_t>(seq_id)].clear();
-@@ -2279,6 +2496,7 @@ enum skippy_status skippy_session_set_position(
+@@ -2643,6 +2866,7 @@ enum skippy_status skippy_session_set_position(
      if (session->signal_history.size() > static_cast<size_t>(n_past)) {
          session->signal_history.resize(static_cast<size_t>(n_past));
      }
@@ -360,7 +363,7 @@ index 41a03145..7d22f43d 100644
      return skippy_success(out_error);
  }
  
-@@ -2372,6 +2590,7 @@ enum skippy_status skippy_session_reset(
+@@ -2736,6 +2960,7 @@ enum skippy_status skippy_session_reset(
      }
      session->signal_history.clear();
      skippy_clear_chat_sampling(session);
@@ -368,7 +371,7 @@ index 41a03145..7d22f43d 100644
      session->ctx->synchronize();
      return skippy_success(out_error);
  }
-@@ -2408,6 +2627,7 @@ enum skippy_status skippy_session_free(
+@@ -2772,6 +2997,7 @@ enum skippy_status skippy_session_free(
                  session->stage_model->lane_in_use[lane] = false;
              }
          }
@@ -376,7 +379,7 @@ index 41a03145..7d22f43d 100644
          delete session;
      }
      return skippy_success(out_error);
-@@ -2970,7 +3190,7 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
+@@ -3334,7 +3560,7 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
          };
      }
  
@@ -385,7 +388,7 @@ index 41a03145..7d22f43d 100644
              session,
              token_id,
              sampling,
-@@ -2982,6 +3202,11 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
+@@ -3346,6 +3572,11 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
              out_output_payload_bytes,
              out_predicted_token,
              out_error);
@@ -397,13 +400,15 @@ index 41a03145..7d22f43d 100644
  }
  
  enum skippy_status skippy_decode_step_frame_batch_sampled(
-@@ -3226,5 +3453,5 @@ enum skippy_status skippy_verify_tokens_frame(
+@@ -3589,7 +3820,7 @@ enum skippy_status skippy_verify_tokens_frame(
+ 
      if (skippy_is_filtered(session) && session->stage_model->config.layer_start > 0) {
          status = session->stage_model->config.include_output ?
 -                skippy_verify_activation_frame(session, input_desc, input_payload, token_count, out_error) :
 +                skippy_verify_activation_frame(session, input_desc, input_payload, token_ids, token_count, out_error) :
                  skippy_decode_activation_frame(session, input_desc, input_payload, token_ids, nullptr, 0, token_count, false, out_error);
      } else {
-
+         status = session->stage_model->config.include_output ?
 -- 
 2.54.0 (Apple Git-156)
+

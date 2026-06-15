@@ -1,7 +1,7 @@
-From ea51c822b0a2b27aa5822b0cdb5d0db6e0f7f965 Mon Sep 17 00:00:00 2001
+From 0f37fa76941a402b6a4c2e7e6ca642afcecf9ea7 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Mon, 15 Jun 2026 18:50:29 +1000
-Subject: [PATCH] Add Skippy native MTP n1 decode ABI
+Subject: [PATCH 93/96] Add Skippy native MTP n1 decode ABI
 
 ---
  include/skippy.h        | 21 +++++++++++++++++++++
@@ -10,7 +10,7 @@ Subject: [PATCH] Add Skippy native MTP n1 decode ABI
  3 files changed, 61 insertions(+), 2 deletions(-)
 
 diff --git a/include/skippy.h b/include/skippy.h
-index b30c631e..be770fe2 100644
+index 7cace0a4..c4da8e28 100644
 --- a/include/skippy.h
 +++ b/include/skippy.h
 @@ -131,6 +131,13 @@ struct skippy_kv_page_desc {
@@ -27,7 +27,7 @@ index b30c631e..be770fe2 100644
  LLAMA_API enum skippy_status skippy_model_open(
          const char * path,
          const struct skippy_runtime_config * config,
-@@ -353,6 +360,20 @@ LLAMA_API enum skippy_status skippy_decode_step_frame_sampled(
+@@ -368,6 +375,20 @@ LLAMA_API enum skippy_status skippy_decode_step_frame_sampled(
          llama_token * out_predicted_token,
          struct skippy_error ** out_error);
  
@@ -49,7 +49,7 @@ index b30c631e..be770fe2 100644
          struct skippy_session * const * sessions,
          const llama_token * token_ids,
 diff --git a/include/skippy/common.h b/include/skippy/common.h
-index c13d8caa..b04a642a 100644
+index 7009d98c..a8438390 100644
 --- a/include/skippy/common.h
 +++ b/include/skippy/common.h
 @@ -26,7 +26,7 @@ extern "C" {
@@ -61,29 +61,29 @@ index c13d8caa..b04a642a 100644
  
  enum skippy_feature {
      SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
-@@ -53,6 +53,7 @@ enum skippy_feature {
-     SKIPPY_FEATURE_CHAT_TEMPLATE_TOOLS    = 1 << 21,
+@@ -54,6 +54,7 @@ enum skippy_feature {
      SKIPPY_FEATURE_CHAT_SAMPLING_GRAMMAR  = 1 << 22,
      SKIPPY_FEATURE_BACKEND_DEVICES        = 1 << 23,
-+    SKIPPY_FEATURE_NATIVE_MTP_N1          = 1 << 24,
+     SKIPPY_FEATURE_RUNTIME_EVENTS         = 1 << 24,
++    SKIPPY_FEATURE_NATIVE_MTP_N1          = 1 << 25,
  };
  
  enum skippy_status {
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index 3dfe75a0..41a03145 100644
+index 79b294fc..a3bd91b2 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1760,7 +1760,8 @@ uint64_t skippy_abi_features(void) {
-            SKIPPY_FEATURE_PACKAGE_PART_LOAD |
+@@ -2008,7 +2008,8 @@ uint64_t skippy_abi_features(void) {
             SKIPPY_FEATURE_GENERATION_SIGNALS |
             SKIPPY_FEATURE_EXTERNAL_MEDIA_PREFILL |
+            SKIPPY_FEATURE_RUNTIME_EVENTS |
 -           SKIPPY_FEATURE_BACKEND_DEVICES;
 +           SKIPPY_FEATURE_BACKEND_DEVICES |
 +           SKIPPY_FEATURE_NATIVE_MTP_N1;
  }
  
  const char * skippy_status_string(enum skippy_status status) {
-@@ -2947,6 +2948,42 @@ enum skippy_status skippy_decode_step_frame_sampled(
+@@ -3311,6 +3312,42 @@ enum skippy_status skippy_decode_step_frame_sampled(
      return skippy_copy_output_activation_frame(session, 1, output_payload, input_desc, input_payload, out_error);
  }
  

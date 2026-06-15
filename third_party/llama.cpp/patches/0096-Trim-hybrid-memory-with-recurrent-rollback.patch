@@ -1,17 +1,17 @@
-From 50154ae85c5d8752b689e3d24b8a5241e614fdf4 Mon Sep 17 00:00:00 2001
+From 4d7c6841b8aa39a5b37ad06c03903756e036a863 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Mon, 15 Jun 2026 23:11:52 +1000
-Subject: [PATCH] Trim hybrid memory with recurrent rollback
+Subject: [PATCH 96/96] Trim hybrid memory with recurrent rollback
 
 ---
  src/skippy.cpp | 11 +++++------
  1 file changed, 5 insertions(+), 6 deletions(-)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index e82485a2..4c987c71 100644
+index 559a21b3..15d9a75d 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -2212,6 +2212,7 @@ static enum skippy_status skippy_finish_model_open(
+@@ -2481,6 +2481,7 @@ static enum skippy_status skippy_finish_model_open(
      params.embeddings = config != nullptr && config->filter_tensors_on_load && !config->include_output;
      if (llm_arch_is_recurrent(model->arch) || llm_arch_is_hybrid(model->arch)) {
          params.n_seq_max = std::max<uint32_t>(2, stage_model->lane_count * 2);
@@ -19,7 +19,7 @@ index e82485a2..4c987c71 100644
          params.kv_unified = true;
      }
  
-@@ -3977,15 +3978,13 @@ enum skippy_status skippy_trim_session(
+@@ -4342,15 +4343,13 @@ enum skippy_status skippy_trim_session(
      }
      const llama_pos p0 = static_cast<llama_pos>(token_count);
      if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {

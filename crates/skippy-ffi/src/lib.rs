@@ -3,6 +3,7 @@ pub const ABI_VERSION_MINOR: u32 = 1;
 pub const ABI_VERSION_PATCH: u32 = 28;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
+pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
 
 use std::ffi::{c_char, c_int, c_void};
 
