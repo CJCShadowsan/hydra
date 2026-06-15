@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use model_artifact::ModelIdentity;
+use model_artifact::{ModelIdentity, gguf::scan_gguf_compact_meta};
 use model_hf::HfModelRepository;
 use model_ref::ModelRef;
 use serde::Deserialize;
@@ -87,6 +87,37 @@ struct BinarySplitResult {
     boundary_payload_bytes: u64,
     boundary_wire_payload_bytes: usize,
     stage_models: Vec<StageModelReport>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NativeMtpArtifactSummary {
+    nextn_predict_layers: u32,
+    has_eh_proj: bool,
+    has_enorm: bool,
+    has_hnorm: bool,
+}
+
+impl NativeMtpArtifactSummary {
+    fn supports_native_mtp(&self) -> bool {
+        self.nextn_predict_layers > 0 && self.has_eh_proj && self.has_enorm && self.has_hnorm
+    }
+
+    fn missing_reasons(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.nextn_predict_layers == 0 {
+            missing.push("*.nextn_predict_layers > 0");
+        }
+        if !self.has_eh_proj {
+            missing.push("*.nextn.eh_proj tensor");
+        }
+        if !self.has_enorm {
+            missing.push("*.nextn.enorm tensor");
+        }
+        if !self.has_hnorm {
+            missing.push("*.nextn.hnorm tensor");
+        }
+        missing
+    }
 }
 
 struct BinaryChainConfig {
@@ -294,6 +325,8 @@ impl LocalStatePayload {
 }
 
 pub fn single_step(args: SingleStepArgs) -> Result<()> {
+    let native_mtp = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
     let report = run_single_step_with_baseline(
@@ -305,7 +338,7 @@ pub fn single_step(args: SingleStepArgs) -> Result<()> {
             split_layer: args.split_layer,
             stage1_bind_addr: args.stage1_bind_addr,
             activation_wire_dtype: args.activation_wire_dtype,
-            native_mtp: native_mtp_requirement(args.native_mtp),
+            native_mtp,
         },
     )?;
     emit_report(&report, args.output.report_out.as_deref())?;
@@ -314,6 +347,8 @@ pub fn single_step(args: SingleStepArgs) -> Result<()> {
 }
 
 pub fn chain(args: ChainArgs) -> Result<()> {
+    let native_mtp_requirement = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp_requirement)?;
     let splits = parse_chain_splits(&args.splits)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
@@ -339,7 +374,6 @@ pub fn chain(args: ChainArgs) -> Result<()> {
         model_identity: model_identity.clone(),
     })?;
     let native_mtp = chain.native_mtp.clone();
-    let native_mtp_requirement = native_mtp_requirement(args.native_mtp);
     let matches = baseline.predicted_token == chain.predicted_token
         && native_mtp_satisfies_requirement(&native_mtp, native_mtp_requirement);
     let report = ChainReport {
@@ -391,6 +425,8 @@ pub fn chain(args: ChainArgs) -> Result<()> {
 }
 
 pub fn split_scan(args: SplitScanArgs) -> Result<()> {
+    let native_mtp = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp)?;
     let splits = parse_split_list(&args.splits)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
@@ -414,7 +450,7 @@ pub fn split_scan(args: SplitScanArgs) -> Result<()> {
                 split_layer,
                 stage1_bind_addr: args.stage1_bind_addr,
                 activation_wire_dtype: args.activation_wire_dtype.clone(),
-                native_mtp: native_mtp_requirement(args.native_mtp),
+                native_mtp,
             },
         )?);
     }
@@ -434,6 +470,8 @@ pub fn split_scan(args: SplitScanArgs) -> Result<()> {
 }
 
 pub fn dtype_matrix(args: DtypeMatrixArgs) -> Result<()> {
+    let native_mtp = native_mtp_requirement(args.native_mtp);
+    ensure_native_mtp_artifact_if_required(&args.runtime, native_mtp)?;
     let dtypes = parse_csv(&args.dtypes)?;
     let model_identity = runtime_model_identity(&args.runtime)?;
     let baseline = run_full_model_decode(&args.runtime)?;
@@ -451,7 +489,7 @@ pub fn dtype_matrix(args: DtypeMatrixArgs) -> Result<()> {
                 split_layer: args.split_layer,
                 stage1_bind_addr: args.stage1_bind_addr,
                 activation_wire_dtype: dtype,
-                native_mtp: native_mtp_requirement(args.native_mtp),
+                native_mtp,
             },
         )?);
     }
@@ -2690,6 +2728,74 @@ fn native_mtp_requirement(args: NativeMtpArgs) -> NativeMtpRequirement {
     }
 }
 
+fn ensure_native_mtp_artifact_if_required(
+    runtime: &RuntimeArgs,
+    requirement: NativeMtpRequirement,
+) -> Result<()> {
+    if !requirement.require_draft {
+        return Ok(());
+    }
+
+    let model_path = native_mtp_preflight_model_path(runtime);
+    if !model_path.is_file() {
+        return Ok(());
+    }
+
+    let summary = native_mtp_artifact_summary(model_path)?;
+    if summary.supports_native_mtp() {
+        return Ok(());
+    }
+
+    bail!(
+        "native MTP draft was required, but {} does not advertise a usable native MTP head: missing {}",
+        model_path.display(),
+        summary.missing_reasons().join(", ")
+    );
+}
+
+fn native_mtp_preflight_model_path(runtime: &RuntimeArgs) -> &Path {
+    runtime
+        .stage_model
+        .as_deref()
+        .filter(|path| path.is_file())
+        .unwrap_or(runtime.model.as_path())
+}
+
+fn native_mtp_artifact_summary(model_path: &Path) -> Result<NativeMtpArtifactSummary> {
+    let meta = scan_gguf_compact_meta(model_path)
+        .with_context(|| format!("inspect GGUF metadata for {}", model_path.display()))?;
+    let info = skippy_runtime::ModelInfo::open(model_path)
+        .with_context(|| format!("inspect GGUF tensors for {}", model_path.display()))?;
+    let tensors = info.tensors()?;
+    Ok(native_mtp_artifact_summary_from_names(
+        meta.nextn_predict_layers,
+        tensors.iter().map(|tensor| tensor.name.as_str()),
+    ))
+}
+
+fn native_mtp_artifact_summary_from_names<'a>(
+    nextn_predict_layers: u32,
+    names: impl IntoIterator<Item = &'a str>,
+) -> NativeMtpArtifactSummary {
+    let mut summary = NativeMtpArtifactSummary {
+        nextn_predict_layers,
+        ..NativeMtpArtifactSummary::default()
+    };
+    for name in names {
+        let name = name.to_ascii_lowercase();
+        summary.has_eh_proj |= native_mtp_name_matches(&name, "eh_proj");
+        summary.has_enorm |= native_mtp_name_matches(&name, "enorm");
+        summary.has_hnorm |= native_mtp_name_matches(&name, "hnorm");
+    }
+    summary
+}
+
+fn native_mtp_name_matches(name: &str, suffix: &str) -> bool {
+    name.contains(&format!(".nextn.{suffix}"))
+        || name.contains(&format!(".{suffix}."))
+        || name.ends_with(&format!(".{suffix}"))
+}
+
 fn native_mtp_satisfies_requirement(
     report: &NativeMtpSidebandReport,
     requirement: NativeMtpRequirement,
@@ -2784,6 +2890,53 @@ mod tests {
         assert!(native_mtp_satisfies_requirement(&no_draft, optional));
         assert!(!native_mtp_satisfies_requirement(&no_draft, required));
         assert!(native_mtp_satisfies_requirement(&draft, required));
+    }
+
+    #[test]
+    fn native_mtp_artifact_summary_requires_metadata_and_tensors() {
+        let summary = native_mtp_artifact_summary_from_names(
+            1,
+            [
+                "blk.47.nextn.eh_proj",
+                "blk.47.nextn.enorm",
+                "blk.47.nextn.hnorm",
+            ],
+        );
+
+        assert!(summary.supports_native_mtp());
+        assert!(summary.missing_reasons().is_empty());
+    }
+
+    #[test]
+    fn native_mtp_artifact_summary_accepts_source_style_tensor_names() {
+        let summary = native_mtp_artifact_summary_from_names(
+            1,
+            [
+                "model.layers.47.eh_proj.weight",
+                "model.layers.47.enorm.weight",
+                "model.layers.47.hnorm.weight",
+            ],
+        );
+
+        assert!(summary.supports_native_mtp());
+    }
+
+    #[test]
+    fn native_mtp_artifact_summary_rejects_missing_nextn_metadata() {
+        let summary = native_mtp_artifact_summary_from_names(
+            0,
+            [
+                "blk.47.nextn.eh_proj",
+                "blk.47.nextn.enorm",
+                "blk.47.nextn.hnorm",
+            ],
+        );
+
+        assert!(!summary.supports_native_mtp());
+        assert_eq!(
+            summary.missing_reasons(),
+            vec!["*.nextn_predict_layers > 0"]
+        );
     }
 }
 
