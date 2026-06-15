@@ -1,0 +1,24 @@
+From d86a108a10484b5ffca227175023c60e9bbed84f Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Mon, 15 Jun 2026 22:52:20 +1000
+Subject: [PATCH 90/90] Clear native MTP sidecar on session trim
+
+---
+ src/skippy.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 239e9460..e82485a2 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -4005,6 +4005,7 @@ enum skippy_status skippy_trim_session(
+     if (session->signal_history.size() > token_count) {
+         session->signal_history.resize(static_cast<size_t>(token_count));
+     }
++    skippy_mtp_clear_session_state(session);
+     session->ctx->synchronize();
+ 
+     return skippy_success(out_error);
+-- 
+2.54.0 (Apple Git-156)
+

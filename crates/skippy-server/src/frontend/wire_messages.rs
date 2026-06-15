@@ -191,23 +191,6 @@ pub(super) fn embedded_session_control_message(
     }
 }
 
-pub(super) fn embedded_trim_session_message(
-    wire_dtype: WireActivationDType,
-    request_id: u64,
-    session_id: u64,
-    token_count: usize,
-) -> OpenAiResult<StageWireMessage> {
-    let mut message = embedded_session_control_message(
-        wire_dtype,
-        WireMessageKind::TrimSession,
-        request_id,
-        session_id,
-    );
-    message.token_count = i32::try_from(token_count)
-        .map_err(|_| OpenAiError::backend("trim token count exceeds i32"))?;
-    Ok(message)
-}
-
 pub(super) fn generation_config_message(
     wire_dtype: WireActivationDType,
     request_id: u64,
