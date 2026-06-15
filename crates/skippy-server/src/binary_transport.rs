@@ -881,7 +881,9 @@ fn handle_binary_connection(
             }
             compute_start_unix_nanos = now_unix_nanos() as u64;
             let compute_started = Instant::now();
-            let result = if is_decode_frame_batch_candidate(&message, executable_token_ids) {
+            let use_decode_frame_batch =
+                is_decode_frame_batch_candidate(config, &message, executable_token_ids);
+            let result = if use_decode_frame_batch {
                 let token_id = executable_token_ids
                     .first()
                     .copied()
@@ -3321,7 +3323,15 @@ pub(crate) fn run_binary_stage_message(
     }
 }
 
-fn is_decode_frame_batch_candidate(message: &StageWireMessage, token_ids: &[i32]) -> bool {
+fn is_decode_frame_batch_candidate(
+    config: &StageConfig,
+    message: &StageWireMessage,
+    token_ids: &[i32],
+) -> bool {
+    if config.downstream.is_none() {
+        return false;
+    }
+
     matches!(
         message.kind,
         WireMessageKind::DecodeEmbd

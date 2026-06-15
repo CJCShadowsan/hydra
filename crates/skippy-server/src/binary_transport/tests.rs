@@ -1,7 +1,7 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    prepare_binary_stage_connection, restore_prefill_decode_as_decode_message,
-    token_sideband_or_fill,
+    is_decode_frame_batch_candidate, prepare_binary_stage_connection,
+    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
 };
 use std::{
     io,
@@ -204,6 +204,23 @@ fn decode_record_tokens_sideband_rejects_wrong_checkpoint_len() {
 
     assert!(decode_record_tokens_sideband(&message).is_none());
     assert_eq!(token_sideband_or_fill(&message).unwrap(), vec![104]);
+}
+
+#[test]
+fn decode_frame_batch_candidate_keeps_intermediate_decode_batching() {
+    let config = prefix_cache_test_config();
+    let message = first_decode_message_with_full_prompt_sideband();
+
+    assert!(is_decode_frame_batch_candidate(&config, &message, &[104]));
+}
+
+#[test]
+fn decode_frame_batch_candidate_skips_final_output_stage() {
+    let mut config = prefix_cache_test_config();
+    config.downstream = None;
+    let message = first_decode_message_with_full_prompt_sideband();
+
+    assert!(!is_decode_frame_batch_candidate(&config, &message, &[104]));
 }
 
 #[test]
