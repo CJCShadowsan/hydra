@@ -194,11 +194,12 @@ same activation/cache contracts without requiring a monolithic full GGUF.
   same continuation, producing a recompute-vs-cache-hit speedup estimate. Use
   `--allow-mismatch` only for diagnostic payloads such as recurrent-only.
 - `native-mtp-open-ai-ab` launches a real two-stage `skippy-server
-  serve-binary` split twice through the embedded OpenAI frontend. The first run
-  sets `SKIPPY_NATIVE_MTP_BATCHED_VERIFY=0` to prove native MTP n=1 behavior;
-  the second run uses the default batched verification path. The command fails
-  unless both responses are HTTP 200, native MTP metrics are observed, output
-  content is byte-identical, and the batched run emits
+  serve-binary` split three times through the embedded OpenAI frontend. The
+  baseline run sets `SKIPPY_NATIVE_MTP_ENABLED=0`, the n=1 run sets
+  `SKIPPY_NATIVE_MTP_BATCHED_VERIFY=0`, and the batched run uses the default
+  transactional verification path. The command fails unless all responses are
+  HTTP 200, baseline/n=1/batched output content is byte-identical, native MTP
+  metrics are observed for n=1 and batched runs, and the batched run emits
   `stage.openai_native_mtp_verify` events.
 - Requires a built `skippy-server` binary for binary transport checks.
 - Uses the same llama-backed runtime ABI as the server.

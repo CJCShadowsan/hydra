@@ -1,6 +1,6 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    is_decode_frame_batch_candidate, prepare_binary_stage_connection,
+    is_decode_frame_batch_candidate, native_mtp_enabled_from, prepare_binary_stage_connection,
     restore_prefill_decode_as_decode_message, token_sideband_or_fill,
 };
 use std::{
@@ -42,6 +42,16 @@ fn accepted_binary_stage_connection_is_blocking() {
     assert_ne!(flags, -1);
     assert_eq!(flags & libc::O_NONBLOCK, 0);
     drop(client.join().unwrap());
+}
+
+#[test]
+fn native_mtp_enabled_flag_defaults_on_and_accepts_false_values() {
+    assert!(native_mtp_enabled_from(None));
+    assert!(native_mtp_enabled_from(Some("1")));
+    assert!(native_mtp_enabled_from(Some("true")));
+    assert!(!native_mtp_enabled_from(Some("0")));
+    assert!(!native_mtp_enabled_from(Some("false")));
+    assert!(!native_mtp_enabled_from(Some(" disabled ")));
 }
 
 #[test]

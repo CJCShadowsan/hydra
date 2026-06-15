@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    env,
     future::Future,
     io,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
@@ -57,6 +58,7 @@ pub use self::wire::WireCondition;
 pub(crate) use self::wire::write_stage_message_conditioned;
 
 static BINARY_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+const NATIVE_MTP_ENABLED_ENV: &str = "SKIPPY_NATIVE_MTP_ENABLED";
 
 #[derive(Default)]
 struct BinaryKvLookupResult {
@@ -1535,6 +1537,17 @@ fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -
         draft.token_id,
         draft.proposal_compute_us.clamp(0, i64::from(i32::MAX)) as i32,
     ]
+}
+
+fn native_mtp_enabled() -> bool {
+    native_mtp_enabled_from(env::var(NATIVE_MTP_ENABLED_ENV).ok().as_deref())
+}
+
+fn native_mtp_enabled_from(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "off" | "disable" | "disabled" | "no")
+    )
 }
 
 fn estimated_stage_message_wire_bytes(message: &StageWireMessage) -> usize {
@@ -3289,6 +3302,11 @@ pub(crate) fn run_binary_stage_message(
                 .copied()
                 .unwrap_or(message.state.current_token);
             let sampling = runtime_sampling_config(message.sampling.as_ref());
+            if !native_mtp_enabled() {
+                let (predicted, output) =
+                    runtime.decode_frame_sampled(session_id, token_id, sampling.as_ref(), input)?;
+                return Ok((predicted, vec![predicted], output));
+            }
             let (predicted, native_mtp, output) = runtime.decode_frame_sampled_mtp_n1(
                 session_id,
                 token_id,

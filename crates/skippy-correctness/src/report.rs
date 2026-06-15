@@ -264,6 +264,7 @@ pub struct NativeMtpOpenAiAbReport {
     pub batched_events_required: bool,
     pub batched_events_present: bool,
     pub matches: bool,
+    pub baseline: NativeMtpOpenAiCaseReport,
     pub n1: NativeMtpOpenAiCaseReport,
     pub batched: NativeMtpOpenAiCaseReport,
 }
@@ -271,6 +272,7 @@ pub struct NativeMtpOpenAiAbReport {
 #[derive(Debug, Serialize)]
 pub struct NativeMtpOpenAiCaseReport {
     pub case: &'static str,
+    pub native_mtp_enabled: bool,
     pub batched_verify_enabled: bool,
     pub http_status: u16,
     pub content: String,
