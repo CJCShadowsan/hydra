@@ -165,42 +165,43 @@ impl StageOpenAiBackend {
         ids: OpenAiGenerationIds,
         on_text_chunk: impl FnMut(&str) -> OpenAiResult<()>,
     ) -> OpenAiResult<GeneratedText> {
-        if let OpenAiBackendMode::EmbeddedStageZero {
-            config,
-            wire_dtype,
-            activation_width,
-            downstream_wire_condition,
-            lane_pool,
-            prediction_returns,
-            ..
-        } = self.mode.clone()
-            && config.downstream.is_some()
-        {
-            let lane_pool = lane_pool.ok_or_else(|| {
-                OpenAiError::backend("embedded stage 0 has no downstream lane pool")
-            })?;
-            let prediction_return = prediction_returns
-                .as_ref()
-                .map(|hub| hub.register(ids.request_id, ids.session_id))
-                .transpose()
-                .map_err(openai_backend_error)?;
-            return self.generate_split_multimodal_text(
-                SplitMultimodalGeneration {
-                    prompt,
-                    max_tokens,
-                    stop,
-                    sampling,
-                    cancellation,
-                    ids,
-                    config,
-                    wire_dtype,
-                    activation_width,
-                    downstream_wire_condition,
-                    lane_pool,
-                    prediction_return,
-                },
-                on_text_chunk,
-            );
+        match self.mode.clone() {
+            OpenAiBackendMode::EmbeddedStageZero {
+                config,
+                wire_dtype,
+                activation_width,
+                downstream_wire_condition,
+                lane_pool,
+                prediction_returns,
+                ..
+            } if config.downstream.is_some() => {
+                let lane_pool = lane_pool.ok_or_else(|| {
+                    OpenAiError::backend("embedded stage 0 has no downstream lane pool")
+                })?;
+                let prediction_return = prediction_returns
+                    .as_ref()
+                    .map(|hub| hub.register(ids.request_id, ids.session_id))
+                    .transpose()
+                    .map_err(openai_backend_error)?;
+                return self.generate_split_multimodal_text(
+                    SplitMultimodalGeneration {
+                        prompt,
+                        max_tokens,
+                        stop,
+                        sampling,
+                        cancellation,
+                        ids,
+                        config,
+                        wire_dtype,
+                        activation_width,
+                        downstream_wire_condition,
+                        lane_pool,
+                        prediction_return,
+                    },
+                    on_text_chunk,
+                );
+            }
+            _ => {}
         }
 
         match &self.mode {

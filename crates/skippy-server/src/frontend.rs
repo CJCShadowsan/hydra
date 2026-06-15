@@ -1751,6 +1751,7 @@ struct EmbeddedStageExecution {
 struct EmbeddedFusedFirstDecode {
     predicted: i32,
     predicted_tokens: Vec<i32>,
+    native_mtp_draft: Option<NativeMtpDraft>,
     reply_stats: StageReplyStats,
     execution: EmbeddedExecutionStats,
     elapsed_ms: f64,
@@ -1831,9 +1832,8 @@ impl ChatOutputStreamParser {
         if let Some(delta) = suffix_delta(parsed.content.as_deref(), &mut self.emitted_content) {
             events.push(GenerationStreamEvent::Delta(delta));
         }
-        if !is_partial
-            && !self.emitted_tool_calls
-            && let Some(tool_calls) = parsed.tool_calls
+        if let (true, Some(tool_calls)) =
+            (!is_partial && !self.emitted_tool_calls, parsed.tool_calls)
         {
             self.emitted_tool_calls = true;
             events.push(GenerationStreamEvent::ToolCalls(tool_calls));

@@ -661,6 +661,7 @@ impl StageOpenAiBackend {
             return Ok(Some(EmbeddedFusedFirstDecode {
                 predicted: *replay.last().expect("checked replay length"),
                 predicted_tokens: replay,
+                native_mtp_draft: None,
                 reply_stats: restore.stats,
                 execution: EmbeddedExecutionStats::default(),
                 elapsed_ms: timer.elapsed_ms(),
@@ -734,6 +735,7 @@ impl StageOpenAiBackend {
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted,
             predicted_tokens: vec![predicted],
+            native_mtp_draft: None,
             reply_stats: restore.stats,
             execution: EmbeddedExecutionStats::default(),
             elapsed_ms: timer.elapsed_ms(),
@@ -1025,6 +1027,9 @@ impl StageOpenAiBackend {
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted: downstream_reply.predicted,
             predicted_tokens: vec![downstream_reply.predicted],
+            native_mtp_draft: NativeMtpDraft::from_prediction_tokens(
+                &downstream_reply.predicted_tokens,
+            ),
             reply_stats,
             execution: EmbeddedExecutionStats {
                 stage0_compute_ms,

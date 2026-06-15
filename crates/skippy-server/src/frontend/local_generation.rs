@@ -184,9 +184,10 @@ impl StageOpenAiBackend {
                 cache_stats.matched_prefix_tokens = saturating_u32(restored_prefill_tokens);
                 cache_stats.suffix_prefill_tokens =
                     saturating_u32(prefill_tokens.len().saturating_sub(restored_prefill_tokens));
-                if (!restored_prefill || decoded_prefill_suffix)
-                    && let Some(kv) = self.kv.as_ref()
-                {
+                if let (true, Some(kv)) = (
+                    !restored_prefill || decoded_prefill_suffix,
+                    self.kv.as_ref(),
+                ) {
                     let base = self.local_kv_message_base(&session_id, request.ids);
                     let exact_identity =
                         kv.prefill_identity(&self.config, &base, 0, prefill_tokens);
@@ -449,8 +450,8 @@ impl StageOpenAiBackend {
                     signal_window = None;
                     token_signal_ms = 0.0;
                 }
-                if generation_hooks_active
-                    && let Some(injected_current) = self.maybe_run_generation_hooks(
+                let injected_current = if generation_hooks_active {
+                    self.maybe_run_generation_hooks(
                         &session_id,
                         &mut hook_request,
                         hook_runtime.as_ref(),
@@ -460,7 +461,10 @@ impl StageOpenAiBackend {
                         token_signal,
                         signal_window,
                     )?
-                {
+                } else {
+                    None
+                };
+                if let Some(injected_current) = injected_current {
                     current = injected_current;
                     continue;
                 }

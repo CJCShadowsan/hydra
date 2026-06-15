@@ -128,28 +128,29 @@ impl StageOpenAiBackend {
                         fused_first_decode = Some(fused);
                     }
                 }
-                if !prefill_chain_cache_restored
-                    && let Some(restore) = self.try_restore_embedded_split_prefill(
+                if !prefill_chain_cache_restored {
+                    let restore = self.try_restore_embedded_split_prefill(
                         &request,
                         &session_key,
                         downstream,
                         prefill_tokens,
-                    )?
-                {
-                    prefill_chain_restored_tokens = restore.restored_tokens;
-                    prefill_chain_cache_restored =
-                        prefill_chain_restored_tokens >= prefill_tokens.len();
-                    prefill_chain_cache_stats = restore.stats;
-                    cache_stats.cached_prompt_tokens =
-                        saturating_u32(prefill_chain_restored_tokens);
-                    cache_stats.matched_prefix_tokens =
-                        saturating_u32(prefill_chain_restored_tokens);
-                    cache_stats.suffix_prefill_tokens = saturating_u32(
-                        prefill_tokens
-                            .len()
-                            .saturating_sub(prefill_chain_restored_tokens),
-                    );
-                    cache_stats.hit_kind = Some("chain_prefix");
+                    )?;
+                    if let Some(restore) = restore {
+                        prefill_chain_restored_tokens = restore.restored_tokens;
+                        prefill_chain_cache_restored =
+                            prefill_chain_restored_tokens >= prefill_tokens.len();
+                        prefill_chain_cache_stats = restore.stats;
+                        cache_stats.cached_prompt_tokens =
+                            saturating_u32(prefill_chain_restored_tokens);
+                        cache_stats.matched_prefix_tokens =
+                            saturating_u32(prefill_chain_restored_tokens);
+                        cache_stats.suffix_prefill_tokens = saturating_u32(
+                            prefill_tokens
+                                .len()
+                                .saturating_sub(prefill_chain_restored_tokens),
+                        );
+                        cache_stats.hit_kind = Some("chain_prefix");
+                    }
                 }
                 let mut pos_start = prefill_chain_restored_tokens.min(prefill_tokens.len());
                 let mut chunk_index = 0usize;
@@ -599,6 +600,7 @@ impl StageOpenAiBackend {
             let mut context_tokens = request.prompt_token_ids.to_vec();
             let mut exact_replay_tokens = Vec::new();
             let mut fused_reached_stop = false;
+            let mut native_mtp = NativeMtpN1Verifier::default();
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -621,6 +623,15 @@ impl StageOpenAiBackend {
                     current = token;
                     exact_replay_tokens.push(current);
                     context_tokens.push(current);
+                    let native_mtp_decision = if index == 0 {
+                        native_mtp.observe_target_token(
+                            current,
+                            ms_to_us(fused.execution.downstream_wait_ms),
+                            fused.native_mtp_draft,
+                        )
+                    } else {
+                        NativeMtpVerification::NoPending
+                    };
                     let mut token_attrs = self.openai_attrs(request.ids);
                     token_attrs.insert("llama_stage.decode_step".to_string(), json!(index));
                     token_attrs.insert(
@@ -708,6 +719,10 @@ impl StageOpenAiBackend {
                         }),
                     );
                     token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.verification".to_string(),
+                        json!(native_mtp_decision.label()),
+                    );
                     self.telemetry
                         .emit_debug("stage.openai_decode_token", token_attrs);
                     if on_token(current)? == TokenControl::Stop {
@@ -735,7 +750,6 @@ impl StageOpenAiBackend {
                 adaptive_window_enabled: request.adaptive_speculative_window,
                 ..OpenAiSpeculativeStats::default()
             };
-            let mut native_mtp = NativeMtpN1Verifier::default();
             let mut draft_guard = match request.draft.as_ref() {
                 Some(draft) if request.speculative_window > 0 => {
                     let draft_reset_timer = PhaseTimer::start();
@@ -784,8 +798,8 @@ impl StageOpenAiBackend {
                     let proposal_limit = remaining.min(adaptive_window);
                     let propose_timer = PhaseTimer::start();
                     let mut draft_tokens = Vec::new();
-                    if draft_tokens.is_empty()
-                        && let Some(draft) = draft_guard.as_deref_mut()
+                    if let (true, Some(draft)) =
+                        (draft_tokens.is_empty(), draft_guard.as_deref_mut())
                     {
                         let proposal_limit = proposal_limit.min(draft.window);
                         draft_tokens = draft
