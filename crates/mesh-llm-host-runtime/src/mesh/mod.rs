@@ -387,7 +387,8 @@ pub struct QuicBindSelection {
 /// Relay map plus per-relay bearer tokens for gated iroh-relays.
 ///
 /// `urls` is the relay map; `auths` is a sparse map of relay URL -> bearer
-/// token used when registering with relays running `AccessConfig::Restricted`.
+/// token used when registering with relays running a restricted
+/// [`iroh_relay::server::AccessControl`].
 /// Public relays in the same map continue to register without auth.
 #[derive(Clone, Copy, Debug)]
 pub struct RelayConfig<'a> {
@@ -614,10 +615,10 @@ mod relay_policy_tests {
 /// are passed to `iroh::RelayConfig::with_auth_token` which sends them as
 /// `Authorization: Bearer <token>` on the WebSocket upgrade. Relays not present
 /// in the map register unauthenticated, which is the correct behavior for
-/// public (`AccessConfig::Everyone`) relays.
+/// public (`AllowAll`) relays.
 ///
-/// This is the wire-up that lets a gated iroh-relay (e.g. one running
-/// `AccessConfig::Restricted` with NIP-98 admission) admit this node while
+/// This is the wire-up that lets a gated iroh-relay (e.g. one running a
+/// custom `AccessControl` with NIP-98 admission) admit this node while
 /// public relays in the same map continue to work normally.
 fn relay_map_from_urls(
     urls: &[String],
@@ -708,7 +709,7 @@ mod relay_map_tests {
 }
 
 /// End-to-end regression tests for `--relay-auth` against a real in-process
-/// iroh-relay running [`iroh_relay::server::AccessConfig::Restricted`].
+/// iroh-relay running a restricted [`iroh_relay::server::AccessControl`].
 ///
 /// These tests do not go through the full `Node::start` path — they exercise
 /// `relay_map_from_urls` (the new wiring) plus the iroh `Endpoint` builder
@@ -730,25 +731,34 @@ mod gated_relay_e2e_tests {
     use iroh::Watcher;
     use iroh::endpoint::{Endpoint, RelayMode, presets};
     use iroh::test_utils::run_relay_server_with_access;
-    use iroh_relay::server::{Access, AccessConfig};
+    use iroh_relay::server::{Access, AccessControl, AllowAll, ClientRequest};
     use iroh_relay::tls::CaRootsConfig;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    /// Token-checking [`AccessControl`] for gated-relay tests.
+    #[derive(Debug)]
+    struct TokenAccess {
+        expected_token: &'static str,
+    }
+
+    impl AccessControl for TokenAccess {
+        async fn on_connect(&self, request: &ClientRequest) -> Access {
+            if request.auth_token().as_deref() == Some(self.expected_token) {
+                Access::Allow
+            } else {
+                Access::Deny { reason: None }
+            }
+        }
+    }
 
     /// Spawn an in-process iroh-relay that only admits `expected_token`.
     /// Returns (relay_url_string, drop-guard server).
     async fn spawn_gated_relay(
         expected_token: &'static str,
     ) -> (String, iroh_relay::server::Server) {
-        let access = AccessConfig::Restricted(Box::new(move |request| {
-            Box::pin(async move {
-                if request.auth_token().as_deref() == Some(expected_token) {
-                    Access::Allow
-                } else {
-                    Access::Deny
-                }
-            })
-        }));
+        let access = Arc::new(TokenAccess { expected_token });
         let (_relay_map, relay_url, server) = run_relay_server_with_access(false, access)
             .await
             .expect("spawn gated relay");
@@ -854,7 +864,7 @@ mod gated_relay_e2e_tests {
         // Spin up a second, fully-open relay to stand in for a public iroh
         // relay sharing the same map.
         let (_public_map, public_url, _public) =
-            run_relay_server_with_access(false, AccessConfig::Everyone)
+            run_relay_server_with_access(false, Arc::new(AllowAll))
                 .await
                 .expect("spawn public relay");
         let public_url = public_url.to_string();
