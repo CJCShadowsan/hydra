@@ -28,8 +28,8 @@ use skippy_runtime::{
 
 use crate::{
     cli::{
-        ChainArgs, DtypeMatrixArgs, FlashAttentionArg, RuntimeArgs, ServerArgs, SingleStepArgs,
-        SplitScanArgs, StageLoadMode, StateHandoffArgs, StatePayloadKind,
+        ChainArgs, DtypeMatrixArgs, FlashAttentionArg, NativeMtpArgs, RuntimeArgs, ServerArgs,
+        SingleStepArgs, SplitScanArgs, StageLoadMode, StateHandoffArgs, StatePayloadKind,
     },
     direct_return::CorrectnessDirectReturnServer,
     report::{
@@ -67,6 +67,11 @@ struct BinarySplitConfig {
     child_logs: bool,
     startup_timeout_secs: u64,
     model_identity: ModelIdentity,
+}
+
+#[derive(Clone, Copy)]
+struct NativeMtpRequirement {
+    require_draft: bool,
 }
 
 struct BinarySplitResult {
@@ -300,6 +305,7 @@ pub fn single_step(args: SingleStepArgs) -> Result<()> {
             split_layer: args.split_layer,
             stage1_bind_addr: args.stage1_bind_addr,
             activation_wire_dtype: args.activation_wire_dtype,
+            native_mtp: native_mtp_requirement(args.native_mtp),
         },
     )?;
     emit_report(&report, args.output.report_out.as_deref())?;
@@ -332,17 +338,20 @@ pub fn chain(args: ChainArgs) -> Result<()> {
         startup_timeout_secs: args.server.startup_timeout_secs,
         model_identity: model_identity.clone(),
     })?;
+    let native_mtp = chain.native_mtp.clone();
+    let native_mtp_requirement = native_mtp_requirement(args.native_mtp);
     let matches = baseline.predicted_token == chain.predicted_token
-        && chain.native_mtp.authoritative_matches_reply;
+        && native_mtp_satisfies_requirement(&native_mtp, native_mtp_requirement);
     let report = ChainReport {
         mode: "chain",
         status: status(matches),
         model_identity,
         matches,
+        native_mtp_draft_required: native_mtp_requirement.require_draft,
         baseline: baseline_report(baseline),
         token_id: chain.token_id,
         predicted_token: chain.predicted_token,
-        native_mtp: chain.native_mtp,
+        native_mtp,
         activation_width: chain.activation_width,
         wire_dtype: chain.wire_dtype,
         stages: vec![
@@ -405,6 +414,7 @@ pub fn split_scan(args: SplitScanArgs) -> Result<()> {
                 split_layer,
                 stage1_bind_addr: args.stage1_bind_addr,
                 activation_wire_dtype: args.activation_wire_dtype.clone(),
+                native_mtp: native_mtp_requirement(args.native_mtp),
             },
         )?);
     }
@@ -441,6 +451,7 @@ pub fn dtype_matrix(args: DtypeMatrixArgs) -> Result<()> {
                 split_layer: args.split_layer,
                 stage1_bind_addr: args.stage1_bind_addr,
                 activation_wire_dtype: dtype,
+                native_mtp: native_mtp_requirement(args.native_mtp),
             },
         )?);
     }
@@ -569,6 +580,7 @@ struct SingleStepCase {
     split_layer: u32,
     stage1_bind_addr: SocketAddr,
     activation_wire_dtype: String,
+    native_mtp: NativeMtpRequirement,
 }
 
 fn run_single_step_with_baseline(
@@ -598,13 +610,14 @@ fn run_single_step_with_baseline(
         model_identity: model_identity.clone(),
     })?;
     let matches = baseline.predicted_token == split.predicted_token
-        && split.native_mtp.authoritative_matches_reply;
+        && native_mtp_satisfies_requirement(&split.native_mtp, case.native_mtp);
     let stage_models = split.stage_models.clone();
     Ok(SingleStepReport {
         mode: "single-step",
         status: status(matches),
         model_identity: model_identity.clone(),
         matches,
+        native_mtp_draft_required: case.native_mtp.require_draft,
         baseline: baseline_report(baseline),
         split: split_report(split),
         stage_models,
@@ -2671,6 +2684,19 @@ fn native_mtp_sideband_report(reply: &StageReply) -> NativeMtpSidebandReport {
     }
 }
 
+fn native_mtp_requirement(args: NativeMtpArgs) -> NativeMtpRequirement {
+    NativeMtpRequirement {
+        require_draft: args.require_native_mtp_draft,
+    }
+}
+
+fn native_mtp_satisfies_requirement(
+    report: &NativeMtpSidebandReport,
+    requirement: NativeMtpRequirement,
+) -> bool {
+    report.authoritative_matches_reply && (!requirement.require_draft || report.sideband_present)
+}
+
 fn emit_report<T: Serialize>(report: &T, report_out: Option<&Path>) -> Result<()> {
     let json = serde_json::to_string_pretty(report)?;
     println!("{json}");
@@ -2742,6 +2768,22 @@ mod tests {
         let report = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, -34]));
 
         assert_eq!(report.proposal_compute_us, Some(0));
+    }
+
+    #[test]
+    fn native_mtp_requirement_can_require_draft_presence() {
+        let no_draft = native_mtp_sideband_report(&predicted_reply(11, vec![11]));
+        let draft = native_mtp_sideband_report(&predicted_reply(11, vec![11, 12, 34]));
+        let optional = NativeMtpRequirement {
+            require_draft: false,
+        };
+        let required = NativeMtpRequirement {
+            require_draft: true,
+        };
+
+        assert!(native_mtp_satisfies_requirement(&no_draft, optional));
+        assert!(!native_mtp_satisfies_requirement(&no_draft, required));
+        assert!(native_mtp_satisfies_requirement(&draft, required));
     }
 }
 

@@ -74,6 +74,15 @@ pub struct ServerArgs {
     pub startup_timeout_secs: u64,
 }
 
+#[derive(Args, Clone, Copy)]
+pub struct NativeMtpArgs {
+    #[arg(
+        long,
+        help = "Fail the correctness run unless the final stage returns a native MTP draft sideband"
+    )]
+    pub require_native_mtp_draft: bool,
+}
+
 #[derive(Args)]
 pub struct OutputArgs {
     #[arg(long)]
@@ -86,6 +95,8 @@ pub struct SingleStepArgs {
     pub runtime: RuntimeArgs,
     #[command(flatten)]
     pub server: ServerArgs,
+    #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
     #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value_t = 15)]
@@ -104,6 +115,8 @@ pub struct ChainArgs {
     pub runtime: RuntimeArgs,
     #[command(flatten)]
     pub server: ServerArgs,
+    #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
     #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value = "10,20")]
@@ -125,6 +138,8 @@ pub struct SplitScanArgs {
     #[command(flatten)]
     pub server: ServerArgs,
     #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
+    #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value = "1..30")]
     pub splits: String,
@@ -142,6 +157,8 @@ pub struct DtypeMatrixArgs {
     pub runtime: RuntimeArgs,
     #[command(flatten)]
     pub server: ServerArgs,
+    #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
     #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value_t = 15)]
