@@ -58,15 +58,17 @@ use tokio::{
 use crate::{
     binary_transport::{
         DecodeFrameBatcher, WireCondition, connect_binary_downstream, forwarded_stage_message,
-        forwarded_stage_message_timed, run_binary_stage_message, write_stage_message_conditioned,
+        forwarded_stage_message_timed, run_binary_stage_message, stage_output_activation_capacity,
+        write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
-    kv_integration::KvStageIntegration,
+    kv_integration::{KvStageIntegration, proactive_eviction_attrs, proactive_eviction_error_kind},
     runtime_state::{RuntimeSessionStats, RuntimeState, load_runtime},
     telemetry::{Telemetry, lifecycle_attrs, now_unix_nanos},
 };
 
+mod admission;
 mod backend;
 mod decode_batcher;
 mod embedded_execution;
@@ -83,7 +85,13 @@ mod util;
 mod wire_messages;
 
 use self::{
-    decode_batcher::DecodeBatcher, native_mtp::*, prefill::*, request::*, speculative::*, util::*,
+    admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
+    decode_batcher::DecodeBatcher,
+    native_mtp::*,
+    prefill::*,
+    request::*,
+    speculative::*,
+    util::*,
     wire_messages::*,
 };
 
@@ -188,6 +196,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
+        generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv,
         decode_batcher,
@@ -535,6 +544,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
+        generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: args.hook_policy,
         kv,
         decode_batcher,
@@ -575,6 +585,7 @@ struct StageOpenAiBackend {
     generation_limit: Arc<Semaphore>,
     generation_queue_depth: Arc<AtomicUsize>,
     generation_queue_limit: usize,
+    generation_token_budget: Arc<GenerationTokenBudget>,
     hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     kv: Option<Arc<KvStageIntegration>>,
     decode_batcher: DecodeBatcher,
@@ -1171,12 +1182,25 @@ fn prompt_cache_retention_label(retention: openai_frontend::PromptCacheRetention
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct GenerationCacheStats {
+    status: &'static str,
     cached_prompt_tokens: u32,
     matched_prefix_tokens: u32,
     suffix_prefill_tokens: u32,
     hit_kind: Option<&'static str>,
+}
+
+impl Default for GenerationCacheStats {
+    fn default() -> Self {
+        Self {
+            status: "disabled",
+            cached_prompt_tokens: 0,
+            matched_prefix_tokens: 0,
+            suffix_prefill_tokens: 0,
+            hit_kind: None,
+        }
+    }
 }
 
 struct ChainPrefixRestore {
@@ -1330,6 +1354,12 @@ impl OpenAiBackendMode {
         match self {
             Self::LocalRuntime => "local-runtime",
             Self::EmbeddedStageZero { .. } => "embedded-stage0",
+        }
+    }
+
+    fn reserves_local_kv_tokens(&self) -> bool {
+        match self {
+            Self::LocalRuntime | Self::EmbeddedStageZero { .. } => true,
         }
     }
 }
@@ -2055,6 +2085,7 @@ where
         Ok(GeneratedText {
             prompt_tokens: saturating_u32(prompt_token_count),
             completion_tokens: saturating_u32(self.completion_tokens),
+            cache_status: cache_stats.status,
             cached_prompt_tokens: cache_stats.cached_prompt_tokens,
             matched_prefix_tokens: cache_stats.matched_prefix_tokens,
             suffix_prefill_tokens: cache_stats.suffix_prefill_tokens,
@@ -2071,6 +2102,7 @@ where
 struct GeneratedText {
     prompt_tokens: u32,
     completion_tokens: u32,
+    cache_status: &'static str,
     cached_prompt_tokens: u32,
     matched_prefix_tokens: u32,
     suffix_prefill_tokens: u32,

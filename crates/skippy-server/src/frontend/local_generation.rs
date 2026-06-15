@@ -25,6 +25,7 @@ impl StageOpenAiBackend {
                 let runtime_lock_hold_timer = PhaseTimer::start();
                 let runtime_sessions_before = runtime.session_stats();
                 if let Some(kv) = self.kv.as_ref() {
+                    cache_stats.status = "miss";
                     let base = self.local_kv_message_base(&session_id, request.ids);
                     let kv_identity_timer = PhaseTimer::start();
                     let identities = kv.lookup_identities(&self.config, &base, 0, prefill_tokens);
@@ -33,6 +34,7 @@ impl StageOpenAiBackend {
                     match kv.restore_exact_state(&mut runtime, &session_id, &identities) {
                         Ok(Some(restored)) => {
                             restored_prefill = true;
+                            cache_stats.status = "hit";
                             cache_stats.hit_kind = Some("exact_prefix");
                             let mut attrs = self.openai_attrs(request.ids);
                             attrs.insert("skippy.kv.decision".to_string(), json!("exact_hit"));
@@ -90,6 +92,7 @@ impl StageOpenAiBackend {
                         ) {
                             Ok(Some(restored)) => {
                                 restored_prefill = true;
+                                cache_stats.status = "hit";
                                 cache_stats.hit_kind = Some("resident_prefix");
                                 let mut attrs = self.openai_attrs(request.ids);
                                 attrs.insert(
@@ -293,6 +296,7 @@ impl StageOpenAiBackend {
                 let mut proactive_eviction_target_tokens = 0_u64;
                 let mut proactive_evicted_entries = 0_usize;
                 let mut proactive_evicted_tokens = 0_u64;
+                let mut proactive_eviction_error = None;
                 if let Some(kv) = self.kv.as_ref() {
                     match kv.evict_resident_prefix_for_decode_batch(&mut runtime, &session_id) {
                         Ok(eviction) => {
@@ -309,6 +313,10 @@ impl StageOpenAiBackend {
                             proactive_eviction_status = "error";
                             proactive_eviction_error_kind_attr =
                                 Some(proactive_eviction_error_kind(&error));
+                            proactive_eviction_error = Some(
+                                error
+                                    .context("evict resident-prefix KV before local OpenAI decode"),
+                            );
                         }
                     }
                 }
@@ -366,6 +374,9 @@ impl StageOpenAiBackend {
                         proactive_evicted_tokens,
                     ),
                 );
+                if let Some(error) = proactive_eviction_error {
+                    return Err(openai_backend_error(error));
+                }
             }
             if let Some(metadata) = request.chat_sampling_metadata {
                 let mut runtime = self

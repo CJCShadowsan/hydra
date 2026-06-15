@@ -1,6 +1,7 @@
 use super::capacity::{model_fits_runtime_capacity, runtime_model_required_bytes};
 use super::context_planning::{
-    RuntimeResourcePlan, RuntimeResourcePlanInput, plan_runtime_resources,
+    RuntimeResourcePlan, RuntimeResourcePlanInput, RuntimeResourcePlanningProfile,
+    plan_runtime_resources,
 };
 use super::split_planning::{
     PlannedRuntimeSliceTopology, RuntimeSliceStagePlan, SplitTopologyResourceInputs, format_gb,
@@ -26,6 +27,10 @@ use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod native_runtime_events;
+
+use native_runtime_events::skippy_native_model_open_event_reporter;
 
 const SPLIT_PARTICIPANT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SPLIT_PARTICIPANT_STABLE_FOR: Duration = Duration::from_secs(2);
@@ -197,6 +202,7 @@ pub(super) struct LocalRuntimeModelStartSpec<'a> {
     pub(super) n_ubatch_override: Option<u32>,
     pub(super) flash_attention_override: FlashAttentionType,
     pub(super) parallel_override: Option<usize>,
+    pub(super) planning_profile: RuntimeResourcePlanningProfile,
     pub(super) openai_guardrail_policy: OpenAiGuardrailPolicyHandle,
     pub(super) skippy_telemetry: skippy::SkippyTelemetryOptions,
     pub(super) survey_telemetry: survey::SurveyTelemetry,
@@ -628,6 +634,7 @@ pub(super) async fn start_runtime_local_model(
         metadata: compact_meta.as_ref(),
         kv_cache_quant,
         local_layer_fraction,
+        planning_profile: spec.planning_profile,
     });
 
     if let Some(package) = layer_package {
@@ -1305,6 +1312,7 @@ async fn load_split_runtime_generation_inner(
     let vision_projector_loaded = runtime_options.config.projector_path.is_some();
     let node_for_hook = spec.node.clone();
     let model_ref = spec.model_ref.to_string();
+    let reporter_model_ref = model_ref.clone();
     let skippy_telemetry = spec.skippy_telemetry.clone();
     let guardrail_telemetry = spec.survey_telemetry.clone();
     let openai_guardrails =
@@ -1314,11 +1322,12 @@ async fn load_split_runtime_generation_inner(
         source: None,
     });
     let handle = tokio::task::spawn_blocking(move || {
-        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args(
+        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args_and_open_events(
             runtime_options,
             settings.embedded_openai.clone(),
             Some(skippy::MeshAutoHookPolicy::new(node_for_hook)),
             skippy_telemetry,
+            Some(skippy_native_model_open_event_reporter(reporter_model_ref)),
             skippy::SkippyOpenAiGuardrailOptions::new(Some(openai_guardrails), guardrail_telemetry),
         )
     })
@@ -3582,11 +3591,13 @@ async fn start_runtime_skippy_model(
         source: None,
     });
     let node_for_hook = spec.node.clone();
+    let reporter_model_name = model_name.clone();
     let guardrail_telemetry = spec.survey_telemetry.clone();
     let skippy_model = tokio::task::spawn_blocking(move || {
-        skippy::SkippyModelHandle::load_with_hooks(
+        skippy::SkippyModelHandle::load_with_hooks_and_open_events(
             options,
             Some(skippy::MeshAutoHookPolicy::new(node_for_hook)),
+            Some(skippy_native_model_open_event_reporter(reporter_model_name)),
             guardrail_telemetry,
         )
     })
@@ -3687,6 +3698,7 @@ async fn start_runtime_layer_package_model(
     runtime_options.config.downstream = None;
     let node_for_hook = spec.node.clone();
     let model_ref = model_name.clone();
+    let reporter_model_ref = model_ref.clone();
     let skippy_telemetry = spec.skippy_telemetry.clone();
     let guardrail_telemetry = spec.survey_telemetry.clone();
     let openai_guardrails =
@@ -3696,11 +3708,12 @@ async fn start_runtime_layer_package_model(
         source: None,
     });
     let handle = tokio::task::spawn_blocking(move || {
-        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args(
+        skippy::SkippyModelHandle::load_stage0_runtime_options_with_openai_args_and_open_events(
             runtime_options,
             embedded_openai,
             Some(skippy::MeshAutoHookPolicy::new(node_for_hook)),
             skippy_telemetry,
+            Some(skippy_native_model_open_event_reporter(reporter_model_ref)),
             skippy::SkippyOpenAiGuardrailOptions::new(Some(openai_guardrails), guardrail_telemetry),
         )
     })
@@ -4268,6 +4281,7 @@ max_tokens = 222
             n_ubatch_override: None,
             flash_attention_override: FlashAttentionType::Auto,
             parallel_override: None,
+            planning_profile: RuntimeResourcePlanningProfile::DedicatedLocal,
             openai_guardrail_policy: openai_guardrail_policy_handle(
                 openai_frontend::GuardrailMode::Disabled,
             ),

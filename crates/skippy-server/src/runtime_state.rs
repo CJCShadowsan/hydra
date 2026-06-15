@@ -228,6 +228,10 @@ impl RuntimeState {
         self.active_session(session_id)?.batch_size()
     }
 
+    pub fn ensure_session_active(&mut self, session_id: &str) -> Result<()> {
+        self.session(session_id).map(|_| ())
+    }
+
     pub fn configure_chat_sampling(
         &mut self,
         session_id: &str,
@@ -298,7 +302,7 @@ impl RuntimeState {
         token_id: i32,
         input: Option<&ActivationFrame>,
     ) -> Result<(i32, ActivationFrame)> {
-        self.decode_frame_sampled(session_id, token_id, None, input)
+        self.decode_frame_sampled(session_id, token_id, None, input, 0)
     }
 
     pub fn decode_frame_sampled(
@@ -307,9 +311,11 @@ impl RuntimeState {
         token_id: i32,
         sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
+        output_capacity: usize,
     ) -> Result<(i32, ActivationFrame)> {
         let session = self.session(session_id)?;
-        let output = session.decode_step_frame_sampled(token_id, sampling, input, 0)?;
+        let output =
+            session.decode_step_frame_sampled(token_id, sampling, input, output_capacity)?;
         self.add_session_tokens(session_id, 1);
         Ok(output)
     }
@@ -320,9 +326,11 @@ impl RuntimeState {
         token_id: i32,
         sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
+        output_capacity: usize,
     ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
         let session = self.session(session_id)?;
-        let output = session.decode_step_frame_sampled_mtp_n1(token_id, sampling, input, 0)?;
+        let output =
+            session.decode_step_frame_sampled_mtp_n1(token_id, sampling, input, output_capacity)?;
         self.add_session_tokens(session_id, 1);
         Ok(output)
     }
@@ -380,9 +388,10 @@ impl RuntimeState {
         session_id: &str,
         token_ids: &[i32],
         input: Option<&ActivationFrame>,
+        output_capacity: usize,
     ) -> Result<(Vec<i32>, ActivationFrame)> {
         let session = self.session(session_id)?;
-        let output = session.verify_tokens_frame(token_ids, input, 0)?;
+        let output = session.verify_tokens_frame(token_ids, input, output_capacity)?;
         self.add_session_tokens(session_id, token_ids.len() as u64);
         Ok(output)
     }
@@ -1029,6 +1038,55 @@ pub fn load_runtime_with_overrides(
     }))))
 }
 
+pub fn load_runtime_with_overrides_and_open_events(
+    config: &StageConfig,
+    overrides: &RuntimeLaunchOverrides,
+    model_open_event_reporter: Option<&mut (dyn FnMut(skippy_runtime::RuntimeEvent) + Send)>,
+) -> Result<Option<Arc<Mutex<RuntimeState>>>> {
+    let mut runtime_config = runtime_config_from_stage_config(config, overrides)?;
+
+    let model = match config.load_mode {
+        _ if std::env::var("MESH_LLM_BYPASS_SKIPPY_MODEL_LOAD").is_ok() => {
+            skippy_runtime::StageModel::new_dummy()
+        }
+        LoadMode::LayerPackage => {
+            let selected =
+                select_package_parts(config).context("select layer package parts for stage")?;
+            if runtime_config.projector_path.is_none() && should_attach_package_projector(config) {
+                runtime_config.projector_path = selected
+                    .projector_paths
+                    .first()
+                    .map(|path| path.to_string_lossy().to_string());
+            }
+            open_stage_model_from_parts_with_events(
+                &selected.absolute_paths,
+                &runtime_config,
+                model_open_event_reporter,
+            )?
+        }
+        _ => {
+            let Some(model_path) = config.model_path.as_ref().map(std::path::Path::new) else {
+                return Ok(None);
+            };
+            open_stage_model_with_events(model_path, &runtime_config, model_open_event_reporter)?
+        }
+    };
+
+    Ok(Some(Arc::new(Mutex::new(RuntimeState {
+        model,
+        layer_start: config.layer_start,
+        layer_end: config.layer_end,
+        lane_count: config.lane_count,
+        next_lane_index: 0,
+        free_lane_indices: Vec::new(),
+        sessions: BTreeMap::new(),
+        idle_sessions: Vec::new(),
+        session_token_counts: BTreeMap::new(),
+        session_checkpoints: BTreeMap::new(),
+        session_resident_prefixes: BTreeMap::new(),
+    }))))
+}
+
 fn should_attach_package_projector(config: &StageConfig) -> bool {
     config.stage_index == 0 && config.layer_start == 0
 }
@@ -1089,11 +1147,35 @@ fn open_stage_model(path: &std::path::Path, runtime_config: &RuntimeConfig) -> R
     StageModel::open(path, runtime_config)
 }
 
+fn open_stage_model_with_events(
+    path: &std::path::Path,
+    runtime_config: &RuntimeConfig,
+    model_open_event_reporter: Option<&mut (dyn FnMut(skippy_runtime::RuntimeEvent) + Send)>,
+) -> Result<StageModel> {
+    match model_open_event_reporter {
+        Some(event_reporter) => StageModel::open_with_events(path, runtime_config, event_reporter),
+        None => StageModel::open(path, runtime_config),
+    }
+}
+
 fn open_stage_model_from_parts(
     paths: &[std::path::PathBuf],
     runtime_config: &RuntimeConfig,
 ) -> Result<StageModel> {
     StageModel::open_from_parts(paths, runtime_config)
+}
+
+fn open_stage_model_from_parts_with_events(
+    paths: &[std::path::PathBuf],
+    runtime_config: &RuntimeConfig,
+    model_open_event_reporter: Option<&mut (dyn FnMut(skippy_runtime::RuntimeEvent) + Send)>,
+) -> Result<StageModel> {
+    match model_open_event_reporter {
+        Some(event_reporter) => {
+            StageModel::open_from_parts_with_events(paths, runtime_config, event_reporter)
+        }
+        None => StageModel::open_from_parts(paths, runtime_config),
+    }
 }
 
 #[cfg(test)]

@@ -670,7 +670,7 @@ jobs:
   build_windows_cpu:
     name: Build Windows CPU
     needs: metadata
-    runs-on: windows-2025
+    runs-on: windows-2022
     env:
       LLAMA_STAGE_BACKEND: cpu
     steps:
@@ -718,7 +718,7 @@ jobs:
     name: Build Windows ${{ matrix.name }}
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: windows-2025
+    runs-on: windows-2022
     env:
       ROCM_HIP_SDK_FILENAME: AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe
       # Pin Windows CUDA to a version sccache 0.15.0 supports.
@@ -879,6 +879,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --out release-artifacts/native-runtimes.json \
             release-artifacts/meshllm-native-runtime-*.tar.gz
+          shasum -a 256 release-artifacts/native-runtimes.json | awk '{print $1 "  native-runtimes.json"}' > release-artifacts/native-runtimes.json.sha256
 
       - name: Download generated SwiftPM manifest
         if: github.event_name == 'workflow_dispatch'
