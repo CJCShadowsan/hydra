@@ -8,6 +8,17 @@ pub(super) struct NativeMtpDraft {
     pub(super) proposal_compute_us: i64,
 }
 
+impl NativeMtpDraft {
+    pub(super) fn from_prediction_tokens(tokens: &[i32]) -> Option<Self> {
+        let token = *tokens.get(1)?;
+        let proposal_compute_us = tokens.get(2).copied().unwrap_or_default();
+        Some(Self {
+            token,
+            proposal_compute_us: i64::from(proposal_compute_us.max(0)),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingDraft {
     token: i32,
@@ -174,6 +185,18 @@ mod tests {
             token,
             proposal_compute_us: 7,
         }
+    }
+
+    #[test]
+    fn parses_prediction_token_sideband() {
+        assert_eq!(
+            NativeMtpDraft::from_prediction_tokens(&[11, 12, 34]),
+            Some(NativeMtpDraft {
+                token: 12,
+                proposal_compute_us: 34,
+            })
+        );
+        assert_eq!(NativeMtpDraft::from_prediction_tokens(&[11]), None);
     }
 
     #[test]

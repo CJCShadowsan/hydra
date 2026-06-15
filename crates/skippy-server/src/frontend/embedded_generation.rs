@@ -1191,8 +1191,13 @@ impl StageOpenAiBackend {
                     )?;
                 }
                 current = reply.predicted;
-                let native_mtp_decision =
-                    native_mtp.observe_target_token(current, ms_to_us(downstream_wait_ms), None);
+                let native_mtp_draft =
+                    NativeMtpDraft::from_prediction_tokens(&reply.predicted_tokens);
+                let native_mtp_decision = native_mtp.observe_target_token(
+                    current,
+                    ms_to_us(downstream_wait_ms),
+                    native_mtp_draft,
+                );
                 decoded_tokens += 1;
                 exact_replay_tokens.push(current);
                 context_tokens.push(current);

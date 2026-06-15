@@ -1,0 +1,383 @@
+From 139be3529e6662202f5dc3424cfa7e63916bb0ed Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Mon, 15 Jun 2026 19:04:12 +1000
+Subject: [PATCH] Implement Skippy native MTP n1 sidecar
+
+---
+ src/skippy.cpp | 233 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 229 insertions(+), 4 deletions(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 41a03145..7d22f43d 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -6,6 +6,7 @@
+ #include "gguf.h"
+ #include "llama-arch.h"
+ #include "llama-context.h"
++#include "llama-ext.h"
+ #include "llama-graph.h"
+ #include "llama-kv-cache.h"
+ #include "llama-memory-hybrid.h"
+@@ -45,6 +46,7 @@ using json = nlohmann::ordered_json;
+ struct skippy_model {
+     llama_model * model = nullptr;
+     llama_context * ctx = nullptr;
++    llama_context * mtp_ctx = nullptr;
+     skippy_runtime_config config = {};
+     bool executable = true;
+     uint32_t lane_count = 1;
+@@ -73,6 +75,9 @@ struct skippy_session {
+     std::string chat_sampling_metadata;
+     uint64_t grammar_generated_start = 0;
+     size_t sampling_accepted_token_count = 0;
++    int32_t mtp_next_pos = 0;
++    bool mtp_has_pending_h = false;
++    std::vector<float> mtp_pending_h;
+ };
+ 
+ struct skippy_tensor_meta {
+@@ -977,6 +982,113 @@ static enum skippy_status skippy_decode_batch(
+     return skippy_success(out_error);
+ }
+ 
++static bool skippy_mtp_available(const skippy_session * session) {
++    return session != nullptr &&
++           session->stage_model != nullptr &&
++           session->stage_model->mtp_ctx != nullptr &&
++           session->stage_model->config.include_output;
++}
++
++static void skippy_mtp_clear_session_state(skippy_session * session) {
++    if (session == nullptr) {
++        return;
++    }
++    session->mtp_next_pos = session->n_past;
++    session->mtp_has_pending_h = false;
++    session->mtp_pending_h.clear();
++    if (skippy_mtp_available(session)) {
++        if (llama_memory_t memory = session->stage_model->mtp_ctx->get_memory()) {
++            llama_memory_seq_rm(memory, session->seq_id, -1, -1);
++        }
++    }
++}
++
++static enum skippy_status skippy_mtp_sync_target_tokens(
++        skippy_session * session,
++        const llama_token * token_ids,
++        size_t token_count,
++        llama_pos token_start,
++        struct skippy_error ** out_error) {
++    if (!skippy_mtp_available(session) || token_ids == nullptr || token_count == 0) {
++        return skippy_success(out_error);
++    }
++    if (token_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "MTP token_count exceeds int32_t range");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    llama_context * mtp_ctx = session->stage_model->mtp_ctx;
++    const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
++    const size_t row_bytes = static_cast<size_t>(n_embd)*sizeof(float);
++    if (session->mtp_pending_h.size() != static_cast<size_t>(n_embd)) {
++        session->mtp_pending_h.assign(static_cast<size_t>(n_embd), 0.0f);
++        session->mtp_has_pending_h = false;
++    }
++
++    size_t first_index = 0;
++    if (session->mtp_next_pos > token_start) {
++        first_index = static_cast<size_t>(std::min<llama_pos>(
++                static_cast<llama_pos>(token_count),
++                session->mtp_next_pos - token_start));
++    }
++
++    const int32_t n_decode = static_cast<int32_t>(token_count - first_index);
++    if (n_decode > 0) {
++        llama_batch batch = llama_batch_init(n_decode, n_embd, 1);
++        batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)*static_cast<size_t>(n_decode)));
++        if (batch.token == nullptr) {
++            llama_batch_free(batch);
++            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to allocate MTP token batch");
++            return SKIPPY_STATUS_RUNTIME_ERROR;
++        }
++        batch.n_tokens = n_decode;
++
++        for (int32_t out_i = 0; out_i < n_decode; ++out_i) {
++            const size_t src_i = first_index + static_cast<size_t>(out_i);
++            batch.token[out_i] = token_ids[src_i];
++            batch.pos[out_i] = token_start + static_cast<llama_pos>(src_i);
++            batch.n_seq_id[out_i] = 1;
++            batch.seq_id[out_i][0] = session->seq_id;
++            batch.logits[out_i] = 0;
++
++            float * dst = batch.embd + static_cast<size_t>(out_i)*n_embd;
++            if (src_i == 0) {
++                std::memcpy(dst, session->mtp_pending_h.data(), row_bytes);
++            } else {
++                const float * h_prev = llama_get_embeddings_pre_norm_ith(session->ctx, static_cast<int32_t>(src_i - 1));
++                if (h_prev == nullptr) {
++                    std::free(batch.token);
++                    batch.token = nullptr;
++                    llama_batch_free(batch);
++                    skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "target pre-norm hidden row was not available");
++                    return SKIPPY_STATUS_RUNTIME_ERROR;
++                }
++                std::memcpy(dst, h_prev, row_bytes);
++            }
++        }
++
++        skippy_graph_filter_scope graph_filter_scope(&session->stage_model->config);
++        const int32_t rc = llama_decode(mtp_ctx, batch);
++        std::free(batch.token);
++        batch.token = nullptr;
++        llama_batch_free(batch);
++        if (rc != 0) {
++            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "llama_decode failed for MTP sidecar sync");
++            return SKIPPY_STATUS_RUNTIME_ERROR;
++        }
++        session->mtp_next_pos = token_start + static_cast<int32_t>(token_count);
++    }
++
++    const float * h_last = llama_get_embeddings_pre_norm_ith(session->ctx, static_cast<int32_t>(token_count - 1));
++    if (h_last == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "target pre-norm hidden row was not available");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    std::memcpy(session->mtp_pending_h.data(), h_last, row_bytes);
++    session->mtp_has_pending_h = true;
++    return skippy_success(out_error);
++}
++
+ static void skippy_record_tokens(
+         skippy_session * session,
+         const llama_token * token_ids,
+@@ -1027,12 +1139,16 @@ static enum skippy_status skippy_decode_tokens(
+             /*logits   =*/ &logits,
+         };
+         enum skippy_status status = skippy_decode_batch(session, batch, 1, out_error);
++        if (status == SKIPPY_STATUS_OK) {
++            status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, pos, out_error);
++        }
+         if (status == SKIPPY_STATUS_OK) {
+             skippy_record_tokens(session, token_ids, token_count);
+         }
+         return status;
+     }
+ 
++    const llama_pos token_start = session->n_past;
+     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+     batch.n_tokens = n_tokens;
+     for (int32_t i = 0; i < n_tokens; ++i) {
+@@ -1045,6 +1161,9 @@ static enum skippy_status skippy_decode_tokens(
+ 
+     enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
+     llama_batch_free(batch);
++    if (status == SKIPPY_STATUS_OK) {
++        status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, token_start, out_error);
++    }
+     if (status == SKIPPY_STATUS_OK) {
+         skippy_record_tokens(session, token_ids, token_count);
+     }
+@@ -1085,10 +1204,16 @@ static enum skippy_status skippy_verify_token_batch(
+     return status;
+ }
+ 
+-static llama_token skippy_greedy_sample_ith(skippy_session * session, int32_t index) {
+-    const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
++static llama_token skippy_greedy_sample_context(
++        llama_model * model,
++        llama_context * ctx,
++        int32_t index) {
++    if (model == nullptr || ctx == nullptr) {
++        return 0;
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+-    const float * logits = llama_get_logits_ith(session->ctx, index);
++    const float * logits = llama_get_logits_ith(ctx, index);
+     if (logits == nullptr) {
+         return 0;
+     }
+@@ -1105,6 +1230,10 @@ static llama_token skippy_greedy_sample_ith(skippy_session * session, int32_t in
+     return best;
+ }
+ 
++static llama_token skippy_greedy_sample_ith(skippy_session * session, int32_t index) {
++    return skippy_greedy_sample_context(session->stage_model->model, session->ctx, index);
++}
++
+ static llama_token skippy_greedy_sample(skippy_session * session) {
+     return skippy_greedy_sample_ith(session, -1);
+ }
+@@ -1501,6 +1630,64 @@ static llama_token skippy_sample_token(
+     return skippy_sample_token_ith(session, sampling, -1);
+ }
+ 
++static enum skippy_status skippy_mtp_propose_next(
++        skippy_session * session,
++        llama_token predicted_token,
++        skippy_native_mtp_draft * out_mtp_draft,
++        struct skippy_error ** out_error) {
++    if (out_mtp_draft != nullptr) {
++        *out_mtp_draft = {
++            1,
++            false,
++            -1,
++            0,
++        };
++    }
++    if (!skippy_mtp_available(session) || predicted_token < 0 || !session->mtp_has_pending_h) {
++        return skippy_success(out_error);
++    }
++
++    llama_context * mtp_ctx = session->stage_model->mtp_ctx;
++    const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
++    if (session->mtp_pending_h.size() != static_cast<size_t>(n_embd)) {
++        return skippy_success(out_error);
++    }
++
++    llama_token token = predicted_token;
++    llama_pos pos = session->n_past;
++    int32_t n_seq_id = 1;
++    llama_seq_id seq_id = session->seq_id;
++    llama_seq_id * seq_ids = &seq_id;
++    int8_t logits = 1;
++    llama_batch batch = {
++        /*n_tokens =*/ 1,
++        /*token    =*/ &token,
++        /*embd     =*/ session->mtp_pending_h.data(),
++        /*pos      =*/ &pos,
++        /*n_seq_id =*/ &n_seq_id,
++        /*seq_id   =*/ &seq_ids,
++        /*logits   =*/ &logits,
++    };
++
++    const int64_t t_start_us = ggml_time_us();
++    skippy_graph_filter_scope graph_filter_scope(&session->stage_model->config);
++    const int32_t rc = llama_decode(mtp_ctx, batch);
++    const int64_t elapsed_us = ggml_time_us() - t_start_us;
++    if (rc != 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "llama_decode failed for MTP sidecar proposal");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++
++    session->mtp_next_pos = session->n_past + 1;
++    if (out_mtp_draft != nullptr) {
++        out_mtp_draft->version = 1;
++        out_mtp_draft->available = true;
++        out_mtp_draft->token_id = skippy_greedy_sample_context(session->stage_model->model, mtp_ctx, -1);
++        out_mtp_draft->proposal_compute_us = elapsed_us;
++    }
++    return skippy_success(out_error);
++}
++
+ static enum skippy_status skippy_prepare_empty_activation_frame(
+         skippy_session * session,
+         size_t token_count,
+@@ -1689,7 +1876,11 @@ static enum skippy_status skippy_decode_activation_frame(
+     skippy_activation_tokens_scope activation_tokens_scope(token_ids, token_count);
+     skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
+     skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
++    const llama_pos token_start = pos_storage.empty() ? session->n_past : pos_storage[0];
+     enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
++    if (status == SKIPPY_STATUS_OK && token_ids != nullptr) {
++        status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, token_start, out_error);
++    }
+     return status;
+ }
+ 
+@@ -2027,6 +2218,24 @@ static enum skippy_status skippy_finish_model_open(
+         skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to create llama context");
+         return SKIPPY_STATUS_RUNTIME_ERROR;
+     }
++
++    if (config != nullptr &&
++        config->include_output &&
++        model->hparams.nextn_predict_layers > 0) {
++        llama_context_params mtp_params = params;
++        mtp_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++        mtp_params.embeddings = false;
++        {
++            skippy_graph_filter_scope graph_filter_scope(config);
++            stage_model->mtp_ctx = llama_init_from_model(model, mtp_params);
++        }
++        if (stage_model->mtp_ctx != nullptr) {
++            llama_set_embeddings_pre_norm(stage_model->ctx, true, false);
++            llama_set_embeddings_pre_norm(stage_model->mtp_ctx, true, true);
++        } else {
++            fprintf(stderr, "skippy: native MTP sidecar unavailable for this final stage; continuing without drafts\n");
++        }
++    }
+     stage_model->lane_in_use.assign(stage_model->lane_count, false);
+     stage_model->lane_resident_prefix_tokens.resize(stage_model->lane_count);
+ 
+@@ -2149,6 +2358,9 @@ enum skippy_status skippy_model_free(
+         struct skippy_model * model,
+         struct skippy_error ** out_error) {
+     if (model != nullptr) {
++        if (model->mtp_ctx != nullptr) {
++            llama_free(model->mtp_ctx);
++        }
+         if (model->ctx != nullptr) {
+             llama_free(model->ctx);
+         }
+@@ -2196,6 +2408,11 @@ enum skippy_status skippy_session_create(
+     session->n_past = 0;
+     session->checkpoint_valid = false;
+     session->checkpoint_n_past = 0;
++    session->mtp_next_pos = 0;
++    if (skippy_mtp_available(session)) {
++        session->mtp_pending_h.assign(static_cast<size_t>(llama_model_n_embd(model->model)), 0.0f);
++        skippy_mtp_clear_session_state(session);
++    }
+     *out_session = session;
+     if (static_cast<size_t>(seq_id) < model->lane_resident_prefix_tokens.size()) {
+         model->lane_resident_prefix_tokens[static_cast<size_t>(seq_id)].clear();
+@@ -2279,6 +2496,7 @@ enum skippy_status skippy_session_set_position(
+     if (session->signal_history.size() > static_cast<size_t>(n_past)) {
+         session->signal_history.resize(static_cast<size_t>(n_past));
+     }
++    skippy_mtp_clear_session_state(session);
+     return skippy_success(out_error);
+ }
+ 
+@@ -2372,6 +2590,7 @@ enum skippy_status skippy_session_reset(
+     }
+     session->signal_history.clear();
+     skippy_clear_chat_sampling(session);
++    skippy_mtp_clear_session_state(session);
+     session->ctx->synchronize();
+     return skippy_success(out_error);
+ }
+@@ -2408,6 +2627,7 @@ enum skippy_status skippy_session_free(
+                 session->stage_model->lane_in_use[lane] = false;
+             }
+         }
++        skippy_mtp_clear_session_state(session);
+         delete session;
+     }
+     return skippy_success(out_error);
+@@ -2970,7 +3190,7 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
+         };
+     }
+ 
+-    return skippy_decode_step_frame_sampled(
++    enum skippy_status status = skippy_decode_step_frame_sampled(
+             session,
+             token_id,
+             sampling,
+@@ -2982,6 +3202,11 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
+             out_output_payload_bytes,
+             out_predicted_token,
+             out_error);
++    if (status != SKIPPY_STATUS_OK || out_predicted_token == nullptr || *out_predicted_token < 0) {
++        return status;
++    }
++
++    return skippy_mtp_propose_next(session, *out_predicted_token, out_mtp_draft, out_error);
+ }
+ 
+ enum skippy_status skippy_decode_step_frame_batch_sampled(
+-- 
+2.54.0 (Apple Git-156)
+

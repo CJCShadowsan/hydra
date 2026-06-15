@@ -9,9 +9,9 @@ use skippy_protocol::{FlashAttentionType, LoadMode, StageConfig};
 use skippy_runtime::{
     ActivationFrame, DecodeBatchRequest, DecodeFrameBatchOutput, DecodeFrameBatchRequest,
     FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow, MediaInput,
-    MediaPrefill, MediaPrefillFrame, RuntimeConfig, RuntimeKvPage, RuntimeKvPageDesc,
-    RuntimeLoadMode, SamplingConfig, StageModel, StageSession, StageSessionCheckpoint, TokenSignal,
-    parse_cache_type,
+    MediaPrefill, MediaPrefillFrame, NativeMtpDraft, RuntimeConfig, RuntimeKvPage,
+    RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
+    StageSessionCheckpoint, TokenSignal, parse_cache_type,
 };
 
 use crate::package::select_package_parts;
@@ -310,6 +310,19 @@ impl RuntimeState {
     ) -> Result<(i32, ActivationFrame)> {
         let session = self.session(session_id)?;
         let output = session.decode_step_frame_sampled(token_id, sampling, input, 0)?;
+        self.add_session_tokens(session_id, 1);
+        Ok(output)
+    }
+
+    pub fn decode_frame_sampled_mtp_n1(
+        &mut self,
+        session_id: &str,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+    ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
+        let session = self.session(session_id)?;
+        let output = session.decode_step_frame_sampled_mtp_n1(token_id, sampling, input, 0)?;
         self.add_session_tokens(session_id, 1);
         Ok(output)
     }

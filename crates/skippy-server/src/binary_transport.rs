@@ -34,8 +34,8 @@ use skippy_protocol::{
     },
 };
 use skippy_runtime::{
-    ActivationDesc, ActivationFrame, LogitBias, MAX_LOGIT_BIAS, RuntimeActivationDType,
-    RuntimeActivationLayout, SamplingConfig,
+    ActivationDesc, ActivationFrame, LogitBias, MAX_LOGIT_BIAS, NativeMtpDraft,
+    RuntimeActivationDType, RuntimeActivationLayout, SamplingConfig,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -1276,7 +1276,7 @@ fn handle_binary_connection(
             let predicted_token_count = if message.kind == WireMessageKind::VerifySpan {
                 predicted_tokens.len()
             } else {
-                1
+                predicted_tokens.len().max(1)
             };
             let return_stream = prediction_return_streams
                 .get_mut(&(message.request_id, message.session_id))
@@ -1522,6 +1522,17 @@ fn insert_optional_unix_nanos(attrs: &mut BTreeMap<String, Value>, key: &str, va
     if let Some(value) = value {
         attrs.insert(key.to_string(), json!(value));
     }
+}
+
+fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -> Vec<i32> {
+    let Some(draft) = draft else {
+        return vec![predicted];
+    };
+    vec![
+        predicted,
+        draft.token_id,
+        draft.proposal_compute_us.clamp(0, i64::from(i32::MAX)) as i32,
+    ]
 }
 
 fn estimated_stage_message_wire_bytes(message: &StageWireMessage) -> usize {
@@ -3276,9 +3287,17 @@ pub(crate) fn run_binary_stage_message(
                 .copied()
                 .unwrap_or(message.state.current_token);
             let sampling = runtime_sampling_config(message.sampling.as_ref());
-            let (predicted, output) =
-                runtime.decode_frame_sampled(session_id, token_id, sampling.as_ref(), input)?;
-            Ok((predicted, Vec::new(), output))
+            let (predicted, native_mtp, output) = runtime.decode_frame_sampled_mtp_n1(
+                session_id,
+                token_id,
+                sampling.as_ref(),
+                input,
+            )?;
+            Ok((
+                predicted,
+                native_mtp_prediction_tokens(predicted, native_mtp),
+                output,
+            ))
         }
         WireMessageKind::VerifySpan => {
             let (predicted_tokens, output) = runtime.verify_frame(session_id, token_ids, input)?;

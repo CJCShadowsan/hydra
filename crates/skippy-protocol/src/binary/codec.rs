@@ -44,10 +44,28 @@ pub fn send_reply_predicted_with_stats(
     predicted: i32,
     stats: StageReplyStats,
 ) -> io::Result<()> {
+    send_reply_predicted_with_tokens_and_stats(&mut writer, predicted, &[predicted], stats)
+}
+
+pub fn send_reply_predicted_with_tokens_and_stats(
+    mut writer: impl Write,
+    predicted: i32,
+    predicted_tokens: &[i32],
+    stats: StageReplyStats,
+) -> io::Result<()> {
+    if predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
+        return Err(invalid_input("too many predicted tokens"));
+    }
     write_i32(&mut writer, WireReplyKind::PredictedToken as i32)?;
     write_i32(&mut writer, predicted)?;
-    write_i32(&mut writer, 1)?;
-    write_i32(&mut writer, predicted)?;
+    write_i32(
+        &mut writer,
+        i32::try_from(predicted_tokens.len())
+            .map_err(|_| invalid_input("too many predicted tokens"))?,
+    )?;
+    for token in predicted_tokens {
+        write_i32(&mut writer, *token)?;
+    }
     write_reply_stats(&mut writer, stats)
 }
 

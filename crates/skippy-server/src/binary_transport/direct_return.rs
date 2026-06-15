@@ -18,7 +18,7 @@ use skippy_protocol::{
         StageReply, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
         WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready,
         send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_stats, write_stage_message,
+        send_reply_predicted_with_tokens_and_stats, write_stage_message,
     },
 };
 
@@ -264,10 +264,13 @@ pub(crate) fn send_direct_prediction_return(
     reply: StageReply,
 ) -> Result<()> {
     match reply.kind {
-        WireReplyKind::PredictedToken => {
-            send_reply_predicted_with_stats(stream, reply.predicted, reply.stats)
-                .context("send direct predicted-token return")
-        }
+        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
+            stream,
+            reply.predicted,
+            &single_prediction_tokens(&reply),
+            reply.stats,
+        )
+        .context("send direct predicted-token return"),
         WireReplyKind::PredictedTokens => {
             send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
                 .context("send direct predicted-tokens return")
@@ -275,6 +278,14 @@ pub(crate) fn send_direct_prediction_return(
         WireReplyKind::Ack => {
             send_reply_ack_with_stats(stream, reply.stats).context("send direct ACK return")
         }
+    }
+}
+
+fn single_prediction_tokens(reply: &StageReply) -> Vec<i32> {
+    if reply.predicted_tokens.is_empty() {
+        vec![reply.predicted]
+    } else {
+        reply.predicted_tokens.clone()
     }
 }
 
