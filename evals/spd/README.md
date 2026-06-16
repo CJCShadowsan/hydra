@@ -40,13 +40,16 @@ Rust.
   Skippy target verifier.
 - `skippy-server` has a request-path speculative proposal-source boundary in
   front of the existing target verify/repair/rollback loop. The current draft
-  model path uses it; SPD is the next proposal source to wire in.
+  model path uses it, and an experimental `spd-replay` source can load the
+  pretrained Qwen3.5-4B head from `--openai-spd-manifest` /
+  `--openai-spd-fixture`.
 
 ## What Does Not Work Yet
 
-- No live Skippy generation request has used trained SPD proposals yet.
-- The live-tap proof is a diagnostic path; the SPD proposer is not wired into
-  request-path serving metrics or live OpenAI generation yet.
+- No local OpenAI request has yet been recorded using the trained SPD source.
+- The `spd-replay` source collects taps by replaying the current context through
+  local `StageModel` slices. It is a correctness bridge into live serving, not
+  the optimized inline hidden-tap transport needed for real speed.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
   `spd-head.safetensors` before Rust-side serving work.
 
@@ -344,6 +347,26 @@ the Skippy tap/head plumbing works and the best proposal survives quantization
 for this prompt. It also proves repeated real target-verifier acceptance
 windows in a diagnostic harness, but does not yet measure request-path SPD
 serving throughput.
+
+`skippy-server serve-binary --openai-bind-addr` now has an experimental
+request-path source for the same head:
+
+```bash
+skippy-server serve-binary \
+  --config stage0.json \
+  --topology topology.json \
+  --activation-width 2560 \
+  --openai-bind-addr 127.0.0.1:9337 \
+  --openai-spd-manifest /path/to/skippy-spd-head.json \
+  --openai-spd-fixture /path/to/spd-parity-fixture.safetensors \
+  --openai-spd-model-path /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  --openai-speculative-window 1
+```
+
+That path feeds real SPD proposals into the normal Skippy `VerifySpan`
+verify/repair/rollback loop. The next proof step is to run ordinary split
+serving and `spd-replay` serving against the same prompts, then replace replayed
+taps with inline tap capture.
 
 ## Validate Hidden Tap Compatibility
 

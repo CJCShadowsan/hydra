@@ -122,6 +122,28 @@ pub struct ServeBinaryArgs {
         help = "Draft GGUF to use for speculative decoding in the embedded stage-0 OpenAI surface."
     )]
     pub openai_draft_model_path: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Experimental SPD head manifest to use as the embedded stage-0 speculative proposal source."
+    )]
+    pub openai_spd_manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Experimental SPD parity fixture exported for the same head. Used for row metadata and final norm weights."
+    )]
+    pub openai_spd_fixture: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Full GGUF to replay live SPD taps from. Defaults to source_model_path, then model_path, from the stage config."
+    )]
+    pub openai_spd_model_path: Option<PathBuf>,
+    #[arg(long, default_value_t = 1)]
+    pub openai_spd_top_k: usize,
+    #[arg(
+        long,
+        help = "Override n_gpu_layers for experimental SPD replay tap models. Defaults to the stage config n_gpu_layers."
+    )]
+    pub openai_spd_n_gpu_layers: Option<i32>,
     #[arg(long, default_value_t = 4)]
     pub openai_speculative_window: usize,
     #[arg(long)]
@@ -224,5 +246,54 @@ mod tests {
         assert_eq!(args.prefill_adaptive_start, 128);
         assert_eq!(args.prefill_adaptive_step, 128);
         assert_eq!(args.prefill_adaptive_max, 384);
+    }
+
+    #[test]
+    fn serve_binary_parses_experimental_spd_options() {
+        let cli = Cli::try_parse_from([
+            "skippy-server",
+            "serve-binary",
+            "--config",
+            "stage.json",
+            "--topology",
+            "topology.json",
+            "--activation-width",
+            "2560",
+            "--openai-bind-addr",
+            "127.0.0.1:9337",
+            "--openai-spd-manifest",
+            "skippy-spd-head.json",
+            "--openai-spd-fixture",
+            "spd-parity-fixture.safetensors",
+            "--openai-spd-model-path",
+            "model.gguf",
+            "--openai-spd-top-k",
+            "4",
+            "--openai-spd-n-gpu-layers",
+            "99",
+            "--openai-speculative-window",
+            "2",
+        ])
+        .unwrap();
+
+        let Command::ServeBinary(args) = cli.command else {
+            panic!("expected serve-binary command");
+        };
+
+        assert_eq!(
+            args.openai_spd_manifest,
+            Some(PathBuf::from("skippy-spd-head.json"))
+        );
+        assert_eq!(
+            args.openai_spd_fixture,
+            Some(PathBuf::from("spd-parity-fixture.safetensors"))
+        );
+        assert_eq!(
+            args.openai_spd_model_path,
+            Some(PathBuf::from("model.gguf"))
+        );
+        assert_eq!(args.openai_spd_top_k, 4);
+        assert_eq!(args.openai_spd_n_gpu_layers, Some(99));
+        assert_eq!(args.openai_speculative_window, 2);
     }
 }

@@ -125,6 +125,7 @@ impl StageOpenAiBackend {
                         .transpose()
                         .map_err(openai_backend_error)?,
                     draft: self.draft.clone(),
+                    spd: self.spd.clone(),
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,
                     prompt_token_ids: &prompt_token_ids,

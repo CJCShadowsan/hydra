@@ -1,3 +1,4 @@
+mod live_tap;
 mod qwen;
 mod safetensors;
 mod tap_input;
@@ -12,6 +13,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use live_tap::{
+    SpdLiveCurInRequest, SpdLiveCurInRows, SpdLiveTapRunner, SpdLiveTapRunnerConfig,
+    assemble_spd_live_cur_in_for_positions, sliding_spd_row_positions,
+};
 pub use qwen::{
     SpdQwen3FixtureDiagnostics, SpdQwen3FixtureParity, SpdQwen3FixtureTopK, SpdQwen3ForwardInput,
     SpdQwen3Head, run_qwen3_fixture_parity, run_qwen3_forward_from_inputs,

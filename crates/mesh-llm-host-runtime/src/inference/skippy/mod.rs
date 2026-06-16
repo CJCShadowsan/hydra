@@ -429,6 +429,7 @@ impl SkippyModelHandle {
                 .parse()
                 .expect("static bind address should parse"),
             config: stage_config.clone(),
+            topology: None,
             runtime: runtime.runtime(),
             model_id: embedded_args.model_id,
             default_max_tokens: embedded_args.default_max_tokens,
@@ -441,6 +442,11 @@ impl SkippyModelHandle {
             prefill_adaptive_step: embedded_args.prefill_adaptive_step,
             prefill_adaptive_max: embedded_args.prefill_adaptive_max,
             draft_model_path: embedded_args.draft_model_path,
+            spd_manifest_path: None,
+            spd_fixture_path: None,
+            spd_model_path: None,
+            spd_top_k: 1,
+            spd_n_gpu_layers: None,
             speculative_window: embedded_args.speculative_window,
             adaptive_speculative_window: embedded_args.adaptive_speculative_window,
             draft_n_gpu_layers: embedded_args.draft_n_gpu_layers,
@@ -524,6 +530,7 @@ impl SkippyModelHandle {
                 .parse()
                 .expect("static bind address should parse"),
             config: stage_config.clone(),
+            topology: None,
             runtime: runtime.runtime(),
             model_id: embedded_args.model_id,
             default_max_tokens: embedded_args.default_max_tokens,
@@ -536,6 +543,11 @@ impl SkippyModelHandle {
             prefill_adaptive_step: embedded_args.prefill_adaptive_step,
             prefill_adaptive_max: embedded_args.prefill_adaptive_max,
             draft_model_path: embedded_args.draft_model_path,
+            spd_manifest_path: None,
+            spd_fixture_path: None,
+            spd_model_path: None,
+            spd_top_k: 1,
+            spd_n_gpu_layers: None,
             speculative_window: embedded_args.speculative_window,
             adaptive_speculative_window: embedded_args.adaptive_speculative_window,
             draft_n_gpu_layers: embedded_args.draft_n_gpu_layers,
@@ -695,6 +707,7 @@ impl SkippyModelHandle {
                 .parse()
                 .expect("static bind address should parse"),
             config: runtime_config.clone(),
+            topology: None,
             runtime: runtime.runtime(),
             model_id: embedded_args.model_id,
             default_max_tokens: embedded_args.default_max_tokens,
@@ -707,6 +720,11 @@ impl SkippyModelHandle {
             prefill_adaptive_step: embedded_args.prefill_adaptive_step,
             prefill_adaptive_max: embedded_args.prefill_adaptive_max,
             draft_model_path: embedded_args.draft_model_path,
+            spd_manifest_path: None,
+            spd_fixture_path: None,
+            spd_model_path: None,
+            spd_top_k: 1,
+            spd_n_gpu_layers: None,
             speculative_window: embedded_args.speculative_window,
             adaptive_speculative_window: embedded_args.adaptive_speculative_window,
             draft_n_gpu_layers: embedded_args.draft_n_gpu_layers,
@@ -788,6 +806,7 @@ impl SkippyModelHandle {
             config.kv_cache = family_policy.stage_kv_cache_config_for_stage(config);
         }
         let runtime_config = config.clone();
+        let embedded_topology = runtime_options.topology.clone();
         let runtime =
             SkippyRuntimeHandle::load_with_open_events(runtime_options, model_open_event_reporter)
                 .with_context(|| {
@@ -817,6 +836,7 @@ impl SkippyModelHandle {
                 .parse()
                 .expect("static bind address should parse"),
             config: runtime_config.clone(),
+            topology: embedded_topology,
             runtime: runtime.runtime(),
             model_id: embedded_args.model_id,
             default_max_tokens: embedded_args.default_max_tokens,
@@ -829,6 +849,11 @@ impl SkippyModelHandle {
             prefill_adaptive_step: embedded_args.prefill_adaptive_step,
             prefill_adaptive_max: embedded_args.prefill_adaptive_max,
             draft_model_path: embedded_args.draft_model_path,
+            spd_manifest_path: None,
+            spd_fixture_path: None,
+            spd_model_path: None,
+            spd_top_k: 1,
+            spd_n_gpu_layers: None,
             speculative_window: embedded_args.speculative_window,
             adaptive_speculative_window: embedded_args.adaptive_speculative_window,
             draft_n_gpu_layers: embedded_args.draft_n_gpu_layers,

@@ -296,18 +296,23 @@ Recorded repeated verifier run with `--verify-steps 3`:
 The top-8 set is the same, with lower-ranked candidates reordered by GGUF
 quantization/runtime drift. This is a real Skippy tap/head/target-verifier
 proof over repeated proposal windows, but it is still a diagnostic harness and
-not integrated into the serving request path. The per-step timings from this
-CPU diagnostic path are not throughput numbers; use the trace latency simulator
-for current speedup estimates until request-path SPD exists.
+not a serving throughput measurement. `skippy-server` now has an experimental
+request-path SPD replay source that can load the same pretrained head and feed
+the existing verifier, but that path still needs a local end-to-end OpenAI run.
+The per-step timings from the CPU diagnostic path are not throughput numbers;
+use the trace latency simulator for current speedup estimates until inline tap
+capture exists.
 
 ## What Does Not Work Yet
 
-- No live Skippy request has used trained SPD proposals.
+- No local OpenAI request has yet been recorded using the trained SPD source.
 - The tap-aligned Qwen3.5-4B proof now proves live Skippy tap capture and SPD
   proposal from those taps plus repeated target verification in a diagnostic
   harness. `skippy-server` now has a pluggable request-path speculative
-  proposal-source boundary ahead of its existing verify/repair/rollback loop,
-  but the SPD proposer is not wired into that boundary yet.
+  proposal-source boundary and an experimental `spd-replay` implementation that
+  replays live taps through local stage slices before feeding proposals into the
+  existing verify/repair/rollback loop. This proves serving-path integration
+  shape, but it is intentionally not the optimized hidden-tap transport.
 - No larger-than-4B head has been trained by us yet.
 
 ## Correctness Contract
@@ -346,6 +351,25 @@ Recommended first implementation:
 - SPD implements the `skippy-server` speculative proposal-source boundary
 - normal Skippy stages verify every emitted token through the existing
   verify/repair/rollback path
+
+Current experimental serving hook:
+
+```bash
+skippy-server serve-binary \
+  --config stage0.json \
+  --topology topology.json \
+  --activation-width 2560 \
+  --openai-bind-addr 127.0.0.1:9337 \
+  --openai-spd-manifest /path/to/skippy-spd-head.json \
+  --openai-spd-fixture /path/to/spd-parity-fixture.safetensors \
+  --openai-spd-model-path /path/to/Qwen3.5-4B-Q4_K_M.gguf \
+  --openai-speculative-window 1
+```
+
+This `spd-replay` source runs real pretrained SPD proposals, but it collects
+taps by replaying the current context through local `StageModel` slices. Use it
+to prove request-path correctness first; do not use it as the final performance
+architecture.
 
 Distributed SPD execution across all stage nodes may become useful later, but it
 is not the first proof path.
@@ -599,13 +623,18 @@ Goal: Skippy uses SPD proposals during generation and verifies every token.
 Tasks:
 
 1. Add a proposal-source boundary in `skippy-server`. Done for the current
-   draft-model path; SPD can now be added without duplicating verifier logic.
-2. Wire SPD proposal generation into that boundary.
-3. Feed proposals into the existing target verification path.
-4. Roll back speculative KV/session state on rejection.
+   draft-model path and reused by SPD.
+2. Wire SPD proposal generation into that boundary. Experimental replay-tap
+   source is in place behind `--openai-spd-manifest` / `--openai-spd-fixture`.
+3. Feed proposals into the existing target verification path. Done by sharing
+   the same `VerifySpan` verifier/repair loop as the draft-model source.
+4. Roll back speculative KV/session state on rejection. Done through the
+   existing verifier reset path for any rejecting proposal source.
 5. Emit metrics for proposals, accepted tokens, rejected tokens, equivalent
    accept length, and decode-loop steps.
 6. Run ordinary split serving and SPD serving against the same prompts.
+7. Replace replayed local tap collection with inline hidden-tap capture and
+   transport so performance can match the SPD pipeline design.
 
 Exit criteria:
 

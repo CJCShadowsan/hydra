@@ -242,10 +242,12 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         let openai_runtime = runtime.clone();
         let openai_telemetry = telemetry.clone();
         let openai_prediction_returns = prediction_returns.clone();
+        let openai_topology = topology.clone();
         tokio::spawn(async move {
             if let Err(error) = frontend::serve_embedded_openai(EmbeddedOpenAiArgs {
                 bind_addr: openai_options.bind_addr,
                 config: openai_config,
+                topology: openai_topology,
                 runtime: openai_runtime,
                 model_id: openai_options.model_id,
                 default_max_tokens: openai_options.default_max_tokens,
@@ -258,6 +260,11 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 prefill_adaptive_step: openai_options.prefill_adaptive_step,
                 prefill_adaptive_max: openai_options.prefill_adaptive_max,
                 draft_model_path: openai_options.draft_model_path,
+                spd_manifest_path: openai_options.spd_manifest_path,
+                spd_fixture_path: openai_options.spd_fixture_path,
+                spd_model_path: openai_options.spd_model_path,
+                spd_top_k: openai_options.spd_top_k,
+                spd_n_gpu_layers: openai_options.spd_n_gpu_layers,
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,

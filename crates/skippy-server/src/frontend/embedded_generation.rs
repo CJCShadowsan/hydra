@@ -748,7 +748,7 @@ impl StageOpenAiBackend {
                 adaptive_window_start: adaptive_window,
                 adaptive_window_final: adaptive_window,
                 adaptive_window_max: max_speculative_window,
-                adaptive_window_min: if request.draft.is_some() {
+                adaptive_window_min: if request.draft.is_some() || request.spd.is_some() {
                     adaptive_window
                 } else {
                     0
@@ -756,6 +756,37 @@ impl StageOpenAiBackend {
                 adaptive_window_max_seen: adaptive_window,
                 adaptive_window_enabled: request.adaptive_speculative_window,
                 ..OpenAiSpeculativeStats::default()
+            };
+            let mut spd_guard = match request.spd.as_ref() {
+                Some(spd) if request.speculative_window > 0 => {
+                    let spd_reset_timer = PhaseTimer::start();
+                    let mut spd = spd
+                        .lock()
+                        .map_err(|_| OpenAiError::backend("SPD source lock poisoned"))?;
+                    spd.reset_to_context(&context_tokens)
+                        .map_err(openai_backend_error)?;
+                    speculative_stats.draft_reset_ms += spd_reset_timer.elapsed_ms();
+                    let mut attrs = self.openai_attrs(request.ids);
+                    attrs.insert(
+                        "llama_stage.spd_manifest_path".to_string(),
+                        json!(spd.manifest_path.display().to_string()),
+                    );
+                    attrs.insert(
+                        "llama_stage.spd_model_path".to_string(),
+                        json!(spd.model_path.display().to_string()),
+                    );
+                    attrs.insert(
+                        "llama_stage.speculative_window".to_string(),
+                        json!(spd.window),
+                    );
+                    attrs.insert(
+                        "llama_stage.adaptive_speculative_window".to_string(),
+                        json!(request.adaptive_speculative_window),
+                    );
+                    self.emit_openai_phase("stage.openai_spd_reset", spd_reset_timer, attrs);
+                    Some(spd)
+                }
+                _ => None,
             };
             let mut draft_guard = match request.draft.as_ref() {
                 Some(draft) if request.speculative_window > 0 => {
@@ -796,17 +827,21 @@ impl StageOpenAiBackend {
                     break;
                 }
                 let token_timer = PhaseTimer::start();
-                if draft_guard.is_some() {
+                if spd_guard.is_some() || draft_guard.is_some() {
                     let remaining = request.max_tokens as usize - decoded_tokens;
                     if remaining == 0 {
                         break;
                     }
                     let proposal_limit = remaining.min(adaptive_window);
                     let propose_timer = PhaseTimer::start();
-                    let proposal = match draft_guard.as_deref_mut() {
-                        Some(draft) => propose_from_source(draft, current, proposal_limit)
-                            .map_err(openai_backend_error)?,
-                        None => SpeculativeProposal::empty(proposal_limit),
+                    let proposal = if let Some(spd) = spd_guard.as_deref_mut() {
+                        propose_from_source(spd, current, proposal_limit)
+                            .map_err(openai_backend_error)?
+                    } else if let Some(draft) = draft_guard.as_deref_mut() {
+                        propose_from_source(draft, current, proposal_limit)
+                            .map_err(openai_backend_error)?
+                    } else {
+                        SpeculativeProposal::empty(proposal_limit)
                     };
                     let draft_propose_ms = propose_timer.elapsed_ms();
                     speculative_stats.draft_propose_ms += draft_propose_ms;
@@ -1013,10 +1048,19 @@ impl StageOpenAiBackend {
                             }
                         }
                         speculative_stats.adaptive_window_final = adaptive_window;
-                        if draft_guard.as_ref().is_some_and(|draft| {
+                        let should_reset_spd = spd_guard.as_ref().is_some_and(|spd| {
+                            spd.should_reset_after_verify(decision, reached_stop)
+                        });
+                        let should_reset_draft = draft_guard.as_ref().is_some_and(|draft| {
                             draft.should_reset_after_verify(decision, reached_stop)
-                        }) {
+                        });
+                        if should_reset_spd || should_reset_draft {
                             let draft_reset_timer = PhaseTimer::start();
+                            if let Some(spd) = spd_guard.as_deref_mut() {
+                                spd.reset_to_context(&context_tokens)
+                                    .map_err(openai_backend_error)?;
+                                speculative_stats.draft_reset_ms += draft_reset_timer.elapsed_ms();
+                            }
                             if let Some(draft) = draft_guard.as_deref_mut() {
                                 draft
                                     .reset_to_context(&context_tokens)

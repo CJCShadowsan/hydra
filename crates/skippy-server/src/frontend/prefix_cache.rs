@@ -63,7 +63,7 @@ fn estimated_activation_bytes(
 }
 
 pub(super) fn request_allows_exact_replay(request: &EmbeddedStageZeroGeneration<'_>) -> bool {
-    request.draft.is_none() && request.sampling.temperature <= 0.0
+    request.draft.is_none() && request.spd.is_none() && request.sampling.temperature <= 0.0
 }
 
 fn exact_replay_cache_key(

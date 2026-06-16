@@ -78,6 +78,7 @@ mod prefill;
 mod prefix_cache;
 mod prompting;
 mod request;
+mod spd;
 mod speculative;
 mod util;
 mod wire_messages;
@@ -86,6 +87,7 @@ use self::{
     admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
     prefill::*,
     request::*,
+    spd::*,
     speculative::*,
     util::*,
     wire_messages::*,
@@ -184,6 +186,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         ctx_size,
         mode,
         draft: None,
+        spd: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
@@ -209,6 +212,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
 pub struct EmbeddedOpenAiArgs {
     pub bind_addr: SocketAddr,
     pub config: StageConfig,
+    pub topology: Option<StageTopology>,
     pub runtime: Arc<Mutex<RuntimeState>>,
     pub model_id: Option<String>,
     pub default_max_tokens: u32,
@@ -221,6 +225,11 @@ pub struct EmbeddedOpenAiArgs {
     pub prefill_adaptive_step: usize,
     pub prefill_adaptive_max: usize,
     pub draft_model_path: Option<PathBuf>,
+    pub spd_manifest_path: Option<PathBuf>,
+    pub spd_fixture_path: Option<PathBuf>,
+    pub spd_model_path: Option<PathBuf>,
+    pub spd_top_k: usize,
+    pub spd_n_gpu_layers: Option<i32>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
     pub draft_n_gpu_layers: Option<i32>,
@@ -465,6 +474,12 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     if args.draft_model_path.is_some() && args.speculative_window == 0 {
         bail!("--openai-speculative-window must be greater than zero when a draft model is set");
     }
+    if args.draft_model_path.is_some() && args.spd_manifest_path.is_some() {
+        bail!("draft-model and SPD speculative sources cannot both be configured");
+    }
+    if args.spd_manifest_path.is_some() && args.speculative_window == 0 {
+        bail!("--openai-speculative-window must be greater than zero when SPD is set");
+    }
     if args.config.stage_index != 0 || args.config.layer_start != 0 {
         bail!("embedded OpenAI serving is only supported on stage 0");
     }
@@ -474,6 +489,16 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         args.draft_n_gpu_layers,
         args.speculative_window,
     )?;
+    let spd = open_spd_replay_source(SpdReplayOpenArgs {
+        manifest_path: args.spd_manifest_path.as_deref(),
+        fixture_path: args.spd_fixture_path.as_deref(),
+        model_path: args.spd_model_path.as_deref(),
+        config: &args.config,
+        topology: args.topology.as_ref(),
+        n_gpu_layers: args.spd_n_gpu_layers,
+        window: args.speculative_window,
+        top_k: args.spd_top_k,
+    })?;
     let model_id = ModelId::new(
         args.model_id
             .unwrap_or_else(|| args.config.model_id.clone()),
@@ -529,6 +554,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         ctx_size,
         mode,
         draft,
+        spd,
         speculative_window: args.speculative_window,
         adaptive_speculative_window: args.adaptive_speculative_window,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
@@ -568,6 +594,7 @@ struct StageOpenAiBackend {
     ctx_size: usize,
     mode: OpenAiBackendMode,
     draft: Option<Arc<Mutex<DraftRunner>>>,
+    spd: Option<Arc<Mutex<SpdReplayProposalSource>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
     generation_limit: Arc<Semaphore>,
@@ -1728,6 +1755,7 @@ struct EmbeddedStageZeroGeneration<'a> {
     lane_pool: Option<Arc<PersistentStageLanePool>>,
     prediction_return: Option<PredictionReturnReceiver>,
     draft: Option<Arc<Mutex<DraftRunner>>>,
+    spd: Option<Arc<Mutex<SpdReplayProposalSource>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
     prompt_token_ids: &'a [i32],
