@@ -14,6 +14,8 @@ const SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str =
     "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS";
 const SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV: &str =
     "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN";
+const SERIAL_AFTER_GAP_REJECT_SKIP_PROBES_ENV: &str =
+    "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_REJECT_SKIP_PROBES";
 const VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV: &str = "SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN";
 const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
@@ -68,6 +70,10 @@ pub(super) fn native_mtp_serial_after_gap_reject_recovery_serial_accepts() -> us
 
 pub(super) fn native_mtp_serial_after_gap_draft_min_margin() -> Option<f32> {
     parse_optional_f32_env(SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV)
+}
+
+pub(super) fn native_mtp_serial_after_gap_reject_skip_probes() -> usize {
+    parse_usize_env(SERIAL_AFTER_GAP_REJECT_SKIP_PROBES_ENV, 0)
 }
 
 pub(super) fn native_mtp_verify_next_draft_min_margin() -> Option<f32> {
@@ -929,6 +935,14 @@ mod tests {
         assert_eq!(
             parse_optional_f32_env("SKIPPY_TEST_MISSING_GAP_DRAFT_MARGIN"),
             None
+        );
+    }
+
+    #[test]
+    fn serial_after_gap_reject_skip_probes_defaults_zero() {
+        assert_eq!(
+            parse_usize_env("SKIPPY_TEST_MISSING_GAP_REJECT_SKIP_PROBES", 0),
+            0
         );
     }
 
