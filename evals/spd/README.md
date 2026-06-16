@@ -91,6 +91,39 @@ layer-47 auxiliary tensors `eh_proj`, `enorm`, and `hnorm`. Because 47 target
 layers do not divide evenly into the old equal-stage assumptions, GLM SPD
 manifests carry explicit `stage_layer_boundaries`.
 
+### GLM Training Smoke Command
+
+After the frontload smoke passes, run a tiny real training smoke with a
+tokenizer-specific draft vocab. This is not a model-quality run; it verifies
+that the reference trainer can load GLM, accept the non-uniform tap topology,
+produce a real `speculation_head_final.pt`, and write a Skippy manifest.
+
+```bash
+python evals/spd/hf_train_eval_qwen06.py \
+  --work-dir /tmp/skippy-spd-glm47-train-smoke \
+  --model-name /path/to/GLM-4.7-Flash \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --dataset-split train_sft \
+  --train-rows 8 \
+  --skip-eval \
+  --num-stages 3 \
+  --stage-layer-boundaries 15,31,47 \
+  --num-spec-layers 1 \
+  --max-length 128 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 1 \
+  --build-draft-vocab-size 1024 \
+  --draft-vocab-json '' \
+  --device cuda \
+  --upload-repo ''
+```
+
+`--stage-layer-boundaries` derives the reference trainer's
+`--shallow_hidden_layer_indices` as `0,15,31,47;0,15,31;0,15`. You can override
+that directly with `--shallow-hidden-layer-indices` when testing another tap
+layout. `--build-draft-vocab-size` builds a GLM-tokenizer draft vocab from the
+loaded training rows and passes the generated JSON into the reference trainer.
+
 ## Reproduce Qwen3-0.6B Training
 
 This is the smallest useful proof that the training path and artifact shape

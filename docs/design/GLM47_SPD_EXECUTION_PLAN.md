@@ -45,6 +45,9 @@ integration gaps:
 - add GLM model metadata inspection
 - support explicit non-uniform `stage_layer_boundaries`
 - derive GLM hidden-state tap rows from those boundaries
+- generate a small GLM-tokenizer draft vocabulary for training smoke runs
+- patch the reference trainer so explicit tap rows can bypass equal-stage
+  assumptions
 - write manifest-compatible GLM SPD smoke artifacts
 - validate the smoke manifest through `skippy-runtime`
 - keep the smoke artifacts clearly separate from trained weights
@@ -66,7 +69,25 @@ After the GLM code path exists, establish the vanilla GLM baseline:
 
 This baseline is the only performance comparison target for SPD.
 
-## Phase 4: Train And Evaluate SPD
+## Phase 4: Training Smoke
+
+Before a model-quality run, run a tiny real training smoke:
+
+- frozen local GLM 4.7 base model
+- explicit stage boundaries `15,31,47`
+- derived hidden tap rows `0,15,31,47;0,15,31;0,15`
+- small generated GLM-tokenizer draft vocab
+- a few rows from the training corpus
+- `--skip-eval` unless the training checkpoint is produced successfully
+
+The success criterion is artifact flow, not acceptance quality:
+
+- `speculation_head_final.pt`
+- `skippy-spd-head.json`
+- optional `spd-head.safetensors` after export
+- Rust SPD manifest validation
+
+## Phase 5: Train And Evaluate SPD
 
 Build a GLM tokenizer-specific draft vocabulary. Do not reuse Qwen draft vocab.
 Start with 32k tokens, then try 50k if vocab coverage limits acceptance.
@@ -80,7 +101,7 @@ Compare exactly two paths:
 - vanilla GLM target decode
 - GLM target decode with verified SPD sidecar
 
-## Phase 5: Serving Decision
+## Phase 6: Serving Decision
 
 Only wire the trained SPD head into live Skippy if it is materially faster than
 vanilla GLM while preserving target-equivalent verified output.

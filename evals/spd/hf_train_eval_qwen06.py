@@ -13,7 +13,7 @@
 #   "transformers>=5.6.0",
 # ]
 # ///
-"""Train and evaluate a small SPD speculation head on Hugging Face Jobs.
+"""Train and evaluate an SPD speculation head on Hugging Face Jobs or locally.
 
 This is intentionally a proof runner, not serving code. It produces a real
 `speculation_head_final.pt` from the reference SPD implementation, evaluates it,
@@ -42,7 +42,7 @@ DEFAULT_DATASET_SPLIT = "train_sft"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a real Qwen3-0.6B SPD head proof job")
+    parser = argparse.ArgumentParser(description="Run a real SPD head proof or smoke job")
     parser.add_argument("--work-dir", default="/tmp/skippy-spd-qwen06-proof")
     parser.add_argument("--reference-repo", default=REFERENCE_REPO)
     parser.add_argument("--model-name", default=DEFAULT_MODEL)
@@ -51,6 +51,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-rows", type=int, default=1024)
     parser.add_argument("--eval-rows-per-set", type=int, default=8)
     parser.add_argument("--num-stages", type=int, default=2)
+    parser.add_argument(
+        "--stage-layer-boundaries",
+        default="",
+        help=(
+            "Comma-separated target layer end indices for non-uniform topologies, "
+            "for example 15,31,47 for GLM 4.7 Flash."
+        ),
+    )
+    parser.add_argument(
+        "--shallow-hidden-layer-indices",
+        default="",
+        help=(
+            "Explicit semicolon-separated HF hidden-state tap rows for [g_n..g_1]. "
+            "Overrides --stage-layer-boundaries when set."
+        ),
+    )
     parser.add_argument("--num-spec-layers", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -74,7 +90,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--draft-vocab-json",
         default="draft_vocab/ultrachat_qwen3_0.6b_top_32k.json",
-        help="Path inside the reference repo; empty disables reduced draft vocab.",
+        help=(
+            "Draft vocab JSON path. Relative paths are resolved inside the reference repo; "
+            "absolute paths are passed through. Empty disables reduced draft vocab."
+        ),
+    )
+    parser.add_argument(
+        "--build-draft-vocab-size",
+        type=int,
+        default=0,
+        help="Build a tokenizer-specific draft vocab from the loaded train rows before training.",
+    )
+    parser.add_argument(
+        "--draft-vocab-out",
+        default="",
+        help="Output JSON for --build-draft-vocab-size. Defaults under the artifact data dir.",
     )
     parser.add_argument(
         "--upload-repo",
@@ -127,6 +157,7 @@ def patch_reference_for_proof(reference_dir: Path) -> None:
         "        report_to=[],\n",
     )
     patch_reference_for_transformers(reference_dir)
+    patch_reference_for_glm_training_smoke(reference_dir)
 
 
 def write_qwen3_nonthink_template(path: Path) -> None:
@@ -157,6 +188,37 @@ def patch_reference_for_transformers(reference_dir: Path) -> None:
         reference_dir / "pipeline_model.py",
         '            "cache_position": cache_position,\n',
         "",
+    )
+
+
+def patch_reference_for_glm_training_smoke(reference_dir: Path) -> None:
+    patch_pipeline_model_for_glm(reference_dir / "pipeline_model.py")
+
+
+def patch_pipeline_model_for_glm(path: Path) -> None:
+    replace_once(
+        path,
+        'supported = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "llama"}',
+        'supported = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "llama", "glm4_moe_lite"}',
+    )
+    replace_once(
+        path,
+        '''        if self.num_layers % self.num_stages != 0:
+            raise ValueError(
+                f"num_layers ({self.num_layers}) must be divisible by num_stages ({self.num_stages})"
+            )
+        self.layers_per_stage = self.num_layers // self.num_stages
+''',
+        '''        if self.num_layers % self.num_stages != 0:
+            if shallow_hidden_layer_indices is None:
+                raise ValueError(
+                    f"num_layers ({self.num_layers}) must be divisible by num_stages ({self.num_stages}) "
+                    "unless shallow_hidden_layer_indices supplies an explicit non-uniform topology"
+                )
+            self.layers_per_stage = max(1, (self.num_layers + self.num_stages - 1) // self.num_stages)
+        else:
+            self.layers_per_stage = self.num_layers // self.num_stages
+''',
     )
 
 
@@ -335,6 +397,113 @@ def create_mini_eval_data(reference_dir: Path, out_dir: Path, rows_per_set: int)
         print(f"mini eval {name}: {copied} rows -> {dest}", flush=True)
 
 
+def parse_stage_layer_boundaries(value: str) -> list[int] | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    boundaries = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not boundaries:
+        raise RuntimeError("--stage-layer-boundaries must not be empty when set")
+    if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
+        raise RuntimeError(f"--stage-layer-boundaries must be strictly increasing: {boundaries}")
+    return boundaries
+
+
+def derive_hidden_tap_indices(boundaries: list[int]) -> list[list[int]]:
+    rows: list[list[int]] = []
+    for depth in range(len(boundaries), 0, -1):
+        rows.append([0, *boundaries[:depth]])
+    return rows
+
+
+def hidden_tap_rows_arg(args: argparse.Namespace) -> str:
+    explicit = args.shallow_hidden_layer_indices.strip()
+    if explicit:
+        return explicit
+    boundaries = parse_stage_layer_boundaries(args.stage_layer_boundaries)
+    if boundaries is None:
+        return ""
+    if len(boundaries) != args.num_stages:
+        raise RuntimeError(
+            f"--stage-layer-boundaries has {len(boundaries)} entries but --num-stages is {args.num_stages}"
+        )
+    return ";".join(",".join(str(index) for index in row) for row in derive_hidden_tap_indices(boundaries))
+
+
+def resolve_draft_vocab_path(reference_dir: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return reference_dir / path
+
+
+def build_draft_vocab_json(
+    *,
+    args: argparse.Namespace,
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    vocab_size: int,
+) -> Path:
+    from collections import Counter
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    counts: Counter[int] = Counter()
+    for row in rows:
+        text = row_text_for_vocab(tokenizer, row.get("messages") or [])
+        if not text:
+            continue
+        counts.update(int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False))
+    for token_id in (
+        getattr(tokenizer, "eos_token_id", None),
+        getattr(tokenizer, "pad_token_id", None),
+        getattr(tokenizer, "bos_token_id", None),
+    ):
+        if token_id is not None:
+            counts[int(token_id)] += 1
+    if not counts:
+        raise RuntimeError("could not build draft vocab: no tokens counted")
+    token_ids = [
+        token_id
+        for token_id, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[
+            : max(1, int(vocab_size))
+        ]
+    ]
+    token_ids = sorted(set(token_ids))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output = {
+        "draft_vocab_size": len(token_ids),
+        "token_ids": token_ids,
+        "metadata": {
+            "base_model_path": args.model_name,
+            "source": "hf_train_eval_qwen06.py --build-draft-vocab-size",
+            "train_rows": len(rows),
+            "requested_vocab_size": int(vocab_size),
+        },
+    }
+    output_path.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"wrote draft vocab ({len(token_ids)} ids) -> {output_path}", flush=True)
+    return output_path
+
+
+def row_text_for_vocab(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
+    if not messages:
+        return ""
+    try:
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+        if isinstance(rendered, str):
+            return rendered
+    except Exception:
+        pass
+    return "\n".join(str(message.get("content", "")) for message in messages)
+
+
 def train_head(args: argparse.Namespace, reference_dir: Path, train_jsonl: Path, train_dir: Path) -> Path:
     cmd = [
         sys.executable,
@@ -368,8 +537,11 @@ def train_head(args: argparse.Namespace, reference_dir: Path, train_jsonl: Path,
         "--output_dir",
         str(train_dir),
     ]
+    hidden_rows = hidden_tap_rows_arg(args)
+    if hidden_rows:
+        cmd.extend(["--shallow_hidden_layer_indices", hidden_rows])
     if args.draft_vocab_json:
-        cmd.extend(["--draft_vocab_json", str(reference_dir / args.draft_vocab_json)])
+        cmd.extend(["--draft_vocab_json", str(resolve_draft_vocab_path(reference_dir, args.draft_vocab_json))])
     started = time.perf_counter()
     run(cmd, cwd=reference_dir, env=reference_env(args))
     elapsed = time.perf_counter() - started
@@ -435,6 +607,9 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
         raise RuntimeError(f"{ckpt} does not contain a config dict")
 
     draft_token_ids = config.get("draft_token_ids")
+    stage_layer_boundaries = config.get("stage_layer_boundaries")
+    if stage_layer_boundaries is None:
+        stage_layer_boundaries = parse_stage_layer_boundaries(args.stage_layer_boundaries)
     manifest_base_model_path = args.manifest_base_model_path.strip()
     if not manifest_base_model_path:
         manifest_base_model_path = config.get("base_model_path") or args.model_name
@@ -458,7 +633,7 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
             "vocab_size": int(config["vocab_size"]),
             "draft_vocab_size": int(config.get("draft_vocab_size", config["vocab_size"])),
             "num_stages": int(config["num_stages"]),
-            "stage_layer_boundaries": config.get("stage_layer_boundaries"),
+            "stage_layer_boundaries": stage_layer_boundaries,
             "num_spec_layers": int(config["num_spec_layers"]),
             "trained_with_use_deepest": bool(config.get("trained_with_use_deepest", False)),
             "shallow_hidden_layer_indices": config["shallow_hidden_layer_indices"],
@@ -593,6 +768,20 @@ def main() -> None:
     elif not args.skip_train:
         rows = load_training_rows(args.dataset, args.dataset_split, args.train_rows)
         write_jsonl(train_jsonl, rows)
+        if args.build_draft_vocab_size > 0:
+            draft_vocab_out = (
+                Path(args.draft_vocab_out).expanduser().resolve()
+                if args.draft_vocab_out
+                else data_dir / f"draft_vocab_top_{args.build_draft_vocab_size}.json"
+            )
+            args.draft_vocab_json = str(
+                build_draft_vocab_json(
+                    args=args,
+                    rows=rows,
+                    output_path=draft_vocab_out,
+                    vocab_size=args.build_draft_vocab_size,
+                )
+            )
         ckpt = train_head(args, reference_dir, train_jsonl, train_dir)
     else:
         ckpt = train_dir / "speculation_head_final.pt"
