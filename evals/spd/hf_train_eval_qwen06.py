@@ -724,7 +724,7 @@ def print_eval_summary(eval_dir: Path) -> None:
 
 def resolve_upload_repo(value: str) -> str | None:
     value = (value or "").strip()
-    if not value:
+    if not value or value.lower() in {"none", "off", "false", "disabled"}:
         return None
     if value != "auto":
         return value
