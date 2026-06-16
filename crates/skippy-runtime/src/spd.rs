@@ -55,6 +55,8 @@ pub struct SpdHeadTopology {
     pub vocab_size: u32,
     pub draft_vocab_size: u32,
     pub num_stages: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_layer_boundaries: Option<Vec<u32>>,
     pub num_spec_layers: u32,
     pub trained_with_use_deepest: bool,
     pub shallow_hidden_layer_indices: Vec<Vec<u32>>,
@@ -455,6 +457,16 @@ impl SpdHeadTopology {
         if self.num_stages == 0 {
             bail!("SPD head num_stages must be greater than zero");
         }
+        if let Some(boundaries) = &self.stage_layer_boundaries {
+            if boundaries.len() != self.num_stages as usize {
+                bail!(
+                    "SPD head stage_layer_boundaries length {} must match num_stages {}",
+                    boundaries.len(),
+                    self.num_stages
+                );
+            }
+            validate_sorted_unique_indices("stage_layer_boundaries", boundaries)?;
+        }
         if self.num_spec_layers == 0 {
             bail!("SPD head num_spec_layers must be greater than zero");
         }
@@ -647,6 +659,7 @@ mod tests {
                 vocab_size: 10,
                 draft_vocab_size: 3,
                 num_stages: 2,
+                stage_layer_boundaries: Some(vec![7, 14]),
                 num_spec_layers: 1,
                 trained_with_use_deepest: true,
                 shallow_hidden_layer_indices: vec![vec![0, 7, 14], vec![0, 14]],
@@ -709,6 +722,14 @@ mod tests {
         manifest.topology.draft_token_ids = Some(vec![1, 3]);
         let error = manifest.validate().unwrap_err().to_string();
         assert!(error.contains("draft_token_ids length"));
+    }
+
+    #[test]
+    fn rejects_stage_layer_boundary_count_mismatch() {
+        let mut manifest = valid_manifest();
+        manifest.topology.stage_layer_boundaries = Some(vec![7]);
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("stage_layer_boundaries length"));
     }
 
     #[test]

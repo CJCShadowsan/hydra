@@ -1,0 +1,100 @@
+# GLM 4.7 SPD Execution Plan
+
+This plan combines the local GLM 4.7 checkpoint, the GLM llama.cpp/Skippy work
+on `feat/jianyang-glm-llama-patches`, the Skippy SPD proof handoff in PR #859,
+and the reference implementation at `yuyijiong/speculative_pipeline_decoding`.
+
+The goal is to train a GLM 4.7 SPD sidecar model and benchmark vanilla GLM
+decode against GLM decode with the verified SPD sidecar enabled.
+
+## Scope
+
+This effort is about trained SPD, not native GLM MTP performance. The GLM MTP
+branch is useful as implementation scaffolding because it carries GLM
+llama.cpp/Skippy support, hidden-state exposure, verification, sampler, and
+rollback work. It should not be used as a competing benchmark lane.
+
+PR #859 is the SPD training, export, manifest, and latency-model handoff. The
+reference SPD repo remains the training/evaluation source for the sidecar head.
+
+## Phase 1: Inspect GLM
+
+Inspect the local checkpoint before training or benchmarking:
+
+- architecture and `model_type`
+- tokenizer identity and chat template presence
+- `num_hidden_layers`
+- `hidden_size`
+- vocab size
+- any GLM-specific auxiliary tensors preserved by llama.cpp patches
+
+The local `zai-org/GLM-4.7-Flash` snapshot reports:
+
+- architecture: `Glm4MoeLiteForCausalLM`
+- model type: `glm4_moe_lite`
+- target layers: `47`
+- hidden size: `2048`
+- vocab size: `154880`
+- auxiliary layer-47 tensors: `eh_proj`, `enorm`, `hnorm`
+
+## Phase 2: Frontload Code Risk
+
+Before long GPU training jobs, make the GLM SPD path executable enough to expose
+integration gaps:
+
+- add GLM model metadata inspection
+- support explicit non-uniform `stage_layer_boundaries`
+- derive GLM hidden-state tap rows from those boundaries
+- write manifest-compatible GLM SPD smoke artifacts
+- validate the smoke manifest through `skippy-runtime`
+- keep the smoke artifacts clearly separate from trained weights
+
+`evals/spd/glm47_frontload.py` owns this first executable surface. The default
+GLM 4.7 Flash topology uses stage boundaries `15,31,47`, matching the 47-layer
+target model without relying on equal layer division.
+
+## Phase 3: Baseline
+
+After the GLM code path exists, establish the vanilla GLM baseline:
+
+1. Run vanilla GLM decode from the local checkpoint or Skippy package.
+2. Freeze prompts, generation settings, tokenizer, temperature, max tokens, and
+   hardware.
+3. Record throughput, latency distribution, generated token counts, and output
+   text.
+4. If using Skippy, validate vanilla split correctness against non-split GLM.
+
+This baseline is the only performance comparison target for SPD.
+
+## Phase 4: Train And Evaluate SPD
+
+Build a GLM tokenizer-specific draft vocabulary. Do not reuse Qwen draft vocab.
+Start with 32k tokens, then try 50k if vocab coverage limits acceptance.
+
+Train only the SPD sidecar head against the frozen GLM base model. Evaluate with
+verification enabled and record accepted draft flags, acceptance rate,
+equivalent accept length, theoretical gain, summaries, and raw traces.
+
+Compare exactly two paths:
+
+- vanilla GLM target decode
+- GLM target decode with verified SPD sidecar
+
+## Phase 5: Serving Decision
+
+Only wire the trained SPD head into live Skippy if it is materially faster than
+vanilla GLM while preserving target-equivalent verified output.
+
+Serving integration then needs:
+
+- Rust safetensors loading for the SPD head
+- GLM SPD forward pass for the recorded topology
+- Skippy hidden-state taps or transport
+- Python/Rust proposal parity on fixed taps
+- verified proposal generation
+- rollback/session trim for rejected proposals
+- SPD metrics for draft, accept, reject, proposal time, verification time, and
+  end-to-end throughput
+
+If the trained sidecar is weak, keep the result as research evidence and do not
+wire it into serving.

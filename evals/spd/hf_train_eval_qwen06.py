@@ -458,6 +458,7 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
             "vocab_size": int(config["vocab_size"]),
             "draft_vocab_size": int(config.get("draft_vocab_size", config["vocab_size"])),
             "num_stages": int(config["num_stages"]),
+            "stage_layer_boundaries": config.get("stage_layer_boundaries"),
             "num_spec_layers": int(config["num_spec_layers"]),
             "trained_with_use_deepest": bool(config.get("trained_with_use_deepest", False)),
             "shallow_hidden_layer_indices": config["shallow_hidden_layer_indices"],

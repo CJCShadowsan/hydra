@@ -47,6 +47,50 @@ The reference SPD repository lists the intended training corpus family as:
 
 MT-Bench, HumanEval, and GSM8K prompts are used here only for evaluation.
 
+## GLM 4.7 Frontload Smoke Path
+
+`glm47_frontload.py` inspects a local GLM 4.7 checkpoint and writes a tiny
+manifest-compatible SPD smoke artifact before any long training run. This is
+for frontloading integration risk: GLM model metadata, non-uniform stage
+boundaries, hidden-state tap rows, and Rust manifest validation. The generated
+weights are shape fixtures, not a trained SPD head.
+
+The default local checkpoint path points at the cached `zai-org/GLM-4.7-Flash`
+snapshot when present. Override it with `--model-path` on another machine.
+
+```bash
+python evals/spd/glm47_frontload.py \
+  --model-path /path/to/GLM-4.7-Flash \
+  --work-dir /tmp/skippy-spd-glm47-frontload \
+  --num-stages 3 \
+  --stage-layer-boundaries 15,31,47 \
+  --num-spec-layers 1 \
+  --draft-vocab-size 8 \
+  --write-smoke-artifacts
+```
+
+The command writes:
+
+- `glm47-spd-frontload.json` — checkpoint inspection and derived topology
+- `speculation_head_final.pt` — placeholder provenance file
+- `spd-head.safetensors` — tiny Rust-readable serving shape fixture
+- `skippy-spd-head.json` — manifest with `stage_layer_boundaries`
+
+Validate the smoke manifest without building native llama.cpp:
+
+```bash
+SKIPPY_SPD_MANIFEST=/tmp/skippy-spd-glm47-frontload/glm47-spd-frontload/skippy-spd-head.json \
+  cargo test -p skippy-runtime --features dynamic-native-runtime \
+  validates_external_manifest_when_skippy_spd_manifest_is_set
+```
+
+The inspected local GLM 4.7 Flash checkpoint currently reports
+`model_type = glm4_moe_lite`, architecture `Glm4MoeLiteForCausalLM`,
+`num_hidden_layers = 47`, `hidden_size = 2048`, `vocab_size = 154880`, and
+layer-47 auxiliary tensors `eh_proj`, `enorm`, and `hnorm`. Because 47 target
+layers do not divide evenly into the old equal-stage assumptions, GLM SPD
+manifests carry explicit `stage_layer_boundaries`.
+
 ## Reproduce Qwen3-0.6B Training
 
 This is the smallest useful proof that the training path and artifact shape
