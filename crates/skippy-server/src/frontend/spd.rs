@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -9,6 +10,7 @@ use skippy_runtime::spd::{
     SpdQwen3ForwardInput, SpdQwen3Head, SpdSafetensorsFile, SpdStageLayerRange,
     assemble_spd_live_cur_in_for_positions, plan_hidden_state_taps, sliding_spd_row_positions,
 };
+use skippy_runtime::{ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout};
 
 use super::*;
 
@@ -25,6 +27,12 @@ pub(super) struct SpdReplayOpenArgs<'a> {
     pub(super) top_k: usize,
 }
 
+#[derive(Clone)]
+pub(super) struct SpdReplayProposalState {
+    pub(super) source: Arc<Mutex<SpdReplayProposalSource>>,
+    taps: Arc<Mutex<SpdInlineTapCache>>,
+}
+
 pub(super) struct SpdReplayProposalSource {
     pub(super) manifest_path: PathBuf,
     pub(super) model_path: PathBuf,
@@ -33,6 +41,7 @@ pub(super) struct SpdReplayProposalSource {
     row_count: usize,
     row_stage_ids: Vec<i64>,
     row_hf_indices: Vec<Vec<u32>>,
+    required_hf_indices: Vec<u32>,
     hidden_size: usize,
     final_norm_weight: Vec<f32>,
     context_tokens: Vec<i32>,
@@ -40,6 +49,7 @@ pub(super) struct SpdReplayProposalSource {
     manifest: SpdHeadManifest,
     serving_file: SpdSafetensorsFile,
     live_taps: SpdLiveTapRunner,
+    inline_taps: Arc<Mutex<SpdInlineTapCache>>,
 }
 
 impl SpdReplayProposalSource {
@@ -68,6 +78,7 @@ impl SpdReplayProposalSource {
         let row_count = fixture_cur_in_row_count(&fixture_file, hidden_size)?;
         let row_stage_ids = read_spd_row_stage_ids(&fixture_file, row_count)?;
         let row_hf_indices = read_spd_row_hf_indices(&fixture_file, row_count)?;
+        let required_hf_indices = required_spd_hf_indices(&row_hf_indices);
         let final_norm_weight = read_spd_final_norm_weight(&fixture_file, hidden_size)?;
         let stage_ranges = spd_stage_ranges_from_topology(topology)?;
         let tap_plan = plan_hidden_state_taps(&manifest.topology, &stage_ranges)?;
@@ -93,6 +104,10 @@ impl SpdReplayProposalSource {
                 .map(|device| device.backend_device.clone()),
         })
         .context("open live SPD tap replay stages")?;
+        let inline_taps = Arc::new(Mutex::new(SpdInlineTapCache::new(
+            hidden_size,
+            required_hf_indices.clone(),
+        )));
         Ok(Self {
             manifest_path: manifest_path.to_path_buf(),
             model_path,
@@ -101,6 +116,7 @@ impl SpdReplayProposalSource {
             row_count,
             row_stage_ids,
             row_hf_indices,
+            required_hf_indices,
             hidden_size,
             final_norm_weight,
             context_tokens: Vec::new(),
@@ -108,12 +124,14 @@ impl SpdReplayProposalSource {
             manifest,
             serving_file,
             live_taps,
+            inline_taps,
         })
     }
 
     fn propose_one(&self, context_tokens: &[i32]) -> Result<i32> {
         let row_positions = sliding_spd_row_positions(context_tokens.len(), self.row_count)?;
-        let taps = self.live_taps.collect_taps(context_tokens)?;
+        let mut taps = self.live_taps.collect_taps(context_tokens)?;
+        self.overlay_inline_taps(&mut taps, &row_positions)?;
         let live_rows = assemble_spd_live_cur_in_for_positions(SpdLiveCurInRequest {
             manifest: &self.manifest,
             serving_file: &self.serving_file,
@@ -138,6 +156,23 @@ impl SpdReplayProposalSource {
             .context("SPD head returned no proposal token")
             .and_then(|token| i32::try_from(token).context("SPD proposal token exceeds i32"))
     }
+
+    fn overlay_inline_taps(
+        &self,
+        taps: &mut BTreeMap<u32, ActivationFrame>,
+        row_positions: &[i64],
+    ) -> Result<()> {
+        let mut inline_taps = self
+            .inline_taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?;
+        inline_taps.overlay_complete_frames(
+            taps,
+            row_positions,
+            &self.required_hf_indices,
+            self.hidden_size,
+        )
+    }
 }
 
 impl SpeculativeProposalSource for SpdReplayProposalSource {
@@ -151,6 +186,10 @@ impl SpeculativeProposalSource for SpdReplayProposalSource {
 
     fn reset_to_context(&mut self, context_tokens: &[i32]) -> Result<()> {
         self.context_tokens = context_tokens.to_vec();
+        self.inline_taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?
+            .clear();
         Ok(())
     }
 
@@ -173,13 +212,240 @@ impl SpeculativeProposalSource for SpdReplayProposalSource {
 
 pub(super) fn open_spd_replay_source(
     args: SpdReplayOpenArgs<'_>,
-) -> Result<Option<Arc<Mutex<SpdReplayProposalSource>>>> {
+) -> Result<Option<SpdReplayProposalState>> {
     match (args.manifest_path, args.fixture_path) {
         (None, None) => Ok(None),
-        (Some(_), Some(_)) => Ok(Some(Arc::new(Mutex::new(SpdReplayProposalSource::open(
-            args,
-        )?)))),
+        (Some(_), Some(_)) => {
+            let source = SpdReplayProposalSource::open(args)?;
+            let taps = source.inline_taps.clone();
+            Ok(Some(SpdReplayProposalState {
+                source: Arc::new(Mutex::new(source)),
+                taps,
+            }))
+        }
         _ => bail!("--openai-spd-manifest and --openai-spd-fixture must be set together"),
+    }
+}
+
+impl StageOpenAiBackend {
+    pub(super) fn record_spd_stage0_boundary_tap(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        message: &StageWireMessage,
+        frame: &ActivationFrame,
+    ) {
+        let Some(spd) = request.spd.as_ref() else {
+            return;
+        };
+        let outcome = spd
+            .taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))
+            .and_then(|mut taps| taps.record_stage_output(request.config, message, frame));
+        match outcome {
+            Ok(Some(record)) => {
+                let mut attrs = self.openai_attrs(request.ids);
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_hf_index".to_string(),
+                    json!(record.hf_index),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_rows_recorded".to_string(),
+                    json!(record.rows_recorded),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_cached_rows".to_string(),
+                    json!(record.cached_rows),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_payload_bytes".to_string(),
+                    json!(record.payload_bytes),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_required".to_string(),
+                    json!(record.required),
+                );
+                self.telemetry
+                    .emit_debug("stage.openai_spd_tap_record", attrs);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let mut attrs = self.openai_attrs(request.ids);
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_error".to_string(),
+                    json!(error.to_string()),
+                );
+                self.telemetry
+                    .emit_debug("stage.openai_spd_tap_record_failed", attrs);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpdInlineTapRecord {
+    hf_index: u32,
+    rows_recorded: usize,
+    cached_rows: usize,
+    payload_bytes: usize,
+    required: bool,
+}
+
+struct SpdInlineTapCache {
+    hidden_size: usize,
+    required_hf_indices: BTreeSet<u32>,
+    frames: BTreeMap<u32, SpdCachedTapFrame>,
+}
+
+impl SpdInlineTapCache {
+    fn new(hidden_size: usize, required_hf_indices: Vec<u32>) -> Self {
+        Self {
+            hidden_size,
+            required_hf_indices: required_hf_indices.into_iter().collect(),
+            frames: BTreeMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    fn record_stage_output(
+        &mut self,
+        config: &StageConfig,
+        message: &StageWireMessage,
+        frame: &ActivationFrame,
+    ) -> Result<Option<SpdInlineTapRecord>> {
+        let hf_index = config.layer_end;
+        if frame.payload.is_empty() {
+            return Ok(None);
+        }
+        let required = self.required_hf_indices.contains(&hf_index);
+        validate_spd_inline_frame(frame, self.hidden_size)?;
+        let token_count =
+            usize::try_from(frame.desc.token_count).context("SPD tap token_count exceeds usize")?;
+        if token_count == 0 {
+            return Ok(None);
+        }
+        let positions = message_positions(message, token_count)?;
+        let cached = self
+            .frames
+            .entry(hf_index)
+            .or_insert_with(|| SpdCachedTapFrame::new(frame.desc));
+        let row_bytes = self
+            .hidden_size
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("SPD inline tap row byte width overflow")?;
+        for (row_index, position) in positions.iter().copied().enumerate() {
+            let offset = row_index
+                .checked_mul(row_bytes)
+                .context("SPD inline tap payload offset overflow")?;
+            cached
+                .rows
+                .insert(position, frame.payload[offset..offset + row_bytes].to_vec());
+        }
+        Ok(Some(SpdInlineTapRecord {
+            hf_index,
+            rows_recorded: positions.len(),
+            cached_rows: cached.rows.len(),
+            payload_bytes: frame.payload.len(),
+            required,
+        }))
+    }
+
+    fn overlay_complete_frames(
+        &mut self,
+        taps: &mut BTreeMap<u32, ActivationFrame>,
+        row_positions: &[i64],
+        required_hf_indices: &[u32],
+        hidden_size: usize,
+    ) -> Result<()> {
+        if hidden_size != self.hidden_size {
+            bail!(
+                "SPD inline tap hidden size mismatch: cache {}, request {}",
+                self.hidden_size,
+                hidden_size
+            );
+        }
+        for hf_index in required_hf_indices {
+            let Some(frame) = self.frame_for_positions(*hf_index, row_positions)? else {
+                continue;
+            };
+            taps.insert(*hf_index, frame);
+        }
+        Ok(())
+    }
+
+    fn frame_for_positions(
+        &self,
+        hf_index: u32,
+        row_positions: &[i64],
+    ) -> Result<Option<ActivationFrame>> {
+        let Some(cached) = self.frames.get(&hf_index) else {
+            return Ok(None);
+        };
+        let positions = row_positions
+            .iter()
+            .copied()
+            .map(|position| {
+                u32::try_from(position)
+                    .with_context(|| format!("negative SPD inline tap position {position}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if positions
+            .iter()
+            .any(|position| !cached.rows.contains_key(position))
+        {
+            return Ok(None);
+        }
+        let token_count = positions
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("SPD inline tap synthetic token_count overflow")?;
+        let row_bytes = self
+            .hidden_size
+            .checked_mul(std::mem::size_of::<f32>())
+            .context("SPD inline tap row byte width overflow")?;
+        let total_bytes = usize::try_from(token_count)
+            .context("SPD inline tap token_count exceeds usize")?
+            .checked_mul(row_bytes)
+            .context("SPD inline tap synthetic payload overflow")?;
+        let mut payload = vec![0_u8; total_bytes];
+        for position in positions {
+            let row = cached
+                .rows
+                .get(&position)
+                .context("missing cached SPD row after completeness check")?;
+            let offset = usize::try_from(position)
+                .context("SPD inline tap position exceeds usize")?
+                .checked_mul(row_bytes)
+                .context("SPD inline tap synthetic offset overflow")?;
+            payload[offset..offset + row_bytes].copy_from_slice(row);
+        }
+        let mut desc = cached.desc;
+        desc.token_count = token_count;
+        desc.sequence_count = if token_count == 0 { 0 } else { 1 };
+        desc.payload_bytes =
+            u64::try_from(payload.len()).context("SPD inline tap payload bytes exceed u64")?;
+        Ok(Some(ActivationFrame { desc, payload }))
+    }
+}
+
+#[derive(Clone)]
+struct SpdCachedTapFrame {
+    desc: skippy_runtime::ActivationDesc,
+    rows: BTreeMap<u32, Vec<u8>>,
+}
+
+impl SpdCachedTapFrame {
+    fn new(desc: skippy_runtime::ActivationDesc) -> Self {
+        Self {
+            desc,
+            rows: BTreeMap::new(),
+        }
     }
 }
 
@@ -200,6 +466,76 @@ fn resolve_spd_model_path(override_path: Option<&Path>, config: &StageConfig) ->
     bail!(
         "SPD replay source requires a full GGUF via --openai-spd-model-path, source_model_path, or model_path"
     )
+}
+
+fn required_spd_hf_indices(row_hf_indices: &[Vec<u32>]) -> Vec<u32> {
+    row_hf_indices
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn validate_spd_inline_frame(frame: &ActivationFrame, hidden_size: usize) -> Result<()> {
+    if frame.desc.dtype != RuntimeActivationDType::F32 {
+        bail!(
+            "SPD inline tap frame must be f32, got {:?}",
+            frame.desc.dtype
+        );
+    }
+    if frame.desc.layout != RuntimeActivationLayout::TokenMajor {
+        bail!(
+            "SPD inline tap frame must be token-major, got {:?}",
+            frame.desc.layout
+        );
+    }
+    let token_count =
+        usize::try_from(frame.desc.token_count).context("SPD tap token_count exceeds usize")?;
+    let expected = token_count
+        .checked_mul(hidden_size)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .context("SPD inline tap expected payload byte count overflow")?;
+    if frame.payload.len() != expected {
+        bail!(
+            "SPD inline tap payload has {} bytes, expected {} for {} tokens x hidden {}",
+            frame.payload.len(),
+            expected,
+            token_count,
+            hidden_size
+        );
+    }
+    Ok(())
+}
+
+fn message_positions(message: &StageWireMessage, token_count: usize) -> Result<Vec<u32>> {
+    if message.positions.len() == token_count {
+        return message
+            .positions
+            .iter()
+            .copied()
+            .map(|position| {
+                u32::try_from(position)
+                    .with_context(|| format!("negative SPD inline tap position {position}"))
+            })
+            .collect();
+    }
+    if !message.positions.is_empty() {
+        bail!(
+            "SPD inline tap positions length {} does not match token_count {}",
+            message.positions.len(),
+            token_count
+        );
+    }
+    let start = u32::try_from(message.pos_start).context("negative SPD inline tap pos_start")?;
+    (0..token_count)
+        .map(|offset| {
+            let offset = u32::try_from(offset).context("SPD inline tap offset exceeds u32")?;
+            start
+                .checked_add(offset)
+                .context("SPD inline tap position overflow")
+        })
+        .collect()
 }
 
 fn ensure_model_file(path: &Path) -> Result<()> {
@@ -282,7 +618,11 @@ fn read_spd_final_norm_weight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skippy_protocol::{LoadMode, StageTopologyEntry};
+    use skippy_protocol::{
+        LoadMode, StageTopologyEntry,
+        binary::{StageStateHeader, WireActivationDType, WireMessageKind},
+    };
+    use skippy_runtime::{ActivationDesc, RuntimeActivationDType, RuntimeActivationLayout};
 
     #[test]
     fn stage_ranges_from_topology_are_layer_sorted() {
@@ -306,6 +646,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_tap_cache_rebuilds_positioned_activation_frame() {
+        let mut cache = SpdInlineTapCache::new(2, vec![8]);
+        let config = stage_config("stage-0", 0, 0, 8);
+        let message = stage_message(2, 2, Vec::new());
+        let frame = activation_frame(0, 8, &[1.0, 2.0, 3.0, 4.0]);
+
+        let record = cache
+            .record_stage_output(&config, &message, &frame)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record,
+            SpdInlineTapRecord {
+                hf_index: 8,
+                rows_recorded: 2,
+                cached_rows: 2,
+                payload_bytes: 16,
+                required: true,
+            }
+        );
+
+        let rebuilt = cache
+            .frame_for_positions(8, &[2, 3])
+            .unwrap()
+            .expect("positions should be complete");
+        assert_eq!(rebuilt.desc.token_count, 4);
+        assert_eq!(f32_row(&rebuilt, 2, 2), vec![1.0, 2.0]);
+        assert_eq!(f32_row(&rebuilt, 3, 2), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn inline_tap_cache_overlays_complete_required_frames() {
+        let mut cache = SpdInlineTapCache::new(2, vec![8]);
+        let config = stage_config("stage-0", 0, 0, 8);
+        let message = stage_message(2, 2, vec![2, 3]);
+        let frame = activation_frame(0, 8, &[5.0, 6.0, 7.0, 8.0]);
+        cache
+            .record_stage_output(&config, &message, &frame)
+            .unwrap()
+            .unwrap();
+        let mut taps = BTreeMap::new();
+
+        cache
+            .overlay_complete_frames(&mut taps, &[2, 3], &[8], 2)
+            .unwrap();
+
+        let overlaid = taps.get(&8).expect("expected overlaid tap");
+        assert_eq!(f32_row(overlaid, 2, 2), vec![5.0, 6.0]);
+        assert_eq!(f32_row(overlaid, 3, 2), vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn inline_tap_cache_records_unrequired_stage_output_without_overlaying_it() {
+        let mut cache = SpdInlineTapCache::new(2, vec![8]);
+        let config = stage_config("stage-1", 1, 8, 10);
+        let message = stage_message(0, 1, Vec::new());
+        let frame = activation_frame(8, 10, &[1.0, 2.0]);
+
+        let record = cache
+            .record_stage_output(&config, &message, &frame)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record,
+            SpdInlineTapRecord {
+                hf_index: 10,
+                rows_recorded: 1,
+                cached_rows: 1,
+                payload_bytes: 8,
+                required: false,
+            }
+        );
+        let mut taps = BTreeMap::new();
+        cache
+            .overlay_complete_frames(&mut taps, &[0], &[8], 2)
+            .unwrap();
+        assert!(taps.is_empty());
+    }
+
+    #[test]
+    fn inline_tap_cache_clear_drops_recorded_rows() {
+        let mut cache = SpdInlineTapCache::new(2, vec![8]);
+        let config = stage_config("stage-0", 0, 0, 8);
+        let message = stage_message(2, 1, Vec::new());
+        let frame = activation_frame(0, 8, &[1.0, 2.0]);
+        cache
+            .record_stage_output(&config, &message, &frame)
+            .unwrap()
+            .unwrap();
+
+        cache.clear();
+
+        assert!(cache.frame_for_positions(8, &[2]).unwrap().is_none());
+    }
+
     fn stage_entry(
         stage_id: &str,
         stage_index: u32,
@@ -321,5 +757,93 @@ mod tests {
             layer_end,
             load_mode: LoadMode::RuntimeSlice,
         }
+    }
+
+    fn stage_config(
+        stage_id: &str,
+        stage_index: u32,
+        layer_start: u32,
+        layer_end: u32,
+    ) -> StageConfig {
+        StageConfig {
+            run_id: "run".to_string(),
+            topology_id: "topology".to_string(),
+            model_id: "model".to_string(),
+            package_ref: None,
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some("/tmp/model.gguf".to_string()),
+            projector_path: None,
+            stage_id: stage_id.to_string(),
+            stage_index,
+            layer_start,
+            layer_end,
+            ctx_size: 128,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: 0,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
+            filter_tensors_on_load: true,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::RuntimeSlice,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: None,
+        }
+    }
+
+    fn stage_message(pos_start: i32, token_count: i32, positions: Vec<i32>) -> StageWireMessage {
+        StageWireMessage {
+            kind: WireMessageKind::PrefillEmbd,
+            pos_start,
+            token_count,
+            state: StageStateHeader::new(WireMessageKind::PrefillEmbd, WireActivationDType::F32),
+            request_id: 1,
+            session_id: 2,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![1; usize::try_from(token_count).unwrap()],
+            positions,
+            activation: Vec::new(),
+            raw_bytes: Vec::new(),
+        }
+    }
+
+    fn activation_frame(layer_start: i32, layer_end: i32, values: &[f32]) -> ActivationFrame {
+        let payload = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        ActivationFrame {
+            desc: ActivationDesc {
+                version: 1,
+                dtype: RuntimeActivationDType::F32,
+                layout: RuntimeActivationLayout::TokenMajor,
+                producer_stage_index: 0,
+                layer_start,
+                layer_end,
+                token_count: u32::try_from(values.len() / 2).unwrap(),
+                sequence_count: 1,
+                payload_bytes: u64::try_from(payload.len()).unwrap(),
+                flags: 0,
+            },
+            payload,
+        }
+    }
+
+    fn f32_row(frame: &ActivationFrame, row_index: usize, width: usize) -> Vec<f32> {
+        let offset = row_index * width * std::mem::size_of::<f32>();
+        frame.payload[offset..offset + width * std::mem::size_of::<f32>()]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
     }
 }

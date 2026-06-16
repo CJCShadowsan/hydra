@@ -390,6 +390,12 @@ not speed. The next engineering step is to replace replayed taps with inline
 tap capture and then run ordinary split serving and SPD serving against a
 larger shared prompt set with injected and real hop latency.
 
+Current inline-tap progress: embedded stage-0 serving now records stage-0
+boundary activation rows into an SPD-positioned tap cache and `spd-replay`
+overlays complete cached boundary frames before falling back to local replay.
+The remaining production work is downstream tap return plus scheduling proposal
+generation after the in-flight current-token taps exist.
+
 ## Validate Hidden Tap Compatibility
 
 `skippy-runtime` includes a Rust tap planner that converts the manifest's
@@ -450,7 +456,9 @@ The tap-row-to-`cur_in` projection bridge lives in
    Python reference on the same taps.
 2. For the first live proof, prefer the tap-aligned over-split unless the
    hidden-tap ABI is already available.
-3. Replace `spd-replay` with inline tap capture in `skippy-server`.
+3. Replace `spd-replay` with inline tap capture in `skippy-server`. Stage-0
+   positioned tap caching exists; downstream tap return and in-flight proposal
+   scheduling remain.
 4. Verify every accepted token through the normal target stages.
 5. Benchmark against ordinary split serving with both injected hop latency and a
    real multi-node topology.

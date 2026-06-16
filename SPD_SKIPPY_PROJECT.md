@@ -328,13 +328,24 @@ ordinary greedy output. It is still not a serving throughput measurement:
 on CPU for each proposal. Use the trace latency simulator for current speedup
 estimates until inline tap capture exists.
 
+The first inline-tap plumbing is now in place. During embedded stage-0 serving,
+Skippy records stage-0 boundary activation frames into an SPD-positioned tap
+cache keyed by hidden-state index and token position. `spd-replay` overlays any
+complete cached tap frame before falling back to local replay, and emits debug
+telemetry when stage-0 SPD tap rows are recorded. This does not yet remove the
+replay cost for the full Qwen3.5-4B SPD head, because deeper boundary taps still
+need to be returned from downstream stage processes and the proposal order still
+needs to be rearranged around in-flight current-token taps.
+
 ## What Does Not Work Yet
 
 - The `spd-replay` request path is a correctness bridge, not a speed path. It
   replays taps through local stage slices before feeding proposals into the
   existing verify/repair/rollback loop.
 - Inline hidden-tap capture and transport are still needed before SPD can hide
-  real Skippy pipeline bubbles instead of adding replay overhead.
+  real Skippy pipeline bubbles instead of adding replay overhead. Stage-0
+  positioned tap caching exists; downstream tap return and proposal scheduling
+  still need implementation.
 - Request-path acceptance has been proven on a bounded four-token smoke, but a
   larger local request-path acceptance/latency sweep is still needed.
 - No larger-than-4B head has been trained by us yet.
@@ -661,7 +672,9 @@ Tasks:
 6. Run ordinary split serving and SPD serving against the same prompts. Done
    for one bounded local smoke; still needed as a broader sweep.
 7. Replace replayed local tap collection with inline hidden-tap capture and
-   transport so performance can match the SPD pipeline design.
+   transport so performance can match the SPD pipeline design. Stage-0
+   positioned tap cache/overlay is in place; downstream stage tap return and
+   in-flight proposal scheduling remain.
 
 Exit criteria:
 

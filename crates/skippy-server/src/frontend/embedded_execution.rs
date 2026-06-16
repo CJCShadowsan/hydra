@@ -59,6 +59,7 @@ impl StageOpenAiBackend {
             }
         };
         let stage0_compute_ms = stage0_timer.elapsed_ms();
+        self.record_spd_stage0_boundary_tap(request, message, &output.output);
         let forwarded = forwarded_stage_message_timed(
             request.config,
             message,

@@ -258,6 +258,7 @@ impl StageOpenAiBackend {
                         self.telemetry
                             .emit("stage.openai_kv_record_decision", attrs);
                     }
+                    self.record_spd_stage0_boundary_tap(&request, &message, &output);
                     let chunk_stage0_compute_ms = stage0_timer.elapsed_ms();
                     prefill_stage0_compute_ms += chunk_stage0_compute_ms;
                     let forwarded = forwarded_stage_message(
@@ -761,6 +762,7 @@ impl StageOpenAiBackend {
                 Some(spd) if request.speculative_window > 0 => {
                     let spd_reset_timer = PhaseTimer::start();
                     let mut spd = spd
+                        .source
                         .lock()
                         .map_err(|_| OpenAiError::backend("SPD source lock poisoned"))?;
                     spd.reset_to_context(&context_tokens)
@@ -1206,6 +1208,7 @@ impl StageOpenAiBackend {
                 };
                 let stage0_compute_ms = stage0_timer.elapsed_ms();
                 decode_stage0_compute_ms += stage0_compute_ms;
+                self.record_spd_stage0_boundary_tap(&request, message, &output);
                 let forwarded = forwarded_stage_message_timed(
                     request.config,
                     message,
