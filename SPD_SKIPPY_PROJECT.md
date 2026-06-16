@@ -273,6 +273,18 @@ python evals/spd/export_spd_head.py \
   --base-model-path Qwen/Qwen3.5-4B
 ```
 
+### Export Rust/Python Parity Fixture
+
+```bash
+python evals/spd/export_parity_fixture.py \
+  --reference-dir /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/speculative_pipeline_decoding \
+  --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
+  --base-model-path Qwen/Qwen3.5-4B \
+  --out /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
+  --device mps \
+  --top-k 8
+```
+
 ### Simulate Split Latency From Trace
 
 ```bash
@@ -316,7 +328,8 @@ Goal: Rust computes the same draft candidates as Python for recorded inputs.
 
 Tasks:
 
-1. Record hidden-state tap fixtures from Python reference execution.
+1. Record hidden-state tap fixtures from Python reference execution. Fixture
+   export is scaffolded in `evals/spd/export_parity_fixture.py`.
 2. Implement the Qwen3.5-4B SPD head forward pass in Rust.
 3. Compare Rust top-k draft candidates against Python top-k on the same hidden
    states.
@@ -407,7 +420,7 @@ is to make the SPD path clear and reproducible.
 Run:
 
 ```bash
-python3 -m py_compile evals/spd/hf_train_eval_qwen06.py evals/spd/simulate_latency.py evals/spd/export_spd_head.py
+python3 -m py_compile evals/spd/hf_train_eval_qwen06.py evals/spd/simulate_latency.py evals/spd/export_spd_head.py evals/spd/export_parity_fixture.py
 cargo fmt --all -- --check
 cargo test -p skippy-runtime spd
 cargo clippy -p skippy-runtime --all-targets -- -D warnings

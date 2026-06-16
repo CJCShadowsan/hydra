@@ -168,12 +168,37 @@ SKIPPY_SPD_MANIFEST=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>
   cargo test -p skippy-runtime validates_external_manifest_when_skippy_spd_manifest_is_set
 ```
 
+## Export a Rust/Python Parity Fixture
+
+The next implementation step is Rust top-k parity against Python for the same
+trained head and the same real hidden-state inputs. Export a fixture with:
+
+```bash
+python evals/spd/export_parity_fixture.py \
+  --reference-dir /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/speculative_pipeline_decoding \
+  --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
+  --base-model-path Qwen/Qwen3.5-4B \
+  --out /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
+  --device mps \
+  --top-k 8
+```
+
+This writes real SPD inference rows, position ids, Python logits, Python top-k
+draft indices, and Python top-k full token ids. Validate the fixture container
+through Rust with:
+
+```bash
+SKIPPY_SPD_PARITY_FIXTURE=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
+  cargo test -p skippy-runtime validates_external_parity_fixture_when_skippy_spd_parity_fixture_is_set
+```
+
 ## Artifact Contract
 
 The proof runner writes:
 
 - `train/speculation_head_final.pt`
 - `train/spd-head.safetensors` after export
+- `train/spd-parity-fixture.safetensors` after fixture export
 - `train/skippy-spd-head.json`
 - `eval/raw/*.jsonl`
 - `eval/summary/*.json`

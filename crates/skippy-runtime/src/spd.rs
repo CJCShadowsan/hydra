@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 pub const SPD_HEAD_MANIFEST_SCHEMA: &str = "skippy-spd-head/v1";
 pub const TORCH_SPD_HEAD_FORMAT_V10: &str = "torch-speculation-head-v10";
 pub const SPD_SERVING_CHECKPOINT_FORMAT_SAFETENSORS_V1: &str = "safetensors-spd-head-v1";
+pub const SPD_PARITY_FIXTURE_SCHEMA: &str = "skippy-spd-parity-fixture/v1";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SpdHeadManifest {
@@ -846,6 +847,30 @@ mod tests {
             .ensure_serving_checkpoint_for_runtime(&manifest_path)
             .unwrap();
         assert!(index.tensors.contains_key("lm_head.weight"));
+    }
+
+    #[test]
+    fn validates_external_parity_fixture_when_skippy_spd_parity_fixture_is_set() {
+        let Ok(fixture_path) = std::env::var("SKIPPY_SPD_PARITY_FIXTURE") else {
+            return;
+        };
+        let index = SpdSafetensorsIndex::from_path(PathBuf::from(fixture_path)).unwrap();
+        assert_eq!(
+            index.metadata.get("schema").map(String::as_str),
+            Some(SPD_PARITY_FIXTURE_SCHEMA)
+        );
+
+        let cur_in = index.tensors.get("cur_in").unwrap();
+        let position_ids = index.tensors.get("position_ids").unwrap();
+        let python_logits = index.tensors.get("python_logits").unwrap();
+        let topk_token_ids = index.tensors.get("python_topk_token_ids").unwrap();
+
+        assert_eq!(cur_in.shape.len(), 3);
+        assert_eq!(position_ids.shape, vec![cur_in.shape[0], cur_in.shape[1]]);
+        assert_eq!(python_logits.shape.len(), 3);
+        assert_eq!(python_logits.shape[0], cur_in.shape[0]);
+        assert_eq!(python_logits.shape[1], 1);
+        assert_eq!(topk_token_ids.shape.len(), 1);
     }
 
     #[test]
