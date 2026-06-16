@@ -44,6 +44,10 @@ struct ActivationFrameComparison {
     f32_compared: usize,
     f32_max_abs_diff: f32,
     f32_mean_abs_diff: f64,
+    row_byte_diff_counts: Vec<usize>,
+    row_f32_compared: Vec<usize>,
+    row_f32_max_abs_diff: Vec<f32>,
+    row_f32_mean_abs_diff: Vec<f64>,
 }
 
 impl ActivationFrameComparison {
@@ -66,6 +70,12 @@ impl ActivationFrameComparison {
             .and_then(|(byte, bytes)| (bytes > 0).then_some(byte / bytes));
         let (f32_compared, f32_max_abs_diff, f32_mean_abs_diff) =
             compare_activation_f32_payloads(&batched.payload, &serial.payload);
+        let row_metrics = row_activation_metrics(
+            &batched.payload,
+            &serial.payload,
+            row_bytes,
+            batched.desc.token_count.min(serial.desc.token_count) as usize,
+        );
 
         Self {
             desc_equal: batched.desc == serial.desc,
@@ -78,6 +88,22 @@ impl ActivationFrameComparison {
             f32_compared,
             f32_max_abs_diff,
             f32_mean_abs_diff,
+            row_byte_diff_counts: row_metrics
+                .iter()
+                .map(|metrics| metrics.byte_diff_count)
+                .collect(),
+            row_f32_compared: row_metrics
+                .iter()
+                .map(|metrics| metrics.f32_compared)
+                .collect(),
+            row_f32_max_abs_diff: row_metrics
+                .iter()
+                .map(|metrics| metrics.f32_max_abs_diff)
+                .collect(),
+            row_f32_mean_abs_diff: row_metrics
+                .iter()
+                .map(|metrics| metrics.f32_mean_abs_diff)
+                .collect(),
         }
     }
 
@@ -114,6 +140,28 @@ impl ActivationFrameComparison {
             "llama_stage.native_mtp.stage0_compare.f32_mean_abs_diff".to_string(),
             json!(self.f32_mean_abs_diff),
         );
+        attrs.insert(
+            "llama_stage.native_mtp.stage0_compare.row_count".to_string(),
+            json!(self.row_byte_diff_counts.len()),
+        );
+        for row in 0..self.row_byte_diff_counts.len() {
+            attrs.insert(
+                format!("llama_stage.native_mtp.stage0_compare.row{row}.byte_diff_count"),
+                json!(self.row_byte_diff_counts[row]),
+            );
+            attrs.insert(
+                format!("llama_stage.native_mtp.stage0_compare.row{row}.f32_compared"),
+                json!(self.row_f32_compared[row]),
+            );
+            attrs.insert(
+                format!("llama_stage.native_mtp.stage0_compare.row{row}.f32_max_abs_diff"),
+                json!(self.row_f32_max_abs_diff[row]),
+            );
+            attrs.insert(
+                format!("llama_stage.native_mtp.stage0_compare.row{row}.f32_mean_abs_diff"),
+                json!(self.row_f32_mean_abs_diff[row]),
+            );
+        }
         if let Some(first_diff_byte) = self.first_diff_byte {
             attrs.insert(
                 "llama_stage.native_mtp.stage0_compare.first_diff_byte".to_string(),
@@ -127,6 +175,48 @@ impl ActivationFrameComparison {
             );
         }
     }
+}
+
+struct ActivationRowMetrics {
+    byte_diff_count: usize,
+    f32_compared: usize,
+    f32_max_abs_diff: f32,
+    f32_mean_abs_diff: f64,
+}
+
+fn row_activation_metrics(
+    batched: &[u8],
+    serial: &[u8],
+    row_bytes: Option<usize>,
+    row_count: usize,
+) -> Vec<ActivationRowMetrics> {
+    let Some(row_bytes) = row_bytes.filter(|bytes| *bytes > 0) else {
+        return Vec::new();
+    };
+    let max_complete_rows = batched.len().min(serial.len()) / row_bytes;
+    let compared_rows = row_count.min(max_complete_rows);
+    (0..compared_rows)
+        .map(|row| {
+            let row_start = row * row_bytes;
+            let row_end = row_start + row_bytes;
+            let byte_diff_count = batched[row_start..row_end]
+                .iter()
+                .zip(&serial[row_start..row_end])
+                .filter(|(left, right)| left != right)
+                .count();
+            let (f32_compared, f32_max_abs_diff, f32_mean_abs_diff) =
+                compare_activation_f32_payloads(
+                    &batched[row_start..row_end],
+                    &serial[row_start..row_end],
+                );
+            ActivationRowMetrics {
+                byte_diff_count,
+                f32_compared,
+                f32_max_abs_diff,
+                f32_mean_abs_diff,
+            }
+        })
+        .collect()
 }
 
 fn compare_activation_f32_payloads(batched: &[u8], serial: &[u8]) -> (usize, f32, f64) {
