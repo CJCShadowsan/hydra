@@ -36,6 +36,7 @@ DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-2}"
 N_GPU_LAYERS="${N_GPU_LAYERS:-0}"
 RUN_BENCHY="${RUN_BENCHY:-0}"
 KEEP_SERVER="${KEEP_SERVER:-0}"
+SKIP_UNSUPPORTED_SAMPLING_PROBE="${SKIP_UNSUPPORTED_SAMPLING_PROBE:-0}"
 
 SERVER_PID=""
 
@@ -231,29 +232,33 @@ fi
 sampling_json="$(cat "$sampling_response")"
 echo "$sampling_json" | jq -e '.choices[0].finish_reason == "length"' >/dev/null
 
-echo "probing unsupported sampling rejection"
-unsupported_sampling_request="$(jq -cn --arg model "$MODEL_ID" '{
-  model: $model,
-  messages: [{role: "user", content: "Say hi"}],
-  min_p: 0.1,
-  max_tokens: 2
-}')"
-unsupported_sampling_response="${WORK_DIR}/unsupported-sampling-response.json"
-unsupported_sampling_status="$(
-  curl -sS --max-time 10 \
-    -o "$unsupported_sampling_response" \
-    -w '%{http_code}' \
-    "${BASE_URL}/chat/completions" \
-    -H 'content-type: application/json' \
-    -d "$unsupported_sampling_request"
-)"
-if [[ "$unsupported_sampling_status" != "400" ]]; then
-  echo "expected unsupported sampling to return HTTP 400, got ${unsupported_sampling_status}" >&2
-  cat "$unsupported_sampling_response" >&2 || true
-  exit 1
+if [[ "$SKIP_UNSUPPORTED_SAMPLING_PROBE" == "1" ]]; then
+  echo "skipping unsupported sampling rejection probe"
+else
+  echo "probing unsupported sampling rejection"
+  unsupported_sampling_request="$(jq -cn --arg model "$MODEL_ID" '{
+    model: $model,
+    messages: [{role: "user", content: "Say hi"}],
+    min_p: 0.1,
+    max_tokens: 2
+  }')"
+  unsupported_sampling_response="${WORK_DIR}/unsupported-sampling-response.json"
+  unsupported_sampling_status="$(
+    curl -sS --max-time 10 \
+      -o "$unsupported_sampling_response" \
+      -w '%{http_code}' \
+      "${BASE_URL}/chat/completions" \
+      -H 'content-type: application/json' \
+      -d "$unsupported_sampling_request"
+  )"
+  if [[ "$unsupported_sampling_status" != "400" ]]; then
+    echo "expected unsupported sampling to return HTTP 400, got ${unsupported_sampling_status}" >&2
+    cat "$unsupported_sampling_response" >&2 || true
+    exit 1
+  fi
+  unsupported_sampling_json="$(cat "$unsupported_sampling_response")"
+  echo "$unsupported_sampling_json" | jq -e '.error.code == "unsupported_model_feature"' >/dev/null
 fi
-unsupported_sampling_json="$(cat "$unsupported_sampling_response")"
-echo "$unsupported_sampling_json" | jq -e '.error.code == "unsupported_model_feature"' >/dev/null
 
 if [[ "$RUN_BENCHY" == "1" ]]; then
   require_cmd uvx
