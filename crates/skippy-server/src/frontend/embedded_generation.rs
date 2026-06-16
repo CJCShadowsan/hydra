@@ -629,6 +629,7 @@ impl StageOpenAiBackend {
             let native_mtp_reject_cooldown_tokens = native_mtp_reject_cooldown_tokens();
             let native_mtp_reject_recovery_serial_accepts =
                 native_mtp_reject_recovery_serial_accepts();
+            let native_mtp_verify_next_draft_min_margin = native_mtp_verify_next_draft_min_margin();
             let mut native_mtp_reject_cooldown_remaining = 0usize;
             let mut native_mtp_reject_recovery_remaining = 0usize;
             if let Some(fused) = fused_first_decode.take() {
@@ -927,11 +928,19 @@ impl StageOpenAiBackend {
                         native_mtp.clear_pending_draft();
                     }
                     let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
+                    let verify_next_mtp_draft_margin = verify_next_mtp_draft
+                        .as_ref()
+                        .and_then(NativeMtpDraft::margin);
+                    let verify_next_mtp_draft_margin_accepted =
+                        native_mtp_verify_next_draft_min_margin.is_none_or(|min_margin| {
+                            verify_next_mtp_draft_margin.is_some_and(|margin| margin >= min_margin)
+                        });
                     let verify_next_mtp_draft_adopted = accepted
                         && committed_positions == consumed_positions
                         && !reached_stop
                         && decoded_tokens < request.max_tokens as usize
                         && verify_next_mtp_draft.is_some()
+                        && verify_next_mtp_draft_margin_accepted
                         && !native_mtp_adaptive_disable.disabled();
                     if verify_next_mtp_draft_adopted {
                         native_mtp.observe_next_draft(verify_next_mtp_draft);
@@ -999,6 +1008,22 @@ impl StageOpenAiBackend {
                         "llama_stage.native_mtp.verify_next_draft_adopted".to_string(),
                         json!(verify_next_mtp_draft_adopted),
                     );
+                    if let Some(min_margin) = native_mtp_verify_next_draft_min_margin {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verify_next_draft_min_margin".to_string(),
+                            json!(min_margin),
+                        );
+                    }
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.verify_next_draft_margin_accepted".to_string(),
+                        json!(verify_next_mtp_draft_margin_accepted),
+                    );
+                    if let Some(margin) = verify_next_mtp_draft_margin {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verify_next_draft_margin".to_string(),
+                            json!(margin),
+                        );
+                    }
                     if let Some(next_draft) = verify_next_mtp_draft {
                         token_attrs.insert(
                             "llama_stage.native_mtp.verify_next_draft_token".to_string(),
@@ -1661,6 +1686,12 @@ impl StageOpenAiBackend {
                 "llama_stage.native_mtp.reject_recovery_serial_accepts".to_string(),
                 json!(native_mtp_reject_recovery_serial_accepts),
             );
+            if let Some(min_margin) = native_mtp_verify_next_draft_min_margin {
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.verify_next_draft_min_margin".to_string(),
+                    json!(min_margin),
+                );
+            }
             self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();

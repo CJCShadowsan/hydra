@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From a0074081f3458557215e0a8c3d9472425048bc57 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Tue, 16 Jun 2026 15:30:00 +1000
 Subject: [PATCH] Return native MTP draft from verify span
@@ -22,12 +22,12 @@ index 063706ef..137910df 100644
  enum skippy_feature {
      SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index ee1dcad5..43dcd07b 100644
+index 119b755d..8f77fd13 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -3959,6 +3959,24 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
-                     sampling,
-                     i);
+@@ -3947,6 +3947,24 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+         for (int32_t i = 0; i < n_tokens; ++i) {
+             output_tokens[i] = skippy_sample_token_ith(session, sampling, i);
          }
 +        if (output_token_capacity >= token_count + 2 && token_count > 0) {
 +            skippy_native_mtp_draft mtp_draft = {};
@@ -50,3 +50,6 @@ index ee1dcad5..43dcd07b 100644
      }
  
      return skippy_success(out_error);
+-- 
+2.54.0 (Apple Git-156)
+

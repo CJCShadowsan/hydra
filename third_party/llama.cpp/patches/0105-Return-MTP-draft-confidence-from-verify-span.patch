@@ -1,0 +1,97 @@
+From efd52a32d103da08de6b1106d9019e9b3637e8cf Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Tue, 16 Jun 2026 23:57:54 +1000
+Subject: [PATCH] Return MTP draft confidence from verify span
+
+---
+ include/skippy/common.h |  2 +-
+ src/skippy.cpp          | 40 +++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 137910df..31211268 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 30
++#define SKIPPY_ABI_VERSION_PATCH 31
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index f10e1d5f..66fd0901 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1491,17 +1491,18 @@ static llama_token skippy_greedy_sample(skippy_session * session) {
+     return skippy_greedy_sample_ith(session, -1);
+ }
+ 
+-static bool skippy_compute_token_signal(
+-        skippy_session * session,
++static bool skippy_compute_token_signal_context(
++        const llama_model * model,
++        llama_context * ctx,
+         int32_t logits_index,
+         skippy_token_signal * out_signal) {
+-    if (session == nullptr || session->ctx == nullptr || session->stage_model == nullptr || session->stage_model->model == nullptr || out_signal == nullptr) {
++    if (model == nullptr || ctx == nullptr || out_signal == nullptr) {
+         return false;
+     }
+ 
+-    const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
++    const llama_vocab * vocab = llama_model_get_vocab(model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+-    const float * logits = llama_get_logits_ith(session->ctx, logits_index);
++    const float * logits = llama_get_logits_ith(ctx, logits_index);
+     if (logits == nullptr || n_vocab <= 0) {
+         return false;
+     }
+@@ -1558,6 +1559,20 @@ static bool skippy_compute_token_signal(
+     return true;
+ }
+ 
++static bool skippy_compute_token_signal(
++        skippy_session * session,
++        int32_t logits_index,
++        skippy_token_signal * out_signal) {
++    if (session == nullptr || session->stage_model == nullptr) {
++        return false;
++    }
++    return skippy_compute_token_signal_context(
++            session->stage_model->model,
++            session->ctx,
++            logits_index,
++            out_signal);
++}
++
+ static void skippy_record_signal(skippy_session * session, int32_t logits_index) {
+     skippy_token_signal signal = {};
+     if (skippy_compute_token_signal(session, logits_index, &signal)) {
+@@ -3954,6 +3969,21 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+                         std::max<int64_t>(mtp_draft.proposal_compute_us, 0),
+                         std::numeric_limits<llama_token>::max()));
+                 *out_token_count = token_count + 2;
++                if (output_token_capacity >= token_count + 3) {
++                    skippy_token_signal mtp_signal = {};
++                    if (skippy_compute_token_signal_context(
++                                session->stage_model->model,
++                                session->stage_model->mtp_ctx,
++                                -1,
++                                &mtp_signal)) {
++                        const int64_t margin_milli = static_cast<int64_t>(std::llround(
++                                static_cast<double>(mtp_signal.margin) * 1000.0));
++                        output_tokens[token_count + 2] = static_cast<llama_token>(std::min<int64_t>(
++                                std::max<int64_t>(margin_milli, std::numeric_limits<llama_token>::min()),
++                                std::numeric_limits<llama_token>::max()));
++                        *out_token_count = token_count + 3;
++                    }
++                }
+             }
+         }
+     }
+-- 
+2.54.0 (Apple Git-156)
+

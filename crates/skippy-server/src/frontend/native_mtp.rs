@@ -10,6 +10,8 @@ const ADAPTIVE_DISABLE_MIN_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABL
 const ADAPTIVE_DISABLE_THRESHOLD_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_THRESHOLD";
 const REJECT_COOLDOWN_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_COOLDOWN_TOKENS";
 const REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_RECOVERY_SERIAL_ACCEPTS";
+const VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV: &str = "SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN";
+const MTP_DRAFT_MARGIN_SCALE: f32 = 1000.0;
 const DEFAULT_ADAPTIVE_DISABLE_MIN_VERIFY: u64 = 32;
 const DEFAULT_ADAPTIVE_DISABLE_THRESHOLD: f64 = 0.70;
 
@@ -51,6 +53,10 @@ pub(super) fn native_mtp_reject_cooldown_tokens() -> usize {
 
 pub(super) fn native_mtp_reject_recovery_serial_accepts() -> usize {
     parse_usize_env(REJECT_RECOVERY_SERIAL_ACCEPTS_ENV, 0)
+}
+
+pub(super) fn native_mtp_verify_next_draft_min_margin() -> Option<f32> {
+    parse_optional_f32_env(VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV)
 }
 
 fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
@@ -104,10 +110,18 @@ fn parse_threshold_env(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn parse_optional_f32_env(name: &str) -> Option<f32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct NativeMtpDraft {
     pub(super) token: i32,
     pub(super) proposal_compute_us: i64,
+    pub(super) margin_milli: Option<i32>,
 }
 
 impl NativeMtpDraft {
@@ -117,6 +131,7 @@ impl NativeMtpDraft {
         Some(Self {
             token,
             proposal_compute_us: i64::from(proposal_compute_us.max(0)),
+            margin_milli: None,
         })
     }
 
@@ -132,7 +147,13 @@ impl NativeMtpDraft {
         Some(Self {
             token,
             proposal_compute_us: i64::from(proposal_compute_us.max(0)),
+            margin_milli: tokens.get(verified_token_count.saturating_add(2)).copied(),
         })
+    }
+
+    pub(super) fn margin(&self) -> Option<f32> {
+        self.margin_milli
+            .map(|margin| margin as f32 / MTP_DRAFT_MARGIN_SCALE)
     }
 }
 
@@ -416,6 +437,7 @@ mod tests {
         NativeMtpDraft {
             token,
             proposal_compute_us: 7,
+            margin_milli: None,
         }
     }
 
@@ -426,6 +448,7 @@ mod tests {
             Some(NativeMtpDraft {
                 token: 12,
                 proposal_compute_us: 34,
+                margin_milli: None,
             })
         );
         assert_eq!(NativeMtpDraft::from_prediction_tokens(&[11]), None);
@@ -438,6 +461,7 @@ mod tests {
             Some(NativeMtpDraft {
                 token: 12,
                 proposal_compute_us: 34,
+                margin_milli: None,
             })
         );
         assert_eq!(
@@ -445,8 +469,21 @@ mod tests {
             Some(NativeMtpDraft {
                 token: 12,
                 proposal_compute_us: 0,
+                margin_milli: None,
             })
         );
+        assert_eq!(
+            NativeMtpDraft::from_verify_prediction_tokens(&[10, 11, 12, 34, 567], 2),
+            Some(NativeMtpDraft {
+                token: 12,
+                proposal_compute_us: 34,
+                margin_milli: Some(567),
+            })
+        );
+        let margin = NativeMtpDraft::from_verify_prediction_tokens(&[10, 11, 12, 34, 567], 2)
+            .and_then(|draft| draft.margin())
+            .expect("margin sideband");
+        assert!((margin - 0.567).abs() < 0.000_001);
         assert_eq!(
             NativeMtpDraft::from_verify_prediction_tokens(&[10, 11], 2),
             None
@@ -764,5 +801,13 @@ mod tests {
     #[test]
     fn reject_recovery_serial_accepts_defaults_zero() {
         assert_eq!(parse_usize_env("SKIPPY_TEST_MISSING_REJECT_RECOVERY", 0), 0);
+    }
+
+    #[test]
+    fn verify_next_draft_min_margin_defaults_none() {
+        assert_eq!(
+            parse_optional_f32_env("SKIPPY_TEST_MISSING_VERIFY_NEXT_MARGIN"),
+            None
+        );
     }
 }

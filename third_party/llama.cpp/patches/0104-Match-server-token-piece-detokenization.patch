@@ -1,4 +1,4 @@
-From 2f44fb3ccf58b24816203171d62f96f2ea32b97f Mon Sep 17 00:00:00 2001
+From ca140cbcfb0e70b4ad2b4b11c454b2afc323c75e Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Tue, 16 Jun 2026 16:48:00 +1000
 Subject: [PATCH] Match server token-piece detokenization
@@ -14,14 +14,14 @@ Build staged detokenized text by appending llama_token_to_piece() for each
 generated token so single-stage Skippy output matches llama-server's
 generated text path.
 ---
- src/skippy.cpp | 43 +++++++++++++++++++++++++++++++------------
- 1 file changed, 31 insertions(+), 12 deletions(-)
+ src/skippy.cpp | 50 ++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 38 insertions(+), 12 deletions(-)
 
 diff --git a/src/skippy.cpp b/src/skippy.cpp
-index f6d48cd5..2f44fb3c 100644
+index 50046936..f10e1d5f 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -4912,22 +4912,41 @@ enum skippy_status skippy_detokenize(
+@@ -4909,21 +4909,47 @@ enum skippy_status skippy_detokenize(
      }
  
      const llama_vocab * vocab = llama_model_get_vocab(model->model);
@@ -82,5 +82,5 @@ index f6d48cd5..2f44fb3c 100644
  }
  
 -- 
-2.39.5
+2.54.0 (Apple Git-156)
 
