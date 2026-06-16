@@ -10,6 +10,8 @@ const ADAPTIVE_DISABLE_MIN_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABL
 const ADAPTIVE_DISABLE_THRESHOLD_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_THRESHOLD";
 const REJECT_COOLDOWN_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_COOLDOWN_TOKENS";
 const REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_RECOVERY_SERIAL_ACCEPTS";
+const SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str =
+    "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS";
 const VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV: &str = "SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN";
 const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
@@ -56,6 +58,10 @@ pub(super) fn native_mtp_reject_cooldown_tokens() -> usize {
 
 pub(super) fn native_mtp_reject_recovery_serial_accepts() -> usize {
     parse_usize_env(REJECT_RECOVERY_SERIAL_ACCEPTS_ENV, 0)
+}
+
+pub(super) fn native_mtp_serial_after_gap_reject_recovery_serial_accepts() -> usize {
+    parse_usize_env(SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS_ENV, 0)
 }
 
 pub(super) fn native_mtp_verify_next_draft_min_margin() -> Option<f32> {
@@ -883,6 +889,14 @@ mod tests {
     #[test]
     fn reject_recovery_serial_accepts_defaults_zero() {
         assert_eq!(parse_usize_env("SKIPPY_TEST_MISSING_REJECT_RECOVERY", 0), 0);
+    }
+
+    #[test]
+    fn serial_after_gap_reject_recovery_serial_accepts_defaults_zero() {
+        assert_eq!(
+            parse_usize_env("SKIPPY_TEST_MISSING_GAP_REJECT_RECOVERY", 0),
+            0
+        );
     }
 
     #[test]

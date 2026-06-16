@@ -629,6 +629,8 @@ impl StageOpenAiBackend {
             let native_mtp_reject_cooldown_tokens = native_mtp_reject_cooldown_tokens();
             let native_mtp_reject_recovery_serial_accepts =
                 native_mtp_reject_recovery_serial_accepts();
+            let native_mtp_serial_after_gap_reject_recovery_serial_accepts =
+                native_mtp_serial_after_gap_reject_recovery_serial_accepts();
             let native_mtp_verify_next_draft_min_margin = native_mtp_verify_next_draft_min_margin();
             let native_mtp_defer_reject_trim = native_mtp_defer_reject_trim_enabled();
             let native_mtp_suppress_cooldown_drafts = native_mtp_suppress_cooldown_drafts_enabled();
@@ -972,8 +974,15 @@ impl StageOpenAiBackend {
                         native_mtp.clear_pending_draft();
                     }
                     if !accepted && native_mtp_reject_recovery_serial_accepts > 0 {
-                        native_mtp_reject_recovery_remaining =
-                            native_mtp_reject_recovery_serial_accepts;
+                        let recovery_serial_accepts = if native_mtp_draft_origin
+                            == NativeMtpDraftOrigin::SerialAfterGap
+                            && native_mtp_serial_after_gap_reject_recovery_serial_accepts > 0
+                        {
+                            native_mtp_serial_after_gap_reject_recovery_serial_accepts
+                        } else {
+                            native_mtp_reject_recovery_serial_accepts
+                        };
+                        native_mtp_reject_recovery_remaining = recovery_serial_accepts;
                         native_mtp.clear_pending_draft();
                     }
                     let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
@@ -1147,6 +1156,11 @@ impl StageOpenAiBackend {
                     token_attrs.insert(
                         "llama_stage.native_mtp.reject_recovery_serial_accepts".to_string(),
                         json!(native_mtp_reject_recovery_serial_accepts),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.serial_after_gap_reject_recovery_serial_accepts"
+                            .to_string(),
+                        json!(native_mtp_serial_after_gap_reject_recovery_serial_accepts),
                     );
                     token_attrs.insert(
                         "llama_stage.native_mtp.reject_recovery_remaining".to_string(),
@@ -1809,6 +1823,11 @@ impl StageOpenAiBackend {
             decode_attrs.insert(
                 "llama_stage.native_mtp.reject_recovery_serial_accepts".to_string(),
                 json!(native_mtp_reject_recovery_serial_accepts),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.serial_after_gap_reject_recovery_serial_accepts"
+                    .to_string(),
+                json!(native_mtp_serial_after_gap_reject_recovery_serial_accepts),
             );
             decode_attrs.insert(
                 "llama_stage.native_mtp.defer_reject_trim".to_string(),
