@@ -1,7 +1,8 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
     is_decode_frame_batch_candidate, native_mtp_enabled_from, prepare_binary_stage_connection,
-    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
+    restore_prefill_decode_as_decode_message, serial_verify_span_enabled_from,
+    token_sideband_or_fill,
 };
 use std::{
     io,
@@ -60,6 +61,17 @@ fn native_mtp_enabled_flag_defaults_on_and_accepts_false_values() {
     assert!(!native_mtp_enabled_from(Some("0")));
     assert!(!native_mtp_enabled_from(Some("false")));
     assert!(!native_mtp_enabled_from(Some(" disabled ")));
+}
+
+#[test]
+fn serial_verify_span_flag_defaults_off_and_accepts_true_values() {
+    assert!(!serial_verify_span_enabled_from(None));
+    assert!(serial_verify_span_enabled_from(Some("1")));
+    assert!(serial_verify_span_enabled_from(Some("true")));
+    assert!(serial_verify_span_enabled_from(Some(" enabled ")));
+    assert!(!serial_verify_span_enabled_from(Some("0")));
+    assert!(!serial_verify_span_enabled_from(Some("false")));
+    assert!(!serial_verify_span_enabled_from(Some(" disabled ")));
 }
 
 #[test]

@@ -408,6 +408,44 @@ impl RuntimeState {
         Ok(output)
     }
 
+    pub fn verify_frame_sampled_serial(
+        &mut self,
+        session_id: &str,
+        token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
+        if token_ids.is_empty() {
+            bail!("serial verify_frame requires at least one token");
+        }
+        let input_frames = split_activation_frame(input, token_ids.len())?;
+        let mut predicted_tokens = Vec::with_capacity(token_ids.len() + 2);
+        let mut output_frames = Vec::with_capacity(token_ids.len());
+        let mut last_draft = None;
+        for (index, token_id) in token_ids.iter().copied().enumerate() {
+            let input_frame = input_frames.as_ref().map(|frames| &frames[index]);
+            let (predicted, native_mtp, output) = self.decode_frame_sampled_mtp_n1(
+                session_id,
+                token_id,
+                sampling,
+                input_frame,
+                output_capacity,
+            )?;
+            if predicted >= 0 {
+                predicted_tokens.push(predicted);
+            }
+            last_draft = native_mtp;
+            output_frames.push(output);
+        }
+        if let Some(draft) = last_draft {
+            predicted_tokens.push(draft.token_id);
+            predicted_tokens
+                .push(i32::try_from(draft.proposal_compute_us.max(0)).unwrap_or(i32::MAX));
+        }
+        Ok((predicted_tokens, combine_activation_frames(&output_frames)?))
+    }
+
     pub fn checkpoint_session(&mut self, session_id: &str) -> Result<()> {
         let checkpoint = self.session(session_id)?.checkpoint()?;
         self.session_checkpoints
@@ -955,6 +993,76 @@ impl RuntimeState {
             resident_prefix: None,
         })
     }
+}
+
+fn split_activation_frame(
+    input: Option<&ActivationFrame>,
+    token_count: usize,
+) -> Result<Option<Vec<ActivationFrame>>> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    if token_count == 0 {
+        bail!("cannot split activation frame for zero tokens");
+    }
+    if input.desc.token_count as usize != token_count {
+        bail!(
+            "activation token count mismatch: frame={} tokens={}",
+            input.desc.token_count,
+            token_count
+        );
+    }
+    if input.payload.len() % token_count != 0 {
+        bail!(
+            "activation payload is not divisible by token count: payload={} tokens={}",
+            input.payload.len(),
+            token_count
+        );
+    }
+    let row_bytes = input.payload.len() / token_count;
+    let frames = input
+        .payload
+        .chunks(row_bytes)
+        .map(|row| {
+            let mut desc = input.desc;
+            desc.token_count = 1;
+            desc.sequence_count = 1;
+            desc.payload_bytes = row.len() as u64;
+            ActivationFrame {
+                desc,
+                payload: row.to_vec(),
+            }
+        })
+        .collect();
+    Ok(Some(frames))
+}
+
+fn combine_activation_frames(frames: &[ActivationFrame]) -> Result<ActivationFrame> {
+    let Some(first) = frames.first() else {
+        bail!("cannot combine empty activation frames");
+    };
+    let mut desc = first.desc;
+    let mut payload = Vec::new();
+    let mut token_count = 0u32;
+    for frame in frames {
+        if frame.desc.dtype != desc.dtype
+            || frame.desc.layout != desc.layout
+            || frame.desc.producer_stage_index != desc.producer_stage_index
+            || frame.desc.layer_start != desc.layer_start
+            || frame.desc.layer_end != desc.layer_end
+            || frame.desc.sequence_count != desc.sequence_count
+            || frame.desc.flags != desc.flags
+        {
+            bail!("cannot combine incompatible activation frames");
+        }
+        token_count = token_count
+            .checked_add(frame.desc.token_count)
+            .context("combined activation token count overflow")?;
+        payload.extend_from_slice(&frame.payload);
+    }
+    desc.token_count = token_count;
+    desc.payload_bytes = payload.len() as u64;
+    Ok(ActivationFrame { desc, payload })
 }
 
 /// Allocate the next lane slot.
