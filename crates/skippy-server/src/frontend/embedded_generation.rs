@@ -632,6 +632,14 @@ impl StageOpenAiBackend {
             let native_mtp_verify_next_draft_min_margin = native_mtp_verify_next_draft_min_margin();
             let mut native_mtp_reject_cooldown_remaining = 0usize;
             let mut native_mtp_reject_recovery_remaining = 0usize;
+            let mut native_mtp_verify_next_draft_available_count = 0usize;
+            let mut native_mtp_verify_next_draft_adopted_count = 0usize;
+            let mut native_mtp_verify_next_draft_margin_value_count = 0usize;
+            let mut native_mtp_verify_next_draft_margin_accepted_count = 0usize;
+            let mut native_mtp_verify_next_draft_margin_rejected_count = 0usize;
+            let mut native_mtp_verify_next_draft_margin_sum = 0.0_f64;
+            let mut native_mtp_verify_next_draft_margin_min = f32::INFINITY;
+            let mut native_mtp_verify_next_draft_margin_max = f32::NEG_INFINITY;
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -942,6 +950,29 @@ impl StageOpenAiBackend {
                         && verify_next_mtp_draft.is_some()
                         && verify_next_mtp_draft_margin_accepted
                         && !native_mtp_adaptive_disable.disabled();
+                    if verify_next_mtp_draft_available {
+                        native_mtp_verify_next_draft_available_count += 1;
+                    }
+                    if verify_next_mtp_draft_adopted {
+                        native_mtp_verify_next_draft_adopted_count += 1;
+                    }
+                    if let Some(margin) = verify_next_mtp_draft_margin {
+                        native_mtp_verify_next_draft_margin_value_count += 1;
+                        native_mtp_verify_next_draft_margin_sum += f64::from(margin);
+                        native_mtp_verify_next_draft_margin_min =
+                            native_mtp_verify_next_draft_margin_min.min(margin);
+                        native_mtp_verify_next_draft_margin_max =
+                            native_mtp_verify_next_draft_margin_max.max(margin);
+                    }
+                    if native_mtp_verify_next_draft_min_margin.is_some()
+                        && verify_next_mtp_draft_available
+                    {
+                        if verify_next_mtp_draft_margin_accepted {
+                            native_mtp_verify_next_draft_margin_accepted_count += 1;
+                        } else {
+                            native_mtp_verify_next_draft_margin_rejected_count += 1;
+                        }
+                    }
                     if verify_next_mtp_draft_adopted {
                         native_mtp.observe_next_draft(verify_next_mtp_draft);
                     }
@@ -1690,6 +1721,43 @@ impl StageOpenAiBackend {
                 decode_attrs.insert(
                     "llama_stage.native_mtp.verify_next_draft_min_margin".to_string(),
                     json!(min_margin),
+                );
+            }
+            decode_attrs.insert(
+                "llama_stage.native_mtp.verify_next_draft_available_count".to_string(),
+                json!(native_mtp_verify_next_draft_available_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.verify_next_draft_adopted_count".to_string(),
+                json!(native_mtp_verify_next_draft_adopted_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.verify_next_draft_margin_value_count".to_string(),
+                json!(native_mtp_verify_next_draft_margin_value_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.verify_next_draft_margin_accepted_count".to_string(),
+                json!(native_mtp_verify_next_draft_margin_accepted_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.verify_next_draft_margin_rejected_count".to_string(),
+                json!(native_mtp_verify_next_draft_margin_rejected_count),
+            );
+            if native_mtp_verify_next_draft_margin_value_count > 0 {
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.verify_next_draft_margin_avg".to_string(),
+                    json!(
+                        native_mtp_verify_next_draft_margin_sum
+                            / native_mtp_verify_next_draft_margin_value_count as f64
+                    ),
+                );
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.verify_next_draft_margin_min".to_string(),
+                    json!(native_mtp_verify_next_draft_margin_min),
+                );
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.verify_next_draft_margin_max".to_string(),
+                    json!(native_mtp_verify_next_draft_margin_max),
                 );
             }
             self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
