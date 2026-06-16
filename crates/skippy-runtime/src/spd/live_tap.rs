@@ -72,9 +72,7 @@ impl SpdLiveTapRunner {
 
     pub fn collect_taps(&self, context_tokens: &[i32]) -> Result<BTreeMap<u32, ActivationFrame>> {
         let mut taps = BTreeMap::new();
-        let h0 = run_live_stage_model(&self.h0, 0, 0, 0, context_tokens, None)
-            .context("run embedding-only SPD h0 tap")?;
-        taps.insert(0, h0);
+        taps.insert(0, self.collect_h0_tap(context_tokens)?);
 
         let mut input = None;
         for stage in &self.stages {
@@ -98,6 +96,11 @@ impl SpdLiveTapRunner {
             }
         }
         Ok(taps)
+    }
+
+    pub fn collect_h0_tap(&self, context_tokens: &[i32]) -> Result<ActivationFrame> {
+        run_live_stage_model(&self.h0, 0, 0, 0, context_tokens, None)
+            .context("run embedding-only SPD h0 tap")
     }
 }
 

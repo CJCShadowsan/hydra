@@ -130,8 +130,7 @@ impl SpdReplayProposalSource {
 
     fn propose_one(&self, context_tokens: &[i32]) -> Result<i32> {
         let row_positions = sliding_spd_row_positions(context_tokens.len(), self.row_count)?;
-        let mut taps = self.live_taps.collect_taps(context_tokens)?;
-        self.overlay_inline_taps(&mut taps, &row_positions)?;
+        let taps = self.collect_taps_for_proposal(context_tokens, &row_positions)?;
         let live_rows = assemble_spd_live_cur_in_for_positions(SpdLiveCurInRequest {
             manifest: &self.manifest,
             serving_file: &self.serving_file,
@@ -155,6 +154,37 @@ impl SpdReplayProposalSource {
             .copied()
             .context("SPD head returned no proposal token")
             .and_then(|token| i32::try_from(token).context("SPD proposal token exceeds i32"))
+    }
+
+    fn collect_taps_for_proposal(
+        &self,
+        context_tokens: &[i32],
+        row_positions: &[i64],
+    ) -> Result<BTreeMap<u32, ActivationFrame>> {
+        if let Some(mut taps) = self.complete_inline_taps(row_positions)? {
+            if self.required_hf_indices.contains(&0) {
+                taps.insert(0, self.live_taps.collect_h0_tap(context_tokens)?);
+            }
+            return Ok(taps);
+        }
+        let mut taps = self.live_taps.collect_taps(context_tokens)?;
+        self.overlay_inline_taps(&mut taps, row_positions)?;
+        Ok(taps)
+    }
+
+    fn complete_inline_taps(
+        &self,
+        row_positions: &[i64],
+    ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
+        let inline_taps = self
+            .inline_taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?;
+        inline_taps.complete_frames(
+            row_positions,
+            &non_h0_required_hf_indices(&self.required_hf_indices),
+            self.hidden_size,
+        )
     }
 
     fn overlay_inline_taps(
@@ -540,6 +570,29 @@ impl SpdInlineTapCache {
         Ok(())
     }
 
+    fn complete_frames(
+        &self,
+        row_positions: &[i64],
+        required_hf_indices: &[u32],
+        hidden_size: usize,
+    ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
+        if hidden_size != self.hidden_size {
+            bail!(
+                "SPD inline tap hidden size mismatch: cache {}, request {}",
+                self.hidden_size,
+                hidden_size
+            );
+        }
+        let mut complete = BTreeMap::new();
+        for hf_index in required_hf_indices {
+            let Some(frame) = self.frame_for_positions(*hf_index, row_positions)? else {
+                return Ok(None);
+            };
+            complete.insert(*hf_index, frame);
+        }
+        Ok(Some(complete))
+    }
+
     fn frame_for_positions(
         &self,
         hf_index: u32,
@@ -638,6 +691,14 @@ fn required_spd_hf_indices(row_hf_indices: &[Vec<u32>]) -> Vec<u32> {
         .flat_map(|row| row.iter().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .collect()
+}
+
+fn non_h0_required_hf_indices(required_hf_indices: &[u32]) -> Vec<u32> {
+    required_hf_indices
+        .iter()
+        .copied()
+        .filter(|hf_index| *hf_index != 0)
         .collect()
 }
 
@@ -860,6 +921,52 @@ mod tests {
         let overlaid = taps.get(&8).expect("expected overlaid tap");
         assert_eq!(f32_row(overlaid, 2, 2), vec![5.0, 6.0]);
         assert_eq!(f32_row(overlaid, 3, 2), vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn inline_tap_cache_returns_complete_required_frames() {
+        let mut cache = SpdInlineTapCache::new(2, vec![10, 20]);
+        let message = stage_message(4, 2, Vec::new());
+        cache
+            .record_stage_output(
+                &stage_config("stage-1", 1, 8, 10),
+                &message,
+                &activation_frame(8, 10, &[1.0, 2.0, 3.0, 4.0]),
+            )
+            .unwrap()
+            .unwrap();
+        cache
+            .record_stage_output(
+                &stage_config("stage-3", 3, 16, 20),
+                &message,
+                &activation_frame(16, 20, &[5.0, 6.0, 7.0, 8.0]),
+            )
+            .unwrap()
+            .unwrap();
+
+        let complete = cache
+            .complete_frames(&[4, 5], &[10, 20], 2)
+            .unwrap()
+            .expect("all required taps are complete");
+
+        assert_eq!(complete.keys().copied().collect::<Vec<_>>(), vec![10, 20]);
+        assert_eq!(f32_row(complete.get(&10).unwrap(), 4, 2), vec![1.0, 2.0]);
+        assert_eq!(f32_row(complete.get(&20).unwrap(), 5, 2), vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn inline_tap_cache_reports_missing_required_frame() {
+        let mut cache = SpdInlineTapCache::new(2, vec![10, 20]);
+        cache
+            .record_stage_output(
+                &stage_config("stage-1", 1, 8, 10),
+                &stage_message(4, 1, Vec::new()),
+                &activation_frame(8, 10, &[1.0, 2.0]),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(cache.complete_frames(&[4], &[10, 20], 2).unwrap().is_none());
     }
 
     #[test]

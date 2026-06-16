@@ -396,9 +396,10 @@ return tap frames over the direct-return side channel for SPD-marked requests,
 and `spd-replay` overlays complete cached boundary frames before falling back to
 local replay. A one-token Qwen3.5-4B smoke on seven local CPU stages returned
 the required `10`, `20`, and `31` rows with no tap-return failures. The
-remaining production work is scheduling proposal generation after the in-flight
-current-token taps exist, then measuring ordinary split serving against
-inline-tap SPD serving.
+proposal source now skips local downstream replay when all required non-h0 rows
+are present and runs only the embedding-only h0 tap. The remaining production
+work is scheduling proposal generation after the in-flight current-token taps
+exist, then measuring ordinary split serving against inline-tap SPD serving.
 
 ## Validate Hidden Tap Compatibility
 

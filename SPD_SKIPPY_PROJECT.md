@@ -347,9 +347,11 @@ seven local CPU stages returned and recorded required hidden-state rows for
 
 This still does not make `spd-replay` a speed path. Proposal generation still
 starts before the in-flight current-token target pass has produced the taps that
-the next proposal needs, so the source can still fall back to replay. The next
-serving milestone is proposal scheduling around freshly returned current-token
-taps, then measuring ordinary split serving against inline-tap SPD serving.
+the next proposal needs, so the source can still fall back to replay. When all
+required non-h0 rows are present, `spd-replay` now skips local downstream replay
+and runs only the embedding-only h0 tap before the SPD head. The next serving
+milestone is proposal scheduling around freshly returned current-token taps,
+then measuring ordinary split serving against inline-tap SPD serving.
 
 ## What Does Not Work Yet
 
