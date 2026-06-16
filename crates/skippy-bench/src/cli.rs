@@ -26,6 +26,8 @@ pub enum CommandKind {
     TokenLengths(TokenLengthsArgs),
     #[command(name = "spd-fixture-parity")]
     SpdFixtureParity(SpdFixtureParityArgs),
+    #[command(name = "spd-live-tap-parity")]
+    SpdLiveTapParity(SpdLiveTapParityArgs),
     #[command(name = "focused-runtime")]
     FocusedRuntime(FocusedRuntimeArgs),
     Run(RunArgs),
@@ -96,6 +98,30 @@ pub struct SpdFixtureParityArgs {
     pub manifest: PathBuf,
     #[arg(long)]
     pub fixture: PathBuf,
+    #[arg(long, default_value_t = 8)]
+    pub top_k: usize,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub struct SpdLiveTapParityArgs {
+    #[arg(long)]
+    pub manifest: PathBuf,
+    #[arg(long)]
+    pub fixture: PathBuf,
+    #[arg(long)]
+    pub model_path: PathBuf,
+    #[arg(long, value_delimiter = ',')]
+    pub splits: Vec<u32>,
+    #[arg(long, default_value_t = 32)]
+    pub layer_end: u32,
+    #[arg(long, default_value_t = 128)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = 0)]
+    pub n_gpu_layers: i32,
+    #[arg(long)]
+    pub selected_backend_device: Option<String>,
     #[arg(long, default_value_t = 8)]
     pub top_k: usize,
     #[arg(long)]
@@ -549,5 +575,40 @@ mod tests {
             PathBuf::from("spd-parity-fixture.safetensors")
         );
         assert_eq!(args.top_k, 4);
+    }
+
+    #[test]
+    fn parses_spd_live_tap_parity() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-live-tap-parity",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+            "--layer-end",
+            "32",
+            "--selected-backend-device",
+            "CPU0",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdLiveTapParity(args) = cli.command else {
+            panic!("expected spd-live-tap-parity subcommand");
+        };
+
+        assert_eq!(args.manifest, PathBuf::from("skippy-spd-head.json"));
+        assert_eq!(
+            args.fixture,
+            PathBuf::from("spd-parity-fixture.safetensors")
+        );
+        assert_eq!(args.model_path, PathBuf::from("model.gguf"));
+        assert_eq!(args.splits, vec![8, 10, 16, 20, 24, 31]);
+        assert_eq!(args.layer_end, 32);
+        assert_eq!(args.selected_backend_device.as_deref(), Some("CPU0"));
     }
 }

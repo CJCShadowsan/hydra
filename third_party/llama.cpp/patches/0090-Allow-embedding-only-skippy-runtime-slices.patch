@@ -1,0 +1,65 @@
+From 6374536228d8ab90bf3a5cb9d53f7eeac76033cb Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Tue, 16 Jun 2026 17:58:44 +1000
+Subject: [PATCH] Allow embedding-only skippy runtime slices
+
+---
+ src/llama-model-loader.cpp |  8 ++++----
+ src/skippy.cpp             | 14 +++++++++++++-
+ 2 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 1e7ec54c..4a78a4e1 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1208,11 +1208,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+                             tensor_name.c_str(),
+                             nbytes);
+ 
+-                    if (requested_tensor_exists && first_filtered_request) {
++                    if (requested_tensor_exists &&
++                            first_filtered_request &&
++                            !(flags & TENSOR_DUPLICATED)) {
+                         size_data -= nbytes;
+-                        if (!(flags & TENSOR_DUPLICATED)) {
+-                            n_created++;
+-                        }
++                        n_created++;
+                     }
+                     g_skippy_last_tensor_filtered = true;
+                 } else {
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 9f39198c..d3aea60b 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -791,6 +791,15 @@ static bool skippy_is_full_model_config(const struct skippy_runtime_config * con
+     return !config->filter_tensors_on_load && config->layer_start == 0;
+ }
+ 
++static bool skippy_is_embedding_only_slice_config(const struct skippy_runtime_config * config) {
++    return config != nullptr &&
++           config->filter_tensors_on_load &&
++           config->layer_start == 0 &&
++           config->layer_end == 0 &&
++           config->include_embeddings &&
++           !config->include_output;
++}
++
+ static int32_t skippy_default_thread_count() {
+ #ifdef __linux__
+     std::unordered_set<std::string> siblings;
+@@ -2344,7 +2353,10 @@ static enum skippy_status skippy_model_open_impl(
+ 
+     *out_model = nullptr;
+ 
+-    if (config != nullptr && config->filter_tensors_on_load && (config->layer_start < 0 || config->layer_start >= config->layer_end)) {
++    if (config != nullptr &&
++            config->filter_tensors_on_load &&
++            (config->layer_start < 0 ||
++             (config->layer_start >= config->layer_end && !skippy_is_embedding_only_slice_config(config)))) {
+         const char * message = "layer_start must be non-negative and less than layer_end";
+         event_scope.emit_failure(SKIPPY_STATUS_INVALID_ARGUMENT, message);
+         skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, message);
+-- 
+2.54.0
+

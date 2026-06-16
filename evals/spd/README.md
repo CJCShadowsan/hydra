@@ -30,12 +30,16 @@ Rust.
 - `skippy-bench local-split-chain-binary` can run the `Qwen/Qwen3.5-4B` GGUF
   through the full tap-aligned seven-stage Skippy binary chain locally, using
   `CPU0` to bypass local Metal auto-selection.
+- `skippy-bench spd-live-tap-parity` can assemble the pretrained Qwen3.5-4B
+  SPD head input from live Skippy activation frames, including an
+  embedding-only side tap for hidden-state index `0`, and run the Rust SPD head
+  from those live taps.
 
 ## What Does Not Work Yet
 
-- Skippy does not yet run the SPD head from live staged hidden-state taps.
-- Skippy does not yet expose the live hidden-state taps required by the head.
 - No live Skippy generation request has used trained SPD proposals yet.
+- The live-tap proof is a diagnostic path; request-path proposal,
+  verification, rollback, and metrics are not wired into Skippy serving yet.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
   `spd-head.safetensors` before Rust-side serving work.
 
@@ -279,6 +283,42 @@ Recorded parity result from the regenerated `Hello` fixture:
   `[9419, 21251, 109266, 12675, 14556, 18103, 23066, 0]`
 - spec-query max absolute diff: `0.03125`
 - final-hidden max absolute diff: `0.125`
+
+## Run the Live Skippy Tap Proof
+
+After exporting the parity fixture and building the patched native Skippy ABI,
+run the pretrained head from real Skippy activation frames:
+
+```bash
+cargo run -p skippy-bench -- spd-live-tap-parity \
+  --manifest /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/skippy-spd-head.json \
+  --fixture /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
+  --model-path .artifacts/spd/qwen35-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf \
+  --splits 8,10,16,20,24,31 \
+  --layer-end 32 \
+  --ctx-size 128 \
+  --n-gpu-layers 0 \
+  --selected-backend-device CPU0 \
+  --top-k 8
+```
+
+Recorded local result:
+
+- live taps captured: `0,8,10,16,20,24,31`
+- each tap frame: `13` tokens, `133120` bytes, hidden width `2560`
+- live `cur_in` max absolute diff vs HF fixture: `0.3134765625`
+- g0 row max absolute diff vs HF fixture: `0.00103759765625`
+- live Skippy top-1 token id: `9419`
+- fixture Python/Rust top-1 token id: `9419`
+- live top-8 token ids:
+  `[9419, 21251, 109266, 14556, 23066, 18103, 12675, 0]`
+- fixture top-8 token ids:
+  `[9419, 21251, 109266, 12675, 14556, 18103, 23066, 0]`
+
+The live proof uses the Q4_K_M GGUF, while the fixture was exported from the HF
+BF16 model. The deeper-row drift is therefore expected; the current result says
+the Skippy tap/head plumbing works and the best proposal survives quantization
+for this prompt. It does not yet measure serving-path acceptance.
 
 ## Validate Hidden Tap Compatibility
 

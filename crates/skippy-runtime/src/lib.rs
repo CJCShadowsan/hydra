@@ -841,7 +841,7 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.layer_start >= self.layer_end {
+        if self.layer_start >= self.layer_end && !self.is_embedding_only_slice() {
             return Err("layer_start must be less than layer_end");
         }
         if self
@@ -867,6 +867,14 @@ impl RuntimeConfig {
             return Err("n_threads_batch must be greater than zero when provided");
         }
         Ok(())
+    }
+
+    pub fn is_embedding_only_slice(&self) -> bool {
+        self.filter_tensors_on_load
+            && self.layer_start == 0
+            && self.layer_end == 0
+            && self.include_embeddings
+            && !self.include_output
     }
 
     fn as_raw(&self) -> Result<RawRuntimeConfigParts> {

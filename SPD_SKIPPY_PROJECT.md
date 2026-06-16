@@ -125,8 +125,9 @@ head artifacts:
 `spd-head.safetensors` and updates the manifest with a `serving_checkpoint`
 section. Skippy can inspect the serving artifact and read tensor payloads. The
 constrained Rust Qwen fixture path can reconstruct SPD input rows from recorded
-hidden-state taps and execute the head against recorded fixtures, but live
-Skippy hidden-state integration is not wired yet.
+hidden-state taps and execute the head against recorded fixtures. The live-tap
+bench path can also assemble those rows from real Skippy activation frames for
+the tap-aligned Qwen3.5-4B proof split.
 
 ### 5. Rust Hidden-Tap Planning
 
@@ -231,12 +232,47 @@ Recorded result for the regenerated `Hello` fixture:
 - spec-query max abs diff: `0.03125`
 - final-hidden max abs diff: `0.125`
 
+The branch now also proves the trained head can consume live Skippy-produced
+tap frames for the same Qwen3.5-4B fixture. The proof command drives the
+fixture prompt token ids through tap-aligned runtime slices, adds an
+embedding-only side tap for HF hidden-state index `0`, assembles `cur_in` from
+real activation frames, and runs the Rust Qwen SPD head:
+
+```bash
+cargo run -p skippy-bench -- spd-live-tap-parity \
+  --manifest /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/skippy-spd-head.json \
+  --fixture /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
+  --model-path .artifacts/spd/qwen35-4b-gguf/Qwen3.5-4B-Q4_K_M.gguf \
+  --splits 8,10,16,20,24,31 \
+  --layer-end 32 \
+  --ctx-size 128 \
+  --n-gpu-layers 0 \
+  --selected-backend-device CPU0 \
+  --top-k 8
+```
+
+Recorded local live-tap result against `Qwen3.5-4B-Q4_K_M.gguf`:
+
+- live taps captured: `0,8,10,16,20,24,31`
+- each tap frame: `13` tokens, `133120` bytes, hidden width `2560`
+- live `cur_in` max abs diff vs HF fixture: `0.3134765625`
+- g0 row max abs diff vs HF fixture: `0.00103759765625`
+- live Skippy top-1 token id: `9419`
+- fixture Python/Rust top-1 token id: `9419`
+- live top-8 token ids:
+  `[9419,21251,109266,14556,23066,18103,12675,0]`
+- fixture top-8 token ids:
+  `[9419,21251,109266,12675,14556,18103,23066,0]`
+
+The top-8 set is the same, with lower-ranked candidates reordered by GGUF
+quantization/runtime drift. This is a real Skippy tap/head proof, but it is
+still not integrated into the serving request path or verifier.
+
 ## What Does Not Work Yet
 
-- Skippy does not yet expose live hidden-state taps for SPD.
 - No live Skippy request has used trained SPD proposals.
-- The tap-aligned Qwen3.5-4B proof proves live stage forwarding, not live SPD
-  proposal/verification serving.
+- The tap-aligned Qwen3.5-4B proof now proves live Skippy tap capture and SPD
+  proposal from those taps, but not request-path verification/rollback serving.
 - No larger-than-4B head has been trained by us yet.
 
 ## Correctness Contract

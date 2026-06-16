@@ -31,6 +31,14 @@ pub struct SpdQwen3FixtureDiagnostics {
     pub python_top_logit_values_at_rust_indices: Vec<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpdQwen3ForwardInput {
+    pub cur_in: Vec<f32>,
+    pub seq_len: usize,
+    pub position_ids: Vec<i64>,
+    pub final_norm_weight: Vec<f32>,
+}
+
 #[derive(Debug, Clone)]
 struct SpdQwen3Shape {
     hidden_size: usize,
@@ -80,6 +88,25 @@ pub fn run_qwen3_fixture_parity(
     })
 }
 
+pub fn run_qwen3_forward_from_inputs(
+    manifest_path: impl AsRef<Path>,
+    input: SpdQwen3ForwardInput,
+    top_k: usize,
+) -> Result<SpdQwen3FixtureTopK> {
+    let manifest_path = manifest_path.as_ref();
+    let manifest = SpdHeadManifest::from_path(manifest_path)?;
+    manifest.ensure_serving_checkpoint_for_runtime(manifest_path)?;
+    let serving_path = manifest.serving_checkpoint_path(manifest_path)?;
+    let serving_file = SpdSafetensorsFile::open(&serving_path)?;
+    let shape = SpdQwen3Shape::from_manifest_and_weights(&manifest, &serving_file)?;
+    let trace = run_forward_trace(&serving_file, input, &shape)?;
+    topk_from_logits(
+        &trace.logits,
+        top_k,
+        manifest.topology.draft_token_ids.as_deref(),
+    )
+}
+
 fn run_fixture_forward(
     serving_file: &SpdSafetensorsFile,
     fixture_file: &SpdSafetensorsFile,
@@ -111,6 +138,50 @@ fn run_fixture_forward(
         );
     }
 
+    run_forward_trace(
+        serving_file,
+        SpdQwen3ForwardInput {
+            cur_in,
+            seq_len,
+            position_ids,
+            final_norm_weight,
+        },
+        shape,
+    )
+}
+
+fn run_forward_trace(
+    serving_file: &SpdSafetensorsFile,
+    input: SpdQwen3ForwardInput,
+    shape: &SpdQwen3Shape,
+) -> Result<SpdQwen3ForwardTrace> {
+    if input.cur_in.len() != input.seq_len * shape.hidden_size {
+        bail!(
+            "SPD forward cur_in length {} must match seq_len {} * hidden_size {}",
+            input.cur_in.len(),
+            input.seq_len,
+            shape.hidden_size
+        );
+    }
+    if input.position_ids.len() != input.seq_len {
+        bail!(
+            "SPD forward position_ids length {} must match seq_len {}",
+            input.position_ids.len(),
+            input.seq_len
+        );
+    }
+    if input.final_norm_weight.len() != shape.hidden_size {
+        bail!(
+            "SPD forward final_norm_weight length {} must match hidden_size {}",
+            input.final_norm_weight.len(),
+            shape.hidden_size
+        );
+    }
+
+    let cur_in = input.cur_in;
+    let seq_len = input.seq_len;
+    let position_ids = input.position_ids;
+    let final_norm_weight = input.final_norm_weight;
     let stage_ids = infer_stage_ids(seq_len, shape.num_stages);
     let original_hidden = cur_in.clone();
     let mut base_fixed = cur_in.clone();
