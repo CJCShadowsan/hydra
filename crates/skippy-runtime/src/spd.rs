@@ -1,3 +1,4 @@
+mod gguf_embedding;
 mod live_tap;
 mod qwen;
 mod safetensors;
@@ -13,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use gguf_embedding::GgufTokenEmbeddingTable;
 pub use live_tap::{
     SpdLiveCurInRequest, SpdLiveCurInRows, SpdLiveTapRunner, SpdLiveTapRunnerConfig,
     assemble_spd_live_cur_in_for_positions, sliding_spd_row_positions,

@@ -6,9 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use skippy_runtime::spd::{
-    SpdHeadManifest, SpdLiveCurInRequest, SpdLiveTapRunner, SpdLiveTapRunnerConfig,
-    SpdQwen3ForwardInput, SpdQwen3Head, SpdSafetensorsFile, SpdStageLayerRange,
-    assemble_spd_live_cur_in_for_positions, plan_hidden_state_taps, sliding_spd_row_positions,
+    GgufTokenEmbeddingTable, SpdHeadManifest, SpdLiveCurInRequest, SpdLiveTapRunner,
+    SpdLiveTapRunnerConfig, SpdQwen3ForwardInput, SpdQwen3Head, SpdSafetensorsFile,
+    SpdStageLayerRange, assemble_spd_live_cur_in_for_positions, plan_hidden_state_taps,
+    sliding_spd_row_positions,
 };
 use skippy_runtime::{ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout};
 
@@ -23,6 +24,7 @@ pub(super) struct SpdReplayOpenArgs<'a> {
     pub(super) config: &'a StageConfig,
     pub(super) topology: Option<&'a StageTopology>,
     pub(super) n_gpu_layers: Option<i32>,
+    pub(super) replay_fallback: bool,
     pub(super) window: usize,
     pub(super) top_k: usize,
 }
@@ -49,7 +51,9 @@ pub(super) struct SpdReplayProposalSource {
     manifest: SpdHeadManifest,
     serving_file: SpdSafetensorsFile,
     live_taps: SpdLiveTapRunner,
+    h0_embeddings: Option<GgufTokenEmbeddingTable>,
     inline_taps: Arc<Mutex<SpdInlineTapCache>>,
+    replay_fallback: bool,
 }
 
 impl SpdReplayProposalSource {
@@ -75,6 +79,8 @@ impl SpdReplayProposalSource {
             SpdSafetensorsFile::open(fixture_path).context("open SPD parity fixture")?;
         let hidden_size =
             usize::try_from(manifest.topology.hidden_size).context("SPD hidden_size too large")?;
+        let vocab_size =
+            usize::try_from(manifest.topology.vocab_size).context("SPD vocab_size too large")?;
         let row_count = fixture_cur_in_row_count(&fixture_file, hidden_size)?;
         let row_stage_ids = read_spd_row_stage_ids(&fixture_file, row_count)?;
         let row_hf_indices = read_spd_row_hf_indices(&fixture_file, row_count)?;
@@ -104,6 +110,8 @@ impl SpdReplayProposalSource {
                 .map(|device| device.backend_device.clone()),
         })
         .context("open live SPD tap replay stages")?;
+        let h0_embeddings =
+            GgufTokenEmbeddingTable::open(&model_path, hidden_size, vocab_size).ok();
         let inline_taps = Arc::new(Mutex::new(SpdInlineTapCache::new(
             hidden_size,
             required_hf_indices.clone(),
@@ -124,13 +132,17 @@ impl SpdReplayProposalSource {
             manifest,
             serving_file,
             live_taps,
+            h0_embeddings,
             inline_taps,
+            replay_fallback: args.replay_fallback,
         })
     }
 
-    fn propose_one(&self, context_tokens: &[i32]) -> Result<i32> {
+    fn propose_one(&self, context_tokens: &[i32]) -> Result<Option<i32>> {
         let row_positions = sliding_spd_row_positions(context_tokens.len(), self.row_count)?;
-        let taps = self.collect_taps_for_proposal(context_tokens, &row_positions)?;
+        let Some(taps) = self.collect_taps_for_proposal(context_tokens, &row_positions)? else {
+            return Ok(None);
+        };
         let live_rows = assemble_spd_live_cur_in_for_positions(SpdLiveCurInRequest {
             manifest: &self.manifest,
             serving_file: &self.serving_file,
@@ -154,22 +166,46 @@ impl SpdReplayProposalSource {
             .copied()
             .context("SPD head returned no proposal token")
             .and_then(|token| i32::try_from(token).context("SPD proposal token exceeds i32"))
+            .map(Some)
     }
 
     fn collect_taps_for_proposal(
         &self,
         context_tokens: &[i32],
         row_positions: &[i64],
-    ) -> Result<BTreeMap<u32, ActivationFrame>> {
+    ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
         if let Some(mut taps) = self.complete_inline_taps(row_positions)? {
             if self.required_hf_indices.contains(&0) {
-                taps.insert(0, self.live_taps.collect_h0_tap(context_tokens)?);
+                taps.insert(0, self.collect_h0_tap(context_tokens, row_positions)?);
             }
-            return Ok(taps);
+            return Ok(Some(taps));
+        }
+        if !self.replay_fallback {
+            return Ok(None);
         }
         let mut taps = self.live_taps.collect_taps(context_tokens)?;
         self.overlay_inline_taps(&mut taps, row_positions)?;
-        Ok(taps)
+        Ok(Some(taps))
+    }
+
+    fn collect_h0_tap(
+        &self,
+        context_tokens: &[i32],
+        row_positions: &[i64],
+    ) -> Result<ActivationFrame> {
+        if let Some(embeddings) = &self.h0_embeddings {
+            return embeddings
+                .frame_for_positions(context_tokens, row_positions)
+                .context("collect GGUF token embedding h0 tap");
+        }
+        self.live_taps.collect_h0_tap(context_tokens)
+    }
+
+    pub(super) fn propose_inline_for_current_context(&self, current: i32) -> Result<Option<i32>> {
+        if self.context_tokens.last().copied() != Some(current) {
+            return Ok(None);
+        }
+        self.propose_one(&self.context_tokens)
     }
 
     fn complete_inline_taps(
@@ -232,7 +268,9 @@ impl SpeculativeProposalSource for SpdReplayProposalSource {
         }
         let mut proposals = Vec::with_capacity(max_tokens);
         for _ in 0..max_tokens {
-            let proposal = self.propose_one(&self.context_tokens)?;
+            let Some(proposal) = self.propose_one(&self.context_tokens)? else {
+                break;
+            };
             proposals.push(proposal);
             self.context_tokens.push(proposal);
         }

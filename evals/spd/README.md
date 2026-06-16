@@ -26,6 +26,9 @@ Rust.
 - `skippy-runtime` exposes `SpdQwen3Head`, a reusable loaded-head boundary for
   repeated Qwen SPD proposals without reopening the manifest/checkpoint each
   time.
+- `skippy-runtime` can read GGUF `token_embd.weight` rows directly for the
+  SPD hidden-state-index `0` embedding tap on the current Qwen3.5-4B proof
+  model.
 - `skippy-runtime` can reconstruct the SPD `cur_in` rows from raw recorded
   hidden-state tap inputs using `g0_proj` and `stage_projs.*`.
 - `skippy-model-package` can plan, write, and preflight explicit tap-aligned
@@ -46,12 +49,19 @@ Rust.
 - A bounded local OpenAI request through `skippy-server` has exercised the
   pretrained head in the live serving path: four `spd-replay` proposals, two
   accepted, two rejected, and the same greedy text as the no-SPD baseline.
+- A release `skippy-server` request-path smoke now runs the pretrained head
+  from inline returned Skippy taps plus direct GGUF h0 embeddings without
+  `--openai-spd-replay-fallback`; the inline probe was ready and completed in
+  about `400ms`.
 
 ## What Does Not Work Yet
 
-- The `spd-replay` source collects taps by replaying the current context through
+- The replay fallback collects taps by replaying the current context through
   local `StageModel` slices. It is a correctness bridge into live serving, not
   the optimized inline hidden-tap transport needed for real speed.
+- The no-replay request-path probe currently runs after the normal target token
+  returns. It proves the real head can consume inline taps, but it is not yet a
+  serving speedup.
 - The live request-path proof is bounded; it still needs a larger acceptance
   and latency sweep.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
@@ -397,9 +407,26 @@ and `spd-replay` overlays complete cached boundary frames before falling back to
 local replay. A one-token Qwen3.5-4B smoke on seven local CPU stages returned
 the required `10`, `20`, and `31` rows with no tap-return failures. The
 proposal source now skips local downstream replay when all required non-h0 rows
-are present and runs only the embedding-only h0 tap. The remaining production
-work is scheduling proposal generation after the in-flight current-token taps
-exist, then measuring ordinary split serving against inline-tap SPD serving.
+are present and reads h0 from GGUF `token_embd.weight` when possible. Recorded
+release no-replay smoke for a one-token request:
+
+- topology: seven tap-aligned local CPU stages,
+  `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
+- binary: `target/release/skippy-server`
+- prompt: `Write a Python function named add that returns the sum of two integers.`
+- response content: `<think>\nThinking`
+- inline probe elapsed: about `400ms`
+- inline probe result: ready, proposed token `8160`, target token `90700`,
+  accepted `false`
+- SPD request wall time: about `1.23s`
+- no-SPD same-topology wall time: about `0.46s`
+
+That result proves the real pretrained head runs from inline Skippy request
+taps without replay fallback. It is still not a live speedup because the probe
+is post-target-decode and the sampled proposal was rejected. The remaining
+production work is scheduling proposal generation after current-token taps
+exist but before the final-stage target decision would otherwise idle the
+pipeline, then measuring ordinary split serving against inline-tap SPD serving.
 
 ## Validate Hidden Tap Compatibility
 
@@ -463,7 +490,9 @@ The tap-row-to-`cur_in` projection bridge lives in
    hidden-tap ABI is already available.
 3. Replace `spd-replay` with inline tap capture in `skippy-server`. Stage-0
    positioned tap caching and downstream direct-return tap transport exist for
-   the tap-aligned local proof; in-flight proposal scheduling remains.
+   the tap-aligned local proof, and the no-replay request-path probe can run
+   the real pretrained head from those taps. In-flight proposal scheduling
+   remains.
 4. Verify every accepted token through the normal target stages.
 5. Benchmark against ordinary split serving with both injected hop latency and a
    real multi-node topology.

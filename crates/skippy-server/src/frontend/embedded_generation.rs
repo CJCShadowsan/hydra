@@ -1242,6 +1242,39 @@ impl StageOpenAiBackend {
                     .map_err(openai_backend_error)?;
                 let downstream_wait_ms = wait_timer.elapsed_ms();
                 decode_downstream_wait_ms += downstream_wait_ms;
+                if let Some(spd) = spd_guard.as_deref() {
+                    let probe_timer = PhaseTimer::start();
+                    let proposed = spd
+                        .propose_inline_for_current_context(current)
+                        .map_err(openai_backend_error)?;
+                    let mut probe_attrs = self.openai_attrs(request.ids);
+                    probe_attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
+                    probe_attrs.insert(
+                        "llama_stage.spd_inline_probe_ready".to_string(),
+                        json!(proposed.is_some()),
+                    );
+                    probe_attrs.insert(
+                        "llama_stage.spd_inline_probe_current_token".to_string(),
+                        json!(current),
+                    );
+                    probe_attrs.insert(
+                        "llama_stage.spd_inline_probe_proposed_token".to_string(),
+                        json!(proposed),
+                    );
+                    probe_attrs.insert(
+                        "llama_stage.spd_inline_probe_target_token".to_string(),
+                        json!(reply.predicted),
+                    );
+                    probe_attrs.insert(
+                        "llama_stage.spd_inline_probe_accepted".to_string(),
+                        json!(proposed == Some(reply.predicted)),
+                    );
+                    speculative_stats.draft_propose_ms += self.emit_openai_phase(
+                        "stage.openai_spd_inline_probe",
+                        probe_timer,
+                        probe_attrs,
+                    );
+                }
                 if records_replay_checkpoint
                     && super::prefix_cache::request_allows_exact_replay(&request)
                 {

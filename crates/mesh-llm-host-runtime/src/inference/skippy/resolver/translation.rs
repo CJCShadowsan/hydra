@@ -407,6 +407,7 @@ impl ResolvedEmbeddedOpenAiArgs {
             spd_model_path: None,
             spd_top_k: 1,
             spd_n_gpu_layers: None,
+            spd_replay_fallback: false,
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,
             draft_n_gpu_layers: self.draft_n_gpu_layers,

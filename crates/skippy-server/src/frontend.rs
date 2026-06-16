@@ -230,6 +230,7 @@ pub struct EmbeddedOpenAiArgs {
     pub spd_model_path: Option<PathBuf>,
     pub spd_top_k: usize,
     pub spd_n_gpu_layers: Option<i32>,
+    pub spd_replay_fallback: bool,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
     pub draft_n_gpu_layers: Option<i32>,
@@ -496,6 +497,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         config: &args.config,
         topology: args.topology.as_ref(),
         n_gpu_layers: args.spd_n_gpu_layers,
+        replay_fallback: args.spd_replay_fallback,
         window: args.speculative_window,
         top_k: args.spd_top_k,
     })?;

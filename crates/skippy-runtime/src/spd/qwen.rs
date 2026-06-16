@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -43,8 +46,8 @@ pub struct SpdQwen3ForwardInput {
 pub struct SpdQwen3Head {
     manifest_path: PathBuf,
     manifest: SpdHeadManifest,
-    serving_file: SpdSafetensorsFile,
     shape: SpdQwen3Shape,
+    weights: Arc<SpdQwen3Weights>,
 }
 
 impl SpdQwen3Head {
@@ -55,11 +58,12 @@ impl SpdQwen3Head {
         let serving_file =
             SpdSafetensorsFile::open(manifest.serving_checkpoint_path(&manifest_path)?)?;
         let shape = SpdQwen3Shape::from_manifest_and_weights(&manifest, &serving_file)?;
+        let weights = Arc::new(SpdQwen3Weights::load(&serving_file, &shape)?);
         Ok(Self {
             manifest_path,
             manifest,
-            serving_file,
             shape,
+            weights,
         })
     }
 
@@ -76,7 +80,7 @@ impl SpdQwen3Head {
         input: SpdQwen3ForwardInput,
         top_k: usize,
     ) -> Result<SpdQwen3FixtureTopK> {
-        let trace = run_forward_trace(&self.serving_file, input, &self.shape)?;
+        let trace = run_forward_trace(&self.weights, input, &self.shape)?;
         topk_from_logits(
             &trace.logits,
             top_k,
@@ -106,6 +110,78 @@ struct SpdQwen3ForwardTrace {
     final_hidden: Vec<f32>,
 }
 
+#[derive(Debug)]
+struct SpdQwen3Weights {
+    fixed_stage_per_layer_projs: Vec<Vec<Vec<f32>>>,
+    layers: Vec<SpdQwen3LayerWeights>,
+    lm_head: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct SpdQwen3LayerWeights {
+    input_layernorm: Vec<f32>,
+    q_proj: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_proj: Vec<f32>,
+    k_norm: Vec<f32>,
+    v_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+    post_attention_layernorm: Vec<f32>,
+    gate_proj: Vec<f32>,
+    up_proj: Vec<f32>,
+    down_proj: Vec<f32>,
+}
+
+impl SpdQwen3Weights {
+    fn load(serving_file: &SpdSafetensorsFile, shape: &SpdQwen3Shape) -> Result<Self> {
+        let mut fixed_stage_per_layer_projs = Vec::with_capacity(shape.num_spec_layers);
+        for layer in 0..shape.num_spec_layers {
+            let mut projections = Vec::with_capacity(shape.num_stages);
+            for projection_idx in 0..shape.num_stages {
+                projections.push(serving_file.read_tensor_f32(&format!(
+                    "fixed_stage_per_layer_projs.{layer}.{projection_idx}.weight"
+                ))?);
+            }
+            fixed_stage_per_layer_projs.push(projections);
+        }
+
+        let mut layers = Vec::with_capacity(shape.num_spec_layers);
+        for layer in 0..shape.num_spec_layers {
+            layers.push(SpdQwen3LayerWeights {
+                input_layernorm: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.input_layernorm.weight"))?,
+                q_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.q_proj.weight"))?,
+                q_norm: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.q_norm.weight"))?,
+                k_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.k_proj.weight"))?,
+                k_norm: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.k_norm.weight"))?,
+                v_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.v_proj.weight"))?,
+                o_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.o_proj.weight"))?,
+                post_attention_layernorm: serving_file.read_tensor_f32(&format!(
+                    "spec_layers.{layer}.post_attention_layernorm.weight"
+                ))?,
+                gate_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.mlp.gate_proj.weight"))?,
+                up_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.mlp.up_proj.weight"))?,
+                down_proj: serving_file
+                    .read_tensor_f32(&format!("spec_layers.{layer}.mlp.down_proj.weight"))?,
+            });
+        }
+
+        Ok(Self {
+            fixed_stage_per_layer_projs,
+            layers,
+            lm_head: serving_file.read_tensor_f32("lm_head.weight")?,
+        })
+    }
+}
+
 pub fn run_qwen3_fixture_parity(
     manifest_path: impl AsRef<Path>,
     fixture_path: impl AsRef<Path>,
@@ -115,7 +191,7 @@ pub fn run_qwen3_fixture_parity(
     let fixture_path = fixture_path.as_ref();
     let head = SpdQwen3Head::open(manifest_path)?;
     let fixture_file = SpdSafetensorsFile::open(fixture_path)?;
-    let trace = run_fixture_forward(&head.serving_file, &fixture_file, &head.shape)?;
+    let trace = run_fixture_forward(&head.weights, &fixture_file, &head.shape)?;
     let rust = topk_from_logits(
         &trace.logits,
         top_k,
@@ -139,7 +215,7 @@ pub fn run_qwen3_forward_from_inputs(
 }
 
 fn run_fixture_forward(
-    serving_file: &SpdSafetensorsFile,
+    weights: &SpdQwen3Weights,
     fixture_file: &SpdSafetensorsFile,
     shape: &SpdQwen3Shape,
 ) -> Result<SpdQwen3ForwardTrace> {
@@ -170,7 +246,7 @@ fn run_fixture_forward(
     }
 
     run_forward_trace(
-        serving_file,
+        weights,
         SpdQwen3ForwardInput {
             cur_in,
             seq_len,
@@ -182,7 +258,7 @@ fn run_fixture_forward(
 }
 
 fn run_forward_trace(
-    serving_file: &SpdSafetensorsFile,
+    weights: &SpdQwen3Weights,
     input: SpdQwen3ForwardInput,
     shape: &SpdQwen3Shape,
 ) -> Result<SpdQwen3ForwardTrace> {
@@ -221,20 +297,20 @@ fn run_forward_trace(
     let mut layer_queries = Vec::with_capacity(shape.num_spec_layers);
 
     for layer in 0..shape.num_spec_layers {
-        apply_fixed_stage_projections(serving_file, &mut base_fixed, &stage_ids, layer, shape)?;
+        apply_fixed_stage_projections(weights, &mut base_fixed, &stage_ids, layer, shape)?;
         let mut full_in = original_hidden.clone();
         copy_fixed_rows(&mut full_in, &base_fixed, &stage_ids, shape);
         full_in[(seq_len - 1) * shape.hidden_size..seq_len * shape.hidden_size]
             .copy_from_slice(&query);
         layer_inputs.push(full_in.clone());
-        query = decoder_layer_query(serving_file, &full_in, &position_ids, layer, shape)?;
+        query = decoder_layer_query(weights, &full_in, &position_ids, layer, shape)?;
         layer_queries.push(query.clone());
     }
 
     let spec_query = query.clone();
     qwen35_final_norm_in_place(&mut query, &final_norm_weight, QWEN3_RMS_NORM_EPS);
     let final_hidden = query.clone();
-    let logits = lm_head_logits(serving_file, &query)?;
+    let logits = lm_head_logits(weights, &query)?;
     Ok(SpdQwen3ForwardTrace {
         logits,
         layer_inputs,
@@ -245,7 +321,7 @@ fn run_forward_trace(
 }
 
 fn apply_fixed_stage_projections(
-    serving_file: &SpdSafetensorsFile,
+    weights: &SpdQwen3Weights,
     base_fixed: &mut [f32],
     stage_ids: &[usize],
     layer: usize,
@@ -259,12 +335,14 @@ fn apply_fixed_stage_projections(
             .num_stages
             .checked_sub(*stage_id)
             .context("SPD stage id exceeds num_stages")?;
-        let weight = serving_file.read_tensor_f32(&format!(
-            "fixed_stage_per_layer_projs.{layer}.{projection_idx}.weight"
-        ))?;
+        let weight = weights
+            .fixed_stage_per_layer_projs
+            .get(layer)
+            .and_then(|layer_weights| layer_weights.get(projection_idx))
+            .context("missing cached SPD fixed-stage projection")?;
         let input = row(base_fixed, row_idx, shape.hidden_size).to_vec();
         let output = row_mut(base_fixed, row_idx, shape.hidden_size);
-        linear_into(&weight, shape.hidden_size, &input, output)?;
+        linear_into(weight, shape.hidden_size, &input, output)?;
     }
     Ok(())
 }
@@ -288,34 +366,34 @@ fn copy_fixed_rows(
 }
 
 fn decoder_layer_query(
-    serving_file: &SpdSafetensorsFile,
+    weights: &SpdQwen3Weights,
     full_in: &[f32],
     position_ids: &[i64],
     layer: usize,
     shape: &SpdQwen3Shape,
 ) -> Result<Vec<f32>> {
     let seq_len = position_ids.len();
-    let input_norm_weight =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.input_layernorm.weight"))?;
+    let layer_weights = weights
+        .layers
+        .get(layer)
+        .context("missing cached SPD decoder layer")?;
     let mut normed = full_in.to_vec();
     for token in 0..seq_len {
         rms_norm_in_place(
             row_mut(&mut normed, token, shape.hidden_size),
-            &input_norm_weight,
+            &layer_weights.input_layernorm,
             QWEN3_RMS_NORM_EPS,
         );
     }
 
     let query_row = seq_len - 1;
-    let q = project_query(serving_file, &normed, query_row, layer, shape)?;
-    let k = project_kv(serving_file, &normed, layer, shape, "k_proj")?;
-    let v = project_kv(serving_file, &normed, layer, shape, "v_proj")?;
+    let q = project_query(layer_weights, &normed, query_row, shape)?;
+    let k = project_kv(layer_weights, &normed, shape, KvProjection::K)?;
+    let v = project_kv(layer_weights, &normed, shape, KvProjection::V)?;
     let attn = attention_query(&q, &k, &v, position_ids, shape);
-    let o_proj =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.self_attn.o_proj.weight"))?;
     let mut attn_hidden = vec![0.0; shape.hidden_size];
     linear_into(
-        &o_proj,
+        &layer_weights.o_proj,
         shape.num_attention_heads * shape.head_dim,
         &attn,
         &mut attn_hidden,
@@ -324,74 +402,74 @@ fn decoder_layer_query(
     let mut hidden = row(full_in, query_row, shape.hidden_size).to_vec();
     add_in_place(&mut hidden, &attn_hidden);
 
-    let post_norm_weight = serving_file.read_tensor_f32(&format!(
-        "spec_layers.{layer}.post_attention_layernorm.weight"
-    ))?;
     let mut mlp_in = hidden.clone();
-    rms_norm_in_place(&mut mlp_in, &post_norm_weight, QWEN3_RMS_NORM_EPS);
-    let mlp_out = mlp(serving_file, &mlp_in, layer, shape)?;
+    rms_norm_in_place(
+        &mut mlp_in,
+        &layer_weights.post_attention_layernorm,
+        QWEN3_RMS_NORM_EPS,
+    );
+    let mlp_out = mlp(layer_weights, &mlp_in, shape)?;
     add_in_place(&mut hidden, &mlp_out);
     Ok(hidden)
 }
 
 fn project_query(
-    serving_file: &SpdSafetensorsFile,
+    layer_weights: &SpdQwen3LayerWeights,
     normed: &[f32],
     query_row: usize,
-    layer: usize,
     shape: &SpdQwen3Shape,
 ) -> Result<Vec<f32>> {
-    let q_proj =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.self_attn.q_proj.weight"))?;
     let mut q = vec![0.0; shape.num_attention_heads * shape.head_dim];
     linear_into(
-        &q_proj,
+        &layer_weights.q_proj,
         shape.hidden_size,
         row(normed, query_row, shape.hidden_size),
         &mut q,
     )?;
-    let q_norm =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.self_attn.q_norm.weight"))?;
     for head in 0..shape.num_attention_heads {
         rms_norm_in_place(
             &mut q[head * shape.head_dim..(head + 1) * shape.head_dim],
-            &q_norm,
+            &layer_weights.q_norm,
             QWEN3_RMS_NORM_EPS,
         );
     }
     Ok(q)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KvProjection {
+    K,
+    V,
+}
+
 fn project_kv(
-    serving_file: &SpdSafetensorsFile,
+    layer_weights: &SpdQwen3LayerWeights,
     normed: &[f32],
-    layer: usize,
     shape: &SpdQwen3Shape,
-    projection: &str,
+    projection: KvProjection,
 ) -> Result<Vec<f32>> {
     let seq_len = normed.len() / shape.hidden_size;
-    let weight = serving_file.read_tensor_f32(&format!(
-        "spec_layers.{layer}.self_attn.{projection}.weight"
-    ))?;
+    let weight = match projection {
+        KvProjection::K => &layer_weights.k_proj,
+        KvProjection::V => &layer_weights.v_proj,
+    };
     let mut output = vec![0.0; seq_len * shape.num_key_value_heads * shape.head_dim];
     for token in 0..seq_len {
         linear_into(
-            &weight,
+            weight,
             shape.hidden_size,
             row(normed, token, shape.hidden_size),
             &mut output[token * shape.num_key_value_heads * shape.head_dim
                 ..(token + 1) * shape.num_key_value_heads * shape.head_dim],
         )?;
     }
-    if projection == "k_proj" {
-        let k_norm = serving_file
-            .read_tensor_f32(&format!("spec_layers.{layer}.self_attn.k_norm.weight"))?;
+    if projection == KvProjection::K {
         for token in 0..seq_len {
             for head in 0..shape.num_key_value_heads {
                 let start = (token * shape.num_key_value_heads + head) * shape.head_dim;
                 rms_norm_in_place(
                     &mut output[start..start + shape.head_dim],
-                    &k_norm,
+                    &layer_weights.k_norm,
                     QWEN3_RMS_NORM_EPS,
                 );
             }
@@ -443,40 +521,37 @@ fn attention_query(
 }
 
 fn mlp(
-    serving_file: &SpdSafetensorsFile,
+    layer_weights: &SpdQwen3LayerWeights,
     input: &[f32],
-    layer: usize,
     shape: &SpdQwen3Shape,
 ) -> Result<Vec<f32>> {
-    let gate_weight =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.mlp.gate_proj.weight"))?;
-    let intermediate = gate_weight.len() / shape.hidden_size;
+    let intermediate = layer_weights.gate_proj.len() / shape.hidden_size;
     let mut gate = vec![0.0; intermediate];
-    linear_into(&gate_weight, shape.hidden_size, input, &mut gate)?;
+    linear_into(
+        &layer_weights.gate_proj,
+        shape.hidden_size,
+        input,
+        &mut gate,
+    )?;
     for value in &mut gate {
         *value = round_to_bf16(silu(*value));
     }
 
-    let up_weight =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.mlp.up_proj.weight"))?;
     let mut up = vec![0.0; intermediate];
-    linear_into(&up_weight, shape.hidden_size, input, &mut up)?;
+    linear_into(&layer_weights.up_proj, shape.hidden_size, input, &mut up)?;
     for (gate_value, up_value) in gate.iter_mut().zip(up) {
         *gate_value = round_to_bf16(*gate_value * up_value);
     }
 
-    let down_weight =
-        serving_file.read_tensor_f32(&format!("spec_layers.{layer}.mlp.down_proj.weight"))?;
     let mut output = vec![0.0; shape.hidden_size];
-    linear_into(&down_weight, intermediate, &gate, &mut output)?;
+    linear_into(&layer_weights.down_proj, intermediate, &gate, &mut output)?;
     Ok(output)
 }
 
-fn lm_head_logits(serving_file: &SpdSafetensorsFile, hidden: &[f32]) -> Result<Vec<f32>> {
-    let lm_head = serving_file.read_tensor_f32("lm_head.weight")?;
-    let vocab = lm_head.len() / hidden.len();
+fn lm_head_logits(weights: &SpdQwen3Weights, hidden: &[f32]) -> Result<Vec<f32>> {
+    let vocab = weights.lm_head.len() / hidden.len();
     let mut logits = vec![0.0; vocab];
-    linear_into(&lm_head, hidden.len(), hidden, &mut logits)?;
+    linear_into(&weights.lm_head, hidden.len(), hidden, &mut logits)?;
     Ok(logits)
 }
 

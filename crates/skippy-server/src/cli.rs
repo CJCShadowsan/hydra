@@ -144,6 +144,11 @@ pub struct ServeBinaryArgs {
         help = "Override n_gpu_layers for experimental SPD replay tap models. Defaults to the stage config n_gpu_layers."
     )]
     pub openai_spd_n_gpu_layers: Option<i32>,
+    #[arg(
+        long,
+        help = "Allow the experimental SPD source to run slow local full-context tap replay when inline taps are incomplete."
+    )]
+    pub openai_spd_replay_fallback: bool,
     #[arg(long, default_value_t = 4)]
     pub openai_speculative_window: usize,
     #[arg(long)]
@@ -271,6 +276,7 @@ mod tests {
             "4",
             "--openai-spd-n-gpu-layers",
             "99",
+            "--openai-spd-replay-fallback",
             "--openai-speculative-window",
             "2",
         ])
@@ -294,6 +300,7 @@ mod tests {
         );
         assert_eq!(args.openai_spd_top_k, 4);
         assert_eq!(args.openai_spd_n_gpu_layers, Some(99));
+        assert!(args.openai_spd_replay_fallback);
         assert_eq!(args.openai_speculative_window, 2);
     }
 }

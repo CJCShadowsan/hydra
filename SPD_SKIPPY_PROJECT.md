@@ -46,10 +46,11 @@ and `7.752x` at `25ms` hop. The Rust live-tap harness now also proves three
 consecutive Qwen3.5-4B top-1 SPD proposals from live Skippy activation frames:
 all three were accepted by the target verifier, every verifier window rewound,
 and the committed token stream matched ordinary non-SPD greedy decoding. The
-Skippy OpenAI request path also now runs the pretrained head through the
-experimental `spd-replay` proposal source: a bounded four-token Humaneval smoke
-proposed four SPD tokens, accepted two, rejected two, and emitted the exact same
-greedy text as ordinary no-SPD Skippy serving.
+Skippy OpenAI request path can run the pretrained head from inline returned
+taps without local replay fallback. In the current release smoke that probe was
+ready and ran in about `400ms`, but it ran after the normal target token
+returned and the proposal was rejected. That is a real request-path proof, not
+yet a live serving speedup.
 
 ## What Works Today
 
@@ -138,12 +139,13 @@ the tap-aligned Qwen3.5-4B proof split.
 
 `skippy-runtime::spd::SpdQwen3Head` is the current Rust hosting boundary for
 the pretrained Qwen head. It opens the manifest and serving checkpoint once,
-validates the tensor shapes, keeps the runtime shape, and exposes repeated
-`forward()` calls for proposal generation. The live verifier harness now uses
-that loaded head instead of reopening the artifact on every proposal. This is
-the shape a Skippy SPD sidecar should use, but the current Qwen forward remains
-a straightforward Rust reference path and is not yet optimized for request-path
-throughput.
+validates the tensor shapes, caches the serving weights, keeps the runtime
+shape, and exposes repeated `forward()` calls for proposal generation. The live
+verifier harness and request-path probe now use that loaded head instead of
+reopening the artifact on every proposal. This is the shape a Skippy SPD
+sidecar should use, but the current Qwen forward remains a straightforward Rust
+reference path, expands BF16 weights to `f32`, and is not yet optimized for
+request-path throughput.
 
 ### 5. Rust Hidden-Tap Planning
 
@@ -301,10 +303,13 @@ The top-8 set is the same, with lower-ranked candidates reordered by GGUF
 quantization/runtime drift. This is a real Skippy tap/head/target-verifier
 proof over repeated proposal windows, but it is still a diagnostic harness and
 not a serving throughput measurement. `skippy-server` now has an experimental
-request-path SPD replay source that can load the same pretrained head and feed
-the existing verifier.
+request-path SPD source that can load the same pretrained head. By default it
+uses inline Skippy taps when they are complete and otherwise returns no
+proposal. Passing `--openai-spd-replay-fallback` enables the older slow local
+tap replay mode for correctness proofs.
 
-Recorded local request-path smoke with `skippy-server serve-binary`:
+Recorded local request-path smoke with `skippy-server serve-binary` and
+`--openai-spd-replay-fallback`:
 
 - topology: seven tap-aligned local CPU stages,
   `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
@@ -325,8 +330,9 @@ This proves the live OpenAI serving path can call a real pretrained SPD head,
 feed proposals into Skippy's verifier, accept/reject per token, and preserve
 ordinary greedy output. It is still not a serving throughput measurement:
 `spd-replay` recomputes taps through local `StageModel` slices and runs the head
-on CPU for each proposal. Use the trace latency simulator for current speedup
-estimates until proposal scheduling consumes inline taps without replay.
+on CPU for each proposal when replay fallback is enabled. Use the trace latency
+simulator for current speedup estimates until proposal scheduling consumes
+inline taps without replay.
 
 Inline tap transport now works for the tap-aligned local proof topology. During
 embedded stage-0 serving, Skippy records stage-0 boundary activation frames into
@@ -345,22 +351,51 @@ seven local CPU stages returned and recorded required hidden-state rows for
   - `hf_index=31`, producer stage `5`, rows `17` and `1`, `required=true`
 - downstream non-required tap records: `16` and `24`, rows `17` and `1`
 
-This still does not make `spd-replay` a speed path. Proposal generation still
-starts before the in-flight current-token target pass has produced the taps that
-the next proposal needs, so the source can still fall back to replay. When all
-required non-h0 rows are present, `spd-replay` now skips local downstream replay
-and runs only the embedding-only h0 tap before the SPD head. The next serving
-milestone is proposal scheduling around freshly returned current-token taps,
-then measuring ordinary split serving against inline-tap SPD serving.
+Recorded local release request-path smoke without replay fallback:
+
+- topology: seven tap-aligned local CPU stages,
+  `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
+- binary: `target/release/skippy-server`
+- prompt: `Write a Python function named add that returns the sum of two integers.`
+- response content for `max_tokens=1`: `<think>\nThinking`
+- SPD source: `spd-replay`, with `--openai-spd-replay-fallback` disabled
+- inline tap state: required downstream taps `10`, `20`, and `31` returned and
+  recorded for prompt rows and the current-token row; no tap-return failures
+- h0 source: direct GGUF `token_embd.weight` rows
+- SPD head hosting: cached pretrained Qwen3.5-4B serving weights
+- inline probe elapsed: about `400ms`
+- inline probe result: ready, proposed token `8160`, target token `90700`,
+  accepted `false`
+- SPD request wall time: about `1.23s`
+- no-SPD same-topology wall time for the same one-token request: about `0.46s`
+
+This proves the real pretrained head can run in the Skippy OpenAI request path
+from inline Skippy taps plus direct GGUF h0 embeddings, without replaying local
+stage slices. It is not a speedup yet: the probe currently runs after the target
+token has already traversed the full pipeline, and the first sampled proposal
+in this smoke was rejected.
+
+This still does not make `spd-replay` a full speed path. Proposal generation at
+the top of the decode loop starts before the in-flight current-token target pass
+has produced the taps that the next proposal needs, so the default inline source
+returns no proposal there. When all required non-h0 rows are present, it skips
+local downstream replay and runs only the embedding-only h0 tap before the SPD
+head. The normal decode path now has the right place to probe the head after the
+target pass returns the current-token taps; the next serving milestone is using
+that probe to drive ahead-of-final-stage verification and then measuring
+ordinary split serving against inline-tap SPD serving.
 
 ## What Does Not Work Yet
 
-- The `spd-replay` request path is a correctness bridge, not a speed path. It
-  replays taps through local stage slices before feeding proposals into the
-  existing verify/repair/rollback loop.
+- The `spd-replay` request path has a correctness fallback, not a final speed
+  path. `--openai-spd-replay-fallback` replays taps through local stage slices
+  before feeding proposals into the existing verify/repair/rollback loop.
 - Inline hidden-tap capture and direct-return transport work for the local
-  tap-aligned proof. Proposal scheduling still needs to consume freshly returned
-  current-token taps before `spd-replay` can stop replaying missing rows.
+  tap-aligned proof. Proposal scheduling still needs to turn freshly returned
+  current-token taps into useful ahead-of-final-stage work.
+- The current no-replay request-path probe is post-target-decode telemetry. It
+  proves readiness and measures head cost, but it adds latency instead of
+  hiding pipeline bubbles.
 - Request-path acceptance has been proven on a bounded four-token smoke, but a
   larger local request-path acceptance/latency sweep is still needed.
 - No larger-than-4B head has been trained by us yet.
@@ -416,10 +451,10 @@ skippy-server serve-binary \
   --openai-speculative-window 1
 ```
 
-This `spd-replay` source runs real pretrained SPD proposals, but it collects
-taps by replaying the current context through local `StageModel` slices. Use it
-to prove request-path correctness first; do not use it as the final performance
-architecture.
+The default source uses inline tap cache rows only. Add
+`--openai-spd-replay-fallback` to run the older slow local `StageModel` replay
+path for request-path correctness proofing; do not use that fallback as the
+final performance architecture.
 
 Distributed SPD execution across all stage nodes may become useful later, but it
 is not the first proof path.
