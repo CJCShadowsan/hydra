@@ -19,6 +19,7 @@ const SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV: &str =
     "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN";
 const SERIAL_AFTER_GAP_REJECT_SKIP_PROBES_ENV: &str =
     "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_REJECT_SKIP_PROBES";
+const SERIAL_AFTER_GAP_DIRECT_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DIRECT_VERIFY";
 const VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV: &str = "SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN";
 const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
@@ -91,6 +92,14 @@ pub(super) fn native_mtp_serial_after_gap_reject_skip_probes() -> usize {
     parse_usize_env(SERIAL_AFTER_GAP_REJECT_SKIP_PROBES_ENV, 0)
 }
 
+pub(super) fn native_mtp_serial_after_gap_direct_verify_enabled() -> bool {
+    native_mtp_serial_after_gap_direct_verify_enabled_from(
+        std::env::var(SERIAL_AFTER_GAP_DIRECT_VERIFY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 pub(super) fn native_mtp_verify_next_draft_min_margin() -> Option<f32> {
     parse_optional_f32_env(VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV)
 }
@@ -145,6 +154,13 @@ fn native_mtp_adaptive_disable_enabled_from(value: Option<&str>) -> bool {
 }
 
 fn native_mtp_defer_reject_trim_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
+    )
+}
+
+fn native_mtp_serial_after_gap_direct_verify_enabled_from(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
@@ -454,6 +470,10 @@ impl NativeMtpN1Verifier {
         })
     }
 
+    pub(super) fn pending_draft_origin(&self) -> Option<NativeMtpDraftOrigin> {
+        self.pending.map(|pending| pending.origin)
+    }
+
     pub(super) fn clear_pending_draft(&mut self) {
         self.pending = None;
     }
@@ -742,9 +762,15 @@ mod tests {
         let mut verifier = NativeMtpN1Verifier::default();
         observe(&mut verifier, 11, 5, Some(draft(12)));
 
+        assert_eq!(
+            verifier.pending_draft_origin(),
+            Some(NativeMtpDraftOrigin::InitialSerial)
+        );
+
         let pending = verifier.take_pending_draft();
         let pending = pending.unwrap();
         assert_eq!(pending.origin, NativeMtpDraftOrigin::InitialSerial);
+        assert_eq!(verifier.pending_draft_origin(), None);
         let decision = verifier.observe_taken_draft_verification(pending.token, 12, 9);
 
         assert_eq!(
@@ -996,6 +1022,28 @@ mod tests {
             parse_usize_env("SKIPPY_TEST_MISSING_GAP_REJECT_SKIP_PROBES", 0),
             0
         );
+    }
+
+    #[test]
+    fn serial_after_gap_direct_verify_flag_defaults_off_and_accepts_true_values() {
+        assert!(!native_mtp_serial_after_gap_direct_verify_enabled_from(
+            None
+        ));
+        assert!(native_mtp_serial_after_gap_direct_verify_enabled_from(
+            Some("1")
+        ));
+        assert!(native_mtp_serial_after_gap_direct_verify_enabled_from(
+            Some("true")
+        ));
+        assert!(native_mtp_serial_after_gap_direct_verify_enabled_from(
+            Some(" enabled ")
+        ));
+        assert!(!native_mtp_serial_after_gap_direct_verify_enabled_from(
+            Some("0")
+        ));
+        assert!(!native_mtp_serial_after_gap_direct_verify_enabled_from(
+            Some("false")
+        ));
     }
 
     #[test]
