@@ -96,7 +96,7 @@ The paper-like gain is from the SPD trace itself. The Skippy comparison models
 ordinary split serving as requiring each generated token to traverse all
 stages/hops before the next target token is known.
 
-### 4. Rust Manifest Validation
+### 4. Rust Serving Artifact Validation
 
 `crates/skippy-runtime/src/spd.rs` adds a manifest parser and validator for SPD
 head artifacts:
@@ -111,13 +111,18 @@ head artifacts:
 - number of target stages
 - number of spec layers
 - shallow hidden-layer tap indices
+- optional safetensors serving checkpoint path, size, checksum, tensor count,
+  and dtype
 
-This is validation only. It does not load tensors or run the head.
+`evals/spd/export_spd_head.py` exports the reference `.pt` checkpoint into
+`spd-head.safetensors` and updates the manifest with a `serving_checkpoint`
+section. This is still validation only: Skippy can inspect the serving artifact
+but does not run the SPD head yet.
 
 ## What Does Not Work Yet
 
 - Skippy/Rust does not execute the SPD head.
-- The `.pt` checkpoint is not a serving artifact.
+- Skippy/Rust does not load tensor values into an executable SPD head yet.
 - Skippy does not yet expose live hidden-state taps for SPD.
 - No live Skippy request has used trained SPD proposals.
 - No larger-than-4B head has been trained by us yet.
@@ -259,6 +264,15 @@ python evals/spd/hf_train_eval_qwen06.py \
   --upload-repo ''
 ```
 
+### Export Serving Checkpoint
+
+```bash
+python evals/spd/export_spd_head.py \
+  --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
+  --manifest /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/skippy-spd-head.json \
+  --base-model-path Qwen/Qwen3.5-4B
+```
+
 ### Simulate Split Latency From Trace
 
 ```bash
@@ -276,15 +290,25 @@ Goal: produce a Rust-serving artifact from the `.pt` checkpoint.
 
 Tasks:
 
-1. Add/export a `safetensors` writer for the SPD checkpoint.
-2. Preserve tensor names, shapes, dtype, draft vocab ids, and config.
-3. Extend `skippy-spd-head.json` to reference the serving checkpoint.
-4. Add a small shape/checksum inspection command or test fixture.
+1. Add/export a `safetensors` writer for the SPD checkpoint. Done in
+   `evals/spd/export_spd_head.py`.
+2. Preserve tensor names, shapes, dtype, draft vocab ids, and config. Done via
+   the safetensors file and `skippy-spd-head.json`.
+3. Extend `skippy-spd-head.json` to reference the serving checkpoint. Done with
+   the optional `serving_checkpoint` section.
+4. Add a small shape/checksum inspection command or test fixture. Done in
+   `skippy-runtime` tests.
 
 Exit criteria:
 
 - Qwen3.5-4B SPD head exports deterministically.
 - Rust can validate the manifest and enumerate expected tensors.
+- To validate a local exported head through Rust, set
+  `SKIPPY_SPD_MANIFEST=/tmp/.../train/skippy-spd-head.json` and run:
+
+```bash
+cargo test -p skippy-runtime validates_external_manifest_when_skippy_spd_manifest_is_set
+```
 
 ### Milestone 2: Rust Forward Pass Parity
 
@@ -383,7 +407,7 @@ is to make the SPD path clear and reproducible.
 Run:
 
 ```bash
-python3 -m py_compile evals/spd/hf_train_eval_qwen06.py evals/spd/simulate_latency.py
+python3 -m py_compile evals/spd/hf_train_eval_qwen06.py evals/spd/simulate_latency.py evals/spd/export_spd_head.py
 cargo fmt --all -- --check
 cargo test -p skippy-runtime spd
 cargo clippy -p skippy-runtime --all-targets -- -D warnings
