@@ -87,6 +87,11 @@ The success criterion is artifact flow, not acceptance quality:
 - optional `spd-head.safetensors` after export
 - Rust SPD manifest validation
 
+The initial tiny GLM 4.7 smoke passed and the artifacts are stored in the
+private Hugging Face model repo `meshllm/skippy-spd-glm47-train-smoke`. The
+repo contains the manifest, serving safetensors export, and original reference
+checkpoint for reproducing the Skippy SPD manifest and serving-artifact path.
+
 ## Phase 5: Train And Evaluate SPD
 
 Build a GLM tokenizer-specific draft vocabulary. Do not reuse Qwen draft vocab.

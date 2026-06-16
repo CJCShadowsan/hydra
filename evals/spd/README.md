@@ -124,6 +124,12 @@ that directly with `--shallow-hidden-layer-indices` when testing another tap
 layout. `--build-draft-vocab-size` builds a GLM-tokenizer draft vocab from the
 loaded training rows and passes the generated JSON into the reference trainer.
 
+The first GLM 4.7 smoke artifact is uploaded to the private Hugging Face model
+repo `meshllm/skippy-spd-glm47-train-smoke`. It contains the Skippy manifest,
+the Rust-readable `spd-head.safetensors` export, the original reference
+`speculation_head_final.pt`, and a smoke-focused model card. This artifact is
+for training/export/manifest validation only, not production-quality decoding.
+
 ## Reproduce Qwen3-0.6B Training
 
 This is the smallest useful proof that the training path and artifact shape
