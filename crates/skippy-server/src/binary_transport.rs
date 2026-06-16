@@ -41,6 +41,7 @@ use skippy_runtime::{
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 const SERIAL_VERIFY_SPAN_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_VERIFY_SPAN";
+const AUTO_ALIGN_SESSION_ENV: &str = "SKIPPY_STAGE_AUTO_ALIGN_SESSION";
 
 mod decode_batcher;
 pub(crate) mod direct_return;
@@ -800,6 +801,34 @@ fn handle_binary_connection(
         }
 
         let token_ids = token_sideband_or_fill(&message)?;
+        if binary_auto_align_session_enabled()
+            && message_allows_session_auto_align(&message)
+            && let Some(target_token_count) = message_pos_start_as_token_count(&message)
+        {
+            let align_started = Instant::now();
+            let align = {
+                let mut runtime = runtime.lock().expect("runtime lock poisoned");
+                runtime
+                    .align_session_to_token_count_if_ahead(&session_key, target_token_count)
+                    .context("auto-align binary stage session")?
+            };
+            if let Some(align) = align {
+                let mut attrs = binary_message_attrs(config, session_id, &message);
+                attrs.insert(
+                    "llama_stage.session_auto_align_before_tokens".to_string(),
+                    json!(align.before_token_count),
+                );
+                attrs.insert(
+                    "llama_stage.session_auto_align_after_tokens".to_string(),
+                    json!(align.after_token_count),
+                );
+                attrs.insert(
+                    "llama_stage.elapsed_ms".to_string(),
+                    json!(elapsed_ms(align_started)),
+                );
+                telemetry.emit_debug("stage.binary_session_auto_align", attrs);
+            }
+        }
         if message.kind.is_prefill() {
             accumulate_prefill_tokens(
                 &mut accumulated_prefill_tokens,
@@ -1652,7 +1681,15 @@ fn serial_verify_span_enabled() -> bool {
     serial_verify_span_enabled_from(env::var(SERIAL_VERIFY_SPAN_ENV).ok().as_deref())
 }
 
+fn binary_auto_align_session_enabled() -> bool {
+    truthy_env(env::var(AUTO_ALIGN_SESSION_ENV).ok().as_deref())
+}
+
 fn serial_verify_span_enabled_from(value: Option<&str>) -> bool {
+    truthy_env(value)
+}
+
+fn truthy_env(value: Option<&str>) -> bool {
     matches!(
         value.map(|value| value.trim().to_ascii_lowercase()),
         Some(value)
@@ -1661,6 +1698,20 @@ fn serial_verify_span_enabled_from(value: Option<&str>) -> bool {
                 "1" | "true" | "on" | "enable" | "enabled" | "yes"
             )
     )
+}
+
+fn message_allows_session_auto_align(message: &StageWireMessage) -> bool {
+    matches!(
+        message.kind,
+        WireMessageKind::DecodeEmbd
+            | WireMessageKind::DecodeReadout
+            | WireMessageKind::DecodeLightCtx
+            | WireMessageKind::VerifySpan
+    )
+}
+
+fn message_pos_start_as_token_count(message: &StageWireMessage) -> Option<u64> {
+    u64::try_from(message.pos_start).ok()
 }
 
 fn native_mtp_enabled_from(value: Option<&str>) -> bool {

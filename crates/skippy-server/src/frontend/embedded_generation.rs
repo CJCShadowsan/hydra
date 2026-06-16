@@ -630,8 +630,11 @@ impl StageOpenAiBackend {
             let native_mtp_reject_recovery_serial_accepts =
                 native_mtp_reject_recovery_serial_accepts();
             let native_mtp_verify_next_draft_min_margin = native_mtp_verify_next_draft_min_margin();
+            let native_mtp_defer_reject_trim = native_mtp_defer_reject_trim_enabled();
             let mut native_mtp_reject_cooldown_remaining = 0usize;
             let mut native_mtp_reject_recovery_remaining = 0usize;
+            let mut native_mtp_deferred_reject_trim_count = 0usize;
+            let mut native_mtp_deferred_reject_trim_local_ms = 0.0_f64;
             let mut native_mtp_verify_next_draft_available_count = 0usize;
             let mut native_mtp_verify_next_draft_adopted_count = 0usize;
             let mut native_mtp_verify_next_draft_margin_value_count = 0usize;
@@ -979,14 +982,25 @@ impl StageOpenAiBackend {
                     let mut trim_control = None;
                     if committed_positions < consumed_positions {
                         let target_token_count = prefill_token_count + decoded_tokens;
-                        let trim = self.trim_embedded_stage_session(
-                            &request,
-                            downstream,
-                            &session_key,
-                            request_id,
-                            session_id,
-                            target_token_count,
-                        )?;
+                        let defer_trim = native_mtp_defer_reject_trim && !accepted && !reached_stop;
+                        let trim = if defer_trim {
+                            let trim = self.trim_embedded_stage_session_local(
+                                &session_key,
+                                target_token_count,
+                            )?;
+                            native_mtp_deferred_reject_trim_count += 1;
+                            native_mtp_deferred_reject_trim_local_ms += trim.local_ms;
+                            trim
+                        } else {
+                            self.trim_embedded_stage_session(
+                                &request,
+                                downstream,
+                                &session_key,
+                                request_id,
+                                session_id,
+                                target_token_count,
+                            )?
+                        };
                         trim_control = Some(trim);
                     }
                     decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
@@ -1092,6 +1106,10 @@ impl StageOpenAiBackend {
                     token_attrs.insert(
                         "llama_stage.native_mtp.reject_recovery_remaining".to_string(),
                         json!(native_mtp_reject_recovery_remaining),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.defer_reject_trim".to_string(),
+                        json!(native_mtp_defer_reject_trim),
                     );
                     native_mtp_adaptive_disable.insert_attrs(&mut token_attrs);
                     if let Some(trim) = trim_control {
@@ -1716,6 +1734,18 @@ impl StageOpenAiBackend {
             decode_attrs.insert(
                 "llama_stage.native_mtp.reject_recovery_serial_accepts".to_string(),
                 json!(native_mtp_reject_recovery_serial_accepts),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.defer_reject_trim".to_string(),
+                json!(native_mtp_defer_reject_trim),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.deferred_reject_trim_count".to_string(),
+                json!(native_mtp_deferred_reject_trim_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.deferred_reject_trim_local_ms".to_string(),
+                json!(native_mtp_deferred_reject_trim_local_ms),
             );
             if let Some(min_margin) = native_mtp_verify_next_draft_min_margin {
                 decode_attrs.insert(

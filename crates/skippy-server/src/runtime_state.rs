@@ -91,6 +91,12 @@ pub struct RuntimeSessionDropStats {
     pub stats_after: RuntimeSessionStats,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeSessionAlignStats {
+    pub before_token_count: u64,
+    pub after_token_count: u64,
+}
+
 pub struct RuntimeDecodeBatchRequest<'a> {
     pub session_id: &'a str,
     pub token_id: i32,
@@ -475,6 +481,24 @@ impl RuntimeState {
         self.session_token_counts
             .insert(session_id.to_string(), token_count);
         Ok(())
+    }
+
+    pub fn align_session_to_token_count_if_ahead(
+        &mut self,
+        session_id: &str,
+        token_count: u64,
+    ) -> Result<Option<RuntimeSessionAlignStats>> {
+        let Some(current) = self.session_token_counts.get(session_id).copied() else {
+            return Ok(None);
+        };
+        if current <= token_count {
+            return Ok(None);
+        }
+        self.trim_session(session_id, token_count)?;
+        Ok(Some(RuntimeSessionAlignStats {
+            before_token_count: current,
+            after_token_count: token_count,
+        }))
     }
 
     fn session(&mut self, session_id: &str) -> Result<&mut StageSession> {
