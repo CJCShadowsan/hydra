@@ -311,14 +311,46 @@ impl StageOpenAiBackend {
         request: &EmbeddedStageZeroGeneration<'_>,
         expected: WireReplyKind,
     ) -> Result<StageReply> {
+        Ok(self
+            .recv_spd_aware_prediction_return_with_probe(request, expected, None, 0)?
+            .reply)
+    }
+
+    pub(super) fn recv_spd_aware_prediction_return_with_probe(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        expected: WireReplyKind,
+        spd_source: Option<&SpdReplayProposalSource>,
+        current: i32,
+    ) -> Result<SpdPredictionReturn> {
         let receiver = request
             .prediction_return
             .as_ref()
             .context("missing direct prediction return receiver")?;
+        let mut pre_target_probe = None;
+        let mut wait_after_probe_timer = None;
         loop {
             let reply = receiver.recv()?;
             if reply.kind == WireReplyKind::SpdTap {
+                let trigger_hf_index = reply.spd_tap.as_ref().map(|tap| tap.hf_index);
                 self.record_spd_direct_return_tap(request, &reply);
+                if pre_target_probe.is_none()
+                    && let Some(spd) = spd_source
+                {
+                    let probe_timer = PhaseTimer::start();
+                    let proposed = spd.propose_inline_for_current_context(current)?;
+                    let elapsed_ms = probe_timer.elapsed_ms();
+                    if proposed.is_some() {
+                        pre_target_probe = Some(SpdInlineProbe {
+                            phase: SpdInlineProbePhase::PreTargetReply,
+                            proposed,
+                            elapsed_ms,
+                            target_wait_after_probe_ms: 0.0,
+                            trigger_hf_index,
+                        });
+                        wait_after_probe_timer = Some(PhaseTimer::start());
+                    }
+                }
                 continue;
             }
             if reply.kind != expected {
@@ -327,8 +359,67 @@ impl StageOpenAiBackend {
                     reply.kind
                 );
             }
-            return Ok(reply);
+            if let (Some(probe), Some(wait_timer)) =
+                (pre_target_probe.as_mut(), wait_after_probe_timer)
+            {
+                probe.target_wait_after_probe_ms = wait_timer.elapsed_ms();
+            }
+            return Ok(SpdPredictionReturn {
+                reply,
+                pre_target_probe,
+            });
         }
+    }
+
+    pub(super) fn emit_spd_inline_probe(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        decode_step: u32,
+        current: i32,
+        target: i32,
+        probe: SpdInlineProbe,
+    ) -> f64 {
+        let mut attrs = self.openai_attrs(request.ids);
+        attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
+        attrs.insert(
+            "llama_stage.elapsed_ms".to_string(),
+            json!(probe.elapsed_ms),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_phase".to_string(),
+            json!(probe.phase.as_str()),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_ready".to_string(),
+            json!(probe.proposed.is_some()),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_current_token".to_string(),
+            json!(current),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposed_token".to_string(),
+            json!(probe.proposed),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_target_token".to_string(),
+            json!(target),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_accepted".to_string(),
+            json!(probe.proposed == Some(target)),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_target_wait_after_probe_ms".to_string(),
+            json!(probe.target_wait_after_probe_ms),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_trigger_hf_index".to_string(),
+            json!(probe.trigger_hf_index),
+        );
+        self.telemetry
+            .emit_debug("stage.openai_spd_inline_probe", attrs);
+        probe.elapsed_ms
     }
 
     pub(super) fn record_spd_stage0_boundary_tap(
@@ -450,6 +541,36 @@ impl StageOpenAiBackend {
                 self.telemetry
                     .emit_debug("stage.openai_spd_tap_record_failed", attrs);
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SpdPredictionReturn {
+    pub(super) reply: StageReply,
+    pub(super) pre_target_probe: Option<SpdInlineProbe>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SpdInlineProbe {
+    pub(super) phase: SpdInlineProbePhase,
+    pub(super) proposed: Option<i32>,
+    pub(super) elapsed_ms: f64,
+    pub(super) target_wait_after_probe_ms: f64,
+    pub(super) trigger_hf_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpdInlineProbePhase {
+    PreTargetReply,
+    PostTargetReply,
+}
+
+impl SpdInlineProbePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PreTargetReply => "pre_target_reply",
+            Self::PostTargetReply => "post_target_reply",
         }
     }
 }

@@ -48,9 +48,12 @@ all three were accepted by the target verifier, every verifier window rewound,
 and the committed token stream matched ordinary non-SPD greedy decoding. The
 Skippy OpenAI request path can run the pretrained head from inline returned
 taps without local replay fallback. In the current release smoke that probe was
-ready and ran in about `400ms`, but it ran after the normal target token
-returned and the proposal was rejected. That is a real request-path proof, not
-yet a live serving speedup.
+ready and ran in the `pre_target_reply` slot after the final required
+`hf_index=31` tap arrived, before stage 0 consumed the final target reply. The
+CPU Rust reference head still took about `388ms`, the final target reply was
+effectively already queued by the time the head finished, and the sampled
+proposal was rejected. That is a real request-path scheduling proof, not yet a
+live serving speedup.
 
 ## What Works Today
 
@@ -351,7 +354,8 @@ seven local CPU stages returned and recorded required hidden-state rows for
   - `hf_index=31`, producer stage `5`, rows `17` and `1`, `required=true`
 - downstream non-required tap records: `16` and `24`, rows `17` and `1`
 
-Recorded local release request-path smoke without replay fallback:
+Recorded local release request-path smoke without replay fallback after moving
+the probe into the target-reply wait loop:
 
 - topology: seven tap-aligned local CPU stages,
   `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
@@ -363,27 +367,32 @@ Recorded local release request-path smoke without replay fallback:
   recorded for prompt rows and the current-token row; no tap-return failures
 - h0 source: direct GGUF `token_embd.weight` rows
 - SPD head hosting: cached pretrained Qwen3.5-4B serving weights
-- inline probe elapsed: about `400ms`
+- inline probe phase: `pre_target_reply`
+- inline probe trigger: returned `hf_index=31` tap from producer stage `5`
+- inline probe elapsed: about `388ms`
+- target wait after probe: about `0ms`
 - inline probe result: ready, proposed token `8160`, target token `90700`,
   accepted `false`
-- SPD request wall time: about `1.23s`
+- SPD request wall time: about `1.35s`
 - no-SPD same-topology wall time for the same one-token request: about `0.46s`
 
 This proves the real pretrained head can run in the Skippy OpenAI request path
 from inline Skippy taps plus direct GGUF h0 embeddings, without replaying local
-stage slices. It is not a speedup yet: the probe currently runs after the target
-token has already traversed the full pipeline, and the first sampled proposal
-in this smoke was rejected.
+stage slices. It also proves stage 0 can start that head before consuming the
+final target token reply. It is not a speedup yet: the current unoptimized CPU
+Rust head is much slower than the remaining final-stage work in this local
+topology, and the first sampled proposal in this smoke was rejected.
 
 This still does not make `spd-replay` a full speed path. Proposal generation at
 the top of the decode loop starts before the in-flight current-token target pass
 has produced the taps that the next proposal needs, so the default inline source
 returns no proposal there. When all required non-h0 rows are present, it skips
 local downstream replay and runs only the embedding-only h0 tap before the SPD
-head. The normal decode path now has the right place to probe the head after the
-target pass returns the current-token taps; the next serving milestone is using
-that probe to drive ahead-of-final-stage verification and then measuring
-ordinary split serving against inline-tap SPD serving.
+head. The normal decode path now probes the head as soon as direct-return taps
+complete during the final target-reply wait. The next serving milestone is
+using that pre-target proposal to drive optimistic next-token stage work and
+rollback on rejection, then measuring ordinary split serving against inline-tap
+SPD serving.
 
 ## What Does Not Work Yet
 
@@ -393,9 +402,10 @@ ordinary split serving against inline-tap SPD serving.
 - Inline hidden-tap capture and direct-return transport work for the local
   tap-aligned proof. Proposal scheduling still needs to turn freshly returned
   current-token taps into useful ahead-of-final-stage work.
-- The current no-replay request-path probe is post-target-decode telemetry. It
-  proves readiness and measures head cost, but it adds latency instead of
-  hiding pipeline bubbles.
+- The current no-replay request-path probe is pre-target-reply telemetry, not
+  yet committed speculative execution. It proves the scheduling slot and
+  measures head cost, but it still adds latency instead of hiding pipeline
+  bubbles.
 - Request-path acceptance has been proven on a bounded four-token smoke, but a
   larger local request-path acceptance/latency sweep is still needed.
 - No larger-than-4B head has been trained by us yet.
