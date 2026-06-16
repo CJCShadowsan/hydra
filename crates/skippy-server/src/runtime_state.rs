@@ -390,8 +390,20 @@ impl RuntimeState {
         input: Option<&ActivationFrame>,
         output_capacity: usize,
     ) -> Result<(Vec<i32>, ActivationFrame)> {
+        self.verify_frame_sampled(session_id, token_ids, None, input, output_capacity)
+    }
+
+    pub fn verify_frame_sampled(
+        &mut self,
+        session_id: &str,
+        token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
         let session = self.session(session_id)?;
-        let output = session.verify_tokens_frame(token_ids, input, output_capacity)?;
+        let output =
+            session.verify_tokens_frame_sampled(token_ids, sampling, input, output_capacity)?;
         self.add_session_tokens(session_id, token_ids.len() as u64);
         Ok(output)
     }

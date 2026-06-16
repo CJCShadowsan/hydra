@@ -3419,11 +3419,21 @@ impl StageSession {
         input: Option<&ActivationFrame>,
         output_capacity: usize,
     ) -> Result<(Vec<i32>, ActivationFrame)> {
+        self.verify_tokens_frame_sampled(token_ids, None, input, output_capacity)
+    }
+
+    pub fn verify_tokens_frame_sampled(
+        &mut self,
+        token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
         if token_ids.is_empty() {
             return Err(anyhow!("verify_tokens_frame requires at least one token"));
         }
         let (predicted_tokens, output_desc, output_payload) =
-            self.verify_tokens_frame_raw(token_ids, input, output_capacity)?;
+            self.verify_tokens_frame_raw(token_ids, sampling, input, output_capacity)?;
         Ok((
             predicted_tokens,
             ActivationFrame {
@@ -3436,6 +3446,7 @@ impl StageSession {
     fn verify_tokens_frame_raw(
         &mut self,
         token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
         input: Option<&ActivationFrame>,
         output_capacity: usize,
     ) -> Result<(Vec<i32>, RawActivationDesc, Vec<u8>)> {
@@ -3461,11 +3472,16 @@ impl StageSession {
         let mut predicted = vec![0_i32; token_ids.len()];
         let mut output_token_count = 0usize;
         let mut error = ptr::null_mut();
+        let raw_sampling = sampling.map(SamplingConfig::as_raw);
+        let sampling_ptr = raw_sampling
+            .as_ref()
+            .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
         let status = unsafe {
-            skippy_ffi::skippy_verify_tokens_frame(
+            skippy_ffi::skippy_verify_tokens_frame_sampled(
                 self.raw,
                 token_ids.as_ptr(),
                 token_ids.len(),
+                sampling_ptr,
                 input_desc_ptr,
                 input_payload_ptr,
                 &mut output_desc,
@@ -3480,7 +3496,7 @@ impl StageSession {
         };
         if status == Status::BufferTooSmall && output_bytes > output_payload.len() {
             free_error(error);
-            return self.verify_tokens_frame_raw(token_ids, input, output_bytes);
+            return self.verify_tokens_frame_raw(token_ids, sampling, input, output_bytes);
         }
         ensure_ok(status, error)?;
         predicted.truncate(output_token_count);

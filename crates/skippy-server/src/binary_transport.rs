@@ -3473,8 +3473,14 @@ pub(crate) fn run_binary_stage_message(
             ))
         }
         WireMessageKind::VerifySpan => {
-            let (predicted_tokens, output) =
-                runtime.verify_frame(session_id, token_ids, input, output_capacity)?;
+            let sampling = runtime_sampling_config(message.sampling.as_ref());
+            let (predicted_tokens, output) = runtime.verify_frame_sampled(
+                session_id,
+                token_ids,
+                sampling.as_ref(),
+                input,
+                output_capacity,
+            )?;
             let predicted = predicted_tokens.first().copied().unwrap_or(0);
             Ok((predicted, predicted_tokens, output))
         }

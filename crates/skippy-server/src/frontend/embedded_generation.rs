@@ -832,6 +832,7 @@ impl StageOpenAiBackend {
                             pos_start: prefill_token_count + decoded_tokens,
                             decode_step: decoded_tokens,
                             tokens: &verify_inputs,
+                            sampling: wire_sampling.clone(),
                             checkpoint: false,
                         },
                     )?;
@@ -1032,6 +1033,7 @@ impl StageOpenAiBackend {
                                 pos_start: prefill_token_count + decoded_tokens,
                                 decode_step: decoded_tokens,
                                 tokens: &verify_inputs,
+                                sampling: wire_sampling.clone(),
                                 checkpoint: true,
                             },
                         )?;
@@ -1171,6 +1173,7 @@ impl StageOpenAiBackend {
                                         pos_start: prefill_token_count + decoded_tokens,
                                         decode_step: decoded_tokens,
                                         tokens: repair_inputs,
+                                        sampling: wire_sampling.clone(),
                                         checkpoint: false,
                                     },
                                 )?;

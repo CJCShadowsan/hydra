@@ -128,6 +128,7 @@ pub(super) struct VerifySpanMessageArgs<'a> {
     pub(super) pos_start: usize,
     pub(super) decode_step: usize,
     pub(super) tokens: &'a [i32],
+    pub(super) sampling: Option<WireSamplingConfig>,
     pub(super) checkpoint: bool,
 }
 
@@ -160,7 +161,7 @@ pub(super) fn embedded_verify_message(
         state,
         request_id: args.request_id,
         session_id: args.session_id,
-        sampling: None,
+        sampling: args.sampling,
         chat_sampling_metadata: None,
         tokens: args.tokens.to_vec(),
         positions: Vec::new(),
