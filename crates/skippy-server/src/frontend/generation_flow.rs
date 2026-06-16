@@ -33,7 +33,12 @@ impl StageOpenAiBackend {
                 on_text_chunk,
             );
         }
-        let stop_values = stop.map(|stop| stop.values()).unwrap_or_default();
+        let stop_value_storage =
+            generation_stop_values(stop, prompt.chat_parse_metadata.as_deref());
+        let stop_values = stop_value_storage
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let tokenize_timer = PhaseTimer::start();
         let prompt_token_ids = self.tokenize(&prompt.text)?;
         let mut tokenize_attrs = self.openai_attrs(&ids);
@@ -236,7 +241,12 @@ impl StageOpenAiBackend {
             }
         }
 
-        let stop_values = stop.map(|stop| stop.values()).unwrap_or_default();
+        let stop_value_storage =
+            generation_stop_values(stop, prompt.chat_parse_metadata.as_deref());
+        let stop_values = stop_value_storage
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let session_id = ids.session_label.clone();
         let prefill_timer = PhaseTimer::start();
         let (prefill, mut token_signal, mut signal_window) = {
@@ -535,7 +545,12 @@ impl StageOpenAiBackend {
         request: SplitMultimodalGeneration<'_>,
         on_text_chunk: impl FnMut(&str) -> OpenAiResult<()>,
     ) -> OpenAiResult<GeneratedText> {
-        let stop_values = request.stop.map(|stop| stop.values()).unwrap_or_default();
+        let stop_value_storage =
+            generation_stop_values(request.stop, request.prompt.chat_parse_metadata.as_deref());
+        let stop_values = stop_value_storage
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let mut collector =
             TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
         let wire_sampling = wire_sampling_config(&request.sampling);

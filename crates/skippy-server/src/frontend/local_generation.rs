@@ -9,7 +9,80 @@ impl StageOpenAiBackend {
         let session_id = request.ids.session_label.clone();
         let mut cache_stats = GenerationCacheStats::default();
         let result = (|| {
-            if request.prompt_token_ids.len() > 1 {
+            let mut prompt_prefill_sample = None;
+            let mut chat_sampling_configured = false;
+            if request.prompt_token_ids.len() > 1 && self.kv.is_none() {
+                if let Some(metadata) = request.chat_sampling_metadata {
+                    let mut runtime = self
+                        .runtime
+                        .lock()
+                        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                    runtime
+                        .configure_chat_sampling(
+                            &session_id,
+                            metadata,
+                            request.prompt_token_ids.len() as u64,
+                            request.sampling.enabled.then_some(request.sampling),
+                        )
+                        .map_err(openai_backend_error)?;
+                    chat_sampling_configured = true;
+                }
+                let prefill_timer = PhaseTimer::start();
+                let lock_timer = PhaseTimer::start();
+                let mut runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                let runtime_lock_wait_ms = lock_timer.elapsed_ms();
+                let runtime_lock_hold_timer = PhaseTimer::start();
+                let runtime_sessions_before = runtime.session_stats();
+                let (predicted, _) = runtime
+                    .prefill_final_frame_sampled(
+                        &session_id,
+                        request.prompt_token_ids,
+                        &[],
+                        request.sampling.enabled.then_some(request.sampling),
+                        None,
+                    )
+                    .map_err(openai_backend_error)?;
+                prompt_prefill_sample = Some(predicted);
+                cache_stats.suffix_prefill_tokens = saturating_u32(request.prompt_token_ids.len());
+                let runtime_sessions_after = runtime.session_stats();
+                let runtime_lock_hold_ms = runtime_lock_hold_timer.elapsed_ms();
+                let mut attrs = self.openai_attrs(request.ids);
+                attrs.insert(
+                    "llama_stage.prefill_token_count".to_string(),
+                    json!(request.prompt_token_ids.len()),
+                );
+                attrs.insert("llama_stage.prefill_chunk_count".to_string(), json!(1));
+                attrs.insert("skippy.kv.restored_prefill".to_string(), json!(false));
+                attrs.insert("skippy.kv.restored_prefill_tokens".to_string(), json!(0));
+                attrs.insert(
+                    "skippy.kv.prefill_suffix_tokens".to_string(),
+                    json!(request.prompt_token_ids.len()),
+                );
+                attrs.insert("skippy.kv.recorded_pages".to_string(), json!(0));
+                attrs.insert(
+                    "llama_stage.runtime_lock_wait_ms".to_string(),
+                    json!(runtime_lock_wait_ms),
+                );
+                attrs.insert(
+                    "llama_stage.runtime_lock_hold_ms".to_string(),
+                    json!(runtime_lock_hold_ms),
+                );
+                attrs.insert("llama_stage.runtime_lock_acquires".to_string(), json!(1));
+                Self::insert_runtime_session_stats(
+                    &mut attrs,
+                    "llama_stage.runtime_sessions_before",
+                    &runtime_sessions_before,
+                );
+                Self::insert_runtime_session_stats(
+                    &mut attrs,
+                    "llama_stage.runtime_sessions_after",
+                    &runtime_sessions_after,
+                );
+                self.emit_openai_phase("stage.openai_prefill", prefill_timer, attrs);
+            } else if request.prompt_token_ids.len() > 1 {
                 let prefill_timer = PhaseTimer::start();
                 let prefill_tokens =
                     &request.prompt_token_ids[..request.prompt_token_ids.len() - 1];
@@ -378,7 +451,7 @@ impl StageOpenAiBackend {
                     return Err(openai_backend_error(error));
                 }
             }
-            if let Some(metadata) = request.chat_sampling_metadata {
+            if !chat_sampling_configured && let Some(metadata) = request.chat_sampling_metadata {
                 let mut runtime = self
                     .runtime
                     .lock()
@@ -405,6 +478,12 @@ impl StageOpenAiBackend {
                 .prompt_token_ids
                 .last()
                 .expect("checked non-empty prompt");
+            let mut stopped = false;
+            if let Some(predicted) = prompt_prefill_sample {
+                current = predicted;
+                decoded_tokens += 1;
+                stopped = on_token(current)? == TokenControl::Stop;
+            }
             let mut hook_request = request.hook_request;
             let hook_runtime = request.hook_runtime;
             let generation_hooks_active =
@@ -412,7 +491,7 @@ impl StageOpenAiBackend {
             let emit_token_debug = self.telemetry.is_debug_enabled();
             let mut post_prefill_hook_checked = false;
             let mut last_mid_generation_hook_at = None;
-            while decoded_tokens < request.max_tokens as usize {
+            while !stopped && decoded_tokens < request.max_tokens as usize {
                 if request
                     .cancellation
                     .is_some_and(openai_frontend::CancellationToken::is_cancelled)

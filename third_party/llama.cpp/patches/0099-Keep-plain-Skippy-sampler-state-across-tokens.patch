@@ -1,0 +1,141 @@
+From 5bdf7396d15c5c28cf75eddb6a487855e1680ac3 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Tue, 16 Jun 2026 10:52:00 +1000
+Subject: [PATCH] Keep plain Skippy sampler state across tokens
+
+Skippy already keeps a persistent sampler chain for chat metadata so grammar
+and sampler history advance like llama-server. Plain completion sampling rebuilt
+the sampler for every generated token, which reset sampler-local state and
+advanced RNG state by changing the seed from n_past.
+
+Keep a persistent sampler chain for plain completion sampling too, and rebuild
+it only when the incoming sampling config changes.
+---
+ src/skippy.cpp | 72 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 7d909a9e..35d8c468 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -72,6 +72,8 @@ struct skippy_session {
+     std::vector<skippy_token_signal> signal_history;
+     llama_sampler * sampling_chain = nullptr;
+     llama_sampler * grammar_sampler = nullptr;
++    skippy_sampling_config sampling_config = {};
++    bool sampling_config_valid = false;
+     std::string chat_sampling_metadata;
+     uint64_t grammar_generated_start = 0;
+     size_t sampling_accepted_token_count = 0;
+@@ -1570,6 +1572,8 @@ static void skippy_clear_chat_sampling(skippy_session * session) {
+     llama_sampler_free(session->grammar_sampler);
+     session->sampling_chain = nullptr;
+     session->grammar_sampler = nullptr;
++    session->sampling_config = {};
++    session->sampling_config_valid = false;
+     session->chat_sampling_metadata.clear();
+     session->grammar_generated_start = 0;
+     session->sampling_accepted_token_count = 0;
+@@ -1608,6 +1612,34 @@ static bool skippy_sampling_enabled(const skippy_sampling_config * sampling) {
+     return true;
+ }
+ 
++static bool skippy_sampling_configs_equal(
++        const skippy_sampling_config & lhs,
++        const skippy_sampling_config & rhs) {
++    if (lhs.version != rhs.version ||
++            lhs.flags != rhs.flags ||
++            lhs.seed != rhs.seed ||
++            lhs.top_k != rhs.top_k ||
++            lhs.penalty_last_n != rhs.penalty_last_n ||
++            lhs.temperature != rhs.temperature ||
++            lhs.top_p != rhs.top_p ||
++            lhs.presence_penalty != rhs.presence_penalty ||
++            lhs.frequency_penalty != rhs.frequency_penalty ||
++            lhs.repeat_penalty != rhs.repeat_penalty ||
++            lhs.logit_bias_count != rhs.logit_bias_count ||
++            lhs.min_p != rhs.min_p) {
++        return false;
++    }
++
++    const uint32_t logit_bias_count = std::min<uint32_t>(lhs.logit_bias_count, SKIPPY_MAX_LOGIT_BIAS);
++    for (uint32_t i = 0; i < logit_bias_count; ++i) {
++        if (lhs.logit_bias[i].token != rhs.logit_bias[i].token ||
++                lhs.logit_bias[i].bias != rhs.logit_bias[i].bias) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static llama_sampler * skippy_build_sampling_chain(
+         skippy_session * session,
+         const skippy_sampling_config * sampling) {
+@@ -1664,6 +1696,31 @@ static llama_sampler * skippy_build_sampling_chain(
+     return sampler;
+ }
+ 
++static bool skippy_ensure_plain_sampling_chain(
++        skippy_session * session,
++        const skippy_sampling_config * sampling) {
++    if (session == nullptr || !skippy_sampling_enabled(sampling)) {
++        return false;
++    }
++
++    if (session->sampling_chain != nullptr &&
++            session->chat_sampling_metadata.empty() &&
++            session->sampling_config_valid &&
++            skippy_sampling_configs_equal(session->sampling_config, *sampling)) {
++        return true;
++    }
++
++    skippy_clear_chat_sampling(session);
++    session->sampling_chain = skippy_build_sampling_chain(session, sampling);
++    if (session->sampling_chain == nullptr) {
++        return false;
++    }
++    session->sampling_config = *sampling;
++    session->sampling_config_valid = true;
++    session->sampling_accepted_token_count = 0;
++    return true;
++}
++
+ static bool skippy_init_chat_grammar_sampler(
+         skippy_session * session,
+         const json & metadata,
+@@ -1814,11 +1871,20 @@ static llama_token skippy_sample_token_ith(
+         const skippy_sampling_config * sampling,
+         int32_t logits_index) {
+     if (session != nullptr && session->sampling_chain != nullptr) {
+-        return skippy_chat_sample_token(session, logits_index);
++        if (!session->chat_sampling_metadata.empty() ||
++                (skippy_sampling_enabled(sampling) &&
++                 session->sampling_config_valid &&
++                 skippy_sampling_configs_equal(session->sampling_config, *sampling))) {
++            return skippy_chat_sample_token(session, logits_index);
++        }
++        skippy_clear_chat_sampling(session);
+     }
+     if (!skippy_sampling_enabled(sampling)) {
+         return skippy_greedy_sample_ith(session, logits_index);
+     }
++    if (skippy_ensure_plain_sampling_chain(session, sampling)) {
++        return skippy_chat_sample_token(session, logits_index);
++    }
+ 
+     llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+     llama_sampler * sampler = llama_sampler_chain_init(chain_params);
+@@ -2911,6 +2977,10 @@ enum skippy_status skippy_session_configure_chat_sampling(
+             return SKIPPY_STATUS_RUNTIME_ERROR;
+         }
+         session->chat_sampling_metadata = metadata_json;
++        if (sampling != nullptr) {
++            session->sampling_config = *sampling;
++            session->sampling_config_valid = true;
++        }
+         session->grammar_generated_start = prompt_token_count;
+         session->sampling_accepted_token_count = 0;
+         if (!skippy_init_chat_grammar_sampler(session, metadata, out_error)) {
+-- 
+2.54.0 (Apple Git-156)
+

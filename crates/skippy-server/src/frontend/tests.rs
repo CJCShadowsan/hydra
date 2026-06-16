@@ -1471,6 +1471,19 @@ fn trims_at_first_stop_sequence() {
 }
 
 #[test]
+fn generation_stop_values_include_chat_template_stops() {
+    let request_stop = openai_frontend::StopSequence::One("</stop>".to_string());
+    let metadata = json!({
+        "additional_stops": ["<|user|>", "<|observation|>", ""],
+    })
+    .to_string();
+
+    let stops = generation_stop_values(Some(&request_stop), Some(&metadata));
+
+    assert_eq!(stops, vec!["</stop>", "<|user|>", "<|observation|>"]);
+}
+
+#[test]
 fn valid_utf8_prefix_skips_incomplete_suffix() {
     assert_eq!(valid_utf8_prefix_len("hello".as_bytes()), 5);
     assert_eq!(valid_utf8_prefix_len(&[b'h', b'i', 0xE2, 0x82]), 2);
