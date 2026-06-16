@@ -3469,7 +3469,7 @@ impl StageSession {
         };
         let mut output_payload = vec![0_u8; output_capacity];
         let mut output_bytes = 0usize;
-        let mut predicted = vec![0_i32; token_ids.len()];
+        let mut predicted = vec![0_i32; token_ids.len().saturating_add(2)];
         let mut output_token_count = 0usize;
         let mut error = ptr::null_mut();
         let raw_sampling = sampling.map(SamplingConfig::as_raw);

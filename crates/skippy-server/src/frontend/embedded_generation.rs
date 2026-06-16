@@ -865,6 +865,10 @@ impl StageOpenAiBackend {
                     }
                     let target_token = verify.reply.predicted_tokens[0];
                     let after_draft_token = verify.reply.predicted_tokens[1];
+                    let verify_next_mtp_draft = NativeMtpDraft::from_verify_prediction_tokens(
+                        &verify.reply.predicted_tokens,
+                        verify_inputs.len(),
+                    );
                     let native_mtp_decision = native_mtp.observe_taken_draft_verification(
                         native_mtp_draft_token,
                         target_token,
@@ -892,6 +896,15 @@ impl StageOpenAiBackend {
                         if decoded_tokens >= request.max_tokens as usize {
                             break;
                         }
+                    }
+                    let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
+                    let verify_next_mtp_draft_adopted = accepted
+                        && committed_positions == consumed_positions
+                        && !reached_stop
+                        && decoded_tokens < request.max_tokens as usize
+                        && verify_next_mtp_draft.is_some();
+                    if verify_next_mtp_draft_adopted {
+                        native_mtp.observe_next_draft(verify_next_mtp_draft);
                     }
                     let mut trim_control = None;
                     if committed_positions < consumed_positions {
@@ -948,6 +961,24 @@ impl StageOpenAiBackend {
                         "llama_stage.native_mtp.after_draft_token".to_string(),
                         json!(after_draft_token),
                     );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.verify_next_draft_available".to_string(),
+                        json!(verify_next_mtp_draft_available),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.verify_next_draft_adopted".to_string(),
+                        json!(verify_next_mtp_draft_adopted),
+                    );
+                    if let Some(next_draft) = verify_next_mtp_draft {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verify_next_draft_token".to_string(),
+                            json!(next_draft.token),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verify_next_draft_compute_us".to_string(),
+                            json!(next_draft.proposal_compute_us),
+                        );
+                    }
                     token_attrs.insert(
                         "llama_stage.native_mtp.consumed_positions".to_string(),
                         json!(consumed_positions),
