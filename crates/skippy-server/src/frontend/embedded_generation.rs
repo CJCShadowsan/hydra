@@ -624,6 +624,8 @@ impl StageOpenAiBackend {
             let mut native_mtp = NativeMtpN1Verifier::default();
             let native_mtp_batched_verify = native_mtp_batched_verify_enabled();
             let native_mtp_serial_stage0_verify = native_mtp_serial_stage0_verify_enabled();
+            let native_mtp_serial_after_gap_stage0_verify =
+                native_mtp_serial_after_gap_stage0_verify_enabled();
             let mut native_mtp_adaptive_disable =
                 NativeMtpAdaptiveDisable::new(native_mtp_adaptive_disable_config());
             let native_mtp_reject_cooldown_tokens = native_mtp_reject_cooldown_tokens();
@@ -930,7 +932,10 @@ impl StageOpenAiBackend {
                             checkpoint: false,
                         },
                     )?;
-                    let verify = if native_mtp_serial_stage0_verify {
+                    let use_serial_stage0_verify = native_mtp_serial_stage0_verify
+                        || (native_mtp_serial_after_gap_stage0_verify
+                            && native_mtp_draft_origin == NativeMtpDraftOrigin::SerialAfterGap);
+                    let verify = if use_serial_stage0_verify {
                         self.execute_embedded_verify_span_with_serial_stage0(
                             &request,
                             downstream,
@@ -1133,7 +1138,11 @@ impl StageOpenAiBackend {
                     );
                     token_attrs.insert(
                         "llama_stage.native_mtp.serial_stage0_verification".to_string(),
-                        json!(native_mtp_serial_stage0_verify),
+                        json!(use_serial_stage0_verify),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.serial_after_gap_stage0_verification".to_string(),
+                        json!(native_mtp_serial_after_gap_stage0_verify),
                     );
                     token_attrs.insert(
                         "llama_stage.native_mtp.verification".to_string(),
@@ -1918,6 +1927,14 @@ impl StageOpenAiBackend {
             speculative_stats.insert_attrs(&mut decode_attrs);
             native_mtp.stats().insert_attrs(&mut decode_attrs);
             native_mtp_adaptive_disable.insert_attrs(&mut decode_attrs);
+            decode_attrs.insert(
+                "llama_stage.native_mtp.serial_stage0_verification".to_string(),
+                json!(native_mtp_serial_stage0_verify),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.serial_after_gap_stage0_verification".to_string(),
+                json!(native_mtp_serial_after_gap_stage0_verify),
+            );
             decode_attrs.insert(
                 "llama_stage.native_mtp.reject_cooldown_tokens".to_string(),
                 json!(native_mtp_reject_cooldown_tokens),

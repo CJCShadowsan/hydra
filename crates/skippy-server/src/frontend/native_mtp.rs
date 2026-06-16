@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 const BATCHED_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_BATCHED_VERIFY";
 const SERIAL_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_STAGE0_VERIFY";
+const SERIAL_AFTER_GAP_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_STAGE0_VERIFY";
 const COMPARE_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_COMPARE_STAGE0_VERIFY";
 const ADAPTIVE_DISABLE_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE";
 const ADAPTIVE_DISABLE_MIN_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_MIN_VERIFY";
@@ -31,6 +32,14 @@ pub(super) fn native_mtp_batched_verify_enabled() -> bool {
 pub(super) fn native_mtp_serial_stage0_verify_enabled() -> bool {
     native_mtp_serial_stage0_verify_enabled_from(
         std::env::var(SERIAL_STAGE0_VERIFY_ENV).ok().as_deref(),
+    )
+}
+
+pub(super) fn native_mtp_serial_after_gap_stage0_verify_enabled() -> bool {
+    native_mtp_serial_after_gap_stage0_verify_enabled_from(
+        std::env::var(SERIAL_AFTER_GAP_STAGE0_VERIFY_ENV)
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -102,6 +111,13 @@ fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
 }
 
 fn native_mtp_serial_stage0_verify_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
+    )
+}
+
+fn native_mtp_serial_after_gap_stage0_verify_enabled_from(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
@@ -896,6 +912,28 @@ mod tests {
         )));
         assert!(!native_mtp_serial_stage0_verify_enabled_from(Some("0")));
         assert!(!native_mtp_serial_stage0_verify_enabled_from(Some("false")));
+    }
+
+    #[test]
+    fn serial_after_gap_stage0_verify_flag_defaults_off_and_accepts_true_values() {
+        assert!(!native_mtp_serial_after_gap_stage0_verify_enabled_from(
+            None
+        ));
+        assert!(native_mtp_serial_after_gap_stage0_verify_enabled_from(
+            Some("1")
+        ));
+        assert!(native_mtp_serial_after_gap_stage0_verify_enabled_from(
+            Some("true")
+        ));
+        assert!(native_mtp_serial_after_gap_stage0_verify_enabled_from(
+            Some(" enabled ")
+        ));
+        assert!(!native_mtp_serial_after_gap_stage0_verify_enabled_from(
+            Some("0")
+        ));
+        assert!(!native_mtp_serial_after_gap_stage0_verify_enabled_from(
+            Some("false")
+        ));
     }
 
     #[test]
