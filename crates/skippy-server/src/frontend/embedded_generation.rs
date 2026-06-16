@@ -631,6 +631,8 @@ impl StageOpenAiBackend {
                 native_mtp_reject_recovery_serial_accepts();
             let native_mtp_serial_after_gap_reject_recovery_serial_accepts =
                 native_mtp_serial_after_gap_reject_recovery_serial_accepts();
+            let native_mtp_serial_after_gap_draft_min_margin =
+                native_mtp_serial_after_gap_draft_min_margin();
             let native_mtp_verify_next_draft_min_margin = native_mtp_verify_next_draft_min_margin();
             let native_mtp_defer_reject_trim = native_mtp_defer_reject_trim_enabled();
             let native_mtp_suppress_cooldown_drafts = native_mtp_suppress_cooldown_drafts_enabled();
@@ -647,6 +649,12 @@ impl StageOpenAiBackend {
             let mut native_mtp_initial_serial_accepted_count = 0usize;
             let mut native_mtp_serial_after_gap_verification_count = 0usize;
             let mut native_mtp_serial_after_gap_accepted_count = 0usize;
+            let mut native_mtp_serial_after_gap_draft_margin_value_count = 0usize;
+            let mut native_mtp_serial_after_gap_draft_margin_accepted_count = 0usize;
+            let mut native_mtp_serial_after_gap_draft_margin_rejected_count = 0usize;
+            let mut native_mtp_serial_after_gap_draft_margin_sum = 0.0_f64;
+            let mut native_mtp_serial_after_gap_draft_margin_min = f32::INFINITY;
+            let mut native_mtp_serial_after_gap_draft_margin_max = f32::NEG_INFINITY;
             let mut native_mtp_verify_next_verification_count = 0usize;
             let mut native_mtp_verify_next_accepted_count = 0usize;
             let mut native_mtp_verify_next_draft_available_count = 0usize;
@@ -860,9 +868,35 @@ impl StageOpenAiBackend {
                     && native_mtp_reject_recovery_remaining == 0
                     && draft_guard.is_none()
                     && native_mtp_remaining >= 2;
-                let pending_native_mtp_draft = should_run_native_mtp_batched_verify
+                let mut pending_native_mtp_draft = should_run_native_mtp_batched_verify
                     .then(|| native_mtp.take_pending_draft())
                     .flatten();
+                let mut serial_after_gap_draft_margin = None;
+                let mut serial_after_gap_draft_margin_accepted = true;
+                if let Some(pending_draft) = pending_native_mtp_draft.as_ref()
+                    && pending_draft.origin == NativeMtpDraftOrigin::SerialAfterGap
+                    && native_mtp_serial_after_gap_draft_min_margin.is_some()
+                {
+                    serial_after_gap_draft_margin = pending_draft.margin();
+                    serial_after_gap_draft_margin_accepted =
+                        native_mtp_serial_after_gap_draft_min_margin.is_none_or(|min_margin| {
+                            serial_after_gap_draft_margin.is_some_and(|margin| margin >= min_margin)
+                        });
+                    if let Some(margin) = serial_after_gap_draft_margin {
+                        native_mtp_serial_after_gap_draft_margin_value_count += 1;
+                        native_mtp_serial_after_gap_draft_margin_sum += f64::from(margin);
+                        native_mtp_serial_after_gap_draft_margin_min =
+                            native_mtp_serial_after_gap_draft_margin_min.min(margin);
+                        native_mtp_serial_after_gap_draft_margin_max =
+                            native_mtp_serial_after_gap_draft_margin_max.max(margin);
+                    }
+                    if serial_after_gap_draft_margin_accepted {
+                        native_mtp_serial_after_gap_draft_margin_accepted_count += 1;
+                    } else {
+                        native_mtp_serial_after_gap_draft_margin_rejected_count += 1;
+                        pending_native_mtp_draft = None;
+                    }
+                }
                 if let Some(pending_native_mtp_draft) = pending_native_mtp_draft {
                     let batched_token_timer = PhaseTimer::start();
                     let native_mtp_draft_token = pending_native_mtp_draft.token;
@@ -1091,6 +1125,23 @@ impl StageOpenAiBackend {
                         "llama_stage.native_mtp.pending_origin".to_string(),
                         json!(native_mtp_draft_origin.label()),
                     );
+                    if let Some(min_margin) = native_mtp_serial_after_gap_draft_min_margin {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_after_gap_draft_min_margin".to_string(),
+                            json!(min_margin),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_after_gap_draft_margin_accepted"
+                                .to_string(),
+                            json!(serial_after_gap_draft_margin_accepted),
+                        );
+                    }
+                    if let Some(margin) = serial_after_gap_draft_margin {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_after_gap_draft_margin".to_string(),
+                            json!(margin),
+                        );
+                    }
                     token_attrs.insert(
                         "llama_stage.native_mtp.target_token".to_string(),
                         json!(target_token),
@@ -1750,6 +1801,23 @@ impl StageOpenAiBackend {
                         "llama_stage.native_mtp.cooldown_draft_suppressed".to_string(),
                         json!(suppress_cooldown_draft),
                     );
+                    if let Some(min_margin) = native_mtp_serial_after_gap_draft_min_margin {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_after_gap_draft_min_margin".to_string(),
+                            json!(min_margin),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_after_gap_draft_margin_accepted"
+                                .to_string(),
+                            json!(serial_after_gap_draft_margin_accepted),
+                        );
+                    }
+                    if let Some(margin) = serial_after_gap_draft_margin {
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_after_gap_draft_margin".to_string(),
+                            json!(margin),
+                        );
+                    }
                     self.emit_openai_phase("stage.openai_decode_token", token_timer, token_attrs);
                 }
                 if on_token(current)? == TokenControl::Stop {
@@ -1829,6 +1897,12 @@ impl StageOpenAiBackend {
                     .to_string(),
                 json!(native_mtp_serial_after_gap_reject_recovery_serial_accepts),
             );
+            if let Some(min_margin) = native_mtp_serial_after_gap_draft_min_margin {
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.serial_after_gap_draft_min_margin".to_string(),
+                    json!(min_margin),
+                );
+            }
             decode_attrs.insert(
                 "llama_stage.native_mtp.defer_reject_trim".to_string(),
                 json!(native_mtp_defer_reject_trim),
@@ -1865,6 +1939,35 @@ impl StageOpenAiBackend {
                 "llama_stage.native_mtp.serial_after_gap_accepted_count".to_string(),
                 json!(native_mtp_serial_after_gap_accepted_count),
             );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.serial_after_gap_draft_margin_value_count".to_string(),
+                json!(native_mtp_serial_after_gap_draft_margin_value_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.serial_after_gap_draft_margin_accepted_count".to_string(),
+                json!(native_mtp_serial_after_gap_draft_margin_accepted_count),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.serial_after_gap_draft_margin_rejected_count".to_string(),
+                json!(native_mtp_serial_after_gap_draft_margin_rejected_count),
+            );
+            if native_mtp_serial_after_gap_draft_margin_value_count > 0 {
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.serial_after_gap_draft_margin_avg".to_string(),
+                    json!(
+                        native_mtp_serial_after_gap_draft_margin_sum
+                            / native_mtp_serial_after_gap_draft_margin_value_count as f64
+                    ),
+                );
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.serial_after_gap_draft_margin_min".to_string(),
+                    json!(native_mtp_serial_after_gap_draft_margin_min),
+                );
+                decode_attrs.insert(
+                    "llama_stage.native_mtp.serial_after_gap_draft_margin_max".to_string(),
+                    json!(native_mtp_serial_after_gap_draft_margin_max),
+                );
+            }
             decode_attrs.insert(
                 "llama_stage.native_mtp.verify_next_verification_count".to_string(),
                 json!(native_mtp_verify_next_verification_count),

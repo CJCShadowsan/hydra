@@ -1235,6 +1235,7 @@ pub struct DecodeFrameBatchOutput {
 pub struct NativeMtpDraft {
     pub token_id: i32,
     pub proposal_compute_us: i64,
+    pub margin_milli: i32,
 }
 
 impl NativeMtpDraft {
@@ -1242,6 +1243,7 @@ impl NativeMtpDraft {
         raw.available.then_some(Self {
             token_id: raw.token_id,
             proposal_compute_us: raw.proposal_compute_us,
+            margin_milli: raw.margin_milli,
         })
     }
 }

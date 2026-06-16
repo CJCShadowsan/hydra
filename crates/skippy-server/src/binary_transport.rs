@@ -1670,6 +1670,7 @@ fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -
         predicted,
         draft.token_id,
         draft.proposal_compute_us.clamp(0, i64::from(i32::MAX)) as i32,
+        draft.margin_milli,
     ]
 }
 

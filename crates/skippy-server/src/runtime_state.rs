@@ -448,6 +448,7 @@ impl RuntimeState {
             predicted_tokens.push(draft.token_id);
             predicted_tokens
                 .push(i32::try_from(draft.proposal_compute_us.max(0)).unwrap_or(i32::MAX));
+            predicted_tokens.push(draft.margin_milli);
         }
         Ok((predicted_tokens, combine_activation_frames(&output_frames)?))
     }

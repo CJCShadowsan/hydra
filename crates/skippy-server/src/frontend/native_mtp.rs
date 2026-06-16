@@ -12,6 +12,8 @@ const REJECT_COOLDOWN_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_COOLDOWN_TOKE
 const REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_RECOVERY_SERIAL_ACCEPTS";
 const SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str =
     "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS";
+const SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV: &str =
+    "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN";
 const VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV: &str = "SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN";
 const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
@@ -62,6 +64,10 @@ pub(super) fn native_mtp_reject_recovery_serial_accepts() -> usize {
 
 pub(super) fn native_mtp_serial_after_gap_reject_recovery_serial_accepts() -> usize {
     parse_usize_env(SERIAL_AFTER_GAP_REJECT_RECOVERY_SERIAL_ACCEPTS_ENV, 0)
+}
+
+pub(super) fn native_mtp_serial_after_gap_draft_min_margin() -> Option<f32> {
+    parse_optional_f32_env(SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV)
 }
 
 pub(super) fn native_mtp_verify_next_draft_min_margin() -> Option<f32> {
@@ -168,7 +174,7 @@ impl NativeMtpDraft {
         Some(Self {
             token,
             proposal_compute_us: i64::from(proposal_compute_us.max(0)),
-            margin_milli: None,
+            margin_milli: tokens.get(3).copied(),
         })
     }
 
@@ -197,13 +203,22 @@ impl NativeMtpDraft {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingDraft {
     token: i32,
+    margin_milli: Option<i32>,
     origin: NativeMtpDraftOrigin,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PendingNativeMtpDraft {
     pub(super) token: i32,
+    pub(super) margin_milli: Option<i32>,
     pub(super) origin: NativeMtpDraftOrigin,
+}
+
+impl PendingNativeMtpDraft {
+    pub(super) fn margin(&self) -> Option<f32> {
+        self.margin_milli
+            .map(|margin| margin as f32 / MTP_DRAFT_MARGIN_SCALE)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +421,7 @@ impl NativeMtpN1Verifier {
     pub(super) fn take_pending_draft(&mut self) -> Option<PendingNativeMtpDraft> {
         self.pending.take().map(|pending| PendingNativeMtpDraft {
             token: pending.token,
+            margin_milli: pending.margin_milli,
             origin: pending.origin,
         })
     }
@@ -494,6 +510,7 @@ impl NativeMtpN1Verifier {
             .saturating_add(next_draft.proposal_compute_us);
         self.pending = Some(PendingDraft {
             token: next_draft.token,
+            margin_milli: next_draft.margin_milli,
             origin,
         });
     }
@@ -533,6 +550,14 @@ mod tests {
                 token: 12,
                 proposal_compute_us: 34,
                 margin_milli: None,
+            })
+        );
+        assert_eq!(
+            NativeMtpDraft::from_prediction_tokens(&[11, 12, 34, 567]),
+            Some(NativeMtpDraft {
+                token: 12,
+                proposal_compute_us: 34,
+                margin_milli: Some(567),
             })
         );
         assert_eq!(NativeMtpDraft::from_prediction_tokens(&[11]), None);
@@ -896,6 +921,14 @@ mod tests {
         assert_eq!(
             parse_usize_env("SKIPPY_TEST_MISSING_GAP_REJECT_RECOVERY", 0),
             0
+        );
+    }
+
+    #[test]
+    fn serial_after_gap_draft_min_margin_defaults_none() {
+        assert_eq!(
+            parse_optional_f32_env("SKIPPY_TEST_MISSING_GAP_DRAFT_MARGIN"),
+            None
         );
     }
 

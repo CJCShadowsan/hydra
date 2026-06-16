@@ -1,6 +1,6 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 31;
+pub const ABI_VERSION_PATCH: u32 = 32;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
@@ -372,6 +372,7 @@ pub struct NativeMtpDraft {
     pub available: bool,
     pub token_id: i32,
     pub proposal_compute_us: i64,
+    pub margin_milli: i32,
 }
 
 #[repr(C)]
