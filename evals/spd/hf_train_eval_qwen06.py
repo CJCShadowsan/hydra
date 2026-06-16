@@ -595,6 +595,23 @@ def file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def resolve_manifest_model_type(config: dict[str, Any], model_name: str) -> str | None:
+    model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type:
+        return model_type
+
+    try:
+        from transformers import AutoConfig
+
+        base_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: could not resolve base model_type for manifest: {exc}", flush=True)
+        return None
+
+    model_type = getattr(base_config, "model_type", None)
+    return model_type if isinstance(model_type, str) and model_type else None
+
+
 def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_path: Path) -> None:
     import torch
 
@@ -625,7 +642,7 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
             "format": "torch-speculation-head-v10",
             "reference_repo": args.reference_repo,
             "base_model_path": manifest_base_model_path,
-            "model_type": config.get("model_type"),
+            "model_type": resolve_manifest_model_type(config, args.model_name),
             "checkpoint_version": int(config.get("version", 0)),
         },
         "topology": {
