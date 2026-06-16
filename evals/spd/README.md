@@ -19,8 +19,8 @@ Rust.
   model to estimate how much pipeline bubble/activation-hop latency SPD can
   hide.
 - `skippy-runtime` can parse and validate the SPD head manifest/checkpoint
-  binding, including a Rust-readable safetensors serving checkpoint. It does
-  not execute the head yet.
+  binding, including a Rust-readable safetensors serving checkpoint and
+  selected tensor payload reads. It does not execute the head yet.
 
 ## What Does Not Work Yet
 
@@ -218,6 +218,8 @@ The manifest schema is `skippy-spd-head/v1`. It binds a head checkpoint to:
   and dtype
 
 Rust validation lives in `crates/skippy-runtime/src/spd.rs`.
+Safetensors parsing and BF16/F32/I64 payload reads live in
+`crates/skippy-runtime/src/spd/safetensors.rs`.
 
 ## Next Engineering Steps
 

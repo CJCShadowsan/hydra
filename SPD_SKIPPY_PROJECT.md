@@ -117,7 +117,7 @@ head artifacts:
 `evals/spd/export_spd_head.py` exports the reference `.pt` checkpoint into
 `spd-head.safetensors` and updates the manifest with a `serving_checkpoint`
 section. This is still validation only: Skippy can inspect the serving artifact
-but does not run the SPD head yet.
+and read tensor payloads, but does not run the SPD head yet.
 
 ## What Does Not Work Yet
 
@@ -310,11 +310,14 @@ Tasks:
    the optional `serving_checkpoint` section.
 4. Add a small shape/checksum inspection command or test fixture. Done in
    `skippy-runtime` tests.
+5. Add a minimal safetensors payload reader for BF16/F32/I64 tensors. Done in
+   `crates/skippy-runtime/src/spd/safetensors.rs`.
 
 Exit criteria:
 
 - Qwen3.5-4B SPD head exports deterministically.
-- Rust can validate the manifest and enumerate expected tensors.
+- Rust can validate the manifest, enumerate expected tensors, and read selected
+  tensor payloads from the serving checkpoint or parity fixture.
 - To validate a local exported head through Rust, set
   `SKIPPY_SPD_MANIFEST=/tmp/.../train/skippy-spd-head.json` and run:
 

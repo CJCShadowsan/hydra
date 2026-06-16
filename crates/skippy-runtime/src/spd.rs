@@ -1,13 +1,15 @@
+mod safetensors;
+
 use std::{
-    collections::BTreeMap,
     fs,
-    io::Read,
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use safetensors::{SpdSafetensorsFile, SpdSafetensorsIndex, SpdSafetensorsTensor};
 
 pub const SPD_HEAD_MANIFEST_SCHEMA: &str = "skippy-spd-head/v1";
 pub const TORCH_SPD_HEAD_FORMAT_V10: &str = "torch-speculation-head-v10";
@@ -69,21 +71,6 @@ pub struct SpdHeadRuntimeProfile<'a> {
     pub hidden_size: u32,
     pub vocab_size: u32,
     pub num_stages: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpdSafetensorsIndex {
-    pub tensors: BTreeMap<String, SpdSafetensorsTensor>,
-    pub metadata: BTreeMap<String, String>,
-    pub data_start: u64,
-    pub data_len: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct SpdSafetensorsTensor {
-    pub dtype: String,
-    pub shape: Vec<u64>,
-    pub data_offsets: [u64; 2],
 }
 
 impl SpdHeadManifest {
@@ -332,112 +319,6 @@ impl SpdHeadServingCheckpoint {
     }
 }
 
-impl SpdSafetensorsIndex {
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let mut file = fs::File::open(path)
-            .with_context(|| format!("open SPD safetensors checkpoint {}", path.display()))?;
-        let file_len = file
-            .metadata()
-            .with_context(|| format!("stat SPD safetensors checkpoint {}", path.display()))?
-            .len();
-        let mut header_len_bytes = [0_u8; 8];
-        file.read_exact(&mut header_len_bytes)
-            .with_context(|| format!("read SPD safetensors header length {}", path.display()))?;
-        let header_len = u64::from_le_bytes(header_len_bytes);
-        if header_len == 0 {
-            bail!("SPD safetensors header must not be empty");
-        }
-        if header_len > file_len.saturating_sub(8) {
-            bail!(
-                "SPD safetensors header length {} exceeds file length {}",
-                header_len,
-                file_len
-            );
-        }
-        let header_len_usize =
-            usize::try_from(header_len).context("SPD safetensors header is too large")?;
-        let mut header = vec![0_u8; header_len_usize];
-        file.read_exact(&mut header)
-            .with_context(|| format!("read SPD safetensors header {}", path.display()))?;
-        Self::from_header_bytes(&header, 8 + header_len, file_len)
-    }
-
-    fn from_header_bytes(header: &[u8], data_start: u64, file_len: u64) -> Result<Self> {
-        if data_start > file_len {
-            bail!("SPD safetensors data section starts past end of file");
-        }
-        let data_len = file_len - data_start;
-        let mut metadata = BTreeMap::new();
-        let mut tensors = BTreeMap::new();
-        let value: serde_json::Value =
-            serde_json::from_slice(header).context("parse SPD safetensors header JSON")?;
-        let serde_json::Value::Object(entries) = value else {
-            bail!("SPD safetensors header must be a JSON object");
-        };
-
-        for (name, value) in entries {
-            if name == "__metadata__" {
-                metadata =
-                    serde_json::from_value(value).context("parse SPD safetensors metadata map")?;
-                continue;
-            }
-            if name.trim().is_empty() {
-                bail!("SPD safetensors tensor names must not be empty");
-            }
-            let tensor: SpdSafetensorsTensor = serde_json::from_value(value)
-                .with_context(|| format!("parse SPD safetensors tensor metadata {name}"))?;
-            tensor.validate(&name, data_len)?;
-            tensors.insert(name, tensor);
-        }
-        validate_safetensors_ranges(&tensors, data_len)?;
-        Ok(Self {
-            tensors,
-            metadata,
-            data_start,
-            data_len,
-        })
-    }
-
-    pub fn ensure_tensor_shape(&self, name: &str, expected_shape: &[u64]) -> Result<()> {
-        let tensor = self
-            .tensors
-            .get(name)
-            .with_context(|| format!("SPD serving checkpoint is missing tensor {name}"))?;
-        if tensor.shape != expected_shape {
-            bail!(
-                "SPD serving checkpoint tensor {name} shape mismatch: expected {:?}, got {:?}",
-                expected_shape,
-                tensor.shape
-            );
-        }
-        Ok(())
-    }
-}
-
-impl SpdSafetensorsTensor {
-    fn validate(&self, name: &str, data_len: u64) -> Result<()> {
-        let [start, end] = self.data_offsets;
-        if start > end || end > data_len {
-            bail!(
-                "SPD safetensors tensor {name} has invalid data offsets {:?} for data length {}",
-                self.data_offsets,
-                data_len
-            );
-        }
-        let expected_bytes = tensor_byte_len(&self.dtype, &self.shape)
-            .with_context(|| format!("validate SPD safetensors tensor {name}"))?;
-        if end - start != expected_bytes {
-            bail!(
-                "SPD safetensors tensor {name} byte length mismatch: offsets describe {}, shape/dtype describe {}",
-                end - start,
-                expected_bytes
-            );
-        }
-        Ok(())
-    }
-}
-
 impl SpdHeadTopology {
     fn validate(&self) -> Result<()> {
         if self.hidden_size == 0 {
@@ -528,56 +409,6 @@ fn verify_checkpoint_artifact(
         );
     }
     Ok(())
-}
-
-fn validate_safetensors_ranges(
-    tensors: &BTreeMap<String, SpdSafetensorsTensor>,
-    data_len: u64,
-) -> Result<()> {
-    let mut ranges: Vec<(&str, [u64; 2])> = tensors
-        .iter()
-        .map(|(name, tensor)| (name.as_str(), tensor.data_offsets))
-        .collect();
-    ranges.sort_by_key(|(_, [start, _])| *start);
-    let mut previous_end = 0;
-    for (name, [start, end]) in ranges {
-        if start < previous_end {
-            bail!("SPD safetensors tensor {name} overlaps a previous tensor range");
-        }
-        if start > previous_end {
-            bail!("SPD safetensors tensor {name} leaves a gap before its data range");
-        }
-        previous_end = end;
-    }
-    if previous_end != data_len {
-        bail!(
-            "SPD safetensors tensor data ends at {}, but data section is {} bytes",
-            previous_end,
-            data_len
-        );
-    }
-    Ok(())
-}
-
-fn tensor_byte_len(dtype: &str, shape: &[u64]) -> Result<u64> {
-    let element_bytes = safetensors_dtype_size(dtype)?;
-    let elements = shape.iter().try_fold(1_u64, |acc, dimension| {
-        acc.checked_mul(*dimension)
-            .context("SPD safetensors tensor shape element count overflow")
-    })?;
-    elements
-        .checked_mul(element_bytes)
-        .context("SPD safetensors tensor byte length overflow")
-}
-
-fn safetensors_dtype_size(dtype: &str) -> Result<u64> {
-    match dtype {
-        "BOOL" | "I8" | "U8" => Ok(1),
-        "F16" | "BF16" | "I16" | "U16" => Ok(2),
-        "F32" | "I32" | "U32" => Ok(4),
-        "F64" | "I64" | "U64" => Ok(8),
-        _ => bail!("unsupported SPD safetensors dtype {dtype}"),
-    }
 }
 
 fn validate_sorted_unique_indices(label: &str, values: &[u32]) -> Result<()> {
@@ -675,7 +506,7 @@ mod tests {
         let mut data = Vec::new();
         for (name, dtype, shape) in tensors {
             let start = data.len() as u64;
-            let bytes = tensor_byte_len(dtype, shape).unwrap();
+            let bytes = test_tensor_byte_len(dtype, shape);
             data.resize(data.len() + bytes as usize, 0);
             let end = data.len() as u64;
             header_entries.insert(
@@ -697,6 +528,16 @@ mod tests {
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&data);
         fs::write(path, bytes).unwrap();
+    }
+
+    fn test_tensor_byte_len(dtype: &str, shape: &[u64]) -> u64 {
+        let element_bytes = match dtype {
+            "BF16" | "F16" | "I16" | "U16" => 2,
+            "F32" | "I32" | "U32" => 4,
+            "F64" | "I64" | "U64" => 8,
+            _ => 1,
+        };
+        shape.iter().product::<u64>() * element_bytes
     }
 
     #[test]
@@ -774,6 +615,11 @@ mod tests {
             index.metadata.get("format").unwrap(),
             SPD_SERVING_CHECKPOINT_FORMAT_SAFETENSORS_V1
         );
+
+        let file = SpdSafetensorsFile::open(&checkpoint).unwrap();
+        let lm_head = file.read_tensor_f32("lm_head.weight").unwrap();
+        assert_eq!(lm_head.len(), 3 * 1024);
+        assert!(lm_head.iter().all(|value| *value == 0.0));
     }
 
     #[test]
@@ -854,7 +700,8 @@ mod tests {
         let Ok(fixture_path) = std::env::var("SKIPPY_SPD_PARITY_FIXTURE") else {
             return;
         };
-        let index = SpdSafetensorsIndex::from_path(PathBuf::from(fixture_path)).unwrap();
+        let file = SpdSafetensorsFile::open(PathBuf::from(fixture_path)).unwrap();
+        let index = &file.index;
         assert_eq!(
             index.metadata.get("schema").map(String::as_str),
             Some(SPD_PARITY_FIXTURE_SCHEMA)
@@ -871,6 +718,11 @@ mod tests {
         assert_eq!(python_logits.shape[0], cur_in.shape[0]);
         assert_eq!(python_logits.shape[1], 1);
         assert_eq!(topk_token_ids.shape.len(), 1);
+
+        let cur_in = file.read_tensor_f32("cur_in").unwrap();
+        let token_ids = file.read_tensor_i64("python_topk_token_ids").unwrap();
+        assert!(!cur_in.is_empty());
+        assert!(!token_ids.is_empty());
     }
 
     #[test]
