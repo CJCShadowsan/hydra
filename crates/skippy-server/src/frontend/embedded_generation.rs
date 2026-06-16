@@ -626,6 +626,8 @@ impl StageOpenAiBackend {
             let native_mtp_serial_stage0_verify = native_mtp_serial_stage0_verify_enabled();
             let mut native_mtp_adaptive_disable =
                 NativeMtpAdaptiveDisable::new(native_mtp_adaptive_disable_config());
+            let native_mtp_reject_cooldown_tokens = native_mtp_reject_cooldown_tokens();
+            let mut native_mtp_reject_cooldown_remaining = 0usize;
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -824,6 +826,7 @@ impl StageOpenAiBackend {
                     (request.max_tokens as usize).saturating_sub(decoded_tokens);
                 let should_run_native_mtp_batched_verify = native_mtp_batched_verify
                     && !native_mtp_adaptive_disable.disabled()
+                    && native_mtp_reject_cooldown_remaining == 0
                     && draft_guard.is_none()
                     && native_mtp_remaining >= 2;
                 let native_mtp_draft_token = should_run_native_mtp_batched_verify
@@ -909,6 +912,10 @@ impl StageOpenAiBackend {
                         if decoded_tokens >= request.max_tokens as usize {
                             break;
                         }
+                    }
+                    if !accepted && native_mtp_reject_cooldown_tokens > 0 {
+                        native_mtp_reject_cooldown_remaining = native_mtp_reject_cooldown_tokens;
+                        native_mtp.clear_pending_draft();
                     }
                     let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
                     let verify_next_mtp_draft_adopted = accepted
@@ -1004,6 +1011,14 @@ impl StageOpenAiBackend {
                     token_attrs.insert(
                         "llama_stage.native_mtp.adaptive_disable.triggered".to_string(),
                         json!(adaptive_disable_triggered),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.reject_cooldown_tokens".to_string(),
+                        json!(native_mtp_reject_cooldown_tokens),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.reject_cooldown_remaining".to_string(),
+                        json!(native_mtp_reject_cooldown_remaining),
                     );
                     native_mtp_adaptive_disable.insert_attrs(&mut token_attrs);
                     if let Some(trim) = trim_control {
@@ -1484,6 +1499,8 @@ impl StageOpenAiBackend {
                     ms_to_us(downstream_wait_ms),
                     native_mtp_draft,
                 );
+                native_mtp_reject_cooldown_remaining =
+                    native_mtp_reject_cooldown_remaining.saturating_sub(1);
                 decoded_tokens += 1;
                 exact_replay_tokens.push(current);
                 context_tokens.push(current);
@@ -1606,6 +1623,10 @@ impl StageOpenAiBackend {
             speculative_stats.insert_attrs(&mut decode_attrs);
             native_mtp.stats().insert_attrs(&mut decode_attrs);
             native_mtp_adaptive_disable.insert_attrs(&mut decode_attrs);
+            decode_attrs.insert(
+                "llama_stage.native_mtp.reject_cooldown_tokens".to_string(),
+                json!(native_mtp_reject_cooldown_tokens),
+            );
             self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();
