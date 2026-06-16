@@ -20,11 +20,13 @@ Rust.
   hide.
 - `skippy-runtime` can parse and validate the SPD head manifest/checkpoint
   binding, including a Rust-readable safetensors serving checkpoint and
-  selected tensor payload reads. It does not execute the head yet.
+  selected tensor payload reads.
+- `skippy-runtime` can run the pretrained `Qwen/Qwen3.5-4B` SPD head over a
+  recorded Python fixture and match Python top-k draft candidates.
 
 ## What Does Not Work Yet
 
-- Skippy/Rust does not yet run the SPD head forward pass.
+- Skippy does not yet run the SPD head from live staged hidden-state taps.
 - Skippy does not yet expose the live hidden-state taps required by the head.
 - No live Skippy generation request has used trained SPD proposals yet.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
@@ -170,8 +172,8 @@ SKIPPY_SPD_MANIFEST=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>
 
 ## Export a Rust/Python Parity Fixture
 
-The next implementation step is Rust top-k parity against Python for the same
-trained head and the same real hidden-state inputs. Export a fixture with:
+Rust top-k parity uses the same trained head and the same real hidden-state
+inputs as Python. Export a fixture with:
 
 ```bash
 python evals/spd/export_parity_fixture.py \
@@ -183,14 +185,26 @@ python evals/spd/export_parity_fixture.py \
   --top-k 8
 ```
 
-This writes real SPD inference rows, position ids, Python logits, Python top-k
-draft indices, and Python top-k full token ids. Validate the fixture container
-through Rust with:
+This writes real SPD inference rows, position ids, base final-norm weight,
+Python intermediate states, Python logits, Python top-k draft indices, and
+Python top-k full token ids. Validate the fixture container through Rust with:
 
 ```bash
 SKIPPY_SPD_PARITY_FIXTURE=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
   cargo test -p skippy-runtime validates_external_parity_fixture_when_skippy_spd_parity_fixture_is_set
 ```
+
+Validate the real Rust/Python top-k parity path in release mode:
+
+```bash
+SKIPPY_SPD_MANIFEST=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/skippy-spd-head.json \
+SKIPPY_SPD_PARITY_FIXTURE=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/spd-parity-fixture.safetensors \
+  cargo test --release -p skippy-runtime qwen3_fixture_forward_matches_python_topk_when_env_is_set
+```
+
+Recorded parity result: Rust matched Python top-k draft indices
+`[135, 23, 17, 21, 16, 22, 24, 2598]`, which map to full token ids
+`[220, 23, 17, 21, 16, 22, 24, 2972]`.
 
 ## Artifact Contract
 
@@ -220,16 +234,16 @@ The manifest schema is `skippy-spd-head/v1`. It binds a head checkpoint to:
 Rust validation lives in `crates/skippy-runtime/src/spd.rs`.
 Safetensors parsing and BF16/F32/I64 payload reads live in
 `crates/skippy-runtime/src/spd/safetensors.rs`.
+The constrained Qwen fixture forward path lives in
+`crates/skippy-runtime/src/spd/qwen.rs`.
 
 ## Next Engineering Steps
 
-1. Add a tensor loader for the SPD head weights and draft vocab mapping.
-2. Implement the Qwen3.5-4B SPD forward pass in Rust for the recorded topology.
-3. Capture Skippy hidden-state taps and compare Rust top-k proposals to the
+1. Capture Skippy hidden-state taps and compare Rust top-k proposals to the
    Python reference on the same taps.
-4. Wire live proposal generation into `skippy-server`.
-5. Verify every accepted token through the normal target stages.
-6. Benchmark against ordinary split serving with both injected hop latency and a
+2. Wire live proposal generation into `skippy-server`.
+3. Verify every accepted token through the normal target stages.
+4. Benchmark against ordinary split serving with both injected hop latency and a
    real multi-node topology.
 
 ## Next Research Steps

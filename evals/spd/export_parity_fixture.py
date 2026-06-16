@@ -205,15 +205,39 @@ def build_fixture(
 
         cur_in = torch.cat(rows, dim=1)
         position_ids = torch.tensor([row_positions], device=device, dtype=torch.long)
-        proc = pipeline.speculation_module.forward_inference_g1_only_with_rotary(
-            cur_in,
-            position_ids,
-            attention_mask=None,
-            past_key_values=None,
-            use_cache=False,
-        )
-        proc = pipeline.final_norm(proc)
-        logits = pipeline.speculation_module.lm_head(proc[:, -1:, :]).float()
+        layer_inputs: list[Any] = []
+        layer_queries: list[Any] = []
+        pre_handles = [
+            layer.register_forward_pre_hook(
+                lambda _module, inputs: layer_inputs.append(
+                    inputs[0].detach().cpu().contiguous()
+                )
+            )
+            for layer in pipeline.speculation_module.spec_layers
+        ]
+        handles = [
+            layer.register_forward_hook(
+                lambda _module, _inputs, output: layer_queries.append(
+                    output[:, -1:, :].detach().cpu().contiguous()
+                )
+            )
+            for layer in pipeline.speculation_module.spec_layers
+        ]
+        try:
+            proc = pipeline.speculation_module.forward_inference_g1_only_with_rotary(
+                cur_in,
+                position_ids,
+                attention_mask=None,
+                past_key_values=None,
+                use_cache=False,
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
+            for handle in pre_handles:
+                handle.remove()
+        final_hidden = pipeline.final_norm(proc)
+        logits = pipeline.speculation_module.lm_head(final_hidden[:, -1:, :]).float()
         values, draft_indices = torch.topk(logits[0, 0], k=int(top_k))
         if getattr(pipeline, "_use_draft_vocab", False):
             draft_token_ids = pipeline._draft_token_ids.to(device).long()  # noqa: SLF001
@@ -223,15 +247,22 @@ def build_fixture(
 
     tensors = {
         "cur_in": cur_in.detach().cpu().contiguous(),
+        "final_norm_weight": pipeline.final_norm.weight.detach().cpu().contiguous(),
         "position_ids": position_ids.cpu().contiguous(),
         "prompt_input_ids": input_ids.cpu().contiguous(),
         "row_i_stages": torch.tensor(row_i_stages, dtype=torch.long),
         "row_positions": torch.tensor(row_positions, dtype=torch.long),
         "python_logits": logits.detach().cpu().contiguous(),
+        "python_spec_query": proc.detach().cpu().contiguous(),
+        "python_final_hidden": final_hidden.detach().cpu().contiguous(),
         "python_topk_draft_indices": draft_indices.detach().cpu().long().contiguous(),
         "python_topk_logits": values.detach().cpu().float().contiguous(),
         "python_topk_token_ids": token_ids.detach().cpu().long().contiguous(),
     }
+    for idx, value in enumerate(layer_queries):
+        tensors[f"python_layer_{idx}_query"] = value
+    for idx, value in enumerate(layer_inputs):
+        tensors[f"python_layer_{idx}_full_in"] = value
     return Fixture(tensors=tensors, row_kinds=row_kinds)
 
 

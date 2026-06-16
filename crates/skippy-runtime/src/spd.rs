@@ -1,3 +1,4 @@
+mod qwen;
 mod safetensors;
 
 use std::{
@@ -9,6 +10,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use qwen::{
+    SpdQwen3FixtureDiagnostics, SpdQwen3FixtureParity, SpdQwen3FixtureTopK,
+    run_qwen3_fixture_parity,
+};
 pub use safetensors::{SpdSafetensorsFile, SpdSafetensorsIndex, SpdSafetensorsTensor};
 
 pub const SPD_HEAD_MANIFEST_SCHEMA: &str = "skippy-spd-head/v1";
@@ -709,11 +714,13 @@ mod tests {
 
         let cur_in = index.tensors.get("cur_in").unwrap();
         let position_ids = index.tensors.get("position_ids").unwrap();
+        let final_norm_weight = index.tensors.get("final_norm_weight").unwrap();
         let python_logits = index.tensors.get("python_logits").unwrap();
         let topk_token_ids = index.tensors.get("python_topk_token_ids").unwrap();
 
         assert_eq!(cur_in.shape.len(), 3);
         assert_eq!(position_ids.shape, vec![cur_in.shape[0], cur_in.shape[1]]);
+        assert_eq!(final_norm_weight.shape, vec![cur_in.shape[2]]);
         assert_eq!(python_logits.shape.len(), 3);
         assert_eq!(python_logits.shape[0], cur_in.shape[0]);
         assert_eq!(python_logits.shape[1], 1);
@@ -723,6 +730,37 @@ mod tests {
         let token_ids = file.read_tensor_i64("python_topk_token_ids").unwrap();
         assert!(!cur_in.is_empty());
         assert!(!token_ids.is_empty());
+    }
+
+    #[test]
+    fn qwen3_fixture_forward_matches_python_topk_when_env_is_set() {
+        let (Ok(manifest_path), Ok(fixture_path)) = (
+            std::env::var("SKIPPY_SPD_MANIFEST"),
+            std::env::var("SKIPPY_SPD_PARITY_FIXTURE"),
+        ) else {
+            return;
+        };
+        let parity = qwen::run_qwen3_fixture_parity(manifest_path, fixture_path, 8).unwrap();
+        assert_eq!(
+            parity.rust.draft_indices, parity.python.draft_indices,
+            "diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert_eq!(
+            parity.rust.token_ids, parity.python.token_ids,
+            "diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert!(
+            parity.diagnostics.spec_query_max_abs_diff <= 0.125,
+            "diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert!(
+            parity.diagnostics.final_hidden_max_abs_diff <= 0.125,
+            "diagnostics: {:?}",
+            parity.diagnostics
+        );
     }
 
     #[test]
