@@ -1,0 +1,232 @@
+From d1d28b4b904b0b870ac1160a0a59cae90b6529c8 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Wed, 17 Jun 2026 07:39:00 +1000
+Subject: [PATCH 92/94] Add Skippy batched MTP verification drafts
+
+---
+ include/skippy.h |  17 +++++++
+ src/skippy.cpp   | 118 ++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 129 insertions(+), 6 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index c4da8e28..8360f40d 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -136,6 +136,7 @@ struct skippy_native_mtp_draft {
+     bool available;
+     llama_token token_id;
+     int64_t proposal_compute_us;
++    int32_t margin_milli;
+ };
+ 
+ LLAMA_API enum skippy_status skippy_model_open(
+@@ -419,6 +420,22 @@ LLAMA_API enum skippy_status skippy_verify_tokens_frame(
+         size_t * out_token_count,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_verify_tokens_frame_sampled(
++        struct skippy_session * session,
++        const llama_token * token_ids,
++        size_t token_count,
++        const struct skippy_sampling_config * sampling,
++        const struct skippy_activation_desc * input_desc,
++        const void * input_payload,
++        struct skippy_activation_desc * output_desc,
++        void * output_payload,
++        size_t output_payload_capacity,
++        size_t * out_output_payload_bytes,
++        llama_token * output_tokens,
++        size_t output_token_capacity,
++        size_t * out_token_count,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_session_copy_output_activation_frame(
+         struct skippy_session * session,
+         size_t token_count,
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 7d909a9e..04c0afb4 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1239,6 +1239,17 @@ static bool skippy_mtp_available(const skippy_session * session) {
+            session->stage_model->config.include_output;
+ }
+ 
++static bool skippy_mtp_decode_margin_enabled() {
++    const char * value = std::getenv("SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN");
++    if (value == nullptr || value[0] == '\0') {
++        return false;
++    }
++    return std::strcmp(value, "0") != 0 &&
++           std::strcmp(value, "false") != 0 &&
++           std::strcmp(value, "off") != 0 &&
++           std::strcmp(value, "no") != 0;
++}
++
+ static void skippy_mtp_clear_session_state(skippy_session * session) {
+     if (session == nullptr) {
+         return;
+@@ -1488,17 +1499,18 @@ static llama_token skippy_greedy_sample(skippy_session * session) {
+     return skippy_greedy_sample_ith(session, -1);
+ }
+ 
+-static bool skippy_compute_token_signal(
+-        skippy_session * session,
++static bool skippy_compute_token_signal_context(
++        const llama_model * model,
++        llama_context * ctx,
+         int32_t logits_index,
+         skippy_token_signal * out_signal) {
+-    if (session == nullptr || session->ctx == nullptr || session->stage_model == nullptr || session->stage_model->model == nullptr || out_signal == nullptr) {
++    if (model == nullptr || ctx == nullptr || out_signal == nullptr) {
+         return false;
+     }
+ 
+-    const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
++    const llama_vocab * vocab = llama_model_get_vocab(model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+-    const float * logits = llama_get_logits_ith(session->ctx, logits_index);
++    const float * logits = llama_get_logits_ith(ctx, logits_index);
+     if (logits == nullptr || n_vocab <= 0) {
+         return false;
+     }
+@@ -1555,6 +1567,20 @@ static bool skippy_compute_token_signal(
+     return true;
+ }
+ 
++static bool skippy_compute_token_signal(
++        skippy_session * session,
++        int32_t logits_index,
++        skippy_token_signal * out_signal) {
++    if (session == nullptr || session->stage_model == nullptr) {
++        return false;
++    }
++    return skippy_compute_token_signal_context(
++            session->stage_model->model,
++            session->ctx,
++            logits_index,
++            out_signal);
++}
++
+ static void skippy_record_signal(skippy_session * session, int32_t logits_index) {
+     skippy_token_signal signal = {};
+     if (skippy_compute_token_signal(session, logits_index, &signal)) {
+@@ -1891,6 +1917,7 @@ static enum skippy_status skippy_mtp_propose_next(
+             false,
+             -1,
+             0,
++            0,
+         };
+     }
+     if (!skippy_mtp_available(session) || predicted_token < 0 || !session->mtp_has_pending_h) {
+@@ -1934,6 +1961,19 @@ static enum skippy_status skippy_mtp_propose_next(
+         out_mtp_draft->available = true;
+         out_mtp_draft->token_id = skippy_greedy_sample_context(session->stage_model->model, mtp_ctx, -1);
+         out_mtp_draft->proposal_compute_us = elapsed_us;
++        skippy_token_signal mtp_signal = {};
++        if (skippy_mtp_decode_margin_enabled() &&
++                skippy_compute_token_signal_context(
++                    session->stage_model->model,
++                    mtp_ctx,
++                    -1,
++                    &mtp_signal)) {
++            const int64_t margin_milli = static_cast<int64_t>(std::llround(
++                    static_cast<double>(mtp_signal.margin)*1000.0));
++            out_mtp_draft->margin_milli = static_cast<int32_t>(std::min<int64_t>(
++                    std::max<int64_t>(margin_milli, std::numeric_limits<int32_t>::min()),
++                    std::numeric_limits<int32_t>::max()));
++        }
+     }
+     return skippy_success(out_error);
+ }
+@@ -3561,6 +3601,7 @@ enum skippy_status skippy_decode_step_frame_sampled_mtp_n1(
+             false,
+             -1,
+             0,
++            0,
+         };
+     }
+ 
+@@ -3771,6 +3812,38 @@ enum skippy_status skippy_verify_tokens_frame(
+         size_t output_token_capacity,
+         size_t * out_token_count,
+         struct skippy_error ** out_error) {
++    return skippy_verify_tokens_frame_sampled(
++            session,
++            token_ids,
++            token_count,
++            nullptr,
++            input_desc,
++            input_payload,
++            output_desc,
++            output_payload,
++            output_payload_capacity,
++            out_output_payload_bytes,
++            output_tokens,
++            output_token_capacity,
++            out_token_count,
++            out_error);
++}
++
++enum skippy_status skippy_verify_tokens_frame_sampled(
++        struct skippy_session * session,
++        const llama_token * token_ids,
++        size_t token_count,
++        const struct skippy_sampling_config * sampling,
++        const struct skippy_activation_desc * input_desc,
++        const void * input_payload,
++        struct skippy_activation_desc * output_desc,
++        void * output_payload,
++        size_t output_payload_capacity,
++        size_t * out_output_payload_bytes,
++        llama_token * output_tokens,
++        size_t output_token_capacity,
++        size_t * out_token_count,
++        struct skippy_error ** out_error) {
+     if (out_token_count != nullptr) {
+         *out_token_count = 0;
+     }
+@@ -3843,7 +3916,40 @@ enum skippy_status skippy_verify_tokens_frame(
+     if (session->stage_model->config.include_output) {
+         const int32_t n_tokens = static_cast<int32_t>(token_count);
+         for (int32_t i = 0; i < n_tokens; ++i) {
+-            output_tokens[i] = skippy_greedy_sample_ith(session, i);
++            output_tokens[i] = skippy_sample_token_ith(session, sampling, i);
++        }
++        if (output_token_capacity >= token_count + 2 && token_count > 0) {
++            skippy_native_mtp_draft mtp_draft = {};
++            status = skippy_mtp_propose_next(
++                    session,
++                    output_tokens[token_count - 1],
++                    &mtp_draft,
++                    out_error);
++            if (status != SKIPPY_STATUS_OK) {
++                return status;
++            }
++            if (mtp_draft.available) {
++                output_tokens[token_count] = mtp_draft.token_id;
++                output_tokens[token_count + 1] = static_cast<llama_token>(std::min<int64_t>(
++                        std::max<int64_t>(mtp_draft.proposal_compute_us, 0),
++                        std::numeric_limits<llama_token>::max()));
++                *out_token_count = token_count + 2;
++                if (output_token_capacity >= token_count + 3) {
++                    skippy_token_signal mtp_signal = {};
++                    if (skippy_compute_token_signal_context(
++                                session->stage_model->model,
++                                session->stage_model->mtp_ctx,
++                                -1,
++                                &mtp_signal)) {
++                        const int64_t margin_milli = static_cast<int64_t>(std::llround(
++                                static_cast<double>(mtp_signal.margin) * 1000.0));
++                        output_tokens[token_count + 2] = static_cast<llama_token>(std::min<int64_t>(
++                                std::max<int64_t>(margin_milli, std::numeric_limits<llama_token>::min()),
++                                std::numeric_limits<llama_token>::max()));
++                        *out_token_count = token_count + 3;
++                    }
++                }
++            }
+         }
+     }
+ 
+-- 
+2.54.0 (Apple Git-156)
+
