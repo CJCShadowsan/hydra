@@ -19,19 +19,21 @@ pub(super) fn generation_stop_values(
     let mut values: Vec<String> = stop
         .map(|stop| stop.values().into_iter().map(str::to_string).collect())
         .unwrap_or_default();
-    if let Some(metadata) = chat_metadata
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata)
-        && let Some(stops) = value
-            .get("additional_stops")
-            .and_then(serde_json::Value::as_array)
-    {
-        values.extend(
-            stops
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-        );
+    if let Some(metadata) = chat_metadata {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata) {
+            if let Some(stops) = value
+                .get("additional_stops")
+                .and_then(serde_json::Value::as_array)
+            {
+                values.extend(
+                    stops
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                );
+            }
+        }
     }
     values
 }

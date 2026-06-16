@@ -1509,6 +1509,13 @@ fn tool_calls_requested(request: &ChatCompletionRequest) -> bool {
             .is_some_and(|choice| matches!(choice.as_str(), Some("none")))
 }
 
+fn chat_output_parser_required(
+    request: &ChatCompletionRequest,
+    template_options: &ChatTemplateOptions,
+) -> bool {
+    tool_calls_requested(request) || template_options.enable_thinking == Some(true)
+}
+
 fn chat_response_from_generated_text(
     model: String,
     output: &GeneratedText,

@@ -500,7 +500,7 @@ impl StageOpenAiBackend {
                     stats,
                 );
             }
-            self.emit_openai_phase("stage.openai_decode", decode_timer, attrs);
+            self.emit_openai_summary("stage.openai_decode", decode_timer, attrs);
             Ok(())
         })();
         let lock_timer = PhaseTimer::start();
@@ -912,7 +912,7 @@ impl StageOpenAiBackend {
                 "llama_stage.forward_activation_bytes".to_string(),
                 json!(decode_forward_activation_bytes),
             );
-            self.emit_openai_phase("stage.openai_decode", decode_timer, decode_attrs);
+            self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();
 

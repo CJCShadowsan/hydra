@@ -966,6 +966,43 @@ fn tool_request() -> ChatCompletionRequest {
 }
 
 #[test]
+fn plain_chat_does_not_require_chat_output_parser() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+
+    assert!(!chat_output_parser_required(
+        &request,
+        &ChatTemplateOptions::default(),
+    ));
+}
+
+#[test]
+fn tools_and_enabled_thinking_require_chat_output_parser() {
+    assert!(chat_output_parser_required(
+        &tool_request(),
+        &ChatTemplateOptions::default(),
+    ));
+
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "think"}],
+        "reasoning": {"enabled": true}
+    }))
+    .unwrap();
+
+    assert!(chat_output_parser_required(
+        &request,
+        &ChatTemplateOptions {
+            enable_thinking: Some(true),
+            ..ChatTemplateOptions::default()
+        },
+    ));
+}
+
+#[test]
 fn parses_llama_message_tool_calls() {
     let request = tool_request();
     let parsed = parsed_tool_calls_from_message_json(

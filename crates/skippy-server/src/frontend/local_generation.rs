@@ -451,19 +451,21 @@ impl StageOpenAiBackend {
                     return Err(openai_backend_error(error));
                 }
             }
-            if !chat_sampling_configured && let Some(metadata) = request.chat_sampling_metadata {
-                let mut runtime = self
-                    .runtime
-                    .lock()
-                    .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-                runtime
-                    .configure_chat_sampling(
-                        &session_id,
-                        metadata,
-                        request.prompt_token_ids.len() as u64,
-                        request.sampling.enabled.then_some(request.sampling),
-                    )
-                    .map_err(openai_backend_error)?;
+            if !chat_sampling_configured {
+                if let Some(metadata) = request.chat_sampling_metadata {
+                    let mut runtime = self
+                        .runtime
+                        .lock()
+                        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
+                    runtime
+                        .configure_chat_sampling(
+                            &session_id,
+                            metadata,
+                            request.prompt_token_ids.len() as u64,
+                            request.sampling.enabled.then_some(request.sampling),
+                        )
+                        .map_err(openai_backend_error)?;
+                }
             }
             let decode_timer = PhaseTimer::start();
             let mut decoded_tokens = 0usize;
@@ -602,48 +604,46 @@ impl StageOpenAiBackend {
                     break;
                 }
             }
-            if emit_token_debug {
-                let mut attrs = self.openai_attrs(request.ids);
-                attrs.insert(
-                    "llama_stage.decode_token_count".to_string(),
-                    json!(decoded_tokens),
+            let mut attrs = self.openai_attrs(request.ids);
+            attrs.insert(
+                "llama_stage.decode_token_count".to_string(),
+                json!(decoded_tokens),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_wait_ms".to_string(),
+                json!(runtime_lock_wait_ms),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_wait_max_ms".to_string(),
+                json!(runtime_lock_wait_max_ms),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_hold_ms".to_string(),
+                json!(runtime_lock_hold_ms),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_hold_max_ms".to_string(),
+                json!(runtime_lock_hold_max_ms),
+            );
+            attrs.insert(
+                "llama_stage.runtime_lock_acquires".to_string(),
+                json!(runtime_lock_acquires),
+            );
+            if let Some(stats) = runtime_sessions_before.as_ref() {
+                Self::insert_runtime_session_stats(
+                    &mut attrs,
+                    "llama_stage.runtime_sessions_before",
+                    stats,
                 );
-                attrs.insert(
-                    "llama_stage.runtime_lock_wait_ms".to_string(),
-                    json!(runtime_lock_wait_ms),
-                );
-                attrs.insert(
-                    "llama_stage.runtime_lock_wait_max_ms".to_string(),
-                    json!(runtime_lock_wait_max_ms),
-                );
-                attrs.insert(
-                    "llama_stage.runtime_lock_hold_ms".to_string(),
-                    json!(runtime_lock_hold_ms),
-                );
-                attrs.insert(
-                    "llama_stage.runtime_lock_hold_max_ms".to_string(),
-                    json!(runtime_lock_hold_max_ms),
-                );
-                attrs.insert(
-                    "llama_stage.runtime_lock_acquires".to_string(),
-                    json!(runtime_lock_acquires),
-                );
-                if let Some(stats) = runtime_sessions_before.as_ref() {
-                    Self::insert_runtime_session_stats(
-                        &mut attrs,
-                        "llama_stage.runtime_sessions_before",
-                        stats,
-                    );
-                }
-                if let Some(stats) = runtime_sessions_after.as_ref() {
-                    Self::insert_runtime_session_stats(
-                        &mut attrs,
-                        "llama_stage.runtime_sessions_after",
-                        stats,
-                    );
-                }
-                self.emit_openai_phase("stage.openai_decode", decode_timer, attrs);
             }
+            if let Some(stats) = runtime_sessions_after.as_ref() {
+                Self::insert_runtime_session_stats(
+                    &mut attrs,
+                    "llama_stage.runtime_sessions_after",
+                    stats,
+                );
+            }
+            self.emit_openai_summary("stage.openai_decode", decode_timer, attrs);
             Ok(())
         })();
         let lock_timer = PhaseTimer::start();

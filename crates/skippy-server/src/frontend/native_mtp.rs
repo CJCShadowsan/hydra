@@ -4,6 +4,11 @@ use serde_json::{Value, json};
 
 const BATCHED_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_BATCHED_VERIFY";
 const SERIAL_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_STAGE0_VERIFY";
+const ADAPTIVE_DISABLE_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE";
+const ADAPTIVE_DISABLE_MIN_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_MIN_VERIFY";
+const ADAPTIVE_DISABLE_THRESHOLD_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_THRESHOLD";
+const DEFAULT_ADAPTIVE_DISABLE_MIN_VERIFY: u64 = 32;
+const DEFAULT_ADAPTIVE_DISABLE_THRESHOLD: f64 = 0.70;
 
 pub(super) fn native_mtp_batched_verify_enabled() -> bool {
     native_mtp_batched_verify_enabled_from(std::env::var(BATCHED_VERIFY_ENV).ok().as_deref())
@@ -13,6 +18,22 @@ pub(super) fn native_mtp_serial_stage0_verify_enabled() -> bool {
     native_mtp_serial_stage0_verify_enabled_from(
         std::env::var(SERIAL_STAGE0_VERIFY_ENV).ok().as_deref(),
     )
+}
+
+pub(super) fn native_mtp_adaptive_disable_config() -> NativeMtpAdaptiveDisableConfig {
+    NativeMtpAdaptiveDisableConfig {
+        enabled: native_mtp_adaptive_disable_enabled_from(
+            std::env::var(ADAPTIVE_DISABLE_ENV).ok().as_deref(),
+        ),
+        min_verifications: parse_u64_env(
+            ADAPTIVE_DISABLE_MIN_VERIFY_ENV,
+            DEFAULT_ADAPTIVE_DISABLE_MIN_VERIFY,
+        ),
+        threshold: parse_threshold_env(
+            ADAPTIVE_DISABLE_THRESHOLD_ENV,
+            DEFAULT_ADAPTIVE_DISABLE_THRESHOLD,
+        ),
+    }
 }
 
 fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
@@ -27,6 +48,29 @@ fn native_mtp_serial_stage0_verify_enabled_from(value: Option<&str>) -> bool {
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
     )
+}
+
+fn native_mtp_adaptive_disable_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
+    )
+}
+
+fn parse_u64_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_threshold_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| (0.0..=1.0).contains(value))
+        .unwrap_or(default)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +194,95 @@ impl NativeMtpVerification {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct NativeMtpAdaptiveDisableConfig {
+    pub(super) enabled: bool,
+    pub(super) min_verifications: u64,
+    pub(super) threshold: f64,
+}
+
+#[derive(Debug)]
+pub(super) struct NativeMtpAdaptiveDisable {
+    config: NativeMtpAdaptiveDisableConfig,
+    accepted: u64,
+    rejected: u64,
+    disabled_at_verification: Option<u64>,
+}
+
+impl NativeMtpAdaptiveDisable {
+    pub(super) fn new(config: NativeMtpAdaptiveDisableConfig) -> Self {
+        Self {
+            config,
+            accepted: 0,
+            rejected: 0,
+            disabled_at_verification: None,
+        }
+    }
+
+    pub(super) fn observe(&mut self, verification: NativeMtpVerification) -> bool {
+        if !self.config.enabled || self.disabled() {
+            return false;
+        }
+        match verification {
+            NativeMtpVerification::Accepted { .. } => self.accepted += 1,
+            NativeMtpVerification::Rejected { .. } => self.rejected += 1,
+            NativeMtpVerification::NoPending => return false,
+        }
+        let verified = self.verified();
+        if verified >= self.config.min_verifications && self.accept_rate() < self.config.threshold {
+            self.disabled_at_verification = Some(verified);
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn disabled(&self) -> bool {
+        self.disabled_at_verification.is_some()
+    }
+
+    pub(super) fn insert_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        attrs.insert(
+            "llama_stage.native_mtp.adaptive_disable.enabled".to_string(),
+            json!(self.config.enabled),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.adaptive_disable.disabled".to_string(),
+            json!(self.disabled()),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.adaptive_disable.min_verifications".to_string(),
+            json!(self.config.min_verifications),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.adaptive_disable.threshold".to_string(),
+            json!(self.config.threshold),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.adaptive_disable.accept_rate".to_string(),
+            json!(self.accept_rate()),
+        );
+        if let Some(disabled_at) = self.disabled_at_verification {
+            attrs.insert(
+                "llama_stage.native_mtp.adaptive_disable.disabled_at_verification".to_string(),
+                json!(disabled_at),
+            );
+        }
+    }
+
+    fn verified(&self) -> u64 {
+        self.accepted + self.rejected
+    }
+
+    fn accept_rate(&self) -> f64 {
+        let verified = self.verified();
+        if verified == 0 {
+            0.0
+        } else {
+            self.accepted as f64 / verified as f64
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct NativeMtpN1Verifier {
     pending: Option<PendingDraft>,
@@ -159,6 +292,10 @@ pub(super) struct NativeMtpN1Verifier {
 impl NativeMtpN1Verifier {
     pub(super) fn take_pending_draft(&mut self) -> Option<i32> {
         self.pending.take().map(|pending| pending.token)
+    }
+
+    pub(super) fn clear_pending_draft(&mut self) {
+        self.pending = None;
     }
 
     pub(super) fn observe_taken_draft_verification(
@@ -449,6 +586,82 @@ mod tests {
                 ..NativeMtpN1Stats::default()
             }
         );
+    }
+
+    #[test]
+    fn clear_pending_draft_drops_unverified_draft_without_changing_stats() {
+        let mut verifier = NativeMtpN1Verifier::default();
+        verifier.observe_target_token(11, 5, Some(draft(12)));
+
+        verifier.clear_pending_draft();
+
+        assert_eq!(
+            verifier.stats(),
+            NativeMtpN1Stats {
+                drafted_tokens: 1,
+                proposal_compute_us: 7,
+                ..NativeMtpN1Stats::default()
+            }
+        );
+        assert_eq!(
+            verifier.observe_target_token(12, 9, None),
+            NativeMtpVerification::NoPending
+        );
+    }
+
+    #[test]
+    fn adaptive_disable_triggers_after_minimum_low_acceptance_window() {
+        let mut adaptive = NativeMtpAdaptiveDisable::new(NativeMtpAdaptiveDisableConfig {
+            enabled: true,
+            min_verifications: 4,
+            threshold: 0.75,
+        });
+
+        assert!(!adaptive.observe(NativeMtpVerification::Accepted {
+            draft: 1,
+            target: 1,
+        }));
+        assert!(!adaptive.observe(NativeMtpVerification::Rejected {
+            draft: 2,
+            target: 3,
+        }));
+        assert!(!adaptive.observe(NativeMtpVerification::Accepted {
+            draft: 4,
+            target: 4,
+        }));
+        assert!(adaptive.observe(NativeMtpVerification::Rejected {
+            draft: 5,
+            target: 6,
+        }));
+        assert!(adaptive.disabled());
+    }
+
+    #[test]
+    fn adaptive_disable_stays_enabled_for_high_acceptance_window() {
+        let mut adaptive = NativeMtpAdaptiveDisable::new(NativeMtpAdaptiveDisableConfig {
+            enabled: true,
+            min_verifications: 4,
+            threshold: 0.75,
+        });
+
+        for token in 0..4 {
+            assert!(!adaptive.observe(NativeMtpVerification::Accepted {
+                draft: token,
+                target: token,
+            }));
+        }
+
+        assert!(!adaptive.disabled());
+    }
+
+    #[test]
+    fn adaptive_disable_flag_defaults_off_and_accepts_true_values() {
+        assert!(!native_mtp_adaptive_disable_enabled_from(None));
+        assert!(native_mtp_adaptive_disable_enabled_from(Some("1")));
+        assert!(native_mtp_adaptive_disable_enabled_from(Some("true")));
+        assert!(native_mtp_adaptive_disable_enabled_from(Some(" enabled ")));
+        assert!(!native_mtp_adaptive_disable_enabled_from(Some("0")));
+        assert!(!native_mtp_adaptive_disable_enabled_from(Some("false")));
     }
 
     #[test]

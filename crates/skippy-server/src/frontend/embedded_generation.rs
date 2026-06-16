@@ -134,29 +134,29 @@ impl StageOpenAiBackend {
                         fused_first_decode = Some(fused);
                     }
                 }
-                if !prefill_chain_cache_restored
-                    && let Some(restore) = self.try_restore_embedded_split_prefill(
+                if !prefill_chain_cache_restored {
+                    if let Some(restore) = self.try_restore_embedded_split_prefill(
                         &request,
                         &session_key,
                         downstream,
                         prefill_tokens,
-                    )?
-                {
-                    prefill_chain_restored_tokens = restore.restored_tokens;
-                    prefill_chain_cache_restored =
-                        prefill_chain_restored_tokens >= prefill_tokens.len();
-                    prefill_chain_cache_stats = restore.stats;
-                    cache_stats.cached_prompt_tokens =
-                        saturating_u32(prefill_chain_restored_tokens);
-                    cache_stats.matched_prefix_tokens =
-                        saturating_u32(prefill_chain_restored_tokens);
-                    cache_stats.suffix_prefill_tokens = saturating_u32(
-                        prefill_tokens
-                            .len()
-                            .saturating_sub(prefill_chain_restored_tokens),
-                    );
-                    cache_stats.status = "hit";
-                    cache_stats.hit_kind = Some("chain_prefix");
+                    )? {
+                        prefill_chain_restored_tokens = restore.restored_tokens;
+                        prefill_chain_cache_restored =
+                            prefill_chain_restored_tokens >= prefill_tokens.len();
+                        prefill_chain_cache_stats = restore.stats;
+                        cache_stats.cached_prompt_tokens =
+                            saturating_u32(prefill_chain_restored_tokens);
+                        cache_stats.matched_prefix_tokens =
+                            saturating_u32(prefill_chain_restored_tokens);
+                        cache_stats.suffix_prefill_tokens = saturating_u32(
+                            prefill_tokens
+                                .len()
+                                .saturating_sub(prefill_chain_restored_tokens),
+                        );
+                        cache_stats.status = "hit";
+                        cache_stats.hit_kind = Some("chain_prefix");
+                    }
                 }
                 let mut pos_start = prefill_chain_restored_tokens.min(prefill_tokens.len());
                 let mut chunk_index = 0usize;
@@ -621,6 +621,8 @@ impl StageOpenAiBackend {
             let mut native_mtp = NativeMtpN1Verifier::default();
             let native_mtp_batched_verify = native_mtp_batched_verify_enabled();
             let native_mtp_serial_stage0_verify = native_mtp_serial_stage0_verify_enabled();
+            let mut native_mtp_adaptive_disable =
+                NativeMtpAdaptiveDisable::new(native_mtp_adaptive_disable_config());
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -817,235 +819,250 @@ impl StageOpenAiBackend {
                 let token_timer = PhaseTimer::start();
                 let native_mtp_remaining =
                     (request.max_tokens as usize).saturating_sub(decoded_tokens);
-                if native_mtp_batched_verify
+                let should_run_native_mtp_batched_verify = native_mtp_batched_verify
+                    && !native_mtp_adaptive_disable.disabled()
                     && draft_guard.is_none()
-                    && native_mtp_remaining >= 2
-                    && let Some(native_mtp_draft_token) = native_mtp.take_pending_draft()
-                {
-                    let batched_token_timer = PhaseTimer::start();
-                    let verify_inputs = [current, native_mtp_draft_token];
-                    let message = embedded_verify_message(
-                        request.wire_dtype,
-                        VerifySpanMessageArgs {
-                            request_id,
-                            session_id,
-                            prompt_token_count: request.prompt_token_ids.len(),
-                            pos_start: prefill_token_count + decoded_tokens,
-                            decode_step: decoded_tokens,
-                            tokens: &verify_inputs,
-                            sampling: wire_sampling.clone(),
-                            checkpoint: false,
-                        },
-                    )?;
-                    let verify = if native_mtp_serial_stage0_verify {
-                        self.execute_embedded_verify_span_with_serial_stage0(
-                            &request,
-                            downstream,
-                            &session_key,
-                            &message,
-                            &verify_inputs,
-                            WireReplyKind::PredictedTokens,
-                        )?
-                    } else {
-                        self.execute_embedded_stage_message(
-                            &request,
-                            downstream,
-                            &session_key,
-                            &message,
-                            &verify_inputs,
-                            WireReplyKind::PredictedTokens,
-                        )?
-                    };
-                    if verify.reply.predicted_tokens.len() < verify_inputs.len() {
-                        return Err(OpenAiError::backend(format!(
-                            "native MTP verify span returned too few tokens: got {} expected {}",
-                            verify.reply.predicted_tokens.len(),
-                            verify_inputs.len()
-                        )));
-                    }
-                    let target_token = verify.reply.predicted_tokens[0];
-                    let after_draft_token = verify.reply.predicted_tokens[1];
-                    let verify_next_mtp_draft = NativeMtpDraft::from_verify_prediction_tokens(
-                        &verify.reply.predicted_tokens,
-                        verify_inputs.len(),
-                    );
-                    let native_mtp_decision = native_mtp.observe_taken_draft_verification(
-                        native_mtp_draft_token,
-                        target_token,
-                        ms_to_us(verify.elapsed_ms),
-                    );
-                    let accepted =
-                        matches!(native_mtp_decision, NativeMtpVerification::Accepted { .. });
-                    let mut commit_tokens = vec![target_token];
-                    if accepted {
-                        commit_tokens.push(after_draft_token);
-                    }
-                    let consumed_positions = verify_inputs.len();
-                    let mut committed_positions = 0usize;
-                    let mut reached_stop = false;
-                    for token in commit_tokens {
-                        current = token;
-                        decoded_tokens += 1;
-                        committed_positions += 1;
-                        exact_replay_tokens.push(current);
-                        context_tokens.push(current);
-                        if on_token(current)? == TokenControl::Stop {
-                            reached_stop = true;
-                            break;
-                        }
-                        if decoded_tokens >= request.max_tokens as usize {
-                            break;
-                        }
-                    }
-                    let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
-                    let verify_next_mtp_draft_adopted = accepted
-                        && committed_positions == consumed_positions
-                        && !reached_stop
-                        && decoded_tokens < request.max_tokens as usize
-                        && verify_next_mtp_draft.is_some();
-                    if verify_next_mtp_draft_adopted {
-                        native_mtp.observe_next_draft(verify_next_mtp_draft);
-                    }
-                    let mut trim_control = None;
-                    if committed_positions < consumed_positions {
-                        let target_token_count = prefill_token_count + decoded_tokens;
-                        let trim = self.trim_embedded_stage_session(
-                            &request,
-                            downstream,
-                            &session_key,
-                            request_id,
-                            session_id,
-                            target_token_count,
+                    && native_mtp_remaining >= 2;
+                if should_run_native_mtp_batched_verify {
+                    if let Some(native_mtp_draft_token) = native_mtp.take_pending_draft() {
+                        let batched_token_timer = PhaseTimer::start();
+                        let verify_inputs = [current, native_mtp_draft_token];
+                        let message = embedded_verify_message(
+                            request.wire_dtype,
+                            VerifySpanMessageArgs {
+                                request_id,
+                                session_id,
+                                prompt_token_count: request.prompt_token_ids.len(),
+                                pos_start: prefill_token_count + decoded_tokens,
+                                decode_step: decoded_tokens,
+                                tokens: &verify_inputs,
+                                sampling: wire_sampling.clone(),
+                                checkpoint: false,
+                            },
                         )?;
-                        trim_control = Some(trim);
+                        let verify = if native_mtp_serial_stage0_verify {
+                            self.execute_embedded_verify_span_with_serial_stage0(
+                                &request,
+                                downstream,
+                                &session_key,
+                                &message,
+                                &verify_inputs,
+                                WireReplyKind::PredictedTokens,
+                            )?
+                        } else {
+                            self.execute_embedded_stage_message(
+                                &request,
+                                downstream,
+                                &session_key,
+                                &message,
+                                &verify_inputs,
+                                WireReplyKind::PredictedTokens,
+                            )?
+                        };
+                        if verify.reply.predicted_tokens.len() < verify_inputs.len() {
+                            return Err(OpenAiError::backend(format!(
+                                "native MTP verify span returned too few tokens: got {} expected {}",
+                                verify.reply.predicted_tokens.len(),
+                                verify_inputs.len()
+                            )));
+                        }
+                        let target_token = verify.reply.predicted_tokens[0];
+                        let after_draft_token = verify.reply.predicted_tokens[1];
+                        let verify_next_mtp_draft = NativeMtpDraft::from_verify_prediction_tokens(
+                            &verify.reply.predicted_tokens,
+                            verify_inputs.len(),
+                        );
+                        let native_mtp_decision = native_mtp.observe_taken_draft_verification(
+                            native_mtp_draft_token,
+                            target_token,
+                            ms_to_us(verify.elapsed_ms),
+                        );
+                        let adaptive_disable_triggered =
+                            native_mtp_adaptive_disable.observe(native_mtp_decision);
+                        if adaptive_disable_triggered {
+                            native_mtp.clear_pending_draft();
+                        }
+                        let accepted =
+                            matches!(native_mtp_decision, NativeMtpVerification::Accepted { .. });
+                        let mut commit_tokens = vec![target_token];
+                        if accepted {
+                            commit_tokens.push(after_draft_token);
+                        }
+                        let consumed_positions = verify_inputs.len();
+                        let mut committed_positions = 0usize;
+                        let mut reached_stop = false;
+                        for token in commit_tokens {
+                            current = token;
+                            decoded_tokens += 1;
+                            committed_positions += 1;
+                            exact_replay_tokens.push(current);
+                            context_tokens.push(current);
+                            if on_token(current)? == TokenControl::Stop {
+                                reached_stop = true;
+                                break;
+                            }
+                            if decoded_tokens >= request.max_tokens as usize {
+                                break;
+                            }
+                        }
+                        let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
+                        let verify_next_mtp_draft_adopted = accepted
+                            && committed_positions == consumed_positions
+                            && !reached_stop
+                            && decoded_tokens < request.max_tokens as usize
+                            && verify_next_mtp_draft.is_some()
+                            && !native_mtp_adaptive_disable.disabled();
+                        if verify_next_mtp_draft_adopted {
+                            native_mtp.observe_next_draft(verify_next_mtp_draft);
+                        }
+                        let mut trim_control = None;
+                        if committed_positions < consumed_positions {
+                            let target_token_count = prefill_token_count + decoded_tokens;
+                            let trim = self.trim_embedded_stage_session(
+                                &request,
+                                downstream,
+                                &session_key,
+                                request_id,
+                                session_id,
+                                target_token_count,
+                            )?;
+                            trim_control = Some(trim);
+                        }
+                        decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
+                        decode_runtime_lock_wait_ms += verify.stats.runtime_lock_wait_ms;
+                        decode_runtime_lock_wait_max_ms =
+                            decode_runtime_lock_wait_max_ms.max(verify.stats.runtime_lock_wait_ms);
+                        decode_runtime_lock_hold_ms += verify.stats.runtime_lock_hold_ms;
+                        decode_runtime_lock_hold_max_ms =
+                            decode_runtime_lock_hold_max_ms.max(verify.stats.runtime_lock_hold_ms);
+                        decode_runtime_lock_acquires += 1;
+                        decode_forward_activation_encode_ms += verify.stats.activation_encode_ms;
+                        decode_output_activation_bytes = decode_output_activation_bytes
+                            .saturating_add(verify.stats.output_activation_bytes);
+                        decode_forward_activation_bytes = decode_forward_activation_bytes
+                            .saturating_add(verify.stats.forward_activation_bytes);
+                        decode_forward_write_ms += verify.stats.forward_write_ms;
+                        decode_downstream_wait_ms += verify.stats.downstream_wait_ms;
+                        let mut token_attrs = self.openai_attrs(request.ids);
+                        token_attrs
+                            .insert("llama_stage.decode_step".to_string(), json!(decode_step));
+                        token_attrs
+                            .insert("llama_stage.message_kind".to_string(), json!("VerifySpan"));
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.batched_verification".to_string(),
+                            json!(true),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.serial_stage0_verification".to_string(),
+                            json!(native_mtp_serial_stage0_verify),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verification".to_string(),
+                            json!(native_mtp_decision.label()),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.draft_token".to_string(),
+                            json!(native_mtp_draft_token),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.target_token".to_string(),
+                            json!(target_token),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.after_draft_token".to_string(),
+                            json!(after_draft_token),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verify_next_draft_available".to_string(),
+                            json!(verify_next_mtp_draft_available),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.verify_next_draft_adopted".to_string(),
+                            json!(verify_next_mtp_draft_adopted),
+                        );
+                        if let Some(next_draft) = verify_next_mtp_draft {
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.verify_next_draft_token".to_string(),
+                                json!(next_draft.token),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.verify_next_draft_compute_us".to_string(),
+                                json!(next_draft.proposal_compute_us),
+                            );
+                        }
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.consumed_positions".to_string(),
+                            json!(consumed_positions),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.committed_positions".to_string(),
+                            json!(committed_positions),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.native_mtp.adaptive_disable.triggered".to_string(),
+                            json!(adaptive_disable_triggered),
+                        );
+                        native_mtp_adaptive_disable.insert_attrs(&mut token_attrs);
+                        if let Some(trim) = trim_control {
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.trim_ms".to_string(),
+                                json!(trim.elapsed_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.trim_local_ms".to_string(),
+                                json!(trim.local_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.trim_downstream_write_ms".to_string(),
+                                json!(trim.downstream_write_ms),
+                            );
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.trim_downstream_wait_ms".to_string(),
+                                json!(trim.downstream_wait_ms),
+                            );
+                        }
+                        token_attrs.insert(
+                            "llama_stage.stage0_compute_ms".to_string(),
+                            json!(verify.stats.stage0_compute_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.runtime_lock_wait_ms".to_string(),
+                            json!(verify.stats.runtime_lock_wait_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.runtime_lock_hold_ms".to_string(),
+                            json!(verify.stats.runtime_lock_hold_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.activation_encode_ms".to_string(),
+                            json!(verify.stats.activation_encode_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.forward_write_ms".to_string(),
+                            json!(verify.stats.forward_write_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.downstream_wait_ms".to_string(),
+                            json!(verify.stats.downstream_wait_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.output_activation_bytes".to_string(),
+                            json!(verify.stats.output_activation_bytes),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.forward_activation_bytes".to_string(),
+                            json!(verify.stats.forward_activation_bytes),
+                        );
+                        self.emit_openai_phase(
+                            "stage.openai_native_mtp_verify",
+                            batched_token_timer,
+                            token_attrs,
+                        );
+                        if reached_stop {
+                            break;
+                        }
+                        continue;
                     }
-                    decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
-                    decode_runtime_lock_wait_ms += verify.stats.runtime_lock_wait_ms;
-                    decode_runtime_lock_wait_max_ms =
-                        decode_runtime_lock_wait_max_ms.max(verify.stats.runtime_lock_wait_ms);
-                    decode_runtime_lock_hold_ms += verify.stats.runtime_lock_hold_ms;
-                    decode_runtime_lock_hold_max_ms =
-                        decode_runtime_lock_hold_max_ms.max(verify.stats.runtime_lock_hold_ms);
-                    decode_runtime_lock_acquires += 1;
-                    decode_forward_activation_encode_ms += verify.stats.activation_encode_ms;
-                    decode_output_activation_bytes = decode_output_activation_bytes
-                        .saturating_add(verify.stats.output_activation_bytes);
-                    decode_forward_activation_bytes = decode_forward_activation_bytes
-                        .saturating_add(verify.stats.forward_activation_bytes);
-                    decode_forward_write_ms += verify.stats.forward_write_ms;
-                    decode_downstream_wait_ms += verify.stats.downstream_wait_ms;
-                    let mut token_attrs = self.openai_attrs(request.ids);
-                    token_attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
-                    token_attrs.insert("llama_stage.message_kind".to_string(), json!("VerifySpan"));
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.batched_verification".to_string(),
-                        json!(true),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.serial_stage0_verification".to_string(),
-                        json!(native_mtp_serial_stage0_verify),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.verification".to_string(),
-                        json!(native_mtp_decision.label()),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.draft_token".to_string(),
-                        json!(native_mtp_draft_token),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.target_token".to_string(),
-                        json!(target_token),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.after_draft_token".to_string(),
-                        json!(after_draft_token),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.verify_next_draft_available".to_string(),
-                        json!(verify_next_mtp_draft_available),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.verify_next_draft_adopted".to_string(),
-                        json!(verify_next_mtp_draft_adopted),
-                    );
-                    if let Some(next_draft) = verify_next_mtp_draft {
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.verify_next_draft_token".to_string(),
-                            json!(next_draft.token),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.verify_next_draft_compute_us".to_string(),
-                            json!(next_draft.proposal_compute_us),
-                        );
-                    }
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.consumed_positions".to_string(),
-                        json!(consumed_positions),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.native_mtp.committed_positions".to_string(),
-                        json!(committed_positions),
-                    );
-                    if let Some(trim) = trim_control {
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.trim_ms".to_string(),
-                            json!(trim.elapsed_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.trim_local_ms".to_string(),
-                            json!(trim.local_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.trim_downstream_write_ms".to_string(),
-                            json!(trim.downstream_write_ms),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.trim_downstream_wait_ms".to_string(),
-                            json!(trim.downstream_wait_ms),
-                        );
-                    }
-                    token_attrs.insert(
-                        "llama_stage.stage0_compute_ms".to_string(),
-                        json!(verify.stats.stage0_compute_ms),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.runtime_lock_wait_ms".to_string(),
-                        json!(verify.stats.runtime_lock_wait_ms),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.runtime_lock_hold_ms".to_string(),
-                        json!(verify.stats.runtime_lock_hold_ms),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.activation_encode_ms".to_string(),
-                        json!(verify.stats.activation_encode_ms),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.forward_write_ms".to_string(),
-                        json!(verify.stats.forward_write_ms),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.downstream_wait_ms".to_string(),
-                        json!(verify.stats.downstream_wait_ms),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.output_activation_bytes".to_string(),
-                        json!(verify.stats.output_activation_bytes),
-                    );
-                    token_attrs.insert(
-                        "llama_stage.forward_activation_bytes".to_string(),
-                        json!(verify.stats.forward_activation_bytes),
-                    );
-                    self.emit_openai_phase(
-                        "stage.openai_native_mtp_verify",
-                        batched_token_timer,
-                        token_attrs,
-                    );
-                    if reached_stop {
-                        break;
-                    }
-                    continue;
                 }
                 if draft_guard.is_some() {
                     let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
@@ -1455,8 +1472,11 @@ impl StageOpenAiBackend {
                     )?;
                 }
                 current = reply.predicted;
-                let native_mtp_draft =
-                    NativeMtpDraft::from_prediction_tokens(&reply.predicted_tokens);
+                let native_mtp_draft = if native_mtp_adaptive_disable.disabled() {
+                    None
+                } else {
+                    NativeMtpDraft::from_prediction_tokens(&reply.predicted_tokens)
+                };
                 let native_mtp_decision = native_mtp.observe_target_token(
                     current,
                     ms_to_us(downstream_wait_ms),
@@ -1583,7 +1603,8 @@ impl StageOpenAiBackend {
             );
             speculative_stats.insert_attrs(&mut decode_attrs);
             native_mtp.stats().insert_attrs(&mut decode_attrs);
-            self.emit_openai_phase("stage.openai_decode", decode_timer, decode_attrs);
+            native_mtp_adaptive_disable.insert_attrs(&mut decode_attrs);
+            self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();
 

@@ -1,0 +1,46 @@
+From f6d48cd5918c7c15fbf1350db20c7c717b22a3f5 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Tue, 16 Jun 2026 16:22:00 +1000
+Subject: [PATCH] Synchronize before Skippy sampling
+
+llama.cpp common sampling synchronizes the context before reading logits and
+applying the sampler chain. Skippy's staged sampler path read logits directly,
+which can diverge from llama-server on asynchronous backends such as Metal.
+
+Synchronize before greedy, chat, and fallback staged sampling so Skippy samples
+from the same completed logits row that common sampling would see.
+---
+ src/skippy.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 1d53879e..f6d48cd5 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1465,6 +1465,7 @@ static llama_token skippy_greedy_sample_context(
+     }
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    llama_synchronize(ctx);
+     const float * logits = llama_get_logits_ith(ctx, index);
+     if (logits == nullptr) {
+         return 0;
+@@ -1826,6 +1827,7 @@ static void skippy_sync_chat_sampling_history(skippy_session * session) {
+ 
+ static llama_token skippy_chat_sample_token(skippy_session * session, int32_t logits_index) {
+     skippy_sync_chat_sampling_history(session);
++    llama_synchronize(session->ctx);
+ 
+     const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
+     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+@@ -1881,6 +1883,7 @@ static llama_token skippy_sample_token_ith(
+     if (skippy_ensure_plain_sampling_chain(session, sampling)) {
+         return skippy_chat_sample_token(session, logits_index);
+     }
++    llama_synchronize(session->ctx);
+ 
+     llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+     llama_sampler * sampler = llama_sampler_chain_init(chain_params);
+-- 
+2.54.0
+
