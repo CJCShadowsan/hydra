@@ -361,27 +361,40 @@ the probe into the target-reply wait loop:
   `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
 - binary: `target/release/skippy-server`
 - prompt: `Write a Python function named add that returns the sum of two integers.`
-- response content for `max_tokens=1`: `<think>\nThinking`
+- response content for `max_tokens=4`: `<think>\nThinking Process:\n\n`
+- no-SPD baseline emitted the same text for the same request
 - SPD source: `spd-replay`, with `--openai-spd-replay-fallback` disabled
 - inline tap state: required downstream taps `10`, `20`, and `31` returned and
-  recorded for prompt rows and the current-token row; no tap-return failures
+  recorded for prompt rows and all four generated-token rows; no tap-return
+  failures
 - h0 source: direct GGUF `token_embd.weight` rows
 - SPD head hosting: cached pretrained Qwen3.5-4B serving weights
-- inline probe phase: `pre_target_reply`
+- inline probe phase: `pre_target_reply` for all four proposals
 - inline probe trigger: returned `hf_index=31` tap from producer stage `5`
-- inline probe elapsed: about `388ms`
+- inline probe elapsed: about `389ms` to `393ms` each
 - target wait after probe: about `0ms`
-- inline probe result: ready, proposed token `8160`, target token `90700`,
-  accepted `false`
-- SPD request wall time: about `1.35s`
-- no-SPD same-topology wall time for the same one-token request: about `0.46s`
+- inline verified SPD windows: `4`
+- accepted proposals: `1`
+- rejected proposals: `3`
+- inline accept rate on this prompt: `0.25`
+- target-verified proposal sequence:
+  - proposed `8160`, target `90700`, rejected
+  - proposed `264`, target `8340`, rejected
+  - proposed `25`, target `25`, accepted
+  - proposed `25`, target `271`, rejected
+- SPD request wall time: about `3.39s`
+- no-SPD same-topology wall time for the same four-token request: about `0.57s`
+- SPD decode time: about `2.69s`, including about `1.56s` of head proposal time
+- no-SPD decode time: about `145ms`
 
 This proves the real pretrained head can run in the Skippy OpenAI request path
 from inline Skippy taps plus direct GGUF h0 embeddings, without replaying local
 stage slices. It also proves stage 0 can start that head before consuming the
-final target token reply. It is not a speedup yet: the current unoptimized CPU
-Rust head is much slower than the remaining final-stage work in this local
-topology, and the first sampled proposal in this smoke was rejected.
+final target token reply, count accepted/rejected SPD proposals against normal
+target decode, and preserve ordinary greedy output. It is not a speedup yet:
+the current unoptimized CPU Rust head is much slower than the remaining
+final-stage work in this local topology, and this prompt accepted only one of
+four proposals.
 
 This still does not make `spd-replay` a full speed path. Proposal generation at
 the top of the decode loop starts before the in-flight current-token target pass
@@ -403,9 +416,9 @@ SPD serving.
   tap-aligned proof. Proposal scheduling still needs to turn freshly returned
   current-token taps into useful ahead-of-final-stage work.
 - The current no-replay request-path probe is pre-target-reply telemetry, not
-  yet committed speculative execution. It proves the scheduling slot and
-  measures head cost, but it still adds latency instead of hiding pipeline
-  bubbles.
+  yet committed optimistic next-token execution. It proves the scheduling slot,
+  records target-verified accept/reject counters, and measures head cost, but
+  it still adds latency instead of hiding pipeline bubbles.
 - Request-path acceptance has been proven on a bounded four-token smoke, but a
   larger local request-path acceptance/latency sweep is still needed.
 - No larger-than-4B head has been trained by us yet.

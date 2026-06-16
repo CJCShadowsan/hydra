@@ -105,6 +105,20 @@ pub(super) struct OpenAiSpeculativeStats {
 }
 
 impl OpenAiSpeculativeStats {
+    pub(super) fn observe_inline_verified_probe(&mut self, accepted: bool) {
+        self.windows += 1;
+        self.draft_tokens += 1;
+        if accepted {
+            self.accepted_tokens += 1;
+            self.full_accept_windows += 1;
+        } else {
+            self.rejected_tokens += 1;
+            self.rejected_windows += 1;
+            self.tail_reject_windows += 1;
+            self.first_reject_position_sum += 1;
+        }
+    }
+
     pub(super) fn observe_verify_decision(
         &mut self,
         decision: VerifySpanDecision,
@@ -556,6 +570,24 @@ mod tests {
             verify_inputs_for_proposals(10, &[20, 30, 40]),
             vec![10, 20, 30]
         );
+    }
+
+    #[test]
+    fn inline_verified_probe_records_acceptance_without_repair_work() {
+        let mut stats = OpenAiSpeculativeStats::default();
+
+        stats.observe_inline_verified_probe(true);
+        stats.observe_inline_verified_probe(false);
+
+        assert_eq!(stats.windows, 2);
+        assert_eq!(stats.draft_tokens, 2);
+        assert_eq!(stats.accepted_tokens, 1);
+        assert_eq!(stats.rejected_tokens, 1);
+        assert_eq!(stats.full_accept_windows, 1);
+        assert_eq!(stats.rejected_windows, 1);
+        assert_eq!(stats.tail_reject_windows, 1);
+        assert_eq!(stats.repair_required_windows, 0);
+        assert_eq!(stats.primary_verify_requests, 0);
     }
 
     #[test]

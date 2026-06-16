@@ -53,7 +53,7 @@ Rust.
   from inline returned Skippy taps plus direct GGUF h0 embeddings without
   `--openai-spd-replay-fallback`; the inline probe was ready, started in the
   `pre_target_reply` slot after the `hf_index=31` tap, and completed in about
-  `388ms`.
+  `389-393ms` per token on the four-token smoke.
 
 ## What Does Not Work Yet
 
@@ -62,8 +62,8 @@ Rust.
   the optimized inline hidden-tap transport needed for real speed.
 - The no-replay request-path probe currently runs before stage 0 consumes the
   normal target token reply, but it is still only telemetry. It proves the real
-  head can consume inline taps in the right scheduling slot, but it is not yet a
-  serving speedup.
+  head can consume inline taps in the right scheduling slot and records
+  target-verified accept/reject counters, but it is not yet a serving speedup.
 - The live request-path proof is bounded; it still needs a larger acceptance
   and latency sweep.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
@@ -416,24 +416,35 @@ release no-replay smoke for a one-token request:
   `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
 - binary: `target/release/skippy-server`
 - prompt: `Write a Python function named add that returns the sum of two integers.`
-- response content: `<think>\nThinking`
+- response content for `max_tokens=4`: `<think>\nThinking Process:\n\n`
+- no-SPD baseline emitted the same text
 - inline probe phase: `pre_target_reply`
 - inline probe trigger: returned `hf_index=31` tap from producer stage `5`
-- inline probe elapsed: about `388ms`
+- inline probe elapsed: about `389ms` to `393ms` each
 - target wait after probe: about `0ms`
-- inline probe result: ready, proposed token `8160`, target token `90700`,
-  accepted `false`
-- SPD request wall time: about `1.35s`
-- no-SPD same-topology wall time: about `0.46s`
+- inline verified SPD windows: `4`
+- accepted proposals: `1`
+- rejected proposals: `3`
+- inline accept rate on this prompt: `0.25`
+- target-verified proposal sequence:
+  - proposed `8160`, target `90700`, rejected
+  - proposed `264`, target `8340`, rejected
+  - proposed `25`, target `25`, accepted
+  - proposed `25`, target `271`, rejected
+- SPD request wall time: about `3.39s`
+- no-SPD same-topology wall time for the same four-token request: about `0.57s`
+- SPD decode time: about `2.69s`, including about `1.56s` of head proposal time
+- no-SPD decode time: about `145ms`
 
 That result proves the real pretrained head runs from inline Skippy request
 taps without replay fallback and can start before the final target reply is
-consumed by stage 0. It is still not a live speedup because the current CPU Rust
-head is slower than the remaining final-stage work in this local topology and
-the sampled proposal was rejected. The remaining production work is using that
-pre-target proposal to drive optimistic next-token stage work and rollback on
-rejection, then measuring ordinary split serving against inline-tap SPD
-serving.
+consumed by stage 0. It also proves those proposals are verified against normal
+target decode and ordinary greedy output is preserved. It is still not a live
+speedup because the current CPU Rust head is slower than the remaining
+final-stage work in this local topology and this prompt accepted only one of
+four proposals. The remaining production work is using pre-target accepted
+proposals to drive optimistic next-token stage work and rollback on rejection,
+then measuring ordinary split serving against inline-tap SPD serving.
 
 ## Validate Hidden Tap Compatibility
 

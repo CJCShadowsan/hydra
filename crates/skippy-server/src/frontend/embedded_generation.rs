@@ -1249,6 +1249,10 @@ impl StageOpenAiBackend {
                 let downstream_wait_ms = wait_timer.elapsed_ms();
                 decode_downstream_wait_ms += downstream_wait_ms;
                 if let Some(probe) = prediction_return.pre_target_probe {
+                    if let Some(proposed) = probe.proposed {
+                        speculative_stats
+                            .observe_inline_verified_probe(proposed == reply.predicted);
+                    }
                     speculative_stats.draft_propose_ms += self.emit_spd_inline_probe(
                         &request,
                         decode_step,
@@ -1261,6 +1265,10 @@ impl StageOpenAiBackend {
                     let proposed = spd
                         .propose_inline_for_current_context(current)
                         .map_err(openai_backend_error)?;
+                    if let Some(proposed) = proposed {
+                        speculative_stats
+                            .observe_inline_verified_probe(proposed == reply.predicted);
+                    }
                     speculative_stats.draft_propose_ms += self.emit_spd_inline_probe(
                         &request,
                         decode_step,
