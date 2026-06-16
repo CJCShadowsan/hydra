@@ -627,7 +627,10 @@ impl StageOpenAiBackend {
             let mut native_mtp_adaptive_disable =
                 NativeMtpAdaptiveDisable::new(native_mtp_adaptive_disable_config());
             let native_mtp_reject_cooldown_tokens = native_mtp_reject_cooldown_tokens();
+            let native_mtp_reject_recovery_serial_accepts =
+                native_mtp_reject_recovery_serial_accepts();
             let mut native_mtp_reject_cooldown_remaining = 0usize;
+            let mut native_mtp_reject_recovery_remaining = 0usize;
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -827,6 +830,7 @@ impl StageOpenAiBackend {
                 let should_run_native_mtp_batched_verify = native_mtp_batched_verify
                     && !native_mtp_adaptive_disable.disabled()
                     && native_mtp_reject_cooldown_remaining == 0
+                    && native_mtp_reject_recovery_remaining == 0
                     && draft_guard.is_none()
                     && native_mtp_remaining >= 2;
                 let native_mtp_draft_token = should_run_native_mtp_batched_verify
@@ -915,6 +919,11 @@ impl StageOpenAiBackend {
                     }
                     if !accepted && native_mtp_reject_cooldown_tokens > 0 {
                         native_mtp_reject_cooldown_remaining = native_mtp_reject_cooldown_tokens;
+                        native_mtp.clear_pending_draft();
+                    }
+                    if !accepted && native_mtp_reject_recovery_serial_accepts > 0 {
+                        native_mtp_reject_recovery_remaining =
+                            native_mtp_reject_recovery_serial_accepts;
                         native_mtp.clear_pending_draft();
                     }
                     let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
@@ -1019,6 +1028,14 @@ impl StageOpenAiBackend {
                     token_attrs.insert(
                         "llama_stage.native_mtp.reject_cooldown_remaining".to_string(),
                         json!(native_mtp_reject_cooldown_remaining),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.reject_recovery_serial_accepts".to_string(),
+                        json!(native_mtp_reject_recovery_serial_accepts),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.reject_recovery_remaining".to_string(),
+                        json!(native_mtp_reject_recovery_remaining),
                     );
                     native_mtp_adaptive_disable.insert_attrs(&mut token_attrs);
                     if let Some(trim) = trim_control {
@@ -1499,6 +1516,19 @@ impl StageOpenAiBackend {
                     ms_to_us(downstream_wait_ms),
                     native_mtp_draft,
                 );
+                if native_mtp_reject_recovery_remaining > 0 {
+                    match native_mtp_decision {
+                        NativeMtpVerification::Accepted { .. } => {
+                            native_mtp_reject_recovery_remaining =
+                                native_mtp_reject_recovery_remaining.saturating_sub(1);
+                        }
+                        NativeMtpVerification::Rejected { .. } => {
+                            native_mtp_reject_recovery_remaining =
+                                native_mtp_reject_recovery_serial_accepts;
+                        }
+                        NativeMtpVerification::NoPending => {}
+                    }
+                }
                 native_mtp_reject_cooldown_remaining =
                     native_mtp_reject_cooldown_remaining.saturating_sub(1);
                 decoded_tokens += 1;
@@ -1626,6 +1656,10 @@ impl StageOpenAiBackend {
             decode_attrs.insert(
                 "llama_stage.native_mtp.reject_cooldown_tokens".to_string(),
                 json!(native_mtp_reject_cooldown_tokens),
+            );
+            decode_attrs.insert(
+                "llama_stage.native_mtp.reject_recovery_serial_accepts".to_string(),
+                json!(native_mtp_reject_recovery_serial_accepts),
             );
             self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())

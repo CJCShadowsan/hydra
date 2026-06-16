@@ -9,6 +9,7 @@ const ADAPTIVE_DISABLE_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE";
 const ADAPTIVE_DISABLE_MIN_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_MIN_VERIFY";
 const ADAPTIVE_DISABLE_THRESHOLD_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_THRESHOLD";
 const REJECT_COOLDOWN_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_COOLDOWN_TOKENS";
+const REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_RECOVERY_SERIAL_ACCEPTS";
 const DEFAULT_ADAPTIVE_DISABLE_MIN_VERIFY: u64 = 32;
 const DEFAULT_ADAPTIVE_DISABLE_THRESHOLD: f64 = 0.70;
 
@@ -46,6 +47,10 @@ pub(super) fn native_mtp_adaptive_disable_config() -> NativeMtpAdaptiveDisableCo
 
 pub(super) fn native_mtp_reject_cooldown_tokens() -> usize {
     parse_usize_env(REJECT_COOLDOWN_TOKENS_ENV, 0)
+}
+
+pub(super) fn native_mtp_reject_recovery_serial_accepts() -> usize {
+    parse_usize_env(REJECT_RECOVERY_SERIAL_ACCEPTS_ENV, 0)
 }
 
 fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
@@ -754,5 +759,10 @@ mod tests {
     #[test]
     fn reject_cooldown_tokens_defaults_zero() {
         assert_eq!(parse_usize_env("SKIPPY_TEST_MISSING_REJECT_COOLDOWN", 0), 0);
+    }
+
+    #[test]
+    fn reject_recovery_serial_accepts_defaults_zero() {
+        assert_eq!(parse_usize_env("SKIPPY_TEST_MISSING_REJECT_RECOVERY", 0), 0);
     }
 }
