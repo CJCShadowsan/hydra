@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 mod devices;
 pub mod package;
 mod runtime_events;
+pub mod spd;
 
 pub const MAX_LOGIT_BIAS: usize = 256;
 pub const GGML_TYPE_F16: u32 = 1;
