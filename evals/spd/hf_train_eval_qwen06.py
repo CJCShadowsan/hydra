@@ -220,6 +220,68 @@ def patch_pipeline_model_for_glm(path: Path) -> None:
             self.layers_per_stage = self.num_layers // self.num_stages
 ''',
     )
+    replace_once(
+        path,
+        "        self.shallow_hidden_layer_indices = self._normalize_stage_feature_indices(shallow_hidden_layer_indices)\n",
+        """        self.shallow_hidden_layer_indices = self._normalize_stage_feature_indices(shallow_hidden_layer_indices)
+        self.stage_layer_ranges = self._derive_stage_layer_ranges()
+""",
+    )
+    replace_once(
+        path,
+        '''    def _snap_indices_needed(self) -> Set[int]:
+        want: Set[int] = set()
+        for row in self.shallow_hidden_layer_indices:
+            for idx in row:
+                want.add(int(idx))
+        return want
+''',
+        '''    def _snap_indices_needed(self) -> Set[int]:
+        want: Set[int] = set()
+        for row in self.shallow_hidden_layer_indices:
+            for idx in row:
+                want.add(int(idx))
+        return want
+
+    def _derive_stage_layer_ranges(self) -> List[Tuple[int, int]]:
+        rows = self.shallow_hidden_layer_indices
+        deepest_row = tuple(sorted({int(x) for x in rows[0] if int(x) > 0})) if rows else ()
+        if (
+            len(deepest_row) >= self.num_stages
+            and deepest_row[-1] == self.num_layers
+            and all(a < b for a, b in zip(deepest_row, deepest_row[1:]))
+        ):
+            ranges: List[Tuple[int, int]] = []
+            start = 0
+            for end in deepest_row[: self.num_stages]:
+                ranges.append((start, end))
+                start = end
+            return ranges
+
+        ranges = []
+        for stage_idx in range(self.num_stages):
+            start = min(stage_idx * self.layers_per_stage, self.num_layers)
+            end = min((stage_idx + 1) * self.layers_per_stage, self.num_layers)
+            ranges.append((start, end))
+        return ranges
+''',
+    )
+    replace_once(
+        path,
+        '''                start_layer = stage_idx * lps
+                end_layer = (stage_idx + 1) * lps
+''',
+        '''                start_layer, end_layer = self.stage_layer_ranges[stage_idx]
+''',
+    )
+    replace_once(
+        path,
+        '''                start_layer = stage_idx * lps
+                end_layer = (stage_idx + 1) * lps
+''',
+        '''                start_layer, end_layer = self.stage_layer_ranges[stage_idx]
+''',
+    )
 
 
 def patch_reference_linear_cache_import(path: Path) -> None:
