@@ -115,7 +115,7 @@ python evals/spd/hf_train_eval_qwen06.py \
   --build-draft-vocab-size 1024 \
   --draft-vocab-json '' \
   --device cuda \
-  --upload-repo ''
+  --upload-repo none
 ```
 
 `--stage-layer-boundaries` derives the reference trainer's
@@ -143,7 +143,7 @@ python evals/spd/hf_train_eval_qwen06.py \
   --max-new-tokens 64 \
   --draft-top-k 4 \
   --device mps \
-  --upload-repo ''
+  --upload-repo none
 ```
 
 Use `--device cuda` on a GPU host. The runner also supports HF Jobs, but that is
@@ -174,7 +174,7 @@ python evals/spd/hf_train_eval_qwen06.py \
   --eval-rows-per-set 8 \
   --max-new-tokens 64 \
   --draft-top-k 4 \
-  --upload-repo ''
+  --upload-repo none
 ```
 
 Use `--device cuda` on a GPU host. The first run downloads the base model and
