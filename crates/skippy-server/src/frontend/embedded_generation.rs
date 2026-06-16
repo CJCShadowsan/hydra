@@ -801,25 +801,18 @@ impl StageOpenAiBackend {
                     if remaining == 0 {
                         break;
                     }
-                    let mut proposal_source = "none";
                     let proposal_limit = remaining.min(adaptive_window);
                     let propose_timer = PhaseTimer::start();
-                    let mut draft_tokens = Vec::new();
-                    if draft_tokens.is_empty()
-                        && let Some(draft) = draft_guard.as_deref_mut()
-                    {
-                        let proposal_limit = proposal_limit.min(draft.window);
-                        draft_tokens = draft
-                            .propose(current, proposal_limit)
-                            .map_err(openai_backend_error)?;
-                        if !draft_tokens.is_empty() {
-                            proposal_source = "draft-model";
-                        }
-                    }
+                    let proposal = match draft_guard.as_deref_mut() {
+                        Some(draft) => propose_from_source(draft, current, proposal_limit)
+                            .map_err(openai_backend_error)?,
+                        None => SpeculativeProposal::empty(proposal_limit),
+                    };
                     let draft_propose_ms = propose_timer.elapsed_ms();
                     speculative_stats.draft_propose_ms += draft_propose_ms;
-                    if !draft_tokens.is_empty() {
-                        let verify_inputs = verify_inputs_for_proposals(current, &draft_tokens);
+                    if !proposal.is_empty() {
+                        let draft_tokens = proposal.tokens.as_slice();
+                        let verify_inputs = verify_inputs_for_proposals(current, draft_tokens);
                         let message = embedded_verify_message(
                             request.wire_dtype,
                             VerifySpanMessageArgs {
@@ -883,7 +876,7 @@ impl StageOpenAiBackend {
                         speculative_stats.checkpoint_ms +=
                             us_to_ms(verify.reply.stats.checkpoint_total_us);
                         let decision = classify_verify_span(
-                            &draft_tokens,
+                            draft_tokens,
                             &verify.reply.predicted_tokens,
                             decoded_tokens,
                             request.max_tokens as usize,
@@ -980,7 +973,7 @@ impl StageOpenAiBackend {
                                     WireReplyKind::PredictedTokens,
                                 )?;
                                 commit_tokens = repaired_commit_tokens(
-                                    &draft_tokens,
+                                    draft_tokens,
                                     decision.accepted_before_reject,
                                     repair_input_count,
                                     &repair.reply.predicted_tokens,
@@ -1020,8 +1013,9 @@ impl StageOpenAiBackend {
                             }
                         }
                         speculative_stats.adaptive_window_final = adaptive_window;
-                        if proposal_source == "draft-model" && (decision.rejected() || reached_stop)
-                        {
+                        if draft_guard.as_ref().is_some_and(|draft| {
+                            draft.should_reset_after_verify(decision, reached_stop)
+                        }) {
                             let draft_reset_timer = PhaseTimer::start();
                             if let Some(draft) = draft_guard.as_deref_mut() {
                                 draft
@@ -1057,11 +1051,11 @@ impl StageOpenAiBackend {
                         );
                         token_attrs.insert(
                             "llama_stage.spec.proposal_source".to_string(),
-                            json!(proposal_source),
+                            json!(proposal.source),
                         );
                         token_attrs.insert(
                             "llama_stage.spec.proposal_limit".to_string(),
-                            json!(proposal_limit),
+                            json!(proposal.requested_limit),
                         );
                         token_attrs.insert(
                             "llama_stage.stage0_compute_ms".to_string(),

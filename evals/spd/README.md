@@ -38,12 +38,15 @@ Rust.
   embedding-only side tap for hidden-state index `0`, run the Rust SPD head
   from those live taps, and verify repeated live top-1 proposals with the
   Skippy target verifier.
+- `skippy-server` has a request-path speculative proposal-source boundary in
+  front of the existing target verify/repair/rollback loop. The current draft
+  model path uses it; SPD is the next proposal source to wire in.
 
 ## What Does Not Work Yet
 
 - No live Skippy generation request has used trained SPD proposals yet.
-- The live-tap proof is a diagnostic path; request-path proposal,
-  verification, rollback, and metrics are not wired into Skippy serving yet.
+- The live-tap proof is a diagnostic path; the SPD proposer is not wired into
+  request-path serving metrics or live OpenAI generation yet.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
   `spd-head.safetensors` before Rust-side serving work.
 

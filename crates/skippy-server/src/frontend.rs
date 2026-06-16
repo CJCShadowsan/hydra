@@ -1273,7 +1273,7 @@ impl DraftRunner {
         })
     }
 
-    fn reset_to_context(&mut self, context_tokens: &[i32]) -> Result<()> {
+    fn reset_session_to_context(&mut self, context_tokens: &[i32]) -> Result<()> {
         self.session.reset().context("reset draft session")?;
         if context_tokens.len() > 1 {
             self.session
@@ -1283,7 +1283,7 @@ impl DraftRunner {
         Ok(())
     }
 
-    fn propose(&mut self, mut current: i32, max_tokens: usize) -> Result<Vec<i32>> {
+    fn propose_tokens(&mut self, mut current: i32, max_tokens: usize) -> Result<Vec<i32>> {
         let mut tokens = Vec::with_capacity(max_tokens);
         for _ in 0..max_tokens {
             current = self
@@ -1293,6 +1293,24 @@ impl DraftRunner {
             tokens.push(current);
         }
         Ok(tokens)
+    }
+}
+
+impl SpeculativeProposalSource for DraftRunner {
+    fn label(&self) -> &'static str {
+        DRAFT_MODEL_PROPOSAL_SOURCE
+    }
+
+    fn max_window(&self) -> usize {
+        self.window
+    }
+
+    fn reset_to_context(&mut self, context_tokens: &[i32]) -> Result<()> {
+        self.reset_session_to_context(context_tokens)
+    }
+
+    fn propose(&mut self, current: i32, max_tokens: usize) -> Result<Vec<i32>> {
+        self.propose_tokens(current, max_tokens)
     }
 }
 

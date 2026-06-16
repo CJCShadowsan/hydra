@@ -305,8 +305,9 @@ for current speedup estimates until request-path SPD exists.
 - No live Skippy request has used trained SPD proposals.
 - The tap-aligned Qwen3.5-4B proof now proves live Skippy tap capture and SPD
   proposal from those taps plus repeated target verification in a diagnostic
-  harness, but not request-path proposal windows, rollback integration, or
-  serving metrics.
+  harness. `skippy-server` now has a pluggable request-path speculative
+  proposal-source boundary ahead of its existing verify/repair/rollback loop,
+  but the SPD proposer is not wired into that boundary yet.
 - No larger-than-4B head has been trained by us yet.
 
 ## Correctness Contract
@@ -342,8 +343,9 @@ Recommended first implementation:
 - one SPD sidecar runtime per active Skippy topology/session group
 - host it in one Skippy process first, likely coordinator or final-stage side
 - other stages expose/send selected hidden-state taps
-- SPD proposes token candidates
-- normal Skippy stages verify every emitted token
+- SPD implements the `skippy-server` speculative proposal-source boundary
+- normal Skippy stages verify every emitted token through the existing
+  verify/repair/rollback path
 
 Distributed SPD execution across all stage nodes may become useful later, but it
 is not the first proof path.
@@ -596,12 +598,14 @@ Goal: Skippy uses SPD proposals during generation and verifies every token.
 
 Tasks:
 
-1. Wire SPD proposal generation into `skippy-server`.
-2. Feed proposals into the existing target verification path.
-3. Roll back speculative KV/session state on rejection.
-4. Emit metrics for proposals, accepted tokens, rejected tokens, equivalent
+1. Add a proposal-source boundary in `skippy-server`. Done for the current
+   draft-model path; SPD can now be added without duplicating verifier logic.
+2. Wire SPD proposal generation into that boundary.
+3. Feed proposals into the existing target verification path.
+4. Roll back speculative KV/session state on rejection.
+5. Emit metrics for proposals, accepted tokens, rejected tokens, equivalent
    accept length, and decode-loop steps.
-5. Run ordinary split serving and SPD serving against the same prompts.
+6. Run ordinary split serving and SPD serving against the same prompts.
 
 Exit criteria:
 

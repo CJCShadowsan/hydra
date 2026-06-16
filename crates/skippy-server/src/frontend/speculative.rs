@@ -1,5 +1,60 @@
 use super::*;
 
+pub(super) const DRAFT_MODEL_PROPOSAL_SOURCE: &str = "draft-model";
+
+pub(super) trait SpeculativeProposalSource {
+    fn label(&self) -> &'static str;
+
+    fn max_window(&self) -> usize;
+
+    fn reset_to_context(&mut self, context_tokens: &[i32]) -> Result<()>;
+
+    fn propose(&mut self, current: i32, max_tokens: usize) -> Result<Vec<i32>>;
+
+    fn should_reset_after_verify(&self, decision: VerifySpanDecision, reached_stop: bool) -> bool {
+        decision.rejected() || reached_stop
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SpeculativeProposal {
+    pub(super) source: &'static str,
+    pub(super) requested_limit: usize,
+    pub(super) tokens: Vec<i32>,
+}
+
+impl SpeculativeProposal {
+    pub(super) fn empty(requested_limit: usize) -> Self {
+        Self {
+            source: "none",
+            requested_limit,
+            tokens: Vec::new(),
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+pub(super) fn propose_from_source(
+    source: &mut dyn SpeculativeProposalSource,
+    current: i32,
+    requested_limit: usize,
+) -> Result<SpeculativeProposal> {
+    let capped_limit = requested_limit.min(source.max_window());
+    let tokens = source.propose(current, capped_limit)?;
+    if tokens.is_empty() {
+        Ok(SpeculativeProposal::empty(requested_limit))
+    } else {
+        Ok(SpeculativeProposal {
+            source: source.label(),
+            requested_limit,
+            tokens,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(super) struct OpenAiSpeculativeStats {
     pub(super) windows: usize,
@@ -427,5 +482,119 @@ pub(super) fn nonzero_min(current: usize, candidate: usize) -> usize {
         candidate
     } else {
         current.min(candidate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixedProposalSource {
+        label: &'static str,
+        max_window: usize,
+        tokens: Vec<i32>,
+        observed_limit: Option<usize>,
+    }
+
+    impl SpeculativeProposalSource for FixedProposalSource {
+        fn label(&self) -> &'static str {
+            self.label
+        }
+
+        fn max_window(&self) -> usize {
+            self.max_window
+        }
+
+        fn reset_to_context(&mut self, _context_tokens: &[i32]) -> Result<()> {
+            Ok(())
+        }
+
+        fn propose(&mut self, _current: i32, max_tokens: usize) -> Result<Vec<i32>> {
+            self.observed_limit = Some(max_tokens);
+            Ok(self.tokens.iter().copied().take(max_tokens).collect())
+        }
+    }
+
+    #[test]
+    fn proposal_source_caps_requested_limit_to_source_window() {
+        let mut source = FixedProposalSource {
+            label: "test-source",
+            max_window: 2,
+            tokens: vec![11, 12, 13],
+            observed_limit: None,
+        };
+
+        let proposal = propose_from_source(&mut source, 10, 4).unwrap();
+
+        assert_eq!(source.observed_limit, Some(2));
+        assert_eq!(proposal.source, "test-source");
+        assert_eq!(proposal.requested_limit, 4);
+        assert_eq!(proposal.tokens, vec![11, 12]);
+    }
+
+    #[test]
+    fn empty_proposal_keeps_requested_limit_and_none_source() {
+        let mut source = FixedProposalSource {
+            label: "empty-source",
+            max_window: 4,
+            tokens: Vec::new(),
+            observed_limit: None,
+        };
+
+        let proposal = propose_from_source(&mut source, 10, 3).unwrap();
+
+        assert_eq!(source.observed_limit, Some(3));
+        assert_eq!(proposal, SpeculativeProposal::empty(3));
+        assert!(proposal.is_empty());
+    }
+
+    #[test]
+    fn verify_inputs_begin_with_current_and_shift_proposals() {
+        assert_eq!(verify_inputs_for_proposals(10, &[]), Vec::<i32>::new());
+        assert_eq!(verify_inputs_for_proposals(10, &[20]), vec![10]);
+        assert_eq!(
+            verify_inputs_for_proposals(10, &[20, 30, 40]),
+            vec![10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn verify_span_classifies_full_accept() {
+        let decision = classify_verify_span(&[20, 30], &[20, 30], 0, 8, |_| Ok(false)).unwrap();
+
+        assert_eq!(decision.kind, VerifySpanDecisionKind::FullAccept);
+        assert_eq!(decision.accepted_before_reject, 2);
+        assert_eq!(decision.commit_count, 2);
+        assert_eq!(decision.repair_input_count, None);
+    }
+
+    #[test]
+    fn verify_span_classifies_tail_reject_without_repair() {
+        let decision = classify_verify_span(&[20, 30], &[20, 31], 0, 8, |_| Ok(false)).unwrap();
+
+        assert_eq!(decision.kind, VerifySpanDecisionKind::TailReject);
+        assert_eq!(decision.accepted_before_reject, 1);
+        assert_eq!(decision.commit_count, 2);
+        assert_eq!(decision.repair_input_count, Some(2));
+        assert!(!decision.requires_repair());
+    }
+
+    #[test]
+    fn verify_span_classifies_early_reject_with_repair() {
+        let decision =
+            classify_verify_span(&[20, 30, 40], &[20, 31, 41], 0, 8, |_| Ok(false)).unwrap();
+
+        assert_eq!(decision.kind, VerifySpanDecisionKind::EarlyReject);
+        assert_eq!(decision.accepted_before_reject, 1);
+        assert_eq!(decision.commit_count, 2);
+        assert_eq!(decision.repair_input_count, Some(2));
+        assert!(decision.requires_repair());
+    }
+
+    #[test]
+    fn repaired_commit_tokens_returns_repaired_target_prefix() {
+        let repaired = repaired_commit_tokens(&[20, 30, 40], 1, 2, &[20, 31, 41]).unwrap();
+
+        assert_eq!(repaired, vec![20, 31]);
     }
 }
