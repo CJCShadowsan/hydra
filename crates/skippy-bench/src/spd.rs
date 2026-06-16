@@ -5,9 +5,9 @@ use serde_json::json;
 use skippy_runtime::{
     ActivationFrame, GGML_TYPE_F16, RuntimeConfig, RuntimeLoadMode, StageModel,
     spd::{
-        SpdHeadManifest, SpdQwen3ForwardInput, SpdSafetensorsFile, SpdStageLayerRange,
-        plan_hidden_state_taps, project_spd_tap_input_row, run_qwen3_fixture_parity,
-        run_qwen3_forward_from_inputs, run_spd_tap_input_fixture_parity,
+        SpdHeadManifest, SpdQwen3ForwardInput, SpdQwen3Head, SpdSafetensorsFile,
+        SpdStageLayerRange, plan_hidden_state_taps, project_spd_tap_input_row,
+        run_qwen3_fixture_parity, run_spd_tap_input_fixture_parity,
     },
 };
 
@@ -93,6 +93,7 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
 
     let hidden_size =
         usize::try_from(manifest.topology.hidden_size).context("SPD hidden_size exceeds usize")?;
+    let spd_head = SpdQwen3Head::open(&args.manifest).context("open Qwen SPD head")?;
     let live_runner = LiveTapRunner::open(&args, &ranges)?;
     let taps = live_runner.collect_taps(&prompt_tokens)?;
     let live_rows = assemble_live_cur_in(
@@ -108,8 +109,7 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
             hidden_size,
         },
     )?;
-    let live_topk = run_qwen3_forward_from_inputs(
-        &args.manifest,
+    let live_topk = spd_head.forward(
         SpdQwen3ForwardInput {
             cur_in: live_rows.cur_in.clone(),
             seq_len: row_count,
@@ -125,6 +125,7 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
         &serving,
         &fixture,
         &live_runner,
+        &spd_head,
         VerifiedGenerationInputs {
             prompt_tokens: &prompt_tokens,
             row_i_stages: &row_i_stages,
@@ -204,6 +205,7 @@ fn run_verified_generation(
     serving: &SpdSafetensorsFile,
     fixture: &SpdSafetensorsFile,
     live_runner: &LiveTapRunner,
+    spd_head: &SpdQwen3Head,
     inputs: VerifiedGenerationInputs<'_>,
 ) -> Result<VerifiedGenerationReport> {
     if inputs.prompt_tokens.len() < inputs.row_count {
@@ -254,8 +256,7 @@ fn run_verified_generation(
         let assemble_ms = elapsed_ms(assemble_timer);
 
         let head_timer = Instant::now();
-        let live_topk = run_qwen3_forward_from_inputs(
-            &args.manifest,
+        let live_topk = spd_head.forward(
             SpdQwen3ForwardInput {
                 cur_in: live_rows.cur_in,
                 seq_len: inputs.row_count,

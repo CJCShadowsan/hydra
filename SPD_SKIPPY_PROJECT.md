@@ -132,6 +132,15 @@ hidden-state taps and execute the head against recorded fixtures. The live-tap
 bench path can also assemble those rows from real Skippy activation frames for
 the tap-aligned Qwen3.5-4B proof split.
 
+`skippy-runtime::spd::SpdQwen3Head` is the current Rust hosting boundary for
+the pretrained Qwen head. It opens the manifest and serving checkpoint once,
+validates the tensor shapes, keeps the runtime shape, and exposes repeated
+`forward()` calls for proposal generation. The live verifier harness now uses
+that loaded head instead of reopening the artifact on every proposal. This is
+the shape a Skippy SPD sidecar should use, but the current Qwen forward remains
+a straightforward Rust reference path and is not yet optimized for request-path
+throughput.
+
 ### 5. Rust Hidden-Tap Planning
 
 `crates/skippy-runtime/src/spd/tap_plan.rs` translates the manifest's hidden

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -40,6 +40,52 @@ pub struct SpdQwen3ForwardInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct SpdQwen3Head {
+    manifest_path: PathBuf,
+    manifest: SpdHeadManifest,
+    serving_file: SpdSafetensorsFile,
+    shape: SpdQwen3Shape,
+}
+
+impl SpdQwen3Head {
+    pub fn open(manifest_path: impl AsRef<Path>) -> Result<Self> {
+        let manifest_path = manifest_path.as_ref().to_path_buf();
+        let manifest = SpdHeadManifest::from_path(&manifest_path)?;
+        manifest.ensure_serving_checkpoint_for_runtime(&manifest_path)?;
+        let serving_file =
+            SpdSafetensorsFile::open(manifest.serving_checkpoint_path(&manifest_path)?)?;
+        let shape = SpdQwen3Shape::from_manifest_and_weights(&manifest, &serving_file)?;
+        Ok(Self {
+            manifest_path,
+            manifest,
+            serving_file,
+            shape,
+        })
+    }
+
+    pub fn manifest(&self) -> &SpdHeadManifest {
+        &self.manifest
+    }
+
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    pub fn forward(
+        &self,
+        input: SpdQwen3ForwardInput,
+        top_k: usize,
+    ) -> Result<SpdQwen3FixtureTopK> {
+        let trace = run_forward_trace(&self.serving_file, input, &self.shape)?;
+        topk_from_logits(
+            &trace.logits,
+            top_k,
+            self.manifest.topology.draft_token_ids.as_deref(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 struct SpdQwen3Shape {
     hidden_size: usize,
     num_stages: usize,
@@ -67,17 +113,13 @@ pub fn run_qwen3_fixture_parity(
 ) -> Result<SpdQwen3FixtureParity> {
     let manifest_path = manifest_path.as_ref();
     let fixture_path = fixture_path.as_ref();
-    let manifest = SpdHeadManifest::from_path(manifest_path)?;
-    manifest.ensure_serving_checkpoint_for_runtime(manifest_path)?;
-    let serving_path = manifest.serving_checkpoint_path(manifest_path)?;
-    let serving_file = SpdSafetensorsFile::open(&serving_path)?;
+    let head = SpdQwen3Head::open(manifest_path)?;
     let fixture_file = SpdSafetensorsFile::open(fixture_path)?;
-    let shape = SpdQwen3Shape::from_manifest_and_weights(&manifest, &serving_file)?;
-    let trace = run_fixture_forward(&serving_file, &fixture_file, &shape)?;
+    let trace = run_fixture_forward(&head.serving_file, &fixture_file, &head.shape)?;
     let rust = topk_from_logits(
         &trace.logits,
         top_k,
-        manifest.topology.draft_token_ids.as_deref(),
+        head.manifest.topology.draft_token_ids.as_deref(),
     )?;
     let python = python_topk_from_fixture(&fixture_file)?;
     let diagnostics = fixture_diagnostics(&fixture_file, &trace, &rust)?;
@@ -93,18 +135,7 @@ pub fn run_qwen3_forward_from_inputs(
     input: SpdQwen3ForwardInput,
     top_k: usize,
 ) -> Result<SpdQwen3FixtureTopK> {
-    let manifest_path = manifest_path.as_ref();
-    let manifest = SpdHeadManifest::from_path(manifest_path)?;
-    manifest.ensure_serving_checkpoint_for_runtime(manifest_path)?;
-    let serving_path = manifest.serving_checkpoint_path(manifest_path)?;
-    let serving_file = SpdSafetensorsFile::open(&serving_path)?;
-    let shape = SpdQwen3Shape::from_manifest_and_weights(&manifest, &serving_file)?;
-    let trace = run_forward_trace(&serving_file, input, &shape)?;
-    topk_from_logits(
-        &trace.logits,
-        top_k,
-        manifest.topology.draft_token_ids.as_deref(),
-    )
+    SpdQwen3Head::open(manifest_path)?.forward(input, top_k)
 }
 
 fn run_fixture_forward(

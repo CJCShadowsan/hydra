@@ -23,6 +23,9 @@ Rust.
   selected tensor payload reads.
 - `skippy-runtime` can run the pretrained `Qwen/Qwen3.5-4B` SPD head over a
   recorded Python fixture and match Python top-k draft candidates.
+- `skippy-runtime` exposes `SpdQwen3Head`, a reusable loaded-head boundary for
+  repeated Qwen SPD proposals without reopening the manifest/checkpoint each
+  time.
 - `skippy-runtime` can reconstruct the SPD `cur_in` rows from raw recorded
   hidden-state tap inputs using `g0_proj` and `stage_projs.*`.
 - `skippy-model-package` can plan, write, and preflight explicit tap-aligned

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 pub use qwen::{
     SpdQwen3FixtureDiagnostics, SpdQwen3FixtureParity, SpdQwen3FixtureTopK, SpdQwen3ForwardInput,
-    run_qwen3_fixture_parity, run_qwen3_forward_from_inputs,
+    SpdQwen3Head, run_qwen3_fixture_parity, run_qwen3_forward_from_inputs,
 };
 pub use safetensors::{SpdSafetensorsFile, SpdSafetensorsIndex, SpdSafetensorsTensor};
 pub use tap_input::{
