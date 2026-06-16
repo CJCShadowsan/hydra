@@ -45,7 +45,11 @@ trace into a four-stage Skippy latency model with `4ms` per stage estimated
 and `7.752x` at `25ms` hop. The Rust live-tap harness now also proves three
 consecutive Qwen3.5-4B top-1 SPD proposals from live Skippy activation frames:
 all three were accepted by the target verifier, every verifier window rewound,
-and the committed token stream matched ordinary non-SPD greedy decoding.
+and the committed token stream matched ordinary non-SPD greedy decoding. The
+Skippy OpenAI request path also now runs the pretrained head through the
+experimental `spd-replay` proposal source: a bounded four-token Humaneval smoke
+proposed four SPD tokens, accepted two, rejected two, and emitted the exact same
+greedy text as ordinary no-SPD Skippy serving.
 
 ## What Works Today
 
@@ -298,21 +302,41 @@ quantization/runtime drift. This is a real Skippy tap/head/target-verifier
 proof over repeated proposal windows, but it is still a diagnostic harness and
 not a serving throughput measurement. `skippy-server` now has an experimental
 request-path SPD replay source that can load the same pretrained head and feed
-the existing verifier, but that path still needs a local end-to-end OpenAI run.
-The per-step timings from the CPU diagnostic path are not throughput numbers;
-use the trace latency simulator for current speedup estimates until inline tap
-capture exists.
+the existing verifier.
+
+Recorded local request-path smoke with `skippy-server serve-binary`:
+
+- topology: seven tap-aligned local CPU stages,
+  `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
+- model: `unsloth/Qwen3.5-4B-GGUF:Q4_K_M`
+- prompt: Humaneval eval row `index=8`, `max_tokens=4`, `temperature=0`
+- SPD source: `spd-replay`
+- SPD proposals: `4`
+- accepted proposals: `2`
+- rejected proposals: `2`
+- accepted proposal windows: `2 / 4`
+- emitted text: `<think>\nThe user wants me`
+- no-SPD baseline emitted the same text for the same request
+- SPD replay wall time: about `101.5s`; logged decode time: about `100.6s`
+- no-SPD Skippy baseline wall time: about `1.28s`; logged decode time: about
+  `90ms`
+
+This proves the live OpenAI serving path can call a real pretrained SPD head,
+feed proposals into Skippy's verifier, accept/reject per token, and preserve
+ordinary greedy output. It is still not a serving throughput measurement:
+`spd-replay` recomputes taps through local `StageModel` slices and runs the head
+on CPU for each proposal. Use the trace latency simulator for current speedup
+estimates until inline tap capture exists.
 
 ## What Does Not Work Yet
 
-- No local OpenAI request has yet been recorded using the trained SPD source.
-- The tap-aligned Qwen3.5-4B proof now proves live Skippy tap capture and SPD
-  proposal from those taps plus repeated target verification in a diagnostic
-  harness. `skippy-server` now has a pluggable request-path speculative
-  proposal-source boundary and an experimental `spd-replay` implementation that
-  replays live taps through local stage slices before feeding proposals into the
-  existing verify/repair/rollback loop. This proves serving-path integration
-  shape, but it is intentionally not the optimized hidden-tap transport.
+- The `spd-replay` request path is a correctness bridge, not a speed path. It
+  replays taps through local stage slices before feeding proposals into the
+  existing verify/repair/rollback loop.
+- Inline hidden-tap capture and transport are still needed before SPD can hide
+  real Skippy pipeline bubbles instead of adding replay overhead.
+- Request-path acceptance has been proven on a bounded four-token smoke, but a
+  larger local request-path acceptance/latency sweep is still needed.
 - No larger-than-4B head has been trained by us yet.
 
 ## Correctness Contract
@@ -631,8 +655,11 @@ Tasks:
 4. Roll back speculative KV/session state on rejection. Done through the
    existing verifier reset path for any rejecting proposal source.
 5. Emit metrics for proposals, accepted tokens, rejected tokens, equivalent
-   accept length, and decode-loop steps.
-6. Run ordinary split serving and SPD serving against the same prompts.
+   accept length, and decode-loop steps. Basic request-path proposal/accept
+   telemetry is in place; equivalent accept length and sweep reporting still
+   need promotion into the benchmark/report layer.
+6. Run ordinary split serving and SPD serving against the same prompts. Done
+   for one bounded local smoke; still needed as a broader sweep.
 7. Replace replayed local tap collection with inline hidden-tap capture and
    transport so performance can match the SPD pipeline design.
 

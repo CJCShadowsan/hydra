@@ -43,13 +43,17 @@ Rust.
   model path uses it, and an experimental `spd-replay` source can load the
   pretrained Qwen3.5-4B head from `--openai-spd-manifest` /
   `--openai-spd-fixture`.
+- A bounded local OpenAI request through `skippy-server` has exercised the
+  pretrained head in the live serving path: four `spd-replay` proposals, two
+  accepted, two rejected, and the same greedy text as the no-SPD baseline.
 
 ## What Does Not Work Yet
 
-- No local OpenAI request has yet been recorded using the trained SPD source.
 - The `spd-replay` source collects taps by replaying the current context through
   local `StageModel` slices. It is a correctness bridge into live serving, not
   the optimized inline hidden-tap transport needed for real speed.
+- The live request-path proof is bounded; it still needs a larger acceptance
+  and latency sweep.
 - The `.pt` checkpoint is a proof/training artifact. Export it to
   `spd-head.safetensors` before Rust-side serving work.
 
@@ -364,9 +368,27 @@ skippy-server serve-binary \
 ```
 
 That path feeds real SPD proposals into the normal Skippy `VerifySpan`
-verify/repair/rollback loop. The next proof step is to run ordinary split
-serving and `spd-replay` serving against the same prompts, then replace replayed
-taps with inline tap capture.
+verify/repair/rollback loop.
+
+Recorded bounded local OpenAI request-path proof:
+
+- topology: seven tap-aligned local CPU stages,
+  `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32`
+- model: `unsloth/Qwen3.5-4B-GGUF:Q4_K_M`
+- prompt: Humaneval eval row `index=8`, `max_tokens=4`, `temperature=0`
+- SPD source: `spd-replay`
+- SPD proposals: `4`
+- accepted proposals: `2`
+- rejected proposals: `2`
+- emitted text: `<think>\nThe user wants me`
+- no-SPD baseline emitted the same text
+- SPD replay wall time: about `101.5s`; no-SPD baseline wall time: about
+  `1.28s`
+
+That request-path result proves correct integration with target verification,
+not speed. The next engineering step is to replace replayed taps with inline
+tap capture and then run ordinary split serving and SPD serving against a
+larger shared prompt set with injected and real hop latency.
 
 ## Validate Hidden Tap Compatibility
 
@@ -428,7 +450,7 @@ The tap-row-to-`cur_in` projection bridge lives in
    Python reference on the same taps.
 2. For the first live proof, prefer the tap-aligned over-split unless the
    hidden-tap ABI is already available.
-3. Wire live proposal generation into `skippy-server`.
+3. Replace `spd-replay` with inline tap capture in `skippy-server`.
 4. Verify every accepted token through the normal target stages.
 5. Benchmark against ordinary split serving with both injected hop latency and a
    real multi-node topology.
