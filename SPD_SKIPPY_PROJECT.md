@@ -34,12 +34,15 @@ sidecar head accepts enough tokens. The engineering question is whether Skippy
 can expose the required hidden-state taps and verify proposals without breaking
 target-model equivalence.
 
-Headline current result: the pretrained `Qwen/Qwen3.5-4B` SPD head accepted
-`1230 / 1536` draft flags on the local reference eval, with equivalent accept
-length `2.4704` and token-weighted theoretical gain `163.39%`. Feeding that
-same real trace into a four-stage Skippy latency model with `4ms` per stage
-estimated `9.882x` SPD-vs-serial split throughput at `0ms` hop, `8.117x` at
-`10ms` hop, and `7.752x` at `25ms` hop.
+Headline current result: the pretrained `Qwen/Qwen3.5-4B` SPD head reported
+`1230 / 1536` accepted draft flags on the local reference eval. The reference
+summary reports aggregate acceptance `0.6176`, equivalent accept length
+`2.4704`, and token-weighted theoretical gain `163.39%`; the branch latency
+simulator reports the same equivalent accept length as a paper-like `2.470x`
+ratio (`+147.04%`) under its aggregate-cycle formula. Feeding that same real
+trace into a four-stage Skippy latency model with `4ms` per stage estimated
+`9.882x` SPD-vs-serial split throughput at `0ms` hop, `8.117x` at `10ms` hop,
+and `7.752x` at `25ms` hop.
 
 ## What Works Today
 
@@ -66,6 +69,10 @@ Recorded local proof:
 | Model | Head | Generated tokens | Accepted flags | Acceptance | Equivalent accept length | Theoretical gain |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `Qwen/Qwen3.5-4B` | pretrained, 4 stages / 4 spec layers | 1536 | 1230 / 1536 | 0.6176 | 2.4704 | 163.39% |
+
+The accepted-flags count and aggregate acceptance use different denominators in
+the reference output. `1230 / 1536` is the draft-flag count; `0.6176` is the
+reference aggregate acceptance metric used for equivalent accept length.
 
 Per-dataset theoretical gains from the same run:
 
@@ -119,6 +126,35 @@ head artifacts:
 section. Skippy can inspect the serving artifact and read tensor payloads. The
 constrained Rust Qwen fixture path can execute the head against recorded
 fixtures, but live Skippy hidden-state integration is not wired yet.
+
+### 5. Rust Hidden-Tap Planning
+
+`crates/skippy-runtime/src/spd/tap_plan.rs` translates the manifest's hidden
+state requirements into concrete Skippy stage ownership. The reference
+convention is:
+
+- HF hidden-state index `0` is the embedding output
+- HF hidden-state index `k >= 1` is the output after decoder layer `k - 1`
+
+For the pretrained `Qwen/Qwen3.5-4B` S4/L4 head, the required tap groups are:
+
+```text
+g4: [0, 10, 20, 31]
+g3: [0, 8, 16, 24]
+g2: [0, 8, 16]
+g1: [0, 8]
+```
+
+The new Rust planner confirms:
+
+| Candidate Skippy layer ranges | Result |
+| --- | --- |
+| `0..8, 8..16, 16..24, 24..32` | ordinary four-way split exposes boundary indices `8,16,24,32`; SPD still needs internal taps `10,20,31` |
+| `0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32` | tap-aligned proof split can expose every required tap as a stage boundary |
+
+This gives two implementation options: add a narrow internal hidden-tap ABI for
+normal four-stage serving, or use a tap-aligned over-split as the fastest local
+proof that the pretrained head can drive live Skippy proposals.
 
 ## What Does Not Work Yet
 
@@ -228,7 +264,7 @@ The manifest must bind the head to:
 ### Train Small Qwen3-0.6B Head
 
 ```bash
-python evals/spd/hf_train_eval_qwen06.py \
+python3 evals/spd/hf_train_eval_qwen06.py \
   --work-dir /tmp/skippy-spd-qwen06-proof \
   --model-name Qwen/Qwen3-0.6B \
   --dataset HuggingFaceH4/ultrachat_200k \
@@ -249,7 +285,7 @@ Use `--device cuda` on a CUDA host.
 ### Evaluate Pretrained Qwen3.5-4B Head
 
 ```bash
-python evals/spd/hf_train_eval_qwen06.py \
+python3 evals/spd/hf_train_eval_qwen06.py \
   --work-dir /tmp/skippy-spd-qwen35-4b-pretrained-s4l4 \
   --model-name Qwen/Qwen3.5-4B \
   --spec-head-repo yuyijiong/speculative_pipeline_decoding \
@@ -266,7 +302,7 @@ python evals/spd/hf_train_eval_qwen06.py \
 ### Export Serving Checkpoint
 
 ```bash
-python evals/spd/export_spd_head.py \
+python3 evals/spd/export_spd_head.py \
   --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
   --manifest /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/skippy-spd-head.json \
   --base-model-path Qwen/Qwen3.5-4B
@@ -275,7 +311,7 @@ python evals/spd/export_spd_head.py \
 ### Export Rust/Python Parity Fixture
 
 ```bash
-python evals/spd/export_parity_fixture.py \
+python3 evals/spd/export_parity_fixture.py \
   --reference-dir /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/speculative_pipeline_decoding \
   --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
   --base-model-path Qwen/Qwen3.5-4B \
@@ -287,7 +323,7 @@ python evals/spd/export_parity_fixture.py \
 ### Simulate Split Latency From Trace
 
 ```bash
-python evals/spd/simulate_latency.py \
+python3 evals/spd/simulate_latency.py \
   --raw /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/eval/raw/pipeline_eval__train__speculation_head_final__nt24__per_sample.jsonl \
   --stage-ms 4,4,4,4 \
   --hop-ms 0,1,5,10,25
@@ -361,10 +397,17 @@ Goal: Skippy can expose the hidden states the SPD head needs.
 
 Tasks:
 
-1. Identify the target layer taps from `skippy-spd-head.json`.
-2. Add a hidden-state sideband/tap path in the staged runtime.
-3. Validate dtype, shape, token position, and stage ownership.
-4. Write a correctness test that compares tapped hidden states against a known
+1. Identify the target layer taps from `skippy-spd-head.json`. Done in
+   `skippy-runtime` tap-planning tests.
+2. Decide proof topology:
+   - fastest proof: tap-aligned over-split so required taps are ordinary stage
+     boundaries
+   - production path: add an internal hidden-tap ABI so ordinary four-stage
+     serving can expose taps `10,20,31`
+3. Add a hidden-state sideband/tap path in the staged runtime if not using the
+   over-split proof path.
+4. Validate dtype, shape, token position, and stage ownership.
+5. Write a correctness test that compares tapped hidden states against a known
    reference for a small prompt.
 
 Exit criteria:
@@ -424,6 +467,7 @@ This branch should stay focused on SPD proof and handoff material:
 - `SPD_SKIPPY_PROJECT.md`
 - `evals/spd/`
 - `crates/skippy-runtime/src/spd.rs`
+- `crates/skippy-runtime/src/spd/`
 - minimal module export from `skippy-runtime`
 
 Avoid mixing in unrelated MTP, GLM, packaging, branch-reconciliation, or private

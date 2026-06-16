@@ -55,7 +55,7 @@ This is the smallest useful proof that the training path and artifact shape
 work. It trains a real head from open data.
 
 ```bash
-python evals/spd/hf_train_eval_qwen06.py \
+python3 evals/spd/hf_train_eval_qwen06.py \
   --work-dir /tmp/skippy-spd-qwen06-proof \
   --model-name Qwen/Qwen3-0.6B \
   --dataset HuggingFaceH4/ultrachat_200k \
@@ -88,7 +88,7 @@ This is the strongest current model-quality signal. It uses an author-published
 SPD head and evaluates it locally against the reference verifier.
 
 ```bash
-python evals/spd/hf_train_eval_qwen06.py \
+python3 evals/spd/hf_train_eval_qwen06.py \
   --work-dir /tmp/skippy-spd-qwen35-4b-pretrained-s4l4 \
   --model-name Qwen/Qwen3.5-4B \
   --spec-head-repo yuyijiong/speculative_pipeline_decoding \
@@ -111,6 +111,10 @@ Recorded local result:
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `Qwen/Qwen3.5-4B` | pretrained, 4 stages / 4 spec layers | 4 | 1536 | 1230 / 1536 | 0.6176 | 2.4704 | 163.39% |
 
+The accepted-flags count and aggregate acceptance use different denominators in
+the reference output. `1230 / 1536` is the draft-flag count; `0.6176` is the
+reference aggregate acceptance metric used for equivalent accept length.
+
 Per-dataset theoretical gains from the same run:
 
 | Dataset | Acceptance | Equivalent accept length | Theoretical gain |
@@ -126,7 +130,7 @@ by the reference evaluator. It does not invent acceptance; it uses the real
 `new_tokens`, `decode_loop_steps`, and accepted-flag counters from the run.
 
 ```bash
-python evals/spd/simulate_latency.py \
+python3 evals/spd/simulate_latency.py \
   --raw /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/eval/raw/pipeline_eval__train__speculation_head_final__nt24__per_sample.jsonl \
   --stage-ms 4,4,4,4 \
   --hop-ms 0,1,5,10,25
@@ -147,13 +151,17 @@ split` column models a Skippy-specific comparison where ordinary split serving
 must traverse every stage/hop for each generated token before the next target
 token is known.
 
+The simulator's aggregate-cycle formula reports the same equivalent accept
+length as `2.470x` (`+147.04%`). The reference eval summary separately reports
+a token-weighted theoretical gain of `163.39%`.
+
 ## Export the Serving Checkpoint
 
 After training or downloading a reference SPD head, export the PyTorch
 checkpoint to a Rust-readable serving artifact:
 
 ```bash
-python evals/spd/export_spd_head.py \
+python3 evals/spd/export_spd_head.py \
   --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
   --manifest /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/skippy-spd-head.json \
   --base-model-path Qwen/Qwen3.5-4B
@@ -176,7 +184,7 @@ Rust top-k parity uses the same trained head and the same real hidden-state
 inputs as Python. Export a fixture with:
 
 ```bash
-python evals/spd/export_parity_fixture.py \
+python3 evals/spd/export_parity_fixture.py \
   --reference-dir /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/speculative_pipeline_decoding \
   --checkpoint /tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<run-id>/train/speculation_head_final.pt \
   --base-model-path Qwen/Qwen3.5-4B \
@@ -205,6 +213,27 @@ SKIPPY_SPD_PARITY_FIXTURE=/tmp/skippy-spd-qwen35-4b-pretrained-s4l4/artifacts/<r
 Recorded parity result: Rust matched Python top-k draft indices
 `[135, 23, 17, 21, 16, 22, 24, 2598]`, which map to full token ids
 `[220, 23, 17, 21, 16, 22, 24, 2972]`.
+
+## Validate Hidden Tap Compatibility
+
+`skippy-runtime` includes a Rust tap planner that converts the manifest's
+hidden-state requirements into concrete Skippy stage ownership. The reference
+index convention is `0 = embedding output`; `k >= 1` means output after decoder
+layer `k - 1`.
+
+For the pretrained `Qwen/Qwen3.5-4B` S4/L4 head, required tap groups are:
+
+```text
+g4: [0, 10, 20, 31]
+g3: [0, 8, 16, 24]
+g2: [0, 8, 16]
+g1: [0, 8]
+```
+
+The checked-in tests show that a normal four-way split `0..8, 8..16, 16..24,
+24..32` still needs internal taps `10,20,31`. A tap-aligned proof split
+`0..8, 8..10, 10..16, 16..20, 20..24, 24..31, 31..32` can expose every required
+tap as an ordinary stage boundary.
 
 ## Artifact Contract
 
@@ -241,9 +270,11 @@ The constrained Qwen fixture forward path lives in
 
 1. Capture Skippy hidden-state taps and compare Rust top-k proposals to the
    Python reference on the same taps.
-2. Wire live proposal generation into `skippy-server`.
-3. Verify every accepted token through the normal target stages.
-4. Benchmark against ordinary split serving with both injected hop latency and a
+2. For the first live proof, prefer the tap-aligned over-split unless the
+   hidden-tap ABI is already available.
+3. Wire live proposal generation into `skippy-server`.
+4. Verify every accepted token through the normal target stages.
+5. Benchmark against ordinary split serving with both injected hop latency and a
    real multi-node topology.
 
 ## Next Research Steps

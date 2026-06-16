@@ -1,5 +1,6 @@
 mod qwen;
 mod safetensors;
+mod tap_plan;
 
 use std::{
     fs,
@@ -15,6 +16,10 @@ pub use qwen::{
     run_qwen3_fixture_parity,
 };
 pub use safetensors::{SpdSafetensorsFile, SpdSafetensorsIndex, SpdSafetensorsTensor};
+pub use tap_plan::{
+    SpdHiddenStateRequirement, SpdHiddenStateSource, SpdHiddenTapPlan, SpdStageLayerRange,
+    plan_hidden_state_taps,
+};
 
 pub const SPD_HEAD_MANIFEST_SCHEMA: &str = "skippy-spd-head/v1";
 pub const TORCH_SPD_HEAD_FORMAT_V10: &str = "torch-speculation-head-v10";
