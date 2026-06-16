@@ -620,6 +620,7 @@ impl StageOpenAiBackend {
             let mut fused_reached_stop = false;
             let mut native_mtp = NativeMtpN1Verifier::default();
             let native_mtp_batched_verify = native_mtp_batched_verify_enabled();
+            let native_mtp_serial_stage0_verify = native_mtp_serial_stage0_verify_enabled();
             if let Some(fused) = fused_first_decode.take() {
                 current = fused.predicted;
                 decoded_tokens = fused.predicted_tokens.len();
@@ -836,14 +837,25 @@ impl StageOpenAiBackend {
                             checkpoint: false,
                         },
                     )?;
-                    let verify = self.execute_embedded_stage_message(
-                        &request,
-                        downstream,
-                        &session_key,
-                        &message,
-                        &verify_inputs,
-                        WireReplyKind::PredictedTokens,
-                    )?;
+                    let verify = if native_mtp_serial_stage0_verify {
+                        self.execute_embedded_verify_span_with_serial_stage0(
+                            &request,
+                            downstream,
+                            &session_key,
+                            &message,
+                            &verify_inputs,
+                            WireReplyKind::PredictedTokens,
+                        )?
+                    } else {
+                        self.execute_embedded_stage_message(
+                            &request,
+                            downstream,
+                            &session_key,
+                            &message,
+                            &verify_inputs,
+                            WireReplyKind::PredictedTokens,
+                        )?
+                    };
                     if verify.reply.predicted_tokens.len() < verify_inputs.len() {
                         return Err(OpenAiError::backend(format!(
                             "native MTP verify span returned too few tokens: got {} expected {}",
@@ -915,6 +927,10 @@ impl StageOpenAiBackend {
                     token_attrs.insert(
                         "llama_stage.native_mtp.batched_verification".to_string(),
                         json!(true),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.native_mtp.serial_stage0_verification".to_string(),
+                        json!(native_mtp_serial_stage0_verify),
                     );
                     token_attrs.insert(
                         "llama_stage.native_mtp.verification".to_string(),

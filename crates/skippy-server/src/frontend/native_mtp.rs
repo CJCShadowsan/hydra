@@ -3,15 +3,29 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 const BATCHED_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_BATCHED_VERIFY";
+const SERIAL_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_STAGE0_VERIFY";
 
 pub(super) fn native_mtp_batched_verify_enabled() -> bool {
     native_mtp_batched_verify_enabled_from(std::env::var(BATCHED_VERIFY_ENV).ok().as_deref())
+}
+
+pub(super) fn native_mtp_serial_stage0_verify_enabled() -> bool {
+    native_mtp_serial_stage0_verify_enabled_from(
+        std::env::var(SERIAL_STAGE0_VERIFY_ENV).ok().as_deref(),
+    )
 }
 
 fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
     !matches!(
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("0" | "false" | "off" | "disable" | "disabled" | "no")
+    )
+}
+
+fn native_mtp_serial_stage0_verify_enabled_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "enable" | "enabled" | "yes")
     )
 }
 
@@ -433,5 +447,17 @@ mod tests {
         assert!(!native_mtp_batched_verify_enabled_from(Some("0")));
         assert!(!native_mtp_batched_verify_enabled_from(Some("false")));
         assert!(!native_mtp_batched_verify_enabled_from(Some(" disabled ")));
+    }
+
+    #[test]
+    fn serial_stage0_verify_flag_defaults_off_and_accepts_true_values() {
+        assert!(!native_mtp_serial_stage0_verify_enabled_from(None));
+        assert!(native_mtp_serial_stage0_verify_enabled_from(Some("1")));
+        assert!(native_mtp_serial_stage0_verify_enabled_from(Some("true")));
+        assert!(native_mtp_serial_stage0_verify_enabled_from(Some(
+            " enabled "
+        )));
+        assert!(!native_mtp_serial_stage0_verify_enabled_from(Some("0")));
+        assert!(!native_mtp_serial_stage0_verify_enabled_from(Some("false")));
     }
 }
