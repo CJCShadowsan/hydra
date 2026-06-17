@@ -171,6 +171,16 @@ Rust.
   sidecar cache port: proposal cache prefill averaged `16.8ms` over `24`
   probes, sidecar head total averaged `45.9ms`, normal downstream wait averaged
   `2681.2ms`, and optimistic hidden wait averaged `2169.6ms`.
+- 2026-06-17 the matching local Metal repeat at
+  `/private/tmp/spd-local-multitoken-repeat-metal.json` preserved the same
+  exactness shape (`3 / 3` content matches, `24 / 24` accepted proposals,
+  `18` optimistic commits, `12` chained commits, `0` tap failures, `0` missing
+  or out-of-order rolling proposals). Metal reduced SPD decode from the CPU
+  run's `13964.2ms` mean to `1652.6ms` mean and cut optimistic hidden wait from
+  `2169.6ms` to `90.5ms`, but it was still slower than the `201.0ms` baseline
+  decode (`0.122x`). The paper estimate from the same accepted trace was
+  `50.2ms`, so the remaining gap is still the native rolling executor and
+  same-machine stage contention, not sidecar acceptance.
 - `skippy-runtime::spd::SpdRollingScheduler` now codifies the paper/reference
   rolling scheduler state transitions in Rust: newest-first in-flight entries,
   evicted-prefix speculation rows on acceptance, oldest-entry verification
@@ -475,6 +485,9 @@ Rust.
   The remaining gap is native serving scheduling: direct-return tap plumbing,
   downstream wait, hidden verifier wait, and the missing continuously full
   rolling executor.
+- The matching Metal repeat narrows those waits substantially but still loses
+  to baseline, which makes distinct-device placement the next required speed
+  experiment.
 
 ## Open Training Data
 

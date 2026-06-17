@@ -99,33 +99,38 @@ Readiness check on 2026-06-17:
 | OpenAI downstream wait | 261.7 ms |
 | OpenAI sidecar cache/head | 123.2 ms cache prefill, 52.1 ms head total |
 
-Latest multi-token overhead sweep on 2026-06-17:
+Latest multi-token overhead sweeps on 2026-06-17:
 
 | Field | Value |
 | --- | --- |
-| Report | `/private/tmp/spd-local-multitoken-repeat-cpu.json` |
+| CPU report | `/private/tmp/spd-local-multitoken-repeat-cpu.json` |
+| Metal report | `/private/tmp/spd-local-multitoken-repeat-metal.json` |
 | Command shape | `spd-openai-smoke --max-tokens 8 --warmup-count 1 --repeat-count 3 --run-baseline true --run-spd true` |
-| Host/device | local M4 node, `CPU0`, local binary stage processes |
-| Content match | 3 / 3 baseline/SPD pairs |
-| SPD accepted/proposed | 24 / 24 |
-| Optimistic commits | 18 total, 12 chained |
+| Host/device | local M4 node, local binary stage processes; CPU used `CPU0`, Metal used `MTL0` |
+| Content match | 3 / 3 baseline/SPD pairs on both CPU and Metal |
+| SPD accepted/proposed | 24 / 24 on both CPU and Metal |
+| Optimistic commits | 18 total, 12 chained on both CPU and Metal |
 | Max optimistic chain depth | 2 |
-| Rolling replay | 21 inserted drafts, 15 accepted windows, 0 missing, 0 out-of-order, verified prefix matched target |
-| Tap failures | 0 return, 0 record, 0 ignored |
-| Mean decode | baseline 219.3 ms, SPD 13964.2 ms |
-| Mean sidecar cache prefill | 16.8 ms across 24 probes; first prefill max 120.3 ms |
-| Mean sidecar head total | 45.9 ms |
-| Mean downstream/hidden wait | normal downstream 2681.2 ms, optimistic hidden wait 2169.6 ms |
-| Paper estimate from observed trace | 4.0x versus serial split, 54.8 ms estimated decode at baseline stage cost |
+| Rolling replay | 21 inserted drafts, 15 accepted windows, 0 missing, 0 out-of-order, verified prefix matched target on both runs |
+| Tap failures | 0 return, 0 record, 0 ignored on both runs |
+| CPU mean decode | baseline 219.3 ms, SPD 13964.2 ms |
+| Metal mean decode | baseline 201.0 ms, SPD 1652.6 ms |
+| CPU mean waits | normal downstream 2681.2 ms, optimistic hidden wait 2169.6 ms |
+| Metal mean waits | normal downstream 262.9 ms, optimistic hidden wait 90.5 ms |
+| Sidecar cache/head | CPU 16.8 ms cache prefill / 45.9 ms head total; Metal 18.7 ms cache prefill / 48.9 ms head total |
+| Paper estimate from observed trace | 4.0x versus serial split; 54.8 ms CPU-estimated decode, 50.2 ms Metal-estimated decode |
 
-This run answers the current overhead question: the trained head, cache reuse,
+These runs answer the current overhead question: the trained head, cache reuse,
 tap rows, and verification mechanics are native enough to preserve output and
 reach 100% acceptance on the bounded prompt. The large local slowdown is not a
 missing sidecar-cache port from the paper/reference implementation. It is the
 gap between the paper/reference rolling pipeline schedule and the current
 Skippy serving shape: local stage processes contend for the same machine, and
 bounded optimistic verifier work still spends seconds in downstream and hidden
-waits instead of keeping a full rolling queue continuously useful.
+waits on CPU, or hundreds of milliseconds on Metal, instead of keeping a full
+rolling queue continuously useful. Metal narrows the gap by about 8.4x versus
+CPU SPD decode, but the run still reaches only `0.122x` SPD-vs-baseline decode
+speed and remains about `32.9x` slower than the paper-shaped estimate.
 
 First remote preflight on 2026-06-17:
 
@@ -170,8 +175,9 @@ run with enough instrumentation to explain the result.
 
 Open items:
 
-- Repeat the multi-token baseline-vs-SPD sweep on Metal and then on distinct
-  devices/nodes; the CPU repeat passed correctness but is not a speed oracle.
+- Run the multi-token baseline-vs-SPD sweep on distinct devices/nodes; both CPU
+  and Metal local repeats passed correctness, but same-machine repeats are not
+  speed oracles.
 - Use a topology-compatible artifact and record both logical SPD stage count and
   physical tap-aligned stage count.
 - Use distinct devices or nodes so target stage work and sidecar work can
@@ -213,11 +219,12 @@ Run these before making any speedup claim:
 1. Local all-tap baseline comparison:
 
    CPU status: completed on 2026-06-17 at
-   `/private/tmp/spd-local-multitoken-repeat-cpu.json`. It preserved exact
-   output for all measured pairs and accepted `24 / 24` proposals, but SPD was
-   still much slower than baseline because local downstream/hidden waits
-   dominated. A Metal run is still useful as a contention diagnostic, not as a
-   final speed claim.
+   `/private/tmp/spd-local-multitoken-repeat-cpu.json`. Metal status:
+   completed on 2026-06-17 at
+   `/private/tmp/spd-local-multitoken-repeat-metal.json`. Both preserved exact
+   output and accepted `24 / 24` proposals, but SPD was still slower than
+   baseline. Metal reduced SPD decode from `13964.2ms` to `1652.6ms`, which
+   confirms CPU contention was real while leaving a native scheduler gap.
 
    ```bash
    target/release/skippy-bench spd-openai-smoke \

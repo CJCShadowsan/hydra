@@ -1157,6 +1157,16 @@ and sidecar head total averaged `45.9ms`, while normal downstream wait averaged
 remaining overhead a native serving/scheduler gap, not evidence that the paper
 or reference sidecar cache mechanics failed to port.
 
+The matching Metal repeat at
+`/private/tmp/spd-local-multitoken-repeat-metal.json` preserved the same
+correctness shape (`3 / 3` content matches, `24 / 24` accepted proposals,
+`18` optimistic commits, `12` chained commits, and ordered rolling replay).
+Metal reduced mean SPD decode from `13964.2ms` to `1652.6ms` and optimistic
+hidden wait from `2169.6ms` to `90.5ms`, but it still lost to the `201.0ms`
+baseline decode (`0.122x`) and remained about `32.9x` slower than the
+paper-shaped estimate. The next speed evidence must come from distinct-device
+or real-node placement, not another same-machine repeat.
+
 The first no-launch remote preflight at
 `/private/tmp/spd-qwen35-first-remote-preflight.json` validated the release
 `skippy-server` binary, GGUF, manifest, `66` serving checkpoint tensors, `28`
