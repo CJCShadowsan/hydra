@@ -1,0 +1,110 @@
+From 446d393e21012d7599d3aa5c12153dc7aec7d6ca Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Wed, 17 Jun 2026 21:01:58 +1000
+Subject: [PATCH] Split VerifySpan MTP sync setup timing
+
+---
+ src/skippy.cpp | 38 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 6deaac81..73e8f747 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1284,6 +1284,12 @@ struct skippy_verify_span_native_timing {
+     int64_t mtp_sync_pending_draft_rejects = 0;
+     int64_t mtp_sync_draft_us = 0;
+     int64_t mtp_sync_setup_us = 0;
++    int64_t mtp_sync_batch_init_us = 0;
++    int64_t mtp_sync_token_malloc_us = 0;
++    int64_t mtp_sync_metadata_us = 0;
++    int64_t mtp_sync_pending_h_row_copy_us = 0;
++    int64_t mtp_sync_hidden_lookup_us = 0;
++    int64_t mtp_sync_hidden_row_copy_us = 0;
+     int64_t mtp_sync_decode_us = 0;
+     int64_t mtp_sync_pending_h_copy_us = 0;
+     int64_t output_copy_us = 0;
+@@ -1377,8 +1383,16 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+     }
+     if (n_decode > 0) {
+         const int64_t setup_start_us = timing != nullptr ? ggml_time_us() : 0;
++        const int64_t batch_init_start_us = timing != nullptr ? ggml_time_us() : 0;
+         llama_batch batch = llama_batch_init(n_decode, n_embd, 1);
++        if (timing != nullptr) {
++            timing->mtp_sync_batch_init_us += ggml_time_us() - batch_init_start_us;
++        }
++        const int64_t token_malloc_start_us = timing != nullptr ? ggml_time_us() : 0;
+         batch.token = static_cast<llama_token *>(std::malloc(sizeof(llama_token)*static_cast<size_t>(n_decode)));
++        if (timing != nullptr) {
++            timing->mtp_sync_token_malloc_us += ggml_time_us() - token_malloc_start_us;
++        }
+         if (batch.token == nullptr) {
+             llama_batch_free(batch);
+             skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to allocate MTP token batch");
+@@ -1388,17 +1402,29 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+ 
+         for (int32_t out_i = 0; out_i < n_decode; ++out_i) {
+             const size_t src_i = first_index + static_cast<size_t>(out_i);
++            const int64_t metadata_start_us = timing != nullptr ? ggml_time_us() : 0;
+             batch.token[out_i] = token_ids[src_i];
+             batch.pos[out_i] = token_start + static_cast<llama_pos>(src_i);
+             batch.n_seq_id[out_i] = 1;
+             batch.seq_id[out_i][0] = session->seq_id;
+             batch.logits[out_i] = 0;
++            if (timing != nullptr) {
++                timing->mtp_sync_metadata_us += ggml_time_us() - metadata_start_us;
++            }
+ 
+             float * dst = batch.embd + static_cast<size_t>(out_i)*n_embd;
+             if (src_i == 0) {
++                const int64_t row_copy_start_us = timing != nullptr ? ggml_time_us() : 0;
+                 std::memcpy(dst, session->mtp_pending_h.data(), row_bytes);
++                if (timing != nullptr) {
++                    timing->mtp_sync_pending_h_row_copy_us += ggml_time_us() - row_copy_start_us;
++                }
+             } else {
++                const int64_t hidden_lookup_start_us = timing != nullptr ? ggml_time_us() : 0;
+                 const float * h_prev = llama_get_embeddings_nextn_ith(session->ctx, static_cast<int32_t>(src_i - 1));
++                if (timing != nullptr) {
++                    timing->mtp_sync_hidden_lookup_us += ggml_time_us() - hidden_lookup_start_us;
++                }
+                 if (h_prev == nullptr) {
+                     std::free(batch.token);
+                     batch.token = nullptr;
+@@ -1406,7 +1432,11 @@ static enum skippy_status skippy_mtp_sync_target_tokens(
+                     skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "target pre-norm hidden row was not available");
+                     return SKIPPY_STATUS_RUNTIME_ERROR;
+                 }
++                const int64_t row_copy_start_us = timing != nullptr ? ggml_time_us() : 0;
+                 std::memcpy(dst, h_prev, row_bytes);
++                if (timing != nullptr) {
++                    timing->mtp_sync_hidden_row_copy_us += ggml_time_us() - row_copy_start_us;
++                }
+             }
+         }
+         if (timing != nullptr) {
+@@ -4055,7 +4085,7 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+ 
+     if (native_timing_ptr != nullptr) {
+         fprintf(stderr,
+-                "skippy_verify_span_native_timing stage=%d seq=%d tokens=%zu target_decode_us=%lld mtp_sync_us=%lld mtp_sync_calls=%lld mtp_sync_decoded_tokens=%lld mtp_sync_pending_draft_accepts=%lld mtp_sync_pending_draft_rejects=%lld mtp_sync_draft_us=%lld mtp_sync_setup_us=%lld mtp_sync_decode_us=%lld mtp_sync_pending_h_copy_us=%lld output_copy_us=%lld sampling_us=%lld proposal_total_us=%lld proposal_decode_us=%lld\n",
++                "skippy_verify_span_native_timing stage=%d seq=%d tokens=%zu target_decode_us=%lld mtp_sync_us=%lld mtp_sync_calls=%lld mtp_sync_decoded_tokens=%lld mtp_sync_pending_draft_accepts=%lld mtp_sync_pending_draft_rejects=%lld mtp_sync_draft_us=%lld mtp_sync_setup_us=%lld mtp_sync_batch_init_us=%lld mtp_sync_token_malloc_us=%lld mtp_sync_metadata_us=%lld mtp_sync_pending_h_row_copy_us=%lld mtp_sync_hidden_lookup_us=%lld mtp_sync_hidden_row_copy_us=%lld mtp_sync_decode_us=%lld mtp_sync_pending_h_copy_us=%lld output_copy_us=%lld sampling_us=%lld proposal_total_us=%lld proposal_decode_us=%lld\n",
+                 session->stage_model->config.stage_index,
+                 session->seq_id,
+                 token_count,
+@@ -4067,6 +4097,12 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+                 (long long) native_timing.mtp_sync_pending_draft_rejects,
+                 (long long) native_timing.mtp_sync_draft_us,
+                 (long long) native_timing.mtp_sync_setup_us,
++                (long long) native_timing.mtp_sync_batch_init_us,
++                (long long) native_timing.mtp_sync_token_malloc_us,
++                (long long) native_timing.mtp_sync_metadata_us,
++                (long long) native_timing.mtp_sync_pending_h_row_copy_us,
++                (long long) native_timing.mtp_sync_hidden_lookup_us,
++                (long long) native_timing.mtp_sync_hidden_row_copy_us,
+                 (long long) native_timing.mtp_sync_decode_us,
+                 (long long) native_timing.mtp_sync_pending_h_copy_us,
+                 (long long) native_timing.output_copy_us,
+-- 
+2.54.0 (Apple Git-156)
+
