@@ -648,7 +648,7 @@ fn chat_runtime_feature_guard_allows_noop_parity_fields() {
 }
 
 #[test]
-fn chat_runtime_feature_guard_rejects_structured_output() {
+fn chat_runtime_feature_guard_allows_structured_output_for_guardrails() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "test",
         "messages": [{"role": "user", "content": "hi"}],
@@ -659,11 +659,7 @@ fn chat_runtime_feature_guard_rejects_structured_output() {
     }))
     .unwrap();
 
-    let error = ensure_chat_runtime_features_supported(&request).unwrap_err();
-    assert_eq!(
-        unsupported_code(error),
-        Some("unsupported_model_feature".to_string())
-    );
+    ensure_chat_runtime_features_supported(&request).unwrap();
 }
 
 #[derive(Default)]
@@ -1988,7 +1984,7 @@ fn explicit_completion_request_values_override_request_defaults() {
 }
 
 #[test]
-fn request_defaults_do_not_make_structured_output_or_logprobs_executable() {
+fn request_defaults_do_not_make_logprobs_executable() {
     let mut request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "test",
         "messages": [{"role": "user", "content": "hi"}],

@@ -29,8 +29,8 @@ use openai_frontend::{
     GuardedOpenAiBackend, GuardrailMode, GuardrailPolicy, GuardrailPolicyHandle, MessageContent,
     MessageContentPart, ModelId, ModelObject, OpenAiBackend, OpenAiError, OpenAiErrorKind,
     OpenAiHookPolicy, OpenAiRequestContext, OpenAiResult, PrefillHookSignals, ReasoningEffort,
-    StreamingGuardrailMode, Usage, apply_chat_hook_outcome, chat_mesh_hooks_enabled,
-    normalize_reasoning_template_options,
+    RetryExhaustionMode, StreamingGuardrailMode, Usage, apply_chat_hook_outcome,
+    chat_mesh_hooks_enabled, normalize_reasoning_template_options,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -174,7 +174,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     }
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
     let ctx_size = usize::try_from(config.ctx_size).unwrap_or(usize::MAX);
-    let backend = Arc::new(StageOpenAiBackend {
+    let backend: Arc<dyn OpenAiBackend> = Arc::new(StageOpenAiBackend {
         runtime,
         config,
         telemetry: telemetry.clone(),
@@ -193,6 +193,8 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         hook_policy: None,
         kv,
     });
+    let backend = OpenAiGuardrailsConfig::compatibility_for_skippy()
+        .wrap_backend_with_context_limit(backend, Some(ctx_size));
     let app: Router = instrumented_openai_router(backend, telemetry.clone());
 
     println!(
@@ -260,6 +262,20 @@ impl OpenAiGuardrailsConfig {
         Self {
             target: OpenAiGuardrailsTarget::Skippy,
             policy: GuardrailPolicyHandle::default(),
+            compaction: None,
+        }
+    }
+
+    pub fn compatibility_for_skippy() -> Self {
+        Self {
+            target: OpenAiGuardrailsTarget::Skippy,
+            policy: GuardrailPolicy {
+                mode: GuardrailMode::MetricsOnly,
+                apply_to_all_models: true,
+                retry_exhaustion_mode: RetryExhaustionMode::PassLastText,
+                ..GuardrailPolicy::default()
+            }
+            .into(),
             compaction: None,
         }
     }
