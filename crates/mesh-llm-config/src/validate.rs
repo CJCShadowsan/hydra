@@ -568,6 +568,10 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Result<(
         &format!("{base_path}.spec_default"),
     )?;
     validate_optional_non_empty(
+        config.spd_bundle_ref.as_deref(),
+        &format!("{base_path}.spd_bundle_ref"),
+    )?;
+    validate_optional_non_empty(
         config.spd_manifest_path.as_deref(),
         &format!("{base_path}.spd_manifest_path"),
     )?;

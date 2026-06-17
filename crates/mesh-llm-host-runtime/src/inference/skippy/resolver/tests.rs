@@ -114,6 +114,52 @@ fn write_spd_manifest(path: &Path, hidden_size: u32) {
     .expect("write SPD manifest");
 }
 
+fn write_spd_manifest_with_serving_checkpoint(
+    path: &Path,
+    hidden_size: u32,
+    serving_checkpoint_path: &str,
+) {
+    let manifest = serde_json::json!({
+        "schema": SPD_HEAD_MANIFEST_SCHEMA,
+        "checkpoint": {
+            "path": "speculation_head_final.pt",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bytes": 1
+        },
+        "serving_checkpoint": {
+            "path": serving_checkpoint_path,
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "bytes": 1,
+            "format": skippy_runtime::spd::SPD_SERVING_CHECKPOINT_FORMAT_SAFETENSORS_V1,
+            "tensor_count": 1,
+            "dtype": "BF16"
+        },
+        "source": {
+            "format": TORCH_SPD_HEAD_FORMAT_V10,
+            "reference_repo": "https://example.invalid/spd.git",
+            "base_model_path": "Qwen/Qwen3-0.6B",
+            "model_type": "qwen3",
+            "checkpoint_version": 10
+        },
+        "topology": {
+            "hidden_size": hidden_size,
+            "vocab_size": 64,
+            "draft_vocab_size": 4,
+            "num_stages": 4,
+            "num_spec_layers": 1,
+            "trained_with_use_deepest": true,
+            "shallow_hidden_layer_indices": [[0, 10, 20, 31], [0, 8, 16, 24], [0], [0]],
+            "spec_init_from_base_layers": [31],
+            "draft_token_ids": [1, 2, 3, 4]
+        }
+    });
+    fs::write(
+        path,
+        serde_json::to_vec(&manifest).expect("serialize SPD manifest"),
+    )
+    .expect("write SPD manifest");
+}
+
 fn write_safetensors_with_data(path: &Path, tensors: &[(&str, &str, &[u64], &[u8])]) {
     let mut header_entries = serde_json::Map::new();
     let mut data = Vec::new();
@@ -951,6 +997,64 @@ spd_top_k = 8
         .to_stage_config(Some(fake_package_identity(32)), LoadMode::RuntimeSlice)
         .expect("stage config should derive SPD tap-return allowlist");
 
+    assert_eq!(config.spd_tap_return_hf_indices, [8, 10, 16, 20, 24, 31]);
+}
+
+#[test]
+fn spd_bundle_ref_resolves_local_sidecar_bundle_paths() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let manifest_path = temp.path().join("skippy-spd-head.json");
+    let fixture_path = temp.path().join("spd-parity-fixture.safetensors");
+    let serving_path = temp.path().join("spd-head.safetensors");
+    write_spd_manifest_with_serving_checkpoint(&manifest_path, 4, "spd-head.safetensors");
+    write_spd_fixture(&fixture_path, 4);
+    fs::write(&serving_path, b"x").expect("write serving checkpoint");
+    let mesh_config = parse_config(&format!(
+        r#"
+[defaults.speculative]
+mode = "spd"
+spd_bundle_ref = "{}"
+spd_max_tokens = 2
+spd_top_k = 8
+"#,
+        temp.path().display(),
+    ));
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .expect("SPD bundle config should resolve");
+
+    assert_eq!(resolved.speculative.mode, "spd");
+    assert_eq!(
+        resolved.speculative.spd_manifest_path.as_deref(),
+        Some(manifest_path.as_path())
+    );
+    assert_eq!(
+        resolved.speculative.spd_fixture_path.as_deref(),
+        Some(fixture_path.as_path())
+    );
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("staged embedded args should build");
+    assert_eq!(
+        openai.spd_manifest_path.as_deref(),
+        Some(manifest_path.as_path())
+    );
+    assert_eq!(
+        openai.spd_fixture_path.as_deref(),
+        Some(fixture_path.as_path())
+    );
+
+    let config = resolved
+        .to_stage_config(Some(fake_package_identity(32)), LoadMode::RuntimeSlice)
+        .expect("stage config should derive SPD tap-return allowlist");
     assert_eq!(config.spd_tap_return_hf_indices, [8, 10, 16, 20, 24, 31]);
 }
 

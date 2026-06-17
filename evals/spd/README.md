@@ -1333,10 +1333,10 @@ tap-return transport and sidecar/head work still dominate local latency.
 
 Current mesh-native config status: the same experimental SPD knobs are
 available through `[defaults.speculative]` and per-model `speculative`
-configuration (`mode = "spd"`, `spd_manifest_path`, `spd_fixture_path`,
-`spd_model_path`, `spd_max_tokens`, `spd_top_k`, `spd_gpu_layers`,
+configuration (`mode = "spd"`, `spd_bundle_ref`, `spd_manifest_path`,
+`spd_fixture_path`, `spd_model_path`, `spd_max_tokens`, `spd_top_k`, `spd_gpu_layers`,
 `spd_replay_fallback`, `spd_optimistic_decode`,
-`spd_optimistic_min_logit_margin`). These settings now resolve and propagate
+`spd_rolling_executor`, `spd_optimistic_min_logit_margin`). These settings now resolve and propagate
 into staged embedded OpenAI args. Native staged config also derives
 the SPD tap-return allowlist from the sidecar topology and carries it through
 stage-control load requests so workers return every logical-row tap except h0;
@@ -1344,6 +1344,17 @@ the host-runtime split-load test asserts the derived
 `[8, 10, 16, 20, 24, 31]` list reaches the worker `StageLoadRequest`. This is
 config plumbing only; it does not choose a compatible tap topology or train a
 sidecar automatically.
+
+`spd_bundle_ref` is the product-shaped sidecar input: the coordinator resolves a
+local sidecar directory/manifest or `hf://namespace/repo[@revision]` containing
+`skippy-spd-head.json`, the manifest-declared serving checkpoint
+(`spd-head.safetensors` in current exports), and
+`spd-parity-fixture.safetensors`. Worker stages still receive only the derived
+tap-return allowlist. The remaining product gap is the SPD replay model source:
+today the sidecar proposal source still needs a full GGUF through
+`spd_model_path` unless `source_model_path` already resolves to a real local
+file; teaching live taps to open from Skippy layer-package parts is the clean
+way to remove that extra coordinator-side full-GGUF requirement.
 
 Bounded local `llama-spec-bench` status for ordinary target/draft speculative
 decoding, separate from SPD:

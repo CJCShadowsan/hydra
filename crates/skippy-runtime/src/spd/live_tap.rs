@@ -53,7 +53,9 @@ impl SpdLiveTapRunner {
             .stage_ranges
             .iter()
             .map(|range| {
-                let include_output = range.layer_end == config.layer_end;
+                // SPD tap replay needs the final boundary hidden state too. Target
+                // logits are verified through a separate full-model session.
+                let include_output = false;
                 let model = open_live_stage_model(
                     &config,
                     range.stage_index,

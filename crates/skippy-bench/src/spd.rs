@@ -505,7 +505,9 @@ impl LiveTapRunner {
         let stages = ranges
             .iter()
             .map(|range| {
-                let include_output = range.layer_end == args.layer_end;
+                // Live-tap parity needs the final boundary hidden state too.
+                // Target logits are verified with the separate full target model.
+                let include_output = false;
                 let model = open_live_stage_model(
                     args,
                     range.stage_index,

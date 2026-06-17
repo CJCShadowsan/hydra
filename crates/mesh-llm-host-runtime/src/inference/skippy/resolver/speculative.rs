@@ -1,11 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use skippy_runtime::spd::SpdHeadManifest;
 use skippy_topology::infer_family_capability;
 
 use super::support::{pick_owned, pick_string, pick_string_owned};
 use super::types::ResolvedSpeculativeConfig;
 use crate::plugin::{BoolOrAuto, SpeculativeConfig};
+
+const SPD_BUNDLE_MANIFEST_FILE: &str = "skippy-spd-head.json";
+const SPD_BUNDLE_FIXTURE_FILE: &str = "spd-parity-fixture.safetensors";
 
 pub(super) fn resolve_speculative_config(
     model_config: Option<&SpeculativeConfig>,
@@ -133,8 +137,11 @@ pub(super) fn resolve_speculative_config(
         bail!("skippy draft-model and SPD speculative sources cannot both be configured");
     }
     if mode == "spd" || (mode == "auto" && has_spd_config) {
+        spd.resolve_bundle_ref()?;
         if spd.manifest_path.is_none() || spd.fixture_path.is_none() {
-            bail!("skippy SPD mode requires spd_manifest_path and spd_fixture_path");
+            bail!(
+                "skippy SPD mode requires spd_bundle_ref or both spd_manifest_path and spd_fixture_path"
+            );
         }
         if spd.max_tokens == 0 {
             bail!("skippy SPD mode requires spd_max_tokens > 0");
@@ -200,6 +207,7 @@ pub(super) fn resolve_speculative_config(
 }
 
 struct SpdSpeculativeFields {
+    bundle_ref: Option<String>,
     manifest_path: Option<PathBuf>,
     fixture_path: Option<PathBuf>,
     model_path: Option<PathBuf>,
@@ -218,6 +226,10 @@ impl SpdSpeculativeFields {
         global_config: Option<&SpeculativeConfig>,
     ) -> Self {
         Self {
+            bundle_ref: pick_owned(
+                model_config.and_then(|config| config.spd_bundle_ref.clone()),
+                global_config.and_then(|config| config.spd_bundle_ref.clone()),
+            ),
             manifest_path: pick_owned(
                 model_config.and_then(|config| config.spd_manifest_path.clone()),
                 global_config.and_then(|config| config.spd_manifest_path.clone()),
@@ -271,7 +283,8 @@ impl SpdSpeculativeFields {
     }
 
     fn is_configured(&self) -> bool {
-        self.manifest_path.is_some()
+        self.bundle_ref.is_some()
+            || self.manifest_path.is_some()
             || self.fixture_path.is_some()
             || self.model_path.is_some()
             || self.max_tokens > 0
@@ -284,10 +297,153 @@ impl SpdSpeculativeFields {
     }
 
     fn clear_artifacts(&mut self) {
+        self.bundle_ref = None;
         self.manifest_path = None;
         self.fixture_path = None;
         self.model_path = None;
     }
+
+    fn resolve_bundle_ref(&mut self) -> Result<()> {
+        let Some(bundle_ref) = self.bundle_ref.as_deref() else {
+            return Ok(());
+        };
+        let bundle = resolve_spd_bundle_ref(bundle_ref)
+            .with_context(|| format!("resolve SPD sidecar bundle {bundle_ref}"))?;
+        if self.manifest_path.is_none() {
+            self.manifest_path = Some(bundle.manifest_path);
+        }
+        if self.fixture_path.is_none() {
+            self.fixture_path = Some(bundle.fixture_path);
+        }
+        Ok(())
+    }
+}
+
+struct ResolvedSpdBundle {
+    manifest_path: PathBuf,
+    fixture_path: PathBuf,
+}
+
+fn resolve_spd_bundle_ref(value: &str) -> Result<ResolvedSpdBundle> {
+    if let Some(rest) = value.strip_prefix("hf://") {
+        return resolve_hf_spd_bundle_ref(rest);
+    }
+    let path = PathBuf::from(value);
+    let manifest_path = if path.is_dir() {
+        path.join(SPD_BUNDLE_MANIFEST_FILE)
+    } else {
+        path
+    };
+    let fixture_path = manifest_path
+        .parent()
+        .context("SPD sidecar bundle manifest has no parent directory")?
+        .join(SPD_BUNDLE_FIXTURE_FILE);
+    resolve_local_spd_bundle_paths(manifest_path, fixture_path)
+}
+
+fn resolve_hf_spd_bundle_ref(value: &str) -> Result<ResolvedSpdBundle> {
+    let (repo, revision) = parse_hf_spd_bundle_ref(value)?;
+    crate::models::run_hf_sync(move || download_hf_spd_bundle_to_local_sync(&repo, &revision))
+}
+
+fn parse_hf_spd_bundle_ref(value: &str) -> Result<(String, String)> {
+    let (repo, revision) = if let Some((repo, revision)) = value.split_once('@') {
+        (repo, Some(revision))
+    } else if let Some(index) = value.rfind(':') {
+        (&value[..index], Some(&value[index + 1..]))
+    } else {
+        (value, None)
+    };
+    if repo.split('/').count() != 2 || repo.contains(':') || repo.contains('@') {
+        bail!("HF SPD sidecar bundle repo id must look like namespace/repo");
+    }
+    let revision = revision.unwrap_or("main");
+    let _ = safe_spd_bundle_file_path(revision)
+        .with_context(|| format!("invalid HF SPD sidecar revision: {revision}"))?;
+    Ok((repo.to_string(), revision.to_string()))
+}
+
+fn download_hf_spd_bundle_to_local_sync(repo: &str, revision: &str) -> Result<ResolvedSpdBundle> {
+    let api = crate::models::build_hf_api(false)?;
+    let (owner, name) = repo.split_once('/').context("invalid HF repo format")?;
+    let model_api = api.model(owner, name);
+    let manifest_path = download_hf_spd_bundle_file(&model_api, revision, SPD_BUNDLE_MANIFEST_FILE)
+        .context("download SPD sidecar manifest")?;
+    let manifest = SpdHeadManifest::from_path(&manifest_path)?;
+    let serving_path = manifest.serving_checkpoint_path(&manifest_path)?;
+    let serving_file = serving_path
+        .strip_prefix(
+            manifest_path
+                .parent()
+                .context("SPD sidecar manifest has no parent directory")?,
+        )
+        .ok()
+        .and_then(|path| path.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            manifest
+                .serving_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.path.clone())
+                .unwrap_or_else(|| "spd-head.safetensors".to_string())
+        });
+    let serving_file = safe_spd_bundle_file_path(&serving_file)?;
+    download_hf_spd_bundle_file(&model_api, revision, &serving_file.to_string_lossy())
+        .context("download SPD serving checkpoint")?;
+    let fixture_path = download_hf_spd_bundle_file(&model_api, revision, SPD_BUNDLE_FIXTURE_FILE)
+        .context("download SPD parity fixture")?;
+    resolve_local_spd_bundle_paths(manifest_path, fixture_path)
+}
+
+fn download_hf_spd_bundle_file(
+    model_api: &hf_hub::HFRepositorySync<hf_hub::RepoTypeModel>,
+    revision: &str,
+    file_name: &str,
+) -> Result<PathBuf> {
+    model_api
+        .download_file()
+        .filename(file_name.to_string())
+        .revision(revision.to_string())
+        .send()
+        .with_context(|| format!("download SPD sidecar bundle file: {file_name}"))
+}
+
+fn resolve_local_spd_bundle_paths(
+    manifest_path: PathBuf,
+    fixture_path: PathBuf,
+) -> Result<ResolvedSpdBundle> {
+    let manifest = SpdHeadManifest::from_path(&manifest_path)?;
+    ensure_existing_file(&manifest_path, "SPD sidecar manifest")?;
+    let serving_path = manifest.serving_checkpoint_path(&manifest_path)?;
+    ensure_existing_file(&serving_path, "SPD serving checkpoint")?;
+    ensure_existing_file(&fixture_path, "SPD parity fixture")?;
+    Ok(ResolvedSpdBundle {
+        manifest_path,
+        fixture_path,
+    })
+}
+
+fn ensure_existing_file(path: &Path, label: &str) -> Result<()> {
+    if !path.is_file() {
+        bail!("{label} does not exist: {}", path.display());
+    }
+    Ok(())
+}
+
+fn safe_spd_bundle_file_path(path: &str) -> Result<PathBuf> {
+    anyhow::ensure!(!path.is_empty(), "SPD sidecar bundle file path is empty");
+    let path = Path::new(path);
+    let mut components = path.components();
+    let Some(first) = components.next() else {
+        bail!("SPD sidecar bundle file path is empty");
+    };
+    anyhow::ensure!(
+        matches!(first, Component::Normal(_))
+            && components.all(|component| matches!(component, Component::Normal(_))),
+        "SPD sidecar bundle file path must be a safe relative path: {}",
+        path.display()
+    );
+    Ok(path.to_path_buf())
 }
 
 fn normalize_pairing_fault(value: &str) -> String {

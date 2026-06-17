@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
+#   "numpy",
 #   "safetensors>=0.5.0",
 #   "torch>=2.8.0",
 # ]

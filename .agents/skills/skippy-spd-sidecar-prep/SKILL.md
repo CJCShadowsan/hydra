@@ -18,6 +18,9 @@ Skippy taps.
   head is tied to the base model/tokenizer, chat template, hidden size, logical
   SPD stage count, selected hidden-state taps, projection layout, draft vocab,
   and spec-layer count.
+- Treat the serving sidecar as a coordinator-owned companion bundle. Worker
+  stages should only need the derived `spd_tap_return_hf_indices` allowlist;
+  they should not need the sidecar weights, fixture, or local trainer outputs.
 - Choose the target Skippy split topology before serious training. Physical
   stage placement can differ only if it exposes the same logical hidden-state
   taps required by the sidecar manifest.
@@ -51,6 +54,26 @@ Skippy taps.
   rows, logits, top-k proposals, and cache fixtures for Rust parity checks.
 - `evals/spd/README.md` is the live progress log and command cookbook for the
   current SPD proof.
+
+## Mesh-Native Sidecar Bundles
+
+Use `[defaults.speculative] spd_bundle_ref = "..."`
+or a per-model `speculative.spd_bundle_ref` when proving SPD through Mesh rather
+than a lower-level smoke harness. The ref may be a local bundle directory, a
+direct local `skippy-spd-head.json`, or `hf://namespace/repo[@revision]`.
+
+The bundle must contain:
+
+- `skippy-spd-head.json`
+- the manifest-declared serving checkpoint, normally `spd-head.safetensors`
+- `spd-parity-fixture.safetensors`
+
+The base model should remain a normal Mesh/Skippy model reference or layer
+package so each node materializes its assigned stage through the existing
+resolver. The current SPD proposal source still needs a full GGUF on the
+coordinator via `spd_model_path` unless stage `source_model_path` is already a
+real local file. Do not use `spd-openai-smoke --rsync-model-artifacts` as
+product proof; that is a harness-only shortcut.
 
 ## Topology Checklist
 

@@ -1,0 +1,25 @@
+From 26d0e57ddf7948ce2dbc530c376ebc6ebd402bb6 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 18 Jun 2026 08:06:44 +1000
+Subject: [PATCH] Reserve embedding output capacity for skippy taps
+
+---
+ src/skippy.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index e25a0b9a..d23b9df1 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -2320,7 +2320,9 @@ static enum skippy_status skippy_finish_model_open(
+         params.n_seq_max = std::max<uint32_t>(
+                 2,
+                 static_cast<uint32_t>(skippy_reserved_sequence_count(stage_model->lane_count)));
+-        params.n_outputs_max = std::max<uint32_t>(params.n_outputs_max, params.n_seq_max);
++        const uint32_t requested_outputs = params.n_outputs_max == 0 ? params.n_batch : params.n_outputs_max;
++        const uint32_t min_outputs = params.embeddings ? params.n_batch : params.n_seq_max;
++        params.n_outputs_max = std::max<uint32_t>(requested_outputs, min_outputs);
+         params.kv_unified = true;
+     }
+--
+2.54.0

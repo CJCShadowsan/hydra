@@ -438,6 +438,8 @@ pub struct SpeculativeConfig {
     #[serde(default)]
     pub spec_default: Option<BoolOrAuto>,
     #[serde(default)]
+    pub spd_bundle_ref: Option<String>,
+    #[serde(default)]
     pub spd_manifest_path: Option<String>,
     #[serde(default)]
     pub spd_fixture_path: Option<String>,
