@@ -151,6 +151,7 @@ def clone_reference(repo_url: str, dest: Path) -> None:
 
 def patch_reference_for_proof(reference_dir: Path) -> None:
     write_qwen3_nonthink_template(reference_dir / "qwen3-nonthink-template")
+    write_glm4_moe_lite_template(reference_dir / "glm4-moe-lite-template")
     replace_once(
         reference_dir / "train.py",
         '        report_to="wandb",\n',
@@ -182,6 +183,41 @@ def write_qwen3_nonthink_template(path: Path) -> None:
     )
 
 
+def write_glm4_moe_lite_template(path: Path) -> None:
+    path.write_text(
+        """[gMASK]<sop>
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}
+                {{- item.text }}
+            {%- elif item is string -%}
+                {{- item }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+{% for m in messages %}
+{%- if m.role == 'system' -%}
+<|system|>{{ visible_text(m.content) }}
+{%- elif m.role == 'user' -%}
+<|user|>{{ visible_text(m.content) }}
+{%- elif m.role == 'assistant' -%}
+{% generation %}<|assistant|>{{ visible_text(m.content) }}{% endgeneration %}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+<|assistant|>{{- '</think>' if (enable_thinking is defined and not enable_thinking) else '<think>' -}}
+{%- endif -%}
+""",
+        encoding="utf-8",
+    )
+
+
 def patch_reference_for_transformers(reference_dir: Path) -> None:
     patch_reference_linear_cache_import(reference_dir / "pipeline_linear_cache.py")
     replace_once(
@@ -193,6 +229,34 @@ def patch_reference_for_transformers(reference_dir: Path) -> None:
 
 def patch_reference_for_glm_training_smoke(reference_dir: Path) -> None:
     patch_pipeline_model_for_glm(reference_dir / "pipeline_model.py")
+    patch_train_for_glm_template(reference_dir / "train.py")
+
+
+def patch_train_for_glm_template(path: Path) -> None:
+    replace_once(
+        path,
+        '''    if model_type is not None and not _model_type_looks_like_qwen(model_type):
+        log.info("Skip Qwen file chat template (model_type=%s).", model_type)
+        return
+    if template_dir is None:
+        template_dir = "."
+''',
+        '''    if template_dir is None:
+        template_dir = "."
+    if model_type is not None and str(model_type).lower() == "glm4_moe_lite":
+        path = os.path.join(template_dir, "glm4-moe-lite-template")
+        if not os.path.isfile(path):
+            log.warning("GLM chat template not found: %s (use tokenizer default).", path)
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            tokenizer.chat_template = f.read()
+        log.info("Loaded GLM chat template from %s (model_type=%s).", path, model_type)
+        return
+    if model_type is not None and not _model_type_looks_like_qwen(model_type):
+        log.info("Skip Qwen file chat template (model_type=%s).", model_type)
+        return
+''',
+    )
 
 
 def patch_pipeline_model_for_glm(path: Path) -> None:
