@@ -1,0 +1,138 @@
+From 4935ecee76b91d11e17278f53a4aefff5837a630 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Wed, 17 Jun 2026 20:39:29 +1000
+Subject: [PATCH] Add VerifySpan native timing diagnostics
+
+---
+ src/skippy.cpp | 55 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index b357620e..7b4774f0 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1271,6 +1271,19 @@ static bool skippy_mtp_decode_margin_enabled() {
+            skippy_mtp_margin_env_enabled("SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN");
+ }
+ 
++static bool skippy_verify_span_native_timing_enabled() {
++    return skippy_mtp_margin_env_enabled("SKIPPY_VERIFY_SPAN_NATIVE_TIMING");
++}
++
++struct skippy_verify_span_native_timing {
++    int64_t target_decode_us = 0;
++    int64_t mtp_sync_us = 0;
++    int64_t output_copy_us = 0;
++    int64_t sampling_us = 0;
++    int64_t proposal_total_us = 0;
++    int64_t proposal_decode_us = 0;
++};
++
+ static void skippy_mtp_clear_session_state(skippy_session * session) {
+     if (session == nullptr) {
+         return;
+@@ -2280,6 +2293,7 @@ static enum skippy_status skippy_verify_activation_frame(
+         const void * input_payload,
+         const llama_token * token_ids,
+         size_t token_count,
++        skippy_verify_span_native_timing * timing,
+         struct skippy_error ** out_error) {
+     if (session == nullptr || session->ctx == nullptr || input_desc == nullptr || input_payload == nullptr || token_count == 0) {
+         skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and activation frame input are required");
+@@ -2333,12 +2347,20 @@ static enum skippy_status skippy_verify_activation_frame(
+     skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
+     skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
+     const llama_pos token_start = session->n_past;
++    const int64_t decode_start_us = timing != nullptr ? ggml_time_us() : 0;
+     enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
++    if (timing != nullptr) {
++        timing->target_decode_us += ggml_time_us() - decode_start_us;
++    }
+     if (!alias_input_payload) {
+         llama_batch_free(batch);
+     }
+     if (status == SKIPPY_STATUS_OK && token_ids != nullptr) {
++        const int64_t sync_start_us = timing != nullptr ? ggml_time_us() : 0;
+         status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, token_start, out_error);
++        if (timing != nullptr) {
++            timing->mtp_sync_us += ggml_time_us() - sync_start_us;
++        }
+     }
+     return status;
+ }
+@@ -3928,9 +3950,13 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+         }
+     }
+ 
++    skippy_verify_span_native_timing native_timing = {};
++    skippy_verify_span_native_timing * native_timing_ptr =
++            skippy_verify_span_native_timing_enabled() ? &native_timing : nullptr;
++
+     if (skippy_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+         status = session->stage_model->config.include_output ?
+-                skippy_verify_activation_frame(session, input_desc, input_payload, token_ids, token_count, out_error) :
++                skippy_verify_activation_frame(session, input_desc, input_payload, token_ids, token_count, native_timing_ptr, out_error) :
+                 skippy_decode_activation_frame(session, input_desc, input_payload, token_ids, nullptr, 0, token_count, false, out_error);
+     } else {
+         status = session->stage_model->config.include_output ?
+@@ -3941,23 +3967,36 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+         return status;
+     }
+ 
++    const int64_t copy_start_us = native_timing_ptr != nullptr ? ggml_time_us() : 0;
+     status = skippy_copy_output_activation_frame(session, token_count, output_payload, input_desc, input_payload, out_error);
++    if (native_timing_ptr != nullptr) {
++        native_timing.output_copy_us += ggml_time_us() - copy_start_us;
++    }
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+     }
+ 
+     if (session->stage_model->config.include_output) {
+         const int32_t n_tokens = static_cast<int32_t>(token_count);
++        const int64_t sampling_start_us = native_timing_ptr != nullptr ? ggml_time_us() : 0;
+         for (int32_t i = 0; i < n_tokens; ++i) {
+             output_tokens[i] = skippy_sample_token_ith(session, sampling, i);
+         }
++        if (native_timing_ptr != nullptr) {
++            native_timing.sampling_us += ggml_time_us() - sampling_start_us;
++        }
+         if (output_token_capacity >= token_count + 2 && token_count > 0) {
+             skippy_native_mtp_draft mtp_draft = {};
++            const int64_t proposal_start_us = native_timing_ptr != nullptr ? ggml_time_us() : 0;
+             status = skippy_mtp_propose_next(
+                     session,
+                     output_tokens[token_count - 1],
+                     &mtp_draft,
+                     out_error);
++            if (native_timing_ptr != nullptr) {
++                native_timing.proposal_total_us += ggml_time_us() - proposal_start_us;
++                native_timing.proposal_decode_us += std::max<int64_t>(mtp_draft.proposal_compute_us, 0);
++            }
+             if (status != SKIPPY_STATUS_OK) {
+                 return status;
+             }
+@@ -3977,6 +4016,20 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+         }
+     }
+ 
++    if (native_timing_ptr != nullptr) {
++        fprintf(stderr,
++                "skippy_verify_span_native_timing stage=%d seq=%d tokens=%zu target_decode_us=%lld mtp_sync_us=%lld output_copy_us=%lld sampling_us=%lld proposal_total_us=%lld proposal_decode_us=%lld\n",
++                session->stage_model->config.stage_index,
++                session->seq_id,
++                token_count,
++                (long long) native_timing.target_decode_us,
++                (long long) native_timing.mtp_sync_us,
++                (long long) native_timing.output_copy_us,
++                (long long) native_timing.sampling_us,
++                (long long) native_timing.proposal_total_us,
++                (long long) native_timing.proposal_decode_us);
++    }
++
+     return skippy_success(out_error);
+ }
+ 
+-- 
+2.54.0 (Apple Git-156)
+
