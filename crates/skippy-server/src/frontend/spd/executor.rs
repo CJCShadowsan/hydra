@@ -221,6 +221,39 @@ impl SpdRollingExecutor {
         self.stats.target_tokens += 1;
     }
 
+    pub(in crate::frontend) fn advance_idle_to_accepted_context(
+        &mut self,
+        context_tokens: &[i32],
+    ) -> Result<bool> {
+        if !self.in_flight.is_empty() {
+            return Ok(false);
+        }
+        let Some((accepted_position, accepted_token)) =
+            context_tokens.len().checked_sub(1).and_then(|position| {
+                context_tokens
+                    .last()
+                    .copied()
+                    .map(|token| (position, token))
+            })
+        else {
+            return Ok(false);
+        };
+        if self.base_position == accepted_position
+            && self.speculative_context.as_slice() == context_tokens
+            && self.scheduler.next_position() == context_tokens.len()
+        {
+            return Ok(false);
+        }
+        self.base_position = accepted_position;
+        self.scheduler =
+            SpdRollingScheduler::new(self.logical_stage_count, accepted_position, accepted_token)?;
+        self.pending_pre_step_scheduler = None;
+        self.speculative_context = context_tokens.to_vec();
+        self.target_tokens
+            .retain(|position, _| *position <= accepted_position);
+        Ok(true)
+    }
+
     pub(in crate::frontend) fn commit_ready_oldest(
         &mut self,
     ) -> Result<Option<SpdRollingExecutorCommit>> {
@@ -477,6 +510,46 @@ mod tests {
                 in_flight_after: 2,
             })
         );
+    }
+
+    #[test]
+    fn idle_executor_catches_up_to_accepted_context_after_reset() {
+        let mut executor = SpdRollingExecutor::new(3, &[10, 20]).unwrap();
+        record_launch(&mut executor, 2, 21);
+        record_launch(&mut executor, 3, 22);
+        executor.record_target_token(2, 99);
+        assert!(matches!(
+            executor.commit_ready_oldest().unwrap(),
+            Some(SpdRollingExecutorCommit::Rejected { .. })
+        ));
+
+        assert!(
+            executor
+                .advance_idle_to_accepted_context(&[10, 20, 99, 100])
+                .unwrap()
+        );
+
+        assert_eq!(executor.in_flight_len(), 0);
+        assert_eq!(executor.speculative_context.as_slice(), &[10, 20, 99, 100]);
+        assert_eq!(executor.base_position, 3);
+        record_launch(&mut executor, 4, 101);
+        assert_eq!(executor.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn active_executor_does_not_catch_up_while_verifier_is_in_flight() {
+        let mut executor = SpdRollingExecutor::new(3, &[10, 20]).unwrap();
+        record_launch(&mut executor, 2, 21);
+
+        assert!(
+            !executor
+                .advance_idle_to_accepted_context(&[10, 20, 99])
+                .unwrap()
+        );
+
+        assert_eq!(executor.in_flight_len(), 1);
+        assert_eq!(executor.speculative_context.as_slice(), &[10, 20, 21]);
+        assert_eq!(executor.base_position, 1);
     }
 
     #[test]

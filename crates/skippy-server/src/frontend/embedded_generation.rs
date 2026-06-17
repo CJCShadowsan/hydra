@@ -105,6 +105,18 @@ fn spd_rolling_executor_commit_position(commit: SpdRollingExecutorCommit) -> usi
     }
 }
 
+fn advance_idle_spd_rolling_executor_to_context(
+    executor: Option<&mut SpdRollingExecutor>,
+    context_tokens: &[i32],
+) -> OpenAiResult<()> {
+    if let Some(executor) = executor {
+        executor
+            .advance_idle_to_accepted_context(context_tokens)
+            .map_err(openai_backend_error)?;
+    }
+    Ok(())
+}
+
 struct SpdRollingStartArgs<'a> {
     request: &'a EmbeddedStageZeroGeneration<'a>,
     downstream: &'a mut TcpStream,
@@ -3006,6 +3018,12 @@ impl StageOpenAiBackend {
                 decoded_tokens += 1;
                 exact_replay_tokens.push(current);
                 context_tokens.push(current);
+                if use_spd_rolling_executor {
+                    advance_idle_spd_rolling_executor_to_context(
+                        spd_rolling_executor.as_mut(),
+                        &context_tokens,
+                    )?;
+                }
                 if !spd_advanced_for_current && let Some(spd) = spd_guard.as_deref_mut() {
                     let reset_timer = PhaseTimer::start();
                     spd.advance_to_accepted_context(&context_tokens)
@@ -3131,6 +3149,12 @@ impl StageOpenAiBackend {
                     speculative_stats.optimistic_decode_committed_tokens += 1;
                     exact_replay_tokens.push(current);
                     context_tokens.push(current);
+                    if use_spd_rolling_executor {
+                        advance_idle_spd_rolling_executor_to_context(
+                            spd_rolling_executor.as_mut(),
+                            &context_tokens,
+                        )?;
+                    }
                     if self.telemetry.is_debug_enabled() {
                         let mut token_attrs = self.openai_attrs(request.ids);
                         token_attrs.insert(
@@ -3207,6 +3231,12 @@ impl StageOpenAiBackend {
                     speculative_stats.chained_optimistic_decode_committed_tokens += 1;
                     exact_replay_tokens.push(current);
                     context_tokens.push(current);
+                    if use_spd_rolling_executor {
+                        advance_idle_spd_rolling_executor_to_context(
+                            spd_rolling_executor.as_mut(),
+                            &context_tokens,
+                        )?;
+                    }
                     if self.telemetry.is_debug_enabled() {
                         let mut token_attrs = self.openai_attrs(request.ids);
                         token_attrs.insert(

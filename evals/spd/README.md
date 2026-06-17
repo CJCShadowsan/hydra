@@ -508,6 +508,21 @@ Rust.
   copy is not a portable fix. The next executor change should retain or seed
   shadow snapshots at the paper scheduler positions around rejection/recovery,
   then verify/evict only the oldest completed entry.
+- 2026-06-17 idle rolling-executor catch-up now realigns an empty executor to
+  the accepted canonical context after rejection/drain or other idle gaps,
+  instead of continuing to request stale shadow KV views. The release
+  `spd-openai-smoke` at `/private/tmp/spd-local-idle-catchup-smoke24.json`
+  preserved exact baseline/SPD content and passed
+  `spd-openai-check --require-rolling-executor true --min-accepted 21
+  --max-rejected-oldest 1 --max-drained-younger 3
+  --max-rolling-trace-missing-proposals 3`. Compared with the previous KV
+  report, shadow-missing launch attempts fell from `40` to `5`, rolling
+  launches rose from `15` to `22`, accepted SPD proposals rose from `19 / 23`
+  to `21 / 22`, and replay missing proposals fell from `9` to `3`. This is
+  still below the paper gate: there is one oldest rejection, three drained
+  younger replies, three replay-missing proposals, and local SPD decode is
+  still slower than the baseline because the request path waits on chained
+  verifier replies instead of running the full zero-bubble rolling executor.
 
 ## What Does Not Work Yet
 
@@ -1336,8 +1351,11 @@ The tap-row-to-`cur_in` projection bridge lives in
 ## Next Engineering Steps
 
 1. Move the opt-in native request-path rolling executor from local smoke to a
-   real split run: distinct hardware for downstream stages, stage 0 plus
-   sidecar on the coordinator, and paired baseline/SPD content and timing.
+   real split run as a transport and placement proof: distinct hardware for
+   downstream stages, stage 0 plus sidecar on the coordinator, and paired
+   baseline/SPD content and timing. Do not call it a speed proof until rolling
+   replay is back to `0` missing / `0` out-of-order proposals and oldest
+   rejection drains are understood.
 2. Run a larger local `spd-openai-smoke --prompt-file ...` sweep to measure
    acceptance distribution, rollback frequency, rolling gaps, and
    `summary.paper_pipeline_estimate` across prompt types.

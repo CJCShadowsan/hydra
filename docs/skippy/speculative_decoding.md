@@ -176,12 +176,13 @@ Latest KV/rolling diagnostic on 2026-06-17:
 
 | Check | Result |
 | --- | --- |
-| Report | `/private/tmp/spd-local-rolling-kv-counters-smoke24.json` |
+| Report | `/private/tmp/spd-local-idle-catchup-smoke24.json` |
 | Content match | 1 / 1 baseline/SPD pair matched |
-| SPD proposals | 19 accepted / 23 proposed |
-| Rolling executor | 15 launches, max in flight 4, 12 oldest accepts, 1 oldest rejection, 3 younger replies drained |
-| Launch-miss breakdown | 49 no proposal, 40 missing shadow view, 14 in-flight full, 2 shadow not seedable, 0 no rows |
-| Shadow KV finding | exact canonical-prefix reseed succeeded twice; older-prefix canonical copy failed with the native recurrent/hybrid guard, so missing shadow views need retained snapshots rather than older-prefix copy |
+| SPD proposals | 21 accepted / 22 proposed |
+| Rolling executor | 22 launches, max in flight 4, 17 oldest accepts, 1 oldest rejection, 3 younger replies drained |
+| Launch-miss breakdown | 72 no proposal, 5 missing shadow view, 17 in-flight full, 2 shadow not seedable, 0 no rows |
+| Rolling replay | 20 inserted drafts, 3 missing proposals, 0 out-of-order proposals, verified 24-token prefix matched target |
+| Shadow KV finding | idle executor catch-up to the accepted canonical context reduced stale shadow-view launches from 40 to 5; older-prefix canonical copy remains invalid on this recurrent/hybrid Qwen path |
 | Speed signal | still negative locally; this is correctness/scheduler evidence, not a speedup claim |
 
 Paper fidelity:
