@@ -26,7 +26,116 @@ pub enum CommandKind {
     TokenLengths(TokenLengthsArgs),
     #[command(name = "focused-runtime")]
     FocusedRuntime(FocusedRuntimeArgs),
+    Eval(EvalArgs),
     Run(RunArgs),
+}
+
+#[derive(Parser)]
+pub struct EvalArgs {
+    #[command(subcommand)]
+    pub command: EvalCommandKind,
+}
+
+#[derive(Subcommand)]
+pub enum EvalCommandKind {
+    List(EvalListArgs),
+    Info(EvalInfoArgs),
+    Sync(EvalSyncArgs),
+    Install(EvalSyncArgs),
+    Doctor(EvalDoctorArgs),
+    Run(EvalRunArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum EvalId {
+    SpeedBench,
+    TerminalBench,
+    SweBenchPro,
+    McpAtlas,
+}
+
+impl EvalId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SpeedBench => "speed-bench",
+            Self::TerminalBench => "terminal-bench",
+            Self::SweBenchPro => "swe-bench-pro",
+            Self::McpAtlas => "mcp-atlas",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum EvalPack {
+    Core,
+}
+
+#[derive(Parser)]
+pub struct EvalListArgs {
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalInfoArgs {
+    pub eval: EvalId,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalSyncArgs {
+    #[arg(value_enum)]
+    pub evals: Vec<EvalId>,
+    #[arg(long, value_enum, default_value_t = EvalPack::Core)]
+    pub pack: EvalPack,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalDoctorArgs {
+    #[arg(value_enum)]
+    pub evals: Vec<EvalId>,
+    #[arg(long, value_enum, default_value_t = EvalPack::Core)]
+    pub pack: EvalPack,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalRunArgs {
+    pub eval: EvalId,
+    #[arg(long, default_value = "http://127.0.0.1:9337/v1")]
+    pub base_url: String,
+    #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
+    pub model: String,
+    #[arg(long, default_value = "skippy-bench")]
+    pub api_key: String,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 300)]
+    pub timeout_secs: u64,
+    #[arg(long)]
+    pub run_id: Option<String>,
+    #[arg(long, default_value = "http://127.0.0.1:18080")]
+    pub metrics_http: String,
+    #[arg(long)]
+    pub metrics_run_id: Option<String>,
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -112,6 +221,14 @@ pub struct ChatCorpusArgs {
     pub request_timeout_secs: u64,
     #[arg(long)]
     pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub metrics_report_output: Option<PathBuf>,
+    #[arg(long)]
+    pub run_id: Option<String>,
+    #[arg(long, default_value = "http://127.0.0.1:18080")]
+    pub metrics_http: String,
+    #[arg(long)]
+    pub metrics_run_id: Option<String>,
     #[arg(long, default_value = "chat-corpus-session")]
     pub session_prefix: String,
     #[arg(long)]
