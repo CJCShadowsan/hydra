@@ -57,6 +57,7 @@ pub(in crate::frontend) struct NativeMtpBatchedTimingSample {
     pub(in crate::frontend) trim_downstream_wait_ms: f64,
     pub(in crate::frontend) consumed_positions: usize,
     pub(in crate::frontend) committed_positions: usize,
+    pub(in crate::frontend) verify_next_proposal_compute_us: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -70,6 +71,8 @@ pub(in crate::frontend) struct NativeMtpBatchedTimingStats {
     trim_local_ms: f64,
     trim_downstream_write_ms: f64,
     trim_downstream_wait_ms: f64,
+    verify_next_proposal_count: u64,
+    verify_next_proposal_compute_us: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -125,6 +128,12 @@ impl NativeMtpBatchedTimingStats {
             self.trim_downstream_write_ms += sample.trim_downstream_write_ms;
             self.trim_downstream_wait_ms += sample.trim_downstream_wait_ms;
         }
+        if let Some(proposal_compute_us) = sample.verify_next_proposal_compute_us {
+            self.verify_next_proposal_count = self.verify_next_proposal_count.saturating_add(1);
+            self.verify_next_proposal_compute_us = self
+                .verify_next_proposal_compute_us
+                .saturating_add(proposal_compute_us.max(0));
+        }
     }
 
     pub(in crate::frontend) fn insert_attrs(self, attrs: &mut BTreeMap<String, Value>) {
@@ -160,6 +169,23 @@ impl NativeMtpBatchedTimingStats {
             "llama_stage.native_mtp.batched.trim_downstream_wait_ms".to_string(),
             json!(self.trim_downstream_wait_ms),
         );
+        attrs.insert(
+            "llama_stage.native_mtp.batched.verify_next_proposal_count".to_string(),
+            json!(self.verify_next_proposal_count),
+        );
+        attrs.insert(
+            "llama_stage.native_mtp.batched.verify_next_proposal_compute_us".to_string(),
+            json!(self.verify_next_proposal_compute_us),
+        );
+        if self.verify_next_proposal_count > 0 {
+            attrs.insert(
+                "llama_stage.native_mtp.batched.verify_next_proposal_compute_us_avg".to_string(),
+                json!(
+                    self.verify_next_proposal_compute_us as f64
+                        / self.verify_next_proposal_count as f64
+                ),
+            );
+        }
     }
 }
 
@@ -393,6 +419,7 @@ mod tests {
             downstream_wait_ms: 3.0,
             consumed_positions: 2,
             committed_positions: 2,
+            verify_next_proposal_compute_us: Some(11),
             ..NativeMtpBatchedTimingSample::default()
         });
         stats.record(NativeMtpBatchedTimingSample {
@@ -405,6 +432,7 @@ mod tests {
             trim_downstream_wait_ms: 2.0,
             consumed_positions: 2,
             committed_positions: 1,
+            verify_next_proposal_compute_us: Some(13),
             ..NativeMtpBatchedTimingSample::default()
         });
 
@@ -438,6 +466,18 @@ mod tests {
         assert_eq!(
             attrs.get("llama_stage.native_mtp.batched.committed_positions"),
             Some(&json!(3))
+        );
+        assert_eq!(
+            attrs.get("llama_stage.native_mtp.batched.verify_next_proposal_count"),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            attrs.get("llama_stage.native_mtp.batched.verify_next_proposal_compute_us"),
+            Some(&json!(24))
+        );
+        assert_eq!(
+            attrs.get("llama_stage.native_mtp.batched.verify_next_proposal_compute_us_avg"),
+            Some(&json!(12.0))
         );
     }
 

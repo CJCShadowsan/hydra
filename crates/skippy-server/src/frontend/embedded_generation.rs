@@ -1202,6 +1202,8 @@ impl StageOpenAiBackend {
                         trim_downstream_wait_ms,
                         consumed_positions,
                         committed_positions,
+                        verify_next_proposal_compute_us: verify_next_mtp_draft
+                            .map(|draft| draft.proposal_compute_us),
                     });
                     decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
                     decode_runtime_lock_wait_ms += verify.stats.runtime_lock_wait_ms;
