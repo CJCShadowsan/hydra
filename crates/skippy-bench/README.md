@@ -115,8 +115,13 @@ files accept non-empty plain-text lines, JSON string lines, JSON objects with
 into one user message. `--prompt-limit` bounds quick sweeps. By default
 `spd-openai-smoke` sends `chat_template_kwargs.enable_thinking=false`, matching
 the Qwen parity fixture exporter and reference SPD eval setup. Pass
-`--enable-thinking true` to measure thinking-mode prompts explicitly. The report
-can also exercise the slow correctness-only replay source with
+`--enable-thinking true` to measure thinking-mode prompts explicitly. Pass
+`--warmup-count N --repeat-count M` for isolated warmup and measured case
+iterations. Warmup cases remain in `cases[]` with `warmup=true`, but the
+aggregate `summary` and paired baseline/SPD comparisons use measured repeats
+only. Each iteration launches isolated stage processes so request logs stay
+unambiguous while SPD telemetry is still evolving. The report can also exercise
+the slow correctness-only replay source with
 `--spd-replay-fallback`; combine that with `--optimistic-decode false` when the
 goal is to force primary SPD `VerifySpan` windows instead of inline optimistic
 probes. The report
@@ -139,9 +144,12 @@ baseline/SPD content differs. Pass `--allow-content-mismatch` only for
 exploratory sweeps where mismatched output is expected.
 Inline probe reports include `cache_used` and `cache_prefix_len` when the
 server ran the stateful SPD sidecar cache path for that proposal. They also
-include `tap_source`, `tap_collect_ms`, `cur_in_ms`, and `forward_ms` so
-optimistic probe diagnostics can show whether a proposal came from inline
-direct-return taps or slow replay fallback.
+include `tap_source`, `tap_collect_ms`, `cur_in_ms`, `forward_ms`,
+`cache_prefill_ms`, `head_fixed_stage_projection_ms`, `head_decoder_ms`,
+`head_decoder_layer_ms`, `head_final_norm_ms`, `head_lm_head_topk_ms`, and
+`head_total_ms` so optimistic probe diagnostics can show whether a proposal came
+from inline direct-return taps or slow replay fallback, and whether the current
+cost is in cache prefill, sidecar decoder layers, or LM-head/top-k.
 `cases[].optimistic_decodes[]` carries `chain=true` for bounded chained
 optimistic `VerifySpan` work, and `cases[].token_events[]` preserves the same
 chain flag on emitted `DecodeEmbdOptimistic` token events when stage 0 reports
@@ -184,8 +192,11 @@ start position, verified-up-to frontier, token ids, and token count.
 totals from stage 0 across primary proposal windows and inline probe attempts:
 requested/attempted/proposed counts, inline-tap hits, replay fallbacks, cache
 hits/misses, and milliseconds spent collecting taps, assembling `cur_in`, and
-running the sidecar head. Use these fields to identify whether a smoke is
-exercising direct-return hidden taps or falling back to slow local replay.
+running the sidecar head. The same aggregate family includes sidecar cache
+prefill, fixed-projection, decoder, final-norm, LM-head/top-k, and total head
+timing. Use these fields to identify whether a smoke is exercising
+direct-return hidden taps or falling back to slow local replay, and to separate
+paper-mechanism correctness from current native serving overhead.
 For distinct-device smoke runs, pass `--stage-hosts local,<worker>` to cycle
 physical stage placement while keeping stage 0, the OpenAI frontend, and the
 SPD sidecar on the coordinator. Use `--endpoint-host-map` to put
