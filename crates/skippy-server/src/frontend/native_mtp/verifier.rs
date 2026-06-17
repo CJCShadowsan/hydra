@@ -25,10 +25,6 @@ impl NativeMtpN1Verifier {
         })
     }
 
-    pub(in crate::frontend) fn pending_draft_origin(&self) -> Option<NativeMtpDraftOrigin> {
-        self.pending.map(|pending| pending.origin)
-    }
-
     pub(in crate::frontend) fn clear_pending_draft(&mut self) {
         self.pending = None;
     }
@@ -260,14 +256,9 @@ mod tests {
         let mut verifier = NativeMtpN1Verifier::default();
         observe(&mut verifier, 11, 5, Some(draft(12)));
 
-        assert_eq!(
-            verifier.pending_draft_origin(),
-            Some(NativeMtpDraftOrigin::InitialSerial)
-        );
-
         let pending = verifier.take_pending_draft().unwrap();
         assert_eq!(pending.origin, NativeMtpDraftOrigin::InitialSerial);
-        assert_eq!(verifier.pending_draft_origin(), None);
+        assert!(verifier.take_pending_draft().is_none());
         let decision = verifier.observe_taken_draft_verification(pending.token, 12, 9);
 
         assert_eq!(

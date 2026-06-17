@@ -1,9 +1,6 @@
 use super::NativeMtpAdaptiveDisableConfig;
 
 const BATCHED_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_BATCHED_VERIFY";
-const SERIAL_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_STAGE0_VERIFY";
-const SERIAL_AFTER_GAP_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_STAGE0_VERIFY";
-const COMPARE_STAGE0_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_COMPARE_STAGE0_VERIFY";
 const ADAPTIVE_DISABLE_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE";
 const ADAPTIVE_DISABLE_MIN_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_MIN_VERIFY";
 const ADAPTIVE_DISABLE_THRESHOLD_ENV: &str = "SKIPPY_NATIVE_MTP_ADAPTIVE_DISABLE_THRESHOLD";
@@ -15,9 +12,6 @@ const VERIFY_NEXT_REJECT_RECOVERY_SERIAL_ACCEPTS_ENV: &str =
     "SKIPPY_NATIVE_MTP_VERIFY_NEXT_REJECT_RECOVERY_SERIAL_ACCEPTS";
 const SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV: &str =
     "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN";
-const SERIAL_AFTER_GAP_REJECT_SKIP_PROBES_ENV: &str =
-    "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_REJECT_SKIP_PROBES";
-const SERIAL_AFTER_GAP_DIRECT_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DIRECT_VERIFY";
 const VERIFY_NEXT_DRAFT_MIN_MARGIN_ENV: &str = "SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN";
 const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
@@ -27,22 +21,6 @@ const DEFAULT_ADAPTIVE_DISABLE_THRESHOLD: f64 = 0.70;
 
 pub(in crate::frontend) fn native_mtp_batched_verify_enabled() -> bool {
     native_mtp_batched_verify_enabled_from(std::env::var(BATCHED_VERIFY_ENV).ok().as_deref())
-}
-
-pub(in crate::frontend) fn native_mtp_serial_stage0_verify_enabled() -> bool {
-    truthy_env(std::env::var(SERIAL_STAGE0_VERIFY_ENV).ok().as_deref())
-}
-
-pub(in crate::frontend) fn native_mtp_serial_after_gap_stage0_verify_enabled() -> bool {
-    truthy_env(
-        std::env::var(SERIAL_AFTER_GAP_STAGE0_VERIFY_ENV)
-            .ok()
-            .as_deref(),
-    )
-}
-
-pub(in crate::frontend) fn native_mtp_compare_stage0_verify_enabled() -> bool {
-    truthy_env(std::env::var(COMPARE_STAGE0_VERIFY_ENV).ok().as_deref())
 }
 
 pub(in crate::frontend) fn native_mtp_adaptive_disable_config() -> NativeMtpAdaptiveDisableConfig {
@@ -77,18 +55,6 @@ pub(in crate::frontend) fn native_mtp_verify_next_reject_recovery_serial_accepts
 
 pub(in crate::frontend) fn native_mtp_serial_after_gap_draft_min_margin() -> Option<f32> {
     parse_optional_f32_env(SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN_ENV)
-}
-
-pub(in crate::frontend) fn native_mtp_serial_after_gap_reject_skip_probes() -> usize {
-    parse_usize_env(SERIAL_AFTER_GAP_REJECT_SKIP_PROBES_ENV, 0)
-}
-
-pub(in crate::frontend) fn native_mtp_serial_after_gap_direct_verify_enabled() -> bool {
-    truthy_env(
-        std::env::var(SERIAL_AFTER_GAP_DIRECT_VERIFY_ENV)
-            .ok()
-            .as_deref(),
-    )
 }
 
 pub(in crate::frontend) fn native_mtp_verify_next_draft_min_margin() -> Option<f32> {
@@ -207,10 +173,6 @@ mod tests {
         );
         assert_eq!(
             parse_usize_env("SKIPPY_TEST_MISSING_VERIFY_NEXT_REJECT_RECOVERY", 0),
-            0
-        );
-        assert_eq!(
-            parse_usize_env("SKIPPY_TEST_MISSING_GAP_REJECT_SKIP_PROBES", 0),
             0
         );
         assert_eq!(
