@@ -931,10 +931,10 @@ impl StageOpenAiBackend {
                     && native_mtp_serial_after_gap_draft_min_margin.is_some()
                 {
                     serial_after_gap_draft_margin = pending_draft.margin();
-                    serial_after_gap_draft_margin_accepted =
-                        native_mtp_serial_after_gap_draft_min_margin.is_none_or(|min_margin| {
-                            serial_after_gap_draft_margin.is_some_and(|margin| margin >= min_margin)
-                        });
+                    serial_after_gap_draft_margin_accepted = margin_passes_min_threshold(
+                        serial_after_gap_draft_margin,
+                        native_mtp_serial_after_gap_draft_min_margin,
+                    );
                     if let Some(margin) = serial_after_gap_draft_margin {
                         native_mtp_serial_after_gap_draft_margin_value_count += 1;
                         native_mtp_serial_after_gap_draft_margin_sum += f64::from(margin);
@@ -1107,10 +1107,10 @@ impl StageOpenAiBackend {
                     let verify_next_mtp_draft_margin = verify_next_mtp_draft
                         .as_ref()
                         .and_then(NativeMtpDraft::margin);
-                    let verify_next_mtp_draft_margin_accepted =
-                        native_mtp_verify_next_draft_min_margin.is_none_or(|min_margin| {
-                            verify_next_mtp_draft_margin.is_some_and(|margin| margin >= min_margin)
-                        });
+                    let verify_next_mtp_draft_margin_accepted = margin_passes_min_threshold(
+                        verify_next_mtp_draft_margin,
+                        native_mtp_verify_next_draft_min_margin,
+                    );
                     let verify_next_mtp_draft_adopted = accepted
                         && committed_positions == consumed_positions
                         && !reached_stop

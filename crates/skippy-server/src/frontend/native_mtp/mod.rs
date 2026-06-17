@@ -5,7 +5,9 @@ mod stats;
 mod verifier;
 
 pub(super) use adaptive::{NativeMtpAdaptiveDisable, NativeMtpAdaptiveDisableConfig};
-pub(super) use draft::{NativeMtpDraft, NativeMtpDraftOrigin, PendingNativeMtpDraft};
+pub(super) use draft::{
+    NativeMtpDraft, NativeMtpDraftOrigin, PendingNativeMtpDraft, margin_passes_min_threshold,
+};
 pub(super) use env::{
     native_mtp_adaptive_disable_config, native_mtp_batched_verify_enabled,
     native_mtp_compare_stage0_verify_enabled, native_mtp_defer_reject_trim_enabled,

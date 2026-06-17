@@ -73,6 +73,13 @@ fn margin_from_milli(margin_milli: Option<i32>) -> Option<f32> {
     margin_milli.map(|margin| margin as f32 / MTP_DRAFT_MARGIN_SCALE)
 }
 
+pub(in crate::frontend) fn margin_passes_min_threshold(
+    margin: Option<f32>,
+    min_margin: Option<f32>,
+) -> bool {
+    min_margin.is_none_or(|min_margin| margin.is_none_or(|margin| margin >= min_margin))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +151,19 @@ mod tests {
 
         assert_eq!(pending.margin(), Some(1.25));
         assert_eq!(pending.origin.label(), "verify_next");
+    }
+
+    #[test]
+    fn missing_margin_passes_threshold_filter() {
+        assert!(margin_passes_min_threshold(None, None));
+        assert!(margin_passes_min_threshold(Some(0.25), None));
+        assert!(margin_passes_min_threshold(None, Some(1.0)));
+    }
+
+    #[test]
+    fn present_margin_is_filtered_by_threshold() {
+        assert!(!margin_passes_min_threshold(Some(0.5), Some(1.0)));
+        assert!(margin_passes_min_threshold(Some(1.0), Some(1.0)));
+        assert!(margin_passes_min_threshold(Some(1.5), Some(1.0)));
     }
 }

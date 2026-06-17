@@ -47,12 +47,12 @@ diff --git a/src/skippy.cpp b/src/skippy.cpp
 index f8c07856..8ecb890c 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -1239,6 +1239,17 @@ static bool skippy_mtp_available(const skippy_session * session) {
+@@ -1239,6 +1239,22 @@ static bool skippy_mtp_available(const skippy_session * session) {
             session->stage_model->config.include_output;
  }
  
-+static bool skippy_mtp_decode_margin_enabled() {
-+    const char * value = std::getenv("SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN");
++static bool skippy_mtp_margin_env_enabled(const char * name) {
++    const char * value = std::getenv(name);
 +    if (value == nullptr || value[0] == '\0') {
 +        return false;
 +    }
@@ -60,6 +60,11 @@ index f8c07856..8ecb890c 100644
 +           std::strcmp(value, "false") != 0 &&
 +           std::strcmp(value, "off") != 0 &&
 +           std::strcmp(value, "no") != 0;
++}
++
++static bool skippy_mtp_decode_margin_enabled() {
++    return skippy_mtp_margin_env_enabled("SKIPPY_NATIVE_MTP_SERIAL_AFTER_GAP_DRAFT_MIN_MARGIN") ||
++           skippy_mtp_margin_env_enabled("SKIPPY_NATIVE_MTP_VERIFY_NEXT_DRAFT_MIN_MARGIN");
 +}
 +
  static void skippy_mtp_clear_session_state(skippy_session * session) {
