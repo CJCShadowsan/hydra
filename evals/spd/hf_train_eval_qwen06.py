@@ -34,6 +34,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from topology_plan import write_topology_plan
+
 
 REFERENCE_REPO = "https://github.com/yuyijiong/speculative_pipeline_decoding.git"
 DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
@@ -51,6 +53,60 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-rows", type=int, default=1024)
     parser.add_argument("--eval-rows-per-set", type=int, default=8)
     parser.add_argument("--num-stages", type=int, default=2)
+    parser.add_argument(
+        "--topology-policy",
+        choices=("fixed", "generic-plan"),
+        default="fixed",
+        help=(
+            "Topology handling. 'fixed' preserves the reference trainer contract. "
+            "'generic-plan' writes randomized contiguous-layer tap plans and exits; "
+            "it is the scaffold for topology-independent sidecar training."
+        ),
+    )
+    parser.add_argument(
+        "--topology-plan-out",
+        default="",
+        help=(
+            "Output JSON path for --topology-policy generic-plan. Defaults under "
+            "the current artifact directory."
+        ),
+    )
+    parser.add_argument(
+        "--topology-plan-samples",
+        type=int,
+        default=32,
+        help="Number of randomized contiguous split layouts to write in generic-plan mode.",
+    )
+    parser.add_argument(
+        "--topology-min-stages",
+        type=int,
+        default=2,
+        help="Minimum stage count to sample in generic-plan mode.",
+    )
+    parser.add_argument(
+        "--topology-max-stages",
+        type=int,
+        default=6,
+        help="Maximum stage count to sample in generic-plan mode.",
+    )
+    parser.add_argument(
+        "--topology-seed",
+        type=int,
+        default=47,
+        help="Random seed for generic-plan topology sampling.",
+    )
+    parser.add_argument(
+        "--topology-tap-dropout",
+        type=float,
+        default=0.25,
+        help="Recorded tap-dropout probability for future generic topology training.",
+    )
+    parser.add_argument(
+        "--topology-num-hidden-layers",
+        type=int,
+        default=0,
+        help="Override target layer count for generic-plan mode when config loading is unavailable.",
+    )
     parser.add_argument(
         "--stage-layer-boundaries",
         default="",
@@ -901,6 +957,15 @@ def main() -> None:
 
     work_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    if args.topology_policy == "generic-plan":
+        write_topology_plan(args, artifact_dir)
+        print(
+            "generic-plan mode stops before training because the donor SPD head "
+            "still owns fixed per-stage projection tensors.",
+            flush=True,
+        )
+        return
+
     clone_reference(args.reference_repo, reference_dir)
     patch_reference_for_proof(reference_dir)
     patch_reference_for_device(reference_dir, args.device)

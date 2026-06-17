@@ -22,6 +22,9 @@ are not the model-selection target for this branch.
 - The reference training wrapper accepts explicit GLM tap rows derived from
   `--stage-layer-boundaries 15,31,47` and can build a GLM-tokenizer draft vocab
   for smoke runs.
+- The training wrapper can now emit a generic contiguous-layer topology plan
+  that records randomized logical hidden-state tap layouts without training a
+  fixed-stage head.
 - A real SPD head can be trained locally for `Qwen/Qwen3-0.6B` with the paper's
   reference implementation.
 - A real pretrained SPD head for `Qwen/Qwen3.5-4B` reaches high acceptance on
@@ -35,8 +38,13 @@ are not the model-selection target for this branch.
 
 ## What Does Not Work Yet
 
-- We have not trained the new GLM 4.7 production sidecar for this branch yet.
-- We have not established GLM sidecar acceptance/EAL across `N=1,2,4,8`.
+- We have not trained a topology-independent GLM 4.7 production sidecar for
+  this branch yet.
+- The donor SPD architecture still owns fixed `stage_projs.{stage}` projection
+  tensors. A generic sidecar needs layer-indexed evidence and masks instead of
+  stage-specific projection rows.
+- We have not established generic GLM sidecar acceptance/EAL across
+  `N=1,2,4,8`.
 - Skippy/Rust does not yet run the SPD head forward pass.
 - Skippy does not yet expose the live hidden-state taps required by the head.
 - No live Skippy generation request has used trained SPD proposals yet.
@@ -142,6 +150,39 @@ repo `meshllm/skippy-spd-glm47-train-smoke`. It contains the Skippy manifest,
 the Rust-readable `spd-head.safetensors` export, the original reference
 `speculation_head_final.pt`, and a smoke-focused model card. This artifact is
 for training/export/manifest validation only, not production-quality decoding.
+
+## Generic Topology Plan
+
+The generic GLM 4.7 sidecar target is not "train one head for
+`15,31,47`." Skippy nodes may carry any contiguous layer ranges, so the head
+must learn from logical hidden-state evidence:
+
+- hidden-state index `0` means token embeddings before layer 0
+- hidden-state index `k` means the output after target layer `k - 1`
+- physical hosts only decide which logical taps are cheap to expose
+
+Use `--topology-policy generic-plan` to write randomized contiguous-layer
+layouts and tap rows before implementing or launching generic training:
+
+```bash
+python evals/spd/hf_train_eval_qwen06.py \
+  --topology-policy generic-plan \
+  --model-name /path/to/GLM-4.7-Flash \
+  --topology-plan-samples 32 \
+  --topology-min-stages 2 \
+  --topology-max-stages 6 \
+  --topology-tap-dropout 0.25 \
+  --num-spec-layers 4 \
+  --draft-top-k 4 \
+  --upload-repo none
+```
+
+The command writes `topology/skippy-spd-topology-plan.json` under the run
+artifact directory and exits before cloning or training. That exit is
+intentional: the current reference implementation would otherwise produce a
+fixed-stage head. The next model patch should consume these logical tap plans
+with masks or tap dropout so one exported sidecar can be evaluated against many
+candidate Skippy contiguous-layer topologies.
 
 ## Reproduce Qwen3-0.6B Training
 
