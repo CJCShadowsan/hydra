@@ -29,6 +29,7 @@ struct VerifySpanLocalReport {
     mode: &'static str,
     model_path: PathBuf,
     layer_end: u32,
+    split_layer: Option<u32>,
     ctx_size: u32,
     n_gpu_layers: i32,
     n_batch: Option<u32>,
@@ -41,6 +42,7 @@ struct VerifySpanLocalReport {
     iterations: usize,
     batched_width2: TimingStats,
     serial_two_decode_mtp_n1: TimingStats,
+    split_inprocess_width2: Option<SplitInprocessReport>,
     batched_avg_vs_serial_avg: f64,
     batched_token_per_sec: f64,
     serial_token_per_sec: f64,
@@ -48,10 +50,90 @@ struct VerifySpanLocalReport {
     first_serial_prediction: Vec<i32>,
 }
 
+#[derive(Debug, Serialize)]
+struct SplitInprocessReport {
+    split_layer: u32,
+    boundary_payload_bytes: usize,
+    total: TimingStats,
+    stage0: TimingStats,
+    stage1: TimingStats,
+    total_token_per_sec: f64,
+    total_avg_vs_full_batched_avg: f64,
+    first_prediction: Vec<i32>,
+}
+
 pub fn verify_span_local(args: VerifySpanLocalArgs) -> Result<()> {
     validate_args(&args)?;
     let output = args.output.clone();
-    let config = runtime_config(&args)?;
+    let full = run_full_model_samples(&args)?;
+    let split = match args.split_layer {
+        Some(split_layer) => Some(run_split_inprocess_samples(
+            &args,
+            split_layer,
+            &full.tokens,
+            &full.verify_tokens,
+            full.samples.batched_avg_us()?,
+        )?),
+        None => None,
+    };
+    let report = build_report(args, full, split)?;
+    let encoded = serde_json::to_vec_pretty(&report)?;
+
+    if let Some(path) = output {
+        fs::write(&path, &encoded)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    println!("{}", String::from_utf8(encoded)?);
+    Ok(())
+}
+
+fn validate_args(args: &VerifySpanLocalArgs) -> Result<()> {
+    if args.layer_end == 0 {
+        bail!("layer_end must be greater than zero");
+    }
+    if args.iterations == 0 {
+        bail!("iterations must be greater than zero");
+    }
+    if let Some(split_layer) = args.split_layer
+        && (split_layer == 0 || split_layer >= args.layer_end)
+    {
+        bail!("split_layer must be greater than zero and less than layer_end");
+    }
+    Ok(())
+}
+
+fn full_runtime_config(args: &VerifySpanLocalArgs) -> Result<RuntimeConfig> {
+    Ok(RuntimeConfig {
+        stage_index: 0,
+        layer_start: 0,
+        layer_end: args.layer_end,
+        ctx_size: args.ctx_size,
+        lane_count: 1,
+        n_batch: args.n_batch,
+        n_ubatch: args.n_ubatch,
+        n_threads: None,
+        n_threads_batch: None,
+        n_gpu_layers: args.n_gpu_layers,
+        selected_backend_device: None,
+        cache_type_k: parse_cache_type(&args.cache_type_k)?,
+        cache_type_v: parse_cache_type(&args.cache_type_v)?,
+        flash_attn_type: FlashAttentionType::Auto,
+        load_mode: RuntimeLoadMode::RuntimeSlice,
+        projector_path: None,
+        include_embeddings: true,
+        include_output: true,
+        filter_tensors_on_load: false,
+    })
+}
+
+struct FullModelSamples {
+    tokens: Vec<i32>,
+    verify_tokens: Vec<i32>,
+    samples: SampleSet,
+}
+
+fn run_full_model_samples(args: &VerifySpanLocalArgs) -> Result<FullModelSamples> {
+    let config = full_runtime_config(args)?;
     let model = StageModel::open(&args.model_path, &config)
         .with_context(|| format!("failed to open {}", args.model_path.display()))?;
     let tokens = model
@@ -73,7 +155,6 @@ pub fn verify_span_local(args: VerifySpanLocalArgs) -> Result<()> {
         &args.prompt,
         &config,
     )?;
-
     let samples = run_samples(
         &mut session,
         base_token_count,
@@ -81,48 +162,10 @@ pub fn verify_span_local(args: VerifySpanLocalArgs) -> Result<()> {
         args.warmup,
         args.iterations,
     )?;
-    let report = build_report(args, tokens.len(), verify_tokens, samples)?;
-    let encoded = serde_json::to_vec_pretty(&report)?;
-
-    if let Some(path) = output {
-        fs::write(&path, &encoded)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    println!("{}", String::from_utf8(encoded)?);
-    Ok(())
-}
-
-fn validate_args(args: &VerifySpanLocalArgs) -> Result<()> {
-    if args.layer_end == 0 {
-        bail!("layer_end must be greater than zero");
-    }
-    if args.iterations == 0 {
-        bail!("iterations must be greater than zero");
-    }
-    Ok(())
-}
-
-fn runtime_config(args: &VerifySpanLocalArgs) -> Result<RuntimeConfig> {
-    Ok(RuntimeConfig {
-        stage_index: 0,
-        layer_start: 0,
-        layer_end: args.layer_end,
-        ctx_size: args.ctx_size,
-        lane_count: 1,
-        n_batch: args.n_batch,
-        n_ubatch: args.n_ubatch,
-        n_threads: None,
-        n_threads_batch: None,
-        n_gpu_layers: args.n_gpu_layers,
-        selected_backend_device: None,
-        cache_type_k: parse_cache_type(&args.cache_type_k)?,
-        cache_type_v: parse_cache_type(&args.cache_type_v)?,
-        flash_attn_type: FlashAttentionType::Auto,
-        load_mode: RuntimeLoadMode::RuntimeSlice,
-        projector_path: None,
-        include_embeddings: true,
-        include_output: true,
-        filter_tensors_on_load: false,
+    Ok(FullModelSamples {
+        tokens,
+        verify_tokens,
+        samples,
     })
 }
 
@@ -304,6 +347,190 @@ fn measure_serial(
     Ok((start.elapsed(), prediction))
 }
 
+fn run_split_inprocess_samples(
+    args: &VerifySpanLocalArgs,
+    split_layer: u32,
+    tokens: &[i32],
+    verify_tokens: &[i32],
+    full_batched_avg_us: f64,
+) -> Result<SplitInprocessReport> {
+    let (stage0_config, stage1_config) = split_runtime_configs(args, split_layer)?;
+    let stage0 = StageModel::open(&args.model_path, &stage0_config)
+        .context("failed to open in-process split stage 0")?;
+    let stage1 = StageModel::open(&args.model_path, &stage1_config)
+        .context("failed to open in-process split stage 1")?;
+    let mut session0 = stage0
+        .create_session()
+        .context("failed to create in-process split stage 0 session")?;
+    let mut session1 = stage1
+        .create_session()
+        .context("failed to create in-process split stage 1 session")?;
+    prefill_split_sessions(&mut session0, &mut session1, tokens)?;
+    let base0 = session0.token_count();
+    let base1 = session1.token_count();
+    let samples = run_split_samples(
+        &mut session0,
+        &mut session1,
+        base0,
+        base1,
+        verify_tokens,
+        args.warmup,
+        args.iterations,
+    )?;
+    split_report(split_layer, samples, full_batched_avg_us)
+}
+
+fn split_runtime_configs(
+    args: &VerifySpanLocalArgs,
+    split_layer: u32,
+) -> Result<(RuntimeConfig, RuntimeConfig)> {
+    let cache_type_k = parse_cache_type(&args.cache_type_k)?;
+    let cache_type_v = parse_cache_type(&args.cache_type_v)?;
+    let stage0 = RuntimeConfig {
+        stage_index: 0,
+        layer_start: 0,
+        layer_end: split_layer,
+        ctx_size: args.ctx_size,
+        lane_count: 1,
+        n_batch: args.n_batch,
+        n_ubatch: args.n_ubatch,
+        n_threads: None,
+        n_threads_batch: None,
+        n_gpu_layers: args.n_gpu_layers,
+        selected_backend_device: None,
+        cache_type_k,
+        cache_type_v,
+        flash_attn_type: FlashAttentionType::Auto,
+        load_mode: RuntimeLoadMode::RuntimeSlice,
+        projector_path: None,
+        include_embeddings: true,
+        include_output: false,
+        filter_tensors_on_load: true,
+    };
+    let stage1 = RuntimeConfig {
+        stage_index: 1,
+        layer_start: split_layer,
+        layer_end: args.layer_end,
+        ctx_size: args.ctx_size,
+        lane_count: 1,
+        n_batch: args.n_batch,
+        n_ubatch: args.n_ubatch,
+        n_threads: None,
+        n_threads_batch: None,
+        n_gpu_layers: args.n_gpu_layers,
+        selected_backend_device: None,
+        cache_type_k,
+        cache_type_v,
+        flash_attn_type: FlashAttentionType::Auto,
+        load_mode: RuntimeLoadMode::RuntimeSlice,
+        projector_path: None,
+        include_embeddings: false,
+        include_output: true,
+        filter_tensors_on_load: true,
+    };
+    Ok((stage0, stage1))
+}
+
+fn prefill_split_sessions(
+    session0: &mut StageSession,
+    session1: &mut StageSession,
+    tokens: &[i32],
+) -> Result<()> {
+    let (_stage0_prediction, boundary) = session0
+        .prefill_chunk_frame_sampled(tokens, Some(&SamplingConfig::default()), None, 0)
+        .context("in-process split stage 0 failed to prefill")?;
+    if boundary.payload.is_empty() {
+        bail!("in-process split stage 0 produced an empty prefill activation frame");
+    }
+    session1
+        .prefill_chunk_frame_sampled(tokens, Some(&SamplingConfig::default()), Some(&boundary), 0)
+        .context("in-process split stage 1 failed to prefill")?;
+    Ok(())
+}
+
+fn run_split_samples(
+    session0: &mut StageSession,
+    session1: &mut StageSession,
+    base0: u64,
+    base1: u64,
+    verify_tokens: &[i32],
+    warmup: usize,
+    iterations: usize,
+) -> Result<SplitSampleSet> {
+    let total = warmup
+        .checked_add(iterations)
+        .context("split sample count overflow")?;
+    let mut total_samples = Vec::with_capacity(iterations);
+    let mut stage0_samples = Vec::with_capacity(iterations);
+    let mut stage1_samples = Vec::with_capacity(iterations);
+    let mut boundary_payload_bytes = 0usize;
+    let mut first_prediction = None;
+
+    for index in 0..total {
+        let sample = measure_split_batched(session0, session1, base0, base1, verify_tokens)?;
+        if index >= warmup {
+            total_samples.push(sample.total);
+            stage0_samples.push(sample.stage0);
+            stage1_samples.push(sample.stage1);
+            boundary_payload_bytes = sample.boundary_payload_bytes;
+            first_prediction.get_or_insert(sample.prediction);
+        }
+    }
+
+    Ok(SplitSampleSet {
+        total: total_samples,
+        stage0: stage0_samples,
+        stage1: stage1_samples,
+        boundary_payload_bytes,
+        first_prediction: first_prediction.unwrap_or_default(),
+    })
+}
+
+fn measure_split_batched(
+    session0: &mut StageSession,
+    session1: &mut StageSession,
+    base0: u64,
+    base1: u64,
+    verify_tokens: &[i32],
+) -> Result<SplitSample> {
+    session0
+        .trim_session(base0)
+        .context("failed to trim split stage 0 before verify")?;
+    session1
+        .trim_session(base1)
+        .context("failed to trim split stage 1 before verify")?;
+
+    let total_start = Instant::now();
+    let stage0_start = Instant::now();
+    let (_stage0_prediction, boundary) = session0
+        .verify_tokens_frame_sampled(verify_tokens, Some(&SamplingConfig::default()), None, 0)
+        .context("in-process split stage 0 VerifySpan failed")?;
+    let stage0 = stage0_start.elapsed();
+    let boundary_payload_bytes = boundary.payload.len();
+    if boundary_payload_bytes == 0 {
+        bail!("in-process split stage 0 produced an empty VerifySpan activation frame");
+    }
+
+    let stage1_start = Instant::now();
+    let prediction = session1
+        .verify_tokens_frame_sampled(
+            verify_tokens,
+            Some(&SamplingConfig::default()),
+            Some(&boundary),
+            0,
+        )
+        .context("in-process split stage 1 VerifySpan failed")?
+        .0;
+    let stage1 = stage1_start.elapsed();
+    Ok(SplitSample {
+        total: total_start.elapsed(),
+        stage0,
+        stage1,
+        boundary_payload_bytes,
+        prediction,
+    })
+}
+
 fn serial_decode_mtp_n1(session: &mut StageSession, verify_tokens: &[i32]) -> Result<Vec<i32>> {
     let mut predicted_tokens = Vec::with_capacity(verify_tokens.len() + 3);
     let mut last_draft = None;
@@ -325,6 +552,43 @@ fn serial_decode_mtp_n1(session: &mut StageSession, verify_tokens: &[i32]) -> Re
 }
 
 #[derive(Debug)]
+struct SplitSample {
+    total: Duration,
+    stage0: Duration,
+    stage1: Duration,
+    boundary_payload_bytes: usize,
+    prediction: Vec<i32>,
+}
+
+#[derive(Debug)]
+struct SplitSampleSet {
+    total: Vec<Duration>,
+    stage0: Vec<Duration>,
+    stage1: Vec<Duration>,
+    boundary_payload_bytes: usize,
+    first_prediction: Vec<i32>,
+}
+
+fn split_report(
+    split_layer: u32,
+    samples: SplitSampleSet,
+    full_batched_avg_us: f64,
+) -> Result<SplitInprocessReport> {
+    let total = timing_stats(&samples.total)?;
+    let total_avg = total.avg_us;
+    Ok(SplitInprocessReport {
+        split_layer,
+        boundary_payload_bytes: samples.boundary_payload_bytes,
+        stage0: timing_stats(&samples.stage0)?,
+        stage1: timing_stats(&samples.stage1)?,
+        total,
+        total_token_per_sec: verified_tokens_per_sec(total_avg, 2),
+        total_avg_vs_full_batched_avg: total_avg / full_batched_avg_us,
+        first_prediction: samples.first_prediction,
+    })
+}
+
+#[derive(Debug)]
 struct SampleSet {
     batched: Vec<Duration>,
     serial: Vec<Duration>,
@@ -332,37 +596,44 @@ struct SampleSet {
     first_serial_prediction: Vec<i32>,
 }
 
+impl SampleSet {
+    fn batched_avg_us(&self) -> Result<f64> {
+        Ok(timing_stats(&self.batched)?.avg_us)
+    }
+}
+
 fn build_report(
     args: VerifySpanLocalArgs,
-    prompt_token_count: usize,
-    verify_tokens: Vec<i32>,
-    samples: SampleSet,
+    full: FullModelSamples,
+    split_inprocess_width2: Option<SplitInprocessReport>,
 ) -> Result<VerifySpanLocalReport> {
-    let batched_width2 = timing_stats(&samples.batched)?;
-    let serial_two_decode_mtp_n1 = timing_stats(&samples.serial)?;
+    let batched_width2 = timing_stats(&full.samples.batched)?;
+    let serial_two_decode_mtp_n1 = timing_stats(&full.samples.serial)?;
     let batched_avg = batched_width2.avg_us;
     let serial_avg = serial_two_decode_mtp_n1.avg_us;
     Ok(VerifySpanLocalReport {
         mode: "verify-span-local",
         model_path: args.model_path,
         layer_end: args.layer_end,
+        split_layer: args.split_layer,
         ctx_size: args.ctx_size,
         n_gpu_layers: args.n_gpu_layers,
         n_batch: args.n_batch,
         n_ubatch: args.n_ubatch,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
-        prompt_token_count,
-        verify_tokens,
+        prompt_token_count: full.tokens.len(),
+        verify_tokens: full.verify_tokens,
         warmup: args.warmup,
         iterations: args.iterations,
         batched_width2,
         serial_two_decode_mtp_n1,
+        split_inprocess_width2,
         batched_avg_vs_serial_avg: batched_avg / serial_avg,
         batched_token_per_sec: verified_tokens_per_sec(batched_avg, 2),
         serial_token_per_sec: verified_tokens_per_sec(serial_avg, 2),
-        first_batched_prediction: samples.first_batched_prediction,
-        first_serial_prediction: samples.first_serial_prediction,
+        first_batched_prediction: full.samples.first_batched_prediction,
+        first_serial_prediction: full.samples.first_serial_prediction,
     })
 }
 

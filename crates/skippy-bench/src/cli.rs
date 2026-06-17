@@ -96,6 +96,8 @@ pub struct VerifySpanLocalArgs {
     pub model_path: PathBuf,
     #[arg(long, default_value_t = 48)]
     pub layer_end: u32,
+    #[arg(long)]
+    pub split_layer: Option<u32>,
     #[arg(long, default_value_t = 4096)]
     pub ctx_size: u32,
     #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
@@ -531,8 +533,28 @@ mod tests {
 
         assert_eq!(args.model_path, PathBuf::from("/tmp/model.gguf"));
         assert_eq!(args.layer_end, 48);
+        assert_eq!(args.split_layer, None);
         assert_eq!(args.iterations, 3);
         assert_eq!(args.warmup, 1);
         assert_eq!(args.n_gpu_layers, -1);
+    }
+
+    #[test]
+    fn parses_verify_span_local_split_layer() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-span-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--split-layer",
+            "24",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifySpanLocal(args) = cli.command else {
+            panic!("expected verify-span-local subcommand");
+        };
+
+        assert_eq!(args.split_layer, Some(24));
     }
 }
