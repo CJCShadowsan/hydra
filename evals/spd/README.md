@@ -242,6 +242,11 @@ Run a small real GLM 4.7 quality gate by replacing `--smoke-synthetic` with the
 local checkpoint path and small train/eval row counts first:
 
 ```bash
+export HF_TOKEN="$(cat /Volumes/models/huggingface/token 2>/dev/null || true)"
+export HF_HOME=/tmp/codex-hf-home
+export HF_HUB_CACHE=/tmp/codex-hf-hub
+export HF_DATASETS_CACHE=/tmp/codex-hf-datasets
+
 uv run evals/spd/generic_layer_tap_sidecar.py \
   --model-name /path/to/GLM-4.7-Flash \
   --work-dir /tmp/skippy-spd-glm47-generic-layer-tap-n1 \
@@ -260,6 +265,33 @@ uv run evals/spd/generic_layer_tap_sidecar.py \
   --device cuda \
   --export-dtype float16
 ```
+
+On `micstudio`, keep the model path on the shared NFS mount but use local
+`/tmp` HF caches for dataset/Hub metadata. The NFS-backed shared cache can fail
+dataset metadata locks with `OSError: [Errno 77] No locks available`.
+
+First recorded real GLM mechanics gate:
+
+| Field | Value |
+| --- | --- |
+| Artifact | `/Users/micn/spd-runs/glm47-generic-layer-tap-n1-smoke/artifacts/20260617-221949` |
+| Model type | `glm4_moe_lite` |
+| Hidden / layers / vocab | `2048` / `47` / `154880` |
+| `num_spec_layers` | `1` |
+| Topology samples | `8` layouts, stages `2..4`, tap dropout `0.25` |
+| Draft vocab | `702` observed ids from 2 training rows |
+| Eval examples | `1` |
+| Draft vocab label coverage | `1.0` |
+| Acceptance | `0.0` |
+| Equivalent accept length | `0.0` |
+| Proposal latency | `183.98 ms/example` |
+| Eval wall time | `0.209 s` |
+| Serving checkpoint | `spd-head.safetensors`, `F16`, `11.3 MB`, sha256 `3afea1ba44fc32ea9c77237952eb71010a0ba4d05d17cb6e756ffb799cfb3904` |
+| Rust validation | `SKIPPY_SPD_MANIFEST=... cargo test -p skippy-runtime --lib validates_external_manifest_when_skippy_spd_manifest_is_set` passed |
+
+This is a tokenizer/model/export/manifest mechanics pass, not a quality result.
+The next quality gate needs more rows, more positions, and then the `N=1,2,4`
+sweep.
 
 ## Reproduce Qwen3-0.6B Training
 

@@ -44,6 +44,7 @@ class TapExample:
     hidden: torch.Tensor
     features: torch.Tensor
     labels: list[int]
+    topology_key: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +72,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float16", "bfloat16"), default="float32")
+    parser.add_argument("--attn-implementation", default="sdpa")
+    parser.add_argument(
+        "--model-device-map",
+        choices=("single", "auto", "cpu"),
+        default="single",
+        help="Device map for loading the target model during hidden-state extraction.",
+    )
+    parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--export-dtype", choices=("float32", "float16", "bfloat16"), default="float16")
     parser.add_argument("--smoke-synthetic", action="store_true")
     parser.add_argument("--synthetic-hidden-size", type=int, default=64)
@@ -152,6 +161,7 @@ def main() -> None:
     eval_summary["train_wall_seconds"] = train_elapsed
     eval_summary["total_wall_seconds"] = time.perf_counter() - started
     eval_summary["topology_policy"] = plan["policy"]
+    eval_summary["topology_eval"] = summarize_examples_by_topology(eval_examples)
     eval_summary["model"] = model_meta
 
     checkpoint_path = train_dir / "generic-layer-tap-sidecar.pt"
@@ -250,7 +260,12 @@ def synthetic_example(
     hidden = torch.randn(len(indices), hidden_size)
     features = tap_features(indices, int(plan["model"]["num_hidden_layers"]))
     labels = [rng.choice(draft_token_ids) for _ in range(num_spec_layers)]
-    return TapExample(hidden=hidden, features=features, labels=labels)
+    return TapExample(
+        hidden=hidden,
+        features=features,
+        labels=labels,
+        topology_key=topology_key(indices),
+    )
 
 
 def real_glm_examples(
@@ -265,12 +280,7 @@ def real_glm_examples(
     rows = load_training_rows(args.dataset, args.dataset_split, int(args.train_rows + args.eval_rows))
     texts = [row_text_for_vocab(tokenizer, row.get("messages") or []) for row in rows]
     draft_token_ids = build_draft_vocab(tokenizer, texts[: int(args.train_rows)], int(args.draft_vocab_size))
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        attn_implementation="sdpa",
-    ).to(device)
+    model = load_target_model(args, dtype, device)
     model.eval()
     model_meta = {
         "model_name": args.model_name,
@@ -282,9 +292,32 @@ def real_glm_examples(
     train_texts = texts[: int(args.train_rows)]
     eval_texts = texts[int(args.train_rows) : int(args.train_rows + args.eval_rows)]
     rng = random.Random(int(args.topology_seed))
-    train = collect_examples_from_texts(args, tokenizer, model, train_texts, plan, rng, device)
-    evals = collect_examples_from_texts(args, tokenizer, model, eval_texts, plan, rng, device)
+    model_device = next(model.parameters()).device
+    train = collect_examples_from_texts(args, tokenizer, model, train_texts, plan, rng, model_device)
+    evals = collect_examples_from_texts(args, tokenizer, model, eval_texts, plan, rng, model_device)
     return model_meta, draft_token_ids, train, evals
+
+
+def load_target_model(args: argparse.Namespace, dtype: torch.dtype, device: torch.device) -> Any:
+    from transformers import AutoModelForCausalLM
+
+    kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "torch_dtype": dtype,
+        "attn_implementation": args.attn_implementation,
+        "low_cpu_mem_usage": True,
+        "local_files_only": bool(args.local_files_only),
+    }
+    if args.model_device_map == "auto":
+        kwargs["device_map"] = "auto"
+    elif args.model_device_map == "cpu":
+        kwargs["device_map"] = {"": "cpu"}
+    elif device.type != "cpu":
+        kwargs["device_map"] = {"": device.type}
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, **kwargs)
+    if args.model_device_map == "single" and device.type == "cpu":
+        model = model.to(device)
+    return model
 
 
 def collect_examples_from_texts(
@@ -320,7 +353,14 @@ def collect_examples_from_texts(
             hidden = torch.stack([hidden_states[index][pos] for index in indices], dim=0)
             features = tap_features(indices, num_layers)
             labels = [token_ids[pos + offset] for offset in range(1, int(args.num_spec_layers) + 1)]
-            examples.append(TapExample(hidden=hidden, features=features, labels=labels))
+            examples.append(
+                TapExample(
+                    hidden=hidden,
+                    features=features,
+                    labels=labels,
+                    topology_key=topology_key(indices),
+                )
+            )
     if not examples:
         raise RuntimeError("no real GLM examples collected")
     return examples
@@ -335,6 +375,10 @@ def sample_tap_indices(plan: dict[str, Any], rng: random.Random) -> list[int]:
     if not kept:
         kept = [row[0], row[-1]]
     return sorted(set(int(index) for index in kept))
+
+
+def topology_key(indices: list[int]) -> str:
+    return ",".join(str(index) for index in indices)
 
 
 def tap_features(indices: list[int], num_layers: int) -> torch.Tensor:
@@ -382,7 +426,13 @@ def evaluate_sidecar(
     sidecar.eval()
     accepted = 0
     proposal_slots = 0
+    covered_labels = 0
+    total_labels = 0
     proposal_time = 0.0
+    by_topology = {
+        example.topology_key: {"examples": 0, "accepted": 0, "slots": 0}
+        for example in examples
+    }
     eval_started = time.perf_counter()
     with torch.no_grad():
         for start in range(0, len(examples), batch_size):
@@ -397,26 +447,55 @@ def evaluate_sidecar(
             proposal_time += time.perf_counter() - proposal_started
             predictions = torch.stack([head.argmax(dim=-1) for head in logits], dim=1)
             for row_idx in range(predictions.shape[0]):
+                topology = batch[row_idx].topology_key
+                by_topology[topology]["examples"] += 1
                 for spec_idx in range(predictions.shape[1]):
                     label = int(labels[row_idx, spec_idx].detach().cpu())
+                    total_labels += 1
                     if label < 0:
                         break
+                    covered_labels += 1
                     proposal_slots += 1
+                    by_topology[topology]["slots"] += 1
                     if int(predictions[row_idx, spec_idx].detach().cpu()) != label:
                         break
                     accepted += 1
+                    by_topology[topology]["accepted"] += 1
     eval_wall = time.perf_counter() - eval_started
     denominator = max(1, proposal_slots)
+    topology_rows = []
+    for key, row in sorted(by_topology.items()):
+        slots = max(1, row["slots"])
+        topology_rows.append(
+            {
+                "tap_indices": key,
+                "examples": row["examples"],
+                "accepted_draft_tokens": row["accepted"],
+                "proposal_slots": row["slots"],
+                "acceptance_rate": row["accepted"] / slots,
+            }
+        )
     return {
         "examples": len(examples),
         "accepted_draft_tokens": accepted,
         "proposal_slots": proposal_slots,
         "acceptance_rate": accepted / denominator,
         "equivalent_accept_length": accepted / max(1, len(examples)),
+        "draft_vocab_label_coverage": covered_labels / max(1, total_labels),
+        "covered_labels": covered_labels,
+        "total_labels": total_labels,
         "proposal_latency_ms": (proposal_time / max(1, len(examples))) * 1000.0,
         "proposal_wall_seconds": proposal_time,
         "eval_wall_seconds": eval_wall,
+        "by_topology": topology_rows,
     }
+
+
+def summarize_examples_by_topology(examples: list[TapExample]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for example in examples:
+        counts[example.topology_key] = counts.get(example.topology_key, 0) + 1
+    return [{"tap_indices": key, "examples": value} for key, value in sorted(counts.items())]
 
 
 def collate_batch(
