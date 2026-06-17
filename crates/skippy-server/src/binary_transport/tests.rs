@@ -89,7 +89,13 @@ fn request_summary_tracks_verify_span_compute_ms() {
     assert_eq!(summary.verify_span_token_count, 2);
     assert_eq!(summary.verify_span_max_tokens, 2);
     assert_eq!(summary.verify_span_compute_ms, 12.5);
+    assert_eq!(summary.verify_span_input_activation_decode_ms, 1.25);
+    assert_eq!(summary.verify_span_runtime_lock_hold_ms, 2.5);
+    assert_eq!(summary.verify_span_upstream_reply_ms, 0.75);
     assert_eq!(summary.compute_ms, 19.5);
+    assert_eq!(summary.input_activation_decode_ms, 2.5);
+    assert_eq!(summary.runtime_lock_hold_ms, 5.0);
+    assert_eq!(summary.upstream_reply_ms, 1.5);
 }
 
 #[test]
@@ -275,11 +281,11 @@ fn summary_observation<'a>(
         compute_ms,
         forward_write_ms: 0.0,
         downstream_wait_ms: 0.0,
-        upstream_reply_ms: 0.0,
+        upstream_reply_ms: 0.75,
         message_elapsed_ms: compute_ms,
-        input_activation_decode_ms: 0.0,
+        input_activation_decode_ms: 1.25,
         forward_activation_encode_ms: 0.0,
-        runtime_lock_hold_ms: 0.0,
+        runtime_lock_hold_ms: 2.5,
         input_activation_bytes: 0,
         output_activation_bytes: 0,
         prefill_credit_limit: 0,

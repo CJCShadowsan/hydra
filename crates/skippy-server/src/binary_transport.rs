@@ -3172,6 +3172,9 @@ struct BinaryRequestSummary {
     verify_span_token_count: u64,
     verify_span_max_tokens: u64,
     verify_span_compute_ms: f64,
+    verify_span_input_activation_decode_ms: f64,
+    verify_span_runtime_lock_hold_ms: f64,
+    verify_span_upstream_reply_ms: f64,
     verify_span_pre_compute_ms: f64,
     verify_span_post_compute_ms: f64,
     verify_span_pre_reply_ms: f64,
@@ -3371,6 +3374,9 @@ impl BinaryRequestSummary {
                 .verify_span_session_auto_align_trimmed_tokens
                 .saturating_add(observation.session_auto_align_trimmed_tokens);
             self.verify_span_compute_ms += observation.compute_ms;
+            self.verify_span_input_activation_decode_ms += observation.input_activation_decode_ms;
+            self.verify_span_runtime_lock_hold_ms += observation.runtime_lock_hold_ms;
+            self.verify_span_upstream_reply_ms += observation.upstream_reply_ms;
             self.verify_span_pre_compute_ms += observation.verify_span_pre_compute_ms;
             self.verify_span_post_compute_ms += observation.verify_span_post_compute_ms;
             self.verify_span_pre_reply_ms += observation.verify_span_pre_reply_ms;
@@ -3543,6 +3549,18 @@ impl BinaryRequestSummary {
             json!(self.verify_span_compute_ms),
         );
         attrs.insert(
+            "skippy.verify_span_input_activation_decode_ms".to_string(),
+            json!(self.verify_span_input_activation_decode_ms),
+        );
+        attrs.insert(
+            "skippy.verify_span_runtime_lock_hold_ms".to_string(),
+            json!(self.verify_span_runtime_lock_hold_ms),
+        );
+        attrs.insert(
+            "skippy.verify_span_upstream_reply_ms".to_string(),
+            json!(self.verify_span_upstream_reply_ms),
+        );
+        attrs.insert(
             "skippy.verify_span_post_compute_ms".to_string(),
             json!(self.verify_span_post_compute_ms),
         );
@@ -3567,6 +3585,18 @@ impl BinaryRequestSummary {
             attrs.insert(
                 "skippy.verify_span_compute_ms_avg".to_string(),
                 json!(self.verify_span_compute_ms / verify_span_count),
+            );
+            attrs.insert(
+                "skippy.verify_span_input_activation_decode_ms_avg".to_string(),
+                json!(self.verify_span_input_activation_decode_ms / verify_span_count),
+            );
+            attrs.insert(
+                "skippy.verify_span_runtime_lock_hold_ms_avg".to_string(),
+                json!(self.verify_span_runtime_lock_hold_ms / verify_span_count),
+            );
+            attrs.insert(
+                "skippy.verify_span_upstream_reply_ms_avg".to_string(),
+                json!(self.verify_span_upstream_reply_ms / verify_span_count),
             );
             attrs.insert(
                 "skippy.verify_span_tokens_avg".to_string(),
