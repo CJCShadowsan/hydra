@@ -54,12 +54,19 @@ struct VerifySpanLocalReport {
 struct SplitInprocessReport {
     split_layer: u32,
     boundary_payload_bytes: usize,
+    serial_boundary_payload_bytes: usize,
     total: TimingStats,
     stage0: TimingStats,
     stage1: TimingStats,
+    serial_total: TimingStats,
+    serial_stage0: TimingStats,
+    serial_stage1: TimingStats,
     total_token_per_sec: f64,
+    serial_total_token_per_sec: f64,
     total_avg_vs_full_batched_avg: f64,
+    total_avg_vs_serial_total_avg: f64,
     first_prediction: Vec<i32>,
+    first_serial_prediction: Vec<i32>,
 }
 
 pub fn verify_span_local(args: VerifySpanLocalArgs) -> Result<()> {
@@ -463,17 +470,36 @@ fn run_split_samples(
     let mut total_samples = Vec::with_capacity(iterations);
     let mut stage0_samples = Vec::with_capacity(iterations);
     let mut stage1_samples = Vec::with_capacity(iterations);
+    let mut serial_total_samples = Vec::with_capacity(iterations);
+    let mut serial_stage0_samples = Vec::with_capacity(iterations);
+    let mut serial_stage1_samples = Vec::with_capacity(iterations);
     let mut boundary_payload_bytes = 0usize;
+    let mut serial_boundary_payload_bytes = 0usize;
     let mut first_prediction = None;
+    let mut first_serial_prediction = None;
 
     for index in 0..total {
-        let sample = measure_split_batched(session0, session1, base0, base1, verify_tokens)?;
+        let (batched, serial) = if index.is_multiple_of(2) {
+            (
+                measure_split_batched(session0, session1, base0, base1, verify_tokens)?,
+                measure_split_serial(session0, session1, base0, base1, verify_tokens)?,
+            )
+        } else {
+            let serial = measure_split_serial(session0, session1, base0, base1, verify_tokens)?;
+            let batched = measure_split_batched(session0, session1, base0, base1, verify_tokens)?;
+            (batched, serial)
+        };
         if index >= warmup {
-            total_samples.push(sample.total);
-            stage0_samples.push(sample.stage0);
-            stage1_samples.push(sample.stage1);
-            boundary_payload_bytes = sample.boundary_payload_bytes;
-            first_prediction.get_or_insert(sample.prediction);
+            total_samples.push(batched.total);
+            stage0_samples.push(batched.stage0);
+            stage1_samples.push(batched.stage1);
+            serial_total_samples.push(serial.total);
+            serial_stage0_samples.push(serial.stage0);
+            serial_stage1_samples.push(serial.stage1);
+            boundary_payload_bytes = batched.boundary_payload_bytes;
+            serial_boundary_payload_bytes = serial.boundary_payload_bytes;
+            first_prediction.get_or_insert(batched.prediction);
+            first_serial_prediction.get_or_insert(serial.prediction);
         }
     }
 
@@ -481,8 +507,13 @@ fn run_split_samples(
         total: total_samples,
         stage0: stage0_samples,
         stage1: stage1_samples,
+        serial_total: serial_total_samples,
+        serial_stage0: serial_stage0_samples,
+        serial_stage1: serial_stage1_samples,
         boundary_payload_bytes,
+        serial_boundary_payload_bytes,
         first_prediction: first_prediction.unwrap_or_default(),
+        first_serial_prediction: first_serial_prediction.unwrap_or_default(),
     })
 }
 
@@ -531,6 +562,69 @@ fn measure_split_batched(
     })
 }
 
+fn measure_split_serial(
+    session0: &mut StageSession,
+    session1: &mut StageSession,
+    base0: u64,
+    base1: u64,
+    verify_tokens: &[i32],
+) -> Result<SplitSample> {
+    session0
+        .trim_session(base0)
+        .context("failed to trim split stage 0 before serial verify")?;
+    session1
+        .trim_session(base1)
+        .context("failed to trim split stage 1 before serial verify")?;
+
+    let total_start = Instant::now();
+    let mut stage0_total = Duration::ZERO;
+    let mut stage1_total = Duration::ZERO;
+    let mut boundary_payload_bytes = 0usize;
+    let mut prediction = Vec::with_capacity(verify_tokens.len() + 3);
+    let mut last_draft = None;
+
+    for token_id in verify_tokens {
+        let stage0_start = Instant::now();
+        let (_stage0_prediction, _stage0_draft, boundary) = session0
+            .decode_step_frame_sampled_mtp_n1(*token_id, Some(&SamplingConfig::default()), None, 0)
+            .context("in-process split stage 0 serial decode failed")?;
+        stage0_total += stage0_start.elapsed();
+        if boundary.payload.is_empty() {
+            bail!("in-process split stage 0 produced an empty serial activation frame");
+        }
+        boundary_payload_bytes += boundary.payload.len();
+
+        let stage1_start = Instant::now();
+        let (predicted, native_mtp, _output) = session1
+            .decode_step_frame_sampled_mtp_n1(
+                *token_id,
+                Some(&SamplingConfig::default()),
+                Some(&boundary),
+                0,
+            )
+            .context("in-process split stage 1 serial decode failed")?;
+        stage1_total += stage1_start.elapsed();
+        if predicted >= 0 {
+            prediction.push(predicted);
+        }
+        last_draft = native_mtp;
+    }
+
+    if let Some(draft) = last_draft {
+        prediction.push(draft.token_id);
+        prediction.push(i32::try_from(draft.proposal_compute_us.max(0)).unwrap_or(i32::MAX));
+        prediction.push(draft.margin_milli);
+    }
+
+    Ok(SplitSample {
+        total: total_start.elapsed(),
+        stage0: stage0_total,
+        stage1: stage1_total,
+        boundary_payload_bytes,
+        prediction,
+    })
+}
+
 fn serial_decode_mtp_n1(session: &mut StageSession, verify_tokens: &[i32]) -> Result<Vec<i32>> {
     let mut predicted_tokens = Vec::with_capacity(verify_tokens.len() + 3);
     let mut last_draft = None;
@@ -565,8 +659,13 @@ struct SplitSampleSet {
     total: Vec<Duration>,
     stage0: Vec<Duration>,
     stage1: Vec<Duration>,
+    serial_total: Vec<Duration>,
+    serial_stage0: Vec<Duration>,
+    serial_stage1: Vec<Duration>,
     boundary_payload_bytes: usize,
+    serial_boundary_payload_bytes: usize,
     first_prediction: Vec<i32>,
+    first_serial_prediction: Vec<i32>,
 }
 
 fn split_report(
@@ -575,16 +674,25 @@ fn split_report(
     full_batched_avg_us: f64,
 ) -> Result<SplitInprocessReport> {
     let total = timing_stats(&samples.total)?;
+    let serial_total = timing_stats(&samples.serial_total)?;
     let total_avg = total.avg_us;
+    let serial_total_avg = serial_total.avg_us;
     Ok(SplitInprocessReport {
         split_layer,
         boundary_payload_bytes: samples.boundary_payload_bytes,
+        serial_boundary_payload_bytes: samples.serial_boundary_payload_bytes,
         stage0: timing_stats(&samples.stage0)?,
         stage1: timing_stats(&samples.stage1)?,
+        serial_stage0: timing_stats(&samples.serial_stage0)?,
+        serial_stage1: timing_stats(&samples.serial_stage1)?,
         total,
+        serial_total,
         total_token_per_sec: verified_tokens_per_sec(total_avg, 2),
+        serial_total_token_per_sec: verified_tokens_per_sec(serial_total_avg, 2),
         total_avg_vs_full_batched_avg: total_avg / full_batched_avg_us,
+        total_avg_vs_serial_total_avg: total_avg / serial_total_avg,
         first_prediction: samples.first_prediction,
+        first_serial_prediction: samples.first_serial_prediction,
     })
 }
 
