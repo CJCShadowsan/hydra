@@ -251,6 +251,11 @@ pub struct StageConfig {
     pub stage_index: u32,
     pub layer_start: u32,
     pub layer_end: u32,
+    /// Optional SPD tap return allowlist, keyed by Hugging Face layer index.
+    /// Empty preserves the legacy behavior where every downstream stage may
+    /// return its output as an SPD tap when the request enables tap return.
+    #[serde(default)]
+    pub spd_tap_return_hf_indices: Vec<u32>,
     #[serde(default = "default_ctx_size")]
     pub ctx_size: u32,
     #[serde(default = "default_lane_count")]

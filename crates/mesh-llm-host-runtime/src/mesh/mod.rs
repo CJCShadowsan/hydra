@@ -9160,6 +9160,7 @@ fn stage_load_to_proto(
         coordinator_term: load.coordinator_term,
         coordinator_id: load.coordinator_id.map(|id| id.to_string()),
         lease_until_unix_ms: load.lease_until_unix_ms,
+        spd_tap_return_hf_indices: load.spd_tap_return_hf_indices,
         load_mode: match load.load_mode {
             skippy_protocol::LoadMode::RuntimeSlice => {
                 skippy_stage_proto::StageLoadMode::RuntimeSlice as i32
@@ -9307,6 +9308,7 @@ fn stage_load_from_proto(
         stage_index: load.stage_index,
         layer_start: load.layer_start,
         layer_end: load.layer_end,
+        spd_tap_return_hf_indices: load.spd_tap_return_hf_indices,
         model_path: load.model_path,
         source_model_bytes: load.source_model_bytes,
         projector_path: load.projector_path,

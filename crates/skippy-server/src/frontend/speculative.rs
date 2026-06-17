@@ -93,6 +93,18 @@ pub(super) struct OpenAiSpeculativeStats {
     pub(super) recovery_restore_downstream_write_ms: f64,
     pub(super) recovery_restore_downstream_wait_ms: f64,
     pub(super) recovery_reverify_elapsed_ms: f64,
+    pub(super) optimistic_decode_requests: usize,
+    pub(super) optimistic_decode_accepted: usize,
+    pub(super) optimistic_decode_rejected: usize,
+    pub(super) optimistic_decode_committed_tokens: usize,
+    pub(super) optimistic_checkpoint_ms: f64,
+    pub(super) optimistic_decode_elapsed_ms: f64,
+    pub(super) optimistic_decode_wait_ms: f64,
+    pub(super) optimistic_restore_ms: f64,
+    pub(super) chained_optimistic_decode_requests: usize,
+    pub(super) chained_optimistic_decode_accepted: usize,
+    pub(super) chained_optimistic_decode_rejected: usize,
+    pub(super) chained_optimistic_decode_committed_tokens: usize,
     pub(super) adaptive_window_start: usize,
     pub(super) adaptive_window_final: usize,
     pub(super) adaptive_window_max: usize,
@@ -327,6 +339,54 @@ impl OpenAiSpeculativeStats {
         attrs.insert(
             "llama_stage.spec.recovery_restore_downstream_wait_ms".to_string(),
             json!(self.recovery_restore_downstream_wait_ms),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_decode_requests".to_string(),
+            json!(self.optimistic_decode_requests),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_decode_accepted".to_string(),
+            json!(self.optimistic_decode_accepted),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_decode_rejected".to_string(),
+            json!(self.optimistic_decode_rejected),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_decode_committed_tokens".to_string(),
+            json!(self.optimistic_decode_committed_tokens),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_checkpoint_ms".to_string(),
+            json!(self.optimistic_checkpoint_ms),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_decode_elapsed_ms".to_string(),
+            json!(self.optimistic_decode_elapsed_ms),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_decode_wait_ms".to_string(),
+            json!(self.optimistic_decode_wait_ms),
+        );
+        attrs.insert(
+            "llama_stage.spec.optimistic_restore_ms".to_string(),
+            json!(self.optimistic_restore_ms),
+        );
+        attrs.insert(
+            "llama_stage.spec.chained_optimistic_decode_requests".to_string(),
+            json!(self.chained_optimistic_decode_requests),
+        );
+        attrs.insert(
+            "llama_stage.spec.chained_optimistic_decode_accepted".to_string(),
+            json!(self.chained_optimistic_decode_accepted),
+        );
+        attrs.insert(
+            "llama_stage.spec.chained_optimistic_decode_rejected".to_string(),
+            json!(self.chained_optimistic_decode_rejected),
+        );
+        attrs.insert(
+            "llama_stage.spec.chained_optimistic_decode_committed_tokens".to_string(),
+            json!(self.chained_optimistic_decode_committed_tokens),
         );
         attrs.insert(
             "llama_stage.spec.adaptive_enabled".to_string(),

@@ -28,6 +28,8 @@ pub enum CommandKind {
     SpdFixtureParity(SpdFixtureParityArgs),
     #[command(name = "spd-live-tap-parity")]
     SpdLiveTapParity(SpdLiveTapParityArgs),
+    #[command(name = "spd-openai-smoke")]
+    SpdOpenAiSmoke(SpdOpenAiSmokeArgs),
     #[command(name = "focused-runtime")]
     FocusedRuntime(FocusedRuntimeArgs),
     Run(RunArgs),
@@ -126,6 +128,158 @@ pub struct SpdLiveTapParityArgs {
     pub top_k: usize,
     #[arg(long, default_value_t = 1)]
     pub verify_steps: usize,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub struct SpdOpenAiSmokeArgs {
+    #[arg(long, default_value = "target/release/skippy-server")]
+    pub stage_server_bin: PathBuf,
+    #[arg(long)]
+    pub manifest: PathBuf,
+    #[arg(long)]
+    pub fixture: PathBuf,
+    #[arg(long)]
+    pub model_path: PathBuf,
+    #[arg(long, default_value = "local/spd-openai-smoke")]
+    pub model_id: String,
+    #[arg(long, value_delimiter = ',')]
+    pub splits: Vec<u32>,
+    #[arg(long, default_value_t = 32)]
+    pub layer_end: u32,
+    #[arg(long, default_value_t = 128)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = 0)]
+    pub n_gpu_layers: i32,
+    #[arg(long)]
+    pub selected_backend_device: Option<String>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Optional stage host placement for SPD OpenAI smoke. Use 'local' for the coordinator host; other values are passed to ssh/rsync. Hosts repeat cyclically across stages."
+    )]
+    pub stage_hosts: Vec<String>,
+    #[arg(
+        long,
+        default_value_t = 20031,
+        help = "First binary stage port used when --stage-hosts is set."
+    )]
+    pub stage_port_base: u16,
+    #[arg(
+        long,
+        default_value = "0.0.0.0",
+        help = "Bind host for remote binary stages when --stage-hosts is set."
+    )]
+    pub remote_bind_host: String,
+    #[arg(
+        long,
+        default_value = "/tmp/skippy-spd-openai-smoke",
+        help = "Remote root directory for copied configs/logs/binaries when --stage-hosts includes remote hosts."
+    )]
+    pub remote_root: String,
+    #[arg(
+        long,
+        help = "Comma-separated HOST=ENDPOINT_HOST overrides for topology endpoints, e.g. local=192.168.1.10,worker=192.168.1.11."
+    )]
+    pub endpoint_host_map: Option<String>,
+    #[arg(
+        long,
+        help = "Comma-separated HOST=PATH overrides for the GGUF model path on remote hosts."
+    )]
+    pub remote_model_path_map: Option<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Rsync the GGUF model to each remote host under --remote-root for this smoke run."
+    )]
+    pub rsync_model_artifacts: bool,
+    #[arg(long, default_value_t = 2560)]
+    pub activation_width: i32,
+    #[arg(long, default_value = "f16")]
+    pub activation_wire_dtype: String,
+    #[arg(long, default_value_t = 8)]
+    pub max_tokens: u32,
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+    #[arg(
+        long,
+        default_value = "Write a Python function named add that returns the sum of two integers."
+    )]
+    pub prompt: String,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+        help = "Set chat_template_kwargs.enable_thinking on OpenAI smoke requests. Defaults false to match exported SPD parity fixtures."
+    )]
+    pub enable_thinking: bool,
+    #[arg(
+        long,
+        help = "Optional prompt file. Reads non-empty plain-text lines, JSON strings, or JSON objects with prompt/text/content fields."
+    )]
+    pub prompt_file: Option<PathBuf>,
+    #[arg(long)]
+    pub prompt_limit: Option<usize>,
+    #[arg(long, default_value_t = 1)]
+    pub openai_generation_concurrency: usize,
+    #[arg(long, default_value_t = 1)]
+    pub max_inflight: usize,
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        help = "Artificial downstream write delay in milliseconds per binary stage message."
+    )]
+    pub downstream_wire_delay_ms: f64,
+    #[arg(
+        long,
+        help = "Artificial downstream activation bandwidth cap in megabits per second."
+    )]
+    pub downstream_wire_mbps: Option<f64>,
+    #[arg(long, default_value_t = 4)]
+    pub speculative_window: usize,
+    #[arg(long, default_value_t = 1)]
+    pub spd_top_k: usize,
+    #[arg(long, default_value_t = 0)]
+    pub spd_n_gpu_layers: i32,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow the SPD source to run slow local full-context tap replay when inline taps are incomplete."
+    )]
+    pub spd_replay_fallback: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub optimistic_decode: bool,
+    #[arg(
+        long,
+        help = "Only start optimistic SPD target decode when the inline top-1/top-2 logit margin is at least this value. Use --spd-top-k 2 or higher to produce margins."
+    )]
+    pub optimistic_min_logit_margin: Option<f32>,
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        help = "Derive downstream SPD tap-return allowlist from fixture rows. Disable to preserve legacy all-taps behavior."
+    )]
+    pub derive_tap_allowlist: bool,
+    #[arg(long, value_delimiter = ',')]
+    pub spd_tap_return_hf_indices: Vec<u32>,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub run_baseline: bool,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub run_spd: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Write the report but do not fail when paired baseline/SPD content differs."
+    )]
+    pub allow_content_mismatch: bool,
+    #[arg(long, default_value_t = 120)]
+    pub startup_timeout_secs: u64,
+    #[arg(long, default_value_t = 180)]
+    pub request_timeout_secs: u64,
+    #[arg(long)]
+    pub work_dir: Option<PathBuf>,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -613,5 +767,180 @@ mod tests {
         assert_eq!(args.layer_end, 32);
         assert_eq!(args.selected_backend_device.as_deref(), Some("CPU0"));
         assert_eq!(args.verify_steps, 1);
+    }
+
+    #[test]
+    fn parses_spd_openai_smoke_enable_thinking() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+            "--enable-thinking",
+            "true",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert!(args.enable_thinking);
+
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert!(!args.enable_thinking);
+    }
+
+    #[test]
+    fn parses_spd_openai_smoke_allow_content_mismatch() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+            "--allow-content-mismatch",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert!(args.allow_content_mismatch);
+
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert!(!args.allow_content_mismatch);
+    }
+
+    #[test]
+    fn parses_spd_openai_smoke_spd_replay_fallback() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+            "--spd-replay-fallback",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert!(args.spd_replay_fallback);
+
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert!(!args.spd_replay_fallback);
+    }
+
+    #[test]
+    fn parses_spd_openai_smoke_remote_stage_options() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "spd-openai-smoke",
+            "--manifest",
+            "skippy-spd-head.json",
+            "--fixture",
+            "spd-parity-fixture.safetensors",
+            "--model-path",
+            "model.gguf",
+            "--splits",
+            "8,10,16,20,24,31",
+            "--stage-hosts",
+            "local,worker",
+            "--stage-port-base",
+            "21031",
+            "--endpoint-host-map",
+            "local=host-a,worker=host-b",
+            "--remote-model-path-map",
+            "worker=/models/model.gguf",
+            "--rsync-model-artifacts",
+        ])
+        .unwrap();
+
+        let CommandKind::SpdOpenAiSmoke(args) = cli.command else {
+            panic!("expected spd-openai-smoke subcommand");
+        };
+
+        assert_eq!(args.stage_hosts, ["local", "worker"]);
+        assert_eq!(args.stage_port_base, 21031);
+        assert_eq!(
+            args.endpoint_host_map.as_deref(),
+            Some("local=host-a,worker=host-b")
+        );
+        assert_eq!(
+            args.remote_model_path_map.as_deref(),
+            Some("worker=/models/model.gguf")
+        );
+        assert!(args.rsync_model_artifacts);
     }
 }

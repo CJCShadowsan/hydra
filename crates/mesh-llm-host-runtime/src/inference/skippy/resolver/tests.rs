@@ -3,8 +3,10 @@ use crate::inference::skippy::{SkippyPackageIdentity, SkippyTelemetryOptions, St
 use crate::plugin::{MeshConfig, ReasoningBudget, RequestDefaultsConfig};
 use serde_json::Value;
 use skippy_protocol::{LoadMode, StageKvCacheMode, StageKvCachePayload};
+use skippy_runtime::spd::{SPD_HEAD_MANIFEST_SCHEMA, TORCH_SPD_HEAD_FORMAT_V10};
 use skippy_server::{EmbeddedReasoningEnabled, EmbeddedReasoningFormat};
 use std::{
+    fs,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -76,6 +78,99 @@ fn temp_model_file() -> NamedTempFile {
     file.write_all(&bytes).expect("write fake gguf");
     file.flush().expect("flush fake gguf");
     file
+}
+
+fn write_spd_manifest(path: &Path, hidden_size: u32) {
+    let manifest = serde_json::json!({
+        "schema": SPD_HEAD_MANIFEST_SCHEMA,
+        "checkpoint": {
+            "path": "speculation_head_final.pt",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bytes": 1
+        },
+        "source": {
+            "format": TORCH_SPD_HEAD_FORMAT_V10,
+            "reference_repo": "https://example.invalid/spd.git",
+            "base_model_path": "Qwen/Qwen3-0.6B",
+            "model_type": "qwen3",
+            "checkpoint_version": 10
+        },
+        "topology": {
+            "hidden_size": hidden_size,
+            "vocab_size": 64,
+            "draft_vocab_size": 4,
+            "num_stages": 4,
+            "num_spec_layers": 1,
+            "trained_with_use_deepest": true,
+            "shallow_hidden_layer_indices": [[0, 10, 20, 31], [0, 8, 16, 24], [0], [0]],
+            "spec_init_from_base_layers": [31],
+            "draft_token_ids": [1, 2, 3, 4]
+        }
+    });
+    fs::write(
+        path,
+        serde_json::to_vec(&manifest).expect("serialize SPD manifest"),
+    )
+    .expect("write SPD manifest");
+}
+
+fn write_safetensors_with_data(path: &Path, tensors: &[(&str, &str, &[u64], &[u8])]) {
+    let mut header_entries = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, dtype, shape, tensor_bytes) in tensors {
+        assert_eq!(
+            tensor_bytes.len() as u64,
+            safetensors_tensor_byte_len(dtype, shape)
+        );
+        let start = data.len() as u64;
+        data.extend_from_slice(tensor_bytes);
+        let end = data.len() as u64;
+        header_entries.insert(
+            (*name).to_string(),
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [start, end],
+            }),
+        );
+    }
+    let header = serde_json::to_vec(&serde_json::Value::Object(header_entries))
+        .expect("serialize safetensors header");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&data);
+    fs::write(path, bytes).expect("write safetensors fixture");
+}
+
+fn safetensors_tensor_byte_len(dtype: &str, shape: &[u64]) -> u64 {
+    let element_bytes = match dtype {
+        "F32" | "I32" | "U32" => 4,
+        "I64" | "U64" | "F64" => 8,
+        _ => panic!("unexpected test dtype {dtype}"),
+    };
+    shape.iter().product::<u64>() * element_bytes
+}
+
+fn i64_tensor_bytes(values: &[i64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn write_spd_fixture(path: &Path, hidden_size: u32) {
+    let cur_in = vec![0_u8; 2 * hidden_size as usize * 4];
+    let row0 = i64_tensor_bytes(&[0, 10, 20, 31]);
+    let row1 = i64_tensor_bytes(&[0, 10, 31]);
+    write_safetensors_with_data(
+        path,
+        &[
+            ("cur_in", "F32", &[1, 2, hidden_size as u64], &cur_in),
+            ("tap_row_0_hf_indices", "I64", &[4], &row0),
+            ("tap_row_1_hf_indices", "I64", &[3], &row1),
+        ],
+    );
 }
 
 fn resolve_qwen_config_with_request_defaults(
@@ -721,6 +816,169 @@ draft_max_tokens = 8
         openai.wire_dtype,
         skippy_protocol::binary::WireActivationDType::Q8
     );
+}
+
+#[test]
+fn spd_speculative_controls_propagate_into_embedded_openai_args() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "spd"
+spd_manifest_path = "/models/spd/skippy-spd-head.json"
+spd_fixture_path = "/models/spd/spd-parity-fixture.safetensors"
+spd_model_path = "/models/qwen.gguf"
+spd_max_tokens = 2
+spd_top_k = 8
+spd_gpu_layers = 0
+spd_replay_fallback = true
+spd_optimistic_decode = true
+spd_optimistic_min_logit_margin = 5.5
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .expect("SPD config should resolve");
+
+    assert_eq!(resolved.speculative.mode, "spd");
+    assert!(resolved.speculative.explicit);
+    assert_eq!(resolved.speculative.draft_model_path, None);
+    assert_eq!(
+        resolved.speculative.spd_manifest_path.as_deref(),
+        Some(Path::new("/models/spd/skippy-spd-head.json"))
+    );
+    assert_eq!(
+        resolved.speculative.spd_fixture_path.as_deref(),
+        Some(Path::new("/models/spd/spd-parity-fixture.safetensors"))
+    );
+    assert_eq!(
+        resolved.speculative.spd_model_path.as_deref(),
+        Some(Path::new("/models/qwen.gguf"))
+    );
+
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("staged embedded args should build");
+    assert_eq!(openai.draft_model_path, None);
+    assert_eq!(openai.speculative_window, 2);
+    assert_eq!(
+        openai.spd_manifest_path.as_deref(),
+        Some(Path::new("/models/spd/skippy-spd-head.json"))
+    );
+    assert_eq!(
+        openai.spd_fixture_path.as_deref(),
+        Some(Path::new("/models/spd/spd-parity-fixture.safetensors"))
+    );
+    assert_eq!(
+        openai.spd_model_path.as_deref(),
+        Some(Path::new("/models/qwen.gguf"))
+    );
+    assert_eq!(openai.spd_top_k, 8);
+    assert_eq!(openai.spd_n_gpu_layers, Some(0));
+    assert!(openai.spd_replay_fallback);
+    assert!(openai.spd_optimistic_decode);
+    assert_eq!(openai.spd_optimistic_min_logit_margin, Some(5.5));
+}
+
+#[test]
+fn spd_stage_config_derives_tap_return_allowlist_from_topology() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let manifest_path = temp.path().join("skippy-spd-head.json");
+    let fixture_path = temp.path().join("spd-parity-fixture.safetensors");
+    write_spd_manifest(&manifest_path, 4);
+    write_spd_fixture(&fixture_path, 4);
+    let mesh_config = parse_config(&format!(
+        r#"
+[defaults.speculative]
+mode = "spd"
+spd_manifest_path = "{}"
+spd_fixture_path = "{}"
+spd_max_tokens = 2
+spd_top_k = 8
+"#,
+        manifest_path.display(),
+        fixture_path.display()
+    ));
+    let model_file = temp_model_file();
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .expect("SPD config should resolve");
+
+    let config = resolved
+        .to_stage_config(Some(fake_package_identity(32)), LoadMode::RuntimeSlice)
+        .expect("stage config should derive SPD tap-return allowlist");
+
+    assert_eq!(config.spd_tap_return_hf_indices, [8, 10, 16, 20, 24, 31]);
+}
+
+#[test]
+fn spd_and_draft_sources_cannot_be_combined() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "draft"
+draft_model_path = "/models/qwen-draft.gguf"
+draft_max_tokens = 4
+spd_manifest_path = "/models/spd/skippy-spd-head.json"
+spd_fixture_path = "/models/spd/spd-parity-fixture.safetensors"
+spd_max_tokens = 2
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let err = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("draft-model and SPD speculative sources cannot both be configured"));
+}
+
+#[test]
+fn spd_knobs_do_not_satisfy_draft_mode() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "draft"
+draft_max_tokens = 4
+spd_manifest_path = "/models/spd/skippy-spd-head.json"
+spd_fixture_path = "/models/spd/spd-parity-fixture.safetensors"
+spd_max_tokens = 2
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let err = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("draft-model and SPD speculative sources cannot both be configured"));
 }
 
 #[test]

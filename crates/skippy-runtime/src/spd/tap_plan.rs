@@ -184,6 +184,7 @@ mod tests {
             vocab_size: 248_320,
             draft_vocab_size: 50_000,
             num_stages: 4,
+            stage_layer_boundaries: Some(vec![8, 16, 24, 32]),
             num_spec_layers: 4,
             trained_with_use_deepest: true,
             shallow_hidden_layer_indices: vec![

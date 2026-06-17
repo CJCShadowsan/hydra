@@ -1479,6 +1479,7 @@ fn split_runtime_stage_load_request(
         stage_index: stage.stage_index,
         layer_start: stage.layer_start,
         layer_end: stage.layer_end,
+        spd_tap_return_hf_indices: resolved_config.spd_tap_return_hf_indices.clone(),
         model_path: Some(stage_load_model_path(
             settings.load_mode.clone(),
             &spec.package.package_ref,
@@ -3825,6 +3826,94 @@ mod tests {
         }
     }
 
+    fn write_spd_manifest(path: &Path, hidden_size: u32) {
+        let manifest = serde_json::json!({
+            "schema": skippy_runtime::spd::SPD_HEAD_MANIFEST_SCHEMA,
+            "checkpoint": {
+                "path": "speculation_head_final.pt",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bytes": 1
+            },
+            "source": {
+                "format": skippy_runtime::spd::TORCH_SPD_HEAD_FORMAT_V10,
+                "reference_repo": "https://example.invalid/spd.git",
+                "base_model_path": "Qwen",
+                "model_type": "qwen3",
+                "checkpoint_version": 10
+            },
+            "topology": {
+                "hidden_size": hidden_size,
+                "vocab_size": 64,
+                "draft_vocab_size": 4,
+                "num_stages": 4,
+                "num_spec_layers": 1,
+                "trained_with_use_deepest": true,
+                "shallow_hidden_layer_indices": [[0, 10, 20, 31], [0, 8, 16, 24], [0], [0]],
+                "spec_init_from_base_layers": [31],
+                "draft_token_ids": [1, 2, 3, 4]
+            }
+        });
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn write_spd_fixture(path: &Path, hidden_size: u32) {
+        let cur_in = vec![0_u8; 2 * hidden_size as usize * 4];
+        let row0 = i64_tensor_bytes(&[0, 10, 20, 31]);
+        let row1 = i64_tensor_bytes(&[0, 10, 31]);
+        write_safetensors_with_data(
+            path,
+            &[
+                ("cur_in", "F32", &[1, 2, hidden_size as u64], &cur_in),
+                ("tap_row_0_hf_indices", "I64", &[4], &row0),
+                ("tap_row_1_hf_indices", "I64", &[3], &row1),
+            ],
+        );
+    }
+
+    fn write_safetensors_with_data(path: &Path, tensors: &[(&str, &str, &[u64], &[u8])]) {
+        let mut header_entries = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, tensor_bytes) in tensors {
+            assert_eq!(
+                tensor_bytes.len() as u64,
+                safetensors_tensor_byte_len(dtype, shape)
+            );
+            let start = data.len() as u64;
+            data.extend_from_slice(tensor_bytes);
+            let end = data.len() as u64;
+            header_entries.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let header = serde_json::to_vec(&serde_json::Value::Object(header_entries)).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn safetensors_tensor_byte_len(dtype: &str, shape: &[u64]) -> u64 {
+        let element_bytes = match dtype {
+            "F32" | "I32" | "U32" => 4,
+            "I64" | "U64" | "F64" => 8,
+            _ => panic!("unexpected test dtype {dtype}"),
+        };
+        shape.iter().product::<u64>() * element_bytes
+    }
+
+    fn i64_tensor_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
     fn stage_load_request(load_mode: LoadMode) -> skippy::StageLoadRequest {
         skippy::StageLoadRequest {
             topology_id: "topology-a".to_string(),
@@ -3842,6 +3931,7 @@ mod tests {
             stage_index: 1,
             layer_start: 18,
             layer_end: 36,
+            spd_tap_return_hf_indices: Vec::new(),
             model_path: Some("/models/qwen.gguf".to_string()),
             source_model_bytes: Some(4_900_000_000),
             projector_path: None,
@@ -4236,6 +4326,102 @@ stop = ["END"]
         );
         assert_eq!(settings.embedded_openai.speculative_window, 7);
         assert_eq!(settings.embedded_openai.draft_n_gpu_layers, Some(11));
+    }
+
+    #[tokio::test]
+    async fn split_generation_load_settings_carries_spd_tap_allowlist_to_stage_load() {
+        let node = mesh::Node::new_for_tests(NodeRole::Host { http_port: 9337 })
+            .await
+            .unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let model_path = temp_dir.path().join("qwen.gguf");
+        let manifest_path = temp_dir.path().join("skippy-spd-head.json");
+        let fixture_path = temp_dir.path().join("spd-parity-fixture.safetensors");
+        write_fake_gguf_model(&model_path);
+        write_spd_manifest(&manifest_path, 4);
+        write_spd_fixture(&fixture_path, 4);
+        let mesh_config: plugin::MeshConfig = toml::from_str(&format!(
+            r#"
+[[models]]
+model = "Qwen"
+
+[models.hardware]
+model_path = "{model_path}"
+
+[models.speculative]
+mode = "spd"
+spd_manifest_path = "{manifest_path}"
+spd_fixture_path = "{fixture_path}"
+spd_max_tokens = 4
+spd_top_k = 1
+spd_gpu_layers = 0
+spd_optimistic_decode = true
+"#,
+            model_path = model_path.display(),
+            manifest_path = manifest_path.display(),
+            fixture_path = fixture_path.display(),
+        ))
+        .expect("test mesh config should parse");
+        let local_id = node.id();
+        let generation = SplitTopologyGeneration::new(
+            "spd-topology".into(),
+            "spd-run".into(),
+            1,
+            vec![SplitParticipant::new(local_id, 24_000_000_000, None)],
+            vec![
+                local_stage(local_id, 0, 0, 12),
+                local_stage(local_id, 1, 12, 40),
+            ],
+        );
+        let package = package(40);
+        let spec = SplitGenerationLoadSpec {
+            node: &node,
+            mesh_config: &mesh_config,
+            model_ref: "Qwen",
+            model_path: &model_path,
+            package: &package,
+            generation: &generation,
+            projector_path: None,
+            ctx_size: 8192,
+            pinned_gpu: None,
+            slots: 4,
+            cache_type_k_override: None,
+            cache_type_v_override: None,
+            n_batch_override: None,
+            n_ubatch_override: None,
+            flash_attention_override: FlashAttentionType::Auto,
+            openai_guardrail_policy: openai_guardrail_policy_handle(
+                openai_frontend::GuardrailMode::Disabled,
+            ),
+            skippy_telemetry: skippy::SkippyTelemetryOptions::off(),
+            survey_telemetry: survey::SurveyTelemetry::disabled(),
+        };
+
+        let settings =
+            split_generation_load_settings(&spec).expect("split settings should resolve");
+        assert_eq!(
+            settings.runtime_options.config.spd_tap_return_hf_indices,
+            [8, 10, 16, 20, 24, 31]
+        );
+        assert_eq!(settings.embedded_openai.speculative_window, 4);
+        assert_eq!(
+            settings.embedded_openai.spd_manifest_path.as_deref(),
+            Some(manifest_path.as_path())
+        );
+        assert!(settings.embedded_openai.spd_optimistic_decode);
+
+        let stage1_load = split_runtime_stage_load_request(
+            &spec,
+            &settings,
+            &generation.stages[1],
+            None,
+            "127.0.0.1:32000",
+        );
+
+        assert_eq!(
+            stage1_load.spd_tap_return_hf_indices,
+            [8, 10, 16, 20, 24, 31]
+        );
     }
 
     #[tokio::test]

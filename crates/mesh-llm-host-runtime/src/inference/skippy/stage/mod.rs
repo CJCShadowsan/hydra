@@ -715,6 +715,7 @@ fn stage_config(
         stage_index: load.stage_index,
         layer_start: load.layer_start,
         layer_end: load.layer_end,
+        spd_tap_return_hf_indices: load.spd_tap_return_hf_indices.clone(),
         ctx_size: load.ctx_size,
         lane_count: load.lane_count,
         n_batch: load.n_batch,

@@ -4,9 +4,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use openai_frontend::OpenAiHookPolicy;
 use skippy_protocol::{LoadMode, StageConfig, StageKvCacheConfig, StageKvCachePayload};
+use skippy_runtime::spd::{SpdHeadManifest, required_spd_hf_indices_for_topology};
 use skippy_server::{
     EmbeddedOpenAiArgs, EmbeddedOpenAiRequestDefaults, EmbeddedRuntimeOptions, telemetry::Telemetry,
 };
@@ -133,6 +134,7 @@ impl ResolvedSkippyConfig {
             family_policy_for_model_path(&self.hardware.resolved_model_path, Some(&self.model_id));
         stage_config.kv_cache = self
             .resolve_stage_kv_cache(family_policy.stage_kv_cache_config_for_stage(&stage_config))?;
+        stage_config.spd_tap_return_hf_indices = self.spd_tap_return_hf_indices()?;
         Ok(stage_config)
     }
 
@@ -160,6 +162,8 @@ impl ResolvedSkippyConfig {
     ) -> Result<ResolvedEmbeddedOpenAiArgs> {
         self.ensure_embedded_openai_safe(staged)?;
         let mode = self.speculative_mode_for_embedded(staged);
+        let draft_enabled = mode == "draft";
+        let spd_enabled = mode == "spd";
         Ok(ResolvedEmbeddedOpenAiArgs {
             model_id: Some(self.model_id.clone()),
             default_max_tokens: self.request_defaults.max_tokens,
@@ -224,18 +228,52 @@ impl ResolvedSkippyConfig {
             prefill_adaptive_start: BUILTIN_PREFILL_ADAPTIVE_START,
             prefill_adaptive_step: BUILTIN_PREFILL_ADAPTIVE_STEP,
             prefill_adaptive_max: BUILTIN_PREFILL_ADAPTIVE_MAX,
-            draft_model_path: if mode == "draft" {
+            draft_model_path: if draft_enabled {
                 self.speculative.draft_model_path.clone()
             } else {
                 None
             },
-            speculative_window: if mode == "draft" {
+            spd_manifest_path: if spd_enabled {
+                self.speculative.spd_manifest_path.clone()
+            } else {
+                None
+            },
+            spd_fixture_path: if spd_enabled {
+                self.speculative.spd_fixture_path.clone()
+            } else {
+                None
+            },
+            spd_model_path: if spd_enabled {
+                self.speculative.spd_model_path.clone()
+            } else {
+                None
+            },
+            spd_top_k: if spd_enabled {
+                self.speculative.spd_top_k
+            } else {
+                1
+            },
+            spd_n_gpu_layers: if spd_enabled {
+                self.speculative.spd_n_gpu_layers
+            } else {
+                None
+            },
+            spd_replay_fallback: spd_enabled && self.speculative.spd_replay_fallback,
+            spd_optimistic_decode: spd_enabled && self.speculative.spd_optimistic_decode,
+            spd_optimistic_min_logit_margin: if spd_enabled {
+                self.speculative.spd_optimistic_min_logit_margin
+            } else {
+                None
+            },
+            speculative_window: if draft_enabled {
                 self.speculative.draft_max_tokens as usize
+            } else if spd_enabled {
+                self.speculative.spd_max_tokens as usize
             } else {
                 0
             },
             adaptive_speculative_window: false,
-            draft_n_gpu_layers: if mode == "draft" {
+            draft_n_gpu_layers: if draft_enabled {
                 self.speculative.draft_n_gpu_layers
             } else {
                 None
@@ -263,7 +301,7 @@ impl ResolvedSkippyConfig {
                 bail!("skippy prefill chunk controls require staged serving");
             }
             if self.speculative.explicit {
-                bail!("speculative draft controls require staged serving");
+                bail!("speculative controls require staged serving");
             }
         }
         Ok(())
@@ -275,9 +313,31 @@ impl ResolvedSkippyConfig {
         }
         if self.speculative.mode == "draft" && self.speculative.draft_model_path.is_some() {
             "draft"
+        } else if self.speculative.mode == "spd" && self.speculative.spd_manifest_path.is_some() {
+            "spd"
         } else {
             "disabled"
         }
+    }
+
+    fn spd_tap_return_hf_indices(&self) -> Result<Vec<u32>> {
+        if self.speculative_mode_for_embedded(true) != "spd" {
+            return Ok(Vec::new());
+        }
+        let manifest_path = self
+            .speculative
+            .spd_manifest_path
+            .as_ref()
+            .context("missing SPD manifest path")?;
+        let manifest = SpdHeadManifest::from_path(manifest_path).with_context(|| {
+            format!(
+                "derive SPD tap-return allowlist from {}",
+                manifest_path.display()
+            )
+        })?;
+        let mut indices = required_spd_hf_indices_for_topology(&manifest.topology);
+        indices.retain(|hf_index| *hf_index != 0);
+        Ok(indices)
     }
 
     fn resolve_stage_kv_cache(
@@ -339,6 +399,14 @@ impl ResolvedEmbeddedOpenAiArgs {
             prefill_adaptive_step: BUILTIN_PREFILL_ADAPTIVE_STEP,
             prefill_adaptive_max: BUILTIN_PREFILL_ADAPTIVE_MAX,
             draft_model_path: None,
+            spd_manifest_path: None,
+            spd_fixture_path: None,
+            spd_model_path: None,
+            spd_top_k: 1,
+            spd_n_gpu_layers: None,
+            spd_replay_fallback: false,
+            spd_optimistic_decode: false,
+            spd_optimistic_min_logit_margin: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
             draft_n_gpu_layers: None,
@@ -368,6 +436,14 @@ impl ResolvedEmbeddedOpenAiArgs {
             prefill_adaptive_step: BUILTIN_PREFILL_ADAPTIVE_STEP,
             prefill_adaptive_max: BUILTIN_PREFILL_ADAPTIVE_MAX,
             draft_model_path: None,
+            spd_manifest_path: None,
+            spd_fixture_path: None,
+            spd_model_path: None,
+            spd_top_k: 1,
+            spd_n_gpu_layers: None,
+            spd_replay_fallback: false,
+            spd_optimistic_decode: false,
+            spd_optimistic_min_logit_margin: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
             draft_n_gpu_layers: None,
@@ -402,12 +478,14 @@ impl ResolvedEmbeddedOpenAiArgs {
             prefill_adaptive_step: self.prefill_adaptive_step,
             prefill_adaptive_max: self.prefill_adaptive_max,
             draft_model_path: self.draft_model_path,
-            spd_manifest_path: None,
-            spd_fixture_path: None,
-            spd_model_path: None,
-            spd_top_k: 1,
-            spd_n_gpu_layers: None,
-            spd_replay_fallback: false,
+            spd_manifest_path: self.spd_manifest_path,
+            spd_fixture_path: self.spd_fixture_path,
+            spd_model_path: self.spd_model_path,
+            spd_top_k: self.spd_top_k,
+            spd_n_gpu_layers: self.spd_n_gpu_layers,
+            spd_replay_fallback: self.spd_replay_fallback,
+            spd_optimistic_decode: self.spd_optimistic_decode,
+            spd_optimistic_min_logit_margin: self.spd_optimistic_min_logit_margin,
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,
             draft_n_gpu_layers: self.draft_n_gpu_layers,

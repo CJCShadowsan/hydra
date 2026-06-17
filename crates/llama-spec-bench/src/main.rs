@@ -217,9 +217,9 @@ fn main() -> Result<()> {
         args.speculative_window
     );
 
-    let target = open_full_model(&args.target_model_path, args.ctx_size, args.n_gpu_layers)
+    let target = open_full_model(&args.target_model_path, args.ctx_size, args.n_gpu_layers, 2)
         .with_context(|| format!("open target model {}", args.target_model_path.display()))?;
-    let draft = open_full_model(&args.draft_model_path, args.ctx_size, args.n_gpu_layers)
+    let draft = open_full_model(&args.draft_model_path, args.ctx_size, args.n_gpu_layers, 1)
         .with_context(|| format!("open draft model {}", args.draft_model_path.display()))?;
 
     let mut reports = Vec::with_capacity(prompts.len());
@@ -261,7 +261,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn open_full_model(path: &Path, ctx_size: u32, n_gpu_layers: i32) -> Result<StageModel> {
+fn open_full_model(
+    path: &Path,
+    ctx_size: u32,
+    n_gpu_layers: i32,
+    lane_count: u32,
+) -> Result<StageModel> {
     let layer_count = model_layer_count(path)?;
     StageModel::open(
         path,
@@ -270,7 +275,7 @@ fn open_full_model(path: &Path, ctx_size: u32, n_gpu_layers: i32) -> Result<Stag
             layer_start: 0,
             layer_end: layer_count,
             ctx_size,
-            lane_count: 1,
+            lane_count,
             n_batch: None,
             n_ubatch: None,
             n_threads: None,

@@ -294,6 +294,7 @@ fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         stage_index: 1,
         layer_start: 4,
         layer_end: 8,
+        spd_tap_return_hf_indices: vec![10, 20, 31],
         model_path: Some("/models/demo.gguf".to_string()),
         source_model_bytes: Some(123_456_789),
         projector_path: None,
@@ -641,14 +642,16 @@ async fn routing_telemetry_sink_receives_request_pressure_and_attempt_events() {
 }
 
 #[test]
-fn stage_load_proto_roundtrip_preserves_source_model_bytes() {
+fn stage_load_proto_roundtrip_preserves_source_identity_and_spd_taps() {
     let load = stage_load_request();
     let proto = stage_load_to_proto(load.clone());
     assert_eq!(proto.source_model_bytes, Some(123_456_789));
+    assert_eq!(proto.spd_tap_return_hf_indices, [10, 20, 31]);
 
     let decoded = stage_load_from_proto(proto).unwrap();
     assert_eq!(decoded.source_model_bytes, Some(123_456_789));
     assert_eq!(decoded.model_path.as_deref(), Some("/models/demo.gguf"));
+    assert_eq!(decoded.spd_tap_return_hf_indices, [10, 20, 31]);
 }
 
 #[test]
@@ -7417,6 +7420,7 @@ fn test_stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         stage_index: 1,
         layer_start: 12,
         layer_end: 24,
+        spd_tap_return_hf_indices: Vec::new(),
         model_path: Some("/model.gguf".to_string()),
         source_model_bytes: Some(123_456_789),
         projector_path: None,

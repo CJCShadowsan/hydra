@@ -21,6 +21,7 @@ fn load_request() -> StageLoadRequest {
         stage_index: 0,
         layer_start: 0,
         layer_end: 12,
+        spd_tap_return_hf_indices: vec![10, 20, 31],
         model_path: Some("/models/model.gguf".to_string()),
         source_model_bytes: Some(64 * 1024 * 1024 * 1024),
         projector_path: Some("/models/mmproj.gguf".to_string()),
@@ -182,6 +183,7 @@ fn assert_stage_config_identity(config: &StageConfig) {
     assert_eq!(config.stage_index, 0);
     assert_eq!(config.layer_start, 0);
     assert_eq!(config.layer_end, 12);
+    assert_eq!(config.spd_tap_return_hf_indices, [10, 20, 31]);
     assert_eq!(config.lane_count, 3);
 }
 

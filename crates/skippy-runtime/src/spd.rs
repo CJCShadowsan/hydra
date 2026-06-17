@@ -1,11 +1,13 @@
 mod gguf_embedding;
 mod live_tap;
 mod qwen;
+mod rolling;
 mod safetensors;
 mod tap_input;
 mod tap_plan;
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -20,13 +22,21 @@ pub use live_tap::{
     assemble_spd_live_cur_in_for_positions, sliding_spd_row_positions,
 };
 pub use qwen::{
-    SpdQwen3FixtureDiagnostics, SpdQwen3FixtureParity, SpdQwen3FixtureTopK, SpdQwen3ForwardInput,
-    SpdQwen3Head, run_qwen3_fixture_parity, run_qwen3_forward_from_inputs,
+    SpdQwen3CachedFixtureDiagnostics, SpdQwen3CachedFixtureParity, SpdQwen3FixtureDiagnostics,
+    SpdQwen3FixtureParity, SpdQwen3FixtureTopK, SpdQwen3ForwardCache, SpdQwen3ForwardInput,
+    SpdQwen3ForwardTiming, SpdQwen3Head, SpdQwen3TimedForward, run_qwen3_cached_fixture_parity,
+    run_qwen3_fixture_parity, run_qwen3_forward_from_inputs,
+};
+pub use rolling::{
+    SpdRollingDraftPlan, SpdRollingInsertedDraft, SpdRollingObserver, SpdRollingScheduler,
+    SpdRollingSnapshot, SpdRollingSpeculationRows, SpdRollingTraceReplay, SpdRollingVerifiedDelta,
+    SpdRollingVerifyOutcome,
 };
 pub use safetensors::{SpdSafetensorsFile, SpdSafetensorsIndex, SpdSafetensorsTensor};
 pub use tap_input::{
     SpdTapInputFixtureParity, SpdTapInputFixtureRowParity, SpdTapInputProjection,
-    project_spd_tap_input_row, run_spd_tap_input_fixture_parity,
+    SpdTapInputProjector, project_spd_tap_input_row, required_spd_hf_indices_for_topology,
+    run_spd_tap_input_fixture_parity, spd_hf_indices_for_stage_id,
 };
 pub use tap_plan::{
     SpdHiddenStateRequirement, SpdHiddenStateSource, SpdHiddenTapPlan, SpdStageLayerRange,
@@ -80,6 +90,8 @@ pub struct SpdHeadTopology {
     pub vocab_size: u32,
     pub draft_vocab_size: u32,
     pub num_stages: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_layer_boundaries: Option<Vec<u32>>,
     pub num_spec_layers: u32,
     pub trained_with_use_deepest: bool,
     pub shallow_hidden_layer_indices: Vec<Vec<u32>>,
@@ -93,6 +105,58 @@ pub struct SpdHeadRuntimeProfile<'a> {
     pub hidden_size: u32,
     pub vocab_size: u32,
     pub num_stages: u32,
+}
+
+pub fn spd_fixture_required_hf_indices(
+    fixture_path: impl AsRef<Path>,
+    hidden_size: u32,
+) -> Result<Vec<u32>> {
+    let fixture = SpdSafetensorsFile::open(fixture_path)?;
+    let row_count = spd_fixture_cur_in_row_count(&fixture, hidden_size)?;
+    let row_hf_indices = spd_fixture_row_hf_indices(&fixture, row_count)?;
+    Ok(required_spd_hf_indices(&row_hf_indices))
+}
+
+pub fn spd_fixture_cur_in_row_count(
+    fixture: &SpdSafetensorsFile,
+    hidden_size: u32,
+) -> Result<usize> {
+    let shape = &fixture.index.tensor("cur_in")?.shape;
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != u64::from(hidden_size) {
+        bail!(
+            "SPD fixture cur_in shape {:?} is not [1, rows, hidden]",
+            shape
+        );
+    }
+    usize::try_from(shape[1]).context("SPD fixture row count exceeds usize")
+}
+
+pub fn spd_fixture_row_hf_indices(
+    fixture: &SpdSafetensorsFile,
+    row_count: usize,
+) -> Result<Vec<Vec<u32>>> {
+    (0..row_count)
+        .map(|row_index| {
+            fixture
+                .read_tensor_i64(&format!("tap_row_{row_index}_hf_indices"))?
+                .into_iter()
+                .map(|value| {
+                    u32::try_from(value).with_context(|| {
+                        format!("SPD fixture row {row_index} has negative hf index")
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub fn required_spd_hf_indices(row_hf_indices: &[Vec<u32>]) -> Vec<u32> {
+    row_hf_indices
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 impl SpdHeadManifest {
@@ -359,6 +423,9 @@ impl SpdHeadTopology {
         if self.num_stages == 0 {
             bail!("SPD head num_stages must be greater than zero");
         }
+        if let Some(boundaries) = &self.stage_layer_boundaries {
+            validate_stage_layer_boundaries(boundaries, self.num_stages)?;
+        }
         if self.num_spec_layers == 0 {
             bail!("SPD head num_spec_layers must be greater than zero");
         }
@@ -403,6 +470,25 @@ impl SpdHeadTopology {
         }
         Ok(())
     }
+}
+
+fn validate_stage_layer_boundaries(boundaries: &[u32], num_stages: u32) -> Result<()> {
+    if boundaries.len() != num_stages as usize {
+        bail!(
+            "SPD head stage_layer_boundaries length {} must match num_stages {}",
+            boundaries.len(),
+            num_stages
+        );
+    }
+    if boundaries.first() == Some(&0) {
+        bail!("SPD head stage_layer_boundaries must use positive layer end indices");
+    }
+    for pair in boundaries.windows(2) {
+        if pair[0] >= pair[1] {
+            bail!("SPD head stage_layer_boundaries must be strictly increasing");
+        }
+    }
+    Ok(())
 }
 
 fn verify_checkpoint_artifact(
@@ -501,6 +587,7 @@ mod tests {
                 vocab_size: 10,
                 draft_vocab_size: 3,
                 num_stages: 2,
+                stage_layer_boundaries: Some(vec![7, 14]),
                 num_spec_layers: 1,
                 trained_with_use_deepest: true,
                 shallow_hidden_layer_indices: vec![vec![0, 7, 14], vec![0, 14]],
@@ -552,6 +639,41 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn write_test_safetensors_with_data(path: &Path, tensors: &[(&str, &str, &[u64], &[u8])]) {
+        let mut header_entries = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, tensor_bytes) in tensors {
+            assert_eq!(
+                tensor_bytes.len() as u64,
+                test_tensor_byte_len(dtype, shape)
+            );
+            let start = data.len() as u64;
+            data.extend_from_slice(tensor_bytes);
+            let end = data.len() as u64;
+            header_entries.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let header = serde_json::to_vec(&serde_json::Value::Object(header_entries)).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn i64_tensor_bytes(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
     fn test_tensor_byte_len(dtype: &str, shape: &[u64]) -> u64 {
         let element_bytes = match dtype {
             "BF16" | "F16" | "I16" | "U16" => 2,
@@ -568,11 +690,52 @@ mod tests {
     }
 
     #[test]
+    fn derives_required_hf_indices_from_spd_fixture_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("spd-fixture.safetensors");
+        let cur_in = vec![0_u8; 2 * 4 * 4];
+        let row0 = i64_tensor_bytes(&[0, 10, 20, 31]);
+        let row1 = i64_tensor_bytes(&[0, 10, 31]);
+        write_test_safetensors_with_data(
+            &fixture,
+            &[
+                ("cur_in", "F32", &[1, 2, 4], &cur_in),
+                ("tap_row_0_hf_indices", "I64", &[4], &row0),
+                ("tap_row_1_hf_indices", "I64", &[3], &row1),
+            ],
+        );
+
+        let indices = spd_fixture_required_hf_indices(&fixture, 4).unwrap();
+
+        assert_eq!(indices, [0, 10, 20, 31]);
+    }
+
+    #[test]
     fn rejects_draft_vocab_size_mismatch() {
         let mut manifest = valid_manifest();
         manifest.topology.draft_token_ids = Some(vec![1, 3]);
         let error = manifest.validate().unwrap_err().to_string();
         assert!(error.contains("draft_token_ids length"));
+    }
+
+    #[test]
+    fn rejects_stage_layer_boundary_count_mismatch() {
+        let mut manifest = valid_manifest();
+        manifest.topology.stage_layer_boundaries = Some(vec![7]);
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains("stage_layer_boundaries length"));
+    }
+
+    #[test]
+    fn rejects_unsorted_stage_layer_boundaries() {
+        let mut manifest = valid_manifest();
+        manifest.topology.stage_layer_boundaries = Some(vec![14, 7]);
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains("strictly increasing"));
     }
 
     #[test]
@@ -776,6 +939,52 @@ mod tests {
         assert!(
             parity.diagnostics.final_hidden_max_abs_diff <= 0.125,
             "diagnostics: {:?}",
+            parity.diagnostics
+        );
+    }
+
+    #[test]
+    fn qwen3_cached_fixture_forward_matches_python_topk_when_env_is_set() {
+        let (Ok(manifest_path), Ok(fixture_path)) = (
+            std::env::var("SKIPPY_SPD_MANIFEST"),
+            std::env::var("SKIPPY_SPD_PARITY_FIXTURE"),
+        ) else {
+            return;
+        };
+        let fixture_file = SpdSafetensorsFile::open(PathBuf::from(&fixture_path)).unwrap();
+        if !fixture_file
+            .index
+            .tensors
+            .contains_key("python_cached_logits")
+        {
+            return;
+        }
+        let parity = qwen::run_qwen3_cached_fixture_parity(manifest_path, fixture_path, 8)
+            .unwrap()
+            .expect("cached fixture tensors should produce cached parity");
+        assert_eq!(
+            parity.rust.draft_indices, parity.python.draft_indices,
+            "cached diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert_eq!(
+            parity.rust.token_ids, parity.python.token_ids,
+            "cached diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert!(
+            parity.diagnostics.spec_query_max_abs_diff <= 0.125,
+            "cached diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert!(
+            parity.diagnostics.final_hidden_max_abs_diff <= 0.125,
+            "cached diagnostics: {:?}",
+            parity.diagnostics
+        );
+        assert!(
+            parity.diagnostics.logits_max_abs_diff <= 0.25,
+            "cached diagnostics: {:?}",
             parity.diagnostics
         );
     }

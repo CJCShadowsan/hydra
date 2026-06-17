@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap,
-    io,
+    collections::{HashMap, VecDeque},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
@@ -18,7 +18,8 @@ use skippy_protocol::{
         StageReply, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
         WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready,
         send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_stats, send_reply_spd_tap_with_stats, write_stage_message,
+        send_reply_predicted_with_stats, send_reply_spd_tap_with_stats, state_flags,
+        write_stage_message,
     },
 };
 
@@ -39,8 +40,51 @@ impl PredictionReturnKey {
     }
 }
 
+const PREDICTION_RETURN_ORIGIN_MAGIC: i32 = 0x5350_4452; // "SPDR"
+const PREDICTION_RETURN_ORIGIN_VERSION: i32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PredictionReturnOrigin {
+    pub(crate) kind: WireMessageKind,
+    pub(crate) pos_start: i32,
+    pub(crate) token_count: i32,
+    pub(crate) prompt_token_count: i32,
+    pub(crate) decode_step: i32,
+    pub(crate) checkpoint_generation: i32,
+}
+
+impl PredictionReturnOrigin {
+    pub(crate) fn from_message(message: &StageWireMessage) -> Self {
+        Self {
+            kind: message.kind,
+            pos_start: message.pos_start,
+            token_count: message.token_count,
+            prompt_token_count: message.state.prompt_token_count,
+            decode_step: message.state.decode_step,
+            checkpoint_generation: message.state.checkpoint_generation,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PredictionReturnItem {
+    pub(crate) reply: StageReply,
+    pub(crate) origin: Option<PredictionReturnOrigin>,
+}
+
+impl PredictionReturnItem {
+    pub(crate) fn matches_origin(
+        &self,
+        expected: WireReplyKind,
+        origin: PredictionReturnOrigin,
+    ) -> bool {
+        self.reply.kind == expected && self.origin.is_none_or(|actual| actual == origin)
+    }
+}
+
 pub struct PredictionReturnHub {
-    waiters: Mutex<HashMap<PredictionReturnKey, mpsc::Sender<Result<StageReply, String>>>>,
+    waiters:
+        Mutex<HashMap<PredictionReturnKey, mpsc::Sender<Result<PredictionReturnItem, String>>>>,
 }
 
 impl Default for PredictionReturnHub {
@@ -142,6 +186,7 @@ impl PredictionReturnHub {
             key,
             hub: self.clone(),
             receiver,
+            buffered: Mutex::new(VecDeque::new()),
             timeout: Duration::from_secs(300),
         })
     }
@@ -160,6 +205,7 @@ impl PredictionReturnHub {
         if open.kind != WireMessageKind::PredictionReturnOpen {
             bail!("expected prediction return open message");
         }
+        let origin_enabled = (open.state.flags & state_flags::PREDICTION_RETURN_ORIGIN) != 0;
         let key = PredictionReturnKey::new(open.request_id, open.session_id);
         let sender = self
             .waiters
@@ -169,9 +215,9 @@ impl PredictionReturnHub {
             .cloned()
             .ok_or_else(|| anyhow!("no prediction return waiter for request {}", key.request_id))?;
         loop {
-            match recv_reply(&mut stream) {
-                Ok(reply) => {
-                    if sender.send(Ok(reply)).is_err() {
+            match recv_direct_prediction_return(&mut stream, origin_enabled) {
+                Ok(item) => {
+                    if sender.send(Ok(item)).is_err() {
                         return Ok(());
                     }
                 }
@@ -188,7 +234,8 @@ impl PredictionReturnHub {
 pub(crate) struct PredictionReturnReceiver {
     key: PredictionReturnKey,
     hub: Arc<PredictionReturnHub>,
-    receiver: mpsc::Receiver<Result<StageReply, String>>,
+    receiver: mpsc::Receiver<Result<PredictionReturnItem, String>>,
+    buffered: Mutex<VecDeque<PredictionReturnItem>>,
     timeout: Duration,
 }
 
@@ -205,12 +252,59 @@ impl PredictionReturnReceiver {
     }
 
     pub(crate) fn recv(&self) -> Result<StageReply> {
-        let reply = self
-            .receiver
+        Ok(self.recv_item()?.reply)
+    }
+
+    pub(crate) fn recv_item(&self) -> Result<PredictionReturnItem> {
+        if let Some(item) = self
+            .buffered
+            .lock()
+            .map_err(|_| anyhow!("prediction return buffer lock poisoned"))?
+            .pop_front()
+        {
+            return Ok(item);
+        }
+        self.recv_channel_item()
+    }
+
+    pub(crate) fn recv_item_matching(
+        &self,
+        mut matches: impl FnMut(&PredictionReturnItem) -> bool,
+    ) -> Result<PredictionReturnItem> {
+        loop {
+            if let Some(item) = self.take_buffered_matching(&mut matches)? {
+                return Ok(item);
+            }
+            let item = self.recv_channel_item()?;
+            if matches(&item) {
+                return Ok(item);
+            }
+            self.buffered
+                .lock()
+                .map_err(|_| anyhow!("prediction return buffer lock poisoned"))?
+                .push_back(item);
+        }
+    }
+
+    fn take_buffered_matching(
+        &self,
+        matches: &mut impl FnMut(&PredictionReturnItem) -> bool,
+    ) -> Result<Option<PredictionReturnItem>> {
+        let mut buffered = self
+            .buffered
+            .lock()
+            .map_err(|_| anyhow!("prediction return buffer lock poisoned"))?;
+        let Some(index) = buffered.iter().position(matches) else {
+            return Ok(None);
+        };
+        Ok(buffered.remove(index))
+    }
+
+    fn recv_channel_item(&self) -> Result<PredictionReturnItem> {
+        self.receiver
             .recv_timeout(self.timeout)
             .context("timed out waiting for direct prediction return")?
-            .map_err(|error| anyhow!(error))?;
-        Ok(reply)
+            .map_err(|error| anyhow!(error))
     }
 }
 
@@ -261,29 +355,104 @@ pub(crate) fn open_prediction_return_stream(
 
 pub(crate) fn send_direct_prediction_return(
     stream: &mut TcpStream,
+    origin: PredictionReturnOrigin,
     reply: StageReply,
 ) -> Result<()> {
+    write_direct_prediction_return(stream, Some(origin), reply)
+}
+
+fn write_direct_prediction_return(
+    mut writer: impl Write,
+    origin: Option<PredictionReturnOrigin>,
+    reply: StageReply,
+) -> Result<()> {
+    if let Some(origin) = origin {
+        write_prediction_return_origin(&mut writer, origin)
+            .context("send direct prediction return origin")?;
+    }
     match reply.kind {
         WireReplyKind::PredictedToken => {
-            send_reply_predicted_with_stats(stream, reply.predicted, reply.stats)
+            send_reply_predicted_with_stats(&mut writer, reply.predicted, reply.stats)
                 .context("send direct predicted-token return")
         }
-        WireReplyKind::PredictedTokens => {
-            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
-                .context("send direct predicted-tokens return")
-        }
+        WireReplyKind::PredictedTokens => send_reply_predicted_tokens_with_stats(
+            &mut writer,
+            &reply.predicted_tokens,
+            reply.stats,
+        )
+        .context("send direct predicted-tokens return"),
         WireReplyKind::Ack => {
-            send_reply_ack_with_stats(stream, reply.stats).context("send direct ACK return")
+            send_reply_ack_with_stats(&mut writer, reply.stats).context("send direct ACK return")
         }
         WireReplyKind::SpdTap => {
             let tap = reply
                 .spd_tap
                 .as_ref()
                 .context("missing SPD tap reply payload")?;
-            send_reply_spd_tap_with_stats(stream, tap, reply.stats)
+            send_reply_spd_tap_with_stats(&mut writer, tap, reply.stats)
                 .context("send direct SPD tap return")
         }
     }
+}
+
+fn recv_direct_prediction_return(
+    mut reader: impl Read,
+    origin_enabled: bool,
+) -> io::Result<PredictionReturnItem> {
+    let origin = if origin_enabled {
+        Some(read_prediction_return_origin(&mut reader)?)
+    } else {
+        None
+    };
+    let reply = recv_reply(&mut reader)?;
+    Ok(PredictionReturnItem { reply, origin })
+}
+
+fn write_prediction_return_origin(
+    mut writer: impl Write,
+    origin: PredictionReturnOrigin,
+) -> io::Result<()> {
+    write_i32(&mut writer, PREDICTION_RETURN_ORIGIN_MAGIC)?;
+    write_i32(&mut writer, PREDICTION_RETURN_ORIGIN_VERSION)?;
+    write_i32(&mut writer, origin.kind as i32)?;
+    write_i32(&mut writer, origin.pos_start)?;
+    write_i32(&mut writer, origin.token_count)?;
+    write_i32(&mut writer, origin.prompt_token_count)?;
+    write_i32(&mut writer, origin.decode_step)?;
+    write_i32(&mut writer, origin.checkpoint_generation)
+}
+
+fn read_prediction_return_origin(mut reader: impl Read) -> io::Result<PredictionReturnOrigin> {
+    if read_i32(&mut reader)? != PREDICTION_RETURN_ORIGIN_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "direct prediction return origin magic mismatch",
+        ));
+    }
+    if read_i32(&mut reader)? != PREDICTION_RETURN_ORIGIN_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported direct prediction return origin version",
+        ));
+    }
+    Ok(PredictionReturnOrigin {
+        kind: WireMessageKind::try_from(read_i32(&mut reader)?)?,
+        pos_start: read_i32(&mut reader)?,
+        token_count: read_i32(&mut reader)?,
+        prompt_token_count: read_i32(&mut reader)?,
+        decode_step: read_i32(&mut reader)?,
+        checkpoint_generation: read_i32(&mut reader)?,
+    })
+}
+
+fn write_i32(mut writer: impl Write, value: i32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn read_i32(mut reader: impl Read) -> io::Result<i32> {
+    let mut bytes = [0_u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
 }
 
 fn driver_stage_endpoint<'a>(
@@ -317,14 +486,16 @@ fn strip_tcp_prefix(endpoint: &str) -> &str {
 }
 
 fn prediction_return_open_message(request_id: u64, session_id: u64) -> StageWireMessage {
+    let mut state = StageStateHeader::new(
+        WireMessageKind::PredictionReturnOpen,
+        WireActivationDType::F32,
+    );
+    state.flags |= state_flags::PREDICTION_RETURN_ORIGIN;
     StageWireMessage {
         kind: WireMessageKind::PredictionReturnOpen,
         pos_start: 0,
         token_count: 0,
-        state: StageStateHeader::new(
-            WireMessageKind::PredictionReturnOpen,
-            WireActivationDType::F32,
-        ),
+        state,
         request_id,
         session_id,
         sampling: None,
@@ -333,5 +504,86 @@ fn prediction_return_open_message(request_id: u64, session_id: u64) -> StageWire
         positions: Vec::new(),
         activation: Vec::new(),
         raw_bytes: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin(pos_start: i32, decode_step: i32) -> PredictionReturnOrigin {
+        PredictionReturnOrigin {
+            kind: WireMessageKind::VerifySpan,
+            pos_start,
+            token_count: 1,
+            prompt_token_count: 4,
+            decode_step,
+            checkpoint_generation: 0,
+        }
+    }
+
+    fn predicted_tokens_reply(tokens: &[i32]) -> StageReply {
+        StageReply {
+            kind: WireReplyKind::PredictedTokens,
+            predicted: tokens.first().copied().unwrap_or_default(),
+            predicted_tokens: tokens.to_vec(),
+            spd_tap: None,
+            stats: Default::default(),
+        }
+    }
+
+    #[test]
+    fn direct_prediction_return_origin_round_trips_with_reply() {
+        let expected_origin = origin(7, 3);
+        let expected_reply = predicted_tokens_reply(&[101, 102]);
+        let mut bytes = Vec::new();
+
+        write_direct_prediction_return(&mut bytes, Some(expected_origin), expected_reply.clone())
+            .expect("write direct prediction return");
+
+        let item =
+            recv_direct_prediction_return(bytes.as_slice(), true).expect("read direct return");
+        assert_eq!(item.origin, Some(expected_origin));
+        assert_eq!(item.reply, expected_reply);
+    }
+
+    #[test]
+    fn prediction_return_receiver_buffers_unmatched_origins() {
+        let hub = Arc::new(PredictionReturnHub::default());
+        let receiver = hub.register(11, 22).expect("register receiver");
+        let sender = hub
+            .waiters
+            .lock()
+            .expect("waiters lock")
+            .get(&PredictionReturnKey::new(11, 22))
+            .cloned()
+            .expect("registered sender");
+        let first_origin = origin(5, 1);
+        let second_origin = origin(6, 2);
+
+        sender
+            .send(Ok(PredictionReturnItem {
+                reply: predicted_tokens_reply(&[202]),
+                origin: Some(second_origin),
+            }))
+            .expect("send second");
+        sender
+            .send(Ok(PredictionReturnItem {
+                reply: predicted_tokens_reply(&[101]),
+                origin: Some(first_origin),
+            }))
+            .expect("send first");
+
+        let first = receiver
+            .recv_item_matching(|item| {
+                item.matches_origin(WireReplyKind::PredictedTokens, first_origin)
+            })
+            .expect("receive first origin");
+        assert_eq!(first.origin, Some(first_origin));
+        assert_eq!(first.reply.predicted_tokens, vec![101]);
+
+        let buffered = receiver.recv_item().expect("receive buffered origin");
+        assert_eq!(buffered.origin, Some(second_origin));
+        assert_eq!(buffered.reply.predicted_tokens, vec![202]);
     }
 }

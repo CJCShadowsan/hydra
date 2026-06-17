@@ -5,9 +5,10 @@ use serde_json::json;
 use skippy_runtime::{
     ActivationFrame, GGML_TYPE_F16, RuntimeConfig, RuntimeLoadMode, StageModel,
     spd::{
-        SpdHeadManifest, SpdQwen3ForwardInput, SpdQwen3Head, SpdSafetensorsFile,
-        SpdStageLayerRange, plan_hidden_state_taps, project_spd_tap_input_row,
-        run_qwen3_fixture_parity, run_spd_tap_input_fixture_parity,
+        SpdHeadManifest, SpdQwen3ForwardInput, SpdQwen3ForwardTiming, SpdQwen3Head,
+        SpdSafetensorsFile, SpdStageLayerRange, SpdTapInputProjector, plan_hidden_state_taps,
+        run_qwen3_cached_fixture_parity, run_qwen3_fixture_parity,
+        run_spd_tap_input_fixture_parity, spd_fixture_row_hf_indices,
     },
 };
 
@@ -18,6 +19,8 @@ pub fn spd_fixture_parity(args: SpdFixtureParityArgs) -> Result<()> {
         .context("failed to reconstruct SPD fixture cur_in from tap inputs")?;
     let forward = run_qwen3_fixture_parity(&args.manifest, &args.fixture, args.top_k)
         .context("failed to run Qwen3 SPD fixture forward parity")?;
+    let cached_forward = run_qwen3_cached_fixture_parity(&args.manifest, &args.fixture, args.top_k)
+        .context("failed to run cached Qwen3 SPD fixture forward parity")?;
     let report = json!({
         "mode": "spd-fixture-parity",
         "manifest": args.manifest,
@@ -53,7 +56,28 @@ pub fn spd_fixture_parity(args: SpdFixtureParityArgs) -> Result<()> {
                 "final_hidden_max_abs_diff": forward.diagnostics.final_hidden_max_abs_diff,
                 "python_top_logit_values_at_rust_indices": forward.diagnostics.python_top_logit_values_at_rust_indices,
             }
-        }
+        },
+        "cached_forward": cached_forward.map(|cached| {
+            json!({
+                "rust": {
+                    "draft_indices": cached.rust.draft_indices,
+                    "token_ids": cached.rust.token_ids,
+                    "logits": cached.rust.logits,
+                },
+                "python": {
+                    "draft_indices": cached.python.draft_indices,
+                    "token_ids": cached.python.token_ids,
+                    "logits": cached.python.logits,
+                },
+                "diagnostics": {
+                    "cache_prefix_len": cached.diagnostics.cache_prefix_len,
+                    "spec_query_max_abs_diff": cached.diagnostics.spec_query_max_abs_diff,
+                    "final_hidden_max_abs_diff": cached.diagnostics.final_hidden_max_abs_diff,
+                    "logits_max_abs_diff": cached.diagnostics.logits_max_abs_diff,
+                    "python_top_logit_values_at_rust_indices": cached.diagnostics.python_top_logit_values_at_rust_indices,
+                }
+            })
+        })
     });
     let json = serde_json::to_vec_pretty(&report)?;
     if let Some(output) = args.output {
@@ -77,6 +101,14 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
     let fixture_cur_in = fixture.read_tensor_f32("cur_in")?;
     let row_count = fixture_cur_in_row_count(&fixture, manifest.topology.hidden_size as usize)?;
     validate_fixture_row_inputs(row_count, &row_positions, &row_i_stages, &position_ids)?;
+    let row_hf_indices = spd_fixture_row_hf_indices(&fixture, row_count)?;
+    let tap_projector = SpdTapInputProjector::from_rows(
+        &manifest.topology,
+        &serving,
+        &row_i_stages,
+        &row_hf_indices,
+    )
+    .context("load SPD tap projection weights")?;
 
     let ranges = live_stage_ranges(&args)?;
     let tap_plan = plan_hidden_state_taps(&manifest.topology, &ranges)?;
@@ -97,14 +129,13 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
     let live_runner = LiveTapRunner::open(&args, &ranges)?;
     let taps = live_runner.collect_taps(&prompt_tokens)?;
     let live_rows = assemble_live_cur_in(
-        &manifest,
-        &serving,
-        &fixture,
+        &tap_projector,
         &taps,
         LiveRowInputs {
             row_count,
             row_positions: &row_positions,
             row_i_stages: &row_i_stages,
+            row_hf_indices: &row_hf_indices,
             fixture_cur_in: &fixture_cur_in,
             hidden_size,
         },
@@ -114,6 +145,7 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
             cur_in: live_rows.cur_in.clone(),
             seq_len: row_count,
             position_ids,
+            fixed_stage_ids: None,
             final_norm_weight: final_norm_weight.clone(),
         },
         args.top_k,
@@ -121,14 +153,13 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
     let fixture_forward = run_qwen3_fixture_parity(&args.manifest, &args.fixture, args.top_k)?;
     let verified_generation = run_verified_generation(
         &args,
-        &manifest,
-        &serving,
-        &fixture,
         &live_runner,
         &spd_head,
+        &tap_projector,
         VerifiedGenerationInputs {
             prompt_tokens: &prompt_tokens,
             row_i_stages: &row_i_stages,
+            row_hf_indices: &row_hf_indices,
             final_norm_weight: &final_norm_weight,
             row_count,
             hidden_size,
@@ -194,6 +225,7 @@ struct VerifiedGenerationReport {
 struct VerifiedGenerationInputs<'a> {
     prompt_tokens: &'a [i32],
     row_i_stages: &'a [i64],
+    row_hf_indices: &'a [Vec<u32>],
     final_norm_weight: &'a [f32],
     row_count: usize,
     hidden_size: usize,
@@ -201,11 +233,9 @@ struct VerifiedGenerationInputs<'a> {
 
 fn run_verified_generation(
     args: &SpdLiveTapParityArgs,
-    manifest: &SpdHeadManifest,
-    serving: &SpdSafetensorsFile,
-    fixture: &SpdSafetensorsFile,
     live_runner: &LiveTapRunner,
     spd_head: &SpdQwen3Head,
+    tap_projector: &SpdTapInputProjector,
     inputs: VerifiedGenerationInputs<'_>,
 ) -> Result<VerifiedGenerationReport> {
     if inputs.prompt_tokens.len() < inputs.row_count {
@@ -243,29 +273,30 @@ fn run_verified_generation(
 
         let assemble_timer = Instant::now();
         let live_rows = assemble_live_cur_in_for_positions(
-            manifest,
-            serving,
-            fixture,
+            tap_projector,
             &taps,
             DynamicLiveRowInputs {
                 row_positions: &row_positions,
                 row_i_stages: inputs.row_i_stages,
+                row_hf_indices: inputs.row_hf_indices,
                 hidden_size: inputs.hidden_size,
             },
         )?;
         let assemble_ms = elapsed_ms(assemble_timer);
 
         let head_timer = Instant::now();
-        let live_topk = spd_head.forward(
+        let live_forward = spd_head.forward_timed(
             SpdQwen3ForwardInput {
                 cur_in: live_rows.cur_in,
                 seq_len: inputs.row_count,
                 position_ids: row_positions.clone(),
+                fixed_stage_ids: None,
                 final_norm_weight: inputs.final_norm_weight.to_vec(),
             },
             args.top_k,
         )?;
         let head_ms = elapsed_ms(head_timer);
+        let live_topk = live_forward.topk;
         let proposal_token = live_topk
             .token_ids
             .first()
@@ -333,6 +364,7 @@ fn run_verified_generation(
                 "tap_replay": tap_ms,
                 "assemble_cur_in": assemble_ms,
                 "spd_head": head_ms,
+                "spd_head_detail": qwen_forward_timing_report(&live_forward.timing),
                 "target_verify_rewound": verify_ms,
                 "target_greedy_decode": decode_ms,
                 "total": elapsed_ms(step_timer),
@@ -373,6 +405,16 @@ fn run_verified_generation(
         .and_then(|steps| steps.first())
         .cloned();
     Ok(VerifiedGenerationReport { first_step, report })
+}
+
+fn qwen_forward_timing_report(timing: &SpdQwen3ForwardTiming) -> serde_json::Value {
+    json!({
+        "fixed_stage_projection": timing.fixed_stage_projection_ms,
+        "decoder_layers": timing.decoder_layer_ms,
+        "final_norm": timing.final_norm_ms,
+        "lm_head_topk": timing.lm_head_topk_ms,
+        "total": timing.total_ms,
+    })
 }
 
 fn open_full_target_model(args: &SpdLiveTapParityArgs) -> Result<StageModel> {
@@ -431,6 +473,7 @@ struct LiveRowInputs<'a> {
     row_count: usize,
     row_positions: &'a [i64],
     row_i_stages: &'a [i64],
+    row_hf_indices: &'a [Vec<u32>],
     fixture_cur_in: &'a [f32],
     hidden_size: usize,
 }
@@ -438,6 +481,7 @@ struct LiveRowInputs<'a> {
 struct DynamicLiveRowInputs<'a> {
     row_positions: &'a [i64],
     row_i_stages: &'a [i64],
+    row_hf_indices: &'a [Vec<u32>],
     hidden_size: usize,
 }
 
@@ -631,9 +675,7 @@ fn sequential_positions(token_count: usize) -> Result<Vec<i32>> {
 }
 
 fn assemble_live_cur_in(
-    manifest: &SpdHeadManifest,
-    serving: &SpdSafetensorsFile,
-    fixture: &SpdSafetensorsFile,
+    tap_projector: &SpdTapInputProjector,
     taps: &BTreeMap<u32, ActivationFrame>,
     inputs: LiveRowInputs<'_>,
 ) -> Result<LiveRows> {
@@ -644,15 +686,9 @@ fn assemble_live_cur_in(
         let position = inputs.row_positions[row_index];
         let stage_id = u32::try_from(inputs.row_i_stages[row_index])
             .with_context(|| format!("SPD fixture row {row_index} has negative stage id"))?;
-        let hf_indices = fixture_hf_indices(fixture, row_index)?;
-        let concat_hidden = concat_live_hidden(taps, &hf_indices, position, inputs.hidden_size)?;
-        let projection = project_spd_tap_input_row(
-            &manifest.topology,
-            serving,
-            stage_id,
-            &hf_indices,
-            &concat_hidden,
-        )?;
+        let hf_indices = &inputs.row_hf_indices[row_index];
+        let concat_hidden = concat_live_hidden(taps, hf_indices, position, inputs.hidden_size)?;
+        let projection = tap_projector.project(stage_id, hf_indices, &concat_hidden)?;
         let expected = row(inputs.fixture_cur_in, row_index, inputs.hidden_size);
         let row_diff = max_abs_diff(&projection.projected, expected)?;
         max_diff = max_diff.max(row_diff);
@@ -674,17 +710,18 @@ fn assemble_live_cur_in(
 }
 
 fn assemble_live_cur_in_for_positions(
-    manifest: &SpdHeadManifest,
-    serving: &SpdSafetensorsFile,
-    fixture: &SpdSafetensorsFile,
+    tap_projector: &SpdTapInputProjector,
     taps: &BTreeMap<u32, ActivationFrame>,
     inputs: DynamicLiveRowInputs<'_>,
 ) -> Result<DynamicLiveRows> {
-    if inputs.row_positions.len() != inputs.row_i_stages.len() {
+    if inputs.row_positions.len() != inputs.row_i_stages.len()
+        || inputs.row_positions.len() != inputs.row_hf_indices.len()
+    {
         bail!(
-            "dynamic SPD row metadata length mismatch: positions {}, stages {}",
+            "dynamic SPD row metadata length mismatch: positions {}, stages {}, hf rows {}",
             inputs.row_positions.len(),
-            inputs.row_i_stages.len()
+            inputs.row_i_stages.len(),
+            inputs.row_hf_indices.len()
         );
     }
     let mut cur_in = Vec::with_capacity(inputs.row_positions.len() * inputs.hidden_size);
@@ -692,29 +729,12 @@ fn assemble_live_cur_in_for_positions(
         let position = inputs.row_positions[row_index];
         let stage_id = u32::try_from(inputs.row_i_stages[row_index])
             .with_context(|| format!("SPD dynamic row {row_index} has negative stage id"))?;
-        let hf_indices = fixture_hf_indices(fixture, row_index)?;
-        let concat_hidden = concat_live_hidden(taps, &hf_indices, position, inputs.hidden_size)?;
-        let projection = project_spd_tap_input_row(
-            &manifest.topology,
-            serving,
-            stage_id,
-            &hf_indices,
-            &concat_hidden,
-        )?;
+        let hf_indices = &inputs.row_hf_indices[row_index];
+        let concat_hidden = concat_live_hidden(taps, hf_indices, position, inputs.hidden_size)?;
+        let projection = tap_projector.project(stage_id, hf_indices, &concat_hidden)?;
         cur_in.extend_from_slice(&projection.projected);
     }
     Ok(DynamicLiveRows { cur_in })
-}
-
-fn fixture_hf_indices(fixture: &SpdSafetensorsFile, row_index: usize) -> Result<Vec<u32>> {
-    fixture
-        .read_tensor_i64(&format!("tap_row_{row_index}_hf_indices"))?
-        .into_iter()
-        .map(|value| {
-            u32::try_from(value)
-                .with_context(|| format!("SPD fixture row {row_index} has negative hf index"))
-        })
-        .collect()
 }
 
 fn concat_live_hidden(
@@ -740,21 +760,27 @@ fn live_hidden_row(frame: &ActivationFrame, position: i64, hidden_size: usize) -
     if position >= token_count {
         bail!("live tap position {position} is outside token_count {token_count}");
     }
-    let payload_f32 = activation_payload_f32(frame)?;
-    Ok(row(&payload_f32, position, hidden_size).to_vec())
-}
-
-fn activation_payload_f32(frame: &ActivationFrame) -> Result<Vec<f32>> {
-    if !frame.payload.len().is_multiple_of(4) {
+    let row_bytes = hidden_size
+        .checked_mul(std::mem::size_of::<f32>())
+        .context("live activation row byte width overflow")?;
+    let expected_payload_bytes = token_count
+        .checked_mul(row_bytes)
+        .context("live activation payload byte count overflow")?;
+    if frame.payload.len() != expected_payload_bytes {
         bail!(
-            "live activation payload for {}..{} has non-f32 byte length {}",
+            "live activation payload for {}..{} has {} bytes, expected {} for {} tokens x hidden {}",
             frame.desc.layer_start,
             frame.desc.layer_end,
-            frame.payload.len()
+            frame.payload.len(),
+            expected_payload_bytes,
+            token_count,
+            hidden_size
         );
     }
-    Ok(frame
-        .payload
+    let offset = position
+        .checked_mul(row_bytes)
+        .context("live activation row offset overflow")?;
+    Ok(frame.payload[offset..offset + row_bytes]
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())

@@ -437,6 +437,24 @@ pub struct SpeculativeConfig {
     pub ngram_max: Option<u32>,
     #[serde(default)]
     pub spec_default: Option<BoolOrAuto>,
+    #[serde(default)]
+    pub spd_manifest_path: Option<String>,
+    #[serde(default)]
+    pub spd_fixture_path: Option<String>,
+    #[serde(default)]
+    pub spd_model_path: Option<String>,
+    #[serde(default)]
+    pub spd_max_tokens: Option<u32>,
+    #[serde(default)]
+    pub spd_top_k: Option<usize>,
+    #[serde(default)]
+    pub spd_gpu_layers: Option<i32>,
+    #[serde(default)]
+    pub spd_replay_fallback: Option<bool>,
+    #[serde(default)]
+    pub spd_optimistic_decode: Option<bool>,
+    #[serde(default)]
+    pub spd_optimistic_min_logit_margin: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

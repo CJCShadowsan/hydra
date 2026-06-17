@@ -131,6 +131,7 @@ pub(super) struct VerifySpanMessageArgs<'a> {
     pub(super) prompt_token_count: usize,
     pub(super) pos_start: usize,
     pub(super) decode_step: usize,
+    pub(super) checkpoint_generation: i32,
     pub(super) tokens: &'a [i32],
     pub(super) checkpoint: bool,
 }
@@ -150,6 +151,7 @@ pub(super) fn embedded_verify_message(
         .map_err(|_| OpenAiError::backend("prompt token count exceeds i32"))?;
     state.decode_step = i32::try_from(args.decode_step)
         .map_err(|_| OpenAiError::backend("decode step exceeds i32"))?;
+    state.checkpoint_generation = args.checkpoint_generation;
     state.current_token = args.tokens[0];
     state.source_stage_index = -1;
     if !args.checkpoint {
@@ -173,17 +175,27 @@ pub(super) fn embedded_verify_message(
     })
 }
 
+pub(super) fn checkpoint_generation_from_position(position: usize) -> OpenAiResult<i32> {
+    let generation = position
+        .checked_add(1)
+        .ok_or_else(|| OpenAiError::backend("checkpoint generation overflow"))?;
+    i32::try_from(generation).map_err(|_| OpenAiError::backend("checkpoint generation exceeds i32"))
+}
+
 pub(super) fn embedded_session_control_message(
     wire_dtype: WireActivationDType,
     kind: WireMessageKind,
     request_id: u64,
     session_id: u64,
+    checkpoint_generation: i32,
 ) -> StageWireMessage {
+    let mut state = StageStateHeader::new(kind, wire_dtype);
+    state.checkpoint_generation = checkpoint_generation;
     StageWireMessage {
         kind,
         pos_start: 0,
         token_count: 0,
-        state: StageStateHeader::new(kind, wire_dtype),
+        state,
         request_id,
         session_id,
         sampling: None,
@@ -379,4 +391,43 @@ pub(super) fn multimodal_prefill_message(
         activation: Vec::new(),
         raw_bytes: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_and_restore_messages_preserve_checkpoint_generation() {
+        let verify = embedded_verify_message(
+            WireActivationDType::F16,
+            VerifySpanMessageArgs {
+                request_id: 7,
+                session_id: 11,
+                prompt_token_count: 5,
+                pos_start: 8,
+                decode_step: 3,
+                checkpoint_generation: 9,
+                tokens: &[101],
+                checkpoint: true,
+            },
+        )
+        .expect("verify message");
+        assert_eq!(verify.state.checkpoint_generation, 9);
+
+        let restore = embedded_session_control_message(
+            WireActivationDType::F16,
+            WireMessageKind::RestoreSession,
+            7,
+            11,
+            9,
+        );
+        assert_eq!(restore.state.checkpoint_generation, 9);
+    }
+
+    #[test]
+    fn checkpoint_generation_from_position_reserves_zero_for_legacy() {
+        assert_eq!(checkpoint_generation_from_position(0).unwrap(), 1);
+        assert_eq!(checkpoint_generation_from_position(31).unwrap(), 32);
+    }
 }

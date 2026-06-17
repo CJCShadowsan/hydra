@@ -54,6 +54,7 @@ pub(crate) struct StageLoadRequest {
     pub(crate) stage_index: u32,
     pub(crate) layer_start: u32,
     pub(crate) layer_end: u32,
+    pub(crate) spd_tap_return_hf_indices: Vec<u32>,
     pub(crate) model_path: Option<String>,
     pub(crate) source_model_bytes: Option<u64>,
     pub(crate) projector_path: Option<String>,

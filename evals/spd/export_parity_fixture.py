@@ -17,7 +17,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 FIXTURE_SCHEMA = "skippy-spd-parity-fixture/v1"
@@ -114,7 +114,11 @@ def main() -> None:
         "tap_input_schema": TAP_INPUT_SCHEMA,
         "tap_row_count": str(fixture.tap_row_count),
         "use_deepest": str(bool(getattr(pipeline, "trained_with_use_deepest", False))).lower(),
+        "cached_reference": str(fixture.cached_prefill_row_count > 0).lower(),
+        "cached_prefill_rows": str(fixture.cached_prefill_row_count),
     }
+    if fixture.cached_crop_position is not None:
+        metadata["cached_crop_position"] = str(fixture.cached_crop_position)
     save_file(fixture.tensors, out_path, metadata=metadata)
     print(
         json.dumps(
@@ -125,6 +129,7 @@ def main() -> None:
                 "sha256": file_sha256(out_path),
                 "cur_in_shape": list(fixture.tensors["cur_in"].shape),
                 "python_logits_shape": list(fixture.tensors["python_logits"].shape),
+                "cached_prefill_rows": fixture.cached_prefill_row_count,
                 "top_token_ids": fixture.tensors["python_topk_token_ids"].tolist(),
             },
             indent=2,
@@ -145,10 +150,14 @@ class Fixture:
         tensors: dict[str, Any],
         row_kinds: list[str],
         tap_row_count: int,
+        cached_prefill_row_count: int,
+        cached_crop_position: Optional[int],
     ) -> None:
         self.tensors = tensors
         self.row_kinds = row_kinds
         self.tap_row_count = tap_row_count
+        self.cached_prefill_row_count = cached_prefill_row_count
+        self.cached_crop_position = cached_crop_position
 
 
 def build_fixture(
@@ -160,6 +169,7 @@ def build_fixture(
     newest_pos_arg: int,
 ) -> Fixture:
     import torch
+    from transformers.cache_utils import DynamicCache
 
     device = next(pipeline.base_model.parameters()).device
     batch = tokenizer.apply_chat_template(
@@ -265,6 +275,62 @@ def build_fixture(
         else:
             token_ids = draft_indices
 
+        cached_prefill_row_count = 0
+        cached_crop_position: Optional[int] = None
+        prefill_cur_in = None
+        prefill_position_ids = None
+        cached_proc = None
+        cached_final_hidden = None
+        cached_logits = None
+        cached_values = None
+        cached_draft_indices = None
+        cached_token_ids = None
+        prefill_cache_len = max(0, oldest_needed)
+        if prefill_cache_len > 0:
+            spec_past_kv = DynamicCache()
+            prefill_rows = [
+                pipeline._build_inference_row_from_snap(completed_snaps[pos], n)  # noqa: SLF001
+                for pos in range(prefill_cache_len)
+            ]
+            prefill_cur_in = torch.cat(prefill_rows, dim=1)
+            prefill_position_ids = torch.arange(
+                prefill_cache_len,
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            pipeline.speculation_module.forward_inference_g1_only_with_rotary(
+                prefill_cur_in,
+                prefill_position_ids,
+                attention_mask=None,
+                past_key_values=spec_past_kv,
+                use_cache=True,
+            )
+            cached_crop_position = min(row_positions)
+            pipeline._rollback_spec_kv_cache(  # noqa: SLF001
+                spec_past_kv,
+                cached_crop_position,
+            )
+            cached_proc = pipeline.speculation_module.forward_inference_g1_only_with_rotary(
+                cur_in,
+                position_ids,
+                attention_mask=None,
+                past_key_values=spec_past_kv,
+                use_cache=True,
+            )
+            cached_final_hidden = pipeline.final_norm(cached_proc)
+            cached_logits = pipeline.speculation_module.lm_head(
+                cached_final_hidden[:, -1:, :]
+            ).float()
+            cached_values, cached_draft_indices = torch.topk(
+                cached_logits[0, 0],
+                k=int(top_k),
+            )
+            if getattr(pipeline, "_use_draft_vocab", False):
+                cached_token_ids = draft_token_ids[cached_draft_indices]
+            else:
+                cached_token_ids = cached_draft_indices
+            cached_prefill_row_count = prefill_cache_len
+
     tensors = {
         "cur_in": cur_in.detach().cpu().contiguous(),
         "final_norm_weight": pipeline.final_norm.weight.detach().cpu().contiguous(),
@@ -279,6 +345,38 @@ def build_fixture(
         "python_topk_logits": values.detach().cpu().float().contiguous(),
         "python_topk_token_ids": token_ids.detach().cpu().long().contiguous(),
     }
+    if cached_prefill_row_count > 0:
+        assert prefill_cur_in is not None
+        assert prefill_position_ids is not None
+        assert cached_proc is not None
+        assert cached_final_hidden is not None
+        assert cached_logits is not None
+        assert cached_values is not None
+        assert cached_draft_indices is not None
+        assert cached_token_ids is not None
+        tensors.update(
+            {
+                "cached_prefill_cur_in": prefill_cur_in.detach().cpu().contiguous(),
+                "cached_prefill_position_ids": prefill_position_ids.cpu().contiguous(),
+                "python_cached_logits": cached_logits.detach().cpu().contiguous(),
+                "python_cached_spec_query": cached_proc.detach().cpu().contiguous(),
+                "python_cached_final_hidden": cached_final_hidden.detach()
+                .cpu()
+                .contiguous(),
+                "python_cached_topk_draft_indices": cached_draft_indices.detach()
+                .cpu()
+                .long()
+                .contiguous(),
+                "python_cached_topk_logits": cached_values.detach()
+                .cpu()
+                .float()
+                .contiguous(),
+                "python_cached_topk_token_ids": cached_token_ids.detach()
+                .cpu()
+                .long()
+                .contiguous(),
+            }
+        )
     for idx, value in enumerate(layer_queries):
         tensors[f"python_layer_{idx}_query"] = value
     for idx, value in enumerate(layer_inputs):
@@ -287,7 +385,13 @@ def build_fixture(
         tensors[f"tap_row_{idx}_concat"] = value.detach().cpu().contiguous()
     for idx, indices in enumerate(tap_hf_indices):
         tensors[f"tap_row_{idx}_hf_indices"] = torch.tensor(indices, dtype=torch.long)
-    return Fixture(tensors=tensors, row_kinds=row_kinds, tap_row_count=len(tap_inputs))
+    return Fixture(
+        tensors=tensors,
+        row_kinds=row_kinds,
+        tap_row_count=len(tap_inputs),
+        cached_prefill_row_count=cached_prefill_row_count,
+        cached_crop_position=cached_crop_position,
+    )
 
 
 def resolve_newest_pos(seq_len: int, num_stages: int, newest_pos_arg: int) -> int:

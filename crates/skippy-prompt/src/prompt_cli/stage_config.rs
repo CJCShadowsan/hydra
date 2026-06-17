@@ -59,6 +59,7 @@ fn write_local_configs(
             stage_index: stage.stage_index as u32,
             layer_start: stage.layer_start,
             layer_end: stage.layer_end,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: args.ctx_size,
             lane_count: args.stage_max_inflight.max(1) as u32,
             n_batch: None,

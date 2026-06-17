@@ -57,9 +57,10 @@ use tokio::{
 
 use crate::{
     binary_transport::{
-        PredictionReturnHub, PredictionReturnReceiver, WireCondition, connect_binary_downstream,
-        forwarded_stage_message, forwarded_stage_message_timed, run_binary_stage_message,
-        stage_output_activation_capacity, write_stage_message_conditioned,
+        PredictionReturnHub, PredictionReturnOrigin, PredictionReturnReceiver, WireCondition,
+        connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
+        run_binary_stage_message, stage_output_activation_capacity,
+        write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
@@ -187,6 +188,8 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         mode,
         draft: None,
         spd: None,
+        spd_optimistic_decode: false,
+        spd_optimistic_min_logit_margin: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
@@ -231,6 +234,8 @@ pub struct EmbeddedOpenAiArgs {
     pub spd_top_k: usize,
     pub spd_n_gpu_layers: Option<i32>,
     pub spd_replay_fallback: bool,
+    pub spd_optimistic_decode: bool,
+    pub spd_optimistic_min_logit_margin: Option<f32>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
     pub draft_n_gpu_layers: Option<i32>,
@@ -557,6 +562,8 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         mode,
         draft,
         spd,
+        spd_optimistic_decode: args.spd_optimistic_decode,
+        spd_optimistic_min_logit_margin: args.spd_optimistic_min_logit_margin,
         speculative_window: args.speculative_window,
         adaptive_speculative_window: args.adaptive_speculative_window,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
@@ -597,6 +604,8 @@ struct StageOpenAiBackend {
     mode: OpenAiBackendMode,
     draft: Option<Arc<Mutex<DraftRunner>>>,
     spd: Option<SpdReplayProposalState>,
+    spd_optimistic_decode: bool,
+    spd_optimistic_min_logit_margin: Option<f32>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
     generation_limit: Arc<Semaphore>,
@@ -1758,6 +1767,8 @@ struct EmbeddedStageZeroGeneration<'a> {
     prediction_return: Option<PredictionReturnReceiver>,
     draft: Option<Arc<Mutex<DraftRunner>>>,
     spd: Option<SpdReplayProposalState>,
+    spd_optimistic_decode: bool,
+    spd_optimistic_min_logit_margin: Option<f32>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
     prompt_token_ids: &'a [i32],
@@ -1791,7 +1802,7 @@ struct EmbeddedLocalOutput {
     runtime_lock_hold_ms: f64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct EmbeddedExecutionStats {
     stage0_compute_ms: f64,
     runtime_lock_wait_ms: f64,
@@ -1807,6 +1818,33 @@ struct EmbeddedStageExecution {
     reply: StageReply,
     stats: EmbeddedExecutionStats,
     elapsed_ms: f64,
+}
+
+struct EmbeddedStageStart {
+    reply_stats: StageReplyStats,
+    stats: EmbeddedExecutionStats,
+    elapsed_ms: f64,
+}
+
+struct SpdOptimisticDecode {
+    proposed: i32,
+    proposed_logit: Option<f32>,
+    proposed_logit_margin: Option<f32>,
+    requested_spd_taps: bool,
+    chain_depth: usize,
+    origin: PredictionReturnOrigin,
+    timer: PhaseTimer,
+    execution: EmbeddedStageStart,
+}
+
+struct SpdOptimisticDecodeStart<'a> {
+    downstream: &'a mut TcpStream,
+    session_key: &'a str,
+    pos_start: usize,
+    decode_step: usize,
+    chain_depth: usize,
+    chain_depth_limit: usize,
+    probe: &'a SpdInlineProbe,
 }
 
 struct EmbeddedFusedFirstDecode {

@@ -44,7 +44,7 @@ pub struct RuntimeState {
     sessions: BTreeMap<String, RuntimeLaneSession>,
     idle_sessions: Vec<RuntimeLaneSession>,
     session_token_counts: BTreeMap<String, u64>,
-    session_checkpoints: BTreeMap<String, StageSessionCheckpoint>,
+    session_checkpoints: BTreeMap<SessionCheckpointKey, StageSessionCheckpoint>,
     session_resident_prefixes: BTreeMap<String, ResidentLanePrefix>,
 }
 
@@ -52,6 +52,21 @@ struct RuntimeLaneSession {
     index: usize,
     session: StageSession,
     resident_prefix: Option<ResidentLanePrefix>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SessionCheckpointKey {
+    session_id: String,
+    checkpoint_generation: i32,
+}
+
+impl SessionCheckpointKey {
+    fn new(session_id: &str, checkpoint_generation: i32) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            checkpoint_generation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -273,18 +288,43 @@ impl RuntimeState {
     }
 
     pub fn checkpoint_session(&mut self, session_id: &str) -> Result<()> {
+        self.checkpoint_session_generation(session_id, 0)
+    }
+
+    pub fn checkpoint_session_generation(
+        &mut self,
+        session_id: &str,
+        checkpoint_generation: i32,
+    ) -> Result<()> {
         let checkpoint = self.session(session_id)?.checkpoint()?;
-        self.session_checkpoints
-            .insert(session_id.to_string(), checkpoint);
+        self.session_checkpoints.insert(
+            SessionCheckpointKey::new(session_id, checkpoint_generation),
+            checkpoint,
+        );
         Ok(())
     }
 
     pub fn restore_session(&mut self, session_id: &str) -> Result<()> {
+        self.restore_session_generation(session_id, 0)
+    }
+
+    pub fn restore_session_generation(
+        &mut self,
+        session_id: &str,
+        checkpoint_generation: i32,
+    ) -> Result<()> {
         let checkpoint = self
             .session_checkpoints
-            .get(session_id)
+            .get(&SessionCheckpointKey::new(
+                session_id,
+                checkpoint_generation,
+            ))
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing checkpoint for session {session_id}"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing checkpoint generation {checkpoint_generation} for session {session_id}"
+                )
+            })?;
         let token_count = {
             let session = self.session(session_id)?;
             session.restore_checkpoint(&checkpoint)?;
@@ -423,7 +463,8 @@ impl RuntimeState {
         // `sessions` (idempotent cleanup, stale callers) must still
         // clear any stray resident-prefix entry under that id.
         self.session_token_counts.remove(session_id);
-        self.session_checkpoints.remove(session_id);
+        self.session_checkpoints
+            .retain(|key, _| key.session_id != session_id);
         self.session_resident_prefixes.remove(session_id);
 
         Ok(RuntimeSessionDropStats {
@@ -1177,6 +1218,7 @@ mod tests {
             stage_index: 0,
             layer_start: 0,
             layer_end: 24,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: 512,
             lane_count: 2,
             n_batch: Some(1024),
@@ -1240,6 +1282,7 @@ mod tests {
             stage_index: 2,
             layer_start: 20,
             layer_end: 30,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: 512,
             lane_count: 1,
             n_batch: None,
@@ -1287,6 +1330,7 @@ mod tests {
             stage_index: 0,
             layer_start: 0,
             layer_end: 24,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: 512,
             lane_count: 1,
             n_batch: None,
@@ -1332,6 +1376,7 @@ mod tests {
             stage_index: 0,
             layer_start: 0,
             layer_end: 24,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: 512,
             lane_count: 1,
             n_batch: None,
@@ -1377,6 +1422,7 @@ mod tests {
             stage_index: 0,
             layer_start: 0,
             layer_end: 10,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: 512,
             lane_count: 1,
             n_batch: None,

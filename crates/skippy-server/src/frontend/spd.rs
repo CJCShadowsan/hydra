@@ -7,13 +7,34 @@ use std::{
 use anyhow::{Context, Result, bail};
 use skippy_runtime::spd::{
     GgufTokenEmbeddingTable, SpdHeadManifest, SpdLiveCurInRequest, SpdLiveTapRunner,
-    SpdLiveTapRunnerConfig, SpdQwen3ForwardInput, SpdQwen3Head, SpdSafetensorsFile,
-    SpdStageLayerRange, assemble_spd_live_cur_in_for_positions, plan_hidden_state_taps,
-    sliding_spd_row_positions,
+    SpdLiveTapRunnerConfig, SpdQwen3ForwardCache, SpdQwen3ForwardInput, SpdQwen3Head,
+    SpdRollingDraftPlan, SpdRollingObserver, SpdRollingSnapshot, SpdRollingSpeculationRows,
+    SpdRollingVerifiedDelta, SpdSafetensorsFile, SpdStageLayerRange, SpdTapInputProjector,
+    assemble_spd_live_cur_in_for_positions, plan_hidden_state_taps, required_spd_hf_indices,
+    required_spd_hf_indices_for_topology, sliding_spd_row_positions, spd_fixture_cur_in_row_count,
+    spd_fixture_row_hf_indices, spd_hf_indices_for_stage_id,
 };
 use skippy_runtime::{ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout};
 
 use super::*;
+
+mod cache;
+mod telemetry;
+#[cfg(test)]
+mod tests;
+
+use self::{
+    cache::{
+        SpdInlineTapCache, SpdInlineTapLifecycle, SpdTapRecordOutcome, inline_required_hf_indices,
+        retained_tap_prefix_len_for_context_update,
+    },
+    telemetry::{
+        insert_proposal_stats_attrs, insert_rolling_attrs, insert_rolling_speculation_rows_attrs,
+        insert_rolling_verified_delta_attrs,
+    },
+};
+
+pub(super) use self::telemetry::SpdRollingTelemetry;
 
 pub(super) const SPD_REPLAY_PROPOSAL_SOURCE: &str = "spd-replay";
 
@@ -33,6 +54,7 @@ pub(super) struct SpdReplayOpenArgs<'a> {
 pub(super) struct SpdReplayProposalState {
     pub(super) source: Arc<Mutex<SpdReplayProposalSource>>,
     taps: Arc<Mutex<SpdInlineTapCache>>,
+    tap_lifecycle: Arc<Mutex<SpdInlineTapLifecycle>>,
 }
 
 pub(super) struct SpdReplayProposalSource {
@@ -43,17 +65,208 @@ pub(super) struct SpdReplayProposalSource {
     row_count: usize,
     row_stage_ids: Vec<i64>,
     row_hf_indices: Vec<Vec<u32>>,
-    required_hf_indices: Vec<u32>,
     hidden_size: usize,
     final_norm_weight: Vec<f32>,
     context_tokens: Vec<i32>,
     head: SpdQwen3Head,
+    head_cache: Mutex<SpdQwen3ForwardCache>,
     manifest: SpdHeadManifest,
     serving_file: SpdSafetensorsFile,
+    tap_projector: SpdTapInputProjector,
     live_taps: SpdLiveTapRunner,
     h0_embeddings: Option<GgufTokenEmbeddingTable>,
     inline_taps: Arc<Mutex<SpdInlineTapCache>>,
+    tap_lifecycle: Arc<Mutex<SpdInlineTapLifecycle>>,
+    logical_stage_count: usize,
+    rolling: SpdRollingObserver,
+    last_proposal_stats: SpdProposalSourceStats,
+    total_proposal_stats: SpdProposalSourceStats,
     replay_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SpdInlineProposal {
+    pub(super) token: i32,
+    pub(super) logit: Option<f32>,
+    pub(super) logit_margin: Option<f32>,
+    pub(super) cache_used: bool,
+    pub(super) cache_prefix_len: Option<usize>,
+    pub(super) tap_source: SpdTapCollectionSource,
+    pub(super) tap_collect_ms: f64,
+    pub(super) cur_in_ms: f64,
+    pub(super) forward_ms: f64,
+    pub(super) proposal_rows: SpdProposalRows,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SpdProposalRows {
+    pub(super) row_positions: Vec<i64>,
+    pub(super) row_i_stages: Vec<i64>,
+    pub(super) evicted_prefix_position: Option<usize>,
+    pub(super) newest_position: Option<usize>,
+    pub(super) next_draft_position: Option<usize>,
+}
+
+impl SpdProposalRows {
+    fn from_probe_rows(
+        context_len: usize,
+        row_positions: &[i64],
+        row_i_stages: &[i64],
+        rolling_rows: Option<&SpdRollingSpeculationRows>,
+    ) -> Result<Self> {
+        let newest_position = row_positions
+            .last()
+            .copied()
+            .map(|position| usize::try_from(position).context("negative SPD proposal row position"))
+            .transpose()?;
+        Ok(Self {
+            row_positions: row_positions.to_vec(),
+            row_i_stages: row_i_stages.to_vec(),
+            evicted_prefix_position: rolling_rows.and_then(|rows| rows.evicted_prefix_position),
+            newest_position: rolling_rows
+                .map(|rows| rows.newest_position)
+                .or(newest_position),
+            next_draft_position: rolling_rows
+                .map(|rows| rows.next_draft_position)
+                .or(Some(context_len)),
+        })
+    }
+
+    fn from_rolling_rows(rows: &SpdRollingSpeculationRows) -> Result<Self> {
+        Ok(Self {
+            row_positions: rows
+                .row_positions
+                .iter()
+                .copied()
+                .map(i64::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("SPD rolling row position exceeds i64")?,
+            row_i_stages: rows
+                .row_i_stages
+                .iter()
+                .copied()
+                .map(i64::try_from)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("SPD rolling row stage exceeds i64")?,
+            evicted_prefix_position: rows.evicted_prefix_position,
+            newest_position: Some(rows.newest_position),
+            next_draft_position: Some(rows.next_draft_position),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SpdInlineProposalMiss {
+    reason: &'static str,
+    missing_taps: BTreeMap<u32, Vec<i64>>,
+    proposal_rows: Option<SpdProposalRows>,
+}
+
+impl SpdInlineProposalMiss {
+    fn empty(reason: &'static str) -> Self {
+        Self {
+            reason,
+            missing_taps: BTreeMap::new(),
+            proposal_rows: None,
+        }
+    }
+
+    fn for_rows(
+        reason: &'static str,
+        rows: &SpdRollingSpeculationRows,
+        missing_taps: BTreeMap<u32, Vec<i64>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            reason,
+            missing_taps,
+            proposal_rows: Some(SpdProposalRows::from_rolling_rows(rows)?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpdTapCollectionSource {
+    Inline,
+    ReplayFallback,
+}
+
+impl SpdTapCollectionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::ReplayFallback => "replay_fallback",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SpdTapCollection {
+    taps: BTreeMap<u32, ActivationFrame>,
+    source: SpdTapCollectionSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct SpdProposalSourceStats {
+    requested_limit: usize,
+    attempts: usize,
+    proposed: usize,
+    inline_tap_hits: usize,
+    replay_fallbacks: usize,
+    cache_hits: usize,
+    cache_misses: usize,
+    tap_collect_ms: f64,
+    cur_in_ms: f64,
+    forward_ms: f64,
+    last_cache_prefix_len: Option<usize>,
+    max_cache_prefix_len: Option<usize>,
+}
+
+impl SpdProposalSourceStats {
+    fn for_limit(requested_limit: usize) -> Self {
+        Self {
+            requested_limit,
+            ..Self::default()
+        }
+    }
+
+    fn observe_proposal(&mut self, proposal: &SpdInlineProposal) {
+        self.proposed += 1;
+        match proposal.tap_source {
+            SpdTapCollectionSource::Inline => self.inline_tap_hits += 1,
+            SpdTapCollectionSource::ReplayFallback => self.replay_fallbacks += 1,
+        }
+        if proposal.cache_used {
+            self.cache_hits += 1;
+        } else {
+            self.cache_misses += 1;
+        }
+        self.tap_collect_ms += proposal.tap_collect_ms;
+        self.cur_in_ms += proposal.cur_in_ms;
+        self.forward_ms += proposal.forward_ms;
+        if let Some(prefix_len) = proposal.cache_prefix_len {
+            self.last_cache_prefix_len = Some(prefix_len);
+            self.max_cache_prefix_len =
+                Some(self.max_cache_prefix_len.unwrap_or(0).max(prefix_len));
+        }
+    }
+
+    fn merge(&mut self, window: &Self) {
+        self.requested_limit += window.requested_limit;
+        self.attempts += window.attempts;
+        self.proposed += window.proposed;
+        self.inline_tap_hits += window.inline_tap_hits;
+        self.replay_fallbacks += window.replay_fallbacks;
+        self.cache_hits += window.cache_hits;
+        self.cache_misses += window.cache_misses;
+        self.tap_collect_ms += window.tap_collect_ms;
+        self.cur_in_ms += window.cur_in_ms;
+        self.forward_ms += window.forward_ms;
+        self.last_cache_prefix_len = window.last_cache_prefix_len.or(self.last_cache_prefix_len);
+        if let Some(prefix_len) = window.max_cache_prefix_len {
+            self.max_cache_prefix_len =
+                Some(self.max_cache_prefix_len.unwrap_or(0).max(prefix_len));
+        }
+    }
 }
 
 impl SpdReplayProposalSource {
@@ -81,11 +294,18 @@ impl SpdReplayProposalSource {
             usize::try_from(manifest.topology.hidden_size).context("SPD hidden_size too large")?;
         let vocab_size =
             usize::try_from(manifest.topology.vocab_size).context("SPD vocab_size too large")?;
-        let row_count = fixture_cur_in_row_count(&fixture_file, hidden_size)?;
+        let row_count = spd_fixture_cur_in_row_count(&fixture_file, manifest.topology.hidden_size)?;
         let row_stage_ids = read_spd_row_stage_ids(&fixture_file, row_count)?;
-        let row_hf_indices = read_spd_row_hf_indices(&fixture_file, row_count)?;
-        let required_hf_indices = required_spd_hf_indices(&row_hf_indices);
+        let row_hf_indices = spd_fixture_row_hf_indices(&fixture_file, row_count)?;
+        let tap_projector = SpdTapInputProjector::from_topology(&manifest.topology, &serving_file)
+            .context("load SPD tap projection weights")?;
+        let required_hf_indices = required_spd_hf_indices_for_topology(&manifest.topology);
         let final_norm_weight = read_spd_final_norm_weight(&fixture_file, hidden_size)?;
+        let logical_stage_count = usize::try_from(manifest.topology.num_stages)
+            .context("SPD manifest num_stages exceeds usize")?;
+        if logical_stage_count == 0 {
+            bail!("SPD manifest num_stages must be greater than zero");
+        }
         let stage_ranges = spd_stage_ranges_from_topology(topology)?;
         let tap_plan = plan_hidden_state_taps(&manifest.topology, &stage_ranges)?;
         if tap_plan.requires_internal_taps() {
@@ -116,6 +336,7 @@ impl SpdReplayProposalSource {
             hidden_size,
             required_hf_indices.clone(),
         )));
+        let tap_lifecycle = Arc::new(Mutex::new(SpdInlineTapLifecycle::default()));
         Ok(Self {
             manifest_path: manifest_path.to_path_buf(),
             model_path,
@@ -124,68 +345,274 @@ impl SpdReplayProposalSource {
             row_count,
             row_stage_ids,
             row_hf_indices,
-            required_hf_indices,
             hidden_size,
             final_norm_weight,
             context_tokens: Vec::new(),
+            head_cache: Mutex::new(head.new_forward_cache()),
             head,
             manifest,
             serving_file,
+            tap_projector,
             live_taps,
             h0_embeddings,
             inline_taps,
+            tap_lifecycle,
+            logical_stage_count,
+            rolling: SpdRollingObserver::new(logical_stage_count),
+            last_proposal_stats: SpdProposalSourceStats::default(),
+            total_proposal_stats: SpdProposalSourceStats::default(),
             replay_fallback: args.replay_fallback,
         })
     }
 
-    fn propose_one(&self, context_tokens: &[i32]) -> Result<Option<i32>> {
+    fn propose_one(&self, context_tokens: &[i32]) -> Result<Option<SpdInlineProposal>> {
         let row_positions = sliding_spd_row_positions(context_tokens.len(), self.row_count)?;
-        let Some(taps) = self.collect_taps_for_proposal(context_tokens, &row_positions)? else {
+        self.propose_from_row_metadata(
+            context_tokens,
+            &row_positions,
+            &self.row_stage_ids,
+            &self.row_hf_indices,
+            None,
+        )
+    }
+
+    fn propose_one_from_rolling_rows(
+        &self,
+        context_tokens: &[i32],
+        rows: &SpdRollingSpeculationRows,
+    ) -> Result<Option<SpdInlineProposal>> {
+        let rows = self.resolve_rolling_rows(rows)?;
+        if rows.row_positions.is_empty()
+            || rows.row_positions.len() != rows.row_i_stages.len()
+            || rows
+                .row_positions
+                .iter()
+                .any(|position| *position >= context_tokens.len())
+        {
+            return Ok(None);
+        }
+        let row_positions = rows
+            .row_positions
+            .iter()
+            .copied()
+            .map(i64::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("SPD rolling row position exceeds i64")?;
+        let row_stage_ids = rows
+            .row_i_stages
+            .iter()
+            .copied()
+            .map(i64::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("SPD rolling row stage exceeds i64")?;
+        let row_hf_indices = rows
+            .row_i_stages
+            .iter()
+            .copied()
+            .map(|stage_id| {
+                u32::try_from(stage_id)
+                    .context("SPD rolling row stage exceeds u32")
+                    .and_then(|stage_id| {
+                        spd_hf_indices_for_stage_id(&self.manifest.topology, stage_id)
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.propose_from_row_metadata(
+            context_tokens,
+            &row_positions,
+            &row_stage_ids,
+            &row_hf_indices,
+            Some(&rows),
+        )
+    }
+
+    fn propose_from_row_metadata(
+        &self,
+        context_tokens: &[i32],
+        row_positions: &[i64],
+        row_stage_ids: &[i64],
+        row_hf_indices: &[Vec<u32>],
+        rolling_rows: Option<&SpdRollingSpeculationRows>,
+    ) -> Result<Option<SpdInlineProposal>> {
+        let required_hf_indices = required_spd_hf_indices(row_hf_indices);
+        let tap_timer = PhaseTimer::start();
+        let Some(tap_collection) = self.collect_taps_for_proposal(
+            context_tokens,
+            row_positions,
+            row_hf_indices,
+            &required_hf_indices,
+        )?
+        else {
             return Ok(None);
         };
+        let tap_collect_ms = tap_timer.elapsed_ms();
+        let cur_in_timer = PhaseTimer::start();
         let live_rows = assemble_spd_live_cur_in_for_positions(SpdLiveCurInRequest {
             manifest: &self.manifest,
             serving_file: &self.serving_file,
-            taps: &taps,
-            row_positions: &row_positions,
-            row_stage_ids: &self.row_stage_ids,
-            row_hf_indices: &self.row_hf_indices,
+            tap_projector: Some(&self.tap_projector),
+            taps: &tap_collection.taps,
+            row_positions,
+            row_stage_ids,
+            row_hf_indices,
             hidden_size: self.hidden_size,
         })?;
-        let topk = self.head.forward(
+        let cur_in_ms = cur_in_timer.elapsed_ms();
+        let forward_timer = PhaseTimer::start();
+        let (topk, cache_used, cache_prefix_len) =
+            self.forward_head_for_rows(context_tokens, row_positions, live_rows.cur_in)?;
+        let forward_ms = forward_timer.elapsed_ms();
+        let mut proposal = spd_inline_proposal_from_topk(&topk)?;
+        proposal.cache_used = cache_used;
+        proposal.cache_prefix_len = cache_prefix_len;
+        proposal.tap_source = tap_collection.source;
+        proposal.tap_collect_ms = tap_collect_ms;
+        proposal.cur_in_ms = cur_in_ms;
+        proposal.forward_ms = forward_ms;
+        proposal.proposal_rows = SpdProposalRows::from_probe_rows(
+            context_tokens.len(),
+            row_positions,
+            row_stage_ids,
+            rolling_rows,
+        )?;
+        Ok(Some(proposal))
+    }
+
+    fn forward_head_for_rows(
+        &self,
+        context_tokens: &[i32],
+        row_positions: &[i64],
+        cur_in: Vec<f32>,
+    ) -> Result<(
+        skippy_runtime::spd::SpdQwen3FixtureTopK,
+        bool,
+        Option<usize>,
+    )> {
+        let input = SpdQwen3ForwardInput {
+            cur_in,
+            seq_len: row_positions.len(),
+            position_ids: row_positions.to_vec(),
+            fixed_stage_ids: None,
+            final_norm_weight: self.final_norm_weight.clone(),
+        };
+        let mut cache = self
+            .head_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD Qwen head cache lock poisoned"))?;
+        if self.prefill_head_cache_for_rows(context_tokens, row_positions, &mut cache)? {
+            let cache_prefix_len = cache.cached_prefix_len();
+            let topk = self
+                .head
+                .forward_with_cache(input, self.top_k, &mut cache)?;
+            return Ok((topk, true, Some(cache_prefix_len)));
+        }
+        Ok((self.head.forward(input, self.top_k)?, false, None))
+    }
+
+    fn prefill_head_cache_for_rows(
+        &self,
+        context_tokens: &[i32],
+        row_positions: &[i64],
+        cache: &mut SpdQwen3ForwardCache,
+    ) -> Result<bool> {
+        let Some(min_position) = row_positions.iter().copied().min() else {
+            return Ok(false);
+        };
+        let min_position =
+            usize::try_from(min_position).context("negative SPD rolling row position")?;
+        let cached_prefix_len = cache.cached_prefix_len().min(min_position);
+        if cached_prefix_len >= min_position {
+            return Ok(true);
+        }
+        let prefix_positions = (cached_prefix_len..min_position)
+            .map(i64::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("SPD prefix position exceeds i64")?;
+        self.prefill_head_cache_positions(context_tokens, &prefix_positions, cache)
+    }
+
+    fn prefill_head_cache_positions(
+        &self,
+        context_tokens: &[i32],
+        row_positions: &[i64],
+        cache: &mut SpdQwen3ForwardCache,
+    ) -> Result<bool> {
+        if row_positions.is_empty() {
+            return Ok(true);
+        }
+        let stage_id = self.manifest.topology.num_stages;
+        let row_stage_ids = vec![i64::from(stage_id); row_positions.len()];
+        let qwen_stage_id = usize::try_from(stage_id).context("SPD stage count exceeds usize")?;
+        let stage_hf_indices = spd_hf_indices_for_stage_id(&self.manifest.topology, stage_id)?;
+        let row_hf_indices = vec![stage_hf_indices; row_positions.len()];
+        let required_hf_indices = required_spd_hf_indices(&row_hf_indices);
+        let required_inline_hf_indices = inline_required_hf_indices(&required_hf_indices);
+        let Some(mut taps) =
+            self.complete_inline_taps(row_positions, &required_inline_hf_indices)?
+        else {
+            return Ok(false);
+        };
+        if required_hf_indices.contains(&0) {
+            taps.insert(0, self.collect_h0_tap(context_tokens, row_positions)?);
+        }
+        let live_rows = assemble_spd_live_cur_in_for_positions(SpdLiveCurInRequest {
+            manifest: &self.manifest,
+            serving_file: &self.serving_file,
+            tap_projector: Some(&self.tap_projector),
+            taps: &taps,
+            row_positions,
+            row_stage_ids: &row_stage_ids,
+            row_hf_indices: &row_hf_indices,
+            hidden_size: self.hidden_size,
+        })?;
+        self.head.prefill_cache(
             SpdQwen3ForwardInput {
                 cur_in: live_rows.cur_in,
-                seq_len: self.row_count,
-                position_ids: row_positions,
+                seq_len: row_positions.len(),
+                position_ids: row_positions.to_vec(),
+                fixed_stage_ids: Some(vec![qwen_stage_id; row_positions.len()]),
                 final_norm_weight: self.final_norm_weight.clone(),
             },
-            self.top_k,
+            cache,
         )?;
-        topk.token_ids
-            .first()
-            .copied()
-            .context("SPD head returned no proposal token")
-            .and_then(|token| i32::try_from(token).context("SPD proposal token exceeds i32"))
-            .map(Some)
+        Ok(true)
     }
 
     fn collect_taps_for_proposal(
         &self,
         context_tokens: &[i32],
         row_positions: &[i64],
-    ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
-        if let Some(mut taps) = self.complete_inline_taps(row_positions)? {
-            if self.required_hf_indices.contains(&0) {
+        row_hf_indices: &[Vec<u32>],
+        required_hf_indices: &[u32],
+    ) -> Result<Option<SpdTapCollection>> {
+        let required_inline_hf_indices = inline_required_hf_indices(required_hf_indices);
+        if let Some(mut taps) = self.complete_inline_taps_for_rows(
+            row_positions,
+            row_hf_indices,
+            &required_inline_hf_indices,
+        )? {
+            if required_hf_indices.contains(&0) {
                 taps.insert(0, self.collect_h0_tap(context_tokens, row_positions)?);
             }
-            return Ok(Some(taps));
+            return Ok(Some(SpdTapCollection {
+                taps,
+                source: SpdTapCollectionSource::Inline,
+            }));
         }
         if !self.replay_fallback {
             return Ok(None);
         }
         let mut taps = self.live_taps.collect_taps(context_tokens)?;
-        self.overlay_inline_taps(&mut taps, row_positions)?;
-        Ok(Some(taps))
+        self.overlay_inline_taps_for_rows(
+            &mut taps,
+            row_positions,
+            row_hf_indices,
+            &required_inline_hf_indices,
+        )?;
+        Ok(Some(SpdTapCollection {
+            taps,
+            source: SpdTapCollectionSource::ReplayFallback,
+        }))
     }
 
     fn collect_h0_tap(
@@ -201,16 +628,291 @@ impl SpdReplayProposalSource {
         self.live_taps.collect_h0_tap(context_tokens)
     }
 
-    pub(super) fn propose_inline_for_current_context(&self, current: i32) -> Result<Option<i32>> {
+    pub(super) fn propose_inline_for_current_context(
+        &mut self,
+        current: i32,
+    ) -> Result<Option<SpdInlineProposal>> {
+        let proposal = self.propose_inline_for_current_context_untracked(current)?;
+        self.record_inline_probe_attempt(proposal.as_ref());
+        Ok(proposal)
+    }
+
+    fn propose_inline_for_current_context_untracked(
+        &self,
+        current: i32,
+    ) -> Result<Option<SpdInlineProposal>> {
         if self.context_tokens.last().copied() != Some(current) {
             return Ok(None);
         }
+        if let Some(rows) = self.resolved_rolling_speculation_rows()?
+            && let Some(proposal) =
+                self.propose_one_from_rolling_rows(&self.context_tokens, &rows)?
+        {
+            return Ok(Some(proposal));
+        }
         self.propose_one(&self.context_tokens)
+    }
+
+    pub(super) fn inline_proposal_miss_for_current_context(
+        &self,
+        current: i32,
+    ) -> Result<Option<SpdInlineProposalMiss>> {
+        if self.context_tokens.last().copied() != Some(current) {
+            return Ok(Some(SpdInlineProposalMiss::empty(
+                "context_current_mismatch",
+            )));
+        }
+        if let Some(rows) = self.resolved_rolling_speculation_rows()? {
+            return self.inline_proposal_miss_for_rolling_rows(&rows);
+        }
+        Ok(Some(SpdInlineProposalMiss::empty(
+            "rolling_rows_unavailable",
+        )))
+    }
+
+    fn inline_proposal_miss_for_rolling_rows(
+        &self,
+        rows: &SpdRollingSpeculationRows,
+    ) -> Result<Option<SpdInlineProposalMiss>> {
+        if rows.row_positions.is_empty() || rows.row_positions.len() != rows.row_i_stages.len() {
+            return Ok(Some(SpdInlineProposalMiss::empty("rolling_rows_invalid")));
+        }
+        if rows
+            .row_positions
+            .iter()
+            .any(|position| *position >= self.context_tokens.len())
+        {
+            return Ok(Some(SpdInlineProposalMiss::empty(
+                "rolling_rows_outside_context",
+            )));
+        }
+        let row_positions = rows
+            .row_positions
+            .iter()
+            .copied()
+            .map(i64::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("SPD rolling row position exceeds i64")?;
+        let row_hf_indices = rows
+            .row_i_stages
+            .iter()
+            .copied()
+            .map(|stage_id| {
+                u32::try_from(stage_id)
+                    .context("SPD rolling row stage exceeds u32")
+                    .and_then(|stage_id| {
+                        spd_hf_indices_for_stage_id(&self.manifest.topology, stage_id)
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let required_hf_indices = required_spd_hf_indices(&row_hf_indices);
+        let required_inline_hf_indices = inline_required_hf_indices(&required_hf_indices);
+        let missing_taps = self
+            .inline_taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?
+            .missing_required_rows_for_row_hf_indices(
+                &row_positions,
+                &row_hf_indices,
+                &required_inline_hf_indices,
+            )?;
+        if missing_taps.is_empty() {
+            return Ok(Some(SpdInlineProposalMiss::for_rows(
+                "rolling_rows_complete_without_proposal",
+                rows,
+                BTreeMap::new(),
+            )?));
+        }
+        Ok(Some(SpdInlineProposalMiss::for_rows(
+            "missing_inline_taps",
+            rows,
+            missing_taps,
+        )?))
+    }
+
+    fn record_inline_probe_attempt(&mut self, proposal: Option<&SpdInlineProposal>) {
+        let mut stats = SpdProposalSourceStats::for_limit(1);
+        stats.attempts = 1;
+        if let Some(proposal) = proposal {
+            stats.observe_proposal(proposal);
+        }
+        self.last_proposal_stats = stats;
+        self.total_proposal_stats.merge(&self.last_proposal_stats);
+    }
+
+    pub(super) fn advance_to_accepted_context(&mut self, context_tokens: &[i32]) -> Result<()> {
+        if self.context_tokens.starts_with(context_tokens) {
+            self.tap_lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+                .accept_context_len(context_tokens.len());
+            return Ok(());
+        }
+        let accepted_extension = context_tokens.starts_with(&self.context_tokens);
+        let retained_prefix_len =
+            retained_tap_prefix_len_for_context_update(&self.context_tokens, context_tokens, true);
+        self.context_tokens = context_tokens.to_vec();
+        self.rolling.advance_to_accepted_context(context_tokens);
+        if !accepted_extension {
+            self.inline_taps
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?
+                .retain_positions_before(retained_prefix_len);
+        }
+        self.head_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD Qwen head cache lock poisoned"))?
+            .crop_to_position(
+                i64::try_from(retained_prefix_len).context("SPD retained prefix exceeds i64")?,
+            );
+        self.tap_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+            .accept_context_len(context_tokens.len());
+        Ok(())
+    }
+
+    pub(super) fn reset_to_verified_context(&mut self, context_tokens: &[i32]) -> Result<()> {
+        let retained_prefix_len =
+            retained_tap_prefix_len_for_context_update(&self.context_tokens, context_tokens, false);
+        self.context_tokens = context_tokens.to_vec();
+        self.rolling.advance_to_accepted_context(context_tokens);
+        self.inline_taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?
+            .retain_positions_before(retained_prefix_len);
+        self.head_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD Qwen head cache lock poisoned"))?
+            .crop_to_position(
+                i64::try_from(retained_prefix_len).context("SPD retained prefix exceeds i64")?,
+            );
+        self.tap_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+            .reset_context_len(context_tokens.len());
+        Ok(())
+    }
+
+    pub(super) fn mark_pending_verify_tap_positions(
+        &mut self,
+        pos_start: usize,
+        token_count: usize,
+    ) -> Result<()> {
+        let positions = (0..token_count)
+            .map(|offset| {
+                pos_start
+                    .checked_add(offset)
+                    .context("SPD verify tap position overflow")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.tap_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+            .mark_pending_future_positions(positions);
+        Ok(())
+    }
+
+    pub(super) fn observe_primary_verify_span(
+        &mut self,
+        first_target_position: usize,
+        draft_tokens: &[i32],
+        target_tokens: &[i32],
+    ) -> Result<Option<SpdRollingTelemetry>> {
+        let mut telemetry = None;
+        for (offset, (draft, target)) in draft_tokens.iter().zip(target_tokens).enumerate() {
+            let target_position = first_target_position
+                .checked_add(offset)
+                .context("SPD primary verify rolling position overflow")?;
+            telemetry = Some(self.observe_rolling_probe(target_position, *target, Some(*draft))?);
+        }
+        Ok(telemetry)
+    }
+
+    pub(super) fn observe_rolling_target_token(
+        &mut self,
+        target_position: usize,
+        target: i32,
+    ) -> Result<SpdRollingTelemetry> {
+        let snapshot = self.rolling.observe_target(target_position, target)?;
+        let speculation_rows = self.resolved_rolling_speculation_rows()?;
+        let verified_delta = self.rolling.take_verified_delta();
+        Ok(SpdRollingTelemetry {
+            snapshot,
+            speculation_rows,
+            verified_delta,
+        })
+    }
+
+    pub(super) fn observe_rolling_probe(
+        &mut self,
+        target_position: usize,
+        target: i32,
+        proposed: Option<i32>,
+    ) -> Result<SpdRollingTelemetry> {
+        let snapshot = self
+            .rolling
+            .observe_probe(target_position, target, proposed)?;
+        let speculation_rows = self.resolved_rolling_speculation_rows()?;
+        let verified_delta = self.rolling.take_verified_delta();
+        Ok(SpdRollingTelemetry {
+            snapshot,
+            speculation_rows,
+            verified_delta,
+        })
+    }
+
+    pub(super) fn insert_rolling_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        insert_rolling_attrs(&self.rolling.snapshot(), attrs);
+    }
+
+    pub(super) fn insert_last_proposal_stats_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        insert_proposal_stats_attrs("window", &self.last_proposal_stats, attrs);
+    }
+
+    pub(super) fn insert_total_proposal_stats_attrs(&self, attrs: &mut BTreeMap<String, Value>) {
+        insert_proposal_stats_attrs("total", &self.total_proposal_stats, attrs);
+    }
+
+    pub(super) fn insert_rolling_telemetry_attrs(
+        attrs: &mut BTreeMap<String, Value>,
+        rolling: &SpdRollingTelemetry,
+    ) {
+        insert_rolling_attrs(&rolling.snapshot, attrs);
+        if let Some(rows) = rolling.speculation_rows.as_ref() {
+            insert_rolling_speculation_rows_attrs(rows, attrs);
+        }
+        if let Some(delta) = rolling.verified_delta.as_ref() {
+            insert_rolling_verified_delta_attrs(delta, attrs);
+        }
+    }
+
+    fn resolved_rolling_speculation_rows(&self) -> Result<Option<SpdRollingSpeculationRows>> {
+        self.rolling
+            .speculation_rows()
+            .map(|rows| self.resolve_rolling_rows(&rows))
+            .transpose()
+    }
+
+    fn resolve_rolling_rows(
+        &self,
+        rows: &SpdRollingSpeculationRows,
+    ) -> Result<SpdRollingSpeculationRows> {
+        let mut resolved = rows.clone();
+        resolved.row_i_stages = {
+            let inline_taps = self
+                .inline_taps
+                .lock()
+                .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?;
+            resolve_rolling_row_stage_roles(&self.manifest.topology, rows, &inline_taps)?
+        };
+        Ok(resolved)
     }
 
     fn complete_inline_taps(
         &self,
         row_positions: &[i64],
+        required_hf_indices: &[u32],
     ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
         let inline_taps = self
             .inline_taps
@@ -218,24 +920,45 @@ impl SpdReplayProposalSource {
             .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?;
         inline_taps.complete_frames(
             row_positions,
-            &non_h0_required_hf_indices(&self.required_hf_indices),
+            &non_h0_required_hf_indices(required_hf_indices),
             self.hidden_size,
         )
     }
 
-    fn overlay_inline_taps(
+    fn complete_inline_taps_for_rows(
+        &self,
+        row_positions: &[i64],
+        row_hf_indices: &[Vec<u32>],
+        required_hf_indices: &[u32],
+    ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
+        let inline_taps = self
+            .inline_taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?;
+        inline_taps.complete_frames_for_row_hf_indices(
+            row_positions,
+            row_hf_indices,
+            &non_h0_required_hf_indices(required_hf_indices),
+            self.hidden_size,
+        )
+    }
+
+    fn overlay_inline_taps_for_rows(
         &self,
         taps: &mut BTreeMap<u32, ActivationFrame>,
         row_positions: &[i64],
+        row_hf_indices: &[Vec<u32>],
+        required_hf_indices: &[u32],
     ) -> Result<()> {
         let mut inline_taps = self
             .inline_taps
             .lock()
             .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?;
-        inline_taps.overlay_complete_frames(
+        inline_taps.overlay_complete_frames_for_row_hf_indices(
             taps,
             row_positions,
-            &self.required_hf_indices,
+            row_hf_indices,
+            required_hf_indices,
             self.hidden_size,
         )
     }
@@ -251,11 +974,26 @@ impl SpeculativeProposalSource for SpdReplayProposalSource {
     }
 
     fn reset_to_context(&mut self, context_tokens: &[i32]) -> Result<()> {
+        let retained_prefix_len =
+            retained_tap_prefix_len_for_context_update(&self.context_tokens, context_tokens, false);
         self.context_tokens = context_tokens.to_vec();
+        self.rolling = SpdRollingObserver::new(self.logical_stage_count);
+        self.last_proposal_stats = SpdProposalSourceStats::default();
+        self.total_proposal_stats = SpdProposalSourceStats::default();
         self.inline_taps
             .lock()
             .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?
-            .clear();
+            .retain_positions_before(retained_prefix_len);
+        self.head_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD Qwen head cache lock poisoned"))?
+            .crop_to_position(
+                i64::try_from(retained_prefix_len).context("SPD retained prefix exceeds i64")?,
+            );
+        self.tap_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+            .reset_context_len(context_tokens.len());
         Ok(())
     }
 
@@ -264,18 +1002,75 @@ impl SpeculativeProposalSource for SpdReplayProposalSource {
             self.context_tokens.push(current);
         }
         if self.context_tokens.len() < self.row_count {
+            self.last_proposal_stats = SpdProposalSourceStats::for_limit(max_tokens);
             return Ok(Vec::new());
         }
         let mut proposals = Vec::with_capacity(max_tokens);
+        let mut stats = SpdProposalSourceStats::for_limit(max_tokens);
+        let mut rolling_plan = self.rolling.draft_plan();
         for _ in 0..max_tokens {
-            let Some(proposal) = self.propose_one(&self.context_tokens)? else {
+            stats.attempts += 1;
+            let Some(proposal) = self.propose_one_for_primary(&rolling_plan)? else {
                 break;
             };
-            proposals.push(proposal);
-            self.context_tokens.push(proposal);
+            stats.observe_proposal(&proposal);
+            proposals.push(proposal.token);
+            self.context_tokens.push(proposal.token);
+            if let Some(plan) = rolling_plan.as_mut() {
+                plan.insert_draft(proposal.token);
+            }
         }
+        self.last_proposal_stats = stats;
+        self.total_proposal_stats.merge(&self.last_proposal_stats);
         Ok(proposals)
     }
+}
+
+impl SpdReplayProposalSource {
+    pub(super) fn logical_stage_count(&self) -> usize {
+        self.logical_stage_count
+    }
+
+    fn propose_one_for_primary(
+        &self,
+        rolling_plan: &Option<SpdRollingDraftPlan>,
+    ) -> Result<Option<SpdInlineProposal>> {
+        let Some(plan) = rolling_plan.as_ref() else {
+            return self.propose_one(&self.context_tokens);
+        };
+        let Some(rows) = plan.speculation_rows() else {
+            return Ok(None);
+        };
+        self.propose_one_from_rolling_rows(&self.context_tokens, &rows)
+    }
+}
+
+fn spd_inline_proposal_from_topk(
+    topk: &skippy_runtime::spd::SpdQwen3FixtureTopK,
+) -> Result<SpdInlineProposal> {
+    let token = topk
+        .token_ids
+        .first()
+        .copied()
+        .context("SPD head returned no proposal token")
+        .and_then(|token| i32::try_from(token).context("SPD proposal token exceeds i32"))?;
+    let logit = topk.logits.first().copied();
+    let logit_margin = match (topk.logits.first(), topk.logits.get(1)) {
+        (Some(first), Some(second)) => Some(*first - *second),
+        _ => None,
+    };
+    Ok(SpdInlineProposal {
+        token,
+        logit,
+        logit_margin,
+        cache_used: false,
+        cache_prefix_len: None,
+        tap_source: SpdTapCollectionSource::Inline,
+        tap_collect_ms: 0.0,
+        cur_in_ms: 0.0,
+        forward_ms: 0.0,
+        proposal_rows: SpdProposalRows::default(),
+    })
 }
 
 pub(super) fn open_spd_replay_source(
@@ -286,12 +1081,41 @@ pub(super) fn open_spd_replay_source(
         (Some(_), Some(_)) => {
             let source = SpdReplayProposalSource::open(args)?;
             let taps = source.inline_taps.clone();
+            let tap_lifecycle = source.tap_lifecycle.clone();
             Ok(Some(SpdReplayProposalState {
                 source: Arc::new(Mutex::new(source)),
                 taps,
+                tap_lifecycle,
             }))
         }
         _ => bail!("--openai-spd-manifest and --openai-spd-fixture must be set together"),
+    }
+}
+
+impl SpdReplayProposalState {
+    pub(super) fn mark_pending_optimistic_tap_position(&self, position: usize) -> Result<()> {
+        self.tap_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+            .mark_pending_optimistic_position(position);
+        Ok(())
+    }
+
+    fn record_returned_tap(&self, tap: &StageReplySpdTap) -> Result<SpdTapRecordOutcome> {
+        let decision = self
+            .tap_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD tap lifecycle lock poisoned"))?
+            .record_decision(tap)?;
+        if let Some(ignored) = decision.ignored {
+            return Ok(SpdTapRecordOutcome::Ignored(ignored));
+        }
+        let record = self
+            .taps
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))?
+            .record_returned_tap(tap)?;
+        Ok(SpdTapRecordOutcome::Recorded(record))
     }
 }
 
@@ -320,9 +1144,72 @@ impl StageOpenAiBackend {
         &self,
         request: &EmbeddedStageZeroGeneration<'_>,
         expected: WireReplyKind,
-        spd_source: Option<&SpdReplayProposalSource>,
+        spd_source: Option<&mut SpdReplayProposalSource>,
         current: i32,
     ) -> Result<SpdPredictionReturn> {
+        self.recv_spd_aware_prediction_return_with_probe_action(
+            request,
+            expected,
+            spd_source,
+            current,
+            SpdInlineProbePhase::PreTargetReply,
+            None::<fn(&StageOpenAiBackend, &SpdInlineProbe) -> Result<()>>,
+        )
+    }
+
+    pub(super) fn recv_spd_aware_prediction_return_for_origin(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        expected: WireReplyKind,
+        expected_origin: PredictionReturnOrigin,
+    ) -> Result<SpdPredictionReturn> {
+        self.recv_spd_aware_prediction_return_with_wait_action(
+            request,
+            SpdPredictionReturnWait {
+                expected,
+                expected_origin: Some(expected_origin),
+                spd_source: None,
+                current: 0,
+                probe_phase: SpdInlineProbePhase::PreTargetReply,
+            },
+            None::<fn(&StageOpenAiBackend, &SpdInlineProbe) -> Result<()>>,
+        )
+    }
+
+    pub(super) fn recv_spd_aware_prediction_return_with_probe_action<F>(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        expected: WireReplyKind,
+        spd_source: Option<&mut SpdReplayProposalSource>,
+        current: i32,
+        probe_phase: SpdInlineProbePhase,
+        on_pre_target_probe: Option<F>,
+    ) -> Result<SpdPredictionReturn>
+    where
+        F: FnOnce(&StageOpenAiBackend, &SpdInlineProbe) -> Result<()>,
+    {
+        self.recv_spd_aware_prediction_return_with_wait_action(
+            request,
+            SpdPredictionReturnWait {
+                expected,
+                expected_origin: None,
+                spd_source,
+                current,
+                probe_phase,
+            },
+            on_pre_target_probe,
+        )
+    }
+
+    pub(super) fn recv_spd_aware_prediction_return_with_wait_action<F>(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        mut wait: SpdPredictionReturnWait<'_>,
+        mut on_pre_target_probe: Option<F>,
+    ) -> Result<SpdPredictionReturn>
+    where
+        F: FnOnce(&StageOpenAiBackend, &SpdInlineProbe) -> Result<()>,
+    {
         let receiver = request
             .prediction_return
             .as_ref()
@@ -330,32 +1217,57 @@ impl StageOpenAiBackend {
         let mut pre_target_probe = None;
         let mut wait_after_probe_timer = None;
         loop {
-            let reply = receiver.recv()?;
+            let item = if let Some(origin) = wait.expected_origin {
+                receiver.recv_item_matching(|item| {
+                    item.reply.kind == WireReplyKind::SpdTap
+                        || item.matches_origin(wait.expected, origin)
+                })?
+            } else {
+                receiver.recv_item()?
+            };
+            let reply = item.reply;
             if reply.kind == WireReplyKind::SpdTap {
                 let trigger_hf_index = reply.spd_tap.as_ref().map(|tap| tap.hf_index);
                 self.record_spd_direct_return_tap(request, &reply);
                 if pre_target_probe.is_none()
-                    && let Some(spd) = spd_source
+                    && let Some(spd) = wait.spd_source.as_mut()
                 {
                     let probe_timer = PhaseTimer::start();
-                    let proposed = spd.propose_inline_for_current_context(current)?;
+                    let proposal = spd.propose_inline_for_current_context(wait.current)?;
                     let elapsed_ms = probe_timer.elapsed_ms();
-                    if proposed.is_some() {
-                        pre_target_probe = Some(SpdInlineProbe {
-                            phase: SpdInlineProbePhase::PreTargetReply,
-                            proposed,
+                    if let Some(proposal) = proposal {
+                        pre_target_probe = Some(SpdInlineProbe::from_proposal(
+                            wait.probe_phase,
+                            Some(&proposal),
                             elapsed_ms,
-                            target_wait_after_probe_ms: 0.0,
+                            0.0,
                             trigger_hf_index,
-                        });
+                        ));
                         wait_after_probe_timer = Some(PhaseTimer::start());
+                        if let (Some(callback), Some(probe)) =
+                            (on_pre_target_probe.take(), pre_target_probe.as_ref())
+                        {
+                            callback(self, probe)?;
+                        }
+                    } else {
+                        let proposal_miss =
+                            spd.inline_proposal_miss_for_current_context(wait.current)?;
+                        self.emit_spd_inline_probe_miss(
+                            request,
+                            wait.probe_phase,
+                            wait.current,
+                            trigger_hf_index,
+                            elapsed_ms,
+                            proposal_miss.as_ref(),
+                        );
                     }
                 }
                 continue;
             }
-            if reply.kind != expected {
+            if reply.kind != wait.expected {
                 bail!(
-                    "expected {expected:?} direct prediction return, got {:?}",
+                    "expected {:?} direct prediction return, got {:?}",
+                    wait.expected,
                     reply.kind
                 );
             }
@@ -378,6 +1290,7 @@ impl StageOpenAiBackend {
         current: i32,
         target: i32,
         probe: SpdInlineProbe,
+        rolling: Option<&SpdRollingTelemetry>,
     ) -> f64 {
         let mut attrs = self.openai_attrs(request.ids);
         attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
@@ -402,6 +1315,38 @@ impl StageOpenAiBackend {
             json!(probe.proposed),
         );
         attrs.insert(
+            "llama_stage.spd_inline_probe_proposed_logit".to_string(),
+            json!(probe.proposed_logit),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_logit_margin".to_string(),
+            json!(probe.proposed_logit_margin),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_cache_used".to_string(),
+            json!(probe.cache_used),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_cache_prefix_len".to_string(),
+            json!(probe.cache_prefix_len),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_tap_source".to_string(),
+            json!(probe.tap_source.map(SpdTapCollectionSource::as_str)),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_tap_collect_ms".to_string(),
+            json!(probe.tap_collect_ms),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_cur_in_ms".to_string(),
+            json!(probe.cur_in_ms),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_forward_ms".to_string(),
+            json!(probe.forward_ms),
+        );
+        attrs.insert(
             "llama_stage.spd_inline_probe_target_token".to_string(),
             json!(target),
         );
@@ -417,9 +1362,131 @@ impl StageOpenAiBackend {
             "llama_stage.spd_inline_probe_trigger_hf_index".to_string(),
             json!(probe.trigger_hf_index),
         );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_positions".to_string(),
+            json!(&probe.proposal_rows.row_positions),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_i_stages".to_string(),
+            json!(&probe.proposal_rows.row_i_stages),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_evicted_prefix_position".to_string(),
+            json!(probe.proposal_rows.evicted_prefix_position),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_newest_position".to_string(),
+            json!(probe.proposal_rows.newest_position),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_next_draft_position".to_string(),
+            json!(probe.proposal_rows.next_draft_position),
+        );
+        if let Some(miss) = probe.proposal_miss.as_ref() {
+            attrs.insert(
+                "llama_stage.spd_inline_probe_miss_reason".to_string(),
+                json!(miss.reason),
+            );
+            attrs.insert(
+                "llama_stage.spd_inline_probe_missing_taps".to_string(),
+                json!(&miss.missing_taps),
+            );
+        }
+        if let Some(rolling) = rolling {
+            insert_rolling_attrs(&rolling.snapshot, &mut attrs);
+            if let Some(rows) = rolling.speculation_rows.as_ref() {
+                insert_rolling_speculation_rows_attrs(rows, &mut attrs);
+            }
+            if let Some(delta) = rolling.verified_delta.as_ref() {
+                insert_rolling_verified_delta_attrs(delta, &mut attrs);
+            }
+        }
         self.telemetry
             .emit_debug("stage.openai_spd_inline_probe", attrs);
         probe.elapsed_ms
+    }
+
+    fn emit_spd_inline_probe_miss(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        phase: SpdInlineProbePhase,
+        current: i32,
+        trigger_hf_index: Option<u32>,
+        elapsed_ms: f64,
+        proposal_miss: Option<&SpdInlineProposalMiss>,
+    ) {
+        if !self.telemetry.is_debug_enabled() {
+            return;
+        }
+        let mut attrs = self.openai_attrs(request.ids);
+        attrs.insert(
+            "llama_stage.spd_inline_probe_phase".to_string(),
+            json!(phase.as_str()),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_ready".to_string(),
+            json!(false),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_current_token".to_string(),
+            json!(current),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_trigger_hf_index".to_string(),
+            json!(trigger_hf_index),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_elapsed_ms".to_string(),
+            json!(elapsed_ms),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_miss_reason".to_string(),
+            json!(proposal_miss.map(|miss| miss.reason)),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_missing_taps".to_string(),
+            json!(proposal_miss.map(|miss| &miss.missing_taps)),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_positions".to_string(),
+            json!(
+                proposal_miss
+                    .and_then(|miss| miss.proposal_rows.as_ref().map(|rows| &rows.row_positions))
+            ),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_i_stages".to_string(),
+            json!(
+                proposal_miss
+                    .and_then(|miss| miss.proposal_rows.as_ref().map(|rows| &rows.row_i_stages))
+            ),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_evicted_prefix_position".to_string(),
+            json!(
+                proposal_miss
+                    .and_then(|miss| miss.proposal_rows.as_ref())
+                    .and_then(|rows| rows.evicted_prefix_position)
+            ),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_newest_position".to_string(),
+            json!(
+                proposal_miss
+                    .and_then(|miss| miss.proposal_rows.as_ref())
+                    .and_then(|rows| rows.newest_position)
+            ),
+        );
+        attrs.insert(
+            "llama_stage.spd_inline_probe_proposal_row_next_draft_position".to_string(),
+            json!(
+                proposal_miss
+                    .and_then(|miss| miss.proposal_rows.as_ref())
+                    .and_then(|rows| rows.next_draft_position)
+            ),
+        );
+        self.telemetry
+            .emit_debug("stage.openai_spd_inline_probe_miss", attrs);
     }
 
     pub(super) fn record_spd_stage0_boundary_tap(
@@ -446,6 +1513,10 @@ impl StageOpenAiBackend {
                 attrs.insert(
                     "llama_stage.spd_inline_tap_rows_recorded".to_string(),
                     json!(record.rows_recorded),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_positions".to_string(),
+                    json!(&record.positions),
                 );
                 attrs.insert(
                     "llama_stage.spd_inline_tap_cached_rows".to_string(),
@@ -480,26 +1551,34 @@ impl StageOpenAiBackend {
         request: &EmbeddedStageZeroGeneration<'_>,
         reply: &StageReply,
     ) {
+        let Some(tap) = reply.spd_tap.as_ref() else {
+            self.emit_missing_spd_tap_payload(request);
+            return;
+        };
+        self.record_spd_direct_tap_payload(request, tap);
+    }
+
+    fn emit_missing_spd_tap_payload(&self, request: &EmbeddedStageZeroGeneration<'_>) {
+        let mut attrs = self.openai_attrs(request.ids);
+        attrs.insert(
+            "llama_stage.spd_inline_tap_error".to_string(),
+            json!("missing SPD tap reply payload"),
+        );
+        self.telemetry
+            .emit_debug("stage.openai_spd_tap_record_failed", attrs);
+    }
+
+    fn record_spd_direct_tap_payload(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        tap: &StageReplySpdTap,
+    ) {
         let Some(spd) = request.spd.as_ref() else {
             return;
         };
-        let Some(tap) = reply.spd_tap.as_ref() else {
-            let mut attrs = self.openai_attrs(request.ids);
-            attrs.insert(
-                "llama_stage.spd_inline_tap_error".to_string(),
-                json!("missing SPD tap reply payload"),
-            );
-            self.telemetry
-                .emit_debug("stage.openai_spd_tap_record_failed", attrs);
-            return;
-        };
-        let outcome = spd
-            .taps
-            .lock()
-            .map_err(|_| anyhow::anyhow!("SPD inline tap cache lock poisoned"))
-            .and_then(|mut taps| taps.record_returned_tap(tap));
+        let outcome = spd.record_returned_tap(tap);
         match outcome {
-            Ok(record) => {
+            Ok(SpdTapRecordOutcome::Recorded(record)) => {
                 let mut attrs = self.openai_attrs(request.ids);
                 attrs.insert(
                     "llama_stage.spd_inline_tap_hf_index".to_string(),
@@ -508,6 +1587,10 @@ impl StageOpenAiBackend {
                 attrs.insert(
                     "llama_stage.spd_inline_tap_rows_recorded".to_string(),
                     json!(record.rows_recorded),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_positions".to_string(),
+                    json!(&record.positions),
                 );
                 attrs.insert(
                     "llama_stage.spd_inline_tap_cached_rows".to_string(),
@@ -527,6 +1610,35 @@ impl StageOpenAiBackend {
                 );
                 self.telemetry
                     .emit_debug("stage.openai_spd_tap_record", attrs);
+            }
+            Ok(SpdTapRecordOutcome::Ignored(ignored)) => {
+                let mut attrs = self.openai_attrs(request.ids);
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_hf_index".to_string(),
+                    json!(tap.hf_index),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_ignored_reason".to_string(),
+                    json!(ignored.reason),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_positions".to_string(),
+                    json!(ignored.positions),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_accepted_context_len".to_string(),
+                    json!(ignored.accepted_context_len),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_pending_position".to_string(),
+                    json!(ignored.pending_positions.first().copied()),
+                );
+                attrs.insert(
+                    "llama_stage.spd_inline_tap_pending_positions".to_string(),
+                    json!(ignored.pending_positions),
+                );
+                self.telemetry
+                    .emit_debug("stage.openai_spd_tap_ignored", attrs);
             }
             Err(error) => {
                 let mut attrs = self.openai_attrs(request.ids);
@@ -551,19 +1663,88 @@ pub(super) struct SpdPredictionReturn {
     pub(super) pre_target_probe: Option<SpdInlineProbe>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SpdPredictionReturnWait<'a> {
+    pub(super) expected: WireReplyKind,
+    pub(super) expected_origin: Option<PredictionReturnOrigin>,
+    pub(super) spd_source: Option<&'a mut SpdReplayProposalSource>,
+    pub(super) current: i32,
+    pub(super) probe_phase: SpdInlineProbePhase,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct SpdInlineProbe {
     pub(super) phase: SpdInlineProbePhase,
     pub(super) proposed: Option<i32>,
+    pub(super) proposed_logit: Option<f32>,
+    pub(super) proposed_logit_margin: Option<f32>,
+    pub(super) cache_used: bool,
+    pub(super) cache_prefix_len: Option<usize>,
+    pub(super) tap_source: Option<SpdTapCollectionSource>,
+    pub(super) tap_collect_ms: f64,
+    pub(super) cur_in_ms: f64,
+    pub(super) forward_ms: f64,
     pub(super) elapsed_ms: f64,
     pub(super) target_wait_after_probe_ms: f64,
     pub(super) trigger_hf_index: Option<u32>,
+    pub(super) proposal_rows: SpdProposalRows,
+    proposal_miss: Option<SpdInlineProposalMiss>,
+}
+
+impl SpdInlineProbe {
+    pub(super) fn from_proposal(
+        phase: SpdInlineProbePhase,
+        proposal: Option<&SpdInlineProposal>,
+        elapsed_ms: f64,
+        target_wait_after_probe_ms: f64,
+        trigger_hf_index: Option<u32>,
+    ) -> Self {
+        Self {
+            phase,
+            proposed: proposal.map(|proposal| proposal.token),
+            proposed_logit: proposal.and_then(|proposal| proposal.logit),
+            proposed_logit_margin: proposal.and_then(|proposal| proposal.logit_margin),
+            cache_used: proposal
+                .map(|proposal| proposal.cache_used)
+                .unwrap_or(false),
+            cache_prefix_len: proposal.and_then(|proposal| proposal.cache_prefix_len),
+            tap_source: proposal.map(|proposal| proposal.tap_source),
+            tap_collect_ms: proposal
+                .map(|proposal| proposal.tap_collect_ms)
+                .unwrap_or(0.0),
+            cur_in_ms: proposal.map(|proposal| proposal.cur_in_ms).unwrap_or(0.0),
+            forward_ms: proposal.map(|proposal| proposal.forward_ms).unwrap_or(0.0),
+            elapsed_ms,
+            target_wait_after_probe_ms,
+            trigger_hf_index,
+            proposal_rows: proposal
+                .map(|proposal| proposal.proposal_rows.clone())
+                .unwrap_or_default(),
+            proposal_miss: None,
+        }
+    }
+
+    pub(super) fn with_proposal_miss(mut self, miss: Option<SpdInlineProposalMiss>) -> Self {
+        if self.proposed.is_none() {
+            self.proposal_miss = miss;
+        }
+        self
+    }
+
+    pub(super) fn allows_optimistic_decode(&self, min_logit_margin: Option<f32>) -> bool {
+        match min_logit_margin {
+            Some(minimum) => self
+                .proposed_logit_margin
+                .is_some_and(|margin| margin >= minimum),
+            None => self.proposed.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpdInlineProbePhase {
     PreTargetReply,
     PostTargetReply,
+    OptimisticCommit,
 }
 
 impl SpdInlineProbePhase {
@@ -571,256 +1752,7 @@ impl SpdInlineProbePhase {
         match self {
             Self::PreTargetReply => "pre_target_reply",
             Self::PostTargetReply => "post_target_reply",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SpdInlineTapRecord {
-    hf_index: u32,
-    rows_recorded: usize,
-    cached_rows: usize,
-    payload_bytes: usize,
-    required: bool,
-}
-
-struct SpdInlineTapCache {
-    hidden_size: usize,
-    required_hf_indices: BTreeSet<u32>,
-    frames: BTreeMap<u32, SpdCachedTapFrame>,
-}
-
-impl SpdInlineTapCache {
-    fn new(hidden_size: usize, required_hf_indices: Vec<u32>) -> Self {
-        Self {
-            hidden_size,
-            required_hf_indices: required_hf_indices.into_iter().collect(),
-            frames: BTreeMap::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.frames.clear();
-    }
-
-    fn record_stage_output(
-        &mut self,
-        config: &StageConfig,
-        message: &StageWireMessage,
-        frame: &ActivationFrame,
-    ) -> Result<Option<SpdInlineTapRecord>> {
-        let hf_index = config.layer_end;
-        if frame.payload.is_empty() {
-            return Ok(None);
-        }
-        validate_spd_inline_frame(frame, self.hidden_size)?;
-        let token_count =
-            usize::try_from(frame.desc.token_count).context("SPD tap token_count exceeds usize")?;
-        if token_count == 0 {
-            return Ok(None);
-        }
-        let positions = message_positions(message, token_count)?;
-        self.record_rows(hf_index, positions, frame).map(Some)
-    }
-
-    fn record_returned_tap(&mut self, tap: &StageReplySpdTap) -> Result<SpdInlineTapRecord> {
-        if tap.dtype != RuntimeActivationDType::F32 as i32 {
-            bail!("SPD returned tap frame must be f32, got {}", tap.dtype);
-        }
-        if tap.layout != RuntimeActivationLayout::TokenMajor as i32 {
-            bail!(
-                "SPD returned tap frame must be token-major, got {}",
-                tap.layout
-            );
-        }
-        let frame = ActivationFrame {
-            desc: skippy_runtime::ActivationDesc {
-                version: 1,
-                dtype: RuntimeActivationDType::F32,
-                layout: RuntimeActivationLayout::TokenMajor,
-                producer_stage_index: tap.producer_stage_index,
-                layer_start: tap.layer_start,
-                layer_end: tap.layer_end,
-                token_count: tap.token_count,
-                sequence_count: tap.sequence_count,
-                payload_bytes: u64::try_from(tap.payload.len())
-                    .context("SPD returned tap payload bytes exceed u64")?,
-                flags: tap.flags,
-            },
-            payload: tap.payload.clone(),
-        };
-        let positions = tap
-            .positions
-            .iter()
-            .copied()
-            .map(|position| {
-                u32::try_from(position)
-                    .with_context(|| format!("negative SPD returned tap position {position}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.record_rows(tap.hf_index, positions, &frame)
-    }
-
-    fn record_rows(
-        &mut self,
-        hf_index: u32,
-        positions: Vec<u32>,
-        frame: &ActivationFrame,
-    ) -> Result<SpdInlineTapRecord> {
-        validate_spd_inline_frame(frame, self.hidden_size)?;
-        let token_count =
-            usize::try_from(frame.desc.token_count).context("SPD tap token_count exceeds usize")?;
-        if positions.len() != token_count {
-            bail!(
-                "SPD inline tap positions length {} does not match token_count {}",
-                positions.len(),
-                token_count
-            );
-        }
-        if positions.is_empty() {
-            bail!("SPD inline tap has no positions");
-        }
-        let required = self.required_hf_indices.contains(&hf_index);
-        let cached = self
-            .frames
-            .entry(hf_index)
-            .or_insert_with(|| SpdCachedTapFrame::new(frame.desc));
-        let row_bytes = self
-            .hidden_size
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("SPD inline tap row byte width overflow")?;
-        for (row_index, position) in positions.iter().copied().enumerate() {
-            let offset = row_index
-                .checked_mul(row_bytes)
-                .context("SPD inline tap payload offset overflow")?;
-            cached
-                .rows
-                .insert(position, frame.payload[offset..offset + row_bytes].to_vec());
-        }
-        Ok(SpdInlineTapRecord {
-            hf_index,
-            rows_recorded: positions.len(),
-            cached_rows: cached.rows.len(),
-            payload_bytes: frame.payload.len(),
-            required,
-        })
-    }
-
-    fn overlay_complete_frames(
-        &mut self,
-        taps: &mut BTreeMap<u32, ActivationFrame>,
-        row_positions: &[i64],
-        required_hf_indices: &[u32],
-        hidden_size: usize,
-    ) -> Result<()> {
-        if hidden_size != self.hidden_size {
-            bail!(
-                "SPD inline tap hidden size mismatch: cache {}, request {}",
-                self.hidden_size,
-                hidden_size
-            );
-        }
-        for hf_index in required_hf_indices {
-            let Some(frame) = self.frame_for_positions(*hf_index, row_positions)? else {
-                continue;
-            };
-            taps.insert(*hf_index, frame);
-        }
-        Ok(())
-    }
-
-    fn complete_frames(
-        &self,
-        row_positions: &[i64],
-        required_hf_indices: &[u32],
-        hidden_size: usize,
-    ) -> Result<Option<BTreeMap<u32, ActivationFrame>>> {
-        if hidden_size != self.hidden_size {
-            bail!(
-                "SPD inline tap hidden size mismatch: cache {}, request {}",
-                self.hidden_size,
-                hidden_size
-            );
-        }
-        let mut complete = BTreeMap::new();
-        for hf_index in required_hf_indices {
-            let Some(frame) = self.frame_for_positions(*hf_index, row_positions)? else {
-                return Ok(None);
-            };
-            complete.insert(*hf_index, frame);
-        }
-        Ok(Some(complete))
-    }
-
-    fn frame_for_positions(
-        &self,
-        hf_index: u32,
-        row_positions: &[i64],
-    ) -> Result<Option<ActivationFrame>> {
-        let Some(cached) = self.frames.get(&hf_index) else {
-            return Ok(None);
-        };
-        let positions = row_positions
-            .iter()
-            .copied()
-            .map(|position| {
-                u32::try_from(position)
-                    .with_context(|| format!("negative SPD inline tap position {position}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if positions
-            .iter()
-            .any(|position| !cached.rows.contains_key(position))
-        {
-            return Ok(None);
-        }
-        let token_count = positions
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .context("SPD inline tap synthetic token_count overflow")?;
-        let row_bytes = self
-            .hidden_size
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("SPD inline tap row byte width overflow")?;
-        let total_bytes = usize::try_from(token_count)
-            .context("SPD inline tap token_count exceeds usize")?
-            .checked_mul(row_bytes)
-            .context("SPD inline tap synthetic payload overflow")?;
-        let mut payload = vec![0_u8; total_bytes];
-        for position in positions {
-            let row = cached
-                .rows
-                .get(&position)
-                .context("missing cached SPD row after completeness check")?;
-            let offset = usize::try_from(position)
-                .context("SPD inline tap position exceeds usize")?
-                .checked_mul(row_bytes)
-                .context("SPD inline tap synthetic offset overflow")?;
-            payload[offset..offset + row_bytes].copy_from_slice(row);
-        }
-        let mut desc = cached.desc;
-        desc.token_count = token_count;
-        desc.sequence_count = if token_count == 0 { 0 } else { 1 };
-        desc.payload_bytes =
-            u64::try_from(payload.len()).context("SPD inline tap payload bytes exceed u64")?;
-        Ok(Some(ActivationFrame { desc, payload }))
-    }
-}
-
-#[derive(Clone)]
-struct SpdCachedTapFrame {
-    desc: skippy_runtime::ActivationDesc,
-    rows: BTreeMap<u32, Vec<u8>>,
-}
-
-impl SpdCachedTapFrame {
-    fn new(desc: skippy_runtime::ActivationDesc) -> Self {
-        Self {
-            desc,
-            rows: BTreeMap::new(),
+            Self::OptimisticCommit => "optimistic_commit",
         }
     }
 }
@@ -842,15 +1774,6 @@ fn resolve_spd_model_path(override_path: Option<&Path>, config: &StageConfig) ->
     bail!(
         "SPD replay source requires a full GGUF via --openai-spd-model-path, source_model_path, or model_path"
     )
-}
-
-fn required_spd_hf_indices(row_hf_indices: &[Vec<u32>]) -> Vec<u32> {
-    row_hf_indices
-        .iter()
-        .flat_map(|row| row.iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }
 
 fn non_h0_required_hf_indices(required_hf_indices: &[u32]) -> Vec<u32> {
@@ -942,17 +1865,6 @@ fn spd_stage_ranges_from_topology(topology: &StageTopology) -> Result<Vec<SpdSta
     Ok(ranges)
 }
 
-fn fixture_cur_in_row_count(fixture: &SpdSafetensorsFile, hidden_size: usize) -> Result<usize> {
-    let shape = &fixture.index.tensor("cur_in")?.shape;
-    if shape.len() != 3 || shape[0] != 1 || shape[2] != hidden_size as u64 {
-        bail!(
-            "SPD fixture cur_in shape {:?} is not [1, rows, hidden]",
-            shape
-        );
-    }
-    usize::try_from(shape[1]).context("SPD fixture row count exceeds usize")
-}
-
 fn read_spd_row_stage_ids(fixture: &SpdSafetensorsFile, row_count: usize) -> Result<Vec<i64>> {
     let row_stage_ids = fixture.read_tensor_i64("row_i_stages")?;
     if row_stage_ids.len() != row_count {
@@ -963,25 +1875,6 @@ fn read_spd_row_stage_ids(fixture: &SpdSafetensorsFile, row_count: usize) -> Res
         );
     }
     Ok(row_stage_ids)
-}
-
-fn read_spd_row_hf_indices(
-    fixture: &SpdSafetensorsFile,
-    row_count: usize,
-) -> Result<Vec<Vec<u32>>> {
-    (0..row_count)
-        .map(|row_index| {
-            fixture
-                .read_tensor_i64(&format!("tap_row_{row_index}_hf_indices"))?
-                .into_iter()
-                .map(|value| {
-                    u32::try_from(value).with_context(|| {
-                        format!("SPD fixture row {row_index} has negative hf index")
-                    })
-                })
-                .collect()
-        })
-        .collect()
 }
 
 fn read_spd_final_norm_weight(
@@ -999,322 +1892,65 @@ fn read_spd_final_norm_weight(
     Ok(final_norm_weight)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use skippy_protocol::{
-        LoadMode, StageTopologyEntry,
-        binary::{StageStateHeader, WireActivationDType, WireMessageKind},
+fn resolve_rolling_row_stage_roles(
+    topology: &skippy_runtime::spd::SpdHeadTopology,
+    rows: &SpdRollingSpeculationRows,
+    inline_taps: &SpdInlineTapCache,
+) -> Result<Vec<usize>> {
+    let has_evicted_prefix = rows.evicted_prefix_position.is_some();
+    rows.row_positions
+        .iter()
+        .copied()
+        .zip(rows.row_i_stages.iter().copied())
+        .map(|(position, nominal)| {
+            resolve_rolling_row_stage_role(
+                topology,
+                position,
+                nominal,
+                has_evicted_prefix,
+                inline_taps,
+            )
+        })
+        .collect()
+}
+
+fn resolve_rolling_row_stage_role(
+    topology: &skippy_runtime::spd::SpdHeadTopology,
+    position: usize,
+    nominal: usize,
+    has_evicted_prefix: bool,
+    inline_taps: &SpdInlineTapCache,
+) -> Result<usize> {
+    let stage_count =
+        usize::try_from(topology.num_stages).context("SPD num_stages exceeds usize")?;
+    if nominal > stage_count {
+        bail!("SPD rolling row stage {nominal} exceeds manifest stage count {stage_count}");
+    }
+    if nominal == 0 || !topology.trained_with_use_deepest {
+        return Ok(nominal);
+    }
+    if nominal == stage_count {
+        return Ok(stage_count);
+    }
+    let deepest_fused = if has_evicted_prefix {
+        stage_count.saturating_sub(1).max(1)
+    } else {
+        stage_count
     };
-    use skippy_runtime::{ActivationDesc, RuntimeActivationDType, RuntimeActivationLayout};
-
-    #[test]
-    fn stage_ranges_from_topology_are_layer_sorted() {
-        let topology = StageTopology {
-            topology_id: "topology".to_string(),
-            model_id: "model".to_string(),
-            stages: vec![
-                stage_entry("stage-1", 1, 8, 16),
-                stage_entry("stage-0", 0, 0, 8),
-            ],
-        };
-
-        let ranges = spd_stage_ranges_from_topology(&topology).unwrap();
-
-        assert_eq!(
-            ranges,
-            vec![
-                SpdStageLayerRange::new(0, 0, 8),
-                SpdStageLayerRange::new(1, 8, 16)
-            ]
-        );
-    }
-
-    #[test]
-    fn inline_tap_cache_rebuilds_positioned_activation_frame() {
-        let mut cache = SpdInlineTapCache::new(2, vec![8]);
-        let config = stage_config("stage-0", 0, 0, 8);
-        let message = stage_message(2, 2, Vec::new());
-        let frame = activation_frame(0, 8, &[1.0, 2.0, 3.0, 4.0]);
-
-        let record = cache
-            .record_stage_output(&config, &message, &frame)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            record,
-            SpdInlineTapRecord {
-                hf_index: 8,
-                rows_recorded: 2,
-                cached_rows: 2,
-                payload_bytes: 16,
-                required: true,
-            }
-        );
-
-        let rebuilt = cache
-            .frame_for_positions(8, &[2, 3])
-            .unwrap()
-            .expect("positions should be complete");
-        assert_eq!(rebuilt.desc.token_count, 4);
-        assert_eq!(f32_row(&rebuilt, 2, 2), vec![1.0, 2.0]);
-        assert_eq!(f32_row(&rebuilt, 3, 2), vec![3.0, 4.0]);
-    }
-
-    #[test]
-    fn inline_tap_cache_overlays_complete_required_frames() {
-        let mut cache = SpdInlineTapCache::new(2, vec![8]);
-        let config = stage_config("stage-0", 0, 0, 8);
-        let message = stage_message(2, 2, vec![2, 3]);
-        let frame = activation_frame(0, 8, &[5.0, 6.0, 7.0, 8.0]);
-        cache
-            .record_stage_output(&config, &message, &frame)
-            .unwrap()
-            .unwrap();
-        let mut taps = BTreeMap::new();
-
-        cache
-            .overlay_complete_frames(&mut taps, &[2, 3], &[8], 2)
-            .unwrap();
-
-        let overlaid = taps.get(&8).expect("expected overlaid tap");
-        assert_eq!(f32_row(overlaid, 2, 2), vec![5.0, 6.0]);
-        assert_eq!(f32_row(overlaid, 3, 2), vec![7.0, 8.0]);
-    }
-
-    #[test]
-    fn inline_tap_cache_returns_complete_required_frames() {
-        let mut cache = SpdInlineTapCache::new(2, vec![10, 20]);
-        let message = stage_message(4, 2, Vec::new());
-        cache
-            .record_stage_output(
-                &stage_config("stage-1", 1, 8, 10),
-                &message,
-                &activation_frame(8, 10, &[1.0, 2.0, 3.0, 4.0]),
-            )
-            .unwrap()
-            .unwrap();
-        cache
-            .record_stage_output(
-                &stage_config("stage-3", 3, 16, 20),
-                &message,
-                &activation_frame(16, 20, &[5.0, 6.0, 7.0, 8.0]),
-            )
-            .unwrap()
-            .unwrap();
-
-        let complete = cache
-            .complete_frames(&[4, 5], &[10, 20], 2)
-            .unwrap()
-            .expect("all required taps are complete");
-
-        assert_eq!(complete.keys().copied().collect::<Vec<_>>(), vec![10, 20]);
-        assert_eq!(f32_row(complete.get(&10).unwrap(), 4, 2), vec![1.0, 2.0]);
-        assert_eq!(f32_row(complete.get(&20).unwrap(), 5, 2), vec![7.0, 8.0]);
-    }
-
-    #[test]
-    fn inline_tap_cache_reports_missing_required_frame() {
-        let mut cache = SpdInlineTapCache::new(2, vec![10, 20]);
-        cache
-            .record_stage_output(
-                &stage_config("stage-1", 1, 8, 10),
-                &stage_message(4, 1, Vec::new()),
-                &activation_frame(8, 10, &[1.0, 2.0]),
-            )
-            .unwrap()
-            .unwrap();
-
-        assert!(cache.complete_frames(&[4], &[10, 20], 2).unwrap().is_none());
-    }
-
-    #[test]
-    fn inline_tap_cache_records_unrequired_stage_output_without_overlaying_it() {
-        let mut cache = SpdInlineTapCache::new(2, vec![8]);
-        let config = stage_config("stage-1", 1, 8, 10);
-        let message = stage_message(0, 1, Vec::new());
-        let frame = activation_frame(8, 10, &[1.0, 2.0]);
-
-        let record = cache
-            .record_stage_output(&config, &message, &frame)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            record,
-            SpdInlineTapRecord {
-                hf_index: 10,
-                rows_recorded: 1,
-                cached_rows: 1,
-                payload_bytes: 8,
-                required: false,
-            }
-        );
-        let mut taps = BTreeMap::new();
-        cache
-            .overlay_complete_frames(&mut taps, &[0], &[8], 2)
-            .unwrap();
-        assert!(taps.is_empty());
-    }
-
-    #[test]
-    fn inline_tap_cache_records_returned_downstream_tap() {
-        let mut cache = SpdInlineTapCache::new(2, vec![10]);
-        let tap = StageReplySpdTap {
-            hf_index: 10,
-            producer_stage_index: 1,
-            layer_start: 8,
-            layer_end: 10,
-            token_count: 2,
-            sequence_count: 1,
-            dtype: RuntimeActivationDType::F32 as i32,
-            layout: RuntimeActivationLayout::TokenMajor as i32,
-            flags: 0,
-            positions: vec![4, 5],
-            payload: f32_payload(&[9.0, 10.0, 11.0, 12.0]),
-        };
-
-        let record = cache.record_returned_tap(&tap).unwrap();
-
-        assert_eq!(
-            record,
-            SpdInlineTapRecord {
-                hf_index: 10,
-                rows_recorded: 2,
-                cached_rows: 2,
-                payload_bytes: 16,
-                required: true,
-            }
-        );
-        let overlaid = cache
-            .frame_for_positions(10, &[4, 5])
-            .unwrap()
-            .expect("returned tap rows should be complete");
-        assert_eq!(f32_row(&overlaid, 4, 2), vec![9.0, 10.0]);
-        assert_eq!(f32_row(&overlaid, 5, 2), vec![11.0, 12.0]);
-    }
-
-    #[test]
-    fn inline_tap_cache_clear_drops_recorded_rows() {
-        let mut cache = SpdInlineTapCache::new(2, vec![8]);
-        let config = stage_config("stage-0", 0, 0, 8);
-        let message = stage_message(2, 1, Vec::new());
-        let frame = activation_frame(0, 8, &[1.0, 2.0]);
-        cache
-            .record_stage_output(&config, &message, &frame)
-            .unwrap()
-            .unwrap();
-
-        cache.clear();
-
-        assert!(cache.frame_for_positions(8, &[2]).unwrap().is_none());
-    }
-
-    fn stage_entry(
-        stage_id: &str,
-        stage_index: u32,
-        layer_start: u32,
-        layer_end: u32,
-    ) -> StageTopologyEntry {
-        StageTopologyEntry {
-            stage_id: stage_id.to_string(),
-            stage_index,
-            host: None,
-            endpoint: "127.0.0.1:0".to_string(),
-            layer_start,
-            layer_end,
-            load_mode: LoadMode::RuntimeSlice,
+    let search_hi = if nominal == stage_count {
+        stage_count
+    } else {
+        deepest_fused
+    };
+    for stage_id in (1..=search_hi).rev() {
+        let hf_indices = spd_hf_indices_for_stage_id(
+            topology,
+            u32::try_from(stage_id).context("SPD stage id exceeds u32")?,
+        )?;
+        let inline_hf_indices = inline_required_hf_indices(&hf_indices);
+        if inline_taps.has_rows_for_hf_indices(position, &inline_hf_indices) {
+            return Ok(stage_id);
         }
     }
-
-    fn stage_config(
-        stage_id: &str,
-        stage_index: u32,
-        layer_start: u32,
-        layer_end: u32,
-    ) -> StageConfig {
-        StageConfig {
-            run_id: "run".to_string(),
-            topology_id: "topology".to_string(),
-            model_id: "model".to_string(),
-            package_ref: None,
-            manifest_sha256: None,
-            source_model_path: None,
-            source_model_sha256: None,
-            source_model_bytes: None,
-            materialized_path: None,
-            materialized_pinned: false,
-            model_path: Some("/tmp/model.gguf".to_string()),
-            projector_path: None,
-            stage_id: stage_id.to_string(),
-            stage_index,
-            layer_start,
-            layer_end,
-            ctx_size: 128,
-            lane_count: 1,
-            n_batch: None,
-            n_ubatch: None,
-            n_gpu_layers: 0,
-            cache_type_k: "f16".to_string(),
-            cache_type_v: "f16".to_string(),
-            flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
-            filter_tensors_on_load: true,
-            selected_device: None,
-            kv_cache: None,
-            load_mode: LoadMode::RuntimeSlice,
-            bind_addr: "127.0.0.1:0".to_string(),
-            upstream: None,
-            downstream: None,
-        }
-    }
-
-    fn stage_message(pos_start: i32, token_count: i32, positions: Vec<i32>) -> StageWireMessage {
-        StageWireMessage {
-            kind: WireMessageKind::PrefillEmbd,
-            pos_start,
-            token_count,
-            state: StageStateHeader::new(WireMessageKind::PrefillEmbd, WireActivationDType::F32),
-            request_id: 1,
-            session_id: 2,
-            sampling: None,
-            chat_sampling_metadata: None,
-            tokens: vec![1; usize::try_from(token_count).unwrap()],
-            positions,
-            activation: Vec::new(),
-            raw_bytes: Vec::new(),
-        }
-    }
-
-    fn activation_frame(layer_start: i32, layer_end: i32, values: &[f32]) -> ActivationFrame {
-        let payload = f32_payload(values);
-        ActivationFrame {
-            desc: ActivationDesc {
-                version: 1,
-                dtype: RuntimeActivationDType::F32,
-                layout: RuntimeActivationLayout::TokenMajor,
-                producer_stage_index: 0,
-                layer_start,
-                layer_end,
-                token_count: u32::try_from(values.len() / 2).unwrap(),
-                sequence_count: 1,
-                payload_bytes: u64::try_from(payload.len()).unwrap(),
-                flags: 0,
-            },
-            payload,
-        }
-    }
-
-    fn f32_payload(values: &[f32]) -> Vec<u8> {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect()
-    }
-
-    fn f32_row(frame: &ActivationFrame, row_index: usize, width: usize) -> Vec<f32> {
-        let offset = row_index * width * std::mem::size_of::<f32>();
-        frame.payload[offset..offset + width * std::mem::size_of::<f32>()]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()
-    }
+    Ok(nominal)
 }

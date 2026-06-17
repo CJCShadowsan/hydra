@@ -23,6 +23,7 @@ pub(crate) struct StageDeploymentContext<'a> {
     pub(crate) n_ubatch: Option<u32>,
     pub(crate) kv_cache: KvCachePolicy,
     pub(crate) flash_attn_type: FlashAttentionType,
+    pub(crate) spd_tap_return_hf_indices: Vec<u32>,
     pub(crate) projector_path: Option<String>,
 }
 
@@ -42,6 +43,7 @@ pub(crate) fn remote_stage_load_request(
         stage_index: stage.stage_index,
         layer_start: stage.layer_start,
         layer_end: stage.layer_end,
+        spd_tap_return_hf_indices: context.spd_tap_return_hf_indices.clone(),
         model_path: Some(context.package.package_ref.clone()),
         source_model_bytes: context.package.source_model_bytes,
         projector_path: None,
@@ -94,6 +96,7 @@ pub(crate) fn stage0_config(
         stage_index: stage0.stage_index,
         layer_start: stage0.layer_start,
         layer_end: stage0.layer_end,
+        spd_tap_return_hf_indices: context.spd_tap_return_hf_indices.clone(),
         ctx_size: context.ctx_size,
         lane_count: context.lane_count,
         n_batch: context.n_batch,
@@ -229,6 +232,7 @@ mod tests {
             n_ubatch: None,
             kv_cache: KvCachePolicy::for_model_size(0),
             flash_attn_type: FlashAttentionType::Auto,
+            spd_tap_return_hf_indices: vec![10, 20, 31],
             projector_path: Some("/models/mmproj.gguf".to_string()),
         };
         let request = remote_stage_load_request(
@@ -253,6 +257,7 @@ mod tests {
             Some("hf://Mesh-LLM/demo-package")
         );
         assert_eq!((request.layer_start, request.layer_end), (4, 8));
+        assert_eq!(request.spd_tap_return_hf_indices, [10, 20, 31]);
         assert!(request.projector_path.is_none());
 
         let stage0 = stage0_config(
@@ -280,5 +285,6 @@ mod tests {
             stage0.projector_path.as_deref(),
             Some("/models/mmproj.gguf")
         );
+        assert_eq!(stage0.spd_tap_return_hf_indices, [10, 20, 31]);
     }
 }

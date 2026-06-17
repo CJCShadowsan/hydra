@@ -15,9 +15,13 @@ use crate::kv_integration::KvStageIntegration;
 use crate::runtime_state::RuntimeState;
 use skippy_protocol::binary::{
     StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
+    state_flags,
 };
 use skippy_protocol::{
     LoadMode, PeerConfig, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
+};
+use skippy_runtime::{
+    ActivationDesc, ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout,
 };
 
 type BinaryEvictionFn = fn(
@@ -131,6 +135,61 @@ fn required_binary_proactive_eviction_is_fallible_before_decode() {
     accepts_fallible_eviction(super::evict_binary_resident_prefix_for_decode);
 }
 
+#[test]
+fn spd_tap_return_uses_legacy_all_downstream_behavior_when_unfiltered() {
+    let mut config = prefix_cache_test_config();
+    config.stage_index = 2;
+    config.layer_end = 16;
+
+    assert!(super::should_send_spd_tap_return(
+        &config,
+        &spd_tap_message(),
+        &spd_tap_frame()
+    ));
+}
+
+#[test]
+fn spd_tap_return_skips_unlisted_hf_index_when_filtered() {
+    let mut config = prefix_cache_test_config();
+    config.stage_index = 2;
+    config.layer_end = 16;
+    config.spd_tap_return_hf_indices = vec![10, 20, 31];
+
+    assert!(!super::should_send_spd_tap_return(
+        &config,
+        &spd_tap_message(),
+        &spd_tap_frame()
+    ));
+}
+
+#[test]
+fn spd_tap_return_allows_listed_hf_index_when_filtered() {
+    let mut config = prefix_cache_test_config();
+    config.stage_index = 2;
+    config.layer_end = 20;
+    config.spd_tap_return_hf_indices = vec![10, 20, 31];
+
+    assert!(super::should_send_spd_tap_return(
+        &config,
+        &spd_tap_message(),
+        &spd_tap_frame()
+    ));
+}
+
+#[test]
+fn spd_tap_return_ignores_stage_zero_even_when_filtered() {
+    let mut config = prefix_cache_test_config();
+    config.stage_index = 0;
+    config.layer_end = 10;
+    config.spd_tap_return_hf_indices = vec![10, 20, 31];
+
+    assert!(!super::should_send_spd_tap_return(
+        &config,
+        &spd_tap_message(),
+        &spd_tap_frame()
+    ));
+}
+
 fn prefix_cache_test_config() -> StageConfig {
     StageConfig {
         run_id: "run".to_string(),
@@ -149,6 +208,7 @@ fn prefix_cache_test_config() -> StageConfig {
         stage_index: 0,
         layer_start: 0,
         layer_end: 4,
+        spd_tap_return_hf_indices: Vec::new(),
         ctx_size: 8192,
         lane_count: 2,
         n_batch: None,
@@ -176,6 +236,30 @@ fn prefix_cache_test_config() -> StageConfig {
             stage_index: 1,
             endpoint: "127.0.0.1:0".to_string(),
         }),
+    }
+}
+
+fn spd_tap_message() -> StageWireMessage {
+    let mut message = first_decode_message_with_full_prompt_sideband();
+    message.state.flags |= state_flags::SPD_TAP_RETURN;
+    message
+}
+
+fn spd_tap_frame() -> ActivationFrame {
+    ActivationFrame {
+        desc: ActivationDesc {
+            version: 1,
+            dtype: RuntimeActivationDType::F32,
+            layout: RuntimeActivationLayout::TokenMajor,
+            producer_stage_index: 2,
+            layer_start: 10,
+            layer_end: 20,
+            token_count: 1,
+            sequence_count: 1,
+            payload_bytes: 4,
+            flags: 0,
+        },
+        payload: vec![0, 0, 0, 0],
     }
 }
 

@@ -103,6 +103,7 @@ mod tests {
             stage_index: 1,
             layer_start: 4,
             layer_end: 8,
+            spd_tap_return_hf_indices: Vec::new(),
             ctx_size: 512,
             lane_count: 1,
             n_batch: None,

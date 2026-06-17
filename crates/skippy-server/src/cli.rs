@@ -149,6 +149,16 @@ pub struct ServeBinaryArgs {
         help = "Allow the experimental SPD source to run slow local full-context tap replay when inline taps are incomplete."
     )]
     pub openai_spd_replay_fallback: bool,
+    #[arg(
+        long,
+        help = "Experimentally start one target decode from an inline SPD proposal before the current target reply arrives. Only used for deterministic sampling."
+    )]
+    pub openai_spd_optimistic_decode: bool,
+    #[arg(
+        long,
+        help = "Only start optimistic SPD target decode when the inline top-1/top-2 logit margin is at least this value. Requires --openai-spd-top-k >= 2 to produce margins."
+    )]
+    pub openai_spd_optimistic_min_logit_margin: Option<f32>,
     #[arg(long, default_value_t = 4)]
     pub openai_speculative_window: usize,
     #[arg(long)]
@@ -277,6 +287,9 @@ mod tests {
             "--openai-spd-n-gpu-layers",
             "99",
             "--openai-spd-replay-fallback",
+            "--openai-spd-optimistic-decode",
+            "--openai-spd-optimistic-min-logit-margin",
+            "5.5",
             "--openai-speculative-window",
             "2",
         ])
@@ -301,6 +314,8 @@ mod tests {
         assert_eq!(args.openai_spd_top_k, 4);
         assert_eq!(args.openai_spd_n_gpu_layers, Some(99));
         assert!(args.openai_spd_replay_fallback);
+        assert!(args.openai_spd_optimistic_decode);
+        assert_eq!(args.openai_spd_optimistic_min_logit_margin, Some(5.5));
         assert_eq!(args.openai_speculative_window, 2);
     }
 }

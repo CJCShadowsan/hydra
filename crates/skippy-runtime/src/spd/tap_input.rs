@@ -1,8 +1,14 @@
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    thread,
+};
 
 use anyhow::{Context, Result, bail};
 
 use super::{SpdHeadManifest, SpdHeadTopology, SpdSafetensorsFile};
+
+const PARALLEL_TAP_LINEAR_MIN_DOT_OPS: usize = 2_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpdTapInputProjection {
@@ -35,6 +41,128 @@ struct TapProjectionSpec {
     input_width: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TapProjectionKey {
+    stage_id: u32,
+    hf_indices: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTapProjection {
+    name: String,
+    hf_indices: Vec<u32>,
+    input_width: usize,
+    weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpdTapInputProjector {
+    hidden_size: usize,
+    projections: BTreeMap<TapProjectionKey, CachedTapProjection>,
+}
+
+impl SpdTapInputProjector {
+    pub fn from_topology(
+        topology: &SpdHeadTopology,
+        serving_file: &SpdSafetensorsFile,
+    ) -> Result<Self> {
+        let hidden_size =
+            usize::try_from(topology.hidden_size).context("SPD hidden_size too large")?;
+        let mut projections = BTreeMap::new();
+        for stage_id in 0..=topology.num_stages {
+            let hf_indices = spd_hf_indices_for_stage_id(topology, stage_id)?;
+            cache_tap_projection(
+                topology,
+                serving_file,
+                stage_id,
+                &hf_indices,
+                &mut projections,
+            )?;
+        }
+        Ok(Self {
+            hidden_size,
+            projections,
+        })
+    }
+
+    pub fn from_rows(
+        topology: &SpdHeadTopology,
+        serving_file: &SpdSafetensorsFile,
+        row_stage_ids: &[i64],
+        row_hf_indices: &[Vec<u32>],
+    ) -> Result<Self> {
+        if row_stage_ids.len() != row_hf_indices.len() {
+            bail!(
+                "SPD tap projector row metadata length mismatch: stages {}, hf rows {}",
+                row_stage_ids.len(),
+                row_hf_indices.len()
+            );
+        }
+        let hidden_size =
+            usize::try_from(topology.hidden_size).context("SPD hidden_size too large")?;
+        let mut projections = BTreeMap::new();
+        for (row_index, hf_indices) in row_hf_indices.iter().enumerate() {
+            let stage_id = u32::try_from(row_stage_ids[row_index])
+                .with_context(|| format!("SPD fixture row {row_index} has negative stage id"))?;
+            cache_tap_projection(
+                topology,
+                serving_file,
+                stage_id,
+                hf_indices,
+                &mut projections,
+            )?;
+        }
+        Ok(Self {
+            hidden_size,
+            projections,
+        })
+    }
+
+    pub fn project(
+        &self,
+        stage_id: u32,
+        hf_indices: &[u32],
+        concat_hidden: &[f32],
+    ) -> Result<SpdTapInputProjection> {
+        let key = TapProjectionKey {
+            stage_id,
+            hf_indices: hf_indices.to_vec(),
+        };
+        let projection = self.projections.get(&key).with_context(|| {
+            format!("missing cached SPD tap projection for stage {stage_id} {hf_indices:?}")
+        })?;
+        project_cached_tap_input(stage_id, self.hidden_size, projection, concat_hidden)
+    }
+}
+
+fn cache_tap_projection(
+    topology: &SpdHeadTopology,
+    serving_file: &SpdSafetensorsFile,
+    stage_id: u32,
+    hf_indices: &[u32],
+    projections: &mut BTreeMap<TapProjectionKey, CachedTapProjection>,
+) -> Result<()> {
+    let key = TapProjectionKey {
+        stage_id,
+        hf_indices: hf_indices.to_vec(),
+    };
+    if projections.contains_key(&key) {
+        return Ok(());
+    }
+    let spec = tap_projection_spec(topology, stage_id, hf_indices)?;
+    let weight = serving_file.read_tensor_f32(&spec.name)?;
+    projections.insert(
+        key,
+        CachedTapProjection {
+            name: spec.name,
+            hf_indices: spec.hf_indices,
+            input_width: spec.input_width,
+            weight,
+        },
+    );
+    Ok(())
+}
+
 pub fn project_spd_tap_input_row(
     topology: &SpdHeadTopology,
     serving_file: &SpdSafetensorsFile,
@@ -45,12 +173,32 @@ pub fn project_spd_tap_input_row(
     let spec = tap_projection_spec(topology, stage_id, hf_indices)?;
     let weight = serving_file.read_tensor_f32(&spec.name)?;
     let hidden_size = usize::try_from(topology.hidden_size).context("SPD hidden_size too large")?;
+    let cached = CachedTapProjection {
+        name: spec.name,
+        hf_indices: spec.hf_indices,
+        input_width: spec.input_width,
+        weight,
+    };
+    project_cached_tap_input(stage_id, hidden_size, &cached, concat_hidden)
+}
+
+fn project_cached_tap_input(
+    stage_id: u32,
+    hidden_size: usize,
+    projection: &CachedTapProjection,
+    concat_hidden: &[f32],
+) -> Result<SpdTapInputProjection> {
     let mut projected = vec![0.0; hidden_size];
-    linear_into(&weight, spec.input_width, concat_hidden, &mut projected)?;
+    linear_into(
+        &projection.weight,
+        projection.input_width,
+        concat_hidden,
+        &mut projected,
+    )?;
     Ok(SpdTapInputProjection {
         stage_id,
-        projection_name: spec.name,
-        hf_indices: spec.hf_indices,
+        projection_name: projection.name.clone(),
+        hf_indices: projection.hf_indices.clone(),
         projected,
     })
 }
@@ -159,6 +307,35 @@ fn tap_projection_spec(
     })
 }
 
+pub fn spd_hf_indices_for_stage_id(topology: &SpdHeadTopology, stage_id: u32) -> Result<Vec<u32>> {
+    if stage_id == 0 {
+        return Ok(vec![0]);
+    }
+    if stage_id > topology.num_stages {
+        bail!(
+            "SPD stage_id {} exceeds num_stages {}",
+            stage_id,
+            topology.num_stages
+        );
+    }
+    let block = usize::try_from(topology.num_stages - stage_id)
+        .context("SPD projection block index too large")?;
+    topology
+        .shallow_hidden_layer_indices
+        .get(block)
+        .cloned()
+        .with_context(|| format!("SPD tap input missing shallow indices for block {block}"))
+}
+
+pub fn required_spd_hf_indices_for_topology(topology: &SpdHeadTopology) -> Vec<u32> {
+    (0..=topology.num_stages)
+        .filter_map(|stage_id| spd_hf_indices_for_stage_id(topology, stage_id).ok())
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn ensure_hf_indices(label: &str, actual: &[u32], expected: &[u32]) -> Result<()> {
     if actual != expected {
         bail!(
@@ -205,11 +382,43 @@ fn linear_into(
             input_width
         );
     }
+    if should_parallelize_linear(output.len(), input_width) {
+        parallel_linear_into(weight, input_width, input, output);
+        return Ok(());
+    }
+    serial_linear_into(weight, input_width, input, output);
+    Ok(())
+}
+
+fn should_parallelize_linear(output_width: usize, input_width: usize) -> bool {
+    thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() > 1)
+        && output_width.saturating_mul(input_width) >= PARALLEL_TAP_LINEAR_MIN_DOT_OPS
+}
+
+fn serial_linear_into(weight: &[f32], input_width: usize, input: &[f32], output: &mut [f32]) {
     for (out_idx, out) in output.iter_mut().enumerate() {
         let weight_row = &weight[out_idx * input_width..(out_idx + 1) * input_width];
         *out = round_to_bf16(dot(weight_row, input));
     }
-    Ok(())
+}
+
+fn parallel_linear_into(weight: &[f32], input_width: usize, input: &[f32], output: &mut [f32]) {
+    let workers = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .min(output.len());
+    let rows_per_worker = output.len().div_ceil(workers);
+    thread::scope(|scope| {
+        for (chunk_idx, output_chunk) in output.chunks_mut(rows_per_worker).enumerate() {
+            let first_row = chunk_idx * rows_per_worker;
+            let weight_start = first_row * input_width;
+            let weight_end = weight_start + output_chunk.len() * input_width;
+            let weight_chunk = &weight[weight_start..weight_end];
+            scope.spawn(move || {
+                serial_linear_into(weight_chunk, input_width, input, output_chunk);
+            });
+        }
+    });
 }
 
 fn max_abs_diff(left: &[f32], right: &[f32]) -> Result<f32> {
@@ -285,6 +494,109 @@ mod tests {
     }
 
     #[test]
+    fn cached_projector_matches_direct_tap_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let serving_path = temp.path().join("serving.safetensors");
+        write_safetensors(
+            &serving_path,
+            &[
+                tensor_f32(
+                    "stage_projs.0.weight",
+                    &[2, 4],
+                    &[1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+                ),
+                tensor_f32("stage_projs.1.weight", &[2, 2], &[2.0, 0.0, 0.0, 3.0]),
+                tensor_f32("g0_proj.weight", &[2, 2], &[1.0, 1.0, 1.0, -1.0]),
+            ],
+        );
+        let serving_file = SpdSafetensorsFile::open(&serving_path).unwrap();
+        let topology = test_topology();
+        let projector = SpdTapInputProjector::from_rows(
+            &topology,
+            &serving_file,
+            &[2, 2, 1],
+            &[vec![0, 1], vec![0, 1], vec![0]],
+        )
+        .unwrap();
+        let concat_hidden = [1.0, 2.0, 3.0, 4.0];
+
+        let direct =
+            project_spd_tap_input_row(&topology, &serving_file, 2, &[0, 1], &concat_hidden)
+                .unwrap();
+        let cached = projector.project(2, &[0, 1], &concat_hidden).unwrap();
+
+        assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn topology_required_indices_include_every_stage_role() {
+        let topology = SpdHeadTopology {
+            hidden_size: 2,
+            vocab_size: 8,
+            draft_vocab_size: 2,
+            num_stages: 4,
+            stage_layer_boundaries: Some(vec![8, 16, 24, 32]),
+            num_spec_layers: 1,
+            trained_with_use_deepest: true,
+            shallow_hidden_layer_indices: vec![
+                vec![0, 10, 20, 31],
+                vec![0, 8, 16, 24],
+                vec![0, 8, 16],
+                vec![0, 8],
+            ],
+            spec_init_from_base_layers: None,
+            draft_token_ids: None,
+        };
+
+        assert_eq!(
+            required_spd_hf_indices_for_topology(&topology),
+            vec![0, 8, 10, 16, 20, 24, 31]
+        );
+        assert_eq!(
+            spd_hf_indices_for_stage_id(&topology, 3).unwrap(),
+            vec![0, 8, 16, 24]
+        );
+        assert_eq!(spd_hf_indices_for_stage_id(&topology, 0).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn topology_projector_preloads_every_stage_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let serving_path = temp.path().join("serving.safetensors");
+        write_safetensors(
+            &serving_path,
+            &[
+                tensor_f32(
+                    "stage_projs.0.weight",
+                    &[2, 4],
+                    &[1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+                ),
+                tensor_f32("stage_projs.1.weight", &[2, 2], &[2.0, 0.0, 0.0, 3.0]),
+                tensor_f32("g0_proj.weight", &[2, 2], &[1.0, 1.0, 1.0, -1.0]),
+            ],
+        );
+        let serving_file = SpdSafetensorsFile::open(&serving_path).unwrap();
+        let topology = test_topology();
+        let projector = SpdTapInputProjector::from_topology(&topology, &serving_file).unwrap();
+
+        assert_eq!(
+            projector
+                .project(2, &[0, 1], &[1.0, 2.0, 3.0, 4.0])
+                .unwrap()
+                .projected,
+            vec![4.0, 6.0]
+        );
+        assert_eq!(
+            projector.project(1, &[0], &[5.0, 7.0]).unwrap().projected,
+            vec![10.0, 21.0]
+        );
+        assert_eq!(
+            projector.project(0, &[0], &[2.0, 1.0]).unwrap().projected,
+            vec![3.0, 1.0]
+        );
+    }
+
+    #[test]
     fn fixture_parity_reconstructs_cur_in_from_tap_rows() {
         let temp = tempfile::tempdir().unwrap();
         let serving_path = temp.path().join("spd-head.safetensors");
@@ -338,6 +650,7 @@ mod tests {
             vocab_size: 8,
             draft_vocab_size: 2,
             num_stages: 2,
+            stage_layer_boundaries: Some(vec![1, 2]),
             num_spec_layers: 1,
             trained_with_use_deepest: true,
             shallow_hidden_layer_indices: vec![vec![0, 1], vec![0]],

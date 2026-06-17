@@ -6,6 +6,7 @@ mod local_single;
 mod local_split;
 mod model_identity;
 mod spd;
+mod spd_openai;
 mod support;
 mod token_lengths;
 
@@ -21,6 +22,7 @@ use crate::{
         local_split_binary, local_split_chain_binary, local_split_compare, local_split_inprocess,
     },
     spd::{spd_fixture_parity, spd_live_tap_parity},
+    spd_openai::spd_openai_smoke,
     token_lengths::token_lengths,
 };
 
@@ -35,6 +37,7 @@ fn main() -> Result<()> {
         CommandKind::TokenLengths(args) => token_lengths(args),
         CommandKind::SpdFixtureParity(args) => spd_fixture_parity(args),
         CommandKind::SpdLiveTapParity(args) => spd_live_tap_parity(args),
+        CommandKind::SpdOpenAiSmoke(args) => spd_openai_smoke(args),
         CommandKind::FocusedRuntime(args) => focused_runtime(args),
         CommandKind::Run(args) => run_distributed(args),
     }

@@ -1,5 +1,13 @@
 use super::*;
 
+struct PendingSpdInlineProbe {
+    decode_step: u32,
+    current: i32,
+    target: i32,
+    probe: super::spd::SpdInlineProbe,
+    rolling: Option<super::spd::SpdRollingTelemetry>,
+}
+
 impl StageOpenAiBackend {
     pub(super) fn generate_embedded_stage_zero_tokens(
         &self,
@@ -822,7 +830,14 @@ impl StageOpenAiBackend {
                 }
                 _ => None,
             };
-            for decode_step in decoded_tokens as u32..request.max_tokens {
+            let spd_optimistic_chain_depth_limit = spd_guard
+                .as_deref()
+                .map(SpdReplayProposalSource::logical_stage_count)
+                .unwrap_or(0)
+                .saturating_sub(1);
+            while decoded_tokens < request.max_tokens as usize {
+                let decode_step = u32::try_from(decoded_tokens)
+                    .map_err(|_| OpenAiError::backend("decode step exceeds u32"))?;
                 if fused_reached_stop {
                     break;
                 }
@@ -833,7 +848,13 @@ impl StageOpenAiBackend {
                     break;
                 }
                 let token_timer = PhaseTimer::start();
-                if spd_guard.is_some() || draft_guard.is_some() {
+                let prefer_rolling_spd_optimistic_decode = request.spd_optimistic_decode
+                    && draft_guard.is_none()
+                    && spd_guard.is_some()
+                    && request.sampling.temperature <= 0.0;
+                if !prefer_rolling_spd_optimistic_decode
+                    && (spd_guard.is_some() || draft_guard.is_some())
+                {
                     let remaining = request.max_tokens as usize - decoded_tokens;
                     if remaining == 0 {
                         break;
@@ -854,18 +875,27 @@ impl StageOpenAiBackend {
                     if !proposal.is_empty() {
                         let draft_tokens = proposal.tokens.as_slice();
                         let verify_inputs = verify_inputs_for_proposals(current, draft_tokens);
+                        let verify_pos_start = prefill_token_count + decoded_tokens;
                         let message = embedded_verify_message(
                             request.wire_dtype,
                             VerifySpanMessageArgs {
                                 request_id,
                                 session_id,
                                 prompt_token_count: request.prompt_token_ids.len(),
-                                pos_start: prefill_token_count + decoded_tokens,
+                                pos_start: verify_pos_start,
                                 decode_step: decoded_tokens,
+                                checkpoint_generation: 0,
                                 tokens: &verify_inputs,
                                 checkpoint: true,
                             },
                         )?;
+                        if let Some(spd) = spd_guard.as_deref_mut() {
+                            spd.mark_pending_verify_tap_positions(
+                                verify_pos_start,
+                                verify_inputs.len(),
+                            )
+                            .map_err(openai_backend_error)?;
+                        }
                         let verify = self.execute_embedded_stage_message(
                             &request,
                             downstream,
@@ -939,6 +969,7 @@ impl StageOpenAiBackend {
                                 &session_key,
                                 request_id,
                                 session_id,
+                                0,
                             )?;
                             speculative_stats.recovery_ms += restore.elapsed_ms;
                             speculative_stats.recovery_restore_ms += restore.elapsed_ms;
@@ -1001,6 +1032,7 @@ impl StageOpenAiBackend {
                                         prompt_token_count: request.prompt_token_ids.len(),
                                         pos_start: prefill_token_count + decoded_tokens,
                                         decode_step: decoded_tokens,
+                                        checkpoint_generation: 0,
                                         tokens: repair_inputs,
                                         checkpoint: false,
                                     },
@@ -1040,12 +1072,95 @@ impl StageOpenAiBackend {
                                 speculative_stats.recovery_reverify_elapsed_ms += repair.elapsed_ms;
                             }
                         }
+                        let primary_rolling = if let Some(spd) = spd_guard.as_deref_mut() {
+                            spd.observe_primary_verify_span(
+                                context_tokens.len(),
+                                draft_tokens,
+                                &commit_tokens,
+                            )
+                            .map_err(openai_backend_error)?
+                        } else {
+                            None
+                        };
 
                         let mut reached_stop = false;
+                        let verify_commit_count = commit_tokens.len().max(1);
+                        let verify_commit_count_f64 = verify_commit_count as f64;
                         for token in commit_tokens {
+                            let committed_step = u32::try_from(decoded_tokens)
+                                .map_err(|_| OpenAiError::backend("decode step exceeds u32"))?;
                             current = token;
                             decoded_tokens += 1;
                             context_tokens.push(current);
+                            if self.telemetry.is_debug_enabled() {
+                                let mut token_attrs = self.openai_attrs(request.ids);
+                                token_attrs.insert(
+                                    "llama_stage.decode_step".to_string(),
+                                    json!(committed_step),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.decode_token_phase".to_string(),
+                                    json!(decode_token_phase(committed_step)),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.stage0_compute_ms".to_string(),
+                                    json!(verify.stats.stage0_compute_ms / verify_commit_count_f64),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.runtime_lock_wait_ms".to_string(),
+                                    json!(
+                                        verify.stats.runtime_lock_wait_ms / verify_commit_count_f64
+                                    ),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.runtime_lock_hold_ms".to_string(),
+                                    json!(
+                                        verify.stats.runtime_lock_hold_ms / verify_commit_count_f64
+                                    ),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.output_activation_bytes".to_string(),
+                                    json!(
+                                        verify.stats.output_activation_bytes / verify_commit_count
+                                    ),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.forward_activation_bytes".to_string(),
+                                    json!(
+                                        verify.stats.forward_activation_bytes / verify_commit_count
+                                    ),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.activation_encode_ms".to_string(),
+                                    json!(
+                                        verify.stats.activation_encode_ms / verify_commit_count_f64
+                                    ),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.forward_write_ms".to_string(),
+                                    json!(verify.stats.forward_write_ms / verify_commit_count_f64),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.downstream_wait_ms".to_string(),
+                                    json!(
+                                        verify.stats.downstream_wait_ms / verify_commit_count_f64
+                                    ),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.predicted_token".to_string(),
+                                    json!(current),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.message_kind".to_string(),
+                                    json!("VerifySpan"),
+                                );
+                                token_attrs.insert(
+                                    "llama_stage.spec.proposal_source".to_string(),
+                                    json!(proposal.source),
+                                );
+                                self.telemetry
+                                    .emit_debug("stage.openai_decode_token", token_attrs);
+                            }
                             if on_token(current)? == TokenControl::Stop {
                                 reached_stop = true;
                             }
@@ -1060,19 +1175,25 @@ impl StageOpenAiBackend {
                         let should_reset_draft = draft_guard.as_ref().is_some_and(|draft| {
                             draft.should_reset_after_verify(decision, reached_stop)
                         });
-                        if should_reset_spd || should_reset_draft {
+                        if let Some(spd) = spd_guard.as_deref_mut() {
                             let draft_reset_timer = PhaseTimer::start();
-                            if let Some(spd) = spd_guard.as_deref_mut() {
-                                spd.reset_to_context(&context_tokens)
+                            if should_reset_spd {
+                                spd.reset_to_verified_context(&context_tokens)
                                     .map_err(openai_backend_error)?;
-                                speculative_stats.draft_reset_ms += draft_reset_timer.elapsed_ms();
+                            } else {
+                                spd.advance_to_accepted_context(&context_tokens)
+                                    .map_err(openai_backend_error)?;
                             }
+                            speculative_stats.draft_reset_ms += draft_reset_timer.elapsed_ms();
+                        }
+                        if should_reset_draft {
+                            let draft_reset_timer = PhaseTimer::start();
                             if let Some(draft) = draft_guard.as_deref_mut() {
                                 draft
                                     .reset_to_context(&context_tokens)
                                     .map_err(openai_backend_error)?;
-                                speculative_stats.draft_reset_ms += draft_reset_timer.elapsed_ms();
                             }
+                            speculative_stats.draft_reset_ms += draft_reset_timer.elapsed_ms();
                         }
                         let mut token_attrs = self.openai_attrs(request.ids);
                         token_attrs
@@ -1103,6 +1224,15 @@ impl StageOpenAiBackend {
                             "llama_stage.spec.proposal_source".to_string(),
                             json!(proposal.source),
                         );
+                        if let Some(spd) = spd_guard.as_deref() {
+                            spd.insert_last_proposal_stats_attrs(&mut token_attrs);
+                        }
+                        if let Some(rolling) = primary_rolling.as_ref() {
+                            super::spd::SpdReplayProposalSource::insert_rolling_telemetry_attrs(
+                                &mut token_attrs,
+                                rolling,
+                            );
+                        }
                         token_attrs.insert(
                             "llama_stage.spec.proposal_limit".to_string(),
                             json!(proposal.requested_limit),
@@ -1237,21 +1367,561 @@ impl StageOpenAiBackend {
                 let forward_write_ms = write_timer.elapsed_ms();
                 decode_forward_write_ms += forward_write_ms;
                 let wait_timer = PhaseTimer::start();
-                let prediction_return = self
-                    .recv_spd_aware_prediction_return_with_probe(
+                let mut optimistic_decode = None;
+                let mut rolling_optimistic_decodes =
+                    std::collections::VecDeque::<SpdOptimisticDecode>::new();
+                let can_start_optimistic_spd = request.spd_optimistic_decode
+                    && spd_guard.is_some()
+                    && request.sampling.temperature <= 0.0
+                    && context_tokens.len().checked_add(1).is_some_and(|position| {
+                        position
+                            < request
+                                .prompt_token_ids
+                                .len()
+                                .saturating_add(request.max_tokens as usize)
+                    });
+                let prediction_return = if can_start_optimistic_spd {
+                    self.recv_spd_aware_prediction_return_with_probe_action(
                         &request,
                         WireReplyKind::PredictedToken,
-                        spd_guard.as_deref(),
+                        spd_guard.as_deref_mut(),
+                        current,
+                        super::spd::SpdInlineProbePhase::PreTargetReply,
+                        Some(
+                            |backend: &StageOpenAiBackend, probe: &super::spd::SpdInlineProbe| {
+                                let optimistic_pos_start = context_tokens.len();
+                                optimistic_decode = backend
+                                    .start_spd_optimistic_decode_for_probe(
+                                        &request,
+                                        SpdOptimisticDecodeStart {
+                                            downstream,
+                                            session_key: &session_key,
+                                            pos_start: optimistic_pos_start,
+                                            decode_step: decoded_tokens + 1,
+                                            chain_depth: 0,
+                                            chain_depth_limit: spd_optimistic_chain_depth_limit,
+                                            probe,
+                                        },
+                                    )
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                Ok(())
+                            },
+                        ),
+                    )
+                } else {
+                    self.recv_spd_aware_prediction_return_with_probe(
+                        &request,
+                        WireReplyKind::PredictedToken,
+                        spd_guard.as_deref_mut(),
                         current,
                     )
-                    .map_err(openai_backend_error)?;
+                }
+                .map_err(openai_backend_error)?;
                 let reply = prediction_return.reply;
                 let downstream_wait_ms = wait_timer.elapsed_ms();
                 decode_downstream_wait_ms += downstream_wait_ms;
+                let mut optimistic_commit = None;
+                let mut chained_optimistic_commits = Vec::new();
+                let mut optimistic_commit_probes = Vec::new();
+                let mut spd_advanced_for_current = false;
+                // Rolling SPD row positions are token indices. Before pushing
+                // reply.predicted, the target token will occupy context_tokens.len().
+                let rolling_target_position = context_tokens.len();
                 if let Some(probe) = prediction_return.pre_target_probe {
+                    let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
+                        Some(
+                            spd.observe_rolling_probe(
+                                rolling_target_position,
+                                reply.predicted,
+                                probe.proposed,
+                            )
+                            .map_err(openai_backend_error)?,
+                        )
+                    } else {
+                        None
+                    };
                     if let Some(proposed) = probe.proposed {
                         speculative_stats
                             .observe_inline_verified_probe(proposed == reply.predicted);
+                    }
+                    if let Some(optimistic) = optimistic_decode.take() {
+                        let optimistic_wait_timer = PhaseTimer::start();
+                        let accepted = optimistic.proposed == reply.predicted;
+                        let mut context_with_reply = context_tokens.clone();
+                        context_with_reply.push(reply.predicted);
+                        let optimistic_return = if accepted && optimistic.requested_spd_taps {
+                            if let Some(spd) = spd_guard.as_deref_mut() {
+                                let reset_timer = PhaseTimer::start();
+                                spd.advance_to_accepted_context(&context_with_reply)
+                                    .map_err(openai_backend_error)?;
+                                speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
+                                spd_advanced_for_current = true;
+                                self.recv_spd_aware_prediction_return_with_wait_action(
+                                    &request,
+                                    SpdPredictionReturnWait {
+                                        expected: WireReplyKind::PredictedTokens,
+                                        expected_origin: Some(optimistic.origin),
+                                        spd_source: Some(spd),
+                                        current: reply.predicted,
+                                        probe_phase: super::spd::SpdInlineProbePhase::OptimisticCommit,
+                                    },
+                                    Some(
+                                        |backend: &StageOpenAiBackend,
+                                         probe: &super::spd::SpdInlineProbe| {
+                                            let chain_pos_start = context_with_reply.len();
+                                            if let Some(decode) = backend
+                                                .start_spd_optimistic_decode_for_probe(
+                                                    &request,
+                                                    SpdOptimisticDecodeStart {
+                                                        downstream,
+                                                        session_key: &session_key,
+                                                        pos_start: chain_pos_start,
+                                                        decode_step: decoded_tokens + 2,
+                                                        chain_depth: 1,
+                                                        chain_depth_limit:
+                                                            spd_optimistic_chain_depth_limit,
+                                                        probe,
+                                                    },
+                                                )
+                                                .map_err(|error| {
+                                                    anyhow::anyhow!(error.to_string())
+                                                })?
+                                            {
+                                                rolling_optimistic_decodes.push_back(decode);
+                                            }
+                                            Ok(())
+                                        },
+                                    ),
+                                )
+                                .map_err(openai_backend_error)?
+                            } else {
+                                self.recv_spd_aware_prediction_return_for_origin(
+                                    &request,
+                                    WireReplyKind::PredictedTokens,
+                                    optimistic.origin,
+                                )
+                                .map_err(openai_backend_error)?
+                            }
+                        } else {
+                            self.recv_spd_aware_prediction_return_for_origin(
+                                &request,
+                                WireReplyKind::PredictedTokens,
+                                optimistic.origin,
+                            )
+                            .map_err(openai_backend_error)?
+                        };
+                        let optimistic_wait_ms = optimistic_wait_timer.elapsed_ms();
+                        let optimistic_reply = optimistic_return.reply;
+                        let optimistic_next = optimistic_reply
+                            .predicted_tokens
+                            .first()
+                            .copied()
+                            .ok_or_else(|| {
+                                OpenAiError::backend(
+                                    "optimistic SPD verify returned no predicted token",
+                                )
+                            })?;
+                        if let Some(probe) = optimistic_return.pre_target_probe {
+                            let rolling_target_position = context_with_reply.len();
+                            let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
+                                Some(
+                                    spd.observe_rolling_probe(
+                                        rolling_target_position,
+                                        optimistic_next,
+                                        probe.proposed,
+                                    )
+                                    .map_err(openai_backend_error)?,
+                                )
+                            } else {
+                                None
+                            };
+                            optimistic_commit_probes.push(PendingSpdInlineProbe {
+                                decode_step: decode_step.saturating_add(1),
+                                current: reply.predicted,
+                                target: optimistic_next,
+                                probe,
+                                rolling,
+                            });
+                        }
+                        let mut optimistic_reply_stats = optimistic.execution.reply_stats;
+                        optimistic_reply_stats.merge(optimistic_reply.stats);
+                        let optimistic_checkpoint_ms =
+                            us_to_ms(optimistic_reply_stats.checkpoint_total_us);
+                        speculative_stats.optimistic_checkpoint_ms += optimistic_checkpoint_ms;
+                        let optimistic_elapsed_ms = optimistic.timer.elapsed_ms();
+                        let optimistic_start_elapsed_ms = optimistic.execution.elapsed_ms;
+                        let mut optimistic_stats = optimistic.execution.stats;
+                        optimistic_stats.downstream_wait_ms = optimistic_wait_ms;
+                        speculative_stats.optimistic_decode_requests += 1;
+                        speculative_stats.optimistic_decode_elapsed_ms += optimistic_elapsed_ms;
+                        speculative_stats.optimistic_decode_wait_ms += optimistic_wait_ms;
+                        decode_stage0_compute_ms += optimistic_stats.stage0_compute_ms;
+                        decode_runtime_lock_wait_ms += optimistic_stats.runtime_lock_wait_ms;
+                        decode_runtime_lock_wait_max_ms = decode_runtime_lock_wait_max_ms
+                            .max(optimistic_stats.runtime_lock_wait_ms);
+                        decode_runtime_lock_hold_ms += optimistic_stats.runtime_lock_hold_ms;
+                        decode_runtime_lock_hold_max_ms = decode_runtime_lock_hold_max_ms
+                            .max(optimistic_stats.runtime_lock_hold_ms);
+                        decode_runtime_lock_acquires += 1;
+                        decode_forward_activation_encode_ms +=
+                            optimistic_stats.activation_encode_ms;
+                        decode_output_activation_bytes = decode_output_activation_bytes
+                            .saturating_add(optimistic_stats.output_activation_bytes);
+                        decode_forward_activation_bytes = decode_forward_activation_bytes
+                            .saturating_add(optimistic_stats.forward_activation_bytes);
+                        decode_forward_write_ms += optimistic_stats.forward_write_ms;
+                        decode_downstream_wait_ms += optimistic_wait_ms;
+                        if accepted {
+                            speculative_stats.optimistic_decode_accepted += 1;
+                            optimistic_commit = Some((optimistic_next, optimistic_stats));
+                        } else {
+                            speculative_stats.optimistic_decode_rejected += 1;
+                            let restore = self.restore_embedded_stage_session(
+                                &request,
+                                downstream,
+                                &session_key,
+                                request_id,
+                                session_id,
+                                optimistic.origin.checkpoint_generation,
+                            )?;
+                            speculative_stats.recovery_restores += 1;
+                            speculative_stats.recovery_ms += restore.elapsed_ms;
+                            speculative_stats.recovery_restore_ms += restore.elapsed_ms;
+                            speculative_stats.recovery_restore_local_ms += restore.local_ms;
+                            speculative_stats.recovery_restore_downstream_write_ms +=
+                                restore.downstream_write_ms;
+                            speculative_stats.recovery_restore_downstream_wait_ms +=
+                                restore.downstream_wait_ms;
+                            speculative_stats.optimistic_restore_ms += restore.elapsed_ms;
+                            if optimistic.requested_spd_taps
+                                && let Some(spd) = spd_guard.as_deref_mut()
+                            {
+                                let reset_timer = PhaseTimer::start();
+                                spd.reset_to_verified_context(&context_with_reply)
+                                    .map_err(openai_backend_error)?;
+                                speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
+                            }
+                        }
+                        let mut attrs = self.openai_attrs(request.ids);
+                        attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_proposed_token".to_string(),
+                            json!(optimistic.proposed),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_proposed_logit".to_string(),
+                            json!(optimistic.proposed_logit),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_logit_margin".to_string(),
+                            json!(optimistic.proposed_logit_margin),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_tap_return".to_string(),
+                            json!(optimistic.requested_spd_taps),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_target_token".to_string(),
+                            json!(reply.predicted),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_accepted".to_string(),
+                            json!(accepted),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_next_token".to_string(),
+                            json!(optimistic_next),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_checkpoint_ms".to_string(),
+                            json!(optimistic_checkpoint_ms),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_decode_elapsed_ms".to_string(),
+                            json!(optimistic_elapsed_ms),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_start_elapsed_ms".to_string(),
+                            json!(optimistic_start_elapsed_ms),
+                        );
+                        attrs.insert(
+                            "llama_stage.spd_optimistic_decode_wait_ms".to_string(),
+                            json!(optimistic_wait_ms),
+                        );
+                        attrs.insert(
+                            "llama_stage.stage0_compute_ms".to_string(),
+                            json!(optimistic_stats.stage0_compute_ms),
+                        );
+                        attrs.insert(
+                            "llama_stage.forward_write_ms".to_string(),
+                            json!(optimistic_stats.forward_write_ms),
+                        );
+                        attrs.insert(
+                            "llama_stage.downstream_wait_ms".to_string(),
+                            json!(optimistic_wait_ms),
+                        );
+                        self.telemetry
+                            .emit_debug("stage.openai_spd_optimistic_decode", attrs);
+                        if accepted {
+                            let mut rolling_context = context_with_reply;
+                            let mut expected_target = optimistic_next;
+                            while let Some(chained) = rolling_optimistic_decodes.pop_front() {
+                                let chain_decode_step =
+                                    u32::try_from(decoded_tokens + 1 + chained.chain_depth)
+                                        .map_err(|_| {
+                                            OpenAiError::backend(
+                                                "optimistic decode step exceeds u32",
+                                            )
+                                        })?;
+                                let chain_target = expected_target;
+                                let chain_accepted = chained.proposed == chain_target;
+                                let mut context_with_expected = rolling_context.clone();
+                                context_with_expected.push(chain_target);
+                                let chain_wait_timer = PhaseTimer::start();
+                                let chain_return = if chain_accepted && chained.requested_spd_taps {
+                                    if let Some(spd) = spd_guard.as_deref_mut() {
+                                        let reset_timer = PhaseTimer::start();
+                                        spd.advance_to_accepted_context(&context_with_expected)
+                                            .map_err(openai_backend_error)?;
+                                        speculative_stats.draft_reset_ms +=
+                                            reset_timer.elapsed_ms();
+                                        let next_chain_depth = chained.chain_depth + 1;
+                                        self.recv_spd_aware_prediction_return_with_wait_action(
+                                                &request,
+                                                SpdPredictionReturnWait {
+                                                    expected: WireReplyKind::PredictedTokens,
+                                                    expected_origin: Some(chained.origin),
+                                                    spd_source: Some(spd),
+                                                    current: chain_target,
+                                                    probe_phase: super::spd::SpdInlineProbePhase::OptimisticCommit,
+                                                },
+                                                Some(
+                                                    |backend: &StageOpenAiBackend,
+                                                     probe: &super::spd::SpdInlineProbe| {
+                                                        let next_pos_start =
+                                                            context_with_expected.len();
+                                                        if let Some(decode) = backend
+                                                            .start_spd_optimistic_decode_for_probe(
+                                                                &request,
+                                                                SpdOptimisticDecodeStart {
+                                                                    downstream,
+                                                                    session_key: &session_key,
+                                                                    pos_start: next_pos_start,
+                                                                    decode_step: decoded_tokens
+                                                                        + 2
+                                                                        + chained.chain_depth,
+                                                                    chain_depth: next_chain_depth,
+                                                                    chain_depth_limit:
+                                                                        spd_optimistic_chain_depth_limit,
+                                                                    probe,
+                                                                },
+                                                            )
+                                                            .map_err(|error| {
+                                                                anyhow::anyhow!(error.to_string())
+                                                            })?
+                                                        {
+                                                            rolling_optimistic_decodes
+                                                                .push_back(decode);
+                                                        }
+                                                        Ok(())
+                                                    },
+                                                ),
+                                            )
+                                            .map_err(openai_backend_error)?
+                                    } else {
+                                        self.recv_spd_aware_prediction_return_for_origin(
+                                            &request,
+                                            WireReplyKind::PredictedTokens,
+                                            chained.origin,
+                                        )
+                                        .map_err(openai_backend_error)?
+                                    }
+                                } else {
+                                    self.recv_spd_aware_prediction_return_for_origin(
+                                        &request,
+                                        WireReplyKind::PredictedTokens,
+                                        chained.origin,
+                                    )
+                                    .map_err(openai_backend_error)?
+                                };
+                                let chain_wait_ms = chain_wait_timer.elapsed_ms();
+                                let chain_reply = chain_return.reply;
+                                let chain_next = chain_reply
+                                    .predicted_tokens
+                                    .first()
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        OpenAiError::backend(
+                                            "chained optimistic SPD verify returned no predicted token",
+                                        )
+                                    })?;
+                                if let Some(probe) = chain_return.pre_target_probe {
+                                    let rolling_target_position = context_with_expected.len();
+                                    let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
+                                        Some(
+                                            spd.observe_rolling_probe(
+                                                rolling_target_position,
+                                                chain_next,
+                                                probe.proposed,
+                                            )
+                                            .map_err(openai_backend_error)?,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    optimistic_commit_probes.push(PendingSpdInlineProbe {
+                                        decode_step: chain_decode_step,
+                                        current: chain_target,
+                                        target: chain_next,
+                                        probe,
+                                        rolling,
+                                    });
+                                }
+                                let mut chain_reply_stats = chained.execution.reply_stats;
+                                chain_reply_stats.merge(chain_reply.stats);
+                                let chain_checkpoint_ms =
+                                    us_to_ms(chain_reply_stats.checkpoint_total_us);
+                                speculative_stats.optimistic_checkpoint_ms += chain_checkpoint_ms;
+                                let chain_elapsed_ms = chained.timer.elapsed_ms();
+                                let chain_start_elapsed_ms = chained.execution.elapsed_ms;
+                                let mut chain_stats = chained.execution.stats;
+                                chain_stats.downstream_wait_ms = chain_wait_ms;
+                                speculative_stats.optimistic_decode_requests += 1;
+                                speculative_stats.chained_optimistic_decode_requests += 1;
+                                speculative_stats.optimistic_decode_elapsed_ms += chain_elapsed_ms;
+                                speculative_stats.optimistic_decode_wait_ms += chain_wait_ms;
+                                decode_stage0_compute_ms += chain_stats.stage0_compute_ms;
+                                decode_runtime_lock_wait_ms += chain_stats.runtime_lock_wait_ms;
+                                decode_runtime_lock_wait_max_ms = decode_runtime_lock_wait_max_ms
+                                    .max(chain_stats.runtime_lock_wait_ms);
+                                decode_runtime_lock_hold_ms += chain_stats.runtime_lock_hold_ms;
+                                decode_runtime_lock_hold_max_ms = decode_runtime_lock_hold_max_ms
+                                    .max(chain_stats.runtime_lock_hold_ms);
+                                decode_runtime_lock_acquires += 1;
+                                decode_forward_activation_encode_ms +=
+                                    chain_stats.activation_encode_ms;
+                                decode_output_activation_bytes = decode_output_activation_bytes
+                                    .saturating_add(chain_stats.output_activation_bytes);
+                                decode_forward_activation_bytes = decode_forward_activation_bytes
+                                    .saturating_add(chain_stats.forward_activation_bytes);
+                                decode_forward_write_ms += chain_stats.forward_write_ms;
+                                decode_downstream_wait_ms += chain_wait_ms;
+                                if chain_accepted {
+                                    speculative_stats.optimistic_decode_accepted += 1;
+                                    speculative_stats.chained_optimistic_decode_accepted += 1;
+                                    chained_optimistic_commits.push((
+                                        chain_next,
+                                        chain_stats,
+                                        chained.chain_depth,
+                                    ));
+                                    rolling_context = context_with_expected;
+                                    expected_target = chain_next;
+                                } else {
+                                    speculative_stats.optimistic_decode_rejected += 1;
+                                    speculative_stats.chained_optimistic_decode_rejected += 1;
+                                    let restore = self.restore_embedded_stage_session(
+                                        &request,
+                                        downstream,
+                                        &session_key,
+                                        request_id,
+                                        session_id,
+                                        chained.origin.checkpoint_generation,
+                                    )?;
+                                    speculative_stats.recovery_restores += 1;
+                                    speculative_stats.recovery_ms += restore.elapsed_ms;
+                                    speculative_stats.recovery_restore_ms += restore.elapsed_ms;
+                                    speculative_stats.recovery_restore_local_ms += restore.local_ms;
+                                    speculative_stats.recovery_restore_downstream_write_ms +=
+                                        restore.downstream_write_ms;
+                                    speculative_stats.recovery_restore_downstream_wait_ms +=
+                                        restore.downstream_wait_ms;
+                                    speculative_stats.optimistic_restore_ms += restore.elapsed_ms;
+                                    if chained.requested_spd_taps
+                                        && let Some(spd) = spd_guard.as_deref_mut()
+                                    {
+                                        let reset_timer = PhaseTimer::start();
+                                        spd.reset_to_verified_context(&rolling_context)
+                                            .map_err(openai_backend_error)?;
+                                        speculative_stats.draft_reset_ms +=
+                                            reset_timer.elapsed_ms();
+                                    }
+                                }
+                                let mut attrs = self.openai_attrs(request.ids);
+                                attrs.insert(
+                                    "llama_stage.decode_step".to_string(),
+                                    json!(chain_decode_step),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_chain".to_string(),
+                                    json!(true),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_chain_depth".to_string(),
+                                    json!(chained.chain_depth),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_proposed_token".to_string(),
+                                    json!(chained.proposed),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_proposed_logit".to_string(),
+                                    json!(chained.proposed_logit),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_logit_margin".to_string(),
+                                    json!(chained.proposed_logit_margin),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_tap_return".to_string(),
+                                    json!(chained.requested_spd_taps),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_target_token".to_string(),
+                                    json!(chain_target),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_accepted".to_string(),
+                                    json!(chain_accepted),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_next_token".to_string(),
+                                    json!(chain_next),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_checkpoint_ms".to_string(),
+                                    json!(chain_checkpoint_ms),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_decode_elapsed_ms".to_string(),
+                                    json!(chain_elapsed_ms),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_start_elapsed_ms".to_string(),
+                                    json!(chain_start_elapsed_ms),
+                                );
+                                attrs.insert(
+                                    "llama_stage.spd_optimistic_decode_wait_ms".to_string(),
+                                    json!(chain_wait_ms),
+                                );
+                                attrs.insert(
+                                    "llama_stage.stage0_compute_ms".to_string(),
+                                    json!(chain_stats.stage0_compute_ms),
+                                );
+                                attrs.insert(
+                                    "llama_stage.forward_write_ms".to_string(),
+                                    json!(chain_stats.forward_write_ms),
+                                );
+                                attrs.insert(
+                                    "llama_stage.downstream_wait_ms".to_string(),
+                                    json!(chain_wait_ms),
+                                );
+                                self.telemetry
+                                    .emit_debug("stage.openai_spd_optimistic_decode", attrs);
+                                if !chain_accepted {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     speculative_stats.draft_propose_ms += self.emit_spd_inline_probe(
                         &request,
@@ -1259,28 +1929,56 @@ impl StageOpenAiBackend {
                         current,
                         reply.predicted,
                         probe,
+                        rolling.as_ref(),
                     );
-                } else if let Some(spd) = spd_guard.as_deref() {
+                } else if spd_guard.is_some() {
                     let probe_timer = PhaseTimer::start();
-                    let proposed = spd
-                        .propose_inline_for_current_context(current)
-                        .map_err(openai_backend_error)?;
+                    let (proposal, proposal_miss) = {
+                        let spd = spd_guard
+                            .as_deref_mut()
+                            .ok_or_else(|| OpenAiError::backend("missing SPD proposal source"))?;
+                        let proposal = spd
+                            .propose_inline_for_current_context(current)
+                            .map_err(openai_backend_error)?;
+                        let proposal_miss = if proposal.is_none() {
+                            spd.inline_proposal_miss_for_current_context(current)
+                                .map_err(openai_backend_error)?
+                        } else {
+                            None
+                        };
+                        (proposal, proposal_miss)
+                    };
+                    let proposed = proposal.as_ref().map(|proposal| proposal.token);
                     if let Some(proposed) = proposed {
                         speculative_stats
                             .observe_inline_verified_probe(proposed == reply.predicted);
                     }
+                    let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
+                        Some(
+                            spd.observe_rolling_probe(
+                                rolling_target_position,
+                                reply.predicted,
+                                proposed,
+                            )
+                            .map_err(openai_backend_error)?,
+                        )
+                    } else {
+                        None
+                    };
                     speculative_stats.draft_propose_ms += self.emit_spd_inline_probe(
                         &request,
                         decode_step,
                         current,
                         reply.predicted,
-                        super::spd::SpdInlineProbe {
-                            phase: super::spd::SpdInlineProbePhase::PostTargetReply,
-                            proposed,
-                            elapsed_ms: probe_timer.elapsed_ms(),
-                            target_wait_after_probe_ms: 0.0,
-                            trigger_hf_index: None,
-                        },
+                        super::spd::SpdInlineProbe::from_proposal(
+                            super::spd::SpdInlineProbePhase::PostTargetReply,
+                            proposal.as_ref(),
+                            probe_timer.elapsed_ms(),
+                            0.0,
+                            None,
+                        )
+                        .with_proposal_miss(proposal_miss),
+                        rolling.as_ref(),
                     );
                 }
                 if records_replay_checkpoint
@@ -1310,6 +2008,72 @@ impl StageOpenAiBackend {
                 decoded_tokens += 1;
                 exact_replay_tokens.push(current);
                 context_tokens.push(current);
+                if !spd_advanced_for_current && let Some(spd) = spd_guard.as_deref_mut() {
+                    let reset_timer = PhaseTimer::start();
+                    spd.advance_to_accepted_context(&context_tokens)
+                        .map_err(openai_backend_error)?;
+                    speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
+                }
+                if let Some((optimistic_token, _)) = optimistic_commit.as_ref()
+                    && optimistic_commit_probes.is_empty()
+                    && let Some(spd) = spd_guard.as_deref_mut()
+                {
+                    let optimistic_probe_step = u32::try_from(decoded_tokens)
+                        .map_err(|_| OpenAiError::backend("decode step exceeds u32"))?;
+                    let probe = {
+                        let probe_timer = PhaseTimer::start();
+                        let proposal = spd
+                            .propose_inline_for_current_context(current)
+                            .map_err(openai_backend_error)?;
+                        let proposal_miss = if proposal.is_none() {
+                            spd.inline_proposal_miss_for_current_context(current)
+                                .map_err(openai_backend_error)?
+                        } else {
+                            None
+                        };
+                        super::spd::SpdInlineProbe::from_proposal(
+                            super::spd::SpdInlineProbePhase::OptimisticCommit,
+                            proposal.as_ref(),
+                            probe_timer.elapsed_ms(),
+                            0.0,
+                            None,
+                        )
+                        .with_proposal_miss(proposal_miss)
+                    };
+                    let rolling_target_position = context_tokens.len();
+                    let rolling = Some(
+                        spd.observe_rolling_probe(
+                            rolling_target_position,
+                            *optimistic_token,
+                            probe.proposed,
+                        )
+                        .map_err(openai_backend_error)?,
+                    );
+                    optimistic_commit_probes.push(PendingSpdInlineProbe {
+                        decode_step: optimistic_probe_step,
+                        current,
+                        target: *optimistic_token,
+                        probe,
+                        rolling,
+                    });
+                }
+                for pending_probe in optimistic_commit_probes.drain(..) {
+                    let proposed = pending_probe.probe.proposed;
+                    if let Some(proposed) = proposed {
+                        speculative_stats
+                            .observe_inline_verified_probe(proposed == pending_probe.target);
+                    }
+                    let rolling = pending_probe.rolling.as_ref();
+                    speculative_stats.draft_propose_ms += self.emit_spd_inline_probe(
+                        &request,
+                        pending_probe.decode_step,
+                        pending_probe.current,
+                        pending_probe.target,
+                        pending_probe.probe,
+                        rolling,
+                    );
+                }
+                let mut reached_stop = false;
                 if self.telemetry.is_debug_enabled() {
                     let mut token_attrs = self.openai_attrs(request.ids);
                     token_attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
@@ -1354,6 +2118,166 @@ impl StageOpenAiBackend {
                     self.emit_openai_phase("stage.openai_decode_token", token_timer, token_attrs);
                 }
                 if on_token(current)? == TokenControl::Stop {
+                    reached_stop = true;
+                }
+                if !reached_stop
+                    && decoded_tokens < request.max_tokens as usize
+                    && let Some((optimistic_token, optimistic_stats)) = optimistic_commit
+                {
+                    let optimistic_decode_step = u32::try_from(decoded_tokens)
+                        .map_err(|_| OpenAiError::backend("decode step exceeds u32"))?;
+                    let optimistic_target_position = context_tokens.len();
+                    current = optimistic_token;
+                    decoded_tokens += 1;
+                    speculative_stats.optimistic_decode_committed_tokens += 1;
+                    exact_replay_tokens.push(current);
+                    context_tokens.push(current);
+                    if self.telemetry.is_debug_enabled() {
+                        let mut token_attrs = self.openai_attrs(request.ids);
+                        token_attrs.insert(
+                            "llama_stage.decode_step".to_string(),
+                            json!(optimistic_decode_step),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.decode_token_phase".to_string(),
+                            json!(decode_token_phase(optimistic_decode_step)),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.stage0_compute_ms".to_string(),
+                            json!(optimistic_stats.stage0_compute_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.runtime_lock_wait_ms".to_string(),
+                            json!(optimistic_stats.runtime_lock_wait_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.runtime_lock_hold_ms".to_string(),
+                            json!(optimistic_stats.runtime_lock_hold_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.output_activation_bytes".to_string(),
+                            json!(optimistic_stats.output_activation_bytes),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.forward_activation_bytes".to_string(),
+                            json!(optimistic_stats.forward_activation_bytes),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.activation_encode_ms".to_string(),
+                            json!(optimistic_stats.activation_encode_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.forward_write_ms".to_string(),
+                            json!(optimistic_stats.forward_write_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.downstream_wait_ms".to_string(),
+                            json!(optimistic_stats.downstream_wait_ms),
+                        );
+                        token_attrs
+                            .insert("llama_stage.predicted_token".to_string(), json!(current));
+                        token_attrs.insert(
+                            "llama_stage.message_kind".to_string(),
+                            json!("DecodeEmbdOptimistic"),
+                        );
+                        self.telemetry
+                            .emit_debug("stage.openai_decode_token", token_attrs);
+                    }
+                    if let Some(spd) = spd_guard.as_deref_mut() {
+                        let reset_timer = PhaseTimer::start();
+                        spd.observe_rolling_target_token(optimistic_target_position, current)
+                            .map_err(openai_backend_error)?;
+                        spd.advance_to_accepted_context(&context_tokens)
+                            .map_err(openai_backend_error)?;
+                        speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
+                    }
+                    if on_token(current)? == TokenControl::Stop {
+                        reached_stop = true;
+                    }
+                }
+                for (chained_token, chained_stats, chain_depth) in chained_optimistic_commits {
+                    if reached_stop || decoded_tokens >= request.max_tokens as usize {
+                        break;
+                    }
+                    let chained_decode_step = u32::try_from(decoded_tokens)
+                        .map_err(|_| OpenAiError::backend("decode step exceeds u32"))?;
+                    let chained_target_position = context_tokens.len();
+                    current = chained_token;
+                    decoded_tokens += 1;
+                    speculative_stats.optimistic_decode_committed_tokens += 1;
+                    speculative_stats.chained_optimistic_decode_committed_tokens += 1;
+                    exact_replay_tokens.push(current);
+                    context_tokens.push(current);
+                    if self.telemetry.is_debug_enabled() {
+                        let mut token_attrs = self.openai_attrs(request.ids);
+                        token_attrs.insert(
+                            "llama_stage.decode_step".to_string(),
+                            json!(chained_decode_step),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.decode_token_phase".to_string(),
+                            json!(decode_token_phase(chained_decode_step)),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.stage0_compute_ms".to_string(),
+                            json!(chained_stats.stage0_compute_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.runtime_lock_wait_ms".to_string(),
+                            json!(chained_stats.runtime_lock_wait_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.runtime_lock_hold_ms".to_string(),
+                            json!(chained_stats.runtime_lock_hold_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.output_activation_bytes".to_string(),
+                            json!(chained_stats.output_activation_bytes),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.forward_activation_bytes".to_string(),
+                            json!(chained_stats.forward_activation_bytes),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.activation_encode_ms".to_string(),
+                            json!(chained_stats.activation_encode_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.forward_write_ms".to_string(),
+                            json!(chained_stats.forward_write_ms),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.downstream_wait_ms".to_string(),
+                            json!(chained_stats.downstream_wait_ms),
+                        );
+                        token_attrs
+                            .insert("llama_stage.predicted_token".to_string(), json!(current));
+                        token_attrs.insert(
+                            "llama_stage.message_kind".to_string(),
+                            json!("DecodeEmbdOptimistic"),
+                        );
+                        token_attrs
+                            .insert("llama_stage.spd_optimistic_chain".to_string(), json!(true));
+                        token_attrs.insert(
+                            "llama_stage.spd_optimistic_chain_depth".to_string(),
+                            json!(chain_depth),
+                        );
+                        self.telemetry
+                            .emit_debug("stage.openai_decode_token", token_attrs);
+                    }
+                    if let Some(spd) = spd_guard.as_deref_mut() {
+                        let reset_timer = PhaseTimer::start();
+                        spd.observe_rolling_target_token(chained_target_position, current)
+                            .map_err(openai_backend_error)?;
+                        spd.advance_to_accepted_context(&context_tokens)
+                            .map_err(openai_backend_error)?;
+                        speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
+                    }
+                    if on_token(current)? == TokenControl::Stop {
+                        reached_stop = true;
+                    }
+                }
+                if reached_stop {
                     break;
                 }
             }
@@ -1420,6 +2344,10 @@ impl StageOpenAiBackend {
                 "llama_stage.downstream_wait_ms".to_string(),
                 json!(decode_downstream_wait_ms),
             );
+            if let Some(spd) = spd_guard.as_deref() {
+                spd.insert_rolling_attrs(&mut decode_attrs);
+                spd.insert_total_proposal_stats_attrs(&mut decode_attrs);
+            }
             speculative_stats.insert_attrs(&mut decode_attrs);
             self.emit_openai_phase("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())

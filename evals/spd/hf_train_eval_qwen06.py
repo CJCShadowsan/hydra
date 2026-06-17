@@ -51,6 +51,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-rows", type=int, default=1024)
     parser.add_argument("--eval-rows-per-set", type=int, default=8)
     parser.add_argument("--num-stages", type=int, default=2)
+    parser.add_argument(
+        "--stage-layer-boundaries",
+        default="",
+        help=(
+            "Comma-separated target layer end indices for the trained logical "
+            "pipeline topology, for example 8,16,24,32."
+        ),
+    )
+    parser.add_argument(
+        "--shallow-hidden-layer-indices",
+        default="",
+        help=(
+            "Explicit semicolon-separated HF hidden-state tap rows for [g_n..g_1]. "
+            "Overrides --stage-layer-boundaries when set."
+        ),
+    )
     parser.add_argument("--num-spec-layers", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -335,6 +351,40 @@ def create_mini_eval_data(reference_dir: Path, out_dir: Path, rows_per_set: int)
         print(f"mini eval {name}: {copied} rows -> {dest}", flush=True)
 
 
+def parse_stage_layer_boundaries(value: str) -> list[int] | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    boundaries = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not boundaries:
+        raise RuntimeError("--stage-layer-boundaries must not be empty when set")
+    if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
+        raise RuntimeError(f"--stage-layer-boundaries must be strictly increasing: {boundaries}")
+    return boundaries
+
+
+def derive_hidden_tap_indices(boundaries: list[int]) -> list[list[int]]:
+    rows: list[list[int]] = []
+    for depth in range(len(boundaries), 0, -1):
+        rows.append([0, *boundaries[:depth]])
+    return rows
+
+
+def hidden_tap_rows_arg(args: argparse.Namespace) -> str:
+    explicit = args.shallow_hidden_layer_indices.strip()
+    if explicit:
+        return explicit
+    boundaries = parse_stage_layer_boundaries(args.stage_layer_boundaries)
+    if boundaries is None:
+        return ""
+    if len(boundaries) != args.num_stages:
+        raise RuntimeError(
+            f"--stage-layer-boundaries has {len(boundaries)} entries but "
+            f"--num-stages is {args.num_stages}"
+        )
+    return ";".join(",".join(str(index) for index in row) for row in derive_hidden_tap_indices(boundaries))
+
+
 def train_head(args: argparse.Namespace, reference_dir: Path, train_jsonl: Path, train_dir: Path) -> Path:
     cmd = [
         sys.executable,
@@ -368,6 +418,9 @@ def train_head(args: argparse.Namespace, reference_dir: Path, train_jsonl: Path,
         "--output_dir",
         str(train_dir),
     ]
+    hidden_rows = hidden_tap_rows_arg(args)
+    if hidden_rows:
+        cmd.extend(["--shallow_hidden_layer_indices", hidden_rows])
     if args.draft_vocab_json:
         cmd.extend(["--draft_vocab_json", str(reference_dir / args.draft_vocab_json)])
     started = time.perf_counter()
@@ -435,6 +488,9 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
         raise RuntimeError(f"{ckpt} does not contain a config dict")
 
     draft_token_ids = config.get("draft_token_ids")
+    stage_layer_boundaries = config.get("stage_layer_boundaries")
+    if stage_layer_boundaries is None:
+        stage_layer_boundaries = parse_stage_layer_boundaries(args.stage_layer_boundaries)
     manifest_base_model_path = args.manifest_base_model_path.strip()
     if not manifest_base_model_path:
         manifest_base_model_path = config.get("base_model_path") or args.model_name
@@ -458,6 +514,7 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
             "vocab_size": int(config["vocab_size"]),
             "draft_vocab_size": int(config.get("draft_vocab_size", config["vocab_size"])),
             "num_stages": int(config["num_stages"]),
+            "stage_layer_boundaries": stage_layer_boundaries,
             "num_spec_layers": int(config["num_spec_layers"]),
             "trained_with_use_deepest": bool(config.get("trained_with_use_deepest", False)),
             "shallow_hidden_layer_indices": config["shallow_hidden_layer_indices"],

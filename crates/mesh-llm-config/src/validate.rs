@@ -494,7 +494,7 @@ fn validate_skippy(config: &SkippyConfig, base_path: &str) -> Result<()> {
 fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Result<()> {
     validate_optional_enum(
         config.mode.as_deref(),
-        &["auto", "disabled", "draft", "ngram"],
+        &["auto", "disabled", "draft", "ngram", "spd"],
         &format!("{base_path}.mode"),
     )?;
     validate_hf_pair(
@@ -567,6 +567,32 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Result<(
         config.spec_default.as_ref(),
         &format!("{base_path}.spec_default"),
     )?;
+    validate_optional_non_empty(
+        config.spd_manifest_path.as_deref(),
+        &format!("{base_path}.spd_manifest_path"),
+    )?;
+    validate_optional_non_empty(
+        config.spd_fixture_path.as_deref(),
+        &format!("{base_path}.spd_fixture_path"),
+    )?;
+    validate_optional_non_empty(
+        config.spd_model_path.as_deref(),
+        &format!("{base_path}.spd_model_path"),
+    )?;
+    validate_optional_positive_u32(
+        config.spd_max_tokens,
+        &format!("{base_path}.spd_max_tokens"),
+    )?;
+    validate_optional_positive_usize(config.spd_top_k, &format!("{base_path}.spd_top_k"))?;
+    validate_non_negative_f64(
+        config.spd_optimistic_min_logit_margin,
+        &format!("{base_path}.spd_optimistic_min_logit_margin"),
+    )?;
+    if let Some(gpu_layers) = config.spd_gpu_layers
+        && gpu_layers < -1
+    {
+        bail!("{base_path}.spd_gpu_layers must be at least -1");
+    }
     if config.mode.as_deref() == Some("draft")
         && config.draft_model_path.is_none()
         && config.draft_hf_repo.is_none()

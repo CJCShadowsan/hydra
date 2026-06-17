@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result, bail};
 
-use super::{SpdHeadManifest, SpdSafetensorsFile, SpdStageLayerRange, project_spd_tap_input_row};
+use super::{
+    SpdHeadManifest, SpdSafetensorsFile, SpdStageLayerRange, SpdTapInputProjector,
+    project_spd_tap_input_row,
+};
 use crate::{ActivationFrame, GGML_TYPE_F16, RuntimeConfig, RuntimeLoadMode, StageModel};
 
 pub struct SpdLiveTapRunnerConfig<'a> {
@@ -30,6 +33,7 @@ struct SpdLiveStage {
 pub struct SpdLiveCurInRequest<'a> {
     pub manifest: &'a SpdHeadManifest,
     pub serving_file: &'a SpdSafetensorsFile,
+    pub tap_projector: Option<&'a SpdTapInputProjector>,
     pub taps: &'a BTreeMap<u32, ActivationFrame>,
     pub row_positions: &'a [i64],
     pub row_stage_ids: &'a [i64],
@@ -116,16 +120,28 @@ pub fn assemble_spd_live_cur_in_for_positions(
         let hf_indices = &request.row_hf_indices[row_index];
         let concat_hidden =
             concat_live_hidden(request.taps, hf_indices, position, request.hidden_size)?;
-        let projection = project_spd_tap_input_row(
-            &request.manifest.topology,
-            request.serving_file,
-            stage_id,
-            hf_indices,
-            &concat_hidden,
-        )?;
+        let projection = project_live_tap_input(&request, stage_id, hf_indices, &concat_hidden)?;
         cur_in.extend_from_slice(&projection.projected);
     }
     Ok(SpdLiveCurInRows { cur_in })
+}
+
+fn project_live_tap_input(
+    request: &SpdLiveCurInRequest<'_>,
+    stage_id: u32,
+    hf_indices: &[u32],
+    concat_hidden: &[f32],
+) -> Result<super::SpdTapInputProjection> {
+    if let Some(projector) = request.tap_projector {
+        return projector.project(stage_id, hf_indices, concat_hidden);
+    }
+    project_spd_tap_input_row(
+        &request.manifest.topology,
+        request.serving_file,
+        stage_id,
+        hf_indices,
+        concat_hidden,
+    )
 }
 
 pub fn sliding_spd_row_positions(context_len: usize, row_count: usize) -> Result<Vec<i64>> {
@@ -230,28 +246,30 @@ fn live_hidden_row(frame: &ActivationFrame, position: i64, hidden_size: usize) -
     if position >= token_count {
         bail!("live tap position {position} is outside token_count {token_count}");
     }
-    let payload_f32 = activation_payload_f32(frame)?;
-    Ok(row(&payload_f32, position, hidden_size).to_vec())
-}
-
-fn activation_payload_f32(frame: &ActivationFrame) -> Result<Vec<f32>> {
-    if !frame.payload.len().is_multiple_of(4) {
+    let row_bytes = hidden_size
+        .checked_mul(std::mem::size_of::<f32>())
+        .context("live activation row byte width overflow")?;
+    let expected_payload_bytes = token_count
+        .checked_mul(row_bytes)
+        .context("live activation payload byte count overflow")?;
+    if frame.payload.len() != expected_payload_bytes {
         bail!(
-            "live activation payload for {}..{} has non-f32 byte length {}",
+            "live activation payload for {}..{} has {} bytes, expected {} for {} tokens x hidden {}",
             frame.desc.layer_start,
             frame.desc.layer_end,
-            frame.payload.len()
+            frame.payload.len(),
+            expected_payload_bytes,
+            token_count,
+            hidden_size
         );
     }
-    Ok(frame
-        .payload
+    let offset = position
+        .checked_mul(row_bytes)
+        .context("live activation row offset overflow")?;
+    Ok(frame.payload[offset..offset + row_bytes]
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect())
-}
-
-fn row(values: &[f32], row_idx: usize, width: usize) -> &[f32] {
-    &values[row_idx * width..(row_idx + 1) * width]
 }
 
 #[cfg(test)]

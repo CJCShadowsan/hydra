@@ -47,7 +47,7 @@ mod wire;
 
 pub use self::direct_return::PredictionReturnHub;
 pub use self::direct_return::PredictionReturnListener;
-pub(crate) use self::direct_return::PredictionReturnReceiver;
+pub(crate) use self::direct_return::{PredictionReturnOrigin, PredictionReturnReceiver};
 pub(crate) use self::forwarding::{forwarded_stage_message, forwarded_stage_message_timed};
 #[cfg(test)]
 use self::kv_eviction::BinaryProactiveEviction;
@@ -266,6 +266,8 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 spd_top_k: openai_options.spd_top_k,
                 spd_n_gpu_layers: openai_options.spd_n_gpu_layers,
                 spd_replay_fallback: openai_options.spd_replay_fallback,
+                spd_optimistic_decode: openai_options.spd_optimistic_decode,
+                spd_optimistic_min_logit_margin: openai_options.spd_optimistic_min_logit_margin,
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
@@ -584,10 +586,16 @@ fn handle_binary_connection(
                 let mut runtime = runtime.lock().expect("runtime lock poisoned");
                 match message.kind {
                     WireMessageKind::CheckpointSession => runtime
-                        .checkpoint_session(&session_key)
+                        .checkpoint_session_generation(
+                            &session_key,
+                            message.state.checkpoint_generation,
+                        )
                         .context("checkpoint binary stage session")?,
                     WireMessageKind::RestoreSession => runtime
-                        .restore_session(&session_key)
+                        .restore_session_generation(
+                            &session_key,
+                            message.state.checkpoint_generation,
+                        )
                         .context("restore binary stage session")?,
                     WireMessageKind::TrimSession => runtime
                         .trim_session(&session_key, message.token_count.max(0) as u64)
@@ -870,7 +878,10 @@ fn handle_binary_connection(
                 {
                     let mut runtime = runtime.lock().expect("runtime lock poisoned");
                     runtime
-                        .checkpoint_session(&session_key)
+                        .checkpoint_session_generation(
+                            &session_key,
+                            message.state.checkpoint_generation,
+                        )
                         .context("checkpoint binary stage session before verify span")?;
                 }
                 let checkpoint_us = elapsed_us(checkpoint_started);
@@ -1317,6 +1328,7 @@ fn handle_binary_connection(
             let reply_started = Instant::now();
             direct_return::send_direct_prediction_return(
                 return_stream,
+                direct_return::PredictionReturnOrigin::from_message(&message),
                 StageReply {
                     kind: reply_kind,
                     predicted: predicted_token,
@@ -2257,6 +2269,7 @@ fn handle_binary_restore_prefill_decode_control(
         .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
     direct_return::send_direct_prediction_return(
         return_stream,
+        direct_return::PredictionReturnOrigin::from_message(&message),
         StageReply {
             kind: WireReplyKind::PredictedToken,
             predicted: predicted_token,
@@ -2284,7 +2297,11 @@ fn send_one_off_direct_return(
         wire_dtype,
         downstream_connect_timeout_secs,
     )?;
-    direct_return::send_direct_prediction_return(&mut stream, reply)
+    direct_return::send_direct_prediction_return(
+        &mut stream,
+        direct_return::PredictionReturnOrigin::from_message(message),
+        reply,
+    )
 }
 
 fn maybe_send_spd_tap_return(
@@ -2296,10 +2313,7 @@ fn maybe_send_spd_tap_return(
     downstream_connect_timeout_secs: u64,
     output: &ActivationFrame,
 ) {
-    if config.stage_index == 0 || (message.state.flags & state_flags::SPD_TAP_RETURN) == 0 {
-        return;
-    }
-    if output.payload.is_empty() {
+    if !should_send_spd_tap_return(config, message, output) {
         return;
     }
     let result = spd_tap_reply(config, message, output).and_then(|reply| {
@@ -2331,6 +2345,21 @@ fn maybe_send_spd_tap_return(
             telemetry.emit_debug("stage.binary_spd_tap_return_failed", attrs);
         }
     }
+}
+
+fn should_send_spd_tap_return(
+    config: &StageConfig,
+    message: &StageWireMessage,
+    output: &ActivationFrame,
+) -> bool {
+    if config.stage_index == 0 || (message.state.flags & state_flags::SPD_TAP_RETURN) == 0 {
+        return false;
+    }
+    if output.payload.is_empty() {
+        return false;
+    }
+    config.spd_tap_return_hf_indices.is_empty()
+        || config.spd_tap_return_hf_indices.contains(&config.layer_end)
 }
 
 fn spd_tap_reply(
@@ -3434,6 +3463,18 @@ pub(crate) fn run_binary_stage_message(
             Ok((predicted, Vec::new(), output))
         }
         WireMessageKind::VerifySpan => {
+            if let Some(token_id) = token_ids.first().copied()
+                && token_ids.len() == 1
+            {
+                let (predicted, output) = runtime.decode_frame_sampled(
+                    session_id,
+                    token_id,
+                    None,
+                    input,
+                    output_capacity,
+                )?;
+                return Ok((predicted, vec![predicted], output));
+            }
             let (predicted_tokens, output) =
                 runtime.verify_frame(session_id, token_ids, input, output_capacity)?;
             let predicted = predicted_tokens.first().copied().unwrap_or(0);
