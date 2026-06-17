@@ -260,6 +260,7 @@ impl ResolvedSkippyConfig {
             },
             spd_replay_fallback: spd_enabled && self.speculative.spd_replay_fallback,
             spd_optimistic_decode: spd_enabled && self.speculative.spd_optimistic_decode,
+            spd_rolling_executor: false,
             spd_optimistic_min_logit_margin: if spd_enabled {
                 self.speculative.spd_optimistic_min_logit_margin
             } else {
@@ -406,6 +407,7 @@ impl ResolvedEmbeddedOpenAiArgs {
             spd_n_gpu_layers: None,
             spd_replay_fallback: false,
             spd_optimistic_decode: false,
+            spd_rolling_executor: false,
             spd_optimistic_min_logit_margin: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
@@ -443,6 +445,7 @@ impl ResolvedEmbeddedOpenAiArgs {
             spd_n_gpu_layers: None,
             spd_replay_fallback: false,
             spd_optimistic_decode: false,
+            spd_rolling_executor: false,
             spd_optimistic_min_logit_margin: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
@@ -485,6 +488,7 @@ impl ResolvedEmbeddedOpenAiArgs {
             spd_n_gpu_layers: self.spd_n_gpu_layers,
             spd_replay_fallback: self.spd_replay_fallback,
             spd_optimistic_decode: self.spd_optimistic_decode,
+            spd_rolling_executor: self.spd_rolling_executor,
             spd_optimistic_min_logit_margin: self.spd_optimistic_min_logit_margin,
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,

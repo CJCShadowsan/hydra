@@ -56,7 +56,7 @@ skippy-bench local-split-chain-binary --model-path model.gguf --model-id org/rep
 skippy-bench spd-fixture-parity --manifest skippy-spd-head.json --fixture spd-parity-fixture.safetensors
 skippy-bench spd-live-tap-parity --manifest skippy-spd-head.json --fixture spd-parity-fixture.safetensors --model-path model.gguf --splits 8,10,16,20,24,31 --layer-end 32
 skippy-bench spd-live-tap-parity --manifest skippy-spd-head.json --fixture spd-parity-fixture.safetensors --model-path model.gguf --splits 8,10,16,20,24,31 --layer-end 32 --verify-steps 8
-skippy-bench spd-openai-smoke --stage-server-bin target/release/skippy-server --manifest skippy-spd-head.json --fixture spd-parity-fixture.safetensors --model-path model.gguf --model-id org/repo:Q4_K_M --splits 8,10,16,20,24,31 --layer-end 32 --activation-width 2560 --activation-wire-dtype f16 --max-tokens 8
+skippy-bench spd-openai-smoke --stage-server-bin target/release/skippy-server --manifest skippy-spd-head.json --fixture spd-parity-fixture.safetensors --model-path model.gguf --model-id org/repo:Q4_K_M --splits 8,10,16,20,24,31 --layer-end 32 --activation-width 2560 --activation-wire-dtype f16 --max-tokens 8 --optimistic-decode true --spd-rolling-executor
 skippy-bench chat-corpus --base-url http://127.0.0.1:9337/v1 --model org/repo:Q4_K_M --prompt-corpus target/bench-corpora/smoke/corpus.jsonl --max-tokens 64 --stream
 skippy-bench token-lengths --model-path model.gguf --prompt-corpus target/bench-corpora/long/corpus.jsonl --ctx-size 8192 --generation-limit 512 --output-tsv target/bench-corpora/long/prompt-lengths.tsv
 skippy-bench focused-runtime --schema-smoke --hosts host-a,host-b --splits 1 --layer-end 2
@@ -108,6 +108,14 @@ decode starts, the request asks for SPD tap returns so accepted optimistic work
 can feed later rolling rows; the margin only controls whether that optimistic
 work is started. A pre-patch no-tap diagnostic was faster but starved later
 rolling rows, so it is not the current request-path behavior. Pass
+`--spd-rolling-executor` to enable the opt-in native SPD rolling executor in the
+stage-0 OpenAI server. That path uses direct-return tap callbacks to launch
+younger speculative target verifies from the executor-owned rolling context,
+keeps up to the manifest's logical SPD stage count in flight, and reports
+`spd_rolling_executor_*` launch, queue-depth, oldest-commit, rejection, and
+drain counters. This flag requires `--optimistic-decode true`; it is the
+request-path validation mode for the paper-style rolling schedule, not a
+standalone speedup claim. Pass
 `--prompt-file` to run the same baseline/SPD shape over a prompt set. Prompt
 files accept non-empty plain-text lines, JSON string lines, JSON objects with
 `prompt`, `text`, or `content`, chat-style `messages`, or `turns` arrays.
@@ -155,11 +163,13 @@ optimistic `VerifySpan` work, and `cases[].token_events[]` preserves the same
 chain flag on emitted `DecodeEmbdOptimistic` token events when stage 0 reports
 it. Primary `VerifySpan` commits also emit `token_events[]` entries with
 `message_kind="VerifySpan"` so rolling replay can reconstruct mixed
-primary/optimistic target streams. Chained counters currently prove bounded
-one-step target execution; they do not imply the full paper rolling executor is
-running. Direct-return prediction replies are origin-tagged on opt-in streams,
-so overlapping same-kind final replies can be buffered and matched to the
-specific `VerifySpan` that launched them. The origin includes
+primary/optimistic target streams. Without `--spd-rolling-executor`, chained
+counters prove bounded target execution only; with the flag enabled, the
+`spd_rolling_executor_*` counters show whether the native executor actually
+filled the logical queue and committed or drained oldest entries. Direct-return
+prediction replies are origin-tagged on opt-in streams, so overlapping
+same-kind final replies can be buffered and matched to the specific
+`VerifySpan` that launched them. The origin includes
 `checkpoint_generation`, and the serving runtime now keeps checkpoints by
 session plus generation so speculative verifier restores cannot overwrite each
 other when several target positions are in flight. The report also includes

@@ -127,6 +127,7 @@ impl StageOpenAiBackend {
                     draft: self.draft.clone(),
                     spd: self.spd.clone(),
                     spd_optimistic_decode: self.spd_optimistic_decode,
+                    spd_rolling_executor: self.spd_rolling_executor,
                     spd_optimistic_min_logit_margin: self.spd_optimistic_min_logit_margin,
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,

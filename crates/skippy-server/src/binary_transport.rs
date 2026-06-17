@@ -267,6 +267,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 spd_n_gpu_layers: openai_options.spd_n_gpu_layers,
                 spd_replay_fallback: openai_options.spd_replay_fallback,
                 spd_optimistic_decode: openai_options.spd_optimistic_decode,
+                spd_rolling_executor: openai_options.spd_rolling_executor,
                 spd_optimistic_min_logit_margin: openai_options.spd_optimistic_min_logit_margin,
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,

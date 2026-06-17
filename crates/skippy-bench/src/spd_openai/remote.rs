@@ -669,6 +669,9 @@ pub(super) fn start_case_stages(
                 if args.optimistic_decode {
                     command.arg("--openai-spd-optimistic-decode");
                 }
+                if args.spd_rolling_executor {
+                    command.arg("--openai-spd-rolling-executor");
+                }
                 if args.spd_replay_fallback {
                     command.arg("--openai-spd-replay-fallback");
                 }

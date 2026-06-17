@@ -19,6 +19,7 @@ use skippy_runtime::{ActivationFrame, RuntimeActivationDType, RuntimeActivationL
 use super::*;
 
 mod cache;
+mod executor;
 mod telemetry;
 #[cfg(test)]
 mod tests;
@@ -36,6 +37,7 @@ use self::{
     timing::{SpdHeadForwardOutcome, SpdHeadForwardTiming, insert_head_forward_timing_attrs},
 };
 
+pub(super) use self::executor::{SpdRollingExecutor, SpdRollingExecutorCommit};
 pub(super) use self::telemetry::SpdRollingTelemetry;
 
 pub(super) const SPD_REPLAY_PROPOSAL_SOURCE: &str = "spd-replay";
@@ -686,6 +688,17 @@ impl SpdReplayProposalSource {
         self.propose_one(&self.context_tokens)
     }
 
+    pub(super) fn propose_inline_for_rolling_context(
+        &mut self,
+        context_tokens: &[i32],
+        rows: &SpdRollingSpeculationRows,
+    ) -> Result<Option<SpdInlineProposal>> {
+        let resolved_rows = self.resolve_rolling_rows(rows)?;
+        let proposal = self.propose_one_from_rolling_rows(context_tokens, &resolved_rows)?;
+        self.record_inline_probe_attempt(proposal.as_ref());
+        Ok(proposal)
+    }
+
     pub(super) fn inline_proposal_miss_for_current_context(
         &self,
         current: i32,
@@ -1208,6 +1221,47 @@ impl StageOpenAiBackend {
             },
             None::<fn(&StageOpenAiBackend, &SpdInlineProbe) -> Result<()>>,
         )
+    }
+
+    pub(super) fn recv_spd_aware_prediction_return_with_tap_action<F>(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        expected: WireReplyKind,
+        expected_origin: Option<PredictionReturnOrigin>,
+        mut on_spd_tap: F,
+    ) -> Result<StageReply>
+    where
+        F: FnMut(&StageOpenAiBackend, Option<u32>) -> Result<()>,
+    {
+        let receiver = request
+            .prediction_return
+            .as_ref()
+            .context("missing direct prediction return receiver")?;
+        loop {
+            let item = if let Some(origin) = expected_origin {
+                receiver.recv_item_matching(|item| {
+                    item.reply.kind == WireReplyKind::SpdTap
+                        || item.matches_origin(expected, origin)
+                })?
+            } else {
+                receiver.recv_item()?
+            };
+            let reply = item.reply;
+            if reply.kind == WireReplyKind::SpdTap {
+                let trigger_hf_index = reply.spd_tap.as_ref().map(|tap| tap.hf_index);
+                self.record_spd_direct_return_tap(request, &reply);
+                on_spd_tap(self, trigger_hf_index)?;
+                continue;
+            }
+            if reply.kind != expected {
+                bail!(
+                    "expected {:?} direct prediction return, got {:?}",
+                    expected,
+                    reply.kind
+                );
+            }
+            return Ok(reply);
+        }
     }
 
     pub(super) fn recv_spd_aware_prediction_return_with_probe_action<F>(

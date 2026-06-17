@@ -264,6 +264,12 @@ pub struct SpdOpenAiSmokeArgs {
     pub optimistic_decode: bool,
     #[arg(
         long,
+        default_value_t = false,
+        help = "Pass --openai-spd-rolling-executor to the SPD stage-0 server for native rolling-executor validation."
+    )]
+    pub spd_rolling_executor: bool,
+    #[arg(
+        long,
         help = "Only start optimistic SPD target decode when the inline top-1/top-2 logit margin is at least this value. Use --spd-top-k 2 or higher to produce margins."
     )]
     pub optimistic_min_logit_margin: Option<f32>,

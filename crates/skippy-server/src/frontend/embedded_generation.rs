@@ -8,6 +8,108 @@ struct PendingSpdInlineProbe {
     rolling: Option<super::spd::SpdRollingTelemetry>,
 }
 
+fn merge_spd_rolling_executor_stats(
+    speculative_stats: &mut OpenAiSpeculativeStats,
+    executor: Option<&SpdRollingExecutor>,
+) {
+    let Some(executor) = executor else {
+        return;
+    };
+    let stats = executor.stats();
+    speculative_stats.spd_rolling_executor_launches = stats.launches;
+    speculative_stats.spd_rolling_executor_launch_misses = stats.launch_misses;
+    speculative_stats.spd_rolling_executor_margin_rejects = stats.launch_margin_rejects;
+    speculative_stats.spd_rolling_executor_max_in_flight = stats.max_in_flight;
+    speculative_stats.spd_rolling_executor_accepted_oldest = stats.accepted_oldest;
+    speculative_stats.spd_rolling_executor_rejected_oldest = stats.rejected_oldest;
+    speculative_stats.spd_rolling_executor_drained_younger = stats.drained_younger;
+}
+
+fn observe_spd_rolling_executor_target(
+    speculative_stats: &mut OpenAiSpeculativeStats,
+    executor: Option<&mut SpdRollingExecutor>,
+    position: usize,
+    token: i32,
+) -> OpenAiResult<Option<SpdRollingExecutorCommit>> {
+    let Some(executor) = executor else {
+        return Ok(None);
+    };
+    executor.record_target_token(position, token);
+    let commit = executor
+        .commit_ready_oldest()
+        .map_err(openai_backend_error)?;
+    merge_spd_rolling_executor_stats(speculative_stats, Some(executor));
+    Ok(commit)
+}
+
+struct SpdRollingStartArgs<'a> {
+    request: &'a EmbeddedStageZeroGeneration<'a>,
+    downstream: &'a mut TcpStream,
+    session_key: &'a str,
+    spd: &'a mut SpdReplayProposalSource,
+    executor: &'a mut SpdRollingExecutor,
+    decode_step: usize,
+    phase: super::spd::SpdInlineProbePhase,
+    trigger_hf_index: Option<u32>,
+}
+
+fn start_spd_rolling_executor_decode(
+    backend: &StageOpenAiBackend,
+    args: SpdRollingStartArgs<'_>,
+) -> OpenAiResult<Option<(SpdOptimisticDecode, super::spd::SpdInlineProbe)>> {
+    let Some(launch) = args
+        .executor
+        .prepare_launch(
+            args.spd,
+            args.decode_step,
+            args.phase,
+            args.request.spd_optimistic_min_logit_margin,
+            args.trigger_hf_index,
+        )
+        .map_err(openai_backend_error)?
+    else {
+        return Ok(None);
+    };
+    let decode = backend.start_spd_optimistic_decode_for_probe(
+        args.request,
+        SpdOptimisticDecodeStart {
+            downstream: args.downstream,
+            session_key: args.session_key,
+            pos_start: launch.position,
+            decode_step: launch.decode_step,
+            chain_depth: launch.chain_depth,
+            chain_depth_limit: args.executor.logical_stage_count(),
+            probe: &launch.probe,
+        },
+    )?;
+    let Some(decode) = decode else {
+        return Ok(None);
+    };
+    args.executor
+        .record_launch(&launch)
+        .map_err(openai_backend_error)?;
+    Ok(Some((decode, launch.probe)))
+}
+
+fn drain_spd_rolling_executor_replies(
+    backend: &StageOpenAiBackend,
+    request: &EmbeddedStageZeroGeneration<'_>,
+    queued: &mut std::collections::VecDeque<SpdOptimisticDecode>,
+) -> OpenAiResult<usize> {
+    let mut drained = 0;
+    while let Some(decode) = queued.pop_front() {
+        backend
+            .recv_spd_aware_prediction_return_for_origin(
+                request,
+                WireReplyKind::PredictedTokens,
+                decode.origin,
+            )
+            .map_err(openai_backend_error)?;
+        drained += 1;
+    }
+    Ok(drained)
+}
+
 impl StageOpenAiBackend {
     pub(super) fn generate_embedded_stage_zero_tokens(
         &self,
@@ -835,6 +937,7 @@ impl StageOpenAiBackend {
                 .map(SpdReplayProposalSource::logical_stage_count)
                 .unwrap_or(0)
                 .saturating_sub(1);
+            let mut spd_rolling_executor = None::<SpdRollingExecutor>;
             while decoded_tokens < request.max_tokens as usize {
                 let decode_step = u32::try_from(decoded_tokens)
                     .map_err(|_| OpenAiError::backend("decode step exceeds u32"))?;
@@ -852,6 +955,18 @@ impl StageOpenAiBackend {
                     && draft_guard.is_none()
                     && spd_guard.is_some()
                     && request.sampling.temperature <= 0.0;
+                let use_spd_rolling_executor =
+                    request.spd_rolling_executor && prefer_rolling_spd_optimistic_decode;
+                if use_spd_rolling_executor && spd_rolling_executor.is_none() {
+                    let logical_stage_count = spd_guard
+                        .as_deref()
+                        .map(SpdReplayProposalSource::logical_stage_count)
+                        .unwrap_or(0);
+                    spd_rolling_executor = Some(
+                        SpdRollingExecutor::new(logical_stage_count, &context_tokens)
+                            .map_err(openai_backend_error)?,
+                    );
+                }
                 if !prefer_rolling_spd_optimistic_decode
                     && (spd_guard.is_some() || draft_guard.is_some())
                 {
@@ -1380,7 +1495,56 @@ impl StageOpenAiBackend {
                                 .len()
                                 .saturating_add(request.max_tokens as usize)
                     });
-                let prediction_return = if can_start_optimistic_spd {
+                let prediction_return = if can_start_optimistic_spd && use_spd_rolling_executor {
+                    let mut pre_target_probe = None;
+                    let rolling_reply = self
+                        .recv_spd_aware_prediction_return_with_tap_action(
+                            &request,
+                            WireReplyKind::PredictedToken,
+                            None,
+                            |backend, trigger_hf_index| {
+                                let Some(executor) = spd_rolling_executor.as_mut() else {
+                                    return Ok(());
+                                };
+                                let Some(spd) = spd_guard.as_deref_mut() else {
+                                    return Ok(());
+                                };
+                                let decode_step = decoded_tokens
+                                    .checked_add(1)
+                                    .and_then(|step| step.checked_add(executor.in_flight_len()))
+                                    .context("SPD rolling executor decode step overflow")?;
+                                let Some((decode, probe)) = start_spd_rolling_executor_decode(
+                                    backend,
+                                    SpdRollingStartArgs {
+                                        request: &request,
+                                        downstream,
+                                        session_key: &session_key,
+                                        spd,
+                                        executor,
+                                        decode_step,
+                                        phase: super::spd::SpdInlineProbePhase::PreTargetReply,
+                                        trigger_hf_index,
+                                    },
+                                )
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                                else {
+                                    return Ok(());
+                                };
+                                pre_target_probe.get_or_insert_with(|| probe.clone());
+                                if optimistic_decode.is_none() {
+                                    optimistic_decode = Some(decode);
+                                } else {
+                                    rolling_optimistic_decodes.push_back(decode);
+                                }
+                                Ok(())
+                            },
+                        )
+                        .map_err(openai_backend_error)?;
+                    Ok(SpdPredictionReturn {
+                        reply: rolling_reply,
+                        pre_target_probe,
+                    })
+                } else if can_start_optimistic_spd {
                     self.recv_spd_aware_prediction_return_with_probe_action(
                         &request,
                         WireReplyKind::PredictedToken,
@@ -1427,6 +1591,12 @@ impl StageOpenAiBackend {
                 // Rolling SPD row positions are token indices. Before pushing
                 // reply.predicted, the target token will occupy context_tokens.len().
                 let rolling_target_position = context_tokens.len();
+                observe_spd_rolling_executor_target(
+                    &mut speculative_stats,
+                    spd_rolling_executor.as_mut(),
+                    rolling_target_position,
+                    reply.predicted,
+                )?;
                 if let Some(probe) = prediction_return.pre_target_probe {
                     let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
                         Some(
@@ -1456,44 +1626,98 @@ impl StageOpenAiBackend {
                                     .map_err(openai_backend_error)?;
                                 speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
                                 spd_advanced_for_current = true;
-                                self.recv_spd_aware_prediction_return_with_wait_action(
-                                    &request,
-                                    SpdPredictionReturnWait {
-                                        expected: WireReplyKind::PredictedTokens,
-                                        expected_origin: Some(optimistic.origin),
-                                        spd_source: Some(spd),
-                                        current: reply.predicted,
-                                        probe_phase: super::spd::SpdInlineProbePhase::OptimisticCommit,
-                                    },
-                                    Some(
-                                        |backend: &StageOpenAiBackend,
-                                         probe: &super::spd::SpdInlineProbe| {
-                                            let chain_pos_start = context_with_reply.len();
-                                            if let Some(decode) = backend
-                                                .start_spd_optimistic_decode_for_probe(
-                                                    &request,
-                                                    SpdOptimisticDecodeStart {
-                                                        downstream,
-                                                        session_key: &session_key,
-                                                        pos_start: chain_pos_start,
-                                                        decode_step: decoded_tokens + 2,
-                                                        chain_depth: 1,
-                                                        chain_depth_limit:
-                                                            spd_optimistic_chain_depth_limit,
-                                                        probe,
-                                                    },
-                                                )
-                                                .map_err(|error| {
-                                                    anyhow::anyhow!(error.to_string())
-                                                })?
-                                            {
+                                if use_spd_rolling_executor {
+                                    let mut optimistic_commit_probe = None;
+                                    let rolling_reply = self
+                                        .recv_spd_aware_prediction_return_with_tap_action(
+                                            &request,
+                                            WireReplyKind::PredictedTokens,
+                                            Some(optimistic.origin),
+                                            |backend, trigger_hf_index| {
+                                                let Some(executor) =
+                                                    spd_rolling_executor.as_mut()
+                                                else {
+                                                    return Ok(());
+                                                };
+                                                let decode_step = decoded_tokens
+                                                    .checked_add(2)
+                                                    .and_then(|step| {
+                                                        step.checked_add(executor.in_flight_len())
+                                                    })
+                                                    .context(
+                                                        "SPD rolling executor decode step overflow",
+                                                    )?;
+                                                let Some((decode, probe)) =
+                                                    start_spd_rolling_executor_decode(
+                                                        backend,
+                                                        SpdRollingStartArgs {
+                                                            request: &request,
+                                                            downstream,
+                                                            session_key: &session_key,
+                                                            spd,
+                                                            executor,
+                                                            decode_step,
+                                                            phase: super::spd::SpdInlineProbePhase::OptimisticCommit,
+                                                            trigger_hf_index,
+                                                        },
+                                                    )
+                                                    .map_err(|error| {
+                                                        anyhow::anyhow!(error.to_string())
+                                                    })?
+                                                else {
+                                                    return Ok(());
+                                                };
+                                                optimistic_commit_probe
+                                                    .get_or_insert_with(|| probe.clone());
                                                 rolling_optimistic_decodes.push_back(decode);
-                                            }
-                                            Ok(())
+                                                Ok(())
+                                            },
+                                        )
+                                        .map_err(openai_backend_error)?;
+                                    SpdPredictionReturn {
+                                        reply: rolling_reply,
+                                        pre_target_probe: optimistic_commit_probe,
+                                    }
+                                } else {
+                                    self.recv_spd_aware_prediction_return_with_wait_action(
+                                        &request,
+                                        SpdPredictionReturnWait {
+                                            expected: WireReplyKind::PredictedTokens,
+                                            expected_origin: Some(optimistic.origin),
+                                            spd_source: Some(spd),
+                                            current: reply.predicted,
+                                            probe_phase: super::spd::SpdInlineProbePhase::OptimisticCommit,
                                         },
-                                    ),
-                                )
-                                .map_err(openai_backend_error)?
+                                        Some(
+                                            |backend: &StageOpenAiBackend,
+                                             probe: &super::spd::SpdInlineProbe| {
+                                                let chain_pos_start = context_with_reply.len();
+                                                if let Some(decode) = backend
+                                                    .start_spd_optimistic_decode_for_probe(
+                                                        &request,
+                                                        SpdOptimisticDecodeStart {
+                                                            downstream,
+                                                            session_key: &session_key,
+                                                            pos_start: chain_pos_start,
+                                                            decode_step: decoded_tokens + 2,
+                                                            chain_depth: 1,
+                                                            chain_depth_limit:
+                                                                spd_optimistic_chain_depth_limit,
+                                                            probe,
+                                                        },
+                                                    )
+                                                    .map_err(|error| {
+                                                        anyhow::anyhow!(error.to_string())
+                                                    })?
+                                                {
+                                                    rolling_optimistic_decodes.push_back(decode);
+                                                }
+                                                Ok(())
+                                            },
+                                        ),
+                                    )
+                                    .map_err(openai_backend_error)?
+                                }
                             } else {
                                 self.recv_spd_aware_prediction_return_for_origin(
                                     &request,
@@ -1521,6 +1745,12 @@ impl StageOpenAiBackend {
                                     "optimistic SPD verify returned no predicted token",
                                 )
                             })?;
+                        observe_spd_rolling_executor_target(
+                            &mut speculative_stats,
+                            spd_rolling_executor.as_mut(),
+                            context_with_reply.len(),
+                            optimistic_next,
+                        )?;
                         if let Some(probe) = optimistic_return.pre_target_probe {
                             let rolling_target_position = context_with_reply.len();
                             let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
@@ -1600,6 +1830,17 @@ impl StageOpenAiBackend {
                                 spd.reset_to_verified_context(&context_with_reply)
                                     .map_err(openai_backend_error)?;
                                 speculative_stats.draft_reset_ms += reset_timer.elapsed_ms();
+                            }
+                            if use_spd_rolling_executor {
+                                drain_spd_rolling_executor_replies(
+                                    self,
+                                    &request,
+                                    &mut rolling_optimistic_decodes,
+                                )?;
+                                merge_spd_rolling_executor_stats(
+                                    &mut speculative_stats,
+                                    spd_rolling_executor.as_ref(),
+                                );
                             }
                         }
                         let mut attrs = self.openai_attrs(request.ids);
@@ -1686,7 +1927,63 @@ impl StageOpenAiBackend {
                                         speculative_stats.draft_reset_ms +=
                                             reset_timer.elapsed_ms();
                                         let next_chain_depth = chained.chain_depth + 1;
-                                        self.recv_spd_aware_prediction_return_with_wait_action(
+                                        if use_spd_rolling_executor {
+                                            let mut optimistic_commit_probe = None;
+                                            let rolling_reply = self
+                                                .recv_spd_aware_prediction_return_with_tap_action(
+                                                    &request,
+                                                    WireReplyKind::PredictedTokens,
+                                                    Some(chained.origin),
+                                                    |backend, trigger_hf_index| {
+                                                        let Some(executor) =
+                                                            spd_rolling_executor.as_mut()
+                                                        else {
+                                                            return Ok(());
+                                                        };
+                                                        let decode_step = decoded_tokens
+                                                            .checked_add(2)
+                                                            .and_then(|step| {
+                                                                step.checked_add(
+                                                                    executor.in_flight_len(),
+                                                                )
+                                                            })
+                                                            .context(
+                                                                "SPD rolling executor decode step overflow",
+                                                            )?;
+                                                        let Some((decode, probe)) =
+                                                            start_spd_rolling_executor_decode(
+                                                                backend,
+                                                                SpdRollingStartArgs {
+                                                                    request: &request,
+                                                                    downstream,
+                                                                    session_key: &session_key,
+                                                                    spd,
+                                                                    executor,
+                                                                    decode_step,
+                                                                    phase: super::spd::SpdInlineProbePhase::OptimisticCommit,
+                                                                    trigger_hf_index,
+                                                                },
+                                                            )
+                                                            .map_err(|error| {
+                                                                anyhow::anyhow!(error.to_string())
+                                                            })?
+                                                        else {
+                                                            return Ok(());
+                                                        };
+                                                        optimistic_commit_probe
+                                                            .get_or_insert_with(|| probe.clone());
+                                                        rolling_optimistic_decodes
+                                                            .push_back(decode);
+                                                        Ok(())
+                                                    },
+                                                )
+                                                .map_err(openai_backend_error)?;
+                                            SpdPredictionReturn {
+                                                reply: rolling_reply,
+                                                pre_target_probe: optimistic_commit_probe,
+                                            }
+                                        } else {
+                                            self.recv_spd_aware_prediction_return_with_wait_action(
                                                 &request,
                                                 SpdPredictionReturnWait {
                                                     expected: WireReplyKind::PredictedTokens,
@@ -1728,6 +2025,7 @@ impl StageOpenAiBackend {
                                                 ),
                                             )
                                             .map_err(openai_backend_error)?
+                                        }
                                     } else {
                                         self.recv_spd_aware_prediction_return_for_origin(
                                             &request,
@@ -1755,6 +2053,12 @@ impl StageOpenAiBackend {
                                             "chained optimistic SPD verify returned no predicted token",
                                         )
                                     })?;
+                                observe_spd_rolling_executor_target(
+                                    &mut speculative_stats,
+                                    spd_rolling_executor.as_mut(),
+                                    context_with_expected.len(),
+                                    chain_next,
+                                )?;
                                 if let Some(probe) = chain_return.pre_target_probe {
                                     let rolling_target_position = context_with_expected.len();
                                     let rolling = if let Some(spd) = spd_guard.as_deref_mut() {
@@ -1844,6 +2148,17 @@ impl StageOpenAiBackend {
                                             .map_err(openai_backend_error)?;
                                         speculative_stats.draft_reset_ms +=
                                             reset_timer.elapsed_ms();
+                                    }
+                                    if use_spd_rolling_executor {
+                                        drain_spd_rolling_executor_replies(
+                                            self,
+                                            &request,
+                                            &mut rolling_optimistic_decodes,
+                                        )?;
+                                        merge_spd_rolling_executor_stats(
+                                            &mut speculative_stats,
+                                            spd_rolling_executor.as_ref(),
+                                        );
                                     }
                                 }
                                 let mut attrs = self.openai_attrs(request.ids);

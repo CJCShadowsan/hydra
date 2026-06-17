@@ -45,6 +45,7 @@ pub struct EmbeddedOpenAiStageOptions {
     pub spd_n_gpu_layers: Option<i32>,
     pub spd_replay_fallback: bool,
     pub spd_optimistic_decode: bool,
+    pub spd_rolling_executor: bool,
     pub spd_optimistic_min_logit_margin: Option<f32>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
@@ -70,6 +71,9 @@ impl BinaryStageOptions {
         }
         if args.openai_spd_optimistic_min_logit_margin.is_some() && args.openai_spd_top_k < 2 {
             bail!("--openai-spd-optimistic-min-logit-margin requires --openai-spd-top-k >= 2");
+        }
+        if args.openai_spd_rolling_executor && !args.openai_spd_optimistic_decode {
+            bail!("--openai-spd-rolling-executor requires --openai-spd-optimistic-decode");
         }
         let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
         let downstream_wire_condition =
@@ -105,6 +109,7 @@ impl BinaryStageOptions {
                 spd_n_gpu_layers: args.openai_spd_n_gpu_layers,
                 spd_replay_fallback: args.openai_spd_replay_fallback,
                 spd_optimistic_decode: args.openai_spd_optimistic_decode,
+                spd_rolling_executor: args.openai_spd_rolling_executor,
                 spd_optimistic_min_logit_margin: args.openai_spd_optimistic_min_logit_margin,
                 speculative_window: args.openai_speculative_window,
                 adaptive_speculative_window: args.openai_adaptive_speculative_window,

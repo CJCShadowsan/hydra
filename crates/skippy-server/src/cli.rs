@@ -156,6 +156,11 @@ pub struct ServeBinaryArgs {
     pub openai_spd_optimistic_decode: bool,
     #[arg(
         long,
+        help = "Route deterministic SPD optimistic work through the native rolling-executor scheduler. Requires --openai-spd-optimistic-decode."
+    )]
+    pub openai_spd_rolling_executor: bool,
+    #[arg(
+        long,
         help = "Only start optimistic SPD target decode when the inline top-1/top-2 logit margin is at least this value. Requires --openai-spd-top-k >= 2 to produce margins."
     )]
     pub openai_spd_optimistic_min_logit_margin: Option<f32>,
@@ -288,6 +293,7 @@ mod tests {
             "99",
             "--openai-spd-replay-fallback",
             "--openai-spd-optimistic-decode",
+            "--openai-spd-rolling-executor",
             "--openai-spd-optimistic-min-logit-margin",
             "5.5",
             "--openai-speculative-window",
@@ -315,6 +321,7 @@ mod tests {
         assert_eq!(args.openai_spd_n_gpu_layers, Some(99));
         assert!(args.openai_spd_replay_fallback);
         assert!(args.openai_spd_optimistic_decode);
+        assert!(args.openai_spd_rolling_executor);
         assert_eq!(args.openai_spd_optimistic_min_logit_margin, Some(5.5));
         assert_eq!(args.openai_speculative_window, 2);
     }

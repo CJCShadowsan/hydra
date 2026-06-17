@@ -105,6 +105,13 @@ pub(super) struct OpenAiSpeculativeStats {
     pub(super) chained_optimistic_decode_accepted: usize,
     pub(super) chained_optimistic_decode_rejected: usize,
     pub(super) chained_optimistic_decode_committed_tokens: usize,
+    pub(super) spd_rolling_executor_launches: usize,
+    pub(super) spd_rolling_executor_launch_misses: usize,
+    pub(super) spd_rolling_executor_margin_rejects: usize,
+    pub(super) spd_rolling_executor_max_in_flight: usize,
+    pub(super) spd_rolling_executor_accepted_oldest: usize,
+    pub(super) spd_rolling_executor_rejected_oldest: usize,
+    pub(super) spd_rolling_executor_drained_younger: usize,
     pub(super) adaptive_window_start: usize,
     pub(super) adaptive_window_final: usize,
     pub(super) adaptive_window_max: usize,
@@ -387,6 +394,34 @@ impl OpenAiSpeculativeStats {
         attrs.insert(
             "llama_stage.spec.chained_optimistic_decode_committed_tokens".to_string(),
             json!(self.chained_optimistic_decode_committed_tokens),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_launches".to_string(),
+            json!(self.spd_rolling_executor_launches),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_launch_misses".to_string(),
+            json!(self.spd_rolling_executor_launch_misses),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_margin_rejects".to_string(),
+            json!(self.spd_rolling_executor_margin_rejects),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_max_in_flight".to_string(),
+            json!(self.spd_rolling_executor_max_in_flight),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_accepted_oldest".to_string(),
+            json!(self.spd_rolling_executor_accepted_oldest),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_rejected_oldest".to_string(),
+            json!(self.spd_rolling_executor_rejected_oldest),
+        );
+        attrs.insert(
+            "llama_stage.spec.spd_rolling_executor_drained_younger".to_string(),
+            json!(self.spd_rolling_executor_drained_younger),
         );
         attrs.insert(
             "llama_stage.spec.adaptive_enabled".to_string(),

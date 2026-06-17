@@ -44,6 +44,11 @@ What is working:
 - The runtime rejects topologies that do not provide the hidden-state tap
   boundaries required by the sidecar manifest, which prevents silently running a
   trained sidecar against an incompatible physical split.
+- The opt-in native rolling executor path (`--openai-spd-rolling-executor` /
+  `skippy-bench spd-openai-smoke --spd-rolling-executor`) can now keep a
+  logical `S=4` rolling queue in flight from live direct-return taps, verify the
+  oldest completed entry, and report oldest-commit/drain counters from the
+  request path.
 
 Latest native evidence:
 
@@ -144,6 +149,29 @@ First remote preflight on 2026-06-17:
 | Remote plan | stage 0 local with checked port 20031, stages 1-6 assigned to one worker endpoint plan |
 | Warnings | none for the complete fake endpoint/model-path map |
 
+Native rolling-executor local smoke on 2026-06-17:
+
+| Check | Result |
+| --- | --- |
+| Preflight report | `/private/tmp/spd-rolling-executor-local-preflight.json` |
+| Paired smoke report | `/private/tmp/spd-rolling-executor-local-paired-final.json` |
+| Build shape | current debug `skippy-server` / `skippy-bench`, not release timing binaries |
+| Command shape | `spd-openai-smoke --splits 8,10,16,20,24,31 --max-tokens 6 --run-baseline true --run-spd true --optimistic-decode true --spd-rolling-executor` |
+| Content match | 1 / 1 baseline/SPD pair matched |
+| Rolling executor launches | 5 |
+| Rolling executor max in flight | 4 |
+| Rolling executor oldest commits | 3 accepted, 0 rejected |
+| Younger drains | 0 |
+| Optimistic commits | 5 total, 4 chained |
+| Tap failures | 0 return, 0 record, 0 ignored |
+| Current speed signal | negative local/debug result; baseline decode 170.5 ms, SPD decode 25149.1 ms |
+
+This closes the earlier "diagnostic-only rolling scheduler" gap for the
+request path: the server can launch younger verifier work from every eligible
+tap callback and maintain a filled logical rolling queue. It is still a local
+same-machine proof. It does not show the paper's distributed overlap regime and
+should not be used as speedup evidence.
+
 Paper fidelity:
 
 - The mechanism is paper-shaped: hidden states from target stages are converted
@@ -158,13 +186,14 @@ Paper fidelity:
   process-heavy, mostly CPU-bound, and one-token. It does not yet reproduce the
   paper's useful overlap regime where target pipeline work and sidecar work hide
   each other on genuinely parallel hardware.
-- The overhead delta is a serving/scheduler gap, not evidence that the paper or
-  reference sidecar mechanics are absent. The reference loop keeps an `n`-slot
-  rolling pipeline, runs target stage work and speculation in parallel, reuses
-  `spec_past_kv`, and verifies/evicts the oldest completed entry. Skippy has
-  the Rust scheduler primitive, inline taps, cache parity, and bounded chained
-  verification evidence, but still needs that rolling executor as the native
-  serving path.
+- The overhead delta is now a distributed-execution and scheduling-quality gap,
+  not evidence that the paper or reference sidecar mechanics are absent. The
+  reference loop keeps an `n`-slot rolling pipeline, runs target stage work and
+  speculation in parallel, reuses `spec_past_kv`, and verifies/evicts the
+  oldest completed entry. Skippy now has the Rust scheduler primitive, inline
+  taps, cache parity, bounded chained verification evidence, and an opt-in
+  request-path rolling executor, but still needs a real split run that proves
+  useful overlap on distinct hardware.
 
 ## Outstanding Work
 
@@ -201,10 +230,10 @@ Open items:
 - Reduce or hide downstream wait and verifier hidden wait; the 8-token CPU
   repeat spent 2681.2 ms mean normal downstream wait and 2169.6 ms mean
   optimistic hidden wait.
-- Turn the paper/reference rolling scheduler from diagnostics into the serving
-  executor: keep multiple speculative entries in flight, route returned taps by
-  scheduler position, verify the oldest completed entry, and reset only on the
-  oldest rejection.
+- Keep tightening the opt-in rolling executor until it is safe as the normal
+  SPD serving path: keep multiple speculative entries useful across longer
+  prompts, route returned taps by scheduler position, verify the oldest
+  completed entry, and reset only on the oldest rejection.
 - Add a server-side reuse path for warmup/measured requests only after request
   attribution is robust; the current benchmark intentionally isolates stage
   processes per iteration so logs are unambiguous.
@@ -241,6 +270,8 @@ Run these before making any speedup claim:
      --max-tokens 8 \
      --warmup-count 1 \
      --repeat-count 3 \
+     --optimistic-decode true \
+     --spd-rolling-executor \
      --output /tmp/spd-openai-smoke-local-mtl-repeat.json
    ```
 

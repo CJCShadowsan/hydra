@@ -83,6 +83,13 @@ fn decode_report_reads_spec_attrs() {
             "llama_stage.spec.enabled": true,
             "llama_stage.spec.accepted": 3,
             "llama_stage.spec.rejected": 1,
+            "llama_stage.spec.spd_rolling_executor_launches": 6,
+            "llama_stage.spec.spd_rolling_executor_launch_misses": 2,
+            "llama_stage.spec.spd_rolling_executor_margin_rejects": 1,
+            "llama_stage.spec.spd_rolling_executor_max_in_flight": 4,
+            "llama_stage.spec.spd_rolling_executor_accepted_oldest": 3,
+            "llama_stage.spec.spd_rolling_executor_rejected_oldest": 0,
+            "llama_stage.spec.spd_rolling_executor_drained_younger": 0,
             "llama_stage.spd_proposal.total.requested_limit": 8,
             "llama_stage.spd_proposal.total.attempts": 8,
             "llama_stage.spd_proposal.total.proposed": 7,
@@ -111,6 +118,13 @@ fn decode_report_reads_spec_attrs() {
     assert_eq!(report.spec_enabled, Some(true));
     assert_eq!(report.spec_accepted, Some(3));
     assert_eq!(report.spec_rejected, Some(1));
+    assert_eq!(report.spd_rolling_executor_launches, Some(6));
+    assert_eq!(report.spd_rolling_executor_launch_misses, Some(2));
+    assert_eq!(report.spd_rolling_executor_margin_rejects, Some(1));
+    assert_eq!(report.spd_rolling_executor_max_in_flight, Some(4));
+    assert_eq!(report.spd_rolling_executor_accepted_oldest, Some(3));
+    assert_eq!(report.spd_rolling_executor_rejected_oldest, Some(0));
+    assert_eq!(report.spd_rolling_executor_drained_younger, Some(0));
     assert_eq!(report.spd_proposal_total_requested_limit, Some(8));
     assert_eq!(report.spd_proposal_total_attempts, Some(8));
     assert_eq!(report.spd_proposal_total_proposed, Some(7));
@@ -906,6 +920,13 @@ fn baseline_decode(elapsed_ms: f64) -> DecodeReport {
         chained_optimistic_accepted: None,
         chained_optimistic_rejected: None,
         chained_optimistic_committed: None,
+        spd_rolling_executor_launches: None,
+        spd_rolling_executor_launch_misses: None,
+        spd_rolling_executor_margin_rejects: None,
+        spd_rolling_executor_max_in_flight: None,
+        spd_rolling_executor_accepted_oldest: None,
+        spd_rolling_executor_rejected_oldest: None,
+        spd_rolling_executor_drained_younger: None,
         stage0_compute_ms: Some(5.0),
         downstream_wait_ms: Some(45.0),
         spd_proposal_total_requested_limit: None,
@@ -958,6 +979,13 @@ fn spd_decode(
         chained_optimistic_accepted: None,
         chained_optimistic_rejected: None,
         chained_optimistic_committed: None,
+        spd_rolling_executor_launches: None,
+        spd_rolling_executor_launch_misses: None,
+        spd_rolling_executor_margin_rejects: None,
+        spd_rolling_executor_max_in_flight: None,
+        spd_rolling_executor_accepted_oldest: None,
+        spd_rolling_executor_rejected_oldest: None,
+        spd_rolling_executor_drained_younger: None,
         stage0_compute_ms: Some(5.0),
         downstream_wait_ms: Some(95.0),
         spd_proposal_total_requested_limit: None,

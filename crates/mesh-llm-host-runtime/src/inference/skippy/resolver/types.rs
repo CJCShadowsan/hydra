@@ -161,6 +161,7 @@ pub(crate) struct ResolvedEmbeddedOpenAiArgs {
     pub(crate) spd_n_gpu_layers: Option<i32>,
     pub(crate) spd_replay_fallback: bool,
     pub(crate) spd_optimistic_decode: bool,
+    pub(crate) spd_rolling_executor: bool,
     pub(crate) spd_optimistic_min_logit_margin: Option<f32>,
     pub(crate) speculative_window: usize,
     pub(crate) adaptive_speculative_window: bool,

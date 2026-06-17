@@ -181,6 +181,22 @@ Rust.
   decode (`0.122x`). The paper estimate from the same accepted trace was
   `50.2ms`, so the remaining gap is still the native rolling executor and
   same-machine stage contention, not sidecar acceptance.
+- 2026-06-17 an opt-in native rolling executor now runs inside the
+  `skippy-server` OpenAI SPD request path behind
+  `--openai-spd-rolling-executor`, and `skippy-bench spd-openai-smoke` passes
+  it with `--spd-rolling-executor`. The first local preflight at
+  `/private/tmp/spd-rolling-executor-local-preflight.json` validated the same
+  Qwen3.5-4B S4/L4 seven-stage split and tap plan without launching stages. The
+  paired local smoke at `/private/tmp/spd-rolling-executor-local-paired-final.json`
+  preserved exact baseline/SPD output for a six-token request, launched `5`
+  executor-owned speculative verifies from direct-return tap callbacks, reached
+  the logical `S=4` max in-flight depth, committed `3` oldest entries, rejected
+  `0` oldest entries, drained `0` younger entries, and recorded `0` tap
+  failures. This closes the earlier diagnostic-only rolling scheduler gap for
+  a request-path smoke. It is still a negative speed result on one local debug
+  machine (`170.5ms` baseline decode versus `25149.1ms` SPD decode), so the
+  next proof needs real split placement on distinct hardware rather than more
+  same-machine timing.
 - `skippy-runtime::spd::SpdRollingScheduler` now codifies the paper/reference
   rolling scheduler state transitions in Rust: newest-first in-flight entries,
   evicted-prefix speculation rows on acceptance, oldest-entry verification
@@ -1223,9 +1239,9 @@ The tap-row-to-`cur_in` projection bridge lives in
 
 ## Next Engineering Steps
 
-1. Keep tightening the native request-path executor toward the paper schedule:
-   multiple in-flight rolling entries, oldest-entry verification, exact
-   generation-addressed rollback, and no reliance on replay fallback for speed.
+1. Move the opt-in native request-path rolling executor from local smoke to a
+   real split run: distinct hardware for downstream stages, stage 0 plus
+   sidecar on the coordinator, and paired baseline/SPD content and timing.
 2. Run a larger local `spd-openai-smoke --prompt-file ...` sweep to measure
    acceptance distribution, rollback frequency, rolling gaps, and
    `summary.paper_pipeline_estimate` across prompt types.

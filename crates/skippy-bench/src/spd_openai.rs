@@ -99,6 +99,7 @@ pub fn spd_openai_smoke(args: SpdOpenAiSmokeArgs) -> Result<()> {
         activation_width: args.activation_width,
         downstream_wire_delay_ms: args.downstream_wire_delay_ms,
         downstream_wire_mbps: args.downstream_wire_mbps,
+        spd_rolling_executor: args.spd_rolling_executor,
         optimistic_min_logit_margin: args.optimistic_min_logit_margin,
         spd_tap_return_hf_indices: tap_allowlist,
         work_dir: work_dir.display().to_string(),
@@ -139,6 +140,7 @@ struct SpdOpenAiSmokeReport {
     activation_width: i32,
     downstream_wire_delay_ms: f64,
     downstream_wire_mbps: Option<f64>,
+    spd_rolling_executor: bool,
     optimistic_min_logit_margin: Option<f32>,
     spd_tap_return_hf_indices: Vec<u32>,
     work_dir: String,
@@ -487,6 +489,13 @@ struct DecodeReport {
     chained_optimistic_accepted: Option<u64>,
     chained_optimistic_rejected: Option<u64>,
     chained_optimistic_committed: Option<u64>,
+    spd_rolling_executor_launches: Option<u64>,
+    spd_rolling_executor_launch_misses: Option<u64>,
+    spd_rolling_executor_margin_rejects: Option<u64>,
+    spd_rolling_executor_max_in_flight: Option<u64>,
+    spd_rolling_executor_accepted_oldest: Option<u64>,
+    spd_rolling_executor_rejected_oldest: Option<u64>,
+    spd_rolling_executor_drained_younger: Option<u64>,
     stage0_compute_ms: Option<f64>,
     downstream_wait_ms: Option<f64>,
     spd_proposal_total_requested_limit: Option<u64>,
@@ -632,6 +641,13 @@ struct SpdOpenAiSmokeSummary {
     chained_optimistic_rejected: u64,
     chained_optimistic_committed: u64,
     max_optimistic_chain_depth: u64,
+    spd_rolling_executor_launches: u64,
+    spd_rolling_executor_launch_misses: u64,
+    spd_rolling_executor_margin_rejects: u64,
+    spd_rolling_executor_max_in_flight: u64,
+    spd_rolling_executor_accepted_oldest: u64,
+    spd_rolling_executor_rejected_oldest: u64,
+    spd_rolling_executor_drained_younger: u64,
     tap_return_failures: usize,
     tap_record_failures: usize,
     tap_ignored: usize,
@@ -795,6 +811,33 @@ fn summarize_cases(
             decode.chained_optimistic_committed
         }),
         max_optimistic_chain_depth: max_optimistic_chain_depth(&spd_cases),
+        spd_rolling_executor_launches: sum_decode_u64(&spd_cases, |decode| {
+            decode.spd_rolling_executor_launches
+        }),
+        spd_rolling_executor_launch_misses: sum_decode_u64(&spd_cases, |decode| {
+            decode.spd_rolling_executor_launch_misses
+        }),
+        spd_rolling_executor_margin_rejects: sum_decode_u64(&spd_cases, |decode| {
+            decode.spd_rolling_executor_margin_rejects
+        }),
+        spd_rolling_executor_max_in_flight: spd_cases
+            .iter()
+            .filter_map(|case| {
+                case.decode
+                    .as_ref()
+                    .and_then(|decode| decode.spd_rolling_executor_max_in_flight)
+            })
+            .max()
+            .unwrap_or(0),
+        spd_rolling_executor_accepted_oldest: sum_decode_u64(&spd_cases, |decode| {
+            decode.spd_rolling_executor_accepted_oldest
+        }),
+        spd_rolling_executor_rejected_oldest: sum_decode_u64(&spd_cases, |decode| {
+            decode.spd_rolling_executor_rejected_oldest
+        }),
+        spd_rolling_executor_drained_younger: sum_decode_u64(&spd_cases, |decode| {
+            decode.spd_rolling_executor_drained_younger
+        }),
         tap_return_failures: spd_cases.iter().map(|case| case.tap_return_failures).sum(),
         tap_record_failures: spd_cases.iter().map(|case| case.tap_record_failures).sum(),
         tap_ignored: spd_cases.iter().map(|case| case.tap_ignored).sum(),
@@ -1481,6 +1524,9 @@ fn validate_args(args: &SpdOpenAiSmokeArgs) -> Result<()> {
     if args.optimistic_min_logit_margin.is_some() && args.spd_top_k < 2 {
         bail!("--optimistic-min-logit-margin requires --spd-top-k >= 2");
     }
+    if args.spd_rolling_executor && !args.optimistic_decode {
+        bail!("--spd-rolling-executor requires --optimistic-decode true");
+    }
     if !args.run_baseline && !args.run_spd {
         bail!("at least one of --run-baseline or --run-spd must be enabled");
     }
@@ -1746,6 +1792,34 @@ fn decode_report(events: &[Value]) -> Option<DecodeReport> {
         chained_optimistic_committed: attr_u64(
             attrs,
             "llama_stage.spec.chained_optimistic_decode_committed_tokens",
+        ),
+        spd_rolling_executor_launches: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_launches",
+        ),
+        spd_rolling_executor_launch_misses: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_launch_misses",
+        ),
+        spd_rolling_executor_margin_rejects: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_margin_rejects",
+        ),
+        spd_rolling_executor_max_in_flight: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_max_in_flight",
+        ),
+        spd_rolling_executor_accepted_oldest: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_accepted_oldest",
+        ),
+        spd_rolling_executor_rejected_oldest: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_rejected_oldest",
+        ),
+        spd_rolling_executor_drained_younger: attr_u64(
+            attrs,
+            "llama_stage.spec.spd_rolling_executor_drained_younger",
         ),
         stage0_compute_ms: attr_f64(attrs, "llama_stage.stage0_compute_ms"),
         downstream_wait_ms: attr_f64(attrs, "llama_stage.downstream_wait_ms"),
