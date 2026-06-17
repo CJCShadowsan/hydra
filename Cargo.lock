@@ -7437,6 +7437,7 @@ dependencies = [
  "model-artifact",
  "model-hf",
  "model-ref",
+ "ratatui",
  "serde",
  "serde_json",
  "sha2 0.10.9",
