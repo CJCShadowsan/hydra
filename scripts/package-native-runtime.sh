@@ -161,6 +161,52 @@ sha256_file() {
     fi
 }
 
+darwin_rpaths() {
+    otool -l "$1" | awk '
+        /LC_RPATH/ { in_rpath = 1; next }
+        in_rpath && $1 == "path" { print $2; in_rpath = 0 }
+    '
+}
+
+fix_darwin_runtime_library() {
+    local library="$1"
+    local name
+    name="$(basename "$library")"
+
+    install_name_tool -id "@rpath/$name" "$library"
+
+    local rpath
+    while IFS= read -r rpath; do
+        if [[ -n "$rpath" && "$rpath" != "@loader_path" ]]; then
+            install_name_tool -delete_rpath "$rpath" "$library" 2>/dev/null || true
+        fi
+    done < <(darwin_rpaths "$library")
+
+    if ! darwin_rpaths "$library" | grep -Fxq '@loader_path'; then
+        install_name_tool -add_rpath '@loader_path' "$library"
+    fi
+}
+
+fix_darwin_runtime_rpaths() {
+    if [[ "$runtime_os" != "macos" ]]; then
+        return
+    fi
+    if ! command -v install_name_tool >/dev/null 2>&1; then
+        echo "install_name_tool is required to package macOS native runtimes" >&2
+        exit 1
+    fi
+    if ! command -v otool >/dev/null 2>&1; then
+        echo "otool is required to package macOS native runtimes" >&2
+        exit 1
+    fi
+
+    local library
+    for library in "$stage_dir"/lib/*.dylib; do
+        [[ -e "$library" ]] || continue
+        fix_darwin_runtime_library "$library"
+    done
+}
+
 workspace_version() {
     python3 - "$REPO_ROOT/Cargo.toml" <<'PY'
 import re
@@ -291,6 +337,8 @@ for library in "${runtime_libraries[@]}"; do
     cp "$library" "$stage_dir/lib/$name"
     library_paths+=("lib/$name")
 done
+
+fix_darwin_runtime_rpaths
 
 primary_library="lib/$primary_name"
 primary_sha="$(sha256_file "$stage_dir/$primary_library")"

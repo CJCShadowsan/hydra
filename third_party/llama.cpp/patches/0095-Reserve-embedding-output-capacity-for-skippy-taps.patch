@@ -11,7 +11,7 @@ diff --git a/src/skippy.cpp b/src/skippy.cpp
 index e25a0b9a..d23b9df1 100644
 --- a/src/skippy.cpp
 +++ b/src/skippy.cpp
-@@ -2320,7 +2320,9 @@ static enum skippy_status skippy_finish_model_open(
+@@ -2320,6 +2320,8 @@ static enum skippy_status skippy_finish_model_open(
          params.n_seq_max = std::max<uint32_t>(
                  2,
                  static_cast<uint32_t>(skippy_reserved_sequence_count(stage_model->lane_count)));

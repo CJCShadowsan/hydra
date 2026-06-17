@@ -228,6 +228,16 @@ baseline/SPD content and recorded `0` tap failures, but accepted `0 / 3`
 proposals from the tiny S2 debug sidecar. Treat this as request-path/package
 source correctness evidence, not speed or sidecar-quality evidence.
 
+Current Mesh-native Qwen3-8B product checkpoint: a real two-node run with the
+exact immutable `meshllm/Qwen3-8B-Q4_K_M-layers` package ref completed through
+Mesh resolver/download/stage-control and answered via the local OpenAI proxy.
+Mesh elected the worker as stage-0 coordinator and placed the local M4 as
+downstream `stage-1` with `layer_range=23..36`. Treat this as product split
+serving evidence. It is not SPD evidence yet. For an SPD run on this exact
+topology, train/export a `Qwen/Qwen3-8B` sidecar with `num_stages=2` and
+`stage_layer_boundaries=23,36`, or add a product planner constraint so an SPD
+manifest can force/reject incompatible Mesh stage boundaries before serving.
+
 ## First Larger Training Target
 
 Use `Qwen/Qwen3-8B` for the first larger dense sidecar training proof. Keep the

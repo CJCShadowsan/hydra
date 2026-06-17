@@ -3,7 +3,7 @@ mod dynamic {
     use crate::system::native_runtime_install::{
         NativeRuntimeInstallOptions, NativeRuntimeInstallOutcome,
     };
-    use anyhow::{Context, Result};
+    use anyhow::{Context, Result, anyhow};
     use mesh_llm_native_runtime::{
         HostRuntimeProfile, NativeRuntimeArtifact, NativeRuntimeCache, NativeRuntimeLoadPlan,
         NativeRuntimeReleaseManifest, RuntimeSelection, select_native_runtime,
@@ -259,11 +259,20 @@ mod dynamic {
     fn default_install_executor(
         options: NativeRuntimeInstallOptions,
     ) -> Result<NativeRuntimeInstallOutcome> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build native runtime startup install executor")?
-            .block_on(crate::system::native_runtime_install::install_native_runtime(options))
+        std::thread::Builder::new()
+            .name("mesh-native-runtime-startup-install".to_string())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("build native runtime startup install executor")?
+                    .block_on(
+                        crate::system::native_runtime_install::install_native_runtime(options),
+                    )
+            })
+            .context("spawn native runtime startup install executor")?
+            .join()
+            .map_err(|_| anyhow!("native runtime startup install executor panicked"))?
     }
 
     #[cfg(test)]

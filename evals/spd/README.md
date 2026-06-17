@@ -276,6 +276,21 @@ Rust.
   requires the physical tap split `8,10,16,20,24,31` and must not be used for a
   two-stage speed claim. The matching sidecar topology is `num_stages=2` with
   `stage_layer_boundaries=16,32`, deriving tap rows `0,16,32;0,16`.
+- 2026-06-18 Mesh-native two-node Qwen3-8B layer-package proof now completes
+  through the product resolver/download/stage-control path. Both nodes used the
+  exact immutable package ref for `meshllm/Qwen3-8B-Q4_K_M-layers`, with HF
+  credentials visible on the worker and artifact transfer enabled. Mesh elected
+  the worker as stage-0 coordinator and placed the local M4 as downstream
+  `stage-1` with `layer_range=23..36`; the worker downloaded the missing stage
+  package artifacts, advertised the model, and a local OpenAI chat request
+  through the proxy succeeded. This is a real two-node Skippy serving proof,
+  not an SPD proof or speed claim. For SPD, the important result is the
+  topology: a sidecar for this run must be trained/exported for
+  `num_stages=2`, `stage_layer_boundaries=23,36` on `Qwen/Qwen3-8B`, or the
+  split planner must be constrained by the SPD manifest before using a sidecar
+  trained for different boundaries. The post-run Ctrl-C shutdown hit a
+  ggml-metal cleanup assert after the successful inference; that was not an
+  inference-path failure.
 - 2026-06-17 the first model-backed 24-token rolling-executor smoke after the
   replay reset cleanup is
   `/private/tmp/spd-rolling-executor-real-local-smoke24-4.json`. It restores
@@ -1346,7 +1361,10 @@ stage-control load requests so workers return every logical-row tap except h0;
 the host-runtime split-load test asserts the derived
 `[8, 10, 16, 20, 24, 31]` list reaches the worker `StageLoadRequest`. This is
 config plumbing only; it does not choose a compatible tap topology or train a
-sidecar automatically.
+sidecar automatically. The current Mesh resource-aware split planner also does
+not consume the SPD manifest when choosing stage boundaries. Until that hook
+exists, a product SPD sidecar must be trained for the actual planned Mesh
+topology, not for a convenient or previously tested split.
 
 `spd_bundle_ref` is the product-shaped sidecar input: the coordinator resolves a
 local sidecar directory/manifest or `hf://namespace/repo[@revision]` containing
@@ -1453,7 +1471,10 @@ The tap-row-to-`cur_in` projection bridge lives in
    split before making the next speed claim. For Qwen3.5-4B that means
    `num_stages=2`, `stage_layer_boundaries=16,32`, and tap rows
    `0,16,32;0,16`; the current pretrained S4/L4 sidecar is intentionally
-   excluded from this test.
+   excluded from this test. For the Mesh-native Qwen3-8B split just observed,
+   the sidecar target is `Qwen/Qwen3-8B` with `num_stages=2` and
+   `stage_layer_boundaries=23,36` unless a manifest-driven topology constraint
+   is added first.
 2. Move from the completed one-worker CPU LAN correctness proofs, the completed
    two-stage Metal baseline, and the completed local package-backed SPD smoke to
    a real speed gate: Mesh-resolved package materialization on both nodes, stage
