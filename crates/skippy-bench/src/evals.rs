@@ -307,8 +307,6 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| run_id.clone());
     let metrics_http = args.metrics_http.trim_end_matches('/').to_string();
-    fs::create_dir_all(run_dir.join("raw"))
-        .with_context(|| format!("create eval run dir {}", run_dir.display()))?;
 
     if !args.dry_run {
         let harness = harness_dir(&root, definition);
@@ -320,7 +318,11 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
                 definition.id.as_str()
             );
         }
+        preflight_eval_run(definition)?;
     }
+
+    fs::create_dir_all(run_dir.join("raw"))
+        .with_context(|| format!("create eval run dir {}", run_dir.display()))?;
 
     let command = run_command(definition, &args, &root, &run_dir)?;
     let display = command.display();
@@ -385,6 +387,25 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn preflight_eval_run(definition: EvalDefinition) -> Result<()> {
+    let failed = definition
+        .required_tools
+        .iter()
+        .map(|tool| tool_check(tool))
+        .filter(|check| !check.ok)
+        .map(|check| format!("{} - {}", check.name, check.detail))
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} prerequisites failed; run `skippy-bench eval doctor {}` for details:\n  {}",
+        definition.id.as_str(),
+        definition.id.as_str(),
+        failed.join("\n  ")
+    )
 }
 
 struct CommandOutcome {
@@ -1692,6 +1713,28 @@ mod tests {
                 .envs
                 .contains(&("OPENAI_BASE_URL".to_string(), args.base_url))
         );
+    }
+
+    #[test]
+    fn preflight_eval_run_reports_missing_prerequisites() {
+        let definition = EvalDefinition {
+            id: EvalId::TerminalBench,
+            name: "Test Eval",
+            repo_url: "https://example.invalid/repo.git",
+            repo_ref: "main",
+            cache_name: "test-eval",
+            description: "test",
+            disk_estimate: "none",
+            required_tools: &["definitely-not-a-real-skippybench-tool"],
+            sync_notes: &[],
+            run_notes: &[],
+        };
+
+        let error = preflight_eval_run(definition).unwrap_err().to_string();
+
+        assert!(error.contains("terminal-bench prerequisites failed"));
+        assert!(error.contains("definitely-not-a-real-skippybench-tool"));
+        assert!(error.contains("skippy-bench eval doctor terminal-bench"));
     }
 
     #[test]

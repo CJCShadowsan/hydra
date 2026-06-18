@@ -131,6 +131,9 @@ wall-clock cap around the native harness process for debugging or CI guardrails.
 `~/.cache/mesh-llm/skippy-bench/harnesses/` by default. Use `--cache-root` to
 override that location. Use `--dry-run` with `sync` or `run` to inspect the
 commands without cloning, pulling Docker images, or launching a benchmark.
+Before launching native harness traffic, `eval run` enforces the same required
+tool checks as `eval doctor`, including Docker container-start readiness for
+Docker-backed evals.
 Terminal-Bench is installed through `uv tool install --python 3.12` because the
 current `tb` CLI is not compatible with Python 3.14. `eval doctor` checks that
 Docker's daemon is reachable and can start a tiny container, not just that the
