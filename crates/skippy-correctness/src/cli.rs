@@ -17,6 +17,7 @@ pub enum CommandKind {
     SplitScan(SplitScanArgs),
     DtypeMatrix(DtypeMatrixArgs),
     StateHandoff(StateHandoffArgs),
+    NativeMtpOpenAiAb(Box<NativeMtpOpenAiAbArgs>),
 }
 
 #[derive(Args, Clone)]
@@ -76,6 +77,15 @@ pub struct ServerArgs {
     pub max_inflight: usize,
 }
 
+#[derive(Args, Clone, Copy)]
+pub struct NativeMtpArgs {
+    #[arg(
+        long,
+        help = "Fail the correctness run unless the final stage returns a native MTP draft sideband"
+    )]
+    pub require_native_mtp_draft: bool,
+}
+
 #[derive(Args)]
 pub struct OutputArgs {
     #[arg(long)]
@@ -88,6 +98,8 @@ pub struct SingleStepArgs {
     pub runtime: RuntimeArgs,
     #[command(flatten)]
     pub server: ServerArgs,
+    #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
     #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value_t = 15)]
@@ -106,6 +118,8 @@ pub struct ChainArgs {
     pub runtime: RuntimeArgs,
     #[command(flatten)]
     pub server: ServerArgs,
+    #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
     #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value = "10,20")]
@@ -127,6 +141,8 @@ pub struct SplitScanArgs {
     #[command(flatten)]
     pub server: ServerArgs,
     #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
+    #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value = "1..30")]
     pub splits: String,
@@ -144,6 +160,8 @@ pub struct DtypeMatrixArgs {
     pub runtime: RuntimeArgs,
     #[command(flatten)]
     pub server: ServerArgs,
+    #[command(flatten)]
+    pub native_mtp: NativeMtpArgs,
     #[command(flatten)]
     pub output: OutputArgs,
     #[arg(long, default_value_t = 15)]
@@ -196,6 +214,58 @@ pub struct StateHandoffArgs {
     pub synthetic_input_activation: bool,
     #[arg(long)]
     pub binary_control: bool,
+    #[arg(long)]
+    pub allow_mismatch: bool,
+}
+
+#[derive(Args)]
+pub struct NativeMtpOpenAiAbArgs {
+    #[command(flatten)]
+    pub runtime: RuntimeArgs,
+    #[command(flatten)]
+    pub server: ServerArgs,
+    #[command(flatten)]
+    pub output: OutputArgs,
+    #[arg(long, default_value_t = 24)]
+    pub split_layer: u32,
+    #[arg(long, default_value = "127.0.0.1:19170")]
+    pub openai_bind_addr: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:19171")]
+    pub stage0_bind_addr: SocketAddr,
+    #[arg(long)]
+    pub stage0_endpoint_addr: Option<SocketAddr>,
+    #[arg(long, default_value = "127.0.0.1:19172")]
+    pub stage1_bind_addr: SocketAddr,
+    #[arg(long)]
+    pub stage1_endpoint_addr: Option<SocketAddr>,
+    #[arg(long)]
+    pub stage0_model: Option<PathBuf>,
+    #[arg(long)]
+    pub stage1_model: Option<PathBuf>,
+    #[arg(long)]
+    pub case_root: Option<PathBuf>,
+    #[arg(long)]
+    pub external_stage1: bool,
+    #[arg(long)]
+    pub stage1_ssh_host: Option<String>,
+    #[arg(long)]
+    pub stage1_remote_stage_server_bin: Option<String>,
+    #[arg(long, default_value = "/tmp/skippy-native-mtp-openai-ab")]
+    pub stage1_remote_root: String,
+    #[arg(long)]
+    pub stage1_remote_workdir: Option<String>,
+    #[arg(long, default_value_t = 10)]
+    pub batched_port_offset: u16,
+    #[arg(long, default_value_t = 2048)]
+    pub activation_width: i32,
+    #[arg(long, default_value = "f16")]
+    pub activation_wire_dtype: String,
+    #[arg(long, default_value_t = 12)]
+    pub max_tokens: u32,
+    #[arg(long, default_value_t = 60)]
+    pub request_timeout_secs: u64,
+    #[arg(long)]
+    pub allow_missing_batched_events: bool,
     #[arg(long)]
     pub allow_mismatch: bool,
 }

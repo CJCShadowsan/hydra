@@ -57,8 +57,9 @@ use tokio::{
 
 use crate::{
     binary_transport::{
-        PredictionReturnHub, PredictionReturnReceiver, WireCondition, connect_binary_downstream,
-        forwarded_stage_message, forwarded_stage_message_timed, run_binary_stage_message,
+        DecodeFrameBatcher, PredictionReturnHub, PredictionReturnReceiver, WireCondition,
+        connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
+        run_binary_stage_message, send_client_ready_hello_if_enabled,
         stage_output_activation_capacity, write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
@@ -70,10 +71,12 @@ use crate::{
 
 mod admission;
 mod backend;
+mod decode_batcher;
 mod embedded_execution;
 mod embedded_generation;
 mod generation_flow;
 mod local_generation;
+mod native_mtp;
 mod prefill;
 mod prefix_cache;
 mod prompting;
@@ -84,6 +87,8 @@ mod wire_messages;
 
 use self::{
     admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
+    decode_batcher::DecodeBatcher,
+    native_mtp::*,
     prefill::*,
     request::*,
     speculative::*,
@@ -174,6 +179,9 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
     }
     let kv = KvStageIntegration::from_config(&config)?.map(Arc::new);
     let ctx_size = usize::try_from(config.ctx_size).unwrap_or(usize::MAX);
+    let decode_batcher = DecodeBatcher::new(runtime.clone(), args.generation_concurrency);
+    let decode_frame_batcher =
+        DecodeFrameBatcher::new(runtime.clone(), args.generation_concurrency);
     let backend = Arc::new(StageOpenAiBackend {
         runtime,
         config,
@@ -192,6 +200,8 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv,
+        decode_batcher,
+        decode_frame_batcher,
     });
     let app: Router = instrumented_openai_router(backend, telemetry.clone());
 
@@ -519,6 +529,9 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     .context("prewarm embedded OpenAI runtime sessions")?;
     let kv = KvStageIntegration::from_config(&args.config)?.map(Arc::new);
     let ctx_size = usize::try_from(args.config.ctx_size).unwrap_or(usize::MAX);
+    let decode_batcher = DecodeBatcher::new(args.runtime.clone(), args.generation_concurrency);
+    let decode_frame_batcher =
+        DecodeFrameBatcher::new(args.runtime.clone(), args.generation_concurrency);
     let backend: Arc<dyn OpenAiBackend> = Arc::new(StageOpenAiBackend {
         runtime: args.runtime,
         config: args.config.clone(),
@@ -537,6 +550,8 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: args.hook_policy,
         kv,
+        decode_batcher,
+        decode_frame_batcher,
     });
     let openai_guardrails = args
         .openai_guardrails
@@ -576,6 +591,8 @@ struct StageOpenAiBackend {
     generation_token_budget: Arc<GenerationTokenBudget>,
     hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     kv: Option<Arc<KvStageIntegration>>,
+    decode_batcher: DecodeBatcher,
+    decode_frame_batcher: DecodeFrameBatcher,
 }
 
 struct GenerationQueueReservation {
@@ -1045,7 +1062,19 @@ impl PersistentStageLanePool {
         let timer = PhaseTimer::start();
         let mut stream = connect_binary_downstream(&self.config, self.timeout_secs)?
             .ok_or_else(|| anyhow!("embedded stage0 has no downstream"))?;
+        let local_addr = stream.local_addr().ok();
+        let peer_addr = stream.peer_addr().ok();
+        eprintln!(
+            "openai downstream lane waiting ready: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
+            self.config.stage_id
+        );
+        send_client_ready_hello_if_enabled(&mut stream)
+            .context("send persistent downstream lane client ready hello")?;
         recv_ready(&mut stream).context("persistent downstream lane did not become ready")?;
+        eprintln!(
+            "openai downstream lane received ready: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
+            self.config.stage_id
+        );
         let mut attrs = lifecycle_attrs(&self.config);
         attrs.insert(
             "llama_stage.openai_downstream_lane_id".to_string(),
@@ -1486,6 +1515,13 @@ fn tool_calls_requested(request: &ChatCompletionRequest) -> bool {
             .is_some_and(|choice| matches!(choice.as_str(), Some("none")))
 }
 
+fn chat_output_parser_required(
+    request: &ChatCompletionRequest,
+    template_options: &ChatTemplateOptions,
+) -> bool {
+    tool_calls_requested(request) || template_options.enable_thinking == Some(true)
+}
+
 fn chat_response_from_generated_text(
     model: String,
     output: &GeneratedText,
@@ -1764,6 +1800,7 @@ struct EmbeddedStageExecution {
 struct EmbeddedFusedFirstDecode {
     predicted: i32,
     predicted_tokens: Vec<i32>,
+    native_mtp_draft: Option<NativeMtpDraft>,
     reply_stats: StageReplyStats,
     execution: EmbeddedExecutionStats,
     elapsed_ms: f64,
@@ -1844,9 +1881,8 @@ impl ChatOutputStreamParser {
         if let Some(delta) = suffix_delta(parsed.content.as_deref(), &mut self.emitted_content) {
             events.push(GenerationStreamEvent::Delta(delta));
         }
-        if !is_partial
-            && !self.emitted_tool_calls
-            && let Some(tool_calls) = parsed.tool_calls
+        if let (true, Some(tool_calls)) =
+            (!is_partial && !self.emitted_tool_calls, parsed.tool_calls)
         {
             self.emitted_tool_calls = true;
             events.push(GenerationStreamEvent::ToolCalls(tool_calls));

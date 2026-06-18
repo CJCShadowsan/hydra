@@ -1,18 +1,21 @@
-From 928b982ab33185d9b99266aaf50fee7d6855f15e Mon Sep 17 00:00:00 2001
+From 36483efd1c6398efa35d8625a6b340516c15d7be Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
-Date: Sat, 13 Jun 2026 12:28:34 +1000
-Subject: [PATCH 89/89] Add GLM native MTP support
+Date: Wed, 17 Jun 2026 07:36:49 +1000
+Subject: [PATCH 89/94] Add GLM native MTP conversion and graph support
 
 ---
  conversion/glm.py                   |  11 ++
+ convert_hf_to_gguf.py               |   6 +-
+ gguf-py/gguf/gguf_writer.py         |  40 +++-
  gguf-py/gguf/tensor_mapping.py      |   1 +
  scripts/check-glm51-mtp-metadata.py | 110 +++++++++++
  src/llama-context.cpp               |  15 +-
  src/llama-model.cpp                 |   8 +
- src/models/deepseek2.cpp            | 280 +++++++++++++++++++++++++++-
+ src/models/deepseek2.cpp            | 284 +++++++++++++++++++++++++++-
  src/models/glm-dsa.cpp              |  12 +-
  src/models/models.h                 |   5 +
- 8 files changed, 432 insertions(+), 10 deletions(-)
+ src/skippy.cpp                      |   3 +
+ 11 files changed, 481 insertions(+), 14 deletions(-)
  create mode 100755 scripts/check-glm51-mtp-metadata.py
 
 diff --git a/conversion/glm.py b/conversion/glm.py
@@ -41,6 +44,85 @@ index 64193772..87d443fe 100644
  
  @ModelBase.register("GlmMoeDsaForCausalLM")
  class GlmMoeDsaModel(DeepseekV2Model):
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index 3b23d5eb..2678c01f 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -212,9 +212,9 @@ def main() -> None:
+     }
+ 
+     is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
+-    if args.use_temp_file and is_split:
+-        logger.error("Error: Cannot use temp file when splitting")
+-        sys.exit(1)
++    if is_split and not args.use_temp_file:
++        logger.info("Split output requested; using a temporary tensor spool to avoid retaining all tensors in memory")
++        args.use_temp_file = True
+ 
+     if args.outfile is not None:
+         fname_out = args.outfile
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index f707f29d..52ee3d31 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -403,6 +403,16 @@ class GGUFWriter:
+         if pad != 0:
+             fp.write(bytes([0] * pad))
+ 
++    @staticmethod
++    def copy_n_bytes(src: IO[bytes], dst: IO[bytes], n: int) -> None:
++        remaining = n
++        while remaining > 0:
++            chunk = src.read(min(1024 * 1024, remaining))
++            if not chunk:
++                raise EOFError("Unexpected end of temporary tensor spool")
++            dst.write(chunk)
++            remaining -= len(chunk)
++
+     def write_tensor_data(self, tensor: np.ndarray[Any, Any], tensor_endianess: GGUFEndian | None = None) -> None:
+         if self.state is not WriterState.TI_DATA and self.state is not WriterState.WEIGHTS:
+             raise ValueError(f'Expected output file to contain tensor info or weights, got {self.state}')
+@@ -476,7 +486,39 @@ class GGUFWriter:
+         else:
+             self.temp_file.seek(0)
+ 
+-            shutil.copyfileobj(self.temp_file, self.fout[0 if not self.small_first_shard else 1])
++            data_fout = self.fout[1:] if self.small_first_shard else self.fout
++            if len(data_fout) != len(self.tensors):
++                raise ValueError(f'Expected {len(self.tensors)} data shards, got {len(data_fout)}')
++
++            if len(data_fout) == 1:
++                shutil.copyfileobj(self.temp_file, data_fout[0])
++            else:
++                shard_bar = None
++                bar = None
++
++                if progress:
++                    from tqdm import tqdm
++
++                    total_bytes = sum(ti.nbytes for t in self.tensors for ti in t.values())
++                    shard_bar = tqdm(desc=f"Shard (0/{len(data_fout)})", total=None, unit="byte", unit_scale=True)
++                    bar = tqdm(desc="Writing", total=total_bytes, unit="byte", unit_scale=True)
++
++                for i, (fout, tensors) in enumerate(zip(data_fout, self.tensors)):
++                    if shard_bar is not None:
++                        shard_bar.set_description(f"Shard ({i + 1}/{len(data_fout)})")
++                        total = sum(ti.nbytes for ti in tensors.values())
++                        shard_bar.reset(total=(total if total > 0 else None))
++
++                    for ti in tensors.values():
++                        self.copy_n_bytes(self.temp_file, fout, ti.nbytes)
++                        if shard_bar is not None:
++                            shard_bar.update(ti.nbytes)
++                        if bar is not None:
++                            bar.update(ti.nbytes)
++
++                        pad = GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment) - ti.nbytes
++                        self.copy_n_bytes(self.temp_file, fout, pad)
++
+             self.flush()
+             self.temp_file.close()
+ 
 diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
 index 5f1e2881..0b1614a9 100644
 --- a/gguf-py/gguf/tensor_mapping.py
@@ -217,7 +299,7 @@ index a1dc66c6..869f80b6 100644
                          GGML_ASSERT(hparams.is_swa_any());
  
 diff --git a/src/models/deepseek2.cpp b/src/models/deepseek2.cpp
-index d1b261b4..b71fc076 100644
+index d1b261b4..d0ddb3c5 100644
 --- a/src/models/deepseek2.cpp
 +++ b/src/models/deepseek2.cpp
 @@ -20,6 +20,9 @@ void llama_model_deepseek2::load_arch_hparams(llama_model_loader & ml) {
@@ -272,9 +354,20 @@ index d1b261b4..b71fc076 100644
              cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
              inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
          }
-@@ -429,6 +445,13 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
-     }
+@@ -430,6 +446,10 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
      cur = inpL;
+ 
+     if (stage_filtered && !stage_filter.include_output) {
++        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++
+         cb(cur, "stage_boundary", il_end - 1);
+         res->t_embd = cur;
+         ggml_build_forward_expand(gf, cur);
+@@ -438,6 +458,13 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+ 
+     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
  
 +    cb(cur, "h_nextn", -1);
 +    res->t_h_nextn = cur;
@@ -283,10 +376,10 @@ index d1b261b4..b71fc076 100644
 +        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
 +    }
 +
-     if (stage_filtered && !stage_filter.include_output) {
-         cb(cur, "stage_boundary", il_end - 1);
-         res->t_embd = cur;
-@@ -449,3 +472,256 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+@@ -449,3 +476,256 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
  
      ggml_build_forward_expand(gf, cur);
  }
@@ -602,6 +695,19 @@ index ee3aff07..75c0ffcf 100644
  
      std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
  };
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 4dcd0d96..20cff23f 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -880,6 +880,9 @@ struct skippy_filter_scope {
+             filter.enabled = true;
+             filter.layer_start = config->layer_start;
+             filter.layer_end = config->layer_end;
++            if (config->include_output && filter.layer_end < std::numeric_limits<int32_t>::max()) {
++                filter.layer_end += 1;
++            }
+             filter.include_embeddings = config->include_embeddings;
+             filter.include_output = config->include_output;
+             llama_model_loader_set_stage_filter(filter);
 -- 
 2.54.0 (Apple Git-156)
-

@@ -661,6 +661,7 @@ impl StageOpenAiBackend {
             return Ok(Some(EmbeddedFusedFirstDecode {
                 predicted: *replay.last().expect("checked replay length"),
                 predicted_tokens: replay,
+                native_mtp_draft: None,
                 reply_stats: restore.stats,
                 execution: EmbeddedExecutionStats::default(),
                 elapsed_ms: timer.elapsed_ms(),
@@ -734,6 +735,7 @@ impl StageOpenAiBackend {
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted,
             predicted_tokens: vec![predicted],
+            native_mtp_draft: None,
             reply_stats: restore.stats,
             execution: EmbeddedExecutionStats::default(),
             elapsed_ms: timer.elapsed_ms(),
@@ -978,12 +980,7 @@ impl StageOpenAiBackend {
         .map_err(openai_io_error)?;
         let forward_write_ms = write_timer.elapsed_ms();
         let wait_timer = PhaseTimer::start();
-        let downstream_reply = request
-            .prediction_return
-            .as_ref()
-            .ok_or_else(|| OpenAiError::backend("missing direct prediction return receiver"))?
-            .recv()
-            .map_err(openai_backend_error)?;
+        let downstream_reply = recv_reply(&mut *downstream).map_err(openai_io_error)?;
         let downstream_wait_ms = wait_timer.elapsed_ms();
         let downstream_missed = downstream_reply.kind != WireReplyKind::PredictedToken
             || downstream_reply.stats.kv_lookup_errors > 0
@@ -1031,6 +1028,9 @@ impl StageOpenAiBackend {
         Ok(Some(EmbeddedFusedFirstDecode {
             predicted: downstream_reply.predicted,
             predicted_tokens: vec![downstream_reply.predicted],
+            native_mtp_draft: NativeMtpDraft::from_prediction_tokens(
+                &downstream_reply.predicted_tokens,
+            ),
             reply_stats,
             execution: EmbeddedExecutionStats {
                 stage0_compute_ms,
