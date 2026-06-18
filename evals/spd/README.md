@@ -345,6 +345,7 @@ pin the logical evidence schedule:
 uv run evals/spd/generic_layer_tap_sidecar.py \
   --model-name /path/to/GLM-4.7-Flash \
   --fixed-layer-taps 0,12,24,35,47 \
+  --extract-batch-size 4 \
   --examples-cache-out /tmp/glm47-fixed-s4-examples-n4.pt \
   --num-spec-layers 4 \
   ...same extraction/training flags...
@@ -352,7 +353,8 @@ uv run evals/spd/generic_layer_tap_sidecar.py \
 
 The fixed taps are logical hidden-state indices, not Skippy host or stage IDs.
 Use this control to prove GLM-specific SPD learnability before returning to
-randomized layer-tap training.
+randomized layer-tap training. Increase `--extract-batch-size` only while hidden
+state extraction fits comfortably in memory.
 
 ## Reproduce Qwen3-0.6B Training
 

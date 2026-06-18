@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-rows", type=int, default=16)
     parser.add_argument("--positions-per-row", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--extract-batch-size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -516,38 +517,84 @@ def collect_examples_from_texts(
 ) -> list[TapExample]:
     examples: list[TapExample] = []
     num_layers = int(plan["model"]["num_hidden_layers"])
-    for text in texts:
+    batch_size = max(1, int(args.extract_batch_size))
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+    for start in range(0, len(texts), batch_size):
+        batch_texts = texts[start : start + batch_size]
         encoded = tokenizer(
-            text,
+            batch_texts,
             return_tensors="pt",
             truncation=True,
             max_length=int(args.max_length),
             add_special_tokens=True,
+            padding=True,
         )
         input_ids = encoded["input_ids"].to(device)
-        if input_ids.shape[1] <= int(args.num_spec_layers) + 1:
-            continue
+        attention_mask = encoded["attention_mask"].to(device)
         with torch.no_grad():
-            output = model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
-        hidden_states = [state[0].detach().cpu().float() for state in output.hidden_states]
-        max_pos = input_ids.shape[1] - int(args.num_spec_layers) - 1
-        positions = sorted(rng.sample(range(max_pos), min(int(args.positions_per_row), max_pos)))
-        token_ids = [int(token) for token in input_ids[0].detach().cpu().tolist()]
-        for pos in positions:
-            indices = sample_tap_indices(plan, rng)
-            hidden = torch.stack([hidden_states[index][pos] for index in indices], dim=0)
-            features = tap_features(indices, num_layers)
-            labels = [token_ids[pos + offset] for offset in range(1, int(args.num_spec_layers) + 1)]
-            examples.append(
-                TapExample(
-                    hidden=hidden,
-                    features=features,
-                    labels=labels,
-                    topology_key=topology_key(indices),
+            output = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        hidden_states = [state.detach().cpu().float() for state in output.hidden_states]
+        input_ids_cpu = input_ids.detach().cpu()
+        attention_mask_cpu = attention_mask.detach().cpu()
+        for row in range(input_ids_cpu.shape[0]):
+            examples.extend(
+                collect_examples_from_encoded_row(
+                    args,
+                    hidden_states,
+                    input_ids_cpu,
+                    attention_mask_cpu,
+                    row,
+                    plan,
+                    rng,
+                    num_layers,
                 )
             )
+        print(
+            f"collected {len(examples)} examples from {min(start + batch_size, len(texts))}/{len(texts)} texts",
+            flush=True,
+        )
     if not examples:
         raise RuntimeError("no real GLM examples collected")
+    return examples
+
+
+def collect_examples_from_encoded_row(
+    args: argparse.Namespace,
+    hidden_states: list[torch.Tensor],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    row: int,
+    plan: dict[str, Any],
+    rng: random.Random,
+    num_layers: int,
+) -> list[TapExample]:
+    real_positions = attention_mask[row].nonzero(as_tuple=False).flatten().tolist()
+    token_ids = [int(input_ids[row, col]) for col in real_positions]
+    if len(token_ids) <= int(args.num_spec_layers) + 1:
+        return []
+    max_pos = len(token_ids) - int(args.num_spec_layers) - 1
+    positions = sorted(rng.sample(range(max_pos), min(int(args.positions_per_row), max_pos)))
+    examples: list[TapExample] = []
+    for pos in positions:
+        indices = sample_tap_indices(plan, rng)
+        tensor_pos = int(real_positions[pos])
+        hidden = torch.stack([hidden_states[index][row, tensor_pos] for index in indices], dim=0)
+        features = tap_features(indices, num_layers)
+        labels = [token_ids[pos + offset] for offset in range(1, int(args.num_spec_layers) + 1)]
+        examples.append(
+            TapExample(
+                hidden=hidden,
+                features=features,
+                labels=labels,
+                topology_key=topology_key(indices),
+            )
+        )
     return examples
 
 
