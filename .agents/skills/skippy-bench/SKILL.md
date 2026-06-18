@@ -93,10 +93,11 @@ download external harnesses, datasets, or Docker images.
 
 Terminal-Bench should be installed with `uv tool install --python 3.12
 terminal-bench`; Python 3.14 currently breaks the `tb` Typer CLI. Treat Docker
-as ready only when `docker info` succeeds, not merely when the `docker` binary
-is present. Do not add Skippy-owned task filters, dataset limits, compatibility
-shims, response-format substitutions, or `tool_choice` overrides to external
-evals unless the user explicitly asks for a noncanonical experiment.
+as ready only when `skippy-bench eval doctor` reports that the daemon can start
+a container; `docker info` alone is insufficient. Do not add Skippy-owned task
+filters, dataset limits, compatibility shims, response-format substitutions, or
+`tool_choice` overrides to external evals unless the user explicitly asks for a
+noncanonical experiment.
 
 For MCP-Atlas scoring, the wrapper defaults `EVAL_LLM_MODEL`,
 `EVAL_LLM_BASE_URL`, and `EVAL_LLM_API_KEY` to the same local endpoint/model

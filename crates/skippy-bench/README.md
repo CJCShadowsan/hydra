@@ -133,7 +133,8 @@ override that location. Use `--dry-run` with `sync` or `run` to inspect the
 commands without cloning, pulling Docker images, or launching a benchmark.
 Terminal-Bench is installed through `uv tool install --python 3.12` because the
 current `tb` CLI is not compatible with Python 3.14. `eval doctor` checks that
-Docker's daemon is reachable, not just that the `docker` CLI exists.
+Docker's daemon is reachable and can start a tiny container, not just that the
+`docker` CLI exists or that `docker info` returns.
 MCP-Atlas starts its Docker agent environment and Python completion service
 when ports `1984` and `3000` are not already reachable, waits for readiness,
 and cleans up only the services that the run started. The adapter runs the
