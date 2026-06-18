@@ -323,6 +323,37 @@ only for plumbing, not for the quality artifact. On local MPS, keep
 `--model-torch-dtype float16` for Qwen3-8B plumbing runs; the runner's default
 `auto` dtype preserves the older float32 MPS behavior used by smaller proof
 heads.
+
+2026-06-18 local Qwen3-8B S2 `23,36` sidecar plumbing checkpoint: a tiny
+2-row MPS run loaded the full `Qwen/Qwen3-8B` HF weights on the local M4 with
+`--model-torch-dtype float16`, trained `num_stages=2`,
+`stage_layer_boundaries=23,36`, `num_spec_layers=4`, `max_length=64`,
+`gradient_accumulation_steps=1`, and wrote a topology-bound
+`speculation_head_final.pt` plus `skippy-spd-head.json`. This proves the local
+trainer can load the first product topology and produce a real checkpoint, but
+it is not a quality artifact: it used only 2 UltraChat rows, reported
+`train_loss=7.961`, and should not be used for a speed or acceptance claim.
+
+The same debug checkpoint exported successfully to a Rust-readable BF16 serving
+artifact: `spd-head.safetensors`, `56` tensors, about `2.12 GiB`, with manifest
+topology `hidden_size=4096`, `draft_vocab_size=32000`, `num_stages=2`,
+`stage_layer_boundaries=[23,36]`, and tap rows `[[0,23,36],[0,23]]`. An F16
+export was rejected by the current Rust parity runner (`unsupported f32 dtype
+F16`), so use BF16 or F32 for Skippy SPD serving exports until F16 tensor reads
+are implemented intentionally. Rust external manifest and fixture validation
+passed for the debug bundle. `skippy-bench spd-fixture-parity` passed against a
+one-prompt parity fixture: tap-input reconstruction was effectively exact
+(`max_abs_diff=0.000061`), the non-cached Rust forward top-8 token ids matched
+Python exactly, and the cached diagnostic returned the same top-token set with
+one rank swap. Treat this as training/export/Rust-forward plumbing evidence
+only.
+
+Reference acceptance eval for the debug `23,36` head is still blocked. The
+reference `eval.py` generation path failed with `KeyError: 23` during pipeline
+fill because it tried to build a `g1` row from a snapshot that only contained
+the embedding row. Do not report an acceptance rate for Qwen3-8B S2 `23,36`
+until either the reference eval path handles custom boundary taps during fill
+or a Rust request-path smoke reports proposals/accepts on the same topology.
 - 2026-06-17 the first model-backed 24-token rolling-executor smoke after the
   replay reset cleanup is
   `/private/tmp/spd-rolling-executor-real-local-smoke24-4.json`. It restores

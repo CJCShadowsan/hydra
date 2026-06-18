@@ -264,6 +264,20 @@ This must report `physical_split_boundaries=[23]`, `layer_end=36`, tap rows
 Qwen3-8B plumbing, keep `--model-torch-dtype float16`; leave `auto` or use
 `bfloat16` on CUDA/HF jobs after confirming the target hardware.
 
+Current local Qwen3-8B debug checkpoint: a 2-row MPS plumbing run trained
+`Qwen/Qwen3-8B` with `num_stages=2`, `stage_layer_boundaries=23,36`,
+`num_spec_layers=4`, `max_length=64`, and `--model-torch-dtype float16`. It
+produced `speculation_head_final.pt`, `skippy-spd-head.json`, a BF16
+`spd-head.safetensors` export with `56` tensors, and a one-prompt parity
+fixture under `/private/tmp/skippy-spd-qwen3-8b-s2-23-debug-20260618-100141`.
+Rust external manifest validation, external fixture validation, and
+`skippy-bench spd-fixture-parity` passed for the BF16 export. Do not use this
+artifact for quality or speed claims: it used only two rows. Do not export this
+head as F16 for Rust today; current SPD safetensors reads reject F16 head
+tensors. No acceptance rate exists yet for the Qwen3-8B S2 `23,36` target:
+reference eval failed with `KeyError: 23` during custom-tap pipeline fill, so
+acceptance must come from a fixed reference eval or a Rust request-path smoke.
+
 ## First Larger Training Target
 
 Use `Qwen/Qwen3-8B` for the first larger dense sidecar training proof. Keep the
