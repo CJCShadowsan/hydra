@@ -639,9 +639,9 @@ impl StageOpenAiBackend {
             let mut native_mtp_verify_next_accepted_count = 0usize;
             let mut native_mtp_verify_next_draft_available_count = 0usize;
             let mut native_mtp_verify_next_draft_adopted_count = 0usize;
-            if let Some(fused) = fused_first_decode.take() {
+            if let Some(mut fused) = fused_first_decode.take() {
                 current = fused.predicted;
-                decoded_tokens = fused.predicted_tokens.len();
+                let mut fused_native_mtp_draft = fused.native_mtp_draft.take();
                 decode_stage0_compute_ms += fused.execution.stage0_compute_ms;
                 decode_runtime_lock_wait_ms += fused.execution.runtime_lock_wait_ms;
                 decode_runtime_lock_wait_max_ms =
@@ -658,19 +658,27 @@ impl StageOpenAiBackend {
                 decode_forward_write_ms += fused.execution.forward_write_ms;
                 decode_downstream_wait_ms += fused.execution.downstream_wait_ms;
                 for (index, token) in fused.predicted_tokens.iter().copied().enumerate() {
+                    if decoded_tokens >= request.max_tokens as usize {
+                        break;
+                    }
                     current = token;
                     exact_replay_tokens.push(current);
                     context_tokens.push(current);
-                    let native_mtp_decision = if index == 0 {
-                        native_mtp.observe_target_token(
-                            current,
-                            ms_to_us(fused.execution.downstream_wait_ms),
-                            fused.native_mtp_draft,
-                            NativeMtpDraftOrigin::InitialSerial,
-                        )
-                    } else {
-                        NativeMtpVerification::NoPending
-                    };
+                    let native_mtp_decision = native_mtp.observe_target_token(
+                        current,
+                        if index == 0 {
+                            ms_to_us(fused.execution.downstream_wait_ms)
+                        } else {
+                            0
+                        },
+                        if index == 0 {
+                            fused_native_mtp_draft.take()
+                        } else {
+                            None
+                        },
+                        NativeMtpDraftOrigin::InitialSerial,
+                    );
+                    decoded_tokens += 1;
                     if self.telemetry.is_debug_enabled() {
                         let mut token_attrs = self.openai_attrs(request.ids);
                         token_attrs.insert("llama_stage.decode_step".to_string(), json!(index));
