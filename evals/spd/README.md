@@ -465,6 +465,21 @@ mini-eval smoke with `ctx_size=256` accepted `2 / 120`, matched content on all
 accept through Rust/package-backed serving, but the product acceptance rate is
 still far below the reference eval.
 
+The Qwen3 no-thinking reference wrapper now matches the product/HF native
+`enable_thinking=false` prompt surface, including the assistant
+`<think></think>` prefill. A fresh eval-only run reused the LR `1e-4`
+checkpoint with the aligned template:
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-lr1e4-template-aligned-eval-20260618/artifacts/20260618-120902/eval/summary/pipeline_eval__train__speculation_head_final__nt36__summary.json`.
+Across `36` prompts and `1152` generated tokens it accepted `140 / 1152`
+draft flags, equivalent accept length `1.0817`, and theoretical gain `8.25%`.
+Dataset split was GSM8K `50 / 384`, MT-Bench `51 / 384`, and HumanEval
+`39 / 384`. Therefore the product-smoke gap is **not** explained by the prior
+chat-template mismatch alone. The next gate is an identical-prompt parity
+diagnostic: render the exact product OpenAI prompt tokens, run reference and
+Rust/package-backed SPD over those same token ids/prompts, and compare
+proposal token ids, tap rows, and target verification decisions position by
+position before spending on larger training.
+
 The corrected parity did **not** make the 512-row Qwen3-8B sidecar a product
 candidate. The paired local package-backed OpenAI sweep
 `/private/tmp/spd-qwen3-8b-s2-23-bf16-train512-local-openai-sweep6-16-after-parity.json`
@@ -474,17 +489,14 @@ remains `90` candidate token round trips, `0` saved, and `90` unsaved. Mean
 baseline decode was `251.3ms`; mean SPD decode was `1226.7ms`; mean sidecar
 head time for proposed tokens was `59.6ms`. Do not run a two-node speed
 comparison with this head; it would only prove overhead. The next real sidecar
-step is training scale/config/top-1 quality, not LAN orchestration: use a
-confirmed HF-scale bfloat16/CUDA job or change the training recipe until
-package-backed serving saves token round trips locally.
+step is reference/product proposal parity plus training scale/config/top-1
+quality, not LAN orchestration: use a confirmed HF-scale bfloat16/CUDA job or
+change the training recipe only after package-backed serving and reference eval
+agree on the same prompt surface.
 
 The LR diagnostic shows the direction: `1e-4` improves top-1 quality, but this
-is still not enough. The next gate is to align the reference training/eval chat
-template with the product OpenAI/GGUF path before scaling rows: the reference
-GSM8K generations start directly with answer text, while the product path emits
-the Qwen `<think></think>` preamble in generated content even with
-`--enable-thinking false`. Do not spend an HF-scale job until the reference eval
-and product smoke agree on this prompt/template surface.
+is still not enough. Do not spend an HF-scale job until the reference evaluator
+and product smoke agree on proposal/verification behavior for identical prompts.
 
 - 2026-06-17 the first model-backed 24-token rolling-executor smoke after the
   replay reset cleanup is
