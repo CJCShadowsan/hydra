@@ -611,7 +611,7 @@ jobs:
         run: scripts/skippy-ci-smoke.sh
 
       - name: Save Skippy smoke model cache
-        if: ${{ matrix.group == 'skippy-smoke' && github.ref == 'refs/heads/main' && steps.skippy_smoke_model_cache.outputs.cache-hit != 'true' }}
+        if: ${{ matrix.group == 'skippy-smoke' && steps.skippy_smoke_model_cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
         uses: actions/cache/save@v5
         with:
           path: ${{ runner.temp }}/skippy-ci-smoke-models

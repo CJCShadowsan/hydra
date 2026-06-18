@@ -137,18 +137,64 @@ download_model() {
     return 0
   fi
   echo "downloading ${repo}/${file}" >&2
+  if download_model_with_hf "$repo" "$file" "$out_dir"; then
+    printf '%s\n' "$cached_path"
+    return 0
+  fi
+  echo "hf download failed for ${repo}/${file}; falling back to curl" >&2
+  if download_model_with_curl "$repo" "$file" "$cached_path"; then
+    printf '%s\n' "$cached_path"
+    return 0
+  fi
+  echo "downloaded model path not found: $cached_path" >&2
+  exit 1
+}
+
+download_model_with_hf() {
+  local repo="$1"
+  local file="$2"
+  local out_dir="$3"
   local output path
-  output="$(run_with_timeout "download ${repo}/${file}" hf download "$repo" "$file" --local-dir "$out_dir")"
+  if ! output="$(run_with_timeout "download ${repo}/${file}" hf download "$repo" "$file" --local-dir "$out_dir" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
   path="$(printf '%s\n' "$output" | sed -n 's/^path=//p' | tail -n 1)"
   if [[ -z "$path" ]]; then
     path="${out_dir}/${file}"
   fi
-  if [[ ! -f "$path" ]]; then
-    echo "downloaded model path not found: $path" >&2
-    printf '%s\n' "$output" >&2
-    exit 1
+  [[ -s "$path" ]]
+}
+
+download_model_with_curl() {
+  local repo="$1"
+  local file="$2"
+  local cached_path="$3"
+  local token="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+  local retry_attempts="${MODEL_DOWNLOAD_RETRY_ATTEMPTS:-12}"
+  local retry_delay="${MODEL_DOWNLOAD_RETRY_DELAY_SECS:-20}"
+  local retry_max_time="${MODEL_DOWNLOAD_RETRY_MAX_TIME_SECS:-600}"
+  local url="https://huggingface.co/${repo}/resolve/main/${file}"
+  local partial="${cached_path}.download"
+  local curl_args=(
+    --fail
+    --location
+    --show-error
+    --retry "$retry_attempts"
+    --retry-delay "$retry_delay"
+    --retry-max-time "$retry_max_time"
+    --retry-all-errors
+  )
+  if [[ -n "$token" ]]; then
+    curl_args+=(--header "Authorization: Bearer ${token}")
   fi
-  printf '%s\n' "$path"
+  rm -f "$partial"
+  if ! run_with_timeout "curl download ${repo}/${file}" curl "${curl_args[@]}" "$url" -o "$partial"; then
+    rm -f "$partial"
+    return 1
+  fi
+  mv "$partial" "$cached_path"
+  [[ -s "$cached_path" ]]
 }
 
 model_layer_end() {
