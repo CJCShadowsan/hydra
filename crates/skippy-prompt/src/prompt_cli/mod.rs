@@ -41,14 +41,6 @@ use skippy_topology::{
     dense_attention_layers, infer_family_capability, plan_contiguous_with_splits,
 };
 
-const DEFAULT_MIN_WINNER_COUNT: u32 = 2;
-const DEFAULT_MIN_CONFIDENCE: f32 = 0.55;
-const DEFAULT_MIN_MARGIN: u32 = 1;
-const DEFAULT_CONFIDENCE_STEP: f32 = 0.0;
-const DEFAULT_CONFIDENCE_STEP_TOKENS: usize = usize::MAX;
-const DEFAULT_MAX_CONFIDENCE: f32 = 0.95;
-const DEFAULT_COUNT_STEP_TOKENS: usize = usize::MAX;
-const DEFAULT_MARGIN_STEP_TOKENS: usize = usize::MAX;
 const DEFAULT_MESH_CTX_SIZE: u32 = 4096;
 const DEFAULT_MESH_PROMPT_MAX_NEW_TOKENS: usize = 0;
 const PROMPT_EXACT_PREFIX_RESTORE_MIN_TOKENS: usize = 512;

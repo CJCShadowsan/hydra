@@ -3,6 +3,9 @@ const REJECT_COOLDOWN_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_COOLDOWN_TOKE
 const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
 const SUPPRESS_COOLDOWN_DRAFT_LIMIT_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFT_LIMIT";
+const NGRAM_HYBRID_ENV: &str = "SKIPPY_NATIVE_MTP_NGRAM_HYBRID";
+const NGRAM_SIZE_ENV: &str = "SKIPPY_NATIVE_MTP_NGRAM_SIZE";
+const NGRAM_MAX_PROPOSAL_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_NGRAM_MAX_PROPOSAL_TOKENS";
 
 pub(in crate::frontend) fn native_mtp_batched_verify_enabled() -> bool {
     native_mtp_batched_verify_enabled_from(std::env::var(BATCHED_VERIFY_ENV).ok().as_deref())
@@ -22,6 +25,18 @@ pub(in crate::frontend) fn native_mtp_suppress_cooldown_drafts_enabled() -> bool
 
 pub(in crate::frontend) fn native_mtp_suppress_cooldown_draft_limit() -> usize {
     parse_usize_env(SUPPRESS_COOLDOWN_DRAFT_LIMIT_ENV, 0)
+}
+
+pub(in crate::frontend) fn native_mtp_ngram_hybrid_enabled() -> bool {
+    truthy_env(std::env::var(NGRAM_HYBRID_ENV).ok().as_deref())
+}
+
+pub(in crate::frontend) fn native_mtp_ngram_size() -> usize {
+    parse_usize_env(NGRAM_SIZE_ENV, 8)
+}
+
+pub(in crate::frontend) fn native_mtp_ngram_max_proposal_tokens() -> usize {
+    parse_usize_env(NGRAM_MAX_PROPOSAL_TOKENS_ENV, 4)
 }
 
 fn native_mtp_batched_verify_enabled_from(value: Option<&str>) -> bool {
