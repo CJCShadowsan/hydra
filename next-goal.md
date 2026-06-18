@@ -1,64 +1,59 @@
-# Next Goal: Train Qwen3-8B SPD Sidecar for 2-Node Split
+# Next Goal: Improve Native Q4 Top-1 Acceptance
 
-This file is disposable and should be deleted when this immediate gate is done.
-Durable status, evidence, caveats, and follow-up notes belong in
-`evals/spd/README.md` and `docs/skippy/speculative_decoding.md`.
+This file is disposable. Durable status, evidence, caveats, and follow-up notes
+belong in `evals/spd/README.md` and `docs/skippy/speculative_decoding.md`.
 
 ## Current Checkpoint
 
 - Target model: `Qwen/Qwen3-8B`.
 - Target Skippy package: `meshllm/Qwen3-8B-Q4_K_M-layers`.
-- First real Mesh layout: two nodes, one Skippy stage per node.
-- Layer split: node 0 `0..23`, node 1 `23..36`.
+- First real layout: two nodes, one Skippy stage per node.
+- Layer split: coordinator `0..23`, worker `23..36`.
 - SPD topology: `num_stages=2`, `stage_layer_boundaries=23,36`.
 - Required sidecar tap rows: `0,23,36;0,23`.
 - Worker tap-return indices: `[23,36]`.
-- Product-row micro-finetunes proved the Rust/Skippy wiring but are not good
-  enough for speed claims. The train56 mixed product-row head scores
-  `788 / 1096` on train rows but only `28 / 128` held-out, while the HF teacher
-  matches native Q4 on `120 / 128`. The blocker is sidecar generalization, not
-  tap plumbing or HF/Q4 drift.
-- Existing real two-node direct-cable smoke with the weak product-row head
-  matched content and had `0` tap failures, but accepted only `78 / 156`
-  (`paper_pipeline_estimate=1.0x`) and measured `0.321x` of baseline because
-  sidecar/native overhead dominated. Treat this as mechanics evidence only.
+- HF job `meshllm/6a33e49bef9220ea67d991c2` completed under the `$50` cap and
+  uploaded `runs/20260618-122936` to
+  `meshllm/skippy-spd-qwen3-8b-s2-23`.
+- Training used UltraChat `train_sft`, `15997` usable rows, BF16,
+  `max_length=2048`, `epochs=1`, LR `1e-4`, `num_spec_layers=4`, and draft
+  top-k `4`.
+- Reference held-out eval on `96` prompts / `6123` generated tokens reported
+  aggregate acceptance `0.7013`, equivalent accept length `1.4026`, and
+  theoretical gain `41.0%`.
+- BF16 serving export and Rust/Python fixture parity passed.
+- Live package-backed strict fixture parity did not pass against native Q4
+  hidden states, but required taps were present and greedy verifier output
+  matched baseline. Treat that as quantization/serving drift, not broken tap
+  wiring.
+- Local package-backed rolling smoke matched content on `6 / 6`, had `0` tap
+  failures, proposed `90`, accepted `17`, rejected `73`.
+- Real two-stage worker smoke over a direct low-latency link matched content on
+  `6 / 6`, had `0` tap failures, proposed `89`, accepted `16`, rejected `73`,
+  and committed `12` optimistic tokens.
 
 ## Immediate Objective
 
-Train and validate a real topology-matched Qwen3-8B SPD sidecar:
+Improve native Q4 top-1 acceptance for the exact `23,36` split before any speed
+claim.
 
-- HF spend below `$50`.
-- Use the paper/reference KD path, not more tiny product-row finetuning.
-- Use `HuggingFaceH4/ultrachat_200k` `train_sft` for the first real run.
-- First run target: 16k rows, max length `2048`, LR `1e-4`, BF16,
-  `num_spec_layers=4`, draft top-k `4`.
-- Upload artifacts to `meshllm/skippy-spd-qwen3-8b-s2-23` with explicit
-  topology metadata.
-- Export `spd-head.safetensors` and `spd-parity-fixture.safetensors`.
-- Validate Rust fixture parity and live Skippy tap parity for
-  `--splits 23 --layer-end 36`.
-- Only after held-out acceptance improves with margin, run the real M4+mini
-  split smoke and report content match, tap failures, accepted/proposed,
-  saved/unsaved token round trips, and timings.
+The current head proves the training/export/request path, but native top-1
+serving acceptance is only about `18%`. That saves some token round trips, but
+not enough to beat sidecar and rolling-executor overhead.
 
-## No-Physical-Split Quality Gate
+## Quality Gate
 
-Do not use the M4+mini split as the first test of whether the sidecar is good.
-The predictor can be trained and scored before any physical split:
+Do not use another real two-node run as the first quality test. The predictor
+can be trained and scored before any physical split:
 
-1. Reference/HF held-out eval: report acceptance rate, equivalent accepted
-   length, top-k target coverage, and theoretical saved decoder steps.
-2. Rust fixture parity: prove the exported safetensors sidecar makes the same
-   proposals as Python for fixed hidden-tap rows.
-3. Local live-tap parity: run the logical Skippy split on one machine and verify
-   returned taps at `23` and `36` feed the sidecar correctly.
-4. Local package-backed SPD smoke: compare baseline versus SPD and require
-   nonzero accepted proposals plus nonzero saved candidate token round trips.
-
-Only after those pass should the real two-node split be used. The physical run
-then validates QUIC/LAN behavior, per-stage KV cleanup, endpoint placement, and
-timing under actual node latency; it should not be treated as the first
-sidecar-quality measurement.
+1. Build a product-tap corpus from broader prompt rows for the same `23,36`
+   topology; keep held-out prompts separate.
+2. Attach HF teacher logits to captured product rows, or expose native target
+   logits if that becomes available.
+3. Fine-tune from the 16k UltraChat checkpoint on product-tap rows.
+4. Re-export `spd-head.safetensors` and a parity fixture.
+5. Run Rust fixture parity, local package-backed smoke, then the real worker
+   smoke only if local package-backed native acceptance improves.
 
 ## Logical Topology Rule
 
@@ -76,14 +71,15 @@ topology is unchanged.
 
 ## Next Actions
 
-1. Monitor HF job `meshllm/6a33e49bef9220ea67d991c2`. It is an
-   `a100-large` job at `$2.50/hr` with an `18h` timeout, so the hard cap is
-   `$45`.
-2. Cancel if it is clearly stuck, switches away from CUDA, or trends beyond the
-   spend cap.
-3. If the 16k checkpoint completes, inspect the reference held-out acceptance
-   summary before doing any physical split work.
-4. If acceptance is promising, download/export the bundle and run Rust fixture
-   parity, local live-tap parity, and local package-backed baseline-versus-SPD.
-5. If 16k acceptance is promising but thin, consider a 64k follow-up only if it
-   still fits the remaining spend cap.
+1. Build or reuse a held-out product prompt set for native package-backed
+   capture.
+2. Capture product tap rows from the current 16k head/topology, keeping train
+   and held-out prompts separate.
+3. Attach teacher logits to captured rows.
+4. Fine-tune from the 16k checkpoint and rerun export, fixture parity, local
+   smoke, and worker smoke.
+5. Gate on native package-backed top-1 acceptance and paper-style saved versus
+   unsaved round trips. Do not run another speed comparison until the estimate
+   clears `1.0` with margin.
+6. Consider a 64k HF follow-up only after the product-tap gate shows the recipe
+   improves native acceptance rather than just reference top-k coverage.

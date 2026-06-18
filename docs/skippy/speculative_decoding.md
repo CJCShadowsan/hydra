@@ -31,43 +31,37 @@ speedup proof yet.
 
 For the current `Qwen/Qwen3-8B` product target, use the exact two-stage
 `23,36` topology observed through Mesh and keep the sidecar tied to that split.
-The immediate blocker is not ordinary LAN orchestration. A topology-correct
-512-row BF16 reference-trained head has weak product Q4 package acceptance,
-while a tiny product-tap fine-tune recovers high acceptance only on its training
-prompts. The newest product-distribution bridge trains on `48` prompts and
-evaluates on `24` held-out prompts across MT-Bench, GSM8K, and HumanEval. It is
-the first same-topology product head to clear the all-local held-out
-paper-style break-even gate: live-tap validation accepts `110 / 192` proposals
-with matched greedy output, and the all-local rolling OpenAI request path
-matches baseline/SPD content on all `24 / 24` held-out prompts with `0` tap
-failures, `0` ignored taps, and `81 / 160` accepted proposals.
+The immediate blocker is now sidecar quality on the native Q4 serving
+distribution, not ordinary worker orchestration. The first HF-scale
+topology-correct sidecar trained on UltraChat `train_sft` with `15997` usable
+rows, BF16, `max_length=2048`, `epochs=1`, LR `1e-4`, `num_spec_layers=4`, and
+draft top-k `4`. Reference held-out eval on `96` prompts / `6123` generated
+tokens reported aggregate acceptance `0.7013`, equivalent accept length
+`1.4026`, and theoretical gain `41.0%`; serving export and Rust/Python fixture
+parity passed.
 
-That is correctness and first-quality evidence, not speed evidence. After
-refreshing the native Metal stage ABI build so the final-stage tap patch was
-actually linked, the real two-node direct-cable gate at
-`/tmp/spd-qwen3-8b-product-finetune-paper3-train16-e5-lr2e5/openai-heldout8-rolling-direct-nativefresh.json`
-matched baseline/SPD content on all `24 / 24` held-out prompts, returned HF36
-taps, accepted `78 / 156` proposals, and recorded `0` tap return failures, `0`
-tap record failures, and `0` ignored taps. Its idealized two-stage
-`paper_pipeline_estimate` is exactly break-even at `1.0x` (`78` saved / `78`
-unsaved candidate token round trips), while measured decode is still only
-`0.321x` of baseline because sidecar/native overhead dominates this two-node
-topology. Do not spend on or claim a larger generic reference-distribution
-sidecar until the train/serve activation-distribution gap and
-HF-teacher-versus-native-logit question are addressed. This keeps the work
+That reference score did not transfer into enough native Q4 top-1 acceptance
+for speed. Strict live-tap parity against the HF BF16 fixture fails because the
+native package hidden states differ from HF BF16 rows, but the request path is
+mechanically clean: required taps are present, verifier greedy output matches
+baseline, local package-backed rolling OpenAI smoke matches content on
+`6 / 6` prompts with `0` tap failures and accepts `17 / 90` proposals, and the
+real two-stage worker smoke matches content on `6 / 6` prompts with `0` tap
+failures and accepts `16 / 89` proposals. Treat this as end-to-end SPD
+mechanics evidence for the real split, not a speed claim. It keeps the work
 aligned with the SPD paper: speed requires speculation to be hidden under the
-target pipeline step, and theoretical `L'_acc = N/K*n` must remain separate from
-measured wall-clock speed. The next gate is a robust same-topology product
-sidecar whose held-out package-backed serving clears `paper_pipeline_estimate >
-1.0` with margin on the real split.
+target pipeline step, and theoretical `L'_acc = N/K*n` must remain separate
+from measured wall-clock speed. The next gate is a robust same-topology sidecar
+whose native package-backed serving clears `paper_pipeline_estimate > 1.0` with
+margin on held-out prompts.
 
 A physical split is not required to decide whether a newly trained SPD sidecar
 predicts useful tokens. The quality ladder is reference/HF held-out acceptance,
 Rust fixture parity for the exported sidecar, local live-tap parity on the
 logical split, and local package-backed baseline-versus-SPD smoke with nonzero
-accepted proposals and saved candidate token round trips. The real M4+mini run
-then validates distributed transport, endpoint placement, per-stage KV cleanup,
-and timing under actual node latency.
+accepted proposals and saved candidate token round trips. The real two-node
+worker run then validates distributed transport, endpoint placement, per-stage
+KV cleanup, and timing under actual node latency.
 
 A later no-spend max120 product-corpus check confirmed that simply fitting the
 small HF-teacher bridge harder is not enough. The

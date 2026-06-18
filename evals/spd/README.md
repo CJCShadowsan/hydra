@@ -2069,22 +2069,71 @@ The constrained Qwen fixture forward path lives in
 The tap-row-to-`cur_in` projection bridge lives in
 `crates/skippy-runtime/src/spd/tap_input.rs`.
 
+## Current Qwen3-8B S2/23 HF-Scale Checkpoint
+
+2026-06-18 HF job `meshllm/6a33e49bef9220ea67d991c2` trained a
+topology-matched `Qwen/Qwen3-8B` SPD sidecar for the real two-stage
+`23,36` logical split. The job used `HuggingFaceH4/ultrachat_200k`
+`train_sft`, `15997` usable rows from the requested `16k`, BF16 on
+`a100-large`, `max_length=2048`, `epochs=1`, batch `1`, gradient accumulation
+`8`, LR `1e-4`, `num_spec_layers=4`, draft top-k `4`, and uploaded artifacts
+to `meshllm/skippy-spd-qwen3-8b-s2-23` under `runs/20260618-122936`.
+
+Reference held-out eval completed on `96` prompts / `6123` generated tokens:
+aggregate acceptance `0.7013`, equivalent accept length `1.4026`, and
+theoretical throughput gain `41.0%`. Per split: MT-Bench `0.7041`, HumanEval
+`0.7299`, GSM8K `0.6724`. Treat this as reference BF16 quality evidence, not
+proof of native Q4 top-1 speed, because the reference run used draft top-k `4`
+and HF weights.
+
+Serving export and fixed-fixture parity passed. The downloaded checkpoint SHA
+matched the manifest
+(`2337ab591beded04ad088d46ef0256c4e569cfcf3bfb940d618e872aa635519a`);
+`export_spd_head.py` produced BF16 `spd-head.safetensors` with `56` tensors
+and SHA `6fa55a0c836dc53fb59bc78a2e942d4f668659c65a3b1af20349e08c6674fccc`;
+`export_parity_fixture.py` produced fixture SHA
+`b7aee917d1ca407efae3fb4d9904ee5da29b4beadd7d616440bef98c53918ac7`.
+`skippy-bench spd-fixture-parity` matched Python/Rust top-8 token IDs on both
+direct and cached fixture paths.
+
+Live package-backed tap parity exposed the expected BF16-versus-Q4 serving
+gap. The split returned required taps `[0,23,36]`, verifier greedy output
+matched the non-SPD baseline, and an 8-step verified generation accepted
+`2 / 8`, but strict fixture parity failed against the HF BF16 rows
+(`terminal_final_normed cur_in max diff 0.5635`, rank logit diff `1.0`, top-k
+order changed). Treat this as quantized-serving drift, not an export/tap wiring
+failure.
+
+Local package-backed OpenAI smoke with rolling executor on six prompts matched
+baseline/SPD content on `6 / 6`, had `0` tap failures, proposed `90`, accepted
+`17`, rejected `73`, and committed `14` optimistic tokens. The paper-style
+round-trip math was `17` saved and `73` unsaved candidate token round trips,
+with mean baseline decode `252.5ms`, mean SPD decode `2502.7ms`, and mean SPD
+head total `63.7ms`. The corresponding real two-stage worker smoke over a
+direct low-latency link also matched content on `6 / 6`, had `0` tap failures,
+proposed `89`, accepted `16`, rejected `73`, and committed `12` optimistic
+tokens. Mean baseline decode was `736.5ms`, mean SPD decode was `3466.2ms`,
+and the measured ICMP link latency immediately before the run was `0.9-2.0ms`
+with `1.16ms` average over 10 packets.
+
+Bottom line: the end-to-end SPD mechanics now work for the real two-stage
+Qwen3-8B split with a real trained sidecar and real worker placement. It is not
+a speed candidate yet. Native Q4 top-1 acceptance is only about `18%`, so the
+sidecar saves some token round trips but not enough to beat added sidecar and
+rolling-executor overhead.
+
 ## Next Engineering Steps
 
-1. Do not run the Qwen3-8B S2/23 head as a speed proof yet. The terminal h36
-   semantic mismatch is understood: Skippy's terminal boundary is pre-final-norm
-   and the HF fixture/training row is post-final-norm, so serving now applies the
-   Qwen final RMSNorm before projecting unflagged terminal rows. Product inline
-   HF36 delivery works on the real two-node split after rebuilding the native
-   Metal stage ABI, and the product-tap training bridge now generalizes enough
-   to propose on all held-out request-path runs. The current full direct-cable
-   gate accepts `78 / 156` proposals, saves `78` candidate token round trips,
-   leaves `78` unsaved, and has `0` tap failures or ignored taps. Its idealized
-   two-stage `paper_pipeline_estimate` is exactly `1.0x`, and measured direct
-   decode is `0.321x`. The next sidecar-quality gate is therefore not another
-   LAN mechanics comparison; improve held-out acceptance for the exact `23,36`
-   product split until the package-backed paper estimate clears `1.0` with
-   margin.
+1. Do not run the current Qwen3-8B S2/23 HF-scale head as a speed proof yet.
+   The terminal h36 semantic mismatch is understood: Skippy's terminal boundary
+   is pre-final-norm and the HF fixture/training row is post-final-norm, so
+   serving now applies the Qwen final RMSNorm before projecting unflagged
+   terminal rows. Inline package taps and the rolling executor work on the real
+   two-stage split, but the current 16k UltraChat head accepts only `16 / 89`
+   proposals on the worker smoke. The next sidecar-quality gate is therefore
+   not another mechanics comparison; improve native Q4 top-1 acceptance for the
+   exact `23,36` product split until the package-backed paper estimate clears
+   `1.0` with margin.
 
    The concrete quality path is to expand product-captured rows beyond the
    current `384` train / `192` held-out samples, keep held-out prompts separate,
@@ -2102,9 +2151,9 @@ The tap-row-to-`cur_in` projection bridge lives in
    `0,16,32;0,16`; the current pretrained S4/L4 sidecar is intentionally
    excluded from this test. For the Mesh-native Qwen3-8B split, the logical
    target is `Qwen/Qwen3-8B` with `num_stages=2` and
-   `stage_layer_boundaries=23,36`. The current product-trained head is a real
-   held-out quality checkpoint, but still only at two-stage paper break-even on
-   the real split.
+   `stage_layer_boundaries=23,36`. The current 16k UltraChat head is a real
+   trained checkpoint and proves the topology end to end, but native Q4 top-1
+   acceptance is still too low for a speed claim.
 3. Run a larger product-row training gate on the same `23,36` topology before
    speed testing: more product-captured rows, held-out prompts kept separate,
    BF16 on CUDA/HF if local MPS is too slow, and no spend-bearing job without a

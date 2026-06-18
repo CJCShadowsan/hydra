@@ -431,6 +431,27 @@ The next real sidecar step is a better or larger training recipe, likely a
 confirmed HF-scale bfloat16/CUDA run or a training/config fix, until local
 package-backed serving shows nonzero saved token round trips.
 
+Current HF-scale Qwen3-8B checkpoint: HF job
+`meshllm/6a33e49bef9220ea67d991c2` trained `Qwen/Qwen3-8B` for the exact S2
+`23,36` topology on UltraChat `train_sft` with `15997` usable rows, BF16,
+`max_length=2048`, `epochs=1`, LR `1e-4`, `num_spec_layers=4`, and draft
+top-k `4`. Artifacts are in
+`meshllm/skippy-spd-qwen3-8b-s2-23/runs/20260618-122936`. Reference held-out
+eval reported aggregate acceptance `0.7013`, equivalent accept length
+`1.4026`, and theoretical gain `41.0%` over `6123` generated tokens. Serving
+export and Rust/Python fixture parity pass, but native Q4 live-tap strict
+parity against the BF16 fixture does not; use package-backed top-1 acceptance
+as the product gate.
+
+Current request-path gate for that HF-scale head: local package-backed rolling
+smoke matched baseline/SPD content on `6 / 6`, had `0` tap failures, proposed
+`90`, accepted `17`, and rejected `73`. A real two-stage worker smoke over a
+direct low-latency link matched content on `6 / 6`, had `0` tap failures,
+proposed `89`, accepted `16`, rejected `73`, and committed `12` optimistic
+tokens. Treat this as end-to-end mechanics evidence for the real split, not a
+speed claim: native Q4 top-1 acceptance is only about `18%`, and the paper-like
+round-trip estimate remains below break-even.
+
 ## First Larger Training Target
 
 Use `Qwen/Qwen3-8B` for the first larger dense sidecar training proof. Keep the
