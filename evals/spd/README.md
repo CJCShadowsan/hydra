@@ -436,6 +436,16 @@ tap reconstruction `max_abs_diff=0.000122`, forward `spec_query_max_abs_diff`
 top-k exactly on the legacy Qwen3.5 rotary/final-norm defaults, so the fix did
 not regress the earlier sidecar.
 
+The reference wrapper now also patches the single-chain evaluator's stage
+stepping path, so serving-equivalent `draft_top_k=1` eval works for the custom
+S2 `23,36` topology instead of failing with `KeyError: 23`. The fresh top-1
+report
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-top1-eval-20260618-continued2/artifacts/20260618-114228/eval/summary/pipeline_eval__train__speculation_head_final__nt12__summary.json`
+processed `12` prompts and `384` generated tokens. It accepted only `12 / 384`
+draft flags, with equivalent accept length `1.0323` and theoretical gain
+`3.23%`. This is the serving-aligned quality metric for this checkpoint; it is
+nonzero but too weak to justify a two-node speed run.
+
 The corrected parity did **not** make the 512-row Qwen3-8B sidecar a product
 candidate. The paired local package-backed OpenAI sweep
 `/private/tmp/spd-qwen3-8b-s2-23-bf16-train512-local-openai-sweep6-16-after-parity.json`

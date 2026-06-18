@@ -273,15 +273,22 @@ def patch_pipeline_model_for_stage_boundaries(path: Path) -> None:
     def _default_stage_feature_indices(self) -> List[Tuple[int, ...]]:
 """,
     )
-    for _ in range(2):
-        replace_once(
-            path,
-            """                    start_layer = stage_idx * lps
+    replace_all(
+        path,
+        """                    start_layer = stage_idx * lps
                     end_layer = (stage_idx + 1) * lps
 """,
-            """                    start_layer, end_layer = self._stage_layer_range(stage_idx)
+        """                    start_layer, end_layer = self._stage_layer_range(stage_idx)
 """,
-        )
+    )
+    replace_all(
+        path,
+        """                start_layer = stage_idx * lps
+                end_layer = (stage_idx + 1) * lps
+""",
+        """                start_layer, end_layer = self._stage_layer_range(stage_idx)
+""",
+    )
 
 
 def patch_pipeline_inference_for_stage_boundaries(path: Path) -> None:
@@ -369,6 +376,15 @@ def replace_once(path: Path, old: str, new: str) -> None:
             return
         raise RuntimeError(f"expected text not found in {path}: {old[:80]!r}")
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def replace_all(path: Path, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        if new in text:
+            return
+        raise RuntimeError(f"expected text not found in {path}: {old[:80]!r}")
+    path.write_text(text.replace(old, new), encoding="utf-8")
 
 
 def patch_train_for_device(path: Path) -> None:

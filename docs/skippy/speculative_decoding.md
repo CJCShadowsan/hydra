@@ -483,6 +483,13 @@ Run these before making any speedup claim:
      `rotary_dim=128`) so Rust serving uses the same head math as the
      reference. Do not reuse the pretrained Qwen3.5-4B `8,10,16,20,24,31`
      physical split as a training topology.
+   - The first 512-row local BF16 Qwen3-8B S2 `23,36` head is a plumbing and
+     parity checkpoint, not a speed candidate. After fixing the reference
+     single-chain evaluator for custom boundaries, serving-equivalent
+     `draft_top_k=1` eval accepted only `12 / 384` draft flags
+     (`3.23%` theoretical gain), and package-backed serving accepted `0 / 90`
+     proposals across the six-prompt smoke. Scale or change the training recipe
+     before spending a two-node speed run on this topology.
    - Run a local or dry-run HF job on `Qwen/Qwen3-0.6B` only when debugging the
      trainer/export path itself. It is no longer the next scaling target now
      that the Qwen3.5-4B request path has real LAN KV evidence.
