@@ -167,18 +167,22 @@ def write_qwen3_nonthink_template(path: Path) -> None:
         """{%- for message in messages %}
 {%- if message['role'] == 'system' %}
 <|im_start|>system
-{{ message['content'] }}<|im_end|>
+{{ message['content'] }}<|im_end|>{{ '\n' }}
 {%- elif message['role'] == 'user' %}
 <|im_start|>user
-{{ message['content'] }}<|im_end|>
+{{ message['content'] }}<|im_end|>{{ '\n' }}
 {%- elif message['role'] == 'assistant' %}
 {% generation %}<|im_start|>assistant
-{{ message['content'] }}<|im_end|>{% endgeneration %}
-{%- endif %}
-{%- endfor %}
-{%- if add_generation_prompt %}
+{{ message['content'] }}<|im_end|>{{ '\n' }}{% endgeneration %}
+{% endif %}
+{% endfor %}
+{% if add_generation_prompt %}
 <|im_start|>assistant
-{%- endif %}
+<think>
+
+</think>
+
+{% endif %}
 """,
         encoding="utf-8",
     )
