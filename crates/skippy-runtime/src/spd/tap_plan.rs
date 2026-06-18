@@ -195,6 +195,8 @@ mod tests {
             ],
             spec_init_from_base_layers: None,
             draft_token_ids: None,
+            rope_theta: None,
+            rotary_dim: None,
         }
     }
 
@@ -210,6 +212,8 @@ mod tests {
             shallow_hidden_layer_indices: vec![vec![0, 16, 32], vec![0, 16]],
             spec_init_from_base_layers: None,
             draft_token_ids: None,
+            rope_theta: None,
+            rotary_dim: None,
         }
     }
 

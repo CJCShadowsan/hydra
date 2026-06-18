@@ -475,13 +475,14 @@ Run these before making any speedup claim:
    - Do not blindly reuse the pretrained Qwen3.5 S4/L4 tap layout for a cleaner
      physical split. For any intended Skippy split, write the exact tap rows
      first, then train/evaluate the sidecar against those rows.
-   - For the next larger dense proof, use `Qwen/Qwen3-8B` with
-     `num_stages=4`, `num_spec_layers=4`, greedy/no-thinking eval, and a `32k`
-     draft vocab cap. Inspect the HF config/GGUF metadata first, derive logical
-     boundaries from the actual target layer count, and then let the Skippy tap
-     planner produce the physical tap-aligned split. Do not reuse the
-     pretrained Qwen3.5-4B `8,10,16,20,24,31` physical split as a training
-     topology.
+   - For the current larger dense proof, use `Qwen/Qwen3-8B` with the
+     product-shaped two-stage topology already observed through Mesh:
+     `num_stages=2`, `stage_layer_boundaries=23,36`, `num_spec_layers=4`,
+     greedy/no-thinking eval, and a `32k` draft vocab cap. The manifest/export
+     path must carry the Qwen3 rotary metadata (`rope_theta=1000000`,
+     `rotary_dim=128`) so Rust serving uses the same head math as the
+     reference. Do not reuse the pretrained Qwen3.5-4B `8,10,16,20,24,31`
+     physical split as a training topology.
    - Run a local or dry-run HF job on `Qwen/Qwen3-0.6B` only when debugging the
      trainer/export path itself. It is no longer the next scaling target now
      that the Qwen3.5-4B request path has real LAN KV evidence.

@@ -420,22 +420,33 @@ checkpoint lives under
 `/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train512-20260618-105916/artifacts/20260618-105916`.
 Reference eval over `48` prompts and `1536` generated tokens reported
 aggregate acceptance `0.5306`, equivalent accept length `1.0611`,
-theoretical gain `6.21%`, and `135 / 1536` accepted draft flags, so it did not
-improve over the 64-row proof. BF16 serving export passed the non-finite guard
-with `56` tensors and SHA
-`85a08a0748bbe3fcc7b030795bb93bcdf43635f0a36f90a31847d2959dec5a84`; parity
+theoretical gain `6.21%`, and `135 / 1536` accepted draft flags at
+`draft_top_k=4`, so it did not improve over the 64-row proof. BF16 serving
+export passed the non-finite guard with `56` tensors. After fixing Rust serving
+to use the Qwen3 rotary config (`rope_theta=1000000`, `rotary_dim=128`) and the
+Qwen3 final RMSNorm style, the refreshed serving checkpoint SHA is
+`0f101bbc5b14b928b2328a7dc38d4ffdc6c0e03e635ffb1d7a78ee86ac421898`; parity
 fixture export produced finite logits and SHA
 `46790b94455d2b421d7fe4a8606d3e29a7163be4407171e74ec5647cb15430c4`.
-`skippy-bench spd-fixture-parity` passed mechanically with tight tap-input
-reconstruction (`max_abs_diff=0.000122`) but the same Rust/Python logit/rank
-drift seen in the 64-row artifact. Local package-backed OpenAI serving on the
-default prompt matched baseline/SPD content and had clean taps, but accepted
-`0 / 15` proposals (`15` candidate token round trips, `0` saved). A six-prompt
-code/math/writing sweep also matched content and kept clean taps but accepted
-`0 / 90` proposals (`90` candidates, `0` saved, `90` unsaved). Do not run a
-two-node speed comparison with this head; it would only prove overhead. The
-next real sidecar step is training scale/config quality, not LAN orchestration:
-use a confirmed HF-scale bfloat16/CUDA job or change the training recipe until
+`skippy-bench spd-fixture-parity` now matches the Python top-k order exactly on
+the forward and cached fixture paths. Remaining numeric drift is BF16-scale:
+tap reconstruction `max_abs_diff=0.000122`, forward `spec_query_max_abs_diff`
+`0.0234`, forward `final_hidden_max_abs_diff=0.1875`, cached
+`logits_max_abs_diff=0.125`. The pretrained Qwen3.5-4B fixture still matches
+top-k exactly on the legacy Qwen3.5 rotary/final-norm defaults, so the fix did
+not regress the earlier sidecar.
+
+The corrected parity did **not** make the 512-row Qwen3-8B sidecar a product
+candidate. The paired local package-backed OpenAI sweep
+`/private/tmp/spd-qwen3-8b-s2-23-bf16-train512-local-openai-sweep6-16-after-parity.json`
+matched baseline/SPD content on all `6` code/math/writing prompts and kept
+clean taps, but accepted `0 / 90` top-1 proposals. The paper estimate therefore
+remains `90` candidate token round trips, `0` saved, and `90` unsaved. Mean
+baseline decode was `251.3ms`; mean SPD decode was `1226.7ms`; mean sidecar
+head time for proposed tokens was `59.6ms`. Do not run a two-node speed
+comparison with this head; it would only prove overhead. The next real sidecar
+step is training scale/config/top-1 quality, not LAN orchestration: use a
+confirmed HF-scale bfloat16/CUDA job or change the training recipe until
 package-backed serving saves token round trips locally.
 
 - 2026-06-17 the first model-backed 24-token rolling-executor smoke after the
@@ -1613,6 +1624,9 @@ The manifest schema is `skippy-spd-head/v1`. It binds a head checkpoint to:
 - number of target stages and optional logical stage layer boundaries
 - number of spec layers
 - shallow hidden-layer tap indices
+- optional rotary metadata (`rope_theta`, `rotary_dim`) used by Rust serving
+  for Qwen-family sidecars; Qwen3.5 legacy manifests may omit it, but new
+  Qwen3 sidecars should include it
 - optional safetensors serving checkpoint path, size, checksum, tensor count,
   and dtype
 

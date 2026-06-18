@@ -739,6 +739,7 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
     manifest_base_model_path = args.manifest_base_model_path.strip()
     if not manifest_base_model_path:
         manifest_base_model_path = config.get("base_model_path") or args.model_name
+    rotary_metadata = resolve_rotary_metadata(manifest_base_model_path, config)
 
     manifest = {
         "schema": "skippy-spd-head/v1",
@@ -765,10 +766,46 @@ def write_skippy_spd_manifest(args: argparse.Namespace, ckpt: Path, manifest_pat
             "shallow_hidden_layer_indices": config["shallow_hidden_layer_indices"],
             "spec_init_from_base_layers": config.get("spec_init_from_base_layers"),
             "draft_token_ids": draft_token_ids,
+            **rotary_metadata,
         },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"wrote Skippy SPD manifest -> {manifest_path}", flush=True)
+
+
+def resolve_rotary_metadata(base_model_path: str, checkpoint_config: dict[str, Any]) -> dict[str, int]:
+    rope_theta = checkpoint_config.get("rope_theta")
+    rotary_dim = checkpoint_config.get("rotary_dim")
+    if rope_theta is not None or rotary_dim is not None:
+        if rope_theta is None or rotary_dim is None:
+            raise RuntimeError("checkpoint rotary metadata must include both rope_theta and rotary_dim")
+        return validated_rotary_metadata(rope_theta, rotary_dim)
+
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(base_model_path, trust_remote_code=True)
+    dec_cfg = getattr(cfg, "text_config", None) or cfg
+    head_dim = int(getattr(dec_cfg, "head_dim"))
+    rope_parameters = getattr(dec_cfg, "rope_parameters", None) or {}
+    rope_theta = getattr(dec_cfg, "rope_theta", None) or rope_parameters.get("rope_theta")
+    if rope_theta is None:
+        raise RuntimeError(f"could not resolve rope_theta for {base_model_path}")
+    partial_rotary_factor = getattr(dec_cfg, "partial_rotary_factor", None)
+    if partial_rotary_factor is None:
+        partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+    if partial_rotary_factor is None:
+        rotary_dim = head_dim
+    else:
+        rotary_dim = int(round(head_dim * float(partial_rotary_factor)))
+    return validated_rotary_metadata(rope_theta, rotary_dim)
+
+
+def validated_rotary_metadata(rope_theta: Any, rotary_dim: Any) -> dict[str, int]:
+    rope_theta_int = int(rope_theta)
+    rotary_dim_int = int(rotary_dim)
+    if rope_theta_int <= 0 or rotary_dim_int <= 0:
+        raise RuntimeError("rope_theta and rotary_dim must be positive")
+    return {"rope_theta": rope_theta_int, "rotary_dim": rotary_dim_int}
 
 
 def evaluate_head(

@@ -97,6 +97,10 @@ pub struct SpdHeadTopology {
     pub shallow_hidden_layer_indices: Vec<Vec<u32>>,
     pub spec_init_from_base_layers: Option<Vec<u32>>,
     pub draft_token_ids: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_theta: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotary_dim: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +433,14 @@ impl SpdHeadTopology {
         if self.num_spec_layers == 0 {
             bail!("SPD head num_spec_layers must be greater than zero");
         }
+        match (self.rope_theta, self.rotary_dim) {
+            (Some(0), _) => bail!("SPD head rope_theta must be greater than zero"),
+            (_, Some(0)) => bail!("SPD head rotary_dim must be greater than zero"),
+            (Some(_), None) | (None, Some(_)) => {
+                bail!("SPD head rope_theta and rotary_dim must be provided together")
+            }
+            _ => {}
+        }
         if self.shallow_hidden_layer_indices.len() != self.num_stages as usize {
             bail!(
                 "SPD head shallow_hidden_layer_indices length {} must match num_stages {}",
@@ -593,6 +605,8 @@ mod tests {
                 shallow_hidden_layer_indices: vec![vec![0, 7, 14], vec![0, 14]],
                 spec_init_from_base_layers: Some(vec![20]),
                 draft_token_ids: Some(vec![1, 3, 5]),
+                rope_theta: Some(1_000_000),
+                rotary_dim: Some(128),
             },
         }
     }

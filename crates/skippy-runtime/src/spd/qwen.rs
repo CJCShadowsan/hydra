@@ -10,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use super::{SpdHeadManifest, SpdSafetensorsFile};
 
 const QWEN3_RMS_NORM_EPS: f32 = 1.0e-6;
-const QWEN35_ROPE_THETA: f32 = 10_000_000.0;
-const QWEN35_PARTIAL_ROTARY_FACTOR: f32 = 0.25;
+const QWEN35_LEGACY_ROPE_THETA: u64 = 10_000_000;
+const QWEN35_LEGACY_PARTIAL_ROTARY_DENOMINATOR: usize = 4;
 const PARALLEL_LINEAR_MIN_DOT_OPS: usize = 2_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -273,10 +273,11 @@ impl SpdQwen3LayerKvCache {
         if k.len() != position_ids.len() * kv_width || v.len() != position_ids.len() * kv_width {
             bail!("SPD cache KV length must match positions * KV width");
         }
-        if let (Some(last), Some(first_new)) = (self.positions.last(), position_ids.first())
-            && last >= first_new
-        {
-            bail!("SPD cache append positions must be after existing cache");
+        match (self.positions.last(), position_ids.first()) {
+            (Some(last), Some(first_new)) if last >= first_new => {
+                bail!("SPD cache append positions must be after existing cache");
+            }
+            _ => {}
         }
         self.positions.extend_from_slice(position_ids);
         self.k.extend_from_slice(k);
@@ -295,6 +296,8 @@ struct SpdQwen3Shape {
     num_key_value_groups: usize,
     head_dim: usize,
     rotary_dim: usize,
+    rope_theta: f32,
+    final_norm_add_unit_offset: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -643,7 +646,12 @@ fn run_forward_core(
 
     let spec_query = query.clone();
     let norm_timer = (mode == ForwardMode::Timed).then(Instant::now);
-    qwen35_final_norm_in_place(&mut query, &final_norm_weight, QWEN3_RMS_NORM_EPS);
+    qwen_final_norm_in_place(
+        &mut query,
+        &final_norm_weight,
+        QWEN3_RMS_NORM_EPS,
+        shape.final_norm_add_unit_offset,
+    );
     if let Some(timer) = norm_timer {
         timing.final_norm_ms = elapsed_ms(timer);
     }
@@ -713,7 +721,12 @@ fn run_forward_core_with_cache(
 
     let spec_query = query.clone();
     let norm_timer = (mode == ForwardMode::Timed).then(Instant::now);
-    qwen35_final_norm_in_place(&mut query, &final_norm_weight, QWEN3_RMS_NORM_EPS);
+    qwen_final_norm_in_place(
+        &mut query,
+        &final_norm_weight,
+        QWEN3_RMS_NORM_EPS,
+        shape.final_norm_add_unit_offset,
+    );
     if let Some(timer) = norm_timer {
         timing.final_norm_ms = elapsed_ms(timer);
     }
@@ -1453,6 +1466,7 @@ impl SpdQwen3Shape {
         if !num_attention_heads.is_multiple_of(num_key_value_heads) {
             bail!("SPD Qwen attention heads must be divisible by KV heads");
         }
+        let (rotary_dim, rope_theta) = resolve_rotary_config(manifest, head_dim)?;
         Ok(Self {
             hidden_size,
             num_stages: manifest.topology.num_stages as usize,
@@ -1461,9 +1475,45 @@ impl SpdQwen3Shape {
             num_key_value_heads,
             num_key_value_groups: num_attention_heads / num_key_value_heads,
             head_dim,
-            rotary_dim: (head_dim as f32 * QWEN35_PARTIAL_ROTARY_FACTOR) as usize,
+            rotary_dim,
+            rope_theta,
+            final_norm_add_unit_offset: can_use_legacy_qwen35_rotary_defaults(manifest),
         })
     }
+}
+
+fn resolve_rotary_config(manifest: &SpdHeadManifest, head_dim: usize) -> Result<(usize, f32)> {
+    match (manifest.topology.rotary_dim, manifest.topology.rope_theta) {
+        (Some(rotary_dim), Some(rope_theta)) => {
+            let rotary_dim = usize::try_from(rotary_dim).context("SPD rotary_dim too large")?;
+            validate_rotary_dim(rotary_dim, head_dim)?;
+            Ok((rotary_dim, rope_theta as f32))
+        }
+        (None, None) if can_use_legacy_qwen35_rotary_defaults(manifest) => {
+            let rotary_dim = head_dim / QWEN35_LEGACY_PARTIAL_ROTARY_DENOMINATOR;
+            validate_rotary_dim(rotary_dim, head_dim)?;
+            Ok((rotary_dim, QWEN35_LEGACY_ROPE_THETA as f32))
+        }
+        (None, None) => bail!(
+            "SPD Qwen head manifest for {} must include topology.rope_theta and topology.rotary_dim",
+            manifest.source.base_model_path
+        ),
+        _ => bail!("SPD Qwen head manifest rope_theta and rotary_dim must be provided together"),
+    }
+}
+
+fn can_use_legacy_qwen35_rotary_defaults(manifest: &SpdHeadManifest) -> bool {
+    let base_model_path = manifest.source.base_model_path.to_ascii_lowercase();
+    base_model_path.contains("qwen3.5") || base_model_path.contains("qwen35")
+}
+
+fn validate_rotary_dim(rotary_dim: usize, head_dim: usize) -> Result<()> {
+    if rotary_dim == 0 || rotary_dim > head_dim || !rotary_dim.is_multiple_of(2) {
+        bail!(
+            "SPD Qwen rotary_dim {rotary_dim} must be a positive even value no larger than head_dim {head_dim}"
+        );
+    }
+    Ok(())
 }
 
 fn infer_stage_ids(seq_len: usize, num_stages: usize) -> Vec<usize> {
@@ -1552,11 +1602,16 @@ fn rms_norm_in_place(values: &mut [f32], weight: &[f32], eps: f32) {
     }
 }
 
-fn qwen35_final_norm_in_place(values: &mut [f32], weight: &[f32], eps: f32) {
+fn qwen_final_norm_in_place(values: &mut [f32], weight: &[f32], eps: f32, add_unit_offset: bool) {
     let sum_sq: f32 = values.iter().map(|value| value * value).sum();
     let scale = (sum_sq / values.len() as f32 + eps).sqrt().recip();
     for (value, weight) in values.iter_mut().zip(weight) {
-        *value = round_to_bf16(*value * scale * (1.0 + *weight));
+        let norm_weight = if add_unit_offset {
+            1.0 + *weight
+        } else {
+            *weight
+        };
+        *value = round_to_bf16(*value * scale * norm_weight);
     }
 }
 
@@ -1580,7 +1635,7 @@ fn apply_rotary_head(values: &mut [f32], position: i64, shape: &SpdQwen3Shape) {
     let rotary_dim = shape.rotary_dim;
     let half = rotary_dim / 2;
     for pair in 0..half {
-        let freq = rope_frequency(pair, position, rotary_dim);
+        let freq = rope_frequency(pair, position, shape);
         let cos = freq.cos();
         let sin = freq.sin();
         let left = values[pair];
@@ -1590,9 +1645,10 @@ fn apply_rotary_head(values: &mut [f32], position: i64, shape: &SpdQwen3Shape) {
     }
 }
 
-fn rope_frequency(pair: usize, position: i64, rotary_dim: usize) -> f32 {
+fn rope_frequency(pair: usize, position: i64, shape: &SpdQwen3Shape) -> f32 {
+    let rotary_dim = shape.rotary_dim;
     let exponent = (2 * pair) as f32 / rotary_dim as f32;
-    position as f32 / QWEN35_ROPE_THETA.powf(exponent)
+    position as f32 / shape.rope_theta.powf(exponent)
 }
 
 fn softmax_in_place(values: &mut [f32]) {
@@ -1762,6 +1818,8 @@ mod tests {
             num_key_value_groups: 1,
             head_dim: 2,
             rotary_dim: 0,
+            rope_theta: 1_000_000.0,
+            final_norm_add_unit_offset: false,
         }
     }
 

@@ -740,6 +740,8 @@ fn test_spd_topology(trained_with_use_deepest: bool) -> skippy_runtime::spd::Spd
         ],
         spec_init_from_base_layers: None,
         draft_token_ids: None,
+        rope_theta: None,
+        rotary_dim: None,
     }
 }
 

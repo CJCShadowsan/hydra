@@ -49,6 +49,18 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional manifest base_model_path override, for portable public manifests.",
     )
+    parser.add_argument(
+        "--rope-theta",
+        type=int,
+        default=0,
+        help="Optional topology rope_theta override for Rust serving.",
+    )
+    parser.add_argument(
+        "--rotary-dim",
+        type=int,
+        default=0,
+        help="Optional topology rotary_dim override for Rust serving.",
+    )
     return parser.parse_args()
 
 
@@ -78,6 +90,11 @@ def main() -> None:
     if base_model_path:
         manifest["source"]["base_model_path"] = base_model_path
     metadata["base_model_path"] = manifest["source"]["base_model_path"]
+    apply_rotary_metadata(manifest, checkpoint_config, args.rope_theta, args.rotary_dim)
+    if manifest["topology"].get("rope_theta") is not None:
+        metadata["rope_theta"] = str(manifest["topology"]["rope_theta"])
+    if manifest["topology"].get("rotary_dim") is not None:
+        metadata["rotary_dim"] = str(manifest["topology"]["rotary_dim"])
 
     save_file(tensors, output_path, metadata=metadata)
 
@@ -103,11 +120,35 @@ def main() -> None:
                 "dtype": dtype_label,
                 "bytes": output_path.stat().st_size,
                 "sha256": manifest["serving_checkpoint"]["sha256"],
+                "rope_theta": manifest["topology"].get("rope_theta"),
+                "rotary_dim": manifest["topology"].get("rotary_dim"),
             },
             indent=2,
             sort_keys=True,
         )
     )
+
+
+def apply_rotary_metadata(
+    manifest: dict[str, Any],
+    checkpoint_config: dict[str, Any],
+    rope_theta_arg: int,
+    rotary_dim_arg: int,
+) -> None:
+    if (rope_theta_arg == 0) ^ (rotary_dim_arg == 0):
+        raise RuntimeError("--rope-theta and --rotary-dim must be provided together")
+    rope_theta = rope_theta_arg or checkpoint_config.get("rope_theta")
+    rotary_dim = rotary_dim_arg or checkpoint_config.get("rotary_dim")
+    if rope_theta is None and rotary_dim is None:
+        return
+    if rope_theta is None or rotary_dim is None:
+        raise RuntimeError("checkpoint rotary metadata must include both rope_theta and rotary_dim")
+    rope_theta = int(rope_theta)
+    rotary_dim = int(rotary_dim)
+    if rope_theta <= 0 or rotary_dim <= 0:
+        raise RuntimeError("rope_theta and rotary_dim must be positive")
+    manifest["topology"]["rope_theta"] = rope_theta
+    manifest["topology"]["rotary_dim"] = rotary_dim
 
 
 def load_tensors(checkpoint_path: Path, dtype: str) -> tuple[dict[str, Any], dict[str, Any]]:
