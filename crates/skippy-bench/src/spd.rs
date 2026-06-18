@@ -1,9 +1,10 @@
-use std::{collections::BTreeMap, fs, time::Instant};
+use std::{collections::BTreeMap, fs, path::Path, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use skippy_runtime::{
     ActivationFrame, GGML_TYPE_F16, RuntimeConfig, RuntimeLoadMode, StageModel,
+    package::{PackageStageRequest, inspect_layer_package, select_layer_package_parts},
     spd::{
         SpdHeadManifest, SpdLiveTapModelSource, SpdLiveTapRunner, SpdLiveTapRunnerConfig,
         SpdQwen3FixtureTopK, SpdQwen3ForwardInput, SpdQwen3ForwardTiming, SpdQwen3Head,
@@ -534,12 +535,35 @@ fn open_full_target_model(args: &SpdLiveTapParityArgs) -> Result<StageModel> {
         cache_type_k: GGML_TYPE_F16,
         cache_type_v: GGML_TYPE_F16,
         flash_attn_type: skippy_runtime::FlashAttentionType::Auto,
-        load_mode: RuntimeLoadMode::RuntimeSlice,
+        load_mode: live_tap_load_mode(&args.model_path),
         projector_path: None,
         include_embeddings: true,
         include_output: true,
         filter_tensors_on_load: false,
     };
+    if live_tap_model_path_is_layer_package(&args.model_path) {
+        let package_ref = args.model_path.to_string_lossy().to_string();
+        let package_info = inspect_layer_package(&package_ref).with_context(|| {
+            format!("inspect SPD live tap package {}", args.model_path.display())
+        })?;
+        let parts = select_layer_package_parts(&PackageStageRequest {
+            model_id: package_info.model_id,
+            topology_id: "spd-live-tap-parity".to_string(),
+            package_ref,
+            stage_id: "spd-live-tap-target".to_string(),
+            layer_start: 0,
+            layer_end: args.layer_end,
+            include_embeddings: true,
+            include_output: true,
+        })
+        .context("select SPD live tap full-target package parts")?;
+        return StageModel::open_from_parts(&parts.absolute_paths, &config).with_context(|| {
+            format!(
+                "open full target layer package {} for SPD verification",
+                args.model_path.display()
+            )
+        });
+    }
     StageModel::open(&args.model_path, &config).with_context(|| {
         format!(
             "open full target model {} for SPD verification",
@@ -671,8 +695,38 @@ fn open_live_tap_runner(
     manifest: &SpdHeadManifest,
     ranges: &[SpdStageLayerRange],
 ) -> Result<SpdLiveTapRunner> {
+    if live_tap_model_path_is_layer_package(&args.model_path) {
+        let package_ref = args.model_path.to_string_lossy().to_string();
+        let package_info = inspect_layer_package(&package_ref).with_context(|| {
+            format!("inspect SPD live tap package {}", args.model_path.display())
+        })?;
+        return open_live_tap_runner_with_source(
+            args,
+            manifest,
+            ranges,
+            SpdLiveTapModelSource::LayerPackage {
+                package_ref: &package_ref,
+                model_id: &package_info.model_id,
+                topology_id: "spd-live-tap-parity",
+            },
+        );
+    }
+    open_live_tap_runner_with_source(
+        args,
+        manifest,
+        ranges,
+        SpdLiveTapModelSource::Gguf(&args.model_path),
+    )
+}
+
+fn open_live_tap_runner_with_source(
+    args: &SpdLiveTapParityArgs,
+    manifest: &SpdHeadManifest,
+    ranges: &[SpdStageLayerRange],
+    model_source: SpdLiveTapModelSource<'_>,
+) -> Result<SpdLiveTapRunner> {
     SpdLiveTapRunner::open(SpdLiveTapRunnerConfig {
-        model_source: SpdLiveTapModelSource::Gguf(&args.model_path),
+        model_source,
         stage_ranges: ranges,
         layer_end: args.layer_end,
         hidden_size: usize::try_from(manifest.topology.hidden_size)
@@ -684,6 +738,18 @@ fn open_live_tap_runner(
         selected_backend_device: args.selected_backend_device.clone(),
     })
     .context("open live SPD tap runner")
+}
+
+fn live_tap_model_path_is_layer_package(path: &Path) -> bool {
+    path.is_dir() && path.join("model-package.json").is_file()
+}
+
+fn live_tap_load_mode(path: &Path) -> RuntimeLoadMode {
+    if live_tap_model_path_is_layer_package(path) {
+        RuntimeLoadMode::LayerPackage
+    } else {
+        RuntimeLoadMode::RuntimeSlice
+    }
 }
 
 fn assemble_live_cur_in(

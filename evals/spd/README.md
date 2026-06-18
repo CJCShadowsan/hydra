@@ -1688,6 +1688,51 @@ metrics honest: reference eval with `draft_top_k=4` is an oracle-style metric an
 cannot be compared directly to serving greedy top-1 verification. For speed
 work, the serving-path metric that matters for this checkpoint is `1 / 7`.
 
+Fresh identical-prompt proposal parity now has a repeatable comparator:
+`evals/spd/compare_reference_product_spd.py`. A reference eval-only rerun with
+the same LR `1e-4` BF16 head, `draft_top_k=1`, `max_new_tokens=8`, and the
+exact GSM8K Indras prompt emitted proposal traces at
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-lr1e4-proposal-trace-eval-uv-20260618-141057/artifacts/20260618-141057/eval/raw/pipeline_eval__train__speculation_head_final__nt9__per_sample.jsonl`.
+Comparing that trace with
+`/private/tmp/spd-qwen3-8b-q4-current-gsm8k-prompt2-inline-finaltap-v5.json`
+produced
+`/private/tmp/spd-qwen3-8b-q4-current-gsm8k-prompt2-reference-product-comparison.json`.
+The target token stream matches exactly for the first eight generated tokens
+(`10061,594,1438,1495,279,3491,3019,553`), but proposal parity is not clean:
+only `2 / 7` proposal tokens match the reference. The first reference proposal
+for target position `56` is token `594` and is accepted; the product inline Q4
+path proposes `7570` for that same target position from row roles `[2,0]` and
+rejects it. Do not start a larger training run solely from aggregate reference
+acceptance until this exact-prompt reference/product proposal divergence is
+explained or accepted as quantized-target training drift.
+
+Current live-tap reruns narrow that decision. `spd-live-tap-parity` now routes a
+local directory containing `model-package.json` through the existing
+layer-package tap runner instead of treating it as a direct GGUF. The
+package-shaped Q4 report
+`/private/tmp/spd-qwen3-8b-s2-23-lr1e4-live-tap-q4-layerpackage-current-rerun.json`
+successfully opens the Mesh-resolved
+`meshllm/Qwen3-8B-Q4_K_M-layers` package, collects h0/HF23/HF36 live taps, and
+matches target verification against the non-SPD decoder. It fails the same
+final-normed parity gate as the direct Q4 control: `cur_in_max_abs_diff=0.49609375`,
+rank-paired logit diff `0.3125`, and exact top-k drift. Direct GGUF controls
+using the same current harness show the quantization gradient. The Q8 report
+`/private/tmp/spd-qwen3-8b-s2-23-lr1e4-live-tap-q8-direct-current-rerun.json`
+uses the terminal-final-normed path, matches target verification against the
+non-SPD decoder, and reduces the gate to `cur_in_max_abs_diff=0.09765625` with
+rank-paired logit diff `0.0625` within tolerance, but exact top-k still drifts.
+The Q4 report
+`/private/tmp/spd-qwen3-8b-s2-23-lr1e4-live-tap-q4-direct-current-rerun.json`
+is worse on the same path: `cur_in_max_abs_diff=0.49609375`, rank-paired logit
+diff `0.3125`, and exact top-k drift. Raw terminal h36 remains much worse in
+both reports, confirming that final-normed terminal h36 is the serving
+convention closest to the BF16 training fixture. The practical read is that the
+current product-side mechanics are good enough to expose the real issue: a BF16
+reference-trained head is being evaluated on quantized GGUF/Metal hidden-state
+distributions, especially Q4. Before spending on a bigger generic BF16 run,
+train/evaluate on product-like quantized activations for the exact `23,36`
+split rather than only scaling the same BF16-reference recipe.
+
 Bounded local `llama-spec-bench` status for ordinary target/draft speculative
 decoding, separate from SPD:
 
@@ -1776,8 +1821,14 @@ The tap-row-to-`cur_in` projection bridge lives in
    HF36 delivery now works locally without replay fallback, but the current
    Qwen3-8B S2/23 head is still weak: the no-replay Q4 request-path smoke accepts
    only `1 / 7` greedy proposals and is much slower than baseline on one machine.
-   The remaining blockers are sidecar quality, broader prompt acceptance, and a
-   real two-node speed gate.
+   The newest identical-prompt comparator proves target-token parity but not
+   proposal-token parity. Current Q8/Q4 live-tap reruns make a remaining broad
+   tap/row semantic mismatch less likely than distribution drift: final-normed
+   Q8 is close but not exact, Q4 is materially farther away, and both preserve
+   normal target verification. The package-aware live-tap harness now confirms
+   the same Q4 drift on the Mesh-resolved layer package, so the next
+   sidecar-quality step should be product-distribution training/eval for the
+   exact `23,36` split.
 2. Train or fetch a topology-matched sidecar for each real two-stage product
    split before making any speed claim. For Qwen3.5-4B that means
    `num_stages=2`, `stage_layer_boundaries=16,32`, and tap rows
