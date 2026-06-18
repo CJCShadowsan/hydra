@@ -624,14 +624,11 @@ impl StageOpenAiBackend {
             let mut native_mtp = NativeMtpN1Verifier::default();
             let native_mtp_batched_verify = native_mtp_batched_verify_enabled();
             let native_mtp_reject_cooldown_tokens = native_mtp_reject_cooldown_tokens();
-            let native_mtp_defer_reject_trim = native_mtp_defer_reject_trim_enabled();
             let native_mtp_suppress_cooldown_drafts = native_mtp_suppress_cooldown_drafts_enabled();
             let native_mtp_suppress_cooldown_draft_limit =
                 native_mtp_suppress_cooldown_draft_limit();
             let mut native_mtp_reject_cooldown_remaining = 0usize;
             let mut native_mtp_suppress_cooldown_drafts_remaining = 0usize;
-            let mut native_mtp_deferred_reject_trim_count = 0usize;
-            let mut native_mtp_deferred_reject_trim_local_ms = 0.0_f64;
             let mut native_mtp_suppressed_cooldown_draft_count = 0usize;
             let mut native_mtp_batched_verification_count = 0usize;
             let mut native_mtp_initial_serial_verification_count = 0usize;
@@ -958,28 +955,20 @@ impl StageOpenAiBackend {
                         );
                     }
                     let mut trim_control = None;
-                    if committed_positions < consumed_positions {
-                        let target_token_count = prefill_token_count + decoded_tokens;
-                        let defer_trim = native_mtp_defer_reject_trim && !accepted && !reached_stop;
-                        let trim = if defer_trim {
-                            let trim = self.trim_embedded_stage_session_local(
-                                &session_key,
-                                target_token_count,
-                            )?;
-                            native_mtp_deferred_reject_trim_count += 1;
-                            native_mtp_deferred_reject_trim_local_ms += trim.local_ms;
-                            trim
-                        } else {
-                            self.trim_embedded_stage_session(
+                    match native_mtp_trim_action(committed_positions, consumed_positions) {
+                        NativeMtpTrimAction::None => {}
+                        NativeMtpTrimAction::FullSession => {
+                            let target_token_count = prefill_token_count + decoded_tokens;
+                            let trim = self.trim_embedded_stage_session(
                                 &request,
                                 downstream,
                                 &session_key,
                                 request_id,
                                 session_id,
                                 target_token_count,
-                            )?
-                        };
-                        trim_control = Some(trim);
+                            )?;
+                            trim_control = Some(trim);
+                        }
                     }
                     decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
                     decode_runtime_lock_wait_ms += verify.stats.runtime_lock_wait_ms;
@@ -1063,10 +1052,6 @@ impl StageOpenAiBackend {
                         token_attrs.insert(
                             "llama_stage.native_mtp.reject_cooldown_remaining".to_string(),
                             json!(native_mtp_reject_cooldown_remaining),
-                        );
-                        token_attrs.insert(
-                            "llama_stage.native_mtp.defer_reject_trim".to_string(),
-                            json!(native_mtp_defer_reject_trim),
                         );
                         if let Some(trim) = trim_control.as_ref() {
                             token_attrs.insert(
@@ -1709,10 +1694,6 @@ impl StageOpenAiBackend {
                 json!(native_mtp_reject_cooldown_tokens),
             );
             decode_attrs.insert(
-                "llama_stage.native_mtp.defer_reject_trim".to_string(),
-                json!(native_mtp_defer_reject_trim),
-            );
-            decode_attrs.insert(
                 "llama_stage.native_mtp.suppress_cooldown_drafts".to_string(),
                 json!(native_mtp_suppress_cooldown_drafts),
             );
@@ -1751,14 +1732,6 @@ impl StageOpenAiBackend {
             decode_attrs.insert(
                 "llama_stage.native_mtp.verify_next_accepted_count".to_string(),
                 json!(native_mtp_verify_next_accepted_count),
-            );
-            decode_attrs.insert(
-                "llama_stage.native_mtp.deferred_reject_trim_count".to_string(),
-                json!(native_mtp_deferred_reject_trim_count),
-            );
-            decode_attrs.insert(
-                "llama_stage.native_mtp.deferred_reject_trim_local_ms".to_string(),
-                json!(native_mtp_deferred_reject_trim_local_ms),
             );
             decode_attrs.insert(
                 "llama_stage.native_mtp.verify_next_draft_available_count".to_string(),

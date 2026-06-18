@@ -213,28 +213,4 @@ impl StageOpenAiBackend {
             downstream_wait_ms,
         })
     }
-
-    pub(super) fn trim_embedded_stage_session_local(
-        &self,
-        session_key: &str,
-        token_count: usize,
-    ) -> OpenAiResult<EmbeddedSessionControl> {
-        let timer = PhaseTimer::start();
-        let local_timer = PhaseTimer::start();
-        {
-            let mut runtime = self
-                .runtime
-                .lock()
-                .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-            runtime
-                .trim_session(session_key, token_count as u64)
-                .map_err(openai_backend_error)?;
-        }
-        Ok(EmbeddedSessionControl {
-            elapsed_ms: timer.elapsed_ms(),
-            local_ms: local_timer.elapsed_ms(),
-            downstream_write_ms: 0.0,
-            downstream_wait_ms: 0.0,
-        })
-    }
 }

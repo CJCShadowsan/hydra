@@ -1,6 +1,5 @@
 const BATCHED_VERIFY_ENV: &str = "SKIPPY_NATIVE_MTP_BATCHED_VERIFY";
 const REJECT_COOLDOWN_TOKENS_ENV: &str = "SKIPPY_NATIVE_MTP_REJECT_COOLDOWN_TOKENS";
-const DEFER_REJECT_TRIM_ENV: &str = "SKIPPY_NATIVE_MTP_DEFER_REJECT_TRIM";
 const SUPPRESS_COOLDOWN_DRAFTS_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFTS";
 const SUPPRESS_COOLDOWN_DRAFT_LIMIT_ENV: &str = "SKIPPY_NATIVE_MTP_SUPPRESS_COOLDOWN_DRAFT_LIMIT";
 
@@ -10,10 +9,6 @@ pub(in crate::frontend) fn native_mtp_batched_verify_enabled() -> bool {
 
 pub(in crate::frontend) fn native_mtp_reject_cooldown_tokens() -> usize {
     parse_usize_env(REJECT_COOLDOWN_TOKENS_ENV, 0)
-}
-
-pub(in crate::frontend) fn native_mtp_defer_reject_trim_enabled() -> bool {
-    truthy_env(std::env::var(DEFER_REJECT_TRIM_ENV).ok().as_deref())
 }
 
 pub(in crate::frontend) fn native_mtp_suppress_cooldown_drafts_enabled() -> bool {
