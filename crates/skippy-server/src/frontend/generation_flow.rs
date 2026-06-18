@@ -114,6 +114,7 @@ impl StageOpenAiBackend {
                 downstream_wire_condition,
                 prefill_reply_credit_limit,
                 lane_pool,
+                prediction_returns,
             } => self.generate_embedded_stage_zero_tokens(
                 EmbeddedStageZeroGeneration {
                     config: &config,
@@ -123,6 +124,11 @@ impl StageOpenAiBackend {
                     downstream_wire_condition,
                     prefill_reply_credit_limit,
                     lane_pool,
+                    prediction_return: prediction_returns
+                        .as_ref()
+                        .map(|hub| hub.register(ids.request_id, ids.session_id))
+                        .transpose()
+                        .map_err(openai_backend_error)?,
                     draft: self.draft.clone(),
                     speculative_window: self.speculative_window,
                     adaptive_speculative_window: self.adaptive_speculative_window,
@@ -206,11 +212,17 @@ impl StageOpenAiBackend {
                 activation_width,
                 downstream_wire_condition,
                 lane_pool,
+                prediction_returns,
                 ..
             } if config.downstream.is_some() => {
                 let lane_pool = lane_pool.ok_or_else(|| {
                     OpenAiError::backend("embedded stage 0 has no downstream lane pool")
                 })?;
+                let prediction_return = prediction_returns
+                    .as_ref()
+                    .map(|hub| hub.register(ids.request_id, ids.session_id))
+                    .transpose()
+                    .map_err(openai_backend_error)?;
                 return self.generate_split_multimodal_text(
                     SplitMultimodalGeneration {
                         prompt,
@@ -224,6 +236,7 @@ impl StageOpenAiBackend {
                         activation_width,
                         downstream_wire_condition,
                         lane_pool,
+                        prediction_return,
                     },
                     on_text_chunk,
                 );
@@ -825,14 +838,15 @@ impl StageOpenAiBackend {
                 let forward_write_ms = write_timer.elapsed_ms();
                 decode_forward_write_ms += forward_write_ms;
                 let wait_timer = PhaseTimer::start();
-                let reply = recv_reply(&mut lane.stream).map_err(openai_io_error)?;
+                let reply = request
+                    .prediction_return
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OpenAiError::backend("missing direct prediction return receiver")
+                    })?
+                    .recv_expected(WireReplyKind::PredictedToken)
+                    .map_err(openai_backend_error)?;
                 let downstream_wait_ms = wait_timer.elapsed_ms();
-                if reply.kind != WireReplyKind::PredictedToken {
-                    return Err(OpenAiError::backend(format!(
-                        "expected split multimodal decode PredictedToken reply from downstream, got {:?}",
-                        reply.kind
-                    )));
-                }
                 decode_downstream_wait_ms += downstream_wait_ms;
                 current = reply.predicted;
                 if self.telemetry.is_debug_enabled() {
