@@ -52,6 +52,12 @@ Skippy taps.
   `skippy-spd-head.json` into Rust-readable `spd-head.safetensors`.
 - `evals/spd/export_parity_fixture.py` exports real Python/reference hidden-tap
   rows, logits, top-k proposals, and cache fixtures for Rust parity checks.
+- `skippy-bench spd-live-tap-parity --product-corpus-dir <dir>` exports live
+  Skippy/product activation rows (`rows.f32` plus `rows.jsonl`) for the current
+  topology. `evals/spd/prepare_product_activation_corpus.py` converts that
+  corpus into safetensors for local supervised debug fine-tuning/eval. This is
+  not paper-faithful KL data yet because the native verifier currently exposes
+  greedy target tokens, not full teacher logits.
 - `evals/spd/README.md` is the live progress log and command cookbook for the
   current SPD proof.
 
@@ -238,6 +244,11 @@ serving evidence. It is not SPD evidence yet. For an SPD run on this exact
 topology, train/export a `Qwen/Qwen3-8B` sidecar with `num_stages=2` and
 `stage_layer_boundaries=23,36`, or add a product planner constraint so an SPD
 manifest can force/reject incompatible Mesh stage boundaries before serving.
+The current product-corpus smoke for this exact package/split is
+`/tmp/spd-qwen3-8b-product-corpus-smoke`: `sample_count=1`, `row_count=2`,
+`hidden_size=4096`, `rows_f32_bytes=32768`, and the old BF16-trained sidecar
+still rejects the first product proposal (`proposal=9914`, `target=23`). Use
+this as corpus-export evidence only, not quality or speed evidence.
 Use the trainer dry-run before spending time or HF money:
 
 ```bash

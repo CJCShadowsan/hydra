@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, fs, path::Path, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -179,6 +185,22 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
         &live_terminal_normed_topk,
         &fixture_forward.rust,
     )?;
+    let mut product_corpus = match &args.product_corpus_dir {
+        Some(dir) => Some(ProductActivationCorpusWriter::create(
+            ProductActivationCorpusConfig {
+                dir: dir.clone(),
+                args: &args,
+                manifest: &manifest,
+                prompt_tokens: &prompt_tokens,
+                row_count,
+                row_i_stages: &row_i_stages,
+                row_hf_indices: &row_hf_indices,
+                hidden_size,
+                final_norm_weight: &final_norm_weight,
+            },
+        )?),
+        None => None,
+    };
     let verified_generation = run_verified_generation(
         &args,
         &live_runner,
@@ -192,8 +214,13 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
             row_count,
             hidden_size,
         },
+        product_corpus.as_mut(),
     )
     .context("run repeated live SPD target verification")?;
+    let product_corpus_report = product_corpus
+        .as_mut()
+        .map(ProductActivationCorpusWriter::finish)
+        .transpose()?;
     let target_verification = verified_generation
         .first_step
         .clone()
@@ -247,6 +274,7 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
         },
         "target_verification": target_verification,
         "verified_generation": verified_generation.report,
+        "product_activation_corpus": product_corpus_report,
     });
     let json = serde_json::to_vec_pretty(&report)?;
     if let Some(output) = args.output {
@@ -337,6 +365,7 @@ fn run_verified_generation(
     spd_head: &SpdQwen3Head,
     tap_projector: &SpdTapInputProjector,
     inputs: VerifiedGenerationInputs<'_>,
+    mut product_corpus: Option<&mut ProductActivationCorpusWriter>,
 ) -> Result<VerifiedGenerationReport> {
     if inputs.prompt_tokens.len() < inputs.row_count {
         bail!(
@@ -387,9 +416,10 @@ fn run_verified_generation(
         let assemble_ms = elapsed_ms(assemble_timer);
 
         let head_timer = Instant::now();
+        let cur_in = live_rows.cur_in;
         let live_forward = spd_head.forward_timed(
             SpdQwen3ForwardInput {
-                cur_in: live_rows.cur_in,
+                cur_in: cur_in.clone(),
                 seq_len: inputs.row_count,
                 position_ids: row_positions.clone(),
                 fixed_stage_ids: None,
@@ -434,6 +464,24 @@ fn run_verified_generation(
             .context("target greedy baseline decode failed")?;
         let decode_ms = elapsed_ms(decode_timer);
         let baseline_token_count_after = target_session.token_count();
+        if let Some(writer) = product_corpus.as_deref_mut() {
+            writer.write_step(ProductActivationSample {
+                step_index,
+                context_tokens: &context_tokens,
+                row_positions: &row_positions,
+                row_stage_ids: inputs.row_i_stages,
+                row_hf_indices: inputs.row_hf_indices,
+                query_row_index: inputs.row_count.saturating_sub(1),
+                target_position: context_tokens.len(),
+                cur_in: &cur_in,
+                current_token: current,
+                proposal_topk: &live_topk,
+                target_token,
+                accepted,
+                committed_token,
+                baseline_greedy_token: baseline_token,
+            })?;
+        }
         context_tokens.push(committed_token);
 
         steps.push(json!({
@@ -597,6 +645,44 @@ struct DynamicLiveRows {
     cur_in: Vec<f32>,
 }
 
+struct ProductActivationCorpusConfig<'a> {
+    dir: PathBuf,
+    args: &'a SpdLiveTapParityArgs,
+    manifest: &'a SpdHeadManifest,
+    prompt_tokens: &'a [i32],
+    row_count: usize,
+    row_i_stages: &'a [i64],
+    row_hf_indices: &'a [Vec<u32>],
+    hidden_size: usize,
+    final_norm_weight: &'a [f32],
+}
+
+struct ProductActivationCorpusWriter {
+    dir: PathBuf,
+    rows_f32: BufWriter<File>,
+    rows_jsonl: BufWriter<File>,
+    row_count: usize,
+    hidden_size: usize,
+    sample_count: usize,
+}
+
+struct ProductActivationSample<'a> {
+    step_index: usize,
+    context_tokens: &'a [i32],
+    row_positions: &'a [i64],
+    row_stage_ids: &'a [i64],
+    row_hf_indices: &'a [Vec<u32>],
+    query_row_index: usize,
+    target_position: usize,
+    cur_in: &'a [f32],
+    current_token: i32,
+    proposal_topk: &'a SpdQwen3FixtureTopK,
+    target_token: i32,
+    accepted: bool,
+    committed_token: i32,
+    baseline_greedy_token: i32,
+}
+
 struct LiveRowInputs<'a> {
     row_count: usize,
     row_positions: &'a [i64],
@@ -616,6 +702,179 @@ struct DynamicLiveRowInputs<'a> {
     final_norm_weight: &'a [f32],
     layer_end: u32,
     hidden_size: usize,
+}
+
+impl ProductActivationCorpusWriter {
+    fn create(config: ProductActivationCorpusConfig<'_>) -> Result<Self> {
+        fs::create_dir_all(&config.dir)
+            .with_context(|| format!("create SPD product corpus dir {}", config.dir.display()))?;
+        write_f32_file(
+            &config.dir.join("final_norm_weight.f32"),
+            config.final_norm_weight,
+        )?;
+        let manifest = json!({
+            "schema": "skippy-spd-product-activation-corpus/v1",
+            "producer": "skippy-bench spd-live-tap-parity",
+            "manifest_path": config.args.manifest.display().to_string(),
+            "fixture_path": config.args.fixture.display().to_string(),
+            "model_path": config.args.model_path.display().to_string(),
+            "splits": &config.args.splits,
+            "layer_end": config.args.layer_end,
+            "ctx_size": config.args.ctx_size,
+            "n_gpu_layers": config.args.n_gpu_layers,
+            "selected_backend_device": &config.args.selected_backend_device,
+            "top_k": config.args.top_k,
+            "verify_steps": config.args.verify_steps,
+            "prompt_tokens": config.prompt_tokens,
+            "topology": &config.manifest.topology,
+            "row_count": config.row_count,
+            "hidden_size": config.hidden_size,
+            "row_stage_ids": config.row_i_stages,
+            "row_hf_indices": config.row_hf_indices,
+            "query_row_index": config.row_count.saturating_sub(1),
+            "cur_in_convention": "terminal_final_normed_cur_in",
+            "row_tensor": {
+                "path": "rows.f32",
+                "dtype": "f32_le",
+                "shape": ["sample_count", config.row_count, config.hidden_size],
+            },
+            "metadata_rows": {
+                "path": "rows.jsonl",
+                "schema": "skippy-spd-product-activation-row/v1",
+            },
+            "final_norm_weight": {
+                "path": "final_norm_weight.f32",
+                "dtype": "f32_le",
+                "shape": [config.hidden_size],
+            },
+            "label_kind": "target_greedy_top1",
+            "target_logits_available": false,
+            "paper_kl_training_ready": false,
+            "notes": [
+                "Rows are captured from live Skippy/product activations after terminal final-norm alignment.",
+                "Labels are greedy target tokens from the product verifier; full teacher logits are not exposed by the current native runtime ABI.",
+            ],
+        });
+        fs::write(
+            config.dir.join("manifest.json"),
+            format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+        )
+        .with_context(|| format!("write {}", config.dir.join("manifest.json").display()))?;
+        let rows_f32 = BufWriter::new(
+            File::create(config.dir.join("rows.f32"))
+                .with_context(|| format!("create {}", config.dir.join("rows.f32").display()))?,
+        );
+        let rows_jsonl = BufWriter::new(
+            File::create(config.dir.join("rows.jsonl"))
+                .with_context(|| format!("create {}", config.dir.join("rows.jsonl").display()))?,
+        );
+        Ok(Self {
+            dir: config.dir,
+            rows_f32,
+            rows_jsonl,
+            row_count: config.row_count,
+            hidden_size: config.hidden_size,
+            sample_count: 0,
+        })
+    }
+
+    fn write_step(&mut self, sample: ProductActivationSample<'_>) -> Result<()> {
+        let expected_len = self
+            .row_count
+            .checked_mul(self.hidden_size)
+            .context("SPD product corpus row length overflow")?;
+        if sample.cur_in.len() != expected_len {
+            bail!(
+                "SPD product corpus cur_in length {} does not match row_count {} * hidden_size {}",
+                sample.cur_in.len(),
+                self.row_count,
+                self.hidden_size
+            );
+        }
+        write_f32_slice(&mut self.rows_f32, sample.cur_in)?;
+        let row = json!({
+            "schema": "skippy-spd-product-activation-row/v1",
+            "sample_index": self.sample_count,
+            "row_f32_offset": self.sample_count * expected_len,
+            "row_f32_count": expected_len,
+            "step_index": sample.step_index,
+            "context_token_count_before": sample.context_tokens.len(),
+            "context_tokens": sample.context_tokens,
+            "row_positions": sample.row_positions,
+            "position_ids": sample.row_positions,
+            "row_stage_ids": sample.row_stage_ids,
+            "row_hf_indices": sample.row_hf_indices,
+            "query_row_index": sample.query_row_index,
+            "query_position": sample.row_positions.get(sample.query_row_index).copied(),
+            "target_position": sample.target_position,
+            "current_token": sample.current_token,
+            "proposal_top_k": {
+                "draft_indices": &sample.proposal_topk.draft_indices,
+                "token_ids": &sample.proposal_topk.token_ids,
+                "logits": &sample.proposal_topk.logits,
+            },
+            "target_token": sample.target_token,
+            "accepted": sample.accepted,
+            "committed_token": sample.committed_token,
+            "baseline_greedy_token": sample.baseline_greedy_token,
+            "greedy_output_matches_non_spd": sample.committed_token == sample.baseline_greedy_token,
+        });
+        serde_json::to_writer(&mut self.rows_jsonl, &row)
+            .context("write SPD product corpus JSONL row")?;
+        self.rows_jsonl
+            .write_all(b"\n")
+            .context("terminate SPD product corpus JSONL row")?;
+        self.sample_count += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<serde_json::Value> {
+        self.rows_f32
+            .flush()
+            .context("flush SPD product corpus rows.f32")?;
+        self.rows_jsonl
+            .flush()
+            .context("flush SPD product corpus rows.jsonl")?;
+        let rows_bytes = fs::metadata(self.dir.join("rows.f32"))
+            .with_context(|| format!("stat {}", self.dir.join("rows.f32").display()))?
+            .len();
+        let summary = json!({
+            "schema": "skippy-spd-product-activation-corpus-summary/v1",
+            "dir": self.dir.display().to_string(),
+            "sample_count": self.sample_count,
+            "row_count": self.row_count,
+            "hidden_size": self.hidden_size,
+            "rows_f32_bytes": rows_bytes,
+            "rows_f32_expected_bytes": self.sample_count * self.row_count * self.hidden_size * std::mem::size_of::<f32>(),
+            "rows_path": "rows.f32",
+            "metadata_path": "rows.jsonl",
+            "manifest_path": "manifest.json",
+        });
+        fs::write(
+            self.dir.join("summary.json"),
+            format!("{}\n", serde_json::to_string_pretty(&summary)?),
+        )
+        .with_context(|| format!("write {}", self.dir.join("summary.json").display()))?;
+        Ok(summary)
+    }
+}
+
+fn write_f32_file(path: &Path, values: &[f32]) -> Result<()> {
+    let mut writer =
+        BufWriter::new(File::create(path).with_context(|| format!("create {}", path.display()))?);
+    write_f32_slice(&mut writer, values)?;
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", path.display()))
+}
+
+fn write_f32_slice(writer: &mut impl Write, values: &[f32]) -> Result<()> {
+    for value in values {
+        writer
+            .write_all(&value.to_le_bytes())
+            .context("write f32 value")?;
+    }
+    Ok(())
 }
 
 fn fixture_prompt_tokens(fixture: &SpdSafetensorsFile) -> Result<Vec<i32>> {

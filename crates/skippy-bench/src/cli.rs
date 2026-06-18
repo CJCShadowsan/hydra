@@ -136,6 +136,11 @@ pub struct SpdLiveTapParityArgs {
     pub logits_tol: f32,
     #[arg(long)]
     pub output: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Write product live-tap SPD training rows into this corpus directory. Emits rows.f32 plus rows.jsonl metadata."
+    )]
+    pub product_corpus_dir: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -806,6 +811,8 @@ mod tests {
             "32",
             "--selected-backend-device",
             "CPU0",
+            "--product-corpus-dir",
+            "/tmp/spd-product-corpus",
         ])
         .unwrap();
 
@@ -822,6 +829,10 @@ mod tests {
         assert_eq!(args.splits, vec![8, 10, 16, 20, 24, 31]);
         assert_eq!(args.layer_end, 32);
         assert_eq!(args.selected_backend_device.as_deref(), Some("CPU0"));
+        assert_eq!(
+            args.product_corpus_dir,
+            Some(PathBuf::from("/tmp/spd-product-corpus"))
+        );
         assert_eq!(args.verify_steps, 1);
         assert_eq!(args.cur_in_tol, 0.05);
         assert_eq!(args.logits_tol, 0.25);

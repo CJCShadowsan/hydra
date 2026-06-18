@@ -45,6 +45,15 @@ Rust.
   embedding-only side tap for hidden-state index `0`, run the Rust SPD head
   from those live taps, and verify repeated live top-1 proposals with the
   Skippy target verifier.
+- `skippy-bench spd-live-tap-parity --product-corpus-dir <dir>` can now write
+  product live-tap SPD rows for sidecar preparation. The corpus contains
+  terminal-final-normed `cur_in` rows in `rows.f32`, verifier/proposal metadata
+  in `rows.jsonl`, and a `manifest.json` that records topology, model package,
+  split, row hf-indices, and the explicit limitation that current labels are
+  product verifier greedy top-1 tokens rather than full teacher logits. The
+  helper `evals/spd/prepare_product_activation_corpus.py` converts that corpus
+  to a safetensors tensor dataset and maps labels into `draft_token_ids` when
+  the SPD manifest provides a draft vocab.
 - `skippy-server` has a request-path speculative proposal-source boundary in
   front of the existing target verify/repair/rollback loop. The current draft
   model path uses it, and an experimental `spd-replay` source can load the
@@ -1826,9 +1835,41 @@ The tap-row-to-`cur_in` projection bridge lives in
    tap/row semantic mismatch less likely than distribution drift: final-normed
    Q8 is close but not exact, Q4 is materially farther away, and both preserve
    normal target verification. The package-aware live-tap harness now confirms
-   the same Q4 drift on the Mesh-resolved layer package, so the next
-   sidecar-quality step should be product-distribution training/eval for the
-   exact `23,36` split.
+   the same Q4 drift on the Mesh-resolved layer package. A one-step product
+   corpus smoke wrote `/tmp/spd-qwen3-8b-product-corpus-smoke` from the exact
+   `meshllm/Qwen3-8B-Q4_K_M-layers` package, `--splits 23 --layer-end 36`,
+   with `sample_count=1`, `row_count=2`, `hidden_size=4096`, and
+   `rows_f32_bytes=32768`; the proposal was still rejected
+   (`proposal=9914`, `target=23`). The next sidecar-quality step should be
+   product-distribution training/eval for the exact `23,36` split. The current
+   corpus is sufficient for a local top-1 supervised debug fine-tune/eval gate;
+   paper-faithful KL training from product execution still needs either target
+   logits exposed from the native runtime or an HF teacher pass aligned to the
+   captured product rows.
+
+   Repro command for the current one-step corpus smoke:
+
+   ```bash
+   target/debug/skippy-bench spd-live-tap-parity \
+     --manifest /private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train512-lr1e4-20260618/artifacts/20260618-114627/train/skippy-spd-head.json \
+     --fixture /private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train512-lr1e4-20260618/artifacts/20260618-114627/train/spd-parity-fixture.safetensors \
+     --model-path /Users/micn/.cache/huggingface/hub/models--meshllm--Qwen3-8B-Q4_K_M-layers/snapshots/3e7a18e5e6e861998189f14bf7f4b45a0d63e07d \
+     --splits 23 \
+     --layer-end 36 \
+     --ctx-size 128 \
+     --n-gpu-layers=-1 \
+     --top-k 4 \
+     --verify-steps 1 \
+     --cur-in-tol 999 \
+     --logits-tol 999 \
+     --product-corpus-dir /tmp/spd-qwen3-8b-product-corpus-smoke \
+     --output /tmp/spd-qwen3-8b-product-corpus-smoke.json
+   ```
+
+   The command exits nonzero today because the existing BF16-trained head still
+   fails the live-vs-fixture top-k parity gate on Q4 product activations; that
+   is expected for this diagnostic. The corpus is written before that final
+   gate and is described by `/tmp/spd-qwen3-8b-product-corpus-smoke/summary.json`.
 2. Train or fetch a topology-matched sidecar for each real two-stage product
    split before making any speed claim. For Qwen3.5-4B that means
    `num_stages=2`, `stage_layer_boundaries=16,32`, and tap rows
