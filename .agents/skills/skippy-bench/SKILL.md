@@ -54,6 +54,11 @@ skippy-bench eval run speed-bench \
   --metrics-run-id run-local-qwen
 ```
 
+`--timeout-secs` is passed to the native harness as its request/task timeout
+where supported. It is not a full-run dataset limit. Use
+`--harness-timeout-secs` only when you need a hard wall-clock cap for an
+operator/debug run; omit it for canonical full-dataset validation.
+
 Core eval ids:
 
 - `speed-bench` — llama.cpp SPEED-Bench client for OpenAI-compatible serving

@@ -129,6 +129,8 @@ pub struct EvalRunArgs {
     #[arg(long, default_value_t = 300)]
     pub timeout_secs: u64,
     #[arg(long)]
+    pub harness_timeout_secs: Option<u64>,
+    #[arg(long)]
     pub run_id: Option<String>,
     #[arg(long, default_value = "http://127.0.0.1:18080")]
     pub metrics_http: String,

@@ -122,6 +122,11 @@ skippy-bench eval run terminal-bench \
   --metrics-run-id run-local-qwen
 ```
 
+`--timeout-secs` is forwarded to native harnesses as their request/task timeout
+where supported. It is not a SkippyBench dataset limit and does not cap full
+canonical runs. Use `--harness-timeout-secs` only when an operator wants a hard
+wall-clock cap around the native harness process for debugging or CI guardrails.
+
 `sync` clones or installs the external harnesses into
 `~/.cache/mesh-llm/skippy-bench/harnesses/` by default. Use `--cache-root` to
 override that location. Use `--dry-run` with `sync` or `run` to inspect the

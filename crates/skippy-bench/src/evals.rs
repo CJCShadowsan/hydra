@@ -2,9 +2,13 @@ use std::{
     env, fs,
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -88,6 +92,9 @@ struct RunReport {
     command: String,
     exit_status: Option<i32>,
     success: bool,
+    timed_out: bool,
+    timeout_secs: u64,
+    harness_timeout_secs: Option<u64>,
     stdout_path: Option<String>,
     stderr_path: Option<String>,
     metrics: EvalMetrics,
@@ -329,6 +336,9 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
         command: display,
         exit_status: None,
         success: args.dry_run,
+        timed_out: false,
+        timeout_secs: args.timeout_secs,
+        harness_timeout_secs: args.harness_timeout_secs,
         stdout_path: None,
         stderr_path: None,
         metrics: EvalMetrics::default(),
@@ -339,19 +349,19 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
     if !args.dry_run {
         create_metrics_run(&args, &run_id, &metrics_run_id)?;
         let started = Instant::now();
-        let output = command
-            .command()
-            .output()
-            .with_context(|| format!("start {}", definition.id.as_str()))?;
-        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         let stdout_path = run_dir.join("raw").join("stdout.log");
         let stderr_path = run_dir.join("raw").join("stderr.log");
-        fs::write(&stdout_path, &output.stdout)
-            .with_context(|| format!("write {}", stdout_path.display()))?;
-        fs::write(&stderr_path, &output.stderr)
-            .with_context(|| format!("write {}", stderr_path.display()))?;
-        report.exit_status = output.status.code();
-        report.success = output.status.success();
+        let outcome = run_command_with_timeout(
+            &command,
+            args.harness_timeout_secs.map(Duration::from_secs),
+            &stdout_path,
+            &stderr_path,
+        )
+        .with_context(|| format!("run {}", definition.id.as_str()))?;
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        report.exit_status = outcome.exit_status;
+        report.success = outcome.success;
+        report.timed_out = outcome.timed_out;
         report.stdout_path = Some(stdout_path.display().to_string());
         report.stderr_path = Some(stderr_path.display().to_string());
         report.metrics = collect_metrics(definition, &run_dir, duration_ms);
@@ -375,6 +385,97 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+struct CommandOutcome {
+    exit_status: Option<i32>,
+    success: bool,
+    timed_out: bool,
+}
+
+fn run_command_with_timeout(
+    spec: &CommandSpec,
+    timeout: Option<Duration>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<CommandOutcome> {
+    let mut command = spec.command();
+    configure_child_group(&mut command);
+    command.stdout(Stdio::from(
+        fs::File::create(stdout_path)
+            .with_context(|| format!("create {}", stdout_path.display()))?,
+    ));
+    command.stderr(Stdio::from(
+        fs::File::create(stderr_path)
+            .with_context(|| format!("create {}", stderr_path.display()))?,
+    ));
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start {}", spec.program))?;
+    wait_with_timeout(&mut child, timeout)
+}
+
+fn wait_with_timeout(child: &mut Child, timeout: Option<Duration>) -> Result<CommandOutcome> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("poll harness command")? {
+            return Ok(CommandOutcome {
+                exit_status: status.code(),
+                success: status.success(),
+                timed_out: false,
+            });
+        }
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            terminate_child(child)?;
+            return Ok(CommandOutcome {
+                exit_status: None,
+                success: false,
+                timed_out: true,
+            });
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn configure_child_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn terminate_child(child: &mut Child) -> Result<()> {
+    terminate_child_signal(child, "TERM");
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(5) {
+        if child
+            .try_wait()
+            .context("poll terminated harness command")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    terminate_child_signal(child, "KILL");
+    let _ = child.wait().context("wait for killed harness command")?;
+    Ok(())
+}
+
+fn terminate_child_signal(child: &mut Child, signal: &str) {
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .args([format!("-{signal}"), process_group])
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = signal;
+    }
 }
 
 fn definition(id: EvalId) -> EvalDefinition {
@@ -1437,6 +1538,7 @@ mod tests {
             cache_root: None,
             output_dir: None,
             timeout_secs: 30,
+            harness_timeout_secs: None,
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,
@@ -1464,6 +1566,7 @@ mod tests {
             cache_root: None,
             output_dir: None,
             timeout_secs: 30,
+            harness_timeout_secs: None,
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,
@@ -1482,6 +1585,64 @@ mod tests {
                 .envs
                 .contains(&("OPENAI_BASE_URL".to_string(), args.base_url))
         );
+    }
+
+    #[test]
+    fn run_command_with_timeout_captures_successful_output() {
+        let run_dir = temp_run_dir("command-success");
+        fs::create_dir_all(&run_dir).unwrap();
+        let stdout_path = run_dir.join("stdout.log");
+        let stderr_path = run_dir.join("stderr.log");
+        let command = CommandSpec::new("sh").args(["-c", "echo stdout-line; echo stderr-line >&2"]);
+
+        let outcome = run_command_with_timeout(
+            &command,
+            Some(Duration::from_secs(5)),
+            &stdout_path,
+            &stderr_path,
+        )
+        .unwrap();
+
+        assert!(outcome.success);
+        assert_eq!(outcome.exit_status, Some(0));
+        assert!(!outcome.timed_out);
+        assert_eq!(
+            fs::read_to_string(stdout_path).unwrap().trim(),
+            "stdout-line"
+        );
+        assert_eq!(
+            fs::read_to_string(stderr_path).unwrap().trim(),
+            "stderr-line"
+        );
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn run_command_with_timeout_marks_hung_command_timed_out() {
+        let run_dir = temp_run_dir("command-timeout");
+        fs::create_dir_all(&run_dir).unwrap();
+        let stdout_path = run_dir.join("stdout.log");
+        let stderr_path = run_dir.join("stderr.log");
+        let command = CommandSpec::new("sh").args(["-c", "echo before-sleep; sleep 30"]);
+
+        let started = Instant::now();
+        let outcome = run_command_with_timeout(
+            &command,
+            Some(Duration::from_secs(1)),
+            &stdout_path,
+            &stderr_path,
+        )
+        .unwrap();
+
+        assert!(!outcome.success);
+        assert_eq!(outcome.exit_status, None);
+        assert!(outcome.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            fs::read_to_string(stdout_path).unwrap().trim(),
+            "before-sleep"
+        );
+        let _ = fs::remove_dir_all(run_dir);
     }
 
     #[test]
