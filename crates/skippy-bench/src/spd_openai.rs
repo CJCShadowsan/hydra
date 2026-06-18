@@ -721,6 +721,10 @@ struct SpdPipelineGapSummary {
 struct SpdPaperPipelineEstimate {
     logical_stage_count: usize,
     physical_stage_count: usize,
+    candidate_token_round_trips: u64,
+    saved_token_round_trips: u64,
+    unsaved_token_round_trips: u64,
+    token_round_trip_save_rate: Option<f64>,
     accepted_proposal_rate: Option<f64>,
     paper_like_speedup_vs_serial_split: Option<f64>,
     estimated_decode_ms_at_baseline_stage_cost: Option<f64>,
@@ -1048,6 +1052,7 @@ fn paper_pipeline_estimate(
     spd_decode_ms: &MetricSummary,
 ) -> SpdPaperPipelineEstimate {
     let accepted_proposal_rate = ratio(accepted, proposed);
+    let unsaved_token_round_trips = proposed.saturating_sub(accepted);
     let paper_like_speedup_vs_serial_split = accepted_proposal_rate.and_then(|rate| {
         let speedup = logical_stage_count as f64 * rate;
         (speedup > 0.0).then_some(speedup)
@@ -1069,6 +1074,10 @@ fn paper_pipeline_estimate(
     SpdPaperPipelineEstimate {
         logical_stage_count,
         physical_stage_count,
+        candidate_token_round_trips: proposed,
+        saved_token_round_trips: accepted,
+        unsaved_token_round_trips,
+        token_round_trip_save_rate: accepted_proposal_rate,
         accepted_proposal_rate,
         paper_like_speedup_vs_serial_split,
         estimated_decode_ms_at_baseline_stage_cost,

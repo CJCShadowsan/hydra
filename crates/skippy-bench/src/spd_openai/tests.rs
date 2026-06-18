@@ -391,6 +391,16 @@ fn summary_compares_prompt_pairs_and_totals() {
     assert_eq!(summary.paper_pipeline_estimate.logical_stage_count, 4);
     assert_eq!(summary.paper_pipeline_estimate.physical_stage_count, 7);
     assert_eq!(
+        summary.paper_pipeline_estimate.candidate_token_round_trips,
+        4
+    );
+    assert_eq!(summary.paper_pipeline_estimate.saved_token_round_trips, 2);
+    assert_eq!(summary.paper_pipeline_estimate.unsaved_token_round_trips, 2);
+    assert_eq!(
+        summary.paper_pipeline_estimate.token_round_trip_save_rate,
+        Some(0.5)
+    );
+    assert_eq!(
         summary
             .paper_pipeline_estimate
             .paper_like_speedup_vs_serial_split,

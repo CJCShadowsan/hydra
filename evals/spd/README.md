@@ -320,10 +320,12 @@ The expected topology output is `physical_split_boundaries=[23]`,
 `layer_end=36`, `shallow_hidden_layer_indices="0,23,36;0,23"`, and worker
 tap-return allowlist `[23,36]`. A real sidecar training run should use the same
 topology arguments without `--dry-run-topology`; use smaller `--train-rows`
-only for plumbing, not for the quality artifact. On local MPS, keep
-`--model-torch-dtype float16` for Qwen3-8B plumbing runs; the runner's default
-`auto` dtype preserves the older float32 MPS behavior used by smaller proof
-heads.
+only for plumbing, not for the quality artifact. On this local M4/MPS path,
+use `--model-torch-dtype bfloat16` for Qwen3-8B runs that take more than a tiny
+debug step count. A 64-row float16 run completed but every exported head tensor
+was non-finite, while the matching bfloat16 run stayed finite. The runner's
+default `auto` dtype preserves the older float32 MPS behavior used by smaller
+proof heads.
 
 2026-06-18 local Qwen3-8B S2 `23,36` sidecar plumbing checkpoint: a tiny
 2-row MPS run loaded the full `Qwen/Qwen3-8B` HF weights on the local M4 with
@@ -378,6 +380,35 @@ plumbing for the exact product topology. It is not speed or quality evidence:
 with `0 / 7` accepted proposals, there are no future verifier/stage round trips
 to remove from the critical path, so the expected ideal speedup is effectively
 `1.0x` before overhead and the measured result is necessarily slower.
+
+2026-06-18 local Qwen3-8B S2 `23,36` 64-row training checkpoint: a float16 MPS
+run with `train_rows=64`, `max_length=128`, `gradient_accumulation_steps=4`,
+and `draft_top_k=4` produced an all-non-finite checkpoint despite completing
+training/eval. The export scripts now reject non-finite checkpoint and fixture
+tensors so this cannot silently become a serving bundle. Repeating the same
+shape with `--model-torch-dtype bfloat16` produced a finite checkpoint at
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train64-20260618-104718/artifacts/20260618-104718`.
+Reference eval over `24` prompts and `384` generated tokens reported aggregate
+acceptance `0.5378`, equivalent accept length `1.0756`, theoretical gain
+`7.59%`, and `30 / 384` accepted draft flags. BF16 export produced a
+Rust-readable `spd-head.safetensors` with `56` tensors; parity fixture export
+produced finite logits and real top-token ids. `skippy-bench
+spd-fixture-parity` passed mechanically; tap reconstruction was close
+(`max_abs_diff=0.000488`), the uncached Rust/Python top-8 token set matched
+with rank/logit drift, and the cached diagnostic still diverged more. Local
+package-backed `spd-openai-smoke` on the same `23,36` topology matched
+baseline/SPD content, proposed `15`, accepted `0`, rejected `15`, recorded
+`0` tap failures, used `15` inline package taps with `0` replay fallbacks, and
+measured `243.4ms` baseline decode versus `1187.8ms` SPD decode. This is a
+finite local training/export/request-path checkpoint, not a speed candidate:
+serving acceptance on the default prompt is still zero, and sidecar forward/head
+time was about `879ms` for `16` generated tokens.
+`spd-openai-smoke` now records the same bottom line directly in
+`summary.paper_pipeline_estimate`: candidate token round trips are proposed SPD
+tokens, saved token round trips are accepted SPD tokens, and unsaved token round
+trips are rejected proposals. For this checkpoint, that math is `15`
+candidates, `0` saved, and `15` unsaved, so there is no ideal critical-path
+speedup to claim before overhead.
 
 - 2026-06-17 the first model-backed 24-token rolling-executor smoke after the
   replay reset cleanup is

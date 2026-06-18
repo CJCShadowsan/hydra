@@ -99,6 +99,7 @@ def main() -> None:
         top_k=args.top_k,
         newest_pos_arg=args.newest_pos,
     )
+    ensure_fixture_tensors_finite(fixture.tensors)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -392,6 +393,22 @@ def build_fixture(
         cached_prefill_row_count=cached_prefill_row_count,
         cached_crop_position=cached_crop_position,
     )
+
+
+def ensure_fixture_tensors_finite(tensors: dict[str, Any]) -> None:
+    import torch
+
+    for name, tensor in tensors.items():
+        if not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
+            continue
+        finite = torch.isfinite(tensor.float())
+        if bool(finite.all()):
+            continue
+        finite_count = int(finite.sum().item())
+        raise RuntimeError(
+            f"fixture tensor {name!r} contains non-finite values: "
+            f"{finite_count}/{tensor.numel()} finite"
+        )
 
 
 def resolve_newest_pos(seq_len: int, num_stages: int, newest_pos_arg: int) -> int:

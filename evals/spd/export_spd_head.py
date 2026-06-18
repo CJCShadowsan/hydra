@@ -142,12 +142,28 @@ def load_tensors(checkpoint_path: Path, dtype: str) -> tuple[dict[str, Any], dic
         tensor = value.detach().cpu().contiguous()
         if target_dtype is not None:
             tensor = tensor.to(target_dtype)
+        ensure_finite_tensor(name, tensor)
         tensors[name] = tensor
 
     if not tensors:
         raise RuntimeError(f"{checkpoint_path} did not contain any tensors")
     config = checkpoint.get("config") if isinstance(checkpoint.get("config"), dict) else {}
     return tensors, config
+
+
+def ensure_finite_tensor(name: str, tensor: Any) -> None:
+    import torch
+
+    if not torch.is_floating_point(tensor):
+        return
+    finite = torch.isfinite(tensor.float())
+    if bool(finite.all()):
+        return
+    finite_count = int(finite.sum().item())
+    raise RuntimeError(
+        f"checkpoint tensor {name!r} contains non-finite values: "
+        f"{finite_count}/{tensor.numel()} finite"
+    )
 
 
 def common_dtype_label(tensors: dict[str, Any]) -> str:

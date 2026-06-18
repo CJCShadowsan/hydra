@@ -261,8 +261,11 @@ python3 evals/spd/hf_train_eval_qwen06.py \
 
 This must report `physical_split_boundaries=[23]`, `layer_end=36`, tap rows
 `0,23,36;0,23`, and worker tap-return allowlist `[23,36]`. For local MPS
-Qwen3-8B plumbing, keep `--model-torch-dtype float16`; leave `auto` or use
-`bfloat16` on CUDA/HF jobs after confirming the target hardware.
+Qwen3-8B training beyond tiny plumbing, use `--model-torch-dtype bfloat16` on
+this M4. A matching 64-row float16 run completed but produced all-non-finite
+head tensors; the bfloat16 run stayed finite. Leave `auto` only for older small
+proof heads or use `bfloat16` on CUDA/HF jobs after confirming the target
+hardware.
 
 Current local Qwen3-8B debug checkpoint: a 2-row MPS plumbing run trained
 `Qwen/Qwen3-8B` with `num_stages=2`, `stage_layer_boundaries=23,36`,
@@ -292,6 +295,21 @@ fallbacks, and measured `134.3ms` baseline decode versus `586.4ms` SPD decode.
 This is request-path plumbing evidence only. With `0 / 7` accepted proposals,
 there are zero critical-path token round trips saved, so the slowdown is
 expected from sidecar overhead.
+
+Current local Qwen3-8B finite training checkpoint: the bfloat16 64-row MPS run
+at `/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train64-20260618-104718/artifacts/20260618-104718`
+uses the exact `23,36` topology, exported finite BF16 serving weights and a
+finite parity fixture, and passed `skippy-bench spd-fixture-parity`
+mechanically. Reference eval over `24` prompts / `384` generated tokens
+reported aggregate acceptance `0.5378`, equivalent accept length `1.0756`, and
+theoretical gain `7.59%`. Local package-backed `spd-openai-smoke` matched
+baseline/SPD content but accepted `0 / 15` proposals on the default prompt,
+with `15` inline package taps, `0` replay fallbacks, and `0` tap failures.
+Treat this as finite training/export/request-path evidence, not speed evidence.
+The export scripts now reject non-finite checkpoint or fixture tensors.
+`spd-openai-smoke` reports candidate, saved, and unsaved token round trips under
+`summary.paper_pipeline_estimate`; for this checkpoint the accepted-token round
+trip math is `15` candidates, `0` saved, and `15` unsaved.
 
 ## First Larger Training Target
 
