@@ -139,6 +139,18 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Training log interval passed to the reference trainer.",
     )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=100,
+        help="Learning-rate warmup steps passed to the reference trainer.",
+    )
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=5000,
+        help="Checkpoint save interval passed to the reference trainer.",
+    )
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--draft-top-k", type=int, default=1)
@@ -293,6 +305,7 @@ def patch_reference_for_glm_training_smoke(reference_dir: Path) -> None:
     patch_pipeline_model_for_glm(reference_dir / "pipeline_model.py")
     patch_train_for_glm_template(reference_dir / "train.py")
     patch_train_for_label_filtering(reference_dir / "train.py")
+    patch_train_for_training_controls(reference_dir / "train.py")
 
 
 def patch_train_for_glm_template(path: Path) -> None:
@@ -372,6 +385,27 @@ def patch_train_for_label_filtering(path: Path) -> None:
         return False
     return True
 ''',
+    )
+
+
+def patch_train_for_training_controls(path: Path) -> None:
+    replace_once(
+        path,
+        '    p.add_argument("--log_interval", type=int, default=20)\n',
+        '''    p.add_argument("--log_interval", type=int, default=20)
+    p.add_argument("--warmup_steps", type=int, default=100)
+    p.add_argument("--save_steps", type=int, default=5000)
+''',
+    )
+    replace_once(
+        path,
+        "        warmup_steps=100,\n",
+        "        warmup_steps=args.warmup_steps,\n",
+    )
+    replace_once(
+        path,
+        "        save_steps=5000,\n",
+        "        save_steps=args.save_steps,\n",
     )
 
 
@@ -805,6 +839,10 @@ def train_head(args: argparse.Namespace, reference_dir: Path, train_jsonl: Path,
         str(train_dir),
         "--log_interval",
         str(args.log_interval),
+        "--warmup_steps",
+        str(args.warmup_steps),
+        "--save_steps",
+        str(args.save_steps),
     ]
     hidden_rows = hidden_tap_rows_arg(args)
     if hidden_rows:
