@@ -159,6 +159,7 @@ def patch_reference_for_proof(reference_dir: Path) -> None:
         '        report_to="wandb",\n',
         "        report_to=[],\n",
     )
+    patch_eval_for_token_trace(reference_dir / "eval.py")
     patch_reference_for_transformers(reference_dir)
 
 
@@ -338,6 +339,21 @@ def patch_train_checkpoint_for_stage_boundaries(path: Path) -> None:
         """                    "num_stages": pm.num_stages,
                     "stage_layer_boundaries": list(getattr(pm, "stage_layer_boundaries", [])),
                     "num_spec_layers": pm.num_spec_layers,
+""",
+    )
+
+
+def patch_eval_for_token_trace(path: Path) -> None:
+    replace_once(
+        path,
+        """            "generated": gen_text,
+            "new_tokens": new_tokens,
+""",
+        """            "generated": gen_text,
+            "prompt_token_ids": [int(x) for x in input_ids[0].detach().cpu().tolist()],
+            "generated_token_ids": [int(x) for x in gen_only_ids.detach().cpu().tolist()],
+            "token_acceptance": [bool(x) for x in token_acceptance],
+            "new_tokens": new_tokens,
 """,
     )
 

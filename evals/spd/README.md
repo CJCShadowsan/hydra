@@ -480,6 +480,23 @@ Rust/package-backed SPD over those same token ids/prompts, and compare
 proposal token ids, tap rows, and target verification decisions position by
 position before spending on larger training.
 
+A follow-up token-trace reference eval added `prompt_token_ids`,
+`generated_token_ids`, and `token_acceptance` to the raw JSONL:
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-lr1e4-token-trace-eval-20260618/artifacts/20260618-121348/eval/raw/pipeline_eval__train__speculation_head_final__nt12__per_sample.jsonl`.
+The first four GSM8K prompts have the same prompt-token lengths in product and
+reference (`51`, `117`, `55`, `76`), but the generated target tokens only match
+all `32` positions for prompts `0` and `2`; prompt `1` diverges at generated
+token index `6`, and prompt `3` diverges immediately at generated token index
+`0`. This exposes a real hidden assumption: the reference eval is using HF
+Qwen3-8B weights, while the product smoke verifies against the Q4_K_M GGUF
+layer package. On the comparable identical-output prompts, product still trails
+reference for prompt `2`: reference has `5 / 31` speculative accepts after
+excluding the always-true first generated token, while product accepts `2 / 27`.
+Prompt `0` has `0 / 31` speculative accepts in both. Do not treat the aggregate
+reference count as product acceptance until the sidecar is evaluated against
+the same quantized target behavior or the product smoke is rerun on a
+higher-precision GGUF target.
+
 The corrected parity did **not** make the 512-row Qwen3-8B sidecar a product
 candidate. The paired local package-backed OpenAI sweep
 `/private/tmp/spd-qwen3-8b-s2-23-bf16-train512-local-openai-sweep6-16-after-parity.json`
