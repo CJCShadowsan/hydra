@@ -133,6 +133,12 @@ def parse_args() -> argparse.Namespace:
         default=1e-5,
         help="Learning rate for the speculation head trainer.",
     )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=20,
+        help="Training log interval passed to the reference trainer.",
+    )
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--draft-top-k", type=int, default=1)
@@ -392,6 +398,31 @@ def patch_pipeline_model_for_glm(path: Path) -> None:
                 end_layer = (stage_idx + 1) * lps
 ''',
         '''                start_layer, end_layer = self.stage_layer_ranges[stage_idx]
+''',
+    )
+    patch_pipeline_model_for_draft_vocab_training(path)
+
+
+def patch_pipeline_model_for_draft_vocab_training(path: Path) -> None:
+    replace_once(
+        path,
+        '''        teacher_argmax_full = teacher_logits.argmax(dim=-1)
+        if self._use_draft_vocab:
+            teacher_argmax_draft = self._token_id_to_draft_idx.to(teacher_argmax_full.device)[teacher_argmax_full]
+            teacher_in_draft = teacher_argmax_draft >= 0
+            valid_mask_2d = valid_mask_2d & teacher_in_draft
+            target_for_acc_2d = teacher_argmax_draft.to(spec_logits.device)
+        else:
+            target_for_acc_2d = teacher_argmax_full.to(spec_logits.device)
+''',
+        '''        if self._use_draft_vocab:
+            # The KL target has already been sliced to the draft vocabulary above.
+            # Filtering by the full-vocab argmax can drop every assistant position
+            # when the reduced draft vocab is small, yielding an exact zero loss.
+            target_for_acc_2d = teacher_target.argmax(dim=-1).to(spec_logits.device)
+        else:
+            teacher_argmax_full = teacher_logits.argmax(dim=-1)
+            target_for_acc_2d = teacher_argmax_full.to(spec_logits.device)
 ''',
     )
     replace_once(
@@ -718,6 +749,8 @@ def train_head(args: argparse.Namespace, reference_dir: Path, train_jsonl: Path,
         args.attn_implementation,
         "--output_dir",
         str(train_dir),
+        "--log_interval",
+        str(args.log_interval),
     ]
     hidden_rows = hidden_tap_rows_arg(args)
     if hidden_rows:
