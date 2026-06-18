@@ -51,6 +51,32 @@ argmax accuracy `0.875`. The serving export is
 `43501aa95fd191ad087af1396f6b1909cb2bc72e83391085d23997978427531b`.
 `skippy-bench spd-fixture-parity` exits successfully for that export.
 
+2026-06-18 larger max120 product-corpus check: the no-spend path was expanded
+to `/tmp/spd-qwen3-8b-product-prompts-paper3-train32-heldout16-max120`, which
+keeps prompts short enough for the current live-tap `n_batch=128` limit. It
+captured `712` train rows from `89` prompts and `256` held-out rows from `32`
+disjoint prompts. HF teacher alignment on the train rows remained strong
+(`668 / 712` teacher top-1 matches native Q4 target; `702 / 712` top-4 contains
+target). The 5-epoch BF16 HF-KL fine-tune exported and passed Rust fixture
+parity at
+`/tmp/spd-qwen3-8b-product-finetune-paper3-train32-max120-e5-lr2e5/`, but
+held-out live-tap acceptance was only `91 / 256` with exact greedy output.
+Held-out attribution shows the problem is sidecar generalization, not
+teacher/Q4 disagreement: the HF teacher matched the native Q4 target on
+`245 / 256`, while the sidecar matched the teacher on only `95 / 256`.
+
+A native-hard-label experiment on the same `712` rows also exported and passed
+Rust fixture parity at
+`/tmp/spd-qwen3-8b-product-finetune-paper3-train32-max120-hard-e5-lr2e5/`.
+It improved the same held-out gate only to `95 / 256`, again with exact greedy
+output and terminal-final-normed parity clean. This is not enough for a
+request-path speed smoke. The grounded next no-spend step is a larger disjoint
+short-prompt product corpus (for example the generated
+`/tmp/spd-qwen3-8b-product-prompts-paper3-train56-heldout8-max120`, `137`
+train prompts / `16` held-out prompts) plus less-overfit training and the same
+held-out attribution. If that still fails, the next tooling gap is native
+Q4_K_M verifier top-k/logit capture for paper-faithful supervision.
+
 The held-out live-tap check at
 `/tmp/spd-qwen3-8b-product-finetune-paper3-train16-e5-lr2e5/live-tap-heldout8.json`
 matched non-SPD greedy output on all `24` prompts and accepted `110 / 192`

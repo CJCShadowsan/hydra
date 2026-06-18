@@ -61,6 +61,19 @@ measured wall-clock speed. The next gate is a robust same-topology product
 sidecar whose held-out package-backed serving clears `paper_pipeline_estimate >
 1.0` with margin on the real split.
 
+A later no-spend max120 product-corpus check confirmed that simply fitting the
+small HF-teacher bridge harder is not enough. The
+`/tmp/spd-qwen3-8b-product-prompts-paper3-train32-heldout16-max120` split
+captured `712` train rows and `256` disjoint held-out rows without the earlier
+live-tap `n_batch=128` assertion. HF teacher alignment stayed high
+(`245 / 256` held-out teacher top-1 matches native Q4 target), but the
+5-epoch HF-KL head accepted only `91 / 256` held-out proposals and the native
+hard-label variant only `95 / 256`; both were fixture-parity clean and
+content-exact. Do not run release/request-path timing for those heads. The next
+grounded step is a larger disjoint short-prompt product corpus plus
+less-overfit training; if that still fails, expose native Q4_K_M verifier
+top-k/logits rather than spending on larger generic HF-teacher KL.
+
 What is working:
 
 - Real `skippy-bench spd-openai-smoke` can launch local binary stages, start the

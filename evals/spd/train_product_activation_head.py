@@ -45,6 +45,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
+        "--kl-weight",
+        type=float,
+        default=1.0,
+        help="Weight for KL loss against teacher logits.",
+    )
+    parser.add_argument(
+        "--hard-label-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for cross-entropy against product native target labels. "
+            "Samples whose target token is outside the draft vocab are ignored."
+        ),
+    )
+    parser.add_argument(
         "--device",
         choices=("auto", "cuda", "mps", "cpu"),
         default="auto",
@@ -71,6 +86,12 @@ def main() -> None:
         raise ValueError("--batch-size must be positive")
     if args.temperature <= 0.0:
         raise ValueError("--temperature must be positive")
+    if args.kl_weight < 0.0:
+        raise ValueError("--kl-weight must be non-negative")
+    if args.hard_label_weight < 0.0:
+        raise ValueError("--hard-label-weight must be non-negative")
+    if args.kl_weight == 0.0 and args.hard_label_weight == 0.0:
+        raise ValueError("at least one of --kl-weight or --hard-label-weight must be positive")
     patch_reference_checkout(Path(args.reference_dir))
     sys.path.insert(0, str(Path(args.reference_dir)))
 
@@ -122,6 +143,13 @@ def main() -> None:
     position_ids = product_tensors["position_ids"].to(device=device)
     teacher_logits = teacher_tensors["teacher_logits"].to(device=device, dtype=torch.float32)
     teacher_argmax = teacher_logits.argmax(dim=-1)
+    label_draft_indices = product_tensors.get("label_draft_indices")
+    if args.hard_label_weight > 0.0 and label_draft_indices is None:
+        raise ValueError(
+            "--hard-label-weight requires label_draft_indices in the product corpus"
+        )
+    if label_draft_indices is not None:
+        label_draft_indices = label_draft_indices.to(device=device, dtype=torch.long)
     optimizer = torch.optim.AdamW(
         pipeline.speculation_module.parameters(),
         lr=float(args.learning_rate),
@@ -131,6 +159,7 @@ def main() -> None:
     sample_count = int(cur_in.shape[0])
     losses: list[float] = []
     accs: list[float] = []
+    hard_label_accs: list[float] = []
     steps = 0
     for _epoch in range(int(args.epochs)):
         for batch_idx in batch_indices(sample_count, int(args.batch_size)):
@@ -152,16 +181,41 @@ def main() -> None:
                     f"student logits shape {tuple(student_logits.shape)} does not match "
                     f"teacher logits shape {tuple(batch_teacher.shape)}"
                 )
-            teacher_probs = F.softmax(batch_teacher / float(args.temperature), dim=-1)
-            student_log_probs = F.log_softmax(student_logits / float(args.temperature), dim=-1)
-            loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
-            loss = loss * (float(args.temperature) ** 2)
+            loss_parts = []
+            if args.kl_weight > 0.0:
+                teacher_probs = F.softmax(batch_teacher / float(args.temperature), dim=-1)
+                student_log_probs = F.log_softmax(
+                    student_logits / float(args.temperature),
+                    dim=-1,
+                )
+                kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+                kl_loss = kl_loss * (float(args.temperature) ** 2)
+                loss_parts.append(float(args.kl_weight) * kl_loss)
+            if args.hard_label_weight > 0.0:
+                assert label_draft_indices is not None
+                batch_labels = label_draft_indices[batch_idx]
+                in_scope = batch_labels >= 0
+                if bool(in_scope.any()):
+                    hard_label_loss = F.cross_entropy(
+                        student_logits[in_scope],
+                        batch_labels[in_scope],
+                    )
+                    loss_parts.append(float(args.hard_label_weight) * hard_label_loss)
+            if not loss_parts:
+                continue
+            loss = sum(loss_parts)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             with torch.no_grad():
                 pred = student_logits.argmax(dim=-1)
                 acc = (pred == teacher_argmax[batch_idx]).float().mean()
+                if label_draft_indices is not None:
+                    batch_labels = label_draft_indices[batch_idx]
+                    in_scope = batch_labels >= 0
+                    if bool(in_scope.any()):
+                        hard_acc = (pred[in_scope] == batch_labels[in_scope]).float().mean()
+                        hard_label_accs.append(float(hard_acc.detach().cpu()))
             losses.append(float(loss.detach().cpu()))
             accs.append(float(acc.detach().cpu()))
             steps += 1
@@ -191,10 +245,14 @@ def main() -> None:
         "steps_completed": steps,
         "learning_rate": float(args.learning_rate),
         "temperature": float(args.temperature),
+        "kl_weight": float(args.kl_weight),
+        "hard_label_weight": float(args.hard_label_weight),
         "initial_loss": losses[0] if losses else None,
         "final_loss": losses[-1] if losses else None,
         "initial_argmax_acc": accs[0] if accs else None,
         "final_argmax_acc": accs[-1] if accs else None,
+        "initial_hard_label_acc": hard_label_accs[0] if hard_label_accs else None,
+        "final_hard_label_acc": hard_label_accs[-1] if hard_label_accs else None,
     }
     if args.summary_json:
         Path(args.summary_json).write_text(

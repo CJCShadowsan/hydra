@@ -75,13 +75,19 @@ def main() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     tensors, checkpoint_config = load_tensors(checkpoint_path, args.dtype)
     out_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_sha256 = file_sha256(checkpoint_path)
+    manifest["checkpoint"] = {
+        "path": checkpoint_manifest_path(checkpoint_path, manifest_out.parent),
+        "sha256": checkpoint_sha256,
+        "bytes": checkpoint_path.stat().st_size,
+    }
 
     from safetensors.torch import save_file
 
     dtype_label = common_dtype_label(tensors)
     metadata = {
         "format": SERVING_FORMAT,
-        "source_checkpoint_sha256": manifest["checkpoint"]["sha256"],
+        "source_checkpoint_sha256": checkpoint_sha256,
         "source_format": manifest["source"]["format"],
         "tensor_count": str(len(tensors)),
         "dtype": dtype_label,
@@ -240,6 +246,13 @@ def manifest_relative_path(path: Path, manifest_dir: Path) -> str:
     if any(part in ("", ".", "..") for part in relative.parts):
         raise RuntimeError(f"unsafe manifest-relative path: {relative}")
     return relative.as_posix()
+
+
+def checkpoint_manifest_path(path: Path, manifest_dir: Path) -> str:
+    try:
+        return manifest_relative_path(path, manifest_dir)
+    except RuntimeError:
+        return str(path)
 
 
 def file_sha256(path: Path) -> str:
