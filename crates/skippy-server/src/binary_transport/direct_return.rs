@@ -226,12 +226,12 @@ pub(crate) fn open_prediction_return_stream(
     request_id: u64,
     session_id: u64,
     wire_dtype: WireActivationDType,
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> Result<TcpStream> {
     let endpoint = driver_stage_endpoint(config, topology)?;
     let return_addr = resolve_downstream_endpoint(endpoint)?;
     let source_ip = downstream_source_ip(config)?;
-    let attempts = timeout_secs.saturating_mul(2).max(1);
+    let attempts = 1;
     let mut last_error = None;
     for _ in 0..attempts {
         match connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2)) {

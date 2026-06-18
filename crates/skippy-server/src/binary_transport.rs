@@ -30,7 +30,8 @@ use skippy_protocol::{
         StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage,
         WireActivationDType, WireMessageKind, WireReplyKind,
         activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
-        send_reply_ack, send_reply_ack_with_stats, state_flags,
+        send_reply_ack, send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
+        send_reply_predicted_with_stats, state_flags,
     },
 };
 use skippy_runtime::{
@@ -692,15 +693,24 @@ fn handle_binary_connection(
                         )
                         .context("configure binary stage generation")?;
                 }
-                let stream = direct_return::open_prediction_return_stream(
+                match direct_return::open_prediction_return_stream(
                     config,
                     topology,
                     message.request_id,
                     message.session_id,
                     wire_dtype,
                     downstream_connect_timeout_secs,
-                )?;
-                prediction_return_streams.insert((message.request_id, message.session_id), stream);
+                ) {
+                    Ok(stream) => {
+                        prediction_return_streams
+                            .insert((message.request_id, message.session_id), stream);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "direct prediction return unavailable; falling back to upstream reply: {error:#}"
+                        );
+                    }
+                }
             }
             send_reply_ack_with_stats(&mut *upstream, generation_stats)
                 .context("generation config ack")?;
@@ -1377,22 +1387,24 @@ fn handle_binary_connection(
             } else {
                 predicted_tokens.len().max(1)
             };
-            let return_stream = prediction_return_streams
-                .get_mut(&(message.request_id, message.session_id))
-                .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
             let reply_start_unix_nanos = now_unix_nanos() as u64;
             upstream_reply_start_unix_nanos.get_or_insert(reply_start_unix_nanos);
             let reply_started = Instant::now();
-            direct_return::send_direct_prediction_return(
-                return_stream,
-                StageReply {
-                    kind: reply_kind,
-                    predicted: predicted_token,
-                    predicted_tokens,
-                    stats: message_reply_stats,
-                },
-            )
-            .context("send direct predicted reply")?;
+            let reply = StageReply {
+                kind: reply_kind,
+                predicted: predicted_token,
+                predicted_tokens,
+                stats: message_reply_stats,
+            };
+            if let Some(return_stream) =
+                prediction_return_streams.get_mut(&(message.request_id, message.session_id))
+            {
+                direct_return::send_direct_prediction_return(return_stream, reply)
+                    .context("send direct predicted reply")?;
+            } else {
+                send_stage_reply(&mut *upstream, reply)
+                    .context("send fallback upstream predicted reply")?;
+            }
             upstream_reply_end_unix_nanos = Some(now_unix_nanos() as u64);
             let reply_write_ms = elapsed_ms(reply_started);
             upstream_reply_ms += reply_write_ms;
@@ -2462,6 +2474,20 @@ fn send_one_off_direct_return(
         downstream_connect_timeout_secs,
     )?;
     direct_return::send_direct_prediction_return(&mut stream, reply)
+}
+
+fn send_stage_reply(stream: &mut TcpStream, reply: StageReply) -> Result<()> {
+    match reply.kind {
+        WireReplyKind::PredictedToken => {
+            send_reply_predicted_with_stats(stream, reply.predicted, reply.stats)
+                .context("send predicted-token reply")
+        }
+        WireReplyKind::PredictedTokens => {
+            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
+                .context("send predicted-tokens reply")
+        }
+        WireReplyKind::Ack => send_reply_ack_with_stats(stream, reply.stats).context("send ACK"),
+    }
 }
 
 fn emit_binary_proactive_eviction(telemetry: &Telemetry, eviction: &BinaryProactiveEviction) {
