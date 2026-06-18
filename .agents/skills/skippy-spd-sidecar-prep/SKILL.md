@@ -311,6 +311,20 @@ The export scripts now reject non-finite checkpoint or fixture tensors.
 `summary.paper_pipeline_estimate`; for this checkpoint the accepted-token round
 trip math is `15` candidates, `0` saved, and `15` unsaved.
 
+Current larger local Qwen3-8B checkpoint: the bfloat16 512-row MPS run at
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train512-20260618-105916/artifacts/20260618-105916`
+also used the exact `23,36` topology. It trained for `10.37min` with
+`train_loss=28.96`, exported finite BF16 serving weights, and passed fixture
+parity mechanically with tight tap-input reconstruction, but reference eval was
+still weak: aggregate acceptance `0.5306`, equivalent accept length `1.0611`,
+theoretical gain `6.21%`, and `135 / 1536` accepted draft flags. Package-backed
+serving accepted `0 / 15` proposals on the default prompt and `0 / 90` across a
+six-prompt code/math/writing sweep, with clean content and tap counters. Do not
+run a two-node speed comparison with this head; it saves zero token round trips.
+The next real sidecar step is a better or larger training recipe, likely a
+confirmed HF-scale bfloat16/CUDA run or a training/config fix, until local
+package-backed serving shows nonzero saved token round trips.
+
 ## First Larger Training Target
 
 Use `Qwen/Qwen3-8B` for the first larger dense sidecar training proof. Keep the

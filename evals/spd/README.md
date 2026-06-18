@@ -410,6 +410,34 @@ trips are rejected proposals. For this checkpoint, that math is `15`
 candidates, `0` saved, and `15` unsaved, so there is no ideal critical-path
 speedup to claim before overhead.
 
+2026-06-18 local Qwen3-8B S2 `23,36` 512-row training checkpoint: a larger
+bfloat16 MPS run used the same exact product topology with `train_rows=512`,
+`max_length=256`, `max_new_tokens=32`, `batch_size=1`,
+`gradient_accumulation_steps=4`, `epochs=1`, `learning_rate=1e-5`,
+`num_spec_layers=4`, `draft_top_k=4`, and the reference UltraChat Qwen top-32k
+draft vocab. Training completed in `10.37min` with `train_loss=28.96`; the
+checkpoint lives under
+`/private/tmp/skippy-spd-qwen3-8b-s2-23-bf16-train512-20260618-105916/artifacts/20260618-105916`.
+Reference eval over `48` prompts and `1536` generated tokens reported
+aggregate acceptance `0.5306`, equivalent accept length `1.0611`,
+theoretical gain `6.21%`, and `135 / 1536` accepted draft flags, so it did not
+improve over the 64-row proof. BF16 serving export passed the non-finite guard
+with `56` tensors and SHA
+`85a08a0748bbe3fcc7b030795bb93bcdf43635f0a36f90a31847d2959dec5a84`; parity
+fixture export produced finite logits and SHA
+`46790b94455d2b421d7fe4a8606d3e29a7163be4407171e74ec5647cb15430c4`.
+`skippy-bench spd-fixture-parity` passed mechanically with tight tap-input
+reconstruction (`max_abs_diff=0.000122`) but the same Rust/Python logit/rank
+drift seen in the 64-row artifact. Local package-backed OpenAI serving on the
+default prompt matched baseline/SPD content and had clean taps, but accepted
+`0 / 15` proposals (`15` candidate token round trips, `0` saved). A six-prompt
+code/math/writing sweep also matched content and kept clean taps but accepted
+`0 / 90` proposals (`90` candidates, `0` saved, `90` unsaved). Do not run a
+two-node speed comparison with this head; it would only prove overhead. The
+next real sidecar step is training scale/config quality, not LAN orchestration:
+use a confirmed HF-scale bfloat16/CUDA job or change the training recipe until
+package-backed serving saves token round trips locally.
+
 - 2026-06-17 the first model-backed 24-token rolling-executor smoke after the
   replay reset cleanup is
   `/private/tmp/spd-rolling-executor-real-local-smoke24-4.json`. It restores
