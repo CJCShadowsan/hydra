@@ -167,6 +167,7 @@ def main() -> None:
         output_repo=output_repo,
     )
     if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if args.json:
         print(json.dumps(plan, indent=2, sort_keys=True))

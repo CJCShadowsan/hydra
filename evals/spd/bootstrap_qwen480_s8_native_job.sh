@@ -16,7 +16,7 @@ apt-get update
 apt-get install -y --no-install-recommends ca-certificates git python3-pip
 python3 -m pip install -U pip huggingface_hub
 
-mkdir -p "$BOOTSTRAP_DIR"
+mkdir -p "$BOOTSTRAP_DIR" "$WORK_DIR"
 git clone --depth 1 --branch "$MESH_REF" \
   https://github.com/Mesh-LLM/mesh-llm.git "$BOOTSTRAP_DIR/mesh-llm"
 
