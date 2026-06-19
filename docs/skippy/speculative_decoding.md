@@ -161,19 +161,25 @@ and matching product row byte counts. The remaining risk is whether native CUDA
 allocator state fully frees the Qwen480 verifier buffers before phase 2; if not,
 the next fix should use a process boundary or CPU tap replay.
 
-Current two-phase HF retry: `meshllm/6a35536b3093dba73ce2a377`, using uploaded
-artifact `job-inputs/20260619T143116Z-3d1442f8/` at revision
-`abaefe222379e5bd6f949ebec7ca37de79faf715`, is the live gate for that
-allocator/residency fix. It keeps the same `rtx-pro-6000x4` / `3.5h` timeout
-cap; the first useful signal is whether streamed tap stage `0..8` opens after
-the verifier phase exits.
+Two-phase HF retry `meshllm/6a35536b3093dba73ce2a377`, using uploaded artifact
+`job-inputs/20260619T143116Z-3d1442f8/` at revision
+`abaefe222379e5bd6f949ebec7ca37de79faf715`, passed the allocator gate: after
+build, package download, prompt processing, and capture startup, it logged
+streamed stage `0..8` with `CUDA0 model buffer size = 34051.88 MiB` instead of
+the previous `cudaMalloc` OOM. It was then manually canceled before timeout
+because streamed live-tap capture reopens every tap stage for every prompt/step;
+that made the full `512` train / `64` held-out / `4` verify-step lane unlikely
+to reach training or smoke under the cap.
 
-That allocator gate has now passed in the live logs: after build, package
-download, prompt processing, and capture startup, the job logged streamed stage
-`0..8` with `CUDA0 model buffer size = 34051.88 MiB` instead of the previous
-`cudaMalloc` OOM. The job remains active, so this only proves the residency fix
-got past the old failure point; capture summaries, training, scoring, and
-package-backed smoke are still pending evidence.
+The next capped retry should keep the two-phase verifier drop but run resident
+tap stages. The earlier resident-stage OOM occurred with the full verifier
+still loaded; after phase 1 exits, the S8 tap stages should fit on
+`rtx-pro-6000x4` using the existing two-stages-per-GPU map. The planner now
+defaults to resident tap stages and emits `--stream-live-tap-stages` only when
+requested. The first artifact-producing profile is `TRAIN_PROMPTS=32`,
+`HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`, `STREAM_LIVE_TAP_STAGES=false`, and
+`JOB_TIMEOUT=2h`, which dry-runs at about `$22` and still avoids the old
+reference-train path.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

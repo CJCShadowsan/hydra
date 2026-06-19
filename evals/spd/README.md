@@ -201,26 +201,40 @@ package smoke passed with
 and matching product row byte counts; report:
 `/tmp/spd-two-phase-smoke-report.json`.
 
-Current two-phase retry on 2026-06-20 local time: HF Job
-`meshllm/6a35536b3093dba73ce2a377` is running on `rtx-pro-6000x4` with a
-`3.5h` timeout cap. It uses input artifact
+Two-phase retry on 2026-06-20 local time: HF Job
+`meshllm/6a35536b3093dba73ce2a377` ran on `rtx-pro-6000x4` with a `3.5h`
+timeout cap. It used input artifact
 `job-inputs/20260619T143116Z-3d1442f8/` from upload commit
 `abaefe222379e5bd6f949ebec7ca37de79faf715`. The patch SHA256 is
 `9f623c5d3f6d5f9aa34b10e72b9849a435794634faecc497d363c3e05bd0afe1`; the
 bootstrap SHA256 is
 `30d27fa808c08df2f3ca1613381de1ca0a828694e66448f3bc03e55b2610cb05`; the
 dry-run plan SHA256 is
-`61ffa3a560948536e9fc4df7e7dd4c178f36ab4309dbe340e37c63de02d5a9d5`. The first
-important gate is whether phase 2 can open streamed tap stage `0..8` after the
-phase-1 verifier model/session is dropped.
+`61ffa3a560948536e9fc4df7e7dd4c178f36ab4309dbe340e37c63de02d5a9d5`.
 
 Observed gate update: this run passed the previous OOM point. It completed the
 release `skippy-bench`/`skippy-server` builds, Python dependency setup, the
 full Qwen480 package snapshot download (`276G / 276G`, `69` files), and prompt
 dataset processing, then entered native capture. Logs show streamed stage
 `0..8` allocating `CUDA0 model buffer size = 34051.88 MiB`; the prior retry
-failed at that exact allocation. The job is still running, so this is allocator
-and startup evidence only, not a completed capture/train/smoke result.
+failed at that exact allocation. The job was manually canceled after this gate
+to avoid burning the rest of the cap on an implementation-shaped bottleneck:
+`--stream-live-tap-stages` reopens all eight tap stages for every prompt/step,
+so the full `512` train / `64` held-out / `4` verify-step lane was not going
+to reach training or smoke in useful time. Treat this as allocator/startup
+evidence only, not a completed capture/train/smoke result.
+
+Next retry plan: keep the two-phase verifier drop but use resident tap stages
+instead of streamed tap stages. The earlier resident-stage OOM happened while
+the full verifier was still loaded; after phase 1 exits, the resident S8 tap
+stages should fit on `rtx-pro-6000x4` with the two-stages-per-GPU device map.
+`plan_hf_spd_qualification.py` now defaults to resident tap stages and emits
+`--stream-live-tap-stages` only when explicitly requested. The bootstrap also
+accepts `TRAIN_PROMPTS`, `HELDOUT_PROMPTS`, `VERIFY_STEPS`, and
+`STREAM_LIVE_TAP_STAGES` overrides. The first artifact-producing retry profile
+is `TRAIN_PROMPTS=32`, `HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`,
+`STREAM_LIVE_TAP_STAGES=false`, and `JOB_TIMEOUT=2h`; its dry run plans about
+`$22` on `rtx-pro-6000x4` and still contains no old reference-train path.
 
 If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
 the next HF validation spike should be a single-job meshlet: one HF Job starts

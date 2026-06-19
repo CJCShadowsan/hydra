@@ -79,6 +79,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heldout-prompts", type=int, default=256)
     parser.add_argument("--max-prompt-tokens", type=int, default=480)
     parser.add_argument("--verify-steps", type=int, default=4)
+    parser.add_argument(
+        "--stream-live-tap-stages",
+        action="store_true",
+        help=(
+            "Open only one live-tap stage at a time during native-package "
+            "capture. Use this for tight VRAM lanes; leave disabled after "
+            "two-phase verifier drop when all tap stages should fit resident."
+        ),
+    )
     parser.add_argument("--ctx-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -607,6 +616,7 @@ def build_plan(
             )
             if args.qualification_mode == "native-package-fresh"
             else [],
+            "capture_stream_live_tap_stages": bool(args.stream_live_tap_stages),
             "physical_stage_ms_for_latency_sim": physical_stage_ms,
             "hop_ms_scenarios": parse_float_list(args.hop_ms, "--hop-ms"),
             "note": (
@@ -988,6 +998,7 @@ def build_native_package_fresh_commands(
         if stage_backend_devices
         else ""
     )
+    stream_tap_arg = "--stream-live-tap-stages " if args.stream_live_tap_stages else ""
     capture_common = (
         "target/release/skippy-bench spd-product-corpus-capture "
         f"--model-path {package_dir} "
@@ -998,8 +1009,8 @@ def build_native_package_fresh_commands(
         f"--ctx-size {args.ctx_size} --n-gpu-layers=-1 "
         + stage_backend_arg
         + f"--top-k {args.draft_top_k} --verify-steps {args.verify_steps} "
-        "--stream-live-tap-stages "
-        "--product-native-teacher-logits true"
+        + stream_tap_arg
+        + "--product-native-teacher-logits true"
     )
     capture_train = (
         f"{capture_common} --prompt-token-file {prompt_dir}/train-prompt-token-ids.jsonl "

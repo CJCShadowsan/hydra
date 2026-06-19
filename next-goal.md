@@ -255,10 +255,10 @@ It failed after reaching `capture[0]` because CUDA0 could not open streamed
 tap stage `0..8` while the full verifier was still resident. Commit `3d1442f8`
 changed `spd-product-corpus-capture` to a two-phase flow: record verifier
 targets/native draft-vocab logits first, drop the verifier, then replay
-contexts through streamed tap stages.
+contexts through live tap stages.
 
-Current two-phase retry uses the `3d1442f8` patch artifact and the same shorter
-timeout:
+The first two-phase retry used the `3d1442f8` patch artifact and the same
+shorter timeout:
 
 ```bash
 id=6a35536b3093dba73ce2a377
@@ -274,20 +274,42 @@ bootstrap_sha256=30d27fa808c08df2f3ca1613381de1ca0a828694e66448f3bc03e55b2610cb0
 dry_run_plan_sha256=61ffa3a560948536e9fc4df7e7dd4c178f36ab4309dbe340e37c63de02d5a9d5
 ```
 
-The timeout is the spending backstop. At the current checked rate for
-`rtx-pro-6000x4`, `3.5h` plans at about `$38.50`; the job should finish, fail,
-or be killed by HF at timeout. The first gate to watch is whether phase 2 can
-open streamed tap stage `0..8` after the phase-1 verifier drop.
+It was manually canceled after proving the old allocator failure point but
+before timeout. It completed release `skippy-bench`/`skippy-server` builds,
+downloaded the full Qwen480 layer-package snapshot (`276G / 276G`, `69`
+files), built the prompt dataset shards, entered native capture, and logged the
+streamed stage `0..8` allocation as
+`CUDA0 model buffer size = 34051.88 MiB` instead of failing with `cudaMalloc`.
+The reason for canceling was not a correctness failure: code inspection showed
+`--stream-live-tap-stages` reopens all eight tap stages for each prompt/step,
+so `512` train prompts plus `64` held-out prompts at `4` verify steps would
+burn the cap on repeated stage-open churn before training or smoke.
 
-Current observed gate: this retry passed the previous allocator failure point.
-It completed release `skippy-bench`/`skippy-server` builds, downloaded the full
-Qwen480 layer-package snapshot (`276G / 276G`, `69` files), built the prompt
-dataset shards, entered native capture, and logged the streamed stage `0..8`
-allocation as `CUDA0 model buffer size = 34051.88 MiB` instead of failing with
-`cudaMalloc`. The job is still running; do not claim capture/train/smoke
-success until their summary artifacts appear.
+Next retry: keep the two-phase verifier drop but run resident tap stages, not
+streamed tap stages. The previous resident OOM happened while the full verifier
+was still loaded; after phase 1 exits, the resident S8 tap stages should fit on
+`rtx-pro-6000x4` with the existing device map. The planner now defaults to
+resident tap stages and only emits `--stream-live-tap-stages` when explicitly
+requested.
 
-Startup attempts before the current live job:
+First artifact-producing profile for the next retry:
+
+```bash
+TRAIN_PROMPTS=32
+HELDOUT_PROMPTS=8
+VERIFY_STEPS=1
+STREAM_LIVE_TAP_STAGES=false
+JOB_TIMEOUT=2h
+```
+
+The matching dry run resolves resident tap capture, `rtx-pro-6000x4`, timeout
+`7200s`, max cost about `$22`, no `AutoModelForCausalLM`, no
+`hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no
+`--stream-live-tap-stages`. Treat this as a mechanics/artifact lane, not final
+sidecar quality. If resident stages fit and this reaches capture/train/export
+smoke, raise the row count in a later capped quality lane.
+
+Startup attempts before the latest two-phase retry:
 
 - `meshllm/6a35304a953ed90bfb9446a8` failed in 3 seconds with exit `126`
   because the HF CLI invocation passed the multiline script to `bash` as a
@@ -382,17 +404,18 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs
   without loading the full model if unsupported.
 - `native-package-fresh` exports a serving fixture, not a true Python/reference
   parity fixture. Do not claim Rust/Python fixture parity for this lane yet.
-- Setup/build time runs inside the `3.5h` cap. If the job expires before useful
-  capture, the next lane should reduce the first-run scope or use prebuilt
-  runtime artifacts before increasing spend.
-- Streamed tap capture trades peak VRAM for repeated stage opens. The next
-  resubmission must report capture timing before deciding whether the reload
-  churn fits the `$50` lane or requires a prebuilt/runtime or larger-memory
-  follow-up lane.
+- Setup/build time runs inside the timeout cap. If the job expires before
+  useful capture, the next lane should reduce the first-run scope further or
+  use prebuilt runtime artifacts before increasing spend.
+- Resident tap capture should remove the streamed per-sample stage-open churn,
+  but it must prove that all S8 tap stages fit after the phase-1 verifier has
+  been dropped. The next resubmission must report capture timing before raising
+  row counts.
 - The two-phase fix relies on `StageModel` / `StageSession` drop returning CUDA
-  buffers before phase 2 opens streamed tap stages. If CUDA allocator state
-  still prevents a 34GiB stage allocation, the next fix should use a process
-  boundary between verifier capture and tap replay or route tap replay to CPU.
+  buffers before phase 2 opens resident tap stages. If CUDA allocator state or
+  resident stage memory still prevents allocation, the next fix should use a
+  process boundary between verifier capture and tap replay, restore streamed
+  capture for a much smaller row count, or move to a larger-memory lane.
 - Because the run uses an uploaded patch artifact rather than a pushed branch,
   keep the run id, upload commit, and patch SHA with every report.
 

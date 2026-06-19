@@ -11,7 +11,12 @@ WORK_DIR="${WORK_DIR:-/workspace/spd-qualification}"
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/workspace/spd-bootstrap}"
 OUTPUT_REPO="${OUTPUT_REPO:-meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8}"
 JOB_TIMEOUT="${JOB_TIMEOUT:-4.5h}"
+TRAIN_PROMPTS="${TRAIN_PROMPTS:-512}"
+HELDOUT_PROMPTS="${HELDOUT_PROMPTS:-64}"
+VERIFY_STEPS="${VERIFY_STEPS:-4}"
+STREAM_LIVE_TAP_STAGES="${STREAM_LIVE_TAP_STAGES:-false}"
 export PATCH_REPO PATCH_REVISION PATCH_PATH_IN_REPO MESH_REF WORK_DIR BOOTSTRAP_DIR OUTPUT_REPO JOB_TIMEOUT
+export TRAIN_PROMPTS HELDOUT_PROMPTS VERIFY_STEPS STREAM_LIVE_TAP_STAGES
 
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates git python3-pip
@@ -42,6 +47,11 @@ export MESH_LLM_PATCH_PATH="$BOOTSTRAP_DIR/mesh-llm.patch"
 git apply "$MESH_LLM_PATCH_PATH"
 git status --short
 
+EXTRA_PLANNER_ARGS=()
+if [[ "$STREAM_LIVE_TAP_STAGES" == "true" ]]; then
+  EXTRA_PLANNER_ARGS+=(--stream-live-tap-stages)
+fi
+
 python3 evals/spd/plan_hf_spd_qualification.py \
   --base-model Qwen/Qwen3-Coder-480B-A35B-Instruct \
   --package-ref meshllm/Qwen3-Coder-480B-A35B-Instruct-UD-Q4_K_XL-layers \
@@ -54,10 +64,10 @@ python3 evals/spd/plan_hf_spd_qualification.py \
   --vocab-size 151936 \
   --dataset HuggingFaceH4/ultrachat_200k \
   --dataset-split train_sft \
-  --train-prompts 512 \
-  --heldout-prompts 64 \
+  --train-prompts "$TRAIN_PROMPTS" \
+  --heldout-prompts "$HELDOUT_PROMPTS" \
   --max-prompt-tokens 480 \
-  --verify-steps 4 \
+  --verify-steps "$VERIFY_STEPS" \
   --ctx-size 1024 \
   --physical-node-count 4 \
   --logical-stage-ms 40 \
@@ -69,7 +79,8 @@ python3 evals/spd/plan_hf_spd_qualification.py \
   --output-repo "$OUTPUT_REPO" \
   --work-dir "$WORK_DIR" \
   --out "$WORK_DIR/native-package-fresh-plan.json" \
-  --json
+  --json \
+  "${EXTRA_PLANNER_ARGS[@]}"
 
 python3 evals/spd/run_hf_spd_qualification_plan.py \
   --plan "$WORK_DIR/native-package-fresh-plan.json" \

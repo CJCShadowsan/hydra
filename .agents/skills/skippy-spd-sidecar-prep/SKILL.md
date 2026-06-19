@@ -715,28 +715,38 @@ installs build prerequisites, detects CUDA architecture, builds the CUDA ABI
 with `just build-runtime`, and builds release `skippy-bench` / `skippy-server`.
 The current capture plan emits
 `--stage-backend-devices CUDA0,CUDA0,CUDA1,CUDA1,CUDA2,CUDA2,CUDA3,CUDA3`,
-`--stream-live-tap-stages`, and `--product-native-teacher-logits true`. The
-streamed mode is intended to fix the `55..62` CUDA3 OOM seen after full package
-download by reducing tap-stage residency while preserving the full native Q4
-verifier for teacher tokens/logits. Measure repeated stage-open time before
-deciding whether the reload churn fits the capped lane.
+resident live-tap stages, and `--product-native-teacher-logits true` by
+default. `--stream-live-tap-stages` is now an explicit fallback for tighter
+memory lanes, not the default Qwen480 two-phase retry path, because it reopens
+all stages for every prompt/step.
 The next Qwen480 retry must also use the two-phase product-corpus capture path:
 record verifier target tokens and native draft-vocab logits first, drop the full
-verifier model/session, then open streamed tap stages and replay the recorded
+verifier model/session, then open resident tap stages and replay the recorded
 contexts to write product rows. This is required because the first streamed
 retry reached capture but still OOMed opening stage `0..8` while the full
 verifier was resident. A small cached Qwen3-0.6B package smoke passed this
-two-phase path with streamed taps and native teacher logits.
-Current two-phase HF retry: `meshllm/6a35536b3093dba73ce2a377`, artifact
+two-phase path with streamed taps and native teacher logits; that smoke remains
+useful for the two-phase logic but does not justify streaming for Qwen480.
+Two-phase HF retry `meshllm/6a35536b3093dba73ce2a377`, artifact
 `job-inputs/20260619T143116Z-3d1442f8/`, upload revision
-`abaefe222379e5bd6f949ebec7ca37de79faf715`, `rtx-pro-6000x4`, `3.5h` timeout.
-Watch whether phase 2 can open streamed tap stage `0..8` after the phase-1
-verifier drop.
-Observed update: the run passed the old allocation failure point. It completed
-build, package download, prompt processing, and capture startup, then logged
-streamed stage `0..8` allocating `CUDA0 model buffer size = 34051.88 MiB`
-instead of failing with `cudaMalloc`. The job is still active; do not claim
-capture/train/smoke success until summaries/artifacts exist.
+`abaefe222379e5bd6f949ebec7ca37de79faf715`, `rtx-pro-6000x4`, `3.5h` timeout,
+passed the old allocation failure point. It completed build, package download,
+prompt processing, and capture startup, then logged streamed stage `0..8`
+allocating `CUDA0 model buffer size = 34051.88 MiB` instead of failing with
+`cudaMalloc`. It was manually canceled after that gate because streamed
+live-tap capture reopens every tap stage for every prompt/step, so the full
+`512` train / `64` held-out / `4` verify-step lane was unlikely to reach
+training or smoke under the cap. Do not claim capture/train/smoke success from
+this job.
+Next retry: keep the two-phase verifier drop but use resident tap stages. The
+earlier resident-stage OOM happened while the full verifier was still loaded;
+after phase 1 exits, S8 tap stages should fit on `rtx-pro-6000x4` with the
+two-stages-per-GPU device map. `plan_hf_spd_qualification.py` now defaults to
+resident tap stages and emits `--stream-live-tap-stages` only when requested.
+The first artifact-producing profile is `TRAIN_PROMPTS=32`,
+`HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`, `STREAM_LIVE_TAP_STAGES=false`, and
+`JOB_TIMEOUT=2h`; dry run shows about `$22`, no `AutoModelForCausalLM`, no
+`hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no stream flag.
 If the local branch is not pushed, upload a patch artifact and set
 `MESH_LLM_PATCH_PATH` so the job applies it after cloning. Remaining risk for
 the first capped job is runtime compatibility with the Qwen480 MoE config and
