@@ -623,7 +623,7 @@ def build_plan(
             "hardware": asdict(hardware),
             "spec_preview": {
                 "dockerImage": args.docker_image,
-                "command": ["bash", "run-spd-qualification.sh"],
+                "command": ["bash", "-lc", "bash run-spd-qualification.sh"],
                 "arguments": [],
                 "environment": job_environment(args, output_repo, mesh_ref),
                 "secrets": {"HF_TOKEN": "<redacted; required only on confirmed submit>"},
