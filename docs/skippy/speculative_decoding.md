@@ -82,22 +82,25 @@ layers / width `6144`, uses vocab size `151936`, emits S8 taps
 `[0,8,16,24,32,40,48,55,62]`, and plans `rtx-pro-6000x4` for `4.5h` at max
 `$49.49991`. The native command graph avoids `AutoModelForCausalLM`,
 `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, and warm-start artifacts.
-The next spend-bearing run should still use `rtx-pro-6000x4` / `4.5h` under
-the same timeout cap and bootstrap from uploaded artifacts under
+The current spend-bearing run is HF Job
+`meshllm/6a3535603093dba73ce2a264` with `rtx-pro-6000x4` / `4.5h` under the
+same timeout cap. It bootstraps from uploaded artifacts under
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`, because the local
-branch is not pushed from this machine. The latest submitted artifact before
-the next resubmit was `job-inputs/20260619T122023Z-861c2450/`, upload commit
-`9d56b2d2d004b84a634121339a53f7421499cb4b`, with patch SHA256
-`2ca0c6314de434b9dd605474b897ebb6241c35a35f6c8d449c3f27d576937374`.
+branch is not pushed from this machine. The current artifact is
+`job-inputs/20260619T122507Z-b843a851/`, upload commit
+`80014e284aa1e727a305c3ff5c44fb2ca82659d6`, with patch SHA256
+`7ec74581ee16e30ce4d56b99a5b0092eb8fc513b92c36acae8fbf8a93d952436`.
 Earlier startup attempts failed before model work due to HF CLI command parsing,
 an unexported bootstrap variable, and a missing generated-plan output
 directory; CPU canary `meshllm/6a3531e9953ed90bfb9446e4` verified the corrected
 CLI form. Job `meshllm/6a353427953ed90bfb944722` reached generated setup and
 failed at `just build-runtime backend=cuda cuda_arch="$CUDA_ARCH"`; the planner
 now emits the recipe's positional form, `just build-runtime cuda "$CUDA_ARCH"`.
-No run has reached package download, capture, training, export, or smoke yet.
-Treat this run as native-package capture/train/smoke qualification under a
-spend cap, not as a distributed speedup run.
+The current run has passed that failure and is compiling the CUDA llama.cpp
+stage runtime; latest observed build progress was `[403/410]` CMake targets. No
+run has reached package download, capture, training, export, or smoke yet. Treat
+this run as native-package capture/train/smoke qualification under a spend cap,
+not as a distributed speedup run.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

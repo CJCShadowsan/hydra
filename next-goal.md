@@ -140,21 +140,21 @@ instead of requiring a GitHub push from this machine.
 it downloads the uploaded patch, applies it to a bootstrap clone, regenerates
 the reviewed plan, then runs `run_hf_spd_qualification_plan.py`.
 
-The next live job should use the same parameters through an HF-uploaded
+Current live job uses the same parameters through an HF-uploaded
 patch/bootstrap artifact, because the local branch is not pushed to GitHub from
 this machine:
 
 ```bash
-id=<pending resubmit after just build-runtime fix>
-url=<pending>
-run_id=<pending>
-local_artifact_dir=<pending>
+id=6a3535603093dba73ce2a264
+url=https://huggingface.co/jobs/meshllm/6a3535603093dba73ce2a264
+run_id=20260619T122507Z-b843a851
+local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T122507Z-b843a851
 output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
-input_prefix=<pending>
-upload_commit=<pending>
-patch_sha256=<pending>
-bootstrap_sha256=<pending>
-dry_run_plan_sha256=<pending>
+input_prefix=job-inputs/20260619T122507Z-b843a851/
+upload_commit=80014e284aa1e727a305c3ff5c44fb2ca82659d6
+patch_sha256=7ec74581ee16e30ce4d56b99a5b0092eb8fc513b92c36acae8fbf8a93d952436
+bootstrap_sha256=378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d6
+dry_run_plan_sha256=542b9b61a118ee5a4a6a68d103ab1614bc020371129e233fe1d8e8bc93c4e7c6
 ```
 
 The timeout is the spending backstop. At the current checked rate for
@@ -187,16 +187,18 @@ Startup attempts before the current live job:
   generated command must be `just build-runtime cuda "$CUDA_ARCH"`. Local dry
   run now emits the corrected command.
 
-Latest status check on 2026-06-19: there is no current successful live job
-after the `just build-runtime` setup failure above. The next submission should
-use a fresh artifact from the corrected planner and the same `rtx-pro-6000x4`
-`4.5h` timeout cap.
+Latest status check on 2026-06-19: current live job
+`meshllm/6a3535603093dba73ce2a264` is `RUNNING`. It has passed the old
+`just build-runtime` argument failure and is compiling the CUDA llama.cpp stage
+runtime; the latest observed build progress was `[403/410]` CMake targets. It
+has not reached package download, capture, training, scoring, export, or smoke
+yet.
 
 Monitoring commands:
 
 ```bash
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect <job-id>
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs <job-id>
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a3535603093dba73ce2a264
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a3535603093dba73ce2a264
 ```
 
 ## Remaining Risks During Run
