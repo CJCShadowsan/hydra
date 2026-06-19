@@ -490,8 +490,25 @@ the same package/topology with `512` train prompts, `64` held-out prompts,
 `4` verify steps, `rtx-pro-6000x4`, timeout `4.5h`, and max cost `$49.49991`.
 The generated plan still has no `AutoModelForCausalLM`, no
 `hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no
-`from_pretrained(` matches. This is the next plausible spend-bearing lane, but
-it should not be submitted without explicit approval.
+`from_pretrained(` matches. This was the next plausible spend-bearing lane and
+was submitted only after explicit spend approval.
+
+Quality-lane submission after explicit spend approval:
+HF Job `meshllm/6a35cdc03093dba73ce2a9ad`, input bundle
+`job-inputs/20260619T231327Z-5b98182e/`, Hub revision
+`cf9e608e208f14708ebd826ce663dc607147fe6f`, patch SHA256
+`9dda3b489a4a17b0cec69d892125613cd7a0b63177e5bc925e406d4d9af4c0bb`.
+The job runs the same native-package-fresh plan on `rtx-pro-6000x4` with
+`TRAIN_PROMPTS=512`, `HELDOUT_PROMPTS=64`, `VERIFY_STEPS=4`,
+`JOB_TIMEOUT=4.5h`, and planned max cost `$49.49991`. The submitted env
+explicitly sets
+`SMOKE_STAGE_BACKEND_DEVICES=CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3` so the
+package-smoke phase uses the CPU-interleaved map that cleared the earlier
+Qwen480 stage-placement OOM. Initial `hf jobs inspect` showed the job accepted
+and in `SCHEDULING`; continue by watching bootstrap logs for patch download,
+`git apply`, plan generation, CUDA build, full package download, native capture,
+head-only train/score, export, package-backed rolling smoke, latency
+simulation, and upload.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving

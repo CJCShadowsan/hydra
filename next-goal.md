@@ -94,7 +94,17 @@ transport.
    - a `4.5h` timeout is about `$49.50`;
    - the risk is whether the larger capture/train/smoke reaches completion
      under the cap, not whether the old reference path is being used.
-   - Pending explicit spend approval before dispatch.
+   - Submitted HF Job `meshllm/6a35cdc03093dba73ce2a9ad` after explicit
+     spend approval. It is capped by the `4.5h` HF timeout on
+     `rtx-pro-6000x4`, for planned max cost `$49.49991`.
+   - Job input bundle:
+     `job-inputs/20260619T231327Z-5b98182e/`, Hub revision
+     `cf9e608e208f14708ebd826ce663dc607147fe6f`.
+   - Patch SHA256:
+     `9dda3b489a4a17b0cec69d892125613cd7a0b63177e5bc925e406d4d9af4c0bb`.
+   - Launch env includes
+     `SMOKE_STAGE_BACKEND_DEVICES=CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`
+     to avoid repeating the old two-stages-per-GPU package-smoke OOM.
 4. Do not dispatch an HF meshlet yet. Meshlet is a follow-on only after
    package-backed held-out serving saves more candidate-token round trips than
    it wastes, with matched content and zero tap failures.
