@@ -57,12 +57,15 @@ model if unsupported.
 
 HF Jobs rates checked on 2026-06-19 put `rtx-pro-6000x4` at about `$11/hr`,
 `h200x2` at about `$10/hr`, `h200x4` at about `$20/hr`, and
-`rtx-pro-6000x8` at about `$22/hr`. The first capped lane should use
-`rtx-pro-6000x4` with a `4.5h` timeout for a planned maximum of `$49.50`. This
-is enough for a serious package/capture/smoke attempt if setup and download are
-fast enough; it is not guaranteed to finish a final-quality sidecar. `h200x2`
-can run for `5h` under `$50` but is tighter on VRAM for a `256.98 GiB` package;
-`h200x4` is safer on memory but only buys about `2.5h` under `$50`.
+`rtx-pro-6000x8` at about `$22/hr`. The first capped lane used
+`rtx-pro-6000x4` with a `4.5h` timeout for a planned maximum of `$49.50`. The
+latest retry used the same flavor with a `3.5h` timeout, planned around
+`$38.50`, so aggregate spend remains under the original `$50` intent after
+earlier failures. These lanes are enough for serious package/capture/smoke
+attempts if setup and download are fast enough; they are not guaranteed to
+finish a final-quality sidecar. `h200x2` can run for `5h` under `$50` but is
+tighter on VRAM for a `256.98 GiB` package; `h200x4` is safer on memory but only
+buys about `2.5h` under `$50`.
 
 Dry-run checkpoint on 2026-06-19:
 `plan_hf_spd_qualification.py --qualification-mode native-package-fresh` with
@@ -82,7 +85,7 @@ and setting `MESH_LLM_PATCH_PATH` before executing the generated plan.
 `evals/spd/bootstrap_qwen480_s8_native_job.sh` is the intended HF job
 entrypoint for this capped lane.
 
-Submitted checkpoint on 2026-06-19: the latest capped run is HF Job
+First serious submitted checkpoint on 2026-06-19: HF Job
 `meshllm/6a3535603093dba73ce2a264` using `rtx-pro-6000x4` and timeout `4.5h`;
 the job URL is `https://huggingface.co/jobs/meshllm/6a3535603093dba73ce2a264`.
 The spending backstop is the HF timeout, still planned at about `$49.50`.
@@ -149,11 +152,11 @@ Qwen480 native dry run now emits both
 `--stream-live-tap-stages`, plus the fixed
 `--product-native-teacher-logits true`. This should reduce peak VRAM without
 changing teacher semantics. The risk to measure on the next HF run is repeated
-stage-open churn inside the `4.5h` cap.
+stage-open churn inside the current timeout cap.
 
 Streamed-capture submission on 2026-06-19: HF Job
-`meshllm/6a354843953ed90bfb944848` is the current live job, again on
-`rtx-pro-6000x4` with the `4.5h` timeout cap. It uses input artifact
+`meshllm/6a354843953ed90bfb944848` used the same `rtx-pro-6000x4` /
+`4.5h` timeout cap and input artifact
 `job-inputs/20260619T134535Z-595b67cb/` from upload commit
 `9198f2468ae69dbb13c0d0a16f7b99c0e3e7dd5d`. The patch SHA256 is
 `717b871d6668ad895869013f8a20168160bc46557b927ade1473258dea369c61`; the
@@ -161,9 +164,51 @@ bootstrap SHA256 is
 `378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d6`; the
 dry-run plan SHA256 is
 `e33d546eb7b3b3d639441fca7331f85fc0addf85d00623bb3cb7fb7b5966d9de`.
-Immediate inspect/log checks show it is `RUNNING` and has cleared inline
-bootstrap download/startup into generated setup. It has not yet reached package
-download, capture, training, scoring, export, or smoke.
+It failed after `209` seconds, before model work, because
+`crates/skippy-server/src/frontend/spd.rs` still initialized
+`SpdLiveTapRunnerConfig` without the new `stage_backend_devices` and
+`stream_stages` fields. Commit `d19da20d` fixed that server initializer, and
+commit `f23e28ba` made the HF job timeout configurable for a shorter retry.
+
+Current streamed-capture retry on 2026-06-20 local time: HF Job
+`meshllm/6a354a2f953ed90bfb94486f` ran on `rtx-pro-6000x4` with a
+`3.5h` timeout cap. It uses input artifact
+`job-inputs/20260619T135416Z-f23e28ba/` from upload commit
+`fc2f95dd543955f1e821c7036bebd0e48501974f`. The patch SHA256 is
+`58cfa43179ce251784014955f43f02092ae0936cb7df75a1a4e545f9f2c8b6bc`; the
+bootstrap SHA256 is
+`30d27fa808c08df2f3ca1613381de1ca0a828694e66448f3bc03e55b2610cb05`; the
+dry-run plan SHA256 is
+`61ffa3a560948536e9fc4df7e7dd4c178f36ab4309dbe340e37c63de02d5a9d5`. It
+failed after `1226` seconds. It cleared inline bootstrap download/startup, CUDA
+ABI build, Rust release builds, Python dependency setup, full 69-file Qwen480
+layer-package download (`276G / 276G`), and prompt-token shard building, then
+reached `capture[0]`. It failed opening streamed tap stage `0..8`: CUDA0 could
+not allocate a `34051.88 MiB` buffer while the full verifier remained resident.
+At about `$11/hr`, this run added about `$3.75`, bringing completed GPU spend
+for the Qwen480 lane to roughly `$12` to `$13`.
+
+Local fix after that capture-residency failure: `spd-product-corpus-capture`
+now phase-separates topology-only capture. Phase 1 runs the full target verifier
+to record target tokens and native draft-vocab logits for every prompt/step,
+then drops the verifier model. Phase 2 opens the streamed tap runner and replays
+the recorded contexts to write `rows.f32`, `raw_rows.f32`, and `rows.jsonl` in
+the original prompt/step order. This keeps native teacher semantics unchanged
+while avoiding full-verifier plus tap-stage GPU residency overlap. A real cached
+package smoke passed with
+`meshllm_Qwen3-0_6B-Q4_K_M-layers-test-main`, `--splits 14 --layer-end 28`,
+`--stream-live-tap-stages`, one prompt, one verify step, native teacher logits,
+and matching product row byte counts; report:
+`/tmp/spd-two-phase-smoke-report.json`.
+
+If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
+the next HF validation spike should be a single-job meshlet: one HF Job starts
+the coordinator, stage servers, SPD sidecar, and OpenAI frontend as separate
+local processes, with optional artificial per-stage latency. That would test
+package download, stage placement, tap returns, SPD proposal/verification,
+rolling executor cleanup, and pipeline economics repeatably. A multi-HF-job
+node spike is lower priority until the transport story is explicit, because HF
+job port exposure is not the same as a normal low-latency Mesh LAN.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
@@ -2666,14 +2711,14 @@ resolve `meshllm/Qwen3-Coder-480B-A35B-Instruct-UD-Q4_K_XL-layers`, keep S8
 logical boundaries `8,16,24,32,40,48,55,62`, require taps
 `[0,8,16,24,32,40,48,55,62]`, and model contiguous physical clumping such as
 `[[0,1],[2,3],[4,5],[6,7]]` for four physical buckets. The first capped HF lane
-is `rtx-pro-6000x4` for `4.5h`, planned at `$49.49991`; it should try package
-download, staged package load, native tap/logit capture, head-only training,
-small held-out scoring, serving export, package-backed smoke, and latency
-simulation. The current dry run uses `--vocab-size 151936` and emits no
-full-base train/score command. Do not submit a spend-bearing Qwen480 job until
-the plan prints model/package ref, dataset shard, prompt counts, topology,
-hardware, timeout, output repo, max cost, and explicit confirmation has been
-given.
+used `rtx-pro-6000x4` for `4.5h`, planned at `$49.49991`; the latest retry used
+the same flavor for `3.5h`, planned around `$38.50`. The next retry should use
+the two-phase capture patch and try package download, staged package load,
+native tap/logit capture, head-only training, small held-out scoring, serving
+export, package-backed smoke, and latency simulation. The current dry run uses
+`--vocab-size 151936` and emits no full-base train/score command. The next
+action is to upload the patch artifact, resubmit the capped job, and patch only
+the next concrete blocker if it fails.
 
 The older `Qwen3-8B` raw-Q4 path remains useful as harness evidence: it proves
 package-backed mechanics, tap return, Rust sidecar loading, rolling
@@ -2696,11 +2741,12 @@ optimized/offloaded.
    boundaries `8,16,24,32,40,48,55,62`, and native package taps/logits as the
    distillation source. Reuse the normal Skippy layer package for physical
    stage material; the SPD sidecar owns logical tap requirements and proposal
-   weights only. Start with the `$50` capped dry-run/job plan on
-   `rtx-pro-6000x4` for `4.5h`. The topology-only capture and head-only
-   train/score path now exists; the next action is explicit review/submit of
-   the capped job, watching for Qwen480 MoE config compatibility and package
-   capture startup under the timeout.
+   weights only. The topology-only capture and head-only train/score path now
+   exists, and the latest `3.5h` capped retry proved package download and prompt
+   building but failed on verifier/tap-stage VRAM overlap. The next action is
+   to resubmit with the two-phase capture patch, watching for Qwen480 MoE config
+   compatibility, CUDA allocator release between phases, and streamed
+   stage-open timing under the timeout.
 2. Do not run the current Qwen3-8B S2/23 HF-scale head as a speed proof yet.
    The terminal h36 semantic mismatch is understood: Skippy's terminal boundary
    is pre-final-norm and the HF fixture/training row is post-final-norm, so

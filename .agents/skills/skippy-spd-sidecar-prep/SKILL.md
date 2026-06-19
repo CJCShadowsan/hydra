@@ -709,6 +709,13 @@ streamed mode is intended to fix the `55..62` CUDA3 OOM seen after full package
 download by reducing tap-stage residency while preserving the full native Q4
 verifier for teacher tokens/logits. Measure repeated stage-open time before
 deciding whether the reload churn fits the capped lane.
+The next Qwen480 retry must also use the two-phase product-corpus capture path:
+record verifier target tokens and native draft-vocab logits first, drop the full
+verifier model/session, then open streamed tap stages and replay the recorded
+contexts to write product rows. This is required because the first streamed
+retry reached capture but still OOMed opening stage `0..8` while the full
+verifier was resident. A small cached Qwen3-0.6B package smoke passed this
+two-phase path with streamed taps and native teacher logits.
 If the local branch is not pushed, upload a patch artifact and set
 `MESH_LLM_PATCH_PATH` so the job applies it after cloning. Remaining risk for
 the first capped job is runtime compatibility with the Qwen480 MoE config and

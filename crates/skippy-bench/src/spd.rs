@@ -378,8 +378,6 @@ pub fn spd_product_corpus_capture(args: SpdProductCorpusCaptureArgs) -> Result<(
     let prompt_token_sets = prompt_token_sets_from_file(&args.prompt_token_file)?;
     let final_norm_weight = read_capture_final_norm_weight(&args)?;
     let draft_token_ids = capture_draft_token_ids(&args)?;
-    let live_runner = open_capture_live_tap_runner(&args, &ranges)?;
-    let target_model = open_capture_full_target_model(&args)?;
     let mut product_corpus =
         ProductActivationCorpusWriter::create(ProductActivationCorpusConfig {
             dir: args.product_corpus_dir.clone(),
@@ -419,15 +417,31 @@ pub fn spd_product_corpus_capture(args: SpdProductCorpusCaptureArgs) -> Result<(
             })
         })
         .transpose()?;
+    let target_traces = {
+        let target_model = open_capture_full_target_model(&args)?;
+        let mut traces = Vec::with_capacity(prompt_token_sets.len());
+        for (prompt_index, prompt_tokens) in prompt_token_sets.iter().enumerate() {
+            traces.push(capture_product_target_generation(
+                &args,
+                ProductTargetCaptureInputs {
+                    prompt_index,
+                    prompt_tokens,
+                    target_model: &target_model,
+                    row_count: row_hf_indices.len(),
+                },
+                native_teacher.as_mut(),
+            )?);
+        }
+        traces
+    };
+    let live_runner = open_capture_live_tap_runner(&args, &ranges)?;
     let mut reports = Vec::with_capacity(prompt_token_sets.len());
-    for (prompt_index, prompt_tokens) in prompt_token_sets.iter().enumerate() {
-        reports.push(capture_product_generation(
+    for trace in &target_traces {
+        reports.push(capture_product_tap_generation(
             &args,
             &live_runner,
-            ProductCaptureInputs {
-                prompt_index,
-                prompt_tokens,
-                target_model: &target_model,
+            trace,
+            ProductTapCaptureInputs {
                 row_i_stages: &row_i_stages,
                 row_hf_indices: &row_hf_indices,
                 final_norm_weight: &final_norm_weight,
@@ -435,7 +449,6 @@ pub fn spd_product_corpus_capture(args: SpdProductCorpusCaptureArgs) -> Result<(
                 hidden_size: args.hidden_size,
             },
             &mut product_corpus,
-            native_teacher.as_mut(),
         )?);
     }
     let product_corpus_report = product_corpus.finish()?;
@@ -479,15 +492,36 @@ struct VerifiedGenerationReport {
     report: serde_json::Value,
 }
 
-struct ProductCaptureInputs<'a> {
+struct ProductTargetCaptureInputs<'a> {
     prompt_index: usize,
     prompt_tokens: &'a [i32],
     target_model: &'a StageModel,
+    row_count: usize,
+}
+
+struct ProductTapCaptureInputs<'a> {
     row_i_stages: &'a [i64],
     row_hf_indices: &'a [Vec<u32>],
     final_norm_weight: &'a [f32],
     row_count: usize,
     hidden_size: usize,
+}
+
+struct ProductTargetTrace {
+    prompt_index: usize,
+    prompt_token_count: usize,
+    generated_tokens: Vec<i32>,
+    target_elapsed_ms: f64,
+    steps: Vec<ProductTargetStep>,
+}
+
+struct ProductTargetStep {
+    step_index: usize,
+    context_tokens: Vec<i32>,
+    row_positions: Vec<i64>,
+    current_token: i32,
+    target_token: i32,
+    decode_ms: f64,
 }
 
 struct LiveTapParityGate {
@@ -786,13 +820,11 @@ fn run_verified_generation(
     Ok(VerifiedGenerationReport { first_step, report })
 }
 
-fn capture_product_generation(
+fn capture_product_target_generation(
     args: &SpdProductCorpusCaptureArgs,
-    live_runner: &SpdLiveTapRunner,
-    inputs: ProductCaptureInputs<'_>,
-    product_corpus: &mut ProductActivationCorpusWriter,
+    inputs: ProductTargetCaptureInputs<'_>,
     mut native_teacher: Option<&mut NativeTeacherLogitsWriter>,
-) -> Result<serde_json::Value> {
+) -> Result<ProductTargetTrace> {
     if inputs.prompt_tokens.len() < inputs.row_count {
         bail!(
             "SPD product capture prompt length {} is shorter than row count {}",
@@ -810,36 +842,14 @@ fn capture_product_generation(
         .context("create product capture target session")?;
     prefill_target_prefix(&mut target_session, prefix)?;
     let mut context_tokens = inputs.prompt_tokens.to_vec();
-    let zero_projected_cur_in = vec![0.0_f32; inputs.row_count * inputs.hidden_size];
-    let empty_topk = SpdQwen3FixtureTopK {
-        draft_indices: Vec::new(),
-        token_ids: Vec::new(),
-        logits: Vec::new(),
-    };
     let total_timer = Instant::now();
     let mut steps = Vec::with_capacity(args.verify_steps);
     for step_index in 0..args.verify_steps {
-        let step_timer = Instant::now();
         let current = *context_tokens
             .last()
             .context("product capture context is empty")?;
         let row_positions = sliding_row_positions(context_tokens.len(), inputs.row_count)?;
-        let tap_timer = Instant::now();
-        let taps = live_runner.collect_taps(&context_tokens)?;
-        let tap_ms = elapsed_ms(tap_timer);
-        let assemble_timer = Instant::now();
-        let raw_tap_concat = assemble_raw_live_tap_concat_for_positions(
-            &taps,
-            DynamicLiveRowInputs {
-                row_positions: &row_positions,
-                row_i_stages: inputs.row_i_stages,
-                row_hf_indices: inputs.row_hf_indices,
-                final_norm_weight: inputs.final_norm_weight,
-                layer_end: args.layer_end,
-                hidden_size: inputs.hidden_size,
-            },
-        )?;
-        let assemble_ms = elapsed_ms(assemble_timer);
+        let step_context_tokens = context_tokens.clone();
         let decode_timer = Instant::now();
         let target_token = target_session
             .decode_step(current)
@@ -853,24 +863,6 @@ fn capture_product_generation(
             ),
             None => None,
         };
-        product_corpus.write_step(ProductActivationSample {
-            prompt_index: inputs.prompt_index,
-            step_index,
-            context_tokens: &context_tokens,
-            row_positions: &row_positions,
-            row_stage_ids: inputs.row_i_stages,
-            row_hf_indices: inputs.row_hf_indices,
-            query_row_index: inputs.row_count.saturating_sub(1),
-            target_position: context_tokens.len(),
-            cur_in: &zero_projected_cur_in,
-            raw_tap_concat: &raw_tap_concat,
-            current_token: current,
-            proposal_topk: &empty_topk,
-            target_token,
-            accepted: false,
-            committed_token: target_token,
-            baseline_greedy_token: target_token,
-        })?;
         if let (Some(writer), Some(logits)) = (
             native_teacher.as_deref_mut(),
             native_teacher_logits.as_deref(),
@@ -886,31 +878,102 @@ fn capture_product_generation(
             })?;
         }
         context_tokens.push(target_token);
+        steps.push(ProductTargetStep {
+            step_index,
+            context_tokens: step_context_tokens,
+            row_positions,
+            current_token: current,
+            target_token,
+            decode_ms,
+        });
+    }
+    Ok(ProductTargetTrace {
+        prompt_index: inputs.prompt_index,
+        prompt_token_count: inputs.prompt_tokens.len(),
+        generated_tokens: context_tokens[inputs.prompt_tokens.len()..].to_vec(),
+        target_elapsed_ms: elapsed_ms(total_timer),
+        steps,
+    })
+}
+
+fn capture_product_tap_generation(
+    args: &SpdProductCorpusCaptureArgs,
+    live_runner: &SpdLiveTapRunner,
+    trace: &ProductTargetTrace,
+    inputs: ProductTapCaptureInputs<'_>,
+    product_corpus: &mut ProductActivationCorpusWriter,
+) -> Result<serde_json::Value> {
+    let zero_projected_cur_in = vec![0.0_f32; inputs.row_count * inputs.hidden_size];
+    let empty_topk = SpdQwen3FixtureTopK {
+        draft_indices: Vec::new(),
+        token_ids: Vec::new(),
+        logits: Vec::new(),
+    };
+    let total_timer = Instant::now();
+    let mut steps = Vec::with_capacity(trace.steps.len());
+    for step in &trace.steps {
+        let step_timer = Instant::now();
+        let tap_timer = Instant::now();
+        let taps = live_runner.collect_taps(&step.context_tokens)?;
+        let tap_ms = elapsed_ms(tap_timer);
+        let assemble_timer = Instant::now();
+        let raw_tap_concat = assemble_raw_live_tap_concat_for_positions(
+            &taps,
+            DynamicLiveRowInputs {
+                row_positions: &step.row_positions,
+                row_i_stages: inputs.row_i_stages,
+                row_hf_indices: inputs.row_hf_indices,
+                final_norm_weight: inputs.final_norm_weight,
+                layer_end: args.layer_end,
+                hidden_size: inputs.hidden_size,
+            },
+        )?;
+        let assemble_ms = elapsed_ms(assemble_timer);
+        product_corpus.write_step(ProductActivationSample {
+            prompt_index: trace.prompt_index,
+            step_index: step.step_index,
+            context_tokens: &step.context_tokens,
+            row_positions: &step.row_positions,
+            row_stage_ids: inputs.row_i_stages,
+            row_hf_indices: inputs.row_hf_indices,
+            query_row_index: inputs.row_count.saturating_sub(1),
+            target_position: step.context_tokens.len(),
+            cur_in: &zero_projected_cur_in,
+            raw_tap_concat: &raw_tap_concat,
+            current_token: step.current_token,
+            proposal_topk: &empty_topk,
+            target_token: step.target_token,
+            accepted: false,
+            committed_token: step.target_token,
+            baseline_greedy_token: step.target_token,
+        })?;
         steps.push(json!({
-            "step_index": step_index,
-            "context_token_count_before": context_tokens.len() - 1,
-            "current_token": current,
-            "target_token": target_token,
-            "committed_tokens": [target_token],
-            "row_positions": row_positions,
+            "step_index": step.step_index,
+            "context_token_count_before": step.context_tokens.len(),
+            "current_token": step.current_token,
+            "target_token": step.target_token,
+            "committed_tokens": [step.target_token],
+            "row_positions": &step.row_positions,
             "row_stage_ids": inputs.row_i_stages,
             "proposal_source": "none_topology_only_capture",
             "timing_ms": {
                 "tap_replay": tap_ms,
                 "assemble_raw_tap_concat": assemble_ms,
-                "target_greedy_decode": decode_ms,
-                "total": elapsed_ms(step_timer),
+                "target_greedy_decode": step.decode_ms,
+                "tap_phase_total": elapsed_ms(step_timer),
+                "phase_sum": tap_ms + assemble_ms + step.decode_ms,
             },
         }));
     }
     Ok(json!({
-        "prompt_index": inputs.prompt_index,
-        "prompt_token_count": inputs.prompt_tokens.len(),
+        "prompt_index": trace.prompt_index,
+        "prompt_token_count": trace.prompt_token_count,
         "steps_requested": args.verify_steps,
         "steps_completed": steps.len(),
-        "generated_tokens": context_tokens[inputs.prompt_tokens.len()..].to_vec(),
+        "generated_tokens": &trace.generated_tokens,
         "proposal_source": "none_topology_only_capture",
-        "total_elapsed_ms": elapsed_ms(total_timer),
+        "target_phase_elapsed_ms": trace.target_elapsed_ms,
+        "tap_phase_elapsed_ms": elapsed_ms(total_timer),
         "steps": steps,
     }))
 }

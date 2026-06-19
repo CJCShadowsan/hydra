@@ -1,4 +1,4 @@
-# Next Goal: Resubmit Qwen3-Coder-480B S8 SPD HF Run With Streamed Capture
+# Next Goal: Resubmit Qwen3-Coder-480B S8 SPD HF Run With Two-Phase Capture
 
 This file is disposable. Durable evidence belongs in `evals/spd/README.md` and
 `docs/skippy/speculative_decoding.md`.
@@ -6,9 +6,9 @@ This file is disposable. Durable evidence belongs in `evals/spd/README.md` and
 ## One-Line Goal
 
 Resubmit the capped Hugging Face native-package run for a Qwen3-Coder-480B S8
-SPD sidecar after checkpointing the streamed live-tap capture fix, using the
-exact MeshLLM Skippy layer package for teacher capture and training only the
-SPD predictor from captured taps/logits.
+SPD sidecar after phase-separating full-verifier target/logit capture from
+streamed tap-stage replay, using the exact MeshLLM Skippy layer package for
+teacher capture and training only the SPD predictor from captured taps/logits.
 
 ## Immediate Target
 
@@ -58,7 +58,11 @@ Candidate HF flavors from the current Jobs hardware list:
 - `h200x4`: `564GB` VRAM, `1024GB` RAM, about `$20/hr`; cap `2h30m`, more
   memory-safe but probably too short for a useful train/capture cycle.
 
-Submitted first target: `rtx-pro-6000x4`, timeout `4h30m`, max cost `$50`.
+First submitted target: `rtx-pro-6000x4`, timeout `4h30m`, max cost `$50`.
+Latest failed retry target: `rtx-pro-6000x4`, timeout `3h30m`, max cost about
+`$38.50`, chosen to keep aggregate spend for this lane under the original
+`$50` intent after earlier failures. The next retry should use the same cap
+unless a dry run changes the planned cost.
 
 ## Steps
 
@@ -184,7 +188,7 @@ bootstrap_sha256=378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d
 dry_run_plan_sha256=dcce197cb092662ae7048df92f65356833fcb6d60b3c4630613942deb739f78a
 ```
 
-Current streamed-capture resubmission uses the same `$50` capped lane with the
+Failed streamed-capture resubmission used the same `$50` capped lane with the
 streamed live-tap capture patch:
 
 ```bash
@@ -201,8 +205,32 @@ bootstrap_sha256=378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d
 dry_run_plan_sha256=e33d546eb7b3b3d639441fca7331f85fc0addf85d00623bb3cb7fb7b5966d9de
 ```
 
+It failed after 209 seconds, before model work, because
+`crates/skippy-server/src/frontend/spd.rs` still initialized
+`SpdLiveTapRunnerConfig` without the new `stage_backend_devices` and
+`stream_stages` fields. Commit `d19da20d` fixed that initializer. Commit
+`f23e28ba` made the job timeout configurable so the retry could run shorter
+than the original `4.5h` lane.
+
+Current streamed-capture retry uses the fixed server config and a shorter
+timeout:
+
+```bash
+id=6a354a2f953ed90bfb94486f
+url=https://huggingface.co/jobs/meshllm/6a354a2f953ed90bfb94486f
+run_id=20260619T135416Z-f23e28ba
+local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T135416Z-f23e28ba
+output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
+input_prefix=job-inputs/20260619T135416Z-f23e28ba/
+upload_commit=fc2f95dd543955f1e821c7036bebd0e48501974f
+patch_revision=fc2f95dd543955f1e821c7036bebd0e48501974f
+patch_sha256=58cfa43179ce251784014955f43f02092ae0936cb7df75a1a4e545f9f2c8b6bc
+bootstrap_sha256=30d27fa808c08df2f3ca1613381de1ca0a828694e66448f3bc03e55b2610cb05
+dry_run_plan_sha256=61ffa3a560948536e9fc4df7e7dd4c178f36ab4309dbe340e37c63de02d5a9d5
+```
+
 The timeout is the spending backstop. At the current checked rate for
-`rtx-pro-6000x4`, `4.5h` plans at about `$49.50`; the job should finish, fail,
+`rtx-pro-6000x4`, `3.5h` plans at about `$38.50`; the job should finish, fail,
 or be killed by HF at timeout.
 
 Startup attempts before the current live job:
@@ -252,17 +280,31 @@ real package download and prompt construction but did not start capture rows,
 training, scoring, export, or smoke because of the fixed capture boolean
 argument issue.
 
-Current status check on 2026-06-19: streamed-capture job
-`meshllm/6a354843953ed90bfb944848` is `RUNNING`. It has cleared inline
-bootstrap download/startup and is in generated setup after apt package install
-and Rust toolchain download. It has not yet reached package download, capture,
-training, scoring, export, or smoke.
+Status check on 2026-06-20 local time: streamed-capture job
+`meshllm/6a354a2f953ed90bfb94486f` is `ERROR` after 1226 seconds. It cleared
+inline bootstrap download/startup, CUDA ABI build, Rust release builds, Python
+dependency setup, full 69-file Qwen480 layer-package download (`276G / 276G`),
+and prompt-token shard building, then reached `capture[0]`. It failed opening
+streamed tap stage `0..8`: CUDA0 could not allocate a `34051.88 MiB` buffer
+while the full verifier remained resident.
 
-Cost status on 2026-06-19: before the current streamed-capture run, the two
+Local fix checkpoint: `spd-product-corpus-capture` now runs target generation
+and native draft-vocab logit capture first, drops the full verifier model, then
+opens the streamed tap runner and replays the recorded contexts to write final
+product rows. This preserves target/logit semantics while avoiding verifier and
+tap-stage model residency overlap. A real cached package smoke passed against
+`meshllm_Qwen3-0_6B-Q4_K_M-layers-test-main` with `--splits 14 --layer-end 28`,
+`--stream-live-tap-stages`, one prompt, one verify step, native teacher logits,
+and matching product row byte counts:
+`/tmp/spd-two-phase-smoke-report.json`.
+
+Cost status on 2026-06-20: before the latest streamed-capture retry, the two
 serious Qwen480 jobs cost about `$7.45` combined (`1189s + 1249s` at about
-`$11/hr`). Including the shorter startup failures keeps completed GPU spend for
-this lane under about `$8`. The current run is capped separately by the same
-`4.5h` / about `$49.50` timeout.
+`$11/hr`). Including the earlier streamed-build failure and the shorter startup
+failures kept completed GPU spend for this lane around `$8` to `$9`; the latest
+1226-second run adds about `$3.75`, putting completed GPU spend around
+`$12` to `$13`. A new `3.5h` retry would still keep aggregate planned spend
+under the original `$50` intent.
 
 Prior-job inspection commands:
 
@@ -271,11 +313,11 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs insp
 UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a3535603093dba73ce2a264
 ```
 
-Current monitoring commands:
+Latest failed-job inspection commands:
 
 ```bash
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a354843953ed90bfb944848
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a354843953ed90bfb944848
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a354a2f953ed90bfb94486f
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs --tail 160 meshllm/6a354a2f953ed90bfb94486f
 ```
 
 ## Remaining Risks During Run
@@ -286,13 +328,17 @@ UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs
   without loading the full model if unsupported.
 - `native-package-fresh` exports a serving fixture, not a true Python/reference
   parity fixture. Do not claim Rust/Python fixture parity for this lane yet.
-- Setup/build time runs inside the `4.5h` cap. If the job expires before useful
+- Setup/build time runs inside the `3.5h` cap. If the job expires before useful
   capture, the next lane should reduce the first-run scope or use prebuilt
   runtime artifacts before increasing spend.
 - Streamed tap capture trades peak VRAM for repeated stage opens. The next
   resubmission must report capture timing before deciding whether the reload
   churn fits the `$50` lane or requires a prebuilt/runtime or larger-memory
   follow-up lane.
+- The two-phase fix relies on `StageModel` / `StageSession` drop returning CUDA
+  buffers before phase 2 opens streamed tap stages. If CUDA allocator state
+  still prevents a 34GiB stage allocation, the next fix should use a process
+  boundary between verifier capture and tap replay or route tap replay to CPU.
 - Because the run uses an uploaded patch artifact rather than a pushed branch,
   keep the run id, upload commit, and patch SHA with every report.
 

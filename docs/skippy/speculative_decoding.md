@@ -85,12 +85,12 @@ layers / width `6144`, uses vocab size `151936`, emits S8 taps
 After job `meshllm/6a3535603093dba73ce2a264`, the dry run now also verifies
 that `spd-product-corpus-capture` emits
 `--product-native-teacher-logits true` and that generated HF setup does not ask
-pip to upgrade/install `torch` over the PyTorch CUDA base image. The latest
-spend-bearing run is HF Job
+pip to upgrade/install `torch` over the PyTorch CUDA base image. The first
+serious spend-bearing run was HF Job
 `meshllm/6a3535603093dba73ce2a264` with `rtx-pro-6000x4` / `4.5h` under the
-same timeout cap. It bootstraps from uploaded artifacts under
+timeout cap. It bootstrapped from uploaded artifacts under
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`, because the local
-branch is not pushed from this machine. The current artifact is
+branch was not pushed from this machine. The artifact was
 `job-inputs/20260619T122507Z-b843a851/`, upload commit
 `80014e284aa1e727a305c3ff5c44fb2ca82659d6`, with patch SHA256
 `7ec74581ee16e30ce4d56b99a5b0092eb8fc513b92c36acae8fbf8a93d952436`.
@@ -125,15 +125,41 @@ Q4 verifier session for greedy target tokens and draft-vocab teacher logits,
 but opens live-tap stage models one at a time instead of keeping the S8 tap
 stages resident. The current Qwen480 dry run emits that flag plus the capture
 CUDA map `CUDA0,CUDA0,CUDA1,CUDA1,CUDA2,CUDA2,CUDA3,CUDA3`. The remaining risk
-is stage-open churn inside the `4.5h` HF cap, not a change to teacher argmax
+is stage-open churn inside the HF timeout cap, not a change to teacher argmax
 definition.
 
-Streamed-capture HF Job `meshllm/6a354843953ed90bfb944848` is now running with
-the same `rtx-pro-6000x4` / `4.5h` cap and uploaded artifact
+Streamed-capture HF Job `meshllm/6a354843953ed90bfb944848` used the same
+`rtx-pro-6000x4` / `4.5h` cap and uploaded artifact
 `job-inputs/20260619T134535Z-595b67cb/` at commit
-`9198f2468ae69dbb13c0d0a16f7b99c0e3e7dd5d`. Immediate logs show it cleared the
-inline bootstrap download/startup path and entered generated setup. It has not
-yet reached package download, capture, training, export, or smoke.
+`9198f2468ae69dbb13c0d0a16f7b99c0e3e7dd5d`. It failed after `209` seconds
+because `skippy-server` still initialized `SpdLiveTapRunnerConfig` without the
+new streamed-capture fields. Commit `d19da20d` fixed that initializer. Commit
+`f23e28ba` made the HF timeout configurable so the retry could keep aggregate
+spend under the original `$50` intent.
+
+The latest streamed-capture retry is HF Job
+`meshllm/6a354a2f953ed90bfb94486f`, using `rtx-pro-6000x4` with a `3.5h` cap
+and uploaded artifact `job-inputs/20260619T135416Z-f23e28ba/` at commit
+`fc2f95dd543955f1e821c7036bebd0e48501974f`. Status on 2026-06-20 local time:
+it has cleared inline bootstrap download/startup, CUDA ABI build, Rust release
+builds, Python dependency setup, full 69-file Qwen480 layer-package download
+(`276G / 276G`), and prompt-token shard building, then reached `capture[0]`.
+It failed after `1226` seconds opening streamed tap stage `0..8`: CUDA0 could
+not allocate a `34051.88 MiB` buffer while the full verifier remained resident.
+At about `$11/hr`, this adds about `$3.75`, so completed Qwen480 GPU spend is
+roughly `$12` to `$13`.
+
+The local fix is a two-phase topology-only capture path. Phase 1 runs the full
+verifier to record greedy target tokens and native draft-vocab logits, then
+drops that model. Phase 2 opens the streamed tap runner and replays the recorded
+contexts to write product rows in the same prompt/step order. This preserves
+teacher semantics while avoiding full-verifier plus tap-stage residency
+overlap. A real cached package smoke passed on
+`meshllm_Qwen3-0_6B-Q4_K_M-layers-test-main` with `--splits 14 --layer-end 28`,
+`--stream-live-tap-stages`, one prompt, one verify step, native teacher logits,
+and matching product row byte counts. The remaining risk is whether native CUDA
+allocator state fully frees the Qwen480 verifier buffers before phase 2; if not,
+the next fix should use a process boundary or CPU tap replay.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages
@@ -151,6 +177,15 @@ verification. Workers should only need the `spd_tap_return_hf_indices` allowlist
 derived from the manifest. Running the sidecar on every node is not required for
 the current design; it would be a separate optimization if tap transport became
 the bottleneck.
+
+If the Qwen480 S8 sidecar clears the held-out and package-backed smoke gates,
+the next HF validation should be a single-job meshlet before trying multiple HF
+Jobs as separate nodes. One HF Job can start a coordinator, stage servers, the
+SPD sidecar, and the OpenAI frontend as separate local processes, optionally
+injecting synthetic per-stage latency. That tests package materialization, tap
+return, proposal/verification, rolling cleanup, and pipeline economics
+repeatably. Multiple HF Jobs with exposed ports are a later transport spike,
+because the HF job proxy is not the same as a normal low-latency Mesh LAN.
 
 A later no-spend max120 product-corpus check confirmed that simply fitting the
 small HF-teacher bridge harder is not enough. The
@@ -765,13 +800,15 @@ Run these before making any speedup claim:
      the sidecar. Workers need only the manifest-derived tap-return allowlist.
      Mesh may colocate contiguous logical SPD stages onto fewer physical nodes
      only if those nodes still return all internal logical-boundary taps.
-   - The first Qwen480 S8 HF lane should be capped at `$50`: `rtx-pro-6000x4`
-     for `4.5h` plans at `$49.50`, `h200x2` can run `5h` at about `$50` but is
-     tight on VRAM for a `256.98 GiB` package, and `h200x4` is safer on memory
-     but only buys `2.5h` under the same cap. Do not use the full-HF-reference
-     trainer for this target; the job must train from native package tap rows
-     and native Q4 verifier logits without loading the full Qwen480 base model
-     through Transformers. The current `native-package-fresh` dry run uses
+   - The first Qwen480 S8 HF lane was capped at `$50`: `rtx-pro-6000x4` for
+     `4.5h` planned at `$49.50`. The latest retry used the same flavor for
+     `3.5h`, planned around `$38.50`; the next retry should use the two-phase
+     capture patch under the same cap unless dry-run cost changes. `h200x2` can run `5h` at
+     about `$50` but is tight on VRAM for a `256.98 GiB` package, and `h200x4`
+     is safer on memory but only buys `2.5h` under the same cap. Do not use the
+     full-HF-reference trainer for this target; the job must train from native
+     package tap rows and native Q4 verifier logits without loading the full
+     Qwen480 base model through Transformers. The current `native-package-fresh` dry run uses
      topology-only capture plus head-only train/score, exports
      `spd-serving-fixture.safetensors`, and skips true Rust/Python fixture
      parity until a native parity fixture exporter exists. Dry-run
