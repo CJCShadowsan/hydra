@@ -309,6 +309,28 @@ The matching dry run resolves resident tap capture, `rtx-pro-6000x4`, timeout
 sidecar quality. If resident stages fit and this reaches capture/train/export
 smoke, raise the row count in a later capped quality lane.
 
+Submitted resident-small retry:
+
+```bash
+id=6a3563743093dba73ce2a4ab
+url=https://huggingface.co/jobs/meshllm/6a3563743093dba73ce2a4ab
+run_id=20260619T154157Z-52a4ffdf
+local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T154157Z-52a4ffdf
+output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
+input_prefix=job-inputs/20260619T154157Z-52a4ffdf/
+upload_commit=509ed659ccfb237892e9329887f1a6261f352bf1
+patch_revision=509ed659ccfb237892e9329887f1a6261f352bf1
+patch_sha256=57bb1e3180923531641384af307bfb41e6ee05fb0c75795916e93cd2ddc25645
+bootstrap_sha256=c8e2efa7ec104ec6c38d6b8584cd8851ea84692b73ff3df40dcb5fe08e79a022
+dry_run_plan_sha256=3936027d9c94951a8667a9d7c58e186064c58df49e1d4ca51a3563b3bbd6e5e4
+```
+
+The job is labeled `spd-qwen480-resident-small` and was submitted with
+`TRAIN_PROMPTS=32`, `HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`,
+`STREAM_LIVE_TAP_STAGES=false`, and `JOB_TIMEOUT=2h`. First gate: resident S8
+tap stages open after verifier drop without CUDA OOM. Second gate: train and
+held-out capture summaries exist, then conversion/training/export/smoke run.
+
 Startup attempts before the latest two-phase retry:
 
 - `meshllm/6a35304a953ed90bfb9446a8` failed in 3 seconds with exit `126`

@@ -236,6 +236,20 @@ is `TRAIN_PROMPTS=32`, `HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`,
 `STREAM_LIVE_TAP_STAGES=false`, and `JOB_TIMEOUT=2h`; its dry run plans about
 `$22` on `rtx-pro-6000x4` and still contains no old reference-train path.
 
+Resident-small retry submitted on 2026-06-20 local time: HF Job
+`meshllm/6a3563743093dba73ce2a4ab`, URL
+`https://huggingface.co/jobs/meshllm/6a3563743093dba73ce2a4ab`, using input
+artifact `job-inputs/20260619T154157Z-52a4ffdf/` from upload commit
+`509ed659ccfb237892e9329887f1a6261f352bf1`. Patch SHA256 is
+`57bb1e3180923531641384af307bfb41e6ee05fb0c75795916e93cd2ddc25645`;
+bootstrap SHA256 is
+`c8e2efa7ec104ec6c38d6b8584cd8851ea84692b73ff3df40dcb5fe08e79a022`; dry-run
+plan SHA256 is
+`3936027d9c94951a8667a9d7c58e186064c58df49e1d4ca51a3563b3bbd6e5e4`.
+The first gate is resident S8 tap-stage allocation after verifier drop. The
+second gate is train and held-out capture summaries, followed by
+conversion/training/export/package smoke if the smaller lane reaches them.
+
 If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
 the next HF validation spike should be a single-job meshlet: one HF Job starts
 the coordinator, stage servers, SPD sidecar, and OpenAI frontend as separate
