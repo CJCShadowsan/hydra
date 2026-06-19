@@ -10,7 +10,8 @@ MESH_REF="${MESH_REF:-codex/skippy-spd-proof}"
 WORK_DIR="${WORK_DIR:-/workspace/spd-qualification}"
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/workspace/spd-bootstrap}"
 OUTPUT_REPO="${OUTPUT_REPO:-meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8}"
-export PATCH_REPO PATCH_REVISION PATCH_PATH_IN_REPO MESH_REF WORK_DIR BOOTSTRAP_DIR OUTPUT_REPO
+JOB_TIMEOUT="${JOB_TIMEOUT:-4.5h}"
+export PATCH_REPO PATCH_REVISION PATCH_PATH_IN_REPO MESH_REF WORK_DIR BOOTSTRAP_DIR OUTPUT_REPO JOB_TIMEOUT
 
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates git python3-pip
@@ -62,7 +63,7 @@ python3 evals/spd/plan_hf_spd_qualification.py \
   --logical-stage-ms 40 \
   --hop-ms 0.2,1,5,10 \
   --flavor rtx-pro-6000x4 \
-  --timeout 4.5h \
+  --timeout "$JOB_TIMEOUT" \
   --max-cost-usd 50 \
   --mesh-llm-ref "$MESH_REF" \
   --output-repo "$OUTPUT_REPO" \
