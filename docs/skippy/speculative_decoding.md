@@ -181,6 +181,20 @@ requested. The first artifact-producing profile is `TRAIN_PROMPTS=32`,
 `JOB_TIMEOUT=2h`, which dry-runs at about `$22` and still avoids the old
 reference-train path.
 
+Resident-small retry `meshllm/6a3563743093dba73ce2a4ab` cleared the native
+mechanics gates and then failed on a generated shell quoting bug. It completed
+release build, downloaded the full `69`-file / `276G` Qwen480 package, loaded
+the full verifier across four RTX PRO 6000 GPUs, split verifier capture from
+resident tap replay, converted native train and held-out corpora, trained the
+head-only predictor with `base_model_load=skipped`, scored held-out, and
+exported an `8.72GB` BF16 serving head. Train had `31 / 32` labels in draft
+scope; held-out had `8 / 8`; held-out score was `2 / 8` top-1 and `5 / 8`
+top-4. The generated parity-skip command used `echo ...; Rust fixture ...`, so
+Bash tried to execute `Rust` and exited `127`. The planner now emits the skip
+as one `printf`; local validation passes for Python compile, the resident dry
+run, and the generated `rust_fixture_parity` group. The next retry should reuse
+the same profile and resume at the package-smoke/upload gate.
+
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages
 onto fewer physical nodes when hardware is scarce. That placement is only valid

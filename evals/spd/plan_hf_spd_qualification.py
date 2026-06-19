@@ -1108,7 +1108,7 @@ def build_native_package_fresh_commands(
         "score": [score],
         "export_serving_bundle": export,
         "rust_fixture_parity": [
-            "echo native-package-fresh exports a serving fixture only; Rust fixture parity is skipped until native fixture export exists"
+            "printf '%s\\n' 'native-package-fresh exports a serving fixture only; Rust fixture parity is skipped until native fixture export exists'"
         ],
         "package_smoke": [smoke],
         "latency_simulation": [latency],

@@ -747,6 +747,19 @@ The first artifact-producing profile is `TRAIN_PROMPTS=32`,
 `HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`, `STREAM_LIVE_TAP_STAGES=false`, and
 `JOB_TIMEOUT=2h`; dry run shows about `$22`, no `AutoModelForCausalLM`, no
 `hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no stream flag.
+Resident-small retry `meshllm/6a3563743093dba73ce2a4ab` cleared the important
+native-package mechanics gates and failed only after export on a generated
+shell quoting bug. It completed build, downloaded the full `69`-file / `276G`
+Qwen480 package, loaded the verifier, split verifier capture from resident tap
+replay, converted native train and held-out corpora, trained/scored the
+head-only predictor with `base_model_load=skipped`, and exported an `8.72GB`
+BF16 serving head. Train labels in scope were `31 / 32`; held-out labels in
+scope were `8 / 8`; held-out score was `2 / 8` top-1 and `5 / 8` top-4. The
+failure was `echo ...; Rust fixture ...` in the parity-skip command, which made
+Bash execute `Rust`. The planner now emits a single `printf` and the same
+resident dry run plus generated `rust_fixture_parity` group pass locally. The
+next retry should reuse the same resident-small profile and target
+package-backed rolling smoke plus upload.
 If the local branch is not pushed, upload a patch artifact and set
 `MESH_LLM_PATCH_PATH` so the job applies it after cloning. Remaining risk for
 the first capped job is runtime compatibility with the Qwen480 MoE config and

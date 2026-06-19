@@ -250,6 +250,31 @@ The first gate is resident S8 tap-stage allocation after verifier drop. The
 second gate is train and held-out capture summaries, followed by
 conversion/training/export/package smoke if the smaller lane reaches them.
 
+Resident-small result: the job failed after `1424s` running, but after the
+native-package mechanics gates cleared. It completed release build, downloaded
+the full `69`-file / `276G` package snapshot, built prompt shards, loaded the
+full Qwen480 verifier across four RTX PRO 6000 GPUs, split verifier
+target/logit capture from tap replay, opened resident S8 tap stages, converted
+train and held-out corpora, trained the head-only predictor, scored held-out,
+and exported a BF16 serving head. Train conversion had `32` samples with
+`31 / 32` labels in draft scope; held-out had `8 / 8`. The head-only train
+summary reported `base_model_load=skipped`, final train hard-label accuracy
+`1.0`, and the held-out score was `2 / 8` top-1 and `5 / 8` top-4. The serving
+export wrote `spd-head.safetensors` with SHA
+`96a520d81a13bb586897e607767081b98a0d587119a63ae3e4eb7ce15732d15d` and
+`8,723,214,136` bytes.
+
+The failure was not allocator, MoE startup, capture, or training. The generated
+`native-package-fresh` parity-skip command was
+`echo native-package-fresh exports a serving fixture only; Rust fixture parity
+is skipped...`, so Bash treated `Rust` as a command and exited `127`.
+`plan_hf_spd_qualification.py` now emits the skip as a single `printf` command.
+Local validation passes: Python compile for the planner/runner, the same
+resident 32/8/1 dry run, and
+`run_hf_spd_qualification_plan.py --groups rust_fixture_parity`. The next retry
+should reuse the same resident-small profile; the first new gate is
+package-backed rolling smoke plus upload.
+
 If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
 the next HF validation spike should be a single-job meshlet: one HF Job starts
 the coordinator, stage servers, SPD sidecar, and OpenAI frontend as separate

@@ -6,9 +6,9 @@ This file is disposable. Durable evidence belongs in `evals/spd/README.md` and
 ## One-Line Goal
 
 Resubmit the capped Hugging Face native-package run for a Qwen3-Coder-480B S8
-SPD sidecar after phase-separating full-verifier target/logit capture from
-streamed tap-stage replay, using the exact MeshLLM Skippy layer package for
-teacher capture and training only the SPD predictor from captured taps/logits.
+SPD sidecar with two-phase full-verifier target/logit capture plus resident
+tap-stage replay, using the exact MeshLLM Skippy layer package for teacher
+capture and training only the SPD predictor from captured taps/logits.
 
 ## Immediate Target
 
@@ -327,9 +327,28 @@ dry_run_plan_sha256=3936027d9c94951a8667a9d7c58e186064c58df49e1d4ca51a3563b3bbd6
 
 The job is labeled `spd-qwen480-resident-small` and was submitted with
 `TRAIN_PROMPTS=32`, `HELDOUT_PROMPTS=8`, `VERIFY_STEPS=1`,
-`STREAM_LIVE_TAP_STAGES=false`, and `JOB_TIMEOUT=2h`. First gate: resident S8
-tap stages open after verifier drop without CUDA OOM. Second gate: train and
-held-out capture summaries exist, then conversion/training/export/smoke run.
+`STREAM_LIVE_TAP_STAGES=false`, and `JOB_TIMEOUT=2h`.
+
+Observed resident-small result: it failed after `1424s` running, but only after
+the important mechanics gates cleared. The job completed release build,
+downloaded the full `69`-file / `276G` package snapshot, built prompts, loaded
+the full Qwen480 verifier across four RTX PRO 6000 GPUs, phase-separated
+verifier capture from tap replay, opened resident S8 tap stages, converted
+train and held-out native corpora, trained the head-only predictor, scored
+held-out, and exported an `8.72GB` BF16 serving head. Train had `32` samples
+with `31 / 32` labels in draft scope; held-out had `8 / 8` labels in scope.
+Head-only training reported `base_model_load=skipped`, final hard-label
+accuracy `1.0` on the tiny train set, and held-out `2 / 8` top-1 plus `5 / 8`
+top-4. The failure was a generated shell quoting bug in the
+`rust_fixture_parity` skip command: the script ran `echo ...; Rust fixture ...`,
+so Bash tried to execute `Rust` and exited `127`.
+
+Next retry: resubmit the same resident-small profile with the generator fixed
+to emit the parity-skip message as one `printf` command. Local validation
+passes for `python3 -m py_compile` on the planner/runner, the same 32/8/1 dry
+run, and `run_hf_spd_qualification_plan.py --groups rust_fixture_parity`. The
+first new gate is package-backed rolling smoke and upload, because capture,
+train, score, and export already worked once.
 
 Startup attempts before the latest two-phase retry:
 
