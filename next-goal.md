@@ -140,21 +140,21 @@ instead of requiring a GitHub push from this machine.
 it downloads the uploaded patch, applies it to a bootstrap clone, regenerates
 the reviewed plan, then runs `run_hf_spd_qualification_plan.py`.
 
-Current live job uses the same parameters through an HF-uploaded
-patch/bootstrap artifact, because the local branch was not pushed to GitHub
-from this machine:
+The next live job should use the same parameters through an HF-uploaded
+patch/bootstrap artifact, because the local branch is not pushed to GitHub from
+this machine:
 
 ```bash
-id=6a35325c3093dba73ce2a206
-url=https://huggingface.co/jobs/meshllm/6a35325c3093dba73ce2a206
-run_id=20260619T121245Z-bcec1f4f
-local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T121245Z-bcec1f4f
+id=<pending resubmit after just build-runtime fix>
+url=<pending>
+run_id=<pending>
+local_artifact_dir=<pending>
 output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
-input_prefix=job-inputs/20260619T121245Z-bcec1f4f/
-upload_commit=dcf8fdfa021ab170855f6b7c64ecbefb7da3d42a
-patch_sha256=d7d937bcdaa711f39cbcbaf1a45093c786dffbfd09746696ca93eb101c634e58
-bootstrap_sha256=3f1bd5a498fff7b1c64e20d95efe7ff793860c364749a460d99d0028cbb599e5
-dry_run_plan_sha256=386b5ac04d93ca072038cc91bfc486d92f99a7f6d97f329b5a4d295ecab8ea3c
+input_prefix=<pending>
+upload_commit=<pending>
+patch_sha256=<pending>
+bootstrap_sha256=<pending>
+dry_run_plan_sha256=<pending>
 ```
 
 The timeout is the spending backstop. At the current checked rate for
@@ -175,16 +175,28 @@ Startup attempts before the current live job:
 - `meshllm/6a3532083093dba73ce2a204` reached the bootstrap script, cloned the
   repo, and failed in 16 seconds because `BOOTSTRAP_DIR` was not exported to
   the Python patch downloader. Fixed in commit `bcec1f4f`.
+- `meshllm/6a35325c3093dba73ce2a206` reached patch apply and plan
+  construction, then failed after 17 seconds because
+  `/workspace/spd-qualification` did not exist before writing
+  `native-package-fresh-plan.json`. Fixed in commit `861c2450`; the planner now
+  creates `--out` parents, and bootstrap also creates `$WORK_DIR`.
+- `meshllm/6a353427953ed90bfb944722` reached generated setup and failed after
+  90 seconds at
+  `MESH_LLM_SKIP_UI=1 MESH_LLM_BUILD_PROFILE=release just build-runtime backend=cuda cuda_arch="$CUDA_ARCH"`.
+  The repo's `just build-runtime` recipe takes positional parameters, so the
+  generated command must be `just build-runtime cuda "$CUDA_ARCH"`. Local dry
+  run now emits the corrected command.
 
-Latest status check on 2026-06-19: current live job
-`meshllm/6a35325c3093dba73ce2a206` reports stage `SCHEDULING`.
-`hf jobs logs` currently returns no runtime log lines yet for that job.
+Latest status check on 2026-06-19: there is no current successful live job
+after the `just build-runtime` setup failure above. The next submission should
+use a fresh artifact from the corrected planner and the same `rtx-pro-6000x4`
+`4.5h` timeout cap.
 
 Monitoring commands:
 
 ```bash
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a35325c3093dba73ce2a206
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a35325c3093dba73ce2a206
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect <job-id>
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs <job-id>
 ```
 
 ## Remaining Risks During Run

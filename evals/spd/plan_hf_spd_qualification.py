@@ -749,7 +749,7 @@ def build_commands(
         "export LLAMA_STAGE_BACKEND=cuda",
         "export LLAMA_STAGE_CUDA_ARCHITECTURES=\"$CUDA_ARCH\"",
         "export LLAMA_STAGE_BUILD_DIR=\"$PWD/.deps/llama-build/build-stage-abi-cuda-sm$CUDA_ARCH_SUFFIX\"",
-        "MESH_LLM_SKIP_UI=1 MESH_LLM_BUILD_PROFILE=release just build-runtime backend=cuda cuda_arch=\"$CUDA_ARCH\"",
+        "MESH_LLM_SKIP_UI=1 MESH_LLM_BUILD_PROFILE=release just build-runtime cuda \"$CUDA_ARCH\"",
         (
             "just with-lld env LLAMA_STAGE_BACKEND=cuda "
             "LLAMA_STAGE_BUILD_DIR=\"$LLAMA_STAGE_BUILD_DIR\" "

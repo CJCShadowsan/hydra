@@ -78,28 +78,35 @@ and setting `MESH_LLM_PATCH_PATH` before executing the generated plan.
 `evals/spd/bootstrap_qwen480_s8_native_job.sh` is the intended HF job
 entrypoint for this capped lane.
 
-Submitted checkpoint on 2026-06-19: the current capped run is HF Job
-`meshllm/6a35325c3093dba73ce2a206` using `rtx-pro-6000x4` and timeout `4.5h`.
-The job URL is `https://huggingface.co/jobs/meshllm/6a35325c3093dba73ce2a206`.
-The spending backstop is the HF timeout, still planned at about `$49.50`.
-Because the local branch was not pushed from this machine, the job bootstraps
-from an uploaded patch artifact in
-`meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8` under
-`job-inputs/20260619T121245Z-bcec1f4f/`. The upload commit is
-`dcf8fdfa021ab170855f6b7c64ecbefb7da3d42a`; local artifacts are in
-`/tmp/spd-qwen480-native-job-20260619T121245Z-bcec1f4f`. Checksums:
-`mesh-llm.patch`
-`d7d937bcdaa711f39cbcbaf1a45093c786dffbfd09746696ca93eb101c634e58`,
-`bootstrap_qwen480_s8_native_job.sh`
-`3f1bd5a498fff7b1c64e20d95efe7ff793860c364749a460d99d0028cbb599e5`, and
-`native-package-fresh-plan.dry-run.json`
+Submitted checkpoint on 2026-06-19: the next capped run should still use
+`rtx-pro-6000x4` and timeout `4.5h`; the spending backstop is the HF timeout,
+still planned at about `$49.50`. Because the local branch is not pushed from
+this machine, the job should bootstrap from an uploaded patch artifact in
+`meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`.
+
+The latest submitted artifact before the next resubmit was
+`job-inputs/20260619T122023Z-861c2450/`, upload commit
+`9d56b2d2d004b84a634121339a53f7421499cb4b`, local artifacts
+`/tmp/spd-qwen480-native-job-20260619T122023Z-861c2450`, patch SHA256
+`2ca0c6314de434b9dd605474b897ebb6241c35a35f6c8d449c3f27d576937374`,
+bootstrap SHA256
+`378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d6`, and
+dry-run plan SHA256
 `386b5ac04d93ca072038cc91bfc486d92f99a7f6d97f329b5a4d295ecab8ea3c`.
 Earlier startup attempts failed before model work: two `bash` invocations
 missed the HF CLI `--` option terminator and treated the script as a filename,
 then one corrected invocation exposed an unexported `BOOTSTRAP_DIR` variable in
-the bootstrap script. CPU canary `meshllm/6a3531e9953ed90bfb9446e4` verified
-the corrected CLI form. Initial inspect for the current run showed
-`SCHEDULING`; runtime logs had not started.
+the bootstrap script, then one run reached plan construction and failed because
+`/workspace/spd-qualification` was missing before writing the generated plan.
+CPU canary `meshllm/6a3531e9953ed90bfb9446e4` verified the corrected CLI form.
+Job `meshllm/6a353427953ed90bfb944722` reached generated setup: it downloaded
+the bootstrap, applied the patch, generated the native-package plan, installed
+build prerequisites, installed Rust, installed `just`, cloned the patched repo
+for execution, and then failed at the generated
+`just build-runtime backend=cuda cuda_arch="$CUDA_ARCH"` command. The repo's
+`build-runtime` recipe takes positional parameters, so the planner now emits
+`just build-runtime cuda "$CUDA_ARCH"`. The job has still not reached package
+download, capture, training, export, or smoke.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving

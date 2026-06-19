@@ -82,21 +82,22 @@ layers / width `6144`, uses vocab size `151936`, emits S8 taps
 `[0,8,16,24,32,40,48,55,62]`, and plans `rtx-pro-6000x4` for `4.5h` at max
 `$49.49991`. The native command graph avoids `AutoModelForCausalLM`,
 `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, and warm-start artifacts.
-The current spend-bearing run was submitted on 2026-06-19 as HF Job
-`meshllm/6a35325c3093dba73ce2a206` with the same `rtx-pro-6000x4` / `4.5h`
-cap. The job URL is
-`https://huggingface.co/jobs/meshllm/6a35325c3093dba73ce2a206`. It bootstraps
-from uploaded artifacts under
-`meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8` at
-`job-inputs/20260619T121245Z-bcec1f4f/`, upload commit
-`dcf8fdfa021ab170855f6b7c64ecbefb7da3d42a`, with patch SHA256
-`d7d937bcdaa711f39cbcbaf1a45093c786dffbfd09746696ca93eb101c634e58`.
-Earlier startup attempts failed before model work due HF CLI command parsing
-and an unexported bootstrap variable; CPU canary
-`meshllm/6a3531e9953ed90bfb9446e4` verified the corrected CLI form. Initial
-inspect for the current run showed scheduling and no runtime logs yet. Treat
-this run as native-package capture/train/smoke qualification under a spend cap,
-not as a distributed speedup run.
+The next spend-bearing run should still use `rtx-pro-6000x4` / `4.5h` under
+the same timeout cap and bootstrap from uploaded artifacts under
+`meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`, because the local
+branch is not pushed from this machine. The latest submitted artifact before
+the next resubmit was `job-inputs/20260619T122023Z-861c2450/`, upload commit
+`9d56b2d2d004b84a634121339a53f7421499cb4b`, with patch SHA256
+`2ca0c6314de434b9dd605474b897ebb6241c35a35f6c8d449c3f27d576937374`.
+Earlier startup attempts failed before model work due to HF CLI command parsing,
+an unexported bootstrap variable, and a missing generated-plan output
+directory; CPU canary `meshllm/6a3531e9953ed90bfb9446e4` verified the corrected
+CLI form. Job `meshllm/6a353427953ed90bfb944722` reached generated setup and
+failed at `just build-runtime backend=cuda cuda_arch="$CUDA_ARCH"`; the planner
+now emits the recipe's positional form, `just build-runtime cuda "$CUDA_ARCH"`.
+No run has reached package download, capture, training, export, or smoke yet.
+Treat this run as native-package capture/train/smoke qualification under a
+spend cap, not as a distributed speedup run.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages
