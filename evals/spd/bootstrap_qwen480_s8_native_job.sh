@@ -10,6 +10,7 @@ MESH_REF="${MESH_REF:-codex/skippy-spd-proof}"
 WORK_DIR="${WORK_DIR:-/workspace/spd-qualification}"
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/workspace/spd-bootstrap}"
 OUTPUT_REPO="${OUTPUT_REPO:-meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8}"
+export PATCH_REPO PATCH_REVISION PATCH_PATH_IN_REPO MESH_REF WORK_DIR BOOTSTRAP_DIR OUTPUT_REPO
 
 apt-get update
 apt-get install -y --no-install-recommends ca-certificates git python3-pip
