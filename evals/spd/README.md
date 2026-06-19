@@ -436,6 +436,23 @@ Next retry remains smoke-existing only: upload the current patch, hydrate
 and rerun package smoke plus latency simulation. Do not recapture or retrain
 unless the uploaded artifact itself becomes unusable.
 
+Current patch bundle for that retry is
+`job-inputs/20260619T190753Z-6abc8370/`, upload commit
+`43940c19fefce860f58c37ebe0517a13d32f8419`. Patch SHA256:
+`4bca067da32ae42067845663ac345e515feeae8abd57aa0ad883de6b9458f15a`;
+bootstrap SHA256:
+`173a370c1f7b9f0b2bac501d866fd835e26c397be39024817a717d7ba3c325e7`;
+dry-run plan SHA256:
+`7fba2ddb364e6ad8eab8bbd4f78ac01b4e359614cf124643a4771da1325a5012`.
+An initial submission `meshllm/6a3593b5953ed90bfb944ef8` failed in `7s`
+with exit `126` because the HF CLI command omitted the `--` terminator and
+parsed `-lc` as a job flag. Corrected retry:
+`meshllm/6a3593cf3093dba73ce2a78f`
+(`https://huggingface.co/jobs/meshllm/6a3593cf3093dba73ce2a78f`), using the
+same `rtx-pro-6000x4` / `1.5h` cap, patch revision, artifact path, and
+CPU/GPU smoke map. First inspect showed the corrected command as
+`['bash', '-lc', ...]` and status `SCHEDULING`.
+
 If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
 the next HF validation spike should be a single-job meshlet: one HF Job starts
 the coordinator, stage servers, SPD sidecar, and OpenAI frontend as separate

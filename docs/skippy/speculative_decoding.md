@@ -264,6 +264,13 @@ The next Qwen480 run should still be smoke-existing only: upload the current
 patch, hydrate `runs/native-package-fresh`, reuse the same package/prompt shard,
 and rerun package smoke plus latency simulation. Do not repeat capture/train
 unless the uploaded artifact is unusable.
+That patch bundle is now uploaded as
+`job-inputs/20260619T190753Z-6abc8370/` at Hub commit
+`43940c19fefce860f58c37ebe0517a13d32f8419`. A first submission
+`meshllm/6a3593b5953ed90bfb944ef8` failed in `7s` with the known HF CLI
+missing-`--` argument issue; no model work ran. Corrected retry
+`meshllm/6a3593cf3093dba73ce2a78f` is submitted with `bash -lc`, the same
+`rtx-pro-6000x4` / `1.5h` cap, artifact path, and CPU/GPU smoke map.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

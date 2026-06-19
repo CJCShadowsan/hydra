@@ -811,6 +811,13 @@ retry is smoke-existing only with the current patch uploaded via
 latency simulation. Remaining risk is proposal quality on broader held-out
 prompts after request-path proposal generation works. True Rust/Python fixture
 parity is still skipped until native parity fixture export exists.
+Current retry bundle: `job-inputs/20260619T190753Z-6abc8370/`, Hub revision
+`43940c19fefce860f58c37ebe0517a13d32f8419`, patch SHA256
+`4bca067da32ae42067845663ac345e515feeae8abd57aa0ad883de6b9458f15a`.
+The corrected smoke-existing HF Job is
+`meshllm/6a3593cf3093dba73ce2a78f`; an immediately previous submission
+`meshllm/6a3593b5953ed90bfb944ef8` failed in `7s` from a missing HF CLI `--`
+terminator before the Docker image and did not run model work.
 
 Do not submit spend until the dry run prints model/package ref, dataset shard,
 prompt counts, topology, hardware flavor, timeout, output repo, and max cost.

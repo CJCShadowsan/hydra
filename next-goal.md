@@ -527,6 +527,27 @@ preserves prefilled tap rows when the source context was empty. The latency
 simulator also now accepts the intended four-physical-bucket clumped model
 against an eight-stage smoke report.
 
+Submitted current-patch smoke-existing retry:
+
+```bash
+id=6a3593cf3093dba73ce2a78f
+url=https://huggingface.co/jobs/meshllm/6a3593cf3093dba73ce2a78f
+run_id=20260619T190753Z-6abc8370
+local_artifact_dir=/tmp/spd-qwen480-smoke-existing-job-20260619T190753Z-6abc8370
+output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
+input_prefix=job-inputs/20260619T190753Z-6abc8370/
+upload_commit=43940c19fefce860f58c37ebe0517a13d32f8419
+patch_revision=43940c19fefce860f58c37ebe0517a13d32f8419
+patch_sha256=4bca067da32ae42067845663ac345e515feeae8abd57aa0ad883de6b9458f15a
+bootstrap_sha256=173a370c1f7b9f0b2bac501d866fd835e26c397be39024817a717d7ba3c325e7
+dry_run_plan_sha256=7fba2ddb364e6ad8eab8bbd4f78ac01b4e359614cf124643a4771da1325a5012
+```
+
+An immediately previous submission `6a3593b5953ed90bfb944ef8` failed in `7s`
+with exit `126` because the HF CLI command omitted the `--` terminator and
+parsed `-lc` as a job flag. The corrected job above inspected as
+`['bash', '-lc', ...]` and started in `SCHEDULING`.
+
 Startup attempts before the latest two-phase retry:
 
 - `meshllm/6a35304a953ed90bfb9446a8` failed in 3 seconds with exit `126`
