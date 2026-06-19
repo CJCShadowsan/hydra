@@ -82,18 +82,21 @@ layers / width `6144`, uses vocab size `151936`, emits S8 taps
 `[0,8,16,24,32,40,48,55,62]`, and plans `rtx-pro-6000x4` for `4.5h` at max
 `$49.49991`. The native command graph avoids `AutoModelForCausalLM`,
 `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, and warm-start artifacts.
-The first spend-bearing run was submitted on 2026-06-19 as HF Job
-`meshllm/6a35304a953ed90bfb9446a8` with the same `rtx-pro-6000x4` / `4.5h`
+The current spend-bearing run was submitted on 2026-06-19 as HF Job
+`meshllm/6a35325c3093dba73ce2a206` with the same `rtx-pro-6000x4` / `4.5h`
 cap. The job URL is
-`https://huggingface.co/jobs/meshllm/6a35304a953ed90bfb9446a8`. It bootstraps
+`https://huggingface.co/jobs/meshllm/6a35325c3093dba73ce2a206`. It bootstraps
 from uploaded artifacts under
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8` at
-`job-inputs/20260619T120328Z-acd77ee3/`, upload commit
-`6c1ad37606d315f1913f8f342286c1ba5d0c007f`, with patch SHA256
-`4377feb3aee64120e54dc81cf8903b362e139130ab02f56eb9d4a6cb72096ac2`. Initial
-inspect showed the job still scheduling and no runtime logs yet. Treat this run
-as native-package capture/train/smoke qualification under a spend cap, not as a
-distributed speedup run.
+`job-inputs/20260619T121245Z-bcec1f4f/`, upload commit
+`dcf8fdfa021ab170855f6b7c64ecbefb7da3d42a`, with patch SHA256
+`d7d937bcdaa711f39cbcbaf1a45093c786dffbfd09746696ca93eb101c634e58`.
+Earlier startup attempts failed before model work due HF CLI command parsing
+and an unexported bootstrap variable; CPU canary
+`meshllm/6a3531e9953ed90bfb9446e4` verified the corrected CLI form. Initial
+inspect for the current run showed scheduling and no runtime logs yet. Treat
+this run as native-package capture/train/smoke qualification under a spend cap,
+not as a distributed speedup run.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

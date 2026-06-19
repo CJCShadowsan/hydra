@@ -78,23 +78,28 @@ and setting `MESH_LLM_PATCH_PATH` before executing the generated plan.
 `evals/spd/bootstrap_qwen480_s8_native_job.sh` is the intended HF job
 entrypoint for this capped lane.
 
-Submitted checkpoint on 2026-06-19: the first capped run was launched as HF Job
-`meshllm/6a35304a953ed90bfb9446a8` using `rtx-pro-6000x4` and timeout `4.5h`.
-The job URL is `https://huggingface.co/jobs/meshllm/6a35304a953ed90bfb9446a8`.
+Submitted checkpoint on 2026-06-19: the current capped run is HF Job
+`meshllm/6a35325c3093dba73ce2a206` using `rtx-pro-6000x4` and timeout `4.5h`.
+The job URL is `https://huggingface.co/jobs/meshllm/6a35325c3093dba73ce2a206`.
 The spending backstop is the HF timeout, still planned at about `$49.50`.
 Because the local branch was not pushed from this machine, the job bootstraps
 from an uploaded patch artifact in
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8` under
-`job-inputs/20260619T120328Z-acd77ee3/`. The upload commit is
-`6c1ad37606d315f1913f8f342286c1ba5d0c007f`; local artifacts are in
-`/tmp/spd-qwen480-native-job-20260619T120328Z-acd77ee3`. Checksums:
+`job-inputs/20260619T121245Z-bcec1f4f/`. The upload commit is
+`dcf8fdfa021ab170855f6b7c64ecbefb7da3d42a`; local artifacts are in
+`/tmp/spd-qwen480-native-job-20260619T121245Z-bcec1f4f`. Checksums:
 `mesh-llm.patch`
-`4377feb3aee64120e54dc81cf8903b362e139130ab02f56eb9d4a6cb72096ac2`,
+`d7d937bcdaa711f39cbcbaf1a45093c786dffbfd09746696ca93eb101c634e58`,
 `bootstrap_qwen480_s8_native_job.sh`
-`ad08edf14348279233844c2af908dc00e76eb53831ff707b7521e40d993ce433`, and
+`3f1bd5a498fff7b1c64e20d95efe7ff793860c364749a460d99d0028cbb599e5`, and
 `native-package-fresh-plan.dry-run.json`
-`eb09956dc86498d80e32e1b73589dd2f429c9ccd026715d6b6f63c39b9141c24`.
-Initial inspect showed the job in `SCHEDULING`; runtime logs had not started.
+`386b5ac04d93ca072038cc91bfc486d92f99a7f6d97f329b5a4d295ecab8ea3c`.
+Earlier startup attempts failed before model work: two `bash` invocations
+missed the HF CLI `--` option terminator and treated the script as a filename,
+then one corrected invocation exposed an unexported `BOOTSTRAP_DIR` variable in
+the bootstrap script. CPU canary `meshllm/6a3531e9953ed90bfb9446e4` verified
+the corrected CLI form. Initial inspect for the current run showed
+`SCHEDULING`; runtime logs had not started.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving

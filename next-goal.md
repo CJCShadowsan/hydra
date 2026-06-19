@@ -140,34 +140,51 @@ instead of requiring a GitHub push from this machine.
 it downloads the uploaded patch, applies it to a bootstrap clone, regenerates
 the reviewed plan, then runs `run_hf_spd_qualification_plan.py`.
 
-Submitted job used the same parameters through an HF-uploaded patch/bootstrap
-artifact, because the local branch was not pushed to GitHub from this machine:
+Current live job uses the same parameters through an HF-uploaded
+patch/bootstrap artifact, because the local branch was not pushed to GitHub
+from this machine:
 
 ```bash
-id=6a35304a953ed90bfb9446a8
-url=https://huggingface.co/jobs/meshllm/6a35304a953ed90bfb9446a8
-run_id=20260619T120328Z-acd77ee3
-local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T120328Z-acd77ee3
+id=6a35325c3093dba73ce2a206
+url=https://huggingface.co/jobs/meshllm/6a35325c3093dba73ce2a206
+run_id=20260619T121245Z-bcec1f4f
+local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T121245Z-bcec1f4f
 output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
-input_prefix=job-inputs/20260619T120328Z-acd77ee3/
-upload_commit=6c1ad37606d315f1913f8f342286c1ba5d0c007f
-patch_sha256=4377feb3aee64120e54dc81cf8903b362e139130ab02f56eb9d4a6cb72096ac2
-bootstrap_sha256=ad08edf14348279233844c2af908dc00e76eb53831ff707b7521e40d993ce433
-dry_run_plan_sha256=eb09956dc86498d80e32e1b73589dd2f429c9ccd026715d6b6f63c39b9141c24
+input_prefix=job-inputs/20260619T121245Z-bcec1f4f/
+upload_commit=dcf8fdfa021ab170855f6b7c64ecbefb7da3d42a
+patch_sha256=d7d937bcdaa711f39cbcbaf1a45093c786dffbfd09746696ca93eb101c634e58
+bootstrap_sha256=3f1bd5a498fff7b1c64e20d95efe7ff793860c364749a460d99d0028cbb599e5
+dry_run_plan_sha256=386b5ac04d93ca072038cc91bfc486d92f99a7f6d97f329b5a4d295ecab8ea3c
 ```
 
 The timeout is the spending backstop. At the current checked rate for
 `rtx-pro-6000x4`, `4.5h` plans at about `$49.50`; the job should finish, fail,
 or be killed by HF at timeout.
 
-Latest status check on 2026-06-19: HF Jobs reports stage `SCHEDULING`.
-`hf jobs logs` currently returns no runtime log lines yet.
+Startup attempts before the current live job:
+
+- `meshllm/6a35304a953ed90bfb9446a8` failed in 3 seconds with exit `126`
+  because the HF CLI invocation passed the multiline script to `bash` as a
+  filename.
+- `meshllm/6a3531c3953ed90bfb9446e2` failed the same way; root cause was
+  missing the HF CLI `--` option terminator before container command flags, so
+  `-lc` was parsed as a job label instead of a Bash argument.
+- CPU canary `meshllm/6a3531e9953ed90bfb9446e4` proved the corrected
+  `hf jobs run ... -- <image> bash -lc <script>` form and printed
+  `hf-command-ok`.
+- `meshllm/6a3532083093dba73ce2a204` reached the bootstrap script, cloned the
+  repo, and failed in 16 seconds because `BOOTSTRAP_DIR` was not exported to
+  the Python patch downloader. Fixed in commit `bcec1f4f`.
+
+Latest status check on 2026-06-19: current live job
+`meshllm/6a35325c3093dba73ce2a206` reports stage `SCHEDULING`.
+`hf jobs logs` currently returns no runtime log lines yet for that job.
 
 Monitoring commands:
 
 ```bash
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a35304a953ed90bfb9446a8
-UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a35304a953ed90bfb9446a8
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a35325c3093dba73ce2a206
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a35325c3093dba73ce2a206
 ```
 
 ## Remaining Risks During Run
