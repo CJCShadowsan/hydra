@@ -453,22 +453,45 @@ same `rtx-pro-6000x4` / `1.5h` cap, patch revision, artifact path, and
 CPU/GPU smoke map. First inspect showed the corrected command as
 `['bash', '-lc', ...]` and status `SCHEDULING`.
 
-If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
-the next HF validation spike should be a single-job meshlet: one HF Job starts
-the coordinator, stage servers, SPD sidecar, and OpenAI frontend as separate
-local processes, with optional artificial per-stage latency. That would test
-package download, stage placement, tap returns, SPD proposal/verification,
-rolling executor cleanup, and pipeline economics repeatably. A multi-HF-job
-node spike is lower priority until the transport story is explicit, because HF
-job port exposure is not the same as a normal low-latency Mesh LAN.
+Completed smoke-existing result: `meshllm/6a3593cf3093dba73ce2a78f` finished
+`COMPLETED`. It repeated release build, full `276G` package download,
+deterministic prompt rebuild, artifact hydration, package-backed baseline/SPD
+smoke, latency simulation, and upload. The request path is now mechanically
+alive: baseline/SPD content matched on `8 / 8` prompts, tap return failures
+were `0`, tap record failures were `0`, ignored taps were `0`, inline probes
+generated proposals for all `32 / 32` probe records, proposal miss reasons were
+all `null`, and `proposal_missing_taps` was empty. Aggregated tap returns were
+hf `16,24,32,40,48,55,62`; local stage-0 hf `8` records were present.
 
-Dispatch gate for that meshlet: do not spend on it until the current Qwen480
-lane has produced held-out native teacher summaries, completed training/scoring
-or failed with an actionable sidecar-quality result, exported the serving
-bundle, and run package-backed rolling `spd-openai-smoke` with matched baseline
-content, zero tap failures, and useful accepted/proposed plus saved/unsaved
-candidate-token round-trip counts. The meshlet is a validation layer for a
-candidate sidecar, not a replacement for producing one.
+This is not a useful sidecar yet. The tiny `32`-row train / `8`-row held-out /
+one-verify-step head overfit train (`final_argmax_acc=1.0`) but scored only
+`2 / 8` held-out top-1 and `5 / 8` top-4. Package-backed rolling smoke proposed
+`32`, accepted `0`, rejected `32`, committed `0` optimistic tokens, and reached
+`max_in_flight=3`. The paper/economics report records `0` saved and `32`
+unsaved candidate-token round trips, so `paper_like_speedup_vs_serial_split=0`.
+Mean sidecar head time was about `399.9ms` for the `16` pre-target probes,
+while normal downstream wait averaged `1515.6ms`; with zero acceptance, that
+available overlap does not matter.
+
+The next HF step is a quality lane, not a meshlet: capture/train substantially
+more native rows for the same Qwen480 S8 topology and require held-out
+package-backed serving to save more candidate-token round trips than it wastes.
+The first single-job HF meshlet remains a follow-on only after the sidecar
+quality gate clears. It should start one coordinator, stage servers, SPD
+sidecar, and OpenAI frontend as separate local processes in one HF Job, with
+optional artificial latency. A multi-HF-job node spike is lower priority until
+the transport story is explicit, because HF job port exposure is not the same
+as a normal low-latency Mesh LAN.
+
+No-spend quality dry run after the completed smoke:
+`/tmp/spd-qwen480-s8-quality-native-package-fresh-plan.json`, SHA256
+`563f142b265067cdda806a9f1ff29fa8743deddca51d48f2e9c829bc93972465`. It plans
+the same package/topology with `512` train prompts, `64` held-out prompts,
+`4` verify steps, `rtx-pro-6000x4`, timeout `4.5h`, and max cost `$49.49991`.
+The generated plan still has no `AutoModelForCausalLM`, no
+`hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no
+`from_pretrained(` matches. This is the next plausible spend-bearing lane, but
+it should not be submitted without explicit approval.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving

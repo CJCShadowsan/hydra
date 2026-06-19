@@ -781,13 +781,15 @@ script ran from the bootstrap checkout and could not resolve
 `$WORK_DIR/mesh-llm` before package smoke and checks for the release binaries
 and `physical-stage-ms.txt`.
 
-Current Qwen480 spend step: use
-`evals/spd/bootstrap_qwen480_s8_smoke_existing_job.sh` to hydrate the uploaded
-artifact, regenerate prompts, download the same package, and run only
-package-smoke, latency simulation, and upload. Default smoke map:
-`CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`; default timeout `1.5h`, about
-`$16.50` max on `rtx-pro-6000x4`. Use
-`SMOKE_STAGE_BACKEND_DEVICES` with either bootstrap if changing the placement.
+Current Qwen480 spend checkpoint: smoke-existing job
+`meshllm/6a3593cf3093dba73ce2a78f` completed with the uploaded
+`job-inputs/20260619T190753Z-6abc8370/` patch at Hub revision
+`43940c19fefce860f58c37ebe0517a13d32f8419`. It used
+`evals/spd/bootstrap_qwen480_s8_smoke_existing_job.sh`, hydrated
+`runs/native-package-fresh`, regenerated prompts, downloaded the same Qwen480
+package, and ran package smoke, latency simulation, and upload. Default smoke
+map was `CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`; timeout was `1.5h`, about
+`$16.50` max on `rtx-pro-6000x4`.
 Fixed retry `meshllm/6a35894f953ed90bfb944e49` ran with uploaded input
 `job-inputs/20260619T182322Z-bf682379/` at revision
 `ea52905865b07ad17a5fdd7519d27a07ad4f689c`.
@@ -817,7 +819,28 @@ Current retry bundle: `job-inputs/20260619T190753Z-6abc8370/`, Hub revision
 The corrected smoke-existing HF Job is
 `meshllm/6a3593cf3093dba73ce2a78f`; an immediately previous submission
 `meshllm/6a3593b5953ed90bfb944ef8` failed in `7s` from a missing HF CLI `--`
-terminator before the Docker image and did not run model work.
+terminator before the Docker image and did not run model work. The corrected
+job passed package-backed smoke mechanically: content matched on `8 / 8`,
+tap return failures were `0`, tap record failures were `0`, ignored taps were
+`0`, all `32 / 32` inline probes proposed with `proposal_miss_reason=null`,
+and no taps were missing. It failed the sidecar-quality/economics gate:
+`32` proposed, `0` accepted, `32` rejected, `0` optimistic tokens committed,
+`0` saved versus `32` unsaved candidate-token round trips, and
+`paper_like_speedup_vs_serial_split=0`. The tiny train/held-out lane overfit
+train but scored only `2 / 8` held-out top-1 and `5 / 8` top-4.
+
+Do not dispatch the HF meshlet yet. The next spend-bearing Qwen480 step is a
+larger native quality lane for the same S8 topology, with enough disjoint rows
+to judge held-out package-backed acceptance. Meshlet validation is allowed only
+after package-backed serving clears matched content, zero tap failures, and
+saved candidate-token round trips greater than unsaved with margin.
+The no-spend dry run for that larger lane is
+`/tmp/spd-qwen480-s8-quality-native-package-fresh-plan.json`, SHA256
+`563f142b265067cdda806a9f1ff29fa8743deddca51d48f2e9c829bc93972465`. It plans
+`512` train prompts, `64` held-out prompts, `4` verify steps,
+`rtx-pro-6000x4`, timeout `4.5h`, and max cost `$49.49991`, with no
+`AutoModelForCausalLM`, `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, or
+`from_pretrained(` matches.
 
 Do not submit spend until the dry run prints model/package ref, dataset shard,
 prompt counts, topology, hardware flavor, timeout, output repo, and max cost.

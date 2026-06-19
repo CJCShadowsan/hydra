@@ -272,6 +272,32 @@ missing-`--` argument issue; no model work ran. Corrected retry
 `meshllm/6a3593cf3093dba73ce2a78f` is submitted with `bash -lc`, the same
 `rtx-pro-6000x4` / `1.5h` cap, artifact path, and CPU/GPU smoke map.
 
+That corrected retry finished `COMPLETED`. It proved the request-path fix and
+the package-backed Qwen480 S8 smoke mechanics: baseline/SPD content matched on
+`8 / 8` prompts, tap return failures were `0`, tap record failures were `0`,
+ignored taps were `0`, all `32 / 32` inline probes produced proposals, proposal
+miss reasons were all `null`, and no taps were missing. The sidecar itself did
+not pass quality: package-backed rolling smoke proposed `32`, accepted `0`,
+rejected `32`, committed `0` optimistic tokens, and saved `0` candidate-token
+round trips. The tiny held-out scorer for the uploaded artifact was only
+`2 / 8` top-1 and `5 / 8` top-4, while the 32-row train fit reached
+`final_argmax_acc=1.0`. Treat this as completed mechanics evidence and a
+sidecar-quality failure, not a speedup signal.
+
+The next spend-bearing Qwen480 step should therefore be a larger native quality
+lane for the same S8 topology, not a meshlet. A single-job HF meshlet remains
+the right end-to-end validation spike only after package-backed held-out
+serving reports matched content, zero tap failures, and saved candidate-token
+round trips greater than unsaved with margin.
+
+A no-spend dry run for that larger lane is saved at
+`/tmp/spd-qwen480-s8-quality-native-package-fresh-plan.json` with SHA256
+`563f142b265067cdda806a9f1ff29fa8743deddca51d48f2e9c829bc93972465`. It uses
+`512` train prompts, `64` held-out prompts, `4` verify steps,
+`rtx-pro-6000x4`, timeout `4.5h`, and max cost `$49.49991`, and still avoids
+the old full-reference path strings: no `AutoModelForCausalLM`, no
+`hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no `from_pretrained(`.
+
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages
 onto fewer physical nodes when hardware is scarce. That placement is only valid
