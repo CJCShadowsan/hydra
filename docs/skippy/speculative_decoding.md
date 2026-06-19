@@ -106,9 +106,13 @@ Qwen480 package snapshot (`69` files, about `276G`), and generated disjoint
 UltraChat prompt-token shards (`512` train prompts, `64` held-out prompts). It
 then failed at the first capture invocation because
 `--product-native-teacher-logits` was emitted without the required `true` value.
-No run has captured rows, trained, exported, or smoked yet. Treat the next
-resubmission as native-package capture/train/smoke qualification under a spend
-cap, not as a distributed speedup run.
+Resubmitted HF Job `meshllm/6a353b9d3093dba73ce2a2bf` is now running with the
+fixed artifact `job-inputs/20260619T125208Z-22663dd2/`, pinned to upload commit
+`da3c7956783e86c3e50368ddbd32c00286f263df`; latest observed logs are still in
+generated setup after apt package install and Rust toolchain download. No run
+has captured rows, trained, exported, or smoked yet. Treat this resubmission as
+native-package capture/train/smoke qualification under a spend cap, not as a
+distributed speedup run.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

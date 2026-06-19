@@ -162,6 +162,23 @@ bootstrap_sha256=378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d
 dry_run_plan_sha256=542b9b61a118ee5a4a6a68d103ab1614bc020371129e233fe1d8e8bc93c4e7c6
 ```
 
+Current resubmission uses the same parameters through the fixed uploaded
+patch/bootstrap artifact:
+
+```bash
+id=6a353b9d3093dba73ce2a2bf
+url=https://huggingface.co/jobs/meshllm/6a353b9d3093dba73ce2a2bf
+run_id=20260619T125208Z-22663dd2
+local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T125208Z-22663dd2
+output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
+input_prefix=job-inputs/20260619T125208Z-22663dd2/
+upload_commit=da3c7956783e86c3e50368ddbd32c00286f263df
+patch_revision=da3c7956783e86c3e50368ddbd32c00286f263df
+patch_sha256=450002e81f41b6adaf72c997ecad28700e29f2faf191c7c93d1aceb06e76757f
+bootstrap_sha256=378a4bc91ff2c4aadeffa2a501180aafba44bedc2df377598bc0a3f3ce8ab6d6
+dry_run_plan_sha256=dcce197cb092662ae7048df92f65356833fcb6d60b3c4630613942deb739f78a
+```
+
 The timeout is the spending backstop. At the current checked rate for
 `rtx-pro-6000x4`, `4.5h` plans at about `$49.50`; the job should finish, fail,
 or be killed by HF at timeout.
@@ -206,11 +223,25 @@ real package download and prompt construction but did not start capture rows,
 training, scoring, export, or smoke because of the fixed capture boolean
 argument issue.
 
+Current status check on 2026-06-19: resubmitted job
+`meshllm/6a353b9d3093dba73ce2a2bf` is `RUNNING`. HF registered
+`PATCH_REVISION=da3c7956783e86c3e50368ddbd32c00286f263df` and the fixed
+artifact paths. Latest observed logs are in generated setup after apt package
+install and Rust toolchain download; it has not reached build-runtime, package
+download, capture, training, scoring, export, or smoke yet.
+
 Prior-job inspection commands:
 
 ```bash
 UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a3535603093dba73ce2a264
 UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a3535603093dba73ce2a264
+```
+
+Current monitoring commands:
+
+```bash
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a353b9d3093dba73ce2a2bf
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a353b9d3093dba73ce2a2bf
 ```
 
 ## Remaining Risks During Run

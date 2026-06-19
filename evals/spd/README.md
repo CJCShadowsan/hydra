@@ -122,6 +122,18 @@ value. The planner now emits `--product-native-teacher-logits true`, so the
 next resubmission should start actual capture rows unless a runtime/model issue
 appears.
 
+Resubmission checkpoint on 2026-06-19: HF Job
+`meshllm/6a353b9d3093dba73ce2a2bf` is running with the same `rtx-pro-6000x4` /
+`4.5h` cap. It uses fixed artifact
+`job-inputs/20260619T125208Z-22663dd2/` from upload commit
+`da3c7956783e86c3e50368ddbd32c00286f263df`, with patch SHA256
+`450002e81f41b6adaf72c997ecad28700e29f2faf191c7c93d1aceb06e76757f` and
+dry-run plan SHA256
+`dcce197cb092662ae7048df92f65356833fcb6d60b3c4630613942deb739f78a`. HF
+registered the pinned `PATCH_REVISION` and fixed artifact paths; latest
+observed logs are still in generated setup, after apt package install and Rust
+toolchain download.
+
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
 artifacts export if training reaches export, package-backed rolling smoke
