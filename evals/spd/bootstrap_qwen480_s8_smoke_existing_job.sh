@@ -122,6 +122,16 @@ if missing:
 print(f"hydrated {source} into {artifact_dir}")
 PY
 
+cd "$WORK_DIR/mesh-llm"
+if [[ ! -x target/release/skippy-bench || ! -x target/release/skippy-server ]]; then
+  echo "missing release skippy binaries under $PWD/target/release" >&2
+  exit 1
+fi
+if [[ ! -f physical-stage-ms.txt ]]; then
+  echo "missing physical-stage-ms.txt in $PWD" >&2
+  exit 1
+fi
+
 python3 evals/spd/run_hf_spd_qualification_plan.py \
   --plan "$WORK_DIR/native-package-fresh-plan.json" \
   --groups package_smoke,latency_simulation,upload \
