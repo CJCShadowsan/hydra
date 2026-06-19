@@ -82,7 +82,11 @@ layers / width `6144`, uses vocab size `151936`, emits S8 taps
 `[0,8,16,24,32,40,48,55,62]`, and plans `rtx-pro-6000x4` for `4.5h` at max
 `$49.49991`. The native command graph avoids `AutoModelForCausalLM`,
 `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, and warm-start artifacts.
-The current spend-bearing run is HF Job
+After job `meshllm/6a3535603093dba73ce2a264`, the dry run now also verifies
+that `spd-product-corpus-capture` emits
+`--product-native-teacher-logits true` and that generated HF setup does not ask
+pip to upgrade/install `torch` over the PyTorch CUDA base image. The latest
+spend-bearing run is HF Job
 `meshllm/6a3535603093dba73ce2a264` with `rtx-pro-6000x4` / `4.5h` under the
 same timeout cap. It bootstraps from uploaded artifacts under
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`, because the local
@@ -96,11 +100,15 @@ directory; CPU canary `meshllm/6a3531e9953ed90bfb9446e4` verified the corrected
 CLI form. Job `meshllm/6a353427953ed90bfb944722` reached generated setup and
 failed at `just build-runtime backend=cuda cuda_arch="$CUDA_ARCH"`; the planner
 now emits the recipe's positional form, `just build-runtime cuda "$CUDA_ARCH"`.
-The current run has passed that failure and is compiling the CUDA llama.cpp
-stage runtime; latest observed build progress was `[403/410]` CMake targets. No
-run has reached package download, capture, training, export, or smoke yet. Treat
-this run as native-package capture/train/smoke qualification under a spend cap,
-not as a distributed speedup run.
+Job `meshllm/6a3535603093dba73ce2a264` passed that failure, built the CUDA
+stage runtime, built release `skippy-bench`/`skippy-server`, downloaded the full
+Qwen480 package snapshot (`69` files, about `276G`), and generated disjoint
+UltraChat prompt-token shards (`512` train prompts, `64` held-out prompts). It
+then failed at the first capture invocation because
+`--product-native-teacher-logits` was emitted without the required `true` value.
+No run has captured rows, trained, exported, or smoked yet. Treat the next
+resubmission as native-package capture/train/smoke qualification under a spend
+cap, not as a distributed speedup run.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

@@ -1,13 +1,14 @@
-# Next Goal: Monitor Qwen3-Coder-480B S8 SPD HF Run
+# Next Goal: Resubmit Qwen3-Coder-480B S8 SPD HF Run
 
 This file is disposable. Durable evidence belongs in `evals/spd/README.md` and
 `docs/skippy/speculative_decoding.md`.
 
 ## One-Line Goal
 
-Monitor the capped Hugging Face native-package run for a Qwen3-Coder-480B S8
-SPD sidecar, using the exact MeshLLM Skippy layer package for teacher capture
-and training only the SPD predictor from captured taps/logits.
+Resubmit the capped Hugging Face native-package run for a Qwen3-Coder-480B S8
+SPD sidecar after fixing the capture boolean argument, using the exact MeshLLM
+Skippy layer package for teacher capture and training only the SPD predictor
+from captured taps/logits.
 
 ## Immediate Target
 
@@ -125,12 +126,16 @@ python3 evals/spd/plan_hf_spd_qualification.py \
   --json
 ```
 
-Latest dry-run checkpoint: this command resolves the package metadata as
+Latest dry-run checkpoint after the capture-arg fix: this command resolves the package metadata as
 `62` layers, activation width `6144`, package model id
 `unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF:UD-Q4_K_XL`, hardware
 `rtx-pro-6000x4`, timeout `16200s`, and max cost `$49.49991`. The generated
 native-package command graph contains no `AutoModelForCausalLM`, no
 `hf_train_eval_qwen06.py`, no `spd-live-tap-parity`, and no warm-start path.
+The generated `spd-product-corpus-capture` command now emits
+`--product-native-teacher-logits true`, matching the native capture CLI's
+`ArgAction::Set` boolean shape. The generated HF setup no longer asks pip to
+upgrade/install `torch`; the PyTorch CUDA base image supplies it.
 The setup path now installs Rust/`just`/build prerequisites, detects the CUDA
 architecture, builds the CUDA stage ABI with `just build-runtime`, and then
 builds `target/release/skippy-bench` plus `target/release/skippy-server`.
@@ -140,8 +145,8 @@ instead of requiring a GitHub push from this machine.
 it downloads the uploaded patch, applies it to a bootstrap clone, regenerates
 the reviewed plan, then runs `run_hf_spd_qualification_plan.py`.
 
-Current live job uses the same parameters through an HF-uploaded
-patch/bootstrap artifact, because the local branch is not pushed to GitHub from
+Latest failed job used the same parameters through an HF-uploaded
+patch/bootstrap artifact, because the local branch was not pushed to GitHub from
 this machine:
 
 ```bash
@@ -186,15 +191,22 @@ Startup attempts before the current live job:
   The repo's `just build-runtime` recipe takes positional parameters, so the
   generated command must be `just build-runtime cuda "$CUDA_ARCH"`. Local dry
   run now emits the corrected command.
+- `meshllm/6a3535603093dba73ce2a264` ran for 1189 seconds, passed CUDA
+  `build-runtime`, built the Rust release binaries, downloaded the full
+  Qwen480 package snapshot (`69` files, about `276G`), and built disjoint
+  UltraChat prompt-token files (`512` train prompts, `64` held-out prompts,
+  train mean `101.3` tokens, held-out mean `103.8` tokens). It failed at the
+  first `spd-product-corpus-capture` command because the planner emitted
+  `--product-native-teacher-logits` without the required `true` value. Local
+  dry run now emits `--product-native-teacher-logits true`.
 
-Latest status check on 2026-06-19: current live job
-`meshllm/6a3535603093dba73ce2a264` is `RUNNING`. It has passed the old
-`just build-runtime` argument failure and is compiling the CUDA llama.cpp stage
-runtime; the latest observed build progress was `[403/410]` CMake targets. It
-has not reached package download, capture, training, scoring, export, or smoke
-yet.
+Latest status check on 2026-06-19: job
+`meshllm/6a3535603093dba73ce2a264` is `ERROR` with exit code `1`. It reached
+real package download and prompt construction but did not start capture rows,
+training, scoring, export, or smoke because of the fixed capture boolean
+argument issue.
 
-Monitoring commands:
+Prior-job inspection commands:
 
 ```bash
 UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a3535603093dba73ce2a264

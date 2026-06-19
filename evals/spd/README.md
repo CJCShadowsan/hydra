@@ -72,13 +72,17 @@ Dry-run checkpoint on 2026-06-19:
 and no warm-start dependency in the generated native command graph. The setup
 commands install Rust/`just`/build prerequisites, detect the CUDA architecture,
 build the CUDA stage ABI with `just build-runtime`, and build
-`target/release/skippy-bench` plus `target/release/skippy-server`. Dispatch can
+`target/release/skippy-bench` plus `target/release/skippy-server`. After job
+`meshllm/6a3535603093dba73ce2a264`, the dry run now also verifies that
+`spd-product-corpus-capture` emits `--product-native-teacher-logits true` and
+that the HF dependency setup does not ask pip to upgrade/install `torch` over
+the PyTorch CUDA base image. Dispatch can
 carry local unpushed changes by uploading a patch artifact to the HF output repo
 and setting `MESH_LLM_PATCH_PATH` before executing the generated plan.
 `evals/spd/bootstrap_qwen480_s8_native_job.sh` is the intended HF job
 entrypoint for this capped lane.
 
-Submitted checkpoint on 2026-06-19: the current capped run is HF Job
+Submitted checkpoint on 2026-06-19: the latest capped run is HF Job
 `meshllm/6a3535603093dba73ce2a264` using `rtx-pro-6000x4` and timeout `4.5h`;
 the job URL is `https://huggingface.co/jobs/meshllm/6a3535603093dba73ce2a264`.
 The spending backstop is the HF timeout, still planned at about `$49.50`.
@@ -106,11 +110,17 @@ build prerequisites, installed Rust, installed `just`, cloned the patched repo
 for execution, and then failed at the generated
 `just build-runtime backend=cuda cuda_arch="$CUDA_ARCH"` command. The repo's
 `build-runtime` recipe takes positional parameters, so the planner now emits
-`just build-runtime cuda "$CUDA_ARCH"`. The current job
-`meshllm/6a3535603093dba73ce2a264` has passed that failure and is compiling the
-CUDA llama.cpp stage runtime; latest observed build progress was `[403/410]`
-CMake targets. It has still not reached package download, capture, training,
-export, or smoke.
+`just build-runtime cuda "$CUDA_ARCH"`. Job
+`meshllm/6a3535603093dba73ce2a264` passed that failure, built the CUDA
+llama.cpp stage runtime, built the Rust release binaries, downloaded the full
+Qwen480 package snapshot (`69` files, about `276G`), and generated the
+UltraChat prompt-token shards (`512` train prompts, `64` held-out prompts,
+train mean `101.3` tokens, held-out mean `103.8` tokens). It then failed at the
+first `spd-product-corpus-capture` invocation because
+`--product-native-teacher-logits` was emitted without its required boolean
+value. The planner now emits `--product-native-teacher-logits true`, so the
+next resubmission should start actual capture rows unless a runtime/model issue
+appears.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving

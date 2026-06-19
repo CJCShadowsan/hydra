@@ -85,6 +85,9 @@ Skippy taps.
 - `skippy-bench spd-product-corpus-capture` captures raw product tap rows and
   native verifier logits from a Skippy layer package using topology only; it
   does not require an existing SPD manifest or parity fixture.
+  If the planner or script emits the native-teacher option explicitly, use
+  `--product-native-teacher-logits true`; this command's Clap argument uses
+  `ArgAction::Set`, unlike the older `spd-live-tap-parity` bool flag.
 - `evals/spd/train_product_activation_head_only.py` and
   `evals/spd/score_product_activation_head_only.py` train/score a fresh SPD
   head from raw product tensors while loading AutoConfig only, not full base

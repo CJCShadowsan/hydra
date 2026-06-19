@@ -808,7 +808,7 @@ def build_commands(
     if args.qualification_mode == "raw-q4-adapt":
         setup.extend(
             [
-                "python3 -m pip install -U pip huggingface_hub safetensors transformers datasets accelerate torch",
+                "python3 -m pip install -U pip huggingface_hub safetensors transformers datasets accelerate",
                 download_warm_start_command(args, warm_start_dir),
                 download_package_command(args, package_dir),
             ]
@@ -958,7 +958,7 @@ def build_native_package_fresh_commands(
         raise SystemExit("--vocab-size is required for native-package-fresh")
     setup = [
         *setup,
-        "python3 -m pip install -U pip huggingface_hub safetensors transformers datasets accelerate torch",
+        "python3 -m pip install -U pip huggingface_hub safetensors transformers datasets accelerate",
         download_package_command(args, package_dir),
     ]
     boundaries_arg = ",".join(str(item) for item in boundaries)
@@ -971,7 +971,7 @@ def build_native_package_fresh_commands(
         f"--num-spec-layers {args.num_spec_layers} "
         f"--ctx-size {args.ctx_size} --n-gpu-layers=-1 "
         f"--top-k {args.draft_top_k} --verify-steps {args.verify_steps} "
-        "--product-native-teacher-logits"
+        "--product-native-teacher-logits true"
     )
     capture_train = (
         f"{capture_common} --prompt-token-file {prompt_dir}/train-prompt-token-ids.jsonl "
@@ -1099,7 +1099,7 @@ def build_reference_train_commands(
 ) -> dict[str, Any]:
     setup = [
         *setup,
-        "python3 -m pip install -U pip huggingface_hub safetensors transformers datasets accelerate torch",
+        "python3 -m pip install -U pip huggingface_hub safetensors transformers datasets accelerate",
         download_package_command(args, package_dir),
     ]
     reference_work = f"{work_dir}/reference-train"
