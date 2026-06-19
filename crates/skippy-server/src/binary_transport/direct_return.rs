@@ -6,6 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
+        mpsc::TryRecvError,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -18,12 +19,13 @@ use skippy_protocol::{
         StageReply, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
         WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready,
         send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_stats, send_reply_spd_tap_with_stats, state_flags,
+        send_reply_predicted_with_tokens_and_stats, send_reply_spd_tap_with_stats, state_flags,
         write_stage_message,
     },
 };
 
 use super::socket::{connect_downstream_socket, downstream_source_ip, resolve_downstream_endpoint};
+use super::{consume_optional_client_ready_hello, send_client_ready_hello_if_enabled};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PredictionReturnKey {
@@ -85,6 +87,11 @@ impl PredictionReturnItem {
 pub struct PredictionReturnHub {
     waiters:
         Mutex<HashMap<PredictionReturnKey, mpsc::Sender<Result<PredictionReturnItem, String>>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct PredictionReturnSinks {
+    streams: Mutex<HashMap<PredictionReturnKey, TcpStream>>,
 }
 
 impl Default for PredictionReturnHub {
@@ -165,6 +172,8 @@ fn handle_prediction_return_connection(
     hub: Arc<PredictionReturnHub>,
     mut stream: TcpStream,
 ) -> Result<()> {
+    consume_optional_client_ready_hello(&mut stream)
+        .context("consume optional direct prediction return client ready hello")?;
     send_ready(&mut stream).context("send direct prediction return ready")?;
     let open = read_stage_message(&mut stream, 0).context("read direct prediction return open")?;
     hub.handle_return_connection(open, stream)
@@ -200,13 +209,22 @@ impl PredictionReturnHub {
     pub(crate) fn handle_return_connection(
         &self,
         open: StageWireMessage,
-        mut stream: TcpStream,
+        stream: TcpStream,
     ) -> Result<()> {
         if open.kind != WireMessageKind::PredictionReturnOpen {
             bail!("expected prediction return open message");
         }
         let origin_enabled = (open.state.flags & state_flags::PREDICTION_RETURN_ORIGIN) != 0;
         let key = PredictionReturnKey::new(open.request_id, open.session_id);
+        self.handle_return_stream(key, stream, origin_enabled)
+    }
+
+    fn handle_return_stream(
+        &self,
+        key: PredictionReturnKey,
+        mut stream: TcpStream,
+        origin_enabled: bool,
+    ) -> Result<()> {
         let sender = self
             .waiters
             .lock()
@@ -240,19 +258,28 @@ pub(crate) struct PredictionReturnReceiver {
 }
 
 impl PredictionReturnReceiver {
-    pub(crate) fn recv_expected(&self, expected: WireReplyKind) -> Result<StageReply> {
-        let reply = self.recv()?;
+    pub(crate) fn attach_opened_stream(&self, stream: TcpStream) {
+        let hub = self.hub.clone();
+        let key = self.key;
+        thread::spawn(move || {
+            if let Err(error) = hub.handle_return_stream(key, stream, true) {
+                eprintln!("direct prediction return reader failed: {error:#}");
+            }
+        });
+    }
+
+    pub(crate) fn try_recv_expected(&self, expected: WireReplyKind) -> Result<Option<StageReply>> {
+        let Some(item) = self.try_recv_item()? else {
+            return Ok(None);
+        };
+        let reply = item.reply;
         if reply.kind != expected {
             bail!(
                 "expected {expected:?} direct prediction return, got {:?}",
                 reply.kind
             );
         }
-        Ok(reply)
-    }
-
-    pub(crate) fn recv(&self) -> Result<StageReply> {
-        Ok(self.recv_item()?.reply)
+        Ok(Some(reply))
     }
 
     pub(crate) fn recv_item(&self) -> Result<PredictionReturnItem> {
@@ -286,6 +313,25 @@ impl PredictionReturnReceiver {
         }
     }
 
+    fn try_recv_item(&self) -> Result<Option<PredictionReturnItem>> {
+        if let Some(item) = self
+            .buffered
+            .lock()
+            .map_err(|_| anyhow!("prediction return buffer lock poisoned"))?
+            .pop_front()
+        {
+            return Ok(Some(item));
+        }
+        match self.receiver.try_recv() {
+            Ok(Ok(item)) => Ok(Some(item)),
+            Ok(Err(error)) => Err(anyhow!(error)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                Err(anyhow!("prediction return channel disconnected"))
+            }
+        }
+    }
+
     fn take_buffered_matching(
         &self,
         matches: &mut impl FnMut(&PredictionReturnItem) -> bool,
@@ -314,23 +360,67 @@ impl Drop for PredictionReturnReceiver {
     }
 }
 
+impl PredictionReturnSinks {
+    pub(crate) fn insert_opened_sink(
+        &self,
+        open: StageWireMessage,
+        stream: TcpStream,
+    ) -> Result<()> {
+        if open.kind != WireMessageKind::PredictionReturnOpen {
+            bail!("expected prediction return open message");
+        }
+        let key = PredictionReturnKey::new(open.request_id, open.session_id);
+        self.streams
+            .lock()
+            .map_err(|_| anyhow!("prediction return sinks lock poisoned"))?
+            .insert(key, stream);
+        Ok(())
+    }
+
+    pub(crate) fn take_wait(
+        &self,
+        request_id: u64,
+        session_id: u64,
+        timeout: Duration,
+    ) -> Result<Option<TcpStream>> {
+        let key = PredictionReturnKey::new(request_id, session_id);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(stream) = self
+                .streams
+                .lock()
+                .map_err(|_| anyhow!("prediction return sinks lock poisoned"))?
+                .remove(&key)
+            {
+                return Ok(Some(stream));
+            }
+            if started.elapsed() >= timeout {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 pub(crate) fn open_prediction_return_stream(
     config: &StageConfig,
     topology: Option<&StageTopology>,
     request_id: u64,
     session_id: u64,
     wire_dtype: WireActivationDType,
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> Result<TcpStream> {
     let endpoint = driver_stage_endpoint(config, topology)?;
     let return_addr = resolve_downstream_endpoint(endpoint)?;
     let source_ip = downstream_source_ip(config)?;
-    let attempts = timeout_secs.saturating_mul(2).max(1);
+    let attempts = 1;
     let mut last_error = None;
     for _ in 0..attempts {
         match connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2)) {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();
+                send_client_ready_hello_if_enabled(&mut stream)
+                    .context("send prediction return client ready hello")?;
                 recv_ready(&mut stream).context("prediction return sink did not become ready")?;
                 write_stage_message(
                     &mut stream,
@@ -353,6 +443,34 @@ pub(crate) fn open_prediction_return_stream(
         )))
 }
 
+pub(crate) fn open_downstream_prediction_return_stream(
+    config: &StageConfig,
+    request_id: u64,
+    session_id: u64,
+    wire_dtype: WireActivationDType,
+) -> Result<TcpStream> {
+    let downstream = config
+        .downstream
+        .as_ref()
+        .ok_or_else(|| anyhow!("direct prediction return requires downstream stage"))?;
+    let endpoint = strip_tcp_prefix(&downstream.endpoint);
+    let return_addr = resolve_downstream_endpoint(endpoint)?;
+    let source_ip = downstream_source_ip(config)?;
+    let mut stream = connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2))
+        .with_context(|| format!("connect downstream prediction return sink at {endpoint}"))?;
+    stream.set_nodelay(true).ok();
+    send_client_ready_hello_if_enabled(&mut stream)
+        .context("send downstream prediction return client ready hello")?;
+    recv_ready(&mut stream).context("downstream prediction return sink did not become ready")?;
+    write_stage_message(
+        &mut stream,
+        &prediction_return_open_message(request_id, session_id),
+        wire_dtype,
+    )
+    .context("open downstream prediction return stream")?;
+    Ok(stream)
+}
+
 pub(crate) fn send_direct_prediction_return(
     stream: &mut TcpStream,
     origin: PredictionReturnOrigin,
@@ -371,10 +489,13 @@ fn write_direct_prediction_return(
             .context("send direct prediction return origin")?;
     }
     match reply.kind {
-        WireReplyKind::PredictedToken => {
-            send_reply_predicted_with_stats(&mut writer, reply.predicted, reply.stats)
-                .context("send direct predicted-token return")
-        }
+        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
+            &mut writer,
+            reply.predicted,
+            &reply.predicted_tokens,
+            reply.stats,
+        )
+        .context("send direct predicted-token return"),
         WireReplyKind::PredictedTokens => send_reply_predicted_tokens_with_stats(
             &mut writer,
             &reply.predicted_tokens,
@@ -506,10 +627,10 @@ fn prediction_return_open_message(request_id: u64, session_id: u64) -> StageWire
         raw_bytes: Vec::new(),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skippy_protocol::binary::{recv_reply, send_reply_predicted_with_stats};
 
     fn origin(pos_start: i32, decode_step: i32) -> PredictionReturnOrigin {
         PredictionReturnOrigin {
@@ -585,5 +706,90 @@ mod tests {
         let buffered = receiver.recv_item().expect("receive buffered origin");
         assert_eq!(buffered.origin, Some(second_origin));
         assert_eq!(buffered.reply.predicted_tokens, vec![202]);
+    }
+
+    #[test]
+    fn handle_return_connection_delivers_reply_to_registered_waiter() {
+        let request_id = 17;
+        let session_id = 23;
+        let hub = Arc::new(PredictionReturnHub::default());
+        let receiver = hub.register(request_id, session_id).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut open = prediction_return_open_message(request_id, session_id);
+        open.state.flags &= !state_flags::PREDICTION_RETURN_ORIGIN;
+        let handle = {
+            let hub = hub.clone();
+            thread::spawn(move || hub.handle_return_connection(open, server))
+        };
+
+        send_reply_predicted_with_stats(&mut client, 42, Default::default()).unwrap();
+
+        let reply = poll_test_reply(&receiver, WireReplyKind::PredictedToken);
+        assert_eq!(reply.predicted, 42);
+        drop(client);
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn direct_prediction_return_preserves_predicted_token_sideband() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let reply = StageReply {
+            kind: WireReplyKind::PredictedToken,
+            predicted: 42,
+            predicted_tokens: vec![42, 43, 123],
+            spd_tap: None,
+            stats: Default::default(),
+        };
+        write_direct_prediction_return(&mut server, None, reply).unwrap();
+
+        let received = recv_reply(&mut client).unwrap();
+        assert_eq!(received.kind, WireReplyKind::PredictedToken);
+        assert_eq!(received.predicted, 42);
+        assert_eq!(received.predicted_tokens, vec![42, 43, 123]);
+    }
+
+    #[test]
+    fn prediction_return_sinks_store_upstream_opened_streams() {
+        let request_id = 31;
+        let session_id = 37;
+        let sinks = PredictionReturnSinks::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        sinks
+            .insert_opened_sink(
+                prediction_return_open_message(request_id, session_id),
+                server,
+            )
+            .unwrap();
+
+        let stream = sinks
+            .take_wait(request_id, session_id, Duration::from_millis(1))
+            .unwrap()
+            .expect("registered prediction return sink");
+        assert_eq!(stream.peer_addr().unwrap(), client.local_addr().unwrap());
+    }
+
+    fn poll_test_reply(receiver: &PredictionReturnReceiver, expected: WireReplyKind) -> StageReply {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(reply) = receiver.try_recv_expected(expected).unwrap() {
+                return reply;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "timed out waiting for prediction return reply"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }

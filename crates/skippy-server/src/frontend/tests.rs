@@ -967,6 +967,43 @@ fn tool_request() -> ChatCompletionRequest {
 }
 
 #[test]
+fn plain_chat_does_not_require_chat_output_parser() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+
+    assert!(!chat_output_parser_required(
+        &request,
+        &ChatTemplateOptions::default(),
+    ));
+}
+
+#[test]
+fn tools_and_enabled_thinking_require_chat_output_parser() {
+    assert!(chat_output_parser_required(
+        &tool_request(),
+        &ChatTemplateOptions::default(),
+    ));
+
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "think"}],
+        "reasoning": {"enabled": true}
+    }))
+    .unwrap();
+
+    assert!(chat_output_parser_required(
+        &request,
+        &ChatTemplateOptions {
+            enable_thinking: Some(true),
+            ..ChatTemplateOptions::default()
+        },
+    ));
+}
+
+#[test]
 fn parses_llama_message_tool_calls() {
     let request = tool_request();
     let parsed = parsed_tool_calls_from_message_json(
@@ -1241,6 +1278,8 @@ fn multimodal_stage_config(
 fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
     let runtime = load_runtime(&config)?.context("load smoke runtime")?;
     let ctx_size = usize::try_from(config.ctx_size).unwrap_or(usize::MAX);
+    let decode_batcher = DecodeBatcher::new(runtime.clone(), 1);
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), 1);
     Ok(StageOpenAiBackend {
         runtime,
         telemetry: Telemetry::new(
@@ -1268,6 +1307,8 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv: None,
+        decode_batcher,
+        decode_frame_batcher,
     })
 }
 
@@ -1425,6 +1466,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         .context("create split smoke lane pool")?;
     let runtime = load_runtime(&stage0_config)?.context("load stage-0 smoke runtime")?;
     let ctx_size = usize::try_from(stage0_config.ctx_size).unwrap_or(usize::MAX);
+    let decode_batcher = DecodeBatcher::new(runtime.clone(), 1);
+    let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), 1);
     let backend = StageOpenAiBackend {
         runtime,
         telemetry,
@@ -1456,6 +1499,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         generation_token_budget: Arc::new(GenerationTokenBudget::new(ctx_size)),
         hook_policy: None,
         kv: None,
+        decode_batcher,
+        decode_frame_batcher,
     };
     let response = backend
         .chat_completion(multimodal_chat_request(&fixture)?)
@@ -1471,6 +1516,19 @@ fn trims_at_first_stop_sequence() {
     assert_eq!(trim_at_stop("hello END world", &["END"]), "hello ");
     assert_eq!(trim_at_stop("abc xyz def", &["def", "xyz"]), "abc ");
     assert_eq!(trim_at_stop("abc", &[""]), "abc");
+}
+
+#[test]
+fn generation_stop_values_include_chat_template_stops() {
+    let request_stop = openai_frontend::StopSequence::One("</stop>".to_string());
+    let metadata = json!({
+        "additional_stops": ["<|user|>", "<|observation|>", ""],
+    })
+    .to_string();
+
+    let stops = generation_stop_values(Some(&request_stop), Some(&metadata));
+
+    assert_eq!(stops, vec!["</stop>", "<|user|>", "<|observation|>"]);
 }
 
 #[test]

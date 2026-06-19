@@ -1,0 +1,128 @@
+From b0dc89610db3b18501aa9d66aeeea38a5540ee76 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Wed, 17 Jun 2026 19:39:07 +1000
+Subject: [PATCH] Add stage session copy ABI
+
+---
+ include/skippy.h |  6 +++
+ src/skippy.cpp   | 88 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 94 insertions(+)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 075850e3..c3ac2087 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -231,6 +231,12 @@ LLAMA_API enum skippy_status skippy_restore_session_checkpoint(
+         uint64_t token_count,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_session_copy_prefix(
++        struct skippy_session * destination,
++        struct skippy_session * source,
++        uint64_t token_count,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_session_free(
+         struct skippy_session * session,
+         struct skippy_error ** out_error);
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index a8be71bc..ee554e1f 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -4324,6 +4324,94 @@ enum skippy_status skippy_restore_session_checkpoint(
+     return skippy_success(out_error);
+ }
+ 
++enum skippy_status skippy_session_copy_prefix(
++        struct skippy_session * destination,
++        struct skippy_session * source,
++        uint64_t token_count,
++        struct skippy_error ** out_error) {
++    if (destination == nullptr || source == nullptr
++            || destination->ctx == nullptr || source->ctx == nullptr
++            || destination->stage_model == nullptr || source->stage_model == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "source and destination sessions are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (destination->stage_model != source->stage_model || destination->ctx != source->ctx) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "sessions must belong to the same stage model");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (destination == source) {
++        return skippy_trim_session(destination, token_count, out_error);
++    }
++    if (token_count > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())
++            || token_count > static_cast<uint64_t>(std::numeric_limits<llama_pos>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "token_count exceeds supported position range");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (token_count > static_cast<uint64_t>(source->n_past)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "cannot copy beyond source session prefix");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    skippy_error * recurrent_error = nullptr;
++    llama_memory_recurrent * recurrent = skippy_get_recurrent_memory(source, &recurrent_error);
++    if (recurrent_error != nullptr) {
++        if (out_error != nullptr) {
++            *out_error = recurrent_error;
++        } else {
++            skippy_error_free(recurrent_error);
++        }
++        return out_error != nullptr && *out_error != nullptr ? (*out_error)->status : SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    if (recurrent != nullptr && token_count != static_cast<uint64_t>(source->n_past)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "recurrent session copy requires source at the copied prefix");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++
++    destination->ctx->synchronize();
++    llama_memory_t memory = destination->ctx->get_memory();
++    if (memory == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "runtime memory is unavailable");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    if (token_count > 0 && recurrent == nullptr) {
++        const llama_pos max_pos = llama_memory_seq_pos_max(memory, source->seq_id);
++        if (max_pos < static_cast<llama_pos>(token_count - 1)) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "source session prefix is incomplete");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++    }
++
++    if (!llama_memory_seq_rm(memory, destination->seq_id, -1, -1)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to clear destination execution lane");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    if (token_count > 0) {
++        llama_memory_seq_cp(memory, source->seq_id, destination->seq_id, 0, static_cast<llama_pos>(token_count));
++    }
++
++    destination->n_past = static_cast<int32_t>(token_count);
++    const size_t token_history_count = std::min<size_t>(source->token_history.size(), static_cast<size_t>(token_count));
++    destination->token_history.assign(
++            source->token_history.begin(),
++            source->token_history.begin() + static_cast<ptrdiff_t>(token_history_count));
++    const size_t signal_count = std::min<size_t>(source->signal_history.size(), static_cast<size_t>(token_count));
++    destination->signal_history.assign(
++            source->signal_history.begin(),
++            source->signal_history.begin() + static_cast<ptrdiff_t>(signal_count));
++    destination->preserve_prefix_on_free = false;
++    destination->preserve_prefix_tokens = 0;
++    skippy_clear_chat_sampling(destination);
++    if (!destination->borrowed_sequence) {
++        llama_memory_seq_rm(memory, destination->checkpoint_seq_id, -1, -1);
++    }
++    destination->checkpoint_valid = false;
++    destination->checkpoint_n_past = 0;
++    destination->checkpoint_token_history_size = 0;
++    destination->checkpoint_signal_history_size = 0;
++    destination->ctx->synchronize();
++    return skippy_success(out_error);
++}
++
+ enum skippy_status skippy_tokenize(
+         struct skippy_model * model,
+         const char * text,
+-- 
+2.54.0

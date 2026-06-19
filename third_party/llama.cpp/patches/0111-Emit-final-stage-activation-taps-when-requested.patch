@@ -1,0 +1,130 @@
+From 12214b6ca2fe784a1402a2f19b7a2e3c2c022256 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 18 Jun 2026 13:38:07 +1000
+Subject: [PATCH] Emit final-stage activation taps when requested
+
+---
+ include/skippy.h |  1 +
+ src/skippy.cpp   | 38 ++++++++++++++++++++++++++++++++------
+ 2 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index c3ac20874..6f3054d89 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -43,6 +43,7 @@ enum skippy_activation_layout {
+ 
+ #define SKIPPY_ACTIVATION_FLAG_RWKV7_V_FIRST   (UINT64_C(1) << 0)
+ #define SKIPPY_ACTIVATION_FLAG_GEMMA3N_ALTUP   (UINT64_C(1) << 1)
++#define SKIPPY_ACTIVATION_FLAG_FINAL_NORMED    (UINT64_C(1) << 2)
+ 
+ struct skippy_model;
+ struct skippy_session;
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index d23b9df12..b72f2785c 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1033,6 +1033,26 @@ static bool skippy_emits_activation_frame(const skippy_session * session) {
+     return skippy_is_filtered(session) && !session->stage_model->config.include_output;
+ }
+ 
++static bool skippy_requests_activation_frame(
++        const skippy_session * session,
++        size_t output_payload_capacity) {
++    return skippy_emits_activation_frame(session) ||
++           (skippy_is_filtered(session) &&
++            session->stage_model->config.include_output &&
++            output_payload_capacity > 0);
++}
++
++static void skippy_configure_output_embeddings_for_request(
++        skippy_session * session,
++        size_t output_payload_bytes) {
++    if (session == nullptr || session->ctx == nullptr || session->stage_model == nullptr) {
++        return;
++    }
++    if (skippy_is_filtered(session) && session->stage_model->config.include_output) {
++        llama_set_embeddings(session->ctx, output_payload_bytes > 0);
++    }
++}
++
+ static bool skippy_is_rwkv7_activation_model(const skippy_session * session) {
+     if (session == nullptr || session->stage_model == nullptr || session->stage_model->model == nullptr) {
+         return false;
+@@ -1072,6 +1092,9 @@ static size_t skippy_gemma3n_altup_bytes(const skippy_session * session, size_t
+ static uint64_t skippy_output_activation_flags(
+         const skippy_session * session,
+         const skippy_activation_desc * input_desc) {
++    if (skippy_is_filtered(session) && session->stage_model->config.include_output) {
++        return SKIPPY_ACTIVATION_FLAG_FINAL_NORMED;
++    }
+     if (skippy_emits_activation_frame(session) && skippy_is_gemma3n_activation_model(session)) {
+         return SKIPPY_ACTIVATION_FLAG_GEMMA3N_ALTUP;
+     }
+@@ -1193,7 +1216,7 @@ static enum skippy_status skippy_prepare_output_activation_frame(
+         const skippy_activation_desc * input_desc,
+         struct skippy_error ** out_error) {
+     const uint64_t output_flags = skippy_output_activation_flags(session, input_desc);
+-    const size_t payload_bytes = skippy_emits_activation_frame(session) ?
++    const size_t payload_bytes = skippy_requests_activation_frame(session, output_payload_capacity) ?
+             skippy_activation_payload_bytes(session, token_count, output_flags) : 0;
+ 
+     if (out_output_payload_bytes != nullptr) {
+@@ -1214,6 +1237,8 @@ static enum skippy_status skippy_prepare_output_activation_frame(
+         return SKIPPY_STATUS_INVALID_ARGUMENT;
+     }
+ 
++    skippy_configure_output_embeddings_for_request(session, payload_bytes);
++
+     if (output_desc != nullptr) {
+         *output_desc = {};
+         output_desc->version = 1;
+@@ -1820,10 +1845,11 @@ static enum skippy_status skippy_copy_output_activation_frame(
+         skippy_session * session,
+         size_t token_count,
+         void * output_payload,
++        size_t output_payload_capacity,
+         const skippy_activation_desc * input_desc,
+         const void * input_payload,
+         struct skippy_error ** out_error) {
+-    if (!skippy_emits_activation_frame(session)) {
++    if (!skippy_requests_activation_frame(session, output_payload_capacity)) {
+         return skippy_success(out_error);
+     }
+ 
+@@ -3075,7 +3101,7 @@ static enum skippy_status skippy_prefill_chunk_frame_impl(
+                 skippy_sample_token(session, sampling) : -1;
+     }
+ 
+-    return skippy_copy_output_activation_frame(session, token_count, output_payload, input_desc, input_payload, out_error);
++    return skippy_copy_output_activation_frame(session, token_count, output_payload, output_payload_capacity, input_desc, input_payload, out_error);
+ }
+ 
+ enum skippy_status skippy_prefill_chunk_frame(
+@@ -3663,5 +3689,5 @@ enum skippy_status skippy_decode_step_frame_sampled(
+         *out_predicted_token = session->stage_model->config.include_output ? skippy_sample_token(session, sampling) : -1;
+     }
+ 
+-    return skippy_copy_output_activation_frame(session, 1, output_payload, input_desc, input_payload, out_error);
++    return skippy_copy_output_activation_frame(session, 1, output_payload, output_payload_capacity, input_desc, input_payload, out_error);
+ }
+@@ -3356,7 +3382,7 @@ enum skippy_status skippy_verify_tokens_frame(
+         return status;
+     }
+ 
+-    status = skippy_copy_output_activation_frame(session, token_count, output_payload, input_desc, input_payload, out_error);
++    status = skippy_copy_output_activation_frame(session, token_count, output_payload, output_payload_capacity, input_desc, input_payload, out_error);
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+     }
+@@ -3395,7 +3421,7 @@ enum skippy_status skippy_session_copy_output_activation_frame(
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+     }
+-    return skippy_copy_output_activation_frame(session, token_count, output_payload, nullptr, nullptr, out_error);
++    return skippy_copy_output_activation_frame(session, token_count, output_payload, output_payload_capacity, nullptr, nullptr, out_error);
+ }
+ 
+ static enum skippy_status skippy_validate_state_range(
+-- 
+2.54.0

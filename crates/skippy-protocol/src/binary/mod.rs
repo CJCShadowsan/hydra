@@ -10,7 +10,8 @@ pub use activation::{
 pub use codec::{
     read_stage_message, recv_ready, recv_reply, send_ready, send_reply_ack,
     send_reply_ack_with_stats, send_reply_predicted, send_reply_predicted_tokens_with_stats,
-    send_reply_predicted_with_stats, send_reply_spd_tap_with_stats, write_stage_message,
+    send_reply_predicted_with_stats, send_reply_predicted_with_tokens_and_stats,
+    send_reply_spd_tap_with_stats, write_stage_message,
 };
 pub use types::{
     ACTIVATION_FLAG_FINAL_NORMED, ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_RWKV7_V_FIRST,
@@ -128,6 +129,22 @@ mod tests {
         assert_eq!(reply.kind, WireReplyKind::SpdTap);
         assert_eq!(reply.predicted_tokens, Vec::<i32>::new());
         assert_eq!(reply.spd_tap.as_ref(), Some(&tap));
+    }
+
+    #[test]
+    fn predicted_token_reply_preserves_sideband_tokens() {
+        let mut bytes = Vec::new();
+        send_reply_predicted_with_tokens_and_stats(
+            &mut bytes,
+            42,
+            &[42, 43, 123],
+            StageReplyStats::default(),
+        )
+        .unwrap();
+        let reply = recv_reply(Cursor::new(bytes)).unwrap();
+        assert_eq!(reply.kind, WireReplyKind::PredictedToken);
+        assert_eq!(reply.predicted, 42);
+        assert_eq!(reply.predicted_tokens, vec![42, 43, 123]);
     }
 
     #[test]

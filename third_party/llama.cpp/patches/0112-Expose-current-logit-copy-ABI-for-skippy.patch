@@ -1,0 +1,141 @@
+From f23029e921c67bd954592b136bd1b5199baf8435 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Fri, 19 Jun 2026 06:50:50 +1000
+Subject: [PATCH] Expose current-logit copy ABI for skippy
+
+---
+ include/skippy.h        |  9 ++++++
+ include/skippy/common.h |  3 +-
+ src/skippy.cpp          | 62 ++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 72 insertions(+), 2 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 6f3054d89..ee3d8d498 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -211,6 +211,15 @@ LLAMA_API enum skippy_status skippy_session_sample_current(
+         llama_token * out_predicted_token,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_session_copy_current_logits(
++        struct skippy_session * session,
++        const llama_token * token_ids,
++        size_t token_count,
++        float * output_logits,
++        size_t output_logit_capacity,
++        size_t * out_logit_count,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_session_configure_chat_sampling(
+         struct skippy_session * session,
+         const struct skippy_sampling_config * sampling,
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 7009d98c8..721e55d92 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 27
++#define SKIPPY_ABI_VERSION_PATCH 28
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+@@ -54,7 +54,8 @@ enum skippy_feature {
+     SKIPPY_FEATURE_CHAT_SAMPLING_GRAMMAR  = 1 << 22,
+     SKIPPY_FEATURE_BACKEND_DEVICES        = 1 << 23,
+     SKIPPY_FEATURE_RUNTIME_EVENTS         = 1 << 24,
+     SKIPPY_FEATURE_NATIVE_MTP_N1          = 1 << 25,
++    SKIPPY_FEATURE_CURRENT_LOGITS         = 1 << 26,
+ };
+ 
+ enum skippy_status {
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index b72f2785c..1bf69b520 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1578,6 +1578,46 @@ static llama_token skippy_greedy_sample(skippy_session * session) {
+ static llama_token skippy_greedy_sample(skippy_session * session) {
+     return skippy_greedy_sample_ith(session, -1);
+ }
+ 
++static enum skippy_status skippy_copy_logits_for_tokens(
++        skippy_session * session,
++        int32_t logits_index,
++        const llama_token * token_ids,
++        size_t token_count,
++        float * output_logits,
++        size_t output_logit_capacity,
++        size_t * out_logit_count,
++        skippy_error ** out_error) {
++    if (out_logit_count != nullptr) {
++        *out_logit_count = token_count;
++    }
++    if (session == nullptr || session->ctx == nullptr || session->stage_model == nullptr || session->stage_model->model == nullptr || token_ids == nullptr || token_count == 0 || out_logit_count == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session, token_ids, token_count, and out_logit_count are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (output_logits == nullptr || output_logit_capacity < token_count) {
++        skippy_set_error(out_error, SKIPPY_STATUS_BUFFER_TOO_SMALL, "logit output buffer is too small");
++        return SKIPPY_STATUS_BUFFER_TOO_SMALL;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(session->stage_model->model);
++    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++    const float * logits = llama_get_logits_ith(session->ctx, logits_index);
++    if (logits == nullptr || n_vocab <= 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "current logits are not available");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++
++    for (size_t i = 0; i < token_count; ++i) {
++        const llama_token token = token_ids[i];
++        if (token < 0 || token >= n_vocab) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "token id is outside the model vocabulary");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        output_logits[i] = logits[token];
++    }
++    return skippy_success(out_error);
++}
++
+ static bool skippy_compute_token_signal_context(
+         const llama_model * model,
+@@ -2418,6 +2458,7 @@ uint64_t skippy_abi_features(void) {
+            SKIPPY_FEATURE_GENERATION_SIGNALS |
+            SKIPPY_FEATURE_EXTERNAL_MEDIA_PREFILL |
+            SKIPPY_FEATURE_RUNTIME_EVENTS |
+            SKIPPY_FEATURE_BACKEND_DEVICES |
+-           SKIPPY_FEATURE_NATIVE_MTP_N1;
++           SKIPPY_FEATURE_NATIVE_MTP_N1 |
++           SKIPPY_FEATURE_CURRENT_LOGITS;
+ }
+@@ -2726,6 +2767,25 @@ enum skippy_status skippy_session_sample_current(
+     return skippy_success(out_error);
+ }
+ 
++enum skippy_status skippy_session_copy_current_logits(
++        struct skippy_session * session,
++        const llama_token * token_ids,
++        size_t token_count,
++        float * output_logits,
++        size_t output_logit_capacity,
++        size_t * out_logit_count,
++        struct skippy_error ** out_error) {
++    return skippy_copy_logits_for_tokens(
++            session,
++            -1,
++            token_ids,
++            token_count,
++            output_logits,
++            output_logit_capacity,
++            out_logit_count,
++            out_error);
++}
++
+ enum skippy_status skippy_session_configure_chat_sampling(
+         struct skippy_session * session,
+         const struct skippy_sampling_config * sampling,
+-- 
+2.54.0

@@ -33,7 +33,12 @@ impl StageOpenAiBackend {
                 on_text_chunk,
             );
         }
-        let stop_values = stop.map(|stop| stop.values()).unwrap_or_default();
+        let stop_value_storage =
+            generation_stop_values(stop, prompt.chat_parse_metadata.as_deref());
+        let stop_values = stop_value_storage
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let tokenize_timer = PhaseTimer::start();
         let prompt_token_ids = self.tokenize(&prompt.text)?;
         let mut tokenize_attrs = self.openai_attrs(&ids);
@@ -204,42 +209,43 @@ impl StageOpenAiBackend {
         ids: OpenAiGenerationIds,
         on_text_chunk: impl FnMut(&str) -> OpenAiResult<()>,
     ) -> OpenAiResult<GeneratedText> {
-        if let OpenAiBackendMode::EmbeddedStageZero {
-            config,
-            wire_dtype,
-            activation_width,
-            downstream_wire_condition,
-            lane_pool,
-            prediction_returns,
-            ..
-        } = self.mode.clone()
-            && config.downstream.is_some()
-        {
-            let lane_pool = lane_pool.ok_or_else(|| {
-                OpenAiError::backend("embedded stage 0 has no downstream lane pool")
-            })?;
-            let prediction_return = prediction_returns
-                .as_ref()
-                .map(|hub| hub.register(ids.request_id, ids.session_id))
-                .transpose()
-                .map_err(openai_backend_error)?;
-            return self.generate_split_multimodal_text(
-                SplitMultimodalGeneration {
-                    prompt,
-                    max_tokens,
-                    stop,
-                    sampling,
-                    cancellation,
-                    ids,
-                    config,
-                    wire_dtype,
-                    activation_width,
-                    downstream_wire_condition,
-                    lane_pool,
-                    prediction_return,
-                },
-                on_text_chunk,
-            );
+        match self.mode.clone() {
+            OpenAiBackendMode::EmbeddedStageZero {
+                config,
+                wire_dtype,
+                activation_width,
+                downstream_wire_condition,
+                lane_pool,
+                prediction_returns,
+                ..
+            } if config.downstream.is_some() => {
+                let lane_pool = lane_pool.ok_or_else(|| {
+                    OpenAiError::backend("embedded stage 0 has no downstream lane pool")
+                })?;
+                let prediction_return = prediction_returns
+                    .as_ref()
+                    .map(|hub| hub.register(ids.request_id, ids.session_id))
+                    .transpose()
+                    .map_err(openai_backend_error)?;
+                return self.generate_split_multimodal_text(
+                    SplitMultimodalGeneration {
+                        prompt,
+                        max_tokens,
+                        stop,
+                        sampling,
+                        cancellation,
+                        ids,
+                        config,
+                        wire_dtype,
+                        activation_width,
+                        downstream_wire_condition,
+                        lane_pool,
+                        prediction_return,
+                    },
+                    on_text_chunk,
+                );
+            }
+            _ => {}
         }
 
         match &self.mode {
@@ -252,7 +258,12 @@ impl StageOpenAiBackend {
             }
         }
 
-        let stop_values = stop.map(|stop| stop.values()).unwrap_or_default();
+        let stop_value_storage =
+            generation_stop_values(stop, prompt.chat_parse_metadata.as_deref());
+        let stop_values = stop_value_storage
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let session_id = ids.session_label.clone();
         let prefill_timer = PhaseTimer::start();
         let (prefill, mut token_signal, mut signal_window) = {
@@ -506,7 +517,7 @@ impl StageOpenAiBackend {
                     stats,
                 );
             }
-            self.emit_openai_phase("stage.openai_decode", decode_timer, attrs);
+            self.emit_openai_summary("stage.openai_decode", decode_timer, attrs);
             Ok(())
         })();
         let lock_timer = PhaseTimer::start();
@@ -551,7 +562,12 @@ impl StageOpenAiBackend {
         request: SplitMultimodalGeneration<'_>,
         on_text_chunk: impl FnMut(&str) -> OpenAiResult<()>,
     ) -> OpenAiResult<GeneratedText> {
-        let stop_values = request.stop.map(|stop| stop.values()).unwrap_or_default();
+        let stop_value_storage =
+            generation_stop_values(request.stop, request.prompt.chat_parse_metadata.as_deref());
+        let stop_values = stop_value_storage
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
         let mut collector =
             TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk);
         let wire_sampling = wire_sampling_config(&request.sampling);
@@ -696,18 +712,7 @@ impl StageOpenAiBackend {
                 .map_err(openai_io_error)?;
                 forward_write_ms += write_timer.elapsed_ms();
                 let wait_timer = PhaseTimer::start();
-                let reply = if is_final_chunk {
-                    request
-                        .prediction_return
-                        .as_ref()
-                        .ok_or_else(|| {
-                            OpenAiError::backend("missing direct prediction return receiver")
-                        })?
-                        .recv_expected(WireReplyKind::PredictedToken)
-                        .map_err(openai_backend_error)?
-                } else {
-                    recv_reply(&mut lane.stream).map_err(openai_io_error)?
-                };
+                let reply = recv_reply(&mut lane.stream).map_err(openai_io_error)?;
                 downstream_wait_ms += wait_timer.elapsed_ms();
                 let expected = if is_final_chunk {
                     WireReplyKind::PredictedToken
@@ -764,6 +769,8 @@ impl StageOpenAiBackend {
             let mut decode_runtime_lock_wait_ms = 0.0;
             let mut decode_runtime_lock_hold_ms = 0.0;
             let mut decode_runtime_lock_acquires = 0usize;
+            let mut decode_batch_size_max = 1usize;
+            let mut decode_batch_wait_ms = 0.0;
             let mut decode_forward_write_ms = 0.0;
             let mut decode_downstream_wait_ms = 0.0;
             let mut decode_output_activation_bytes = 0usize;
@@ -800,35 +807,16 @@ impl StageOpenAiBackend {
                 let message = decode_message.update(decode_input_index, current)?;
                 let token_timer = PhaseTimer::start();
                 let stage0_timer = PhaseTimer::start();
-                let output = {
-                    let lock_timer = PhaseTimer::start();
-                    let mut runtime = self
-                        .runtime
-                        .lock()
-                        .map_err(|_| OpenAiError::backend("runtime lock poisoned"))?;
-                    let lock_wait_ms = lock_timer.elapsed_ms();
-                    decode_runtime_lock_wait_ms += lock_wait_ms;
-                    decode_runtime_lock_acquires += 1;
-                    let hold_timer = PhaseTimer::start();
-                    let output = run_binary_stage_message(
-                        &mut runtime,
-                        &session_key,
-                        message,
-                        &[current],
-                        None,
-                        false,
-                        stage_output_activation_capacity(
-                            &request.config,
-                            message,
-                            request.activation_width,
-                        )
-                        .map_err(openai_backend_error)?,
-                    )
-                    .map_err(openai_backend_error)?
-                    .2;
-                    decode_runtime_lock_hold_ms += hold_timer.elapsed_ms();
-                    output
-                };
+                let batch_outcome = self
+                    .decode_frame_batcher
+                    .decode(&session_key, current, Some(&request.sampling), None)
+                    .map_err(openai_backend_error)?;
+                decode_runtime_lock_wait_ms += batch_outcome.runtime_lock_wait_ms;
+                decode_runtime_lock_hold_ms += batch_outcome.runtime_lock_hold_ms;
+                decode_runtime_lock_acquires += 1;
+                decode_batch_size_max = decode_batch_size_max.max(batch_outcome.batch_size);
+                decode_batch_wait_ms += batch_outcome.batch_wait_ms;
+                let output = batch_outcome.output;
                 let stage0_compute_ms = stage0_timer.elapsed_ms();
                 decode_stage0_compute_ms += stage0_compute_ms;
                 let forwarded = forwarded_stage_message_timed(
@@ -854,14 +842,11 @@ impl StageOpenAiBackend {
                 let forward_write_ms = write_timer.elapsed_ms();
                 decode_forward_write_ms += forward_write_ms;
                 let wait_timer = PhaseTimer::start();
-                let reply = request
-                    .prediction_return
-                    .as_ref()
-                    .ok_or_else(|| {
-                        OpenAiError::backend("missing direct prediction return receiver")
-                    })?
-                    .recv_expected(WireReplyKind::PredictedToken)
-                    .map_err(openai_backend_error)?;
+                let reply = super::embedded_execution::receive_embedded_stage_reply(
+                    &mut lane.stream,
+                    request.prediction_return.as_ref(),
+                    WireReplyKind::PredictedToken,
+                )?;
                 let downstream_wait_ms = wait_timer.elapsed_ms();
                 decode_downstream_wait_ms += downstream_wait_ms;
                 current = reply.predicted;
@@ -882,6 +867,14 @@ impl StageOpenAiBackend {
                     token_attrs.insert(
                         "llama_stage.downstream_wait_ms".to_string(),
                         json!(downstream_wait_ms),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.decode_batch_size".to_string(),
+                        json!(batch_outcome.batch_size),
+                    );
+                    token_attrs.insert(
+                        "llama_stage.decode_batch_wait_ms".to_string(),
+                        json!(batch_outcome.batch_wait_ms),
                     );
                     token_attrs.insert("llama_stage.predicted_token".to_string(), json!(current));
                     token_attrs.insert("llama_stage.message_kind".to_string(), json!("DecodeEmbd"));
@@ -911,6 +904,14 @@ impl StageOpenAiBackend {
                 json!(decode_runtime_lock_acquires),
             );
             decode_attrs.insert(
+                "llama_stage.decode_batch_size_max".to_string(),
+                json!(decode_batch_size_max),
+            );
+            decode_attrs.insert(
+                "llama_stage.decode_batch_wait_ms".to_string(),
+                json!(decode_batch_wait_ms),
+            );
+            decode_attrs.insert(
                 "llama_stage.forward_write_ms".to_string(),
                 json!(decode_forward_write_ms),
             );
@@ -926,7 +927,7 @@ impl StageOpenAiBackend {
                 "llama_stage.forward_activation_bytes".to_string(),
                 json!(decode_forward_activation_bytes),
             );
-            self.emit_openai_phase("stage.openai_decode", decode_timer, decode_attrs);
+            self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();
 

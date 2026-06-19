@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -7,10 +7,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use skippy_protocol::{FlashAttentionType, LoadMode, StageConfig};
 use skippy_runtime::{
-    ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow,
-    MediaInput, MediaPrefill, MediaPrefillFrame, RuntimeConfig, RuntimeKvPage, RuntimeKvPageDesc,
-    RuntimeLoadMode, SamplingConfig, StageModel, StageSession, StageSessionCheckpoint, TokenSignal,
-    parse_cache_type,
+    ActivationFrame, DecodeBatchRequest, DecodeFrameBatchOutput, DecodeFrameBatchRequest,
+    FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow, MediaInput,
+    MediaPrefill, MediaPrefillFrame, NativeMtpDraft, RuntimeConfig, RuntimeKvPage,
+    RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
+    StageSessionCheckpoint, TokenSignal, parse_cache_type,
 };
 
 use crate::package::select_package_parts;
@@ -105,6 +106,25 @@ pub struct RuntimeSessionDropStats {
     pub stats_after: RuntimeSessionStats,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeSessionAlignStats {
+    pub before_token_count: u64,
+    pub after_token_count: u64,
+}
+
+pub struct RuntimeDecodeBatchRequest<'a> {
+    pub session_id: &'a str,
+    pub token_id: i32,
+    pub sampling: Option<&'a SamplingConfig>,
+}
+
+pub struct RuntimeDecodeFrameBatchRequest<'a> {
+    pub session_id: &'a str,
+    pub token_id: i32,
+    pub sampling: Option<&'a SamplingConfig>,
+    pub input: Option<&'a ActivationFrame>,
+}
+
 #[derive(Debug, Clone)]
 struct ResidentLanePrefix {
     page_id: String,
@@ -176,6 +196,53 @@ impl RuntimeState {
         let token = session.decode_step_sampled(token_id, sampling)?;
         self.add_session_tokens(session_id, 1);
         Ok(token)
+    }
+
+    pub fn decode_batch_sampled(
+        &mut self,
+        requests: &[RuntimeDecodeBatchRequest<'_>],
+    ) -> Result<Vec<i32>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        Self::ensure_unique_batch_sessions(requests)?;
+        for request in requests {
+            self.session(request.session_id)?;
+        }
+
+        let mut lane_sessions = Vec::with_capacity(requests.len());
+        for request in requests {
+            let lane_session = self.sessions.remove(request.session_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {} was not active after admission",
+                    request.session_id
+                )
+            })?;
+            lane_sessions.push((request.session_id.to_string(), lane_session));
+        }
+
+        let result = {
+            let mut decode_requests = lane_sessions
+                .iter_mut()
+                .zip(requests.iter())
+                .map(|((_, lane_session), request)| DecodeBatchRequest {
+                    session: &mut lane_session.session,
+                    token_id: request.token_id,
+                    sampling: request.sampling,
+                })
+                .collect::<Vec<_>>();
+            StageSession::decode_batch_sampled(&mut decode_requests)
+        };
+
+        for (session_id, lane_session) in lane_sessions {
+            self.sessions.insert(session_id, lane_session);
+        }
+        if result.is_ok() {
+            for request in requests {
+                self.add_session_tokens(request.session_id, 1);
+            }
+        }
+        result
     }
 
     pub fn session_batch_size(&mut self, session_id: &str) -> Result<usize> {
@@ -274,6 +341,69 @@ impl RuntimeState {
         Ok(output)
     }
 
+    pub fn decode_frame_sampled_mtp_n1(
+        &mut self,
+        session_id: &str,
+        token_id: i32,
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
+        let session = self.session(session_id)?;
+        let output =
+            session.decode_step_frame_sampled_mtp_n1(token_id, sampling, input, output_capacity)?;
+        self.add_session_tokens(session_id, 1);
+        Ok(output)
+    }
+
+    pub fn decode_frame_batch_sampled(
+        &mut self,
+        requests: &[RuntimeDecodeFrameBatchRequest<'_>],
+    ) -> Result<Vec<DecodeFrameBatchOutput>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        Self::ensure_unique_frame_batch_sessions(requests)?;
+        for request in requests {
+            self.session(request.session_id)?;
+        }
+
+        let mut lane_sessions = Vec::with_capacity(requests.len());
+        for request in requests {
+            let lane_session = self.sessions.remove(request.session_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "session {} was not active after admission",
+                    request.session_id
+                )
+            })?;
+            lane_sessions.push((request.session_id.to_string(), lane_session));
+        }
+
+        let result = {
+            let mut decode_requests = lane_sessions
+                .iter_mut()
+                .zip(requests.iter())
+                .map(|((_, lane_session), request)| DecodeFrameBatchRequest {
+                    session: &mut lane_session.session,
+                    token_id: request.token_id,
+                    sampling: request.sampling,
+                    input: request.input,
+                })
+                .collect::<Vec<_>>();
+            StageSession::decode_step_frame_batch_sampled(&mut decode_requests)
+        };
+
+        for (session_id, lane_session) in lane_sessions {
+            self.sessions.insert(session_id, lane_session);
+        }
+        if result.is_ok() {
+            for request in requests {
+                self.add_session_tokens(request.session_id, 1);
+            }
+        }
+        result
+    }
+
     pub fn verify_frame(
         &mut self,
         session_id: &str,
@@ -281,10 +411,60 @@ impl RuntimeState {
         input: Option<&ActivationFrame>,
         output_capacity: usize,
     ) -> Result<(Vec<i32>, ActivationFrame)> {
+        self.verify_frame_sampled(session_id, token_ids, None, input, output_capacity)
+    }
+
+    pub fn verify_frame_sampled(
+        &mut self,
+        session_id: &str,
+        token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
         let session = self.session(session_id)?;
-        let output = session.verify_tokens_frame(token_ids, input, output_capacity)?;
+        let output =
+            session.verify_tokens_frame_sampled(token_ids, sampling, input, output_capacity)?;
         self.add_session_tokens(session_id, token_ids.len() as u64);
         Ok(output)
+    }
+
+    pub fn verify_frame_sampled_serial(
+        &mut self,
+        session_id: &str,
+        token_ids: &[i32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
+        if token_ids.is_empty() {
+            bail!("serial verify_frame requires at least one token");
+        }
+        let input_frames = split_activation_frame(input, token_ids.len())?;
+        let mut predicted_tokens = Vec::with_capacity(token_ids.len() + 2);
+        let mut output_frames = Vec::with_capacity(token_ids.len());
+        let mut last_draft = None;
+        for (index, token_id) in token_ids.iter().copied().enumerate() {
+            let input_frame = input_frames.as_ref().map(|frames| &frames[index]);
+            let (predicted, native_mtp, output) = self.decode_frame_sampled_mtp_n1(
+                session_id,
+                token_id,
+                sampling,
+                input_frame,
+                output_capacity,
+            )?;
+            if predicted >= 0 {
+                predicted_tokens.push(predicted);
+            }
+            last_draft = native_mtp;
+            output_frames.push(output);
+        }
+        if let Some(draft) = last_draft {
+            predicted_tokens.push(draft.token_id);
+            predicted_tokens
+                .push(i32::try_from(draft.proposal_compute_us.max(0)).unwrap_or(i32::MAX));
+        }
+        Ok((predicted_tokens, combine_activation_frames(&output_frames)?))
     }
 
     pub fn checkpoint_session(&mut self, session_id: &str) -> Result<()> {
@@ -376,6 +556,24 @@ impl RuntimeState {
         Ok(())
     }
 
+    pub fn align_session_to_token_count_if_ahead(
+        &mut self,
+        session_id: &str,
+        token_count: u64,
+    ) -> Result<Option<RuntimeSessionAlignStats>> {
+        let Some(current) = self.session_token_counts.get(session_id).copied() else {
+            return Ok(None);
+        };
+        if current <= token_count {
+            return Ok(None);
+        }
+        self.trim_session(session_id, token_count)?;
+        Ok(Some(RuntimeSessionAlignStats {
+            before_token_count: current,
+            after_token_count: token_count,
+        }))
+    }
+
     fn session(&mut self, session_id: &str) -> Result<&mut StageSession> {
         if !self.sessions.contains_key(session_id) {
             let lane_session = self.take_idle_session().map(Ok).unwrap_or_else(|| {
@@ -391,6 +589,31 @@ impl RuntimeState {
             .get_mut(session_id)
             .expect("session inserted above")
             .session)
+    }
+
+    fn ensure_unique_batch_sessions(requests: &[RuntimeDecodeBatchRequest<'_>]) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if !seen.insert(request.session_id) {
+                bail!("duplicate session {} in decode batch", request.session_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_unique_frame_batch_sessions(
+        requests: &[RuntimeDecodeFrameBatchRequest<'_>],
+    ) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if !seen.insert(request.session_id) {
+                bail!(
+                    "duplicate session {} in decode frame batch",
+                    request.session_id
+                );
+            }
+        }
+        Ok(())
     }
 
     fn active_session(&mut self, session_id: &str) -> Result<&mut StageSession> {
@@ -868,6 +1091,76 @@ impl RuntimeState {
             resident_prefix: None,
         })
     }
+}
+
+fn split_activation_frame(
+    input: Option<&ActivationFrame>,
+    token_count: usize,
+) -> Result<Option<Vec<ActivationFrame>>> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    if token_count == 0 {
+        bail!("cannot split activation frame for zero tokens");
+    }
+    if input.desc.token_count as usize != token_count {
+        bail!(
+            "activation token count mismatch: frame={} tokens={}",
+            input.desc.token_count,
+            token_count
+        );
+    }
+    if input.payload.len() % token_count != 0 {
+        bail!(
+            "activation payload is not divisible by token count: payload={} tokens={}",
+            input.payload.len(),
+            token_count
+        );
+    }
+    let row_bytes = input.payload.len() / token_count;
+    let frames = input
+        .payload
+        .chunks(row_bytes)
+        .map(|row| {
+            let mut desc = input.desc;
+            desc.token_count = 1;
+            desc.sequence_count = 1;
+            desc.payload_bytes = row.len() as u64;
+            ActivationFrame {
+                desc,
+                payload: row.to_vec(),
+            }
+        })
+        .collect();
+    Ok(Some(frames))
+}
+
+fn combine_activation_frames(frames: &[ActivationFrame]) -> Result<ActivationFrame> {
+    let Some(first) = frames.first() else {
+        bail!("cannot combine empty activation frames");
+    };
+    let mut desc = first.desc;
+    let mut payload = Vec::new();
+    let mut token_count = 0u32;
+    for frame in frames {
+        if frame.desc.dtype != desc.dtype
+            || frame.desc.layout != desc.layout
+            || frame.desc.producer_stage_index != desc.producer_stage_index
+            || frame.desc.layer_start != desc.layer_start
+            || frame.desc.layer_end != desc.layer_end
+            || frame.desc.sequence_count != desc.sequence_count
+            || frame.desc.flags != desc.flags
+        {
+            bail!("cannot combine incompatible activation frames");
+        }
+        token_count = token_count
+            .checked_add(frame.desc.token_count)
+            .context("combined activation token count overflow")?;
+        payload.extend_from_slice(&frame.payload);
+    }
+    desc.token_count = token_count;
+    desc.payload_bytes = payload.len() as u64;
+    Ok(ActivationFrame { desc, payload })
 }
 
 /// Allocate the next lane slot.
