@@ -642,6 +642,17 @@ only as the paper's ideal hidden-sidecar scenario; otherwise include measured
 for a real split if broad held-out acceptance fails the estimated break-even
 under realistic physical placement.
 
+Use a single-job HF meshlet only as a follow-on validation layer for a candidate
+sidecar. Do not dispatch it while the native-package lane is still trying to
+produce the first sidecar artifacts. The dispatch gate is: held-out native
+teacher summaries exist, training/scoring completed or failed with an
+actionable quality result, the serving bundle exported, and package-backed
+rolling `spd-openai-smoke` matched baseline content with zero tap failures plus
+accepted/proposed and saved/unsaved candidate-token round-trip counts. The
+first meshlet should run the coordinator, stage-server processes, SPD sidecar,
+and OpenAI frontend inside one HF Job; multiple HF Jobs with exposed ports are a
+later transport spike.
+
 Predigest SPD sidecars by canonical logical topology, not physical host count.
 The sidecar manifest owns required tap boundaries. Mesh may fit contiguous
 logical stages onto fewer physical nodes, but only if those internal taps remain

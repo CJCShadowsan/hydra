@@ -97,6 +97,28 @@ unless a dry run changes the planned cost.
    - Treat this as HF-side predictor/economics evidence, not LAN wall-clock
      proof.
 
+## Follow-On HF Meshlet Spike
+
+Do not dispatch a separate HF meshlet while the Qwen480 sidecar job is still
+trying to produce its first usable artifacts. The meshlet becomes the next
+short spike only after the current lane has enough evidence to carry:
+
+- held-out native teacher summaries exist and have coherent in-scope target
+  coverage;
+- training/scoring completed or failed with an actionable quality result;
+- the serving bundle exported;
+- package-backed rolling `spd-openai-smoke` matched baseline content, recorded
+  zero tap failures, and reported useful accepted/proposed plus saved/unsaved
+  candidate-token round trips.
+
+When those gates clear, run the first HF meshlet as one HF Job, not multiple HF
+Jobs: start a coordinator, stage-server processes, SPD sidecar, and OpenAI
+frontend as separate local processes inside the job, with optional synthetic
+per-stage latency. Success for that spike is process lifecycle, package
+materialization, tap return, SPD proposal/verification, rolling cleanup, and a
+repeatable pipeline-economics report. Multiple HF Jobs with exposed ports are a
+later transport spike, not the first end-to-end validation path.
+
 ## First Capped Run
 
 Planner dry run used before submission:

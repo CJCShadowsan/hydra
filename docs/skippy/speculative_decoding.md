@@ -200,6 +200,11 @@ injecting synthetic per-stage latency. That tests package materialization, tap
 return, proposal/verification, rolling cleanup, and pipeline economics
 repeatably. Multiple HF Jobs with exposed ports are a later transport spike,
 because the HF job proxy is not the same as a normal low-latency Mesh LAN.
+The dispatch gate is the sidecar result, not the networking idea: require
+held-out native teacher summaries, training/scoring evidence, exported serving
+artifacts, and a package-backed rolling smoke with matched content, zero tap
+failures, and useful saved/unsaved candidate-token round-trip counts before
+spending on the meshlet.
 
 A later no-spend max120 product-corpus check confirmed that simply fitting the
 small HF-teacher bridge harder is not enough. The

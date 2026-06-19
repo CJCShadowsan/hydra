@@ -231,6 +231,14 @@ rolling executor cleanup, and pipeline economics repeatably. A multi-HF-job
 node spike is lower priority until the transport story is explicit, because HF
 job port exposure is not the same as a normal low-latency Mesh LAN.
 
+Dispatch gate for that meshlet: do not spend on it until the current Qwen480
+lane has produced held-out native teacher summaries, completed training/scoring
+or failed with an actionable sidecar-quality result, exported the serving
+bundle, and run package-backed rolling `spd-openai-smoke` with matched baseline
+content, zero tap failures, and useful accepted/proposed plus saved/unsaved
+candidate-token round-trip counts. The meshlet is a validation layer for a
+candidate sidecar, not a replacement for producing one.
+
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
 artifacts export if training reaches export, package-backed rolling smoke
