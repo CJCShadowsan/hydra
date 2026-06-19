@@ -78,6 +78,24 @@ and setting `MESH_LLM_PATCH_PATH` before executing the generated plan.
 `evals/spd/bootstrap_qwen480_s8_native_job.sh` is the intended HF job
 entrypoint for this capped lane.
 
+Submitted checkpoint on 2026-06-19: the first capped run was launched as HF Job
+`meshllm/6a35304a953ed90bfb9446a8` using `rtx-pro-6000x4` and timeout `4.5h`.
+The job URL is `https://huggingface.co/jobs/meshllm/6a35304a953ed90bfb9446a8`.
+The spending backstop is the HF timeout, still planned at about `$49.50`.
+Because the local branch was not pushed from this machine, the job bootstraps
+from an uploaded patch artifact in
+`meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8` under
+`job-inputs/20260619T120328Z-acd77ee3/`. The upload commit is
+`6c1ad37606d315f1913f8f342286c1ba5d0c007f`; local artifacts are in
+`/tmp/spd-qwen480-native-job-20260619T120328Z-acd77ee3`. Checksums:
+`mesh-llm.patch`
+`4377feb3aee64120e54dc81cf8903b362e139130ab02f56eb9d4a6cb72096ac2`,
+`bootstrap_qwen480_s8_native_job.sh`
+`ad08edf14348279233844c2af908dc00e76eb53831ff707b7521e40d993ce433`, and
+`native-package-fresh-plan.dry-run.json`
+`eb09956dc86498d80e32e1b73589dd2f429c9ccd026715d6b6f63c39b9141c24`.
+Initial inspect showed the job in `SCHEDULING`; runtime logs had not started.
+
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
 artifacts export if training reaches export, package-backed rolling smoke

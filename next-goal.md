@@ -1,14 +1,13 @@
-# Next Goal: Qwen3-Coder-480B S8 SPD HF Plan
+# Next Goal: Monitor Qwen3-Coder-480B S8 SPD HF Run
 
 This file is disposable. Durable evidence belongs in `evals/spd/README.md` and
 `docs/skippy/speculative_decoding.md`.
 
 ## One-Line Goal
 
-Review and then explicitly dispatch a capped Hugging Face native-package run
-for a Qwen3-Coder-480B S8 SPD sidecar, using the exact MeshLLM Skippy layer
-package for teacher capture and training only the SPD predictor from captured
-taps/logits.
+Monitor the capped Hugging Face native-package run for a Qwen3-Coder-480B S8
+SPD sidecar, using the exact MeshLLM Skippy layer package for teacher capture
+and training only the SPD predictor from captured taps/logits.
 
 ## Immediate Target
 
@@ -58,8 +57,7 @@ Candidate HF flavors from the current Jobs hardware list:
 - `h200x4`: `564GB` VRAM, `1024GB` RAM, about `$20/hr`; cap `2h30m`, more
   memory-safe but probably too short for a useful train/capture cycle.
 
-Preferred first dry-run target: `rtx-pro-6000x4`, timeout `4h30m`, max cost
-`$50`.
+Submitted first target: `rtx-pro-6000x4`, timeout `4h30m`, max cost `$50`.
 
 ## Steps
 
@@ -96,7 +94,7 @@ Preferred first dry-run target: `rtx-pro-6000x4`, timeout `4h30m`, max cost
 
 ## First Capped Run
 
-After the patch above, run a planner dry run, no submission:
+Planner dry run used before submission:
 
 ```bash
 python3 evals/spd/plan_hf_spd_qualification.py \
@@ -142,24 +140,37 @@ instead of requiring a GitHub push from this machine.
 it downloads the uploaded patch, applies it to a bootstrap clone, regenerates
 the reviewed plan, then runs `run_hf_spd_qualification_plan.py`.
 
-The submitted job should use the same parameters and:
+Submitted job used the same parameters through an HF-uploaded patch/bootstrap
+artifact, because the local branch was not pushed to GitHub from this machine:
 
 ```bash
-hf jobs run \
-  --namespace meshllm \
-  --flavor rtx-pro-6000x4 \
-  --timeout 4.5h \
-  --secrets HF_TOKEN \
-  --detach \
-  <docker-image> \
-  bash run-qwen480-s8-native-spd.sh
+id=6a35304a953ed90bfb9446a8
+url=https://huggingface.co/jobs/meshllm/6a35304a953ed90bfb9446a8
+run_id=20260619T120328Z-acd77ee3
+local_artifact_dir=/tmp/spd-qwen480-native-job-20260619T120328Z-acd77ee3
+output_repo=meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8
+input_prefix=job-inputs/20260619T120328Z-acd77ee3/
+upload_commit=6c1ad37606d315f1913f8f342286c1ba5d0c007f
+patch_sha256=4377feb3aee64120e54dc81cf8903b362e139130ab02f56eb9d4a6cb72096ac2
+bootstrap_sha256=ad08edf14348279233844c2af908dc00e76eb53831ff707b7521e40d993ce433
+dry_run_plan_sha256=eb09956dc86498d80e32e1b73589dd2f429c9ccd026715d6b6f63c39b9141c24
 ```
 
 The timeout is the spending backstop. At the current checked rate for
 `rtx-pro-6000x4`, `4.5h` plans at about `$49.50`; the job should finish, fail,
 or be killed by HF at timeout.
 
-## Remaining Risks Before Dispatch
+Latest status check on 2026-06-19: HF Jobs reports stage `SCHEDULING`.
+`hf jobs logs` currently returns no runtime log lines yet.
+
+Monitoring commands:
+
+```bash
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs inspect meshllm/6a35304a953ed90bfb9446a8
+UV_DEFAULT_INDEX=https://pypi.org/simple uvx --from huggingface_hub hf jobs logs meshllm/6a35304a953ed90bfb9446a8
+```
+
+## Remaining Risks During Run
 
 - The first HF run may expose a reference-code compatibility issue between
   `SpeculationHeadTransformer` and the Qwen3-Coder-480B MoE config. The
@@ -167,8 +178,11 @@ or be killed by HF at timeout.
   without loading the full model if unsupported.
 - `native-package-fresh` exports a serving fixture, not a true Python/reference
   parity fixture. Do not claim Rust/Python fixture parity for this lane yet.
-- The generated plan is dry-run only. Spend-bearing submit still needs explicit
-  confirmation and should keep the `4.5h` timeout as the hard cost backstop.
+- Setup/build time runs inside the `4.5h` cap. If the job expires before useful
+  capture, the next lane should reduce the first-run scope or use prebuilt
+  runtime artifacts before increasing spend.
+- Because the run uses an uploaded patch artifact rather than a pushed branch,
+  keep the run id, upload commit, and patch SHA with every report.
 
 ## Pass/Fail Gate
 
