@@ -168,6 +168,13 @@ allocator/residency fix. It keeps the same `rtx-pro-6000x4` / `3.5h` timeout
 cap; the first useful signal is whether streamed tap stage `0..8` opens after
 the verifier phase exits.
 
+That allocator gate has now passed in the live logs: after build, package
+download, prompt processing, and capture startup, the job logged streamed stage
+`0..8` with `CUDA0 model buffer size = 34051.88 MiB` instead of the previous
+`cudaMalloc` OOM. The job remains active, so this only proves the residency fix
+got past the old failure point; capture summaries, training, scoring, and
+package-backed smoke are still pending evidence.
+
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages
 onto fewer physical nodes when hardware is scarce. That placement is only valid

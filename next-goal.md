@@ -257,6 +257,14 @@ The timeout is the spending backstop. At the current checked rate for
 or be killed by HF at timeout. The first gate to watch is whether phase 2 can
 open streamed tap stage `0..8` after the phase-1 verifier drop.
 
+Current observed gate: this retry passed the previous allocator failure point.
+It completed release `skippy-bench`/`skippy-server` builds, downloaded the full
+Qwen480 layer-package snapshot (`276G / 276G`, `69` files), built the prompt
+dataset shards, entered native capture, and logged the streamed stage `0..8`
+allocation as `CUDA0 model buffer size = 34051.88 MiB` instead of failing with
+`cudaMalloc`. The job is still running; do not claim capture/train/smoke
+success until their summary artifacts appear.
+
 Startup attempts before the current live job:
 
 - `meshllm/6a35304a953ed90bfb9446a8` failed in 3 seconds with exit `126`

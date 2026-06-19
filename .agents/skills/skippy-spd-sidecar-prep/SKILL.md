@@ -721,6 +721,11 @@ Current two-phase HF retry: `meshllm/6a35536b3093dba73ce2a377`, artifact
 `abaefe222379e5bd6f949ebec7ca37de79faf715`, `rtx-pro-6000x4`, `3.5h` timeout.
 Watch whether phase 2 can open streamed tap stage `0..8` after the phase-1
 verifier drop.
+Observed update: the run passed the old allocation failure point. It completed
+build, package download, prompt processing, and capture startup, then logged
+streamed stage `0..8` allocating `CUDA0 model buffer size = 34051.88 MiB`
+instead of failing with `cudaMalloc`. The job is still active; do not claim
+capture/train/smoke success until summaries/artifacts exist.
 If the local branch is not pushed, upload a patch artifact and set
 `MESH_LLM_PATCH_PATH` so the job applies it after cloning. Remaining risk for
 the first capped job is runtime compatibility with the Qwen480 MoE config and

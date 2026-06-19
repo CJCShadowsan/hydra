@@ -214,6 +214,14 @@ dry-run plan SHA256 is
 important gate is whether phase 2 can open streamed tap stage `0..8` after the
 phase-1 verifier model/session is dropped.
 
+Observed gate update: this run passed the previous OOM point. It completed the
+release `skippy-bench`/`skippy-server` builds, Python dependency setup, the
+full Qwen480 package snapshot download (`276G / 276G`, `69` files), and prompt
+dataset processing, then entered native capture. Logs show streamed stage
+`0..8` allocating `CUDA0 model buffer size = 34051.88 MiB`; the prior retry
+failed at that exact allocation. The job is still running, so this is allocator
+and startup evidence only, not a completed capture/train/smoke result.
+
 If this Qwen480 lane clears the sidecar quality and package-backed smoke gates,
 the next HF validation spike should be a single-job meshlet: one HF Job starts
 the coordinator, stage servers, SPD sidecar, and OpenAI frontend as separate
