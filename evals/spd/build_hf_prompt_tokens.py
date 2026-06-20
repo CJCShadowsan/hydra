@@ -33,6 +33,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", default="HuggingFaceH4/ultrachat_200k")
     parser.add_argument("--dataset-split", default="train_sft")
+    parser.add_argument(
+        "--dataset-config",
+        default="",
+        help=(
+            "Optional Hugging Face dataset config name. For comma-separated "
+            "--dataset values, provide one config for all datasets or the same "
+            "number of comma-separated configs; use empty entries for datasets "
+            "without an explicit config."
+        ),
+    )
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--model-name", default="Qwen/Qwen3-8B")
     parser.add_argument("--train-prompts", type=int, default=512)
@@ -76,11 +86,15 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    source = load_dataset(args.dataset, split=args.dataset_split)
-    if args.max_source_rows > 0:
-        source = source.select(range(min(args.max_source_rows, len(source))))
-
-    rows = build_rows(args, source, tokenizer)
+    rows: list[dict[str, Any]] = []
+    for spec in dataset_specs(args):
+        load_kwargs = {"split": spec.split}
+        if spec.config:
+            load_kwargs["name"] = spec.config
+        source = load_dataset(spec.name, **load_kwargs)
+        if args.max_source_rows > 0:
+            source = source.select(range(min(args.max_source_rows, len(source))))
+        rows.extend(build_rows(args, source, tokenizer, spec))
     if args.shuffle:
         random.Random(args.seed).shuffle(rows)
 
@@ -111,9 +125,60 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-source-rows must be non-negative")
     if args.user_turn_limit < 0:
         raise SystemExit("--user-turn-limit must be non-negative")
+    dataset_count = len(split_csv_arg(args.dataset))
+    split_count = len(split_csv_arg(args.dataset_split))
+    config_count = len(split_csv_arg(args.dataset_config, keep_empty=True))
+    if dataset_count == 0 or split_count == 0:
+        raise SystemExit("--dataset and --dataset-split must not be empty")
+    if split_count not in {1, dataset_count}:
+        raise SystemExit(
+            "--dataset-split must contain one value or the same number of values as --dataset"
+        )
+    if config_count not in {0, 1, dataset_count}:
+        raise SystemExit(
+            "--dataset-config must be empty, contain one value, or contain the same "
+            "number of values as --dataset"
+        )
 
 
-def build_rows(args: argparse.Namespace, source: Any, tokenizer: Any) -> list[dict[str, Any]]:
+def split_csv_arg(value: str, *, keep_empty: bool = False) -> list[str]:
+    parts = [part.strip() for part in value.split(",")]
+    if keep_empty:
+        return parts if any(parts) else []
+    return [part for part in parts if part]
+
+
+class DatasetSpec:
+    def __init__(self, name: str, split: str, config: str = "") -> None:
+        self.name = name
+        self.split = split
+        self.config = config
+
+
+def dataset_specs(args: argparse.Namespace) -> list[DatasetSpec]:
+    datasets = split_csv_arg(args.dataset)
+    splits = split_csv_arg(args.dataset_split)
+    configs = split_csv_arg(args.dataset_config, keep_empty=True)
+    if len(splits) == 1:
+        splits *= len(datasets)
+    if not configs:
+        configs = [""] * len(datasets)
+    elif len(configs) == 1:
+        configs *= len(datasets)
+    return [
+        DatasetSpec(name=dataset_name, split=dataset_split, config=dataset_config)
+        for dataset_name, dataset_split, dataset_config in zip(
+            datasets, splits, configs, strict=True
+        )
+    ]
+
+
+def build_rows(
+    args: argparse.Namespace,
+    source: Any,
+    tokenizer: Any,
+    spec: DatasetSpec,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, obj in enumerate(source):
         messages = extract_user_messages(
@@ -126,8 +191,9 @@ def build_rows(args: argparse.Namespace, source: Any, tokenizer: Any) -> list[di
         tokens = render_prompt_tokens(tokenizer, messages)
         rows.append(
             {
-                "dataset": args.dataset,
-                "dataset_split": args.dataset_split,
+                "dataset": spec.name,
+                "dataset_split": spec.split,
+                "dataset_config": spec.config,
                 "source_index": index,
                 "question_id": obj.get("id") or obj.get("question_id"),
                 "category": obj.get("category"),
@@ -211,8 +277,8 @@ def render_prompt_tokens(tokenizer: Any, messages: list[dict[str, str]]) -> list
     return [int(token) for token in ids]
 
 
-def load_excluded_prompt_keys(paths: list[Path]) -> set[tuple[str, str, str]]:
-    keys: set[tuple[str, str, str]] = set()
+def load_excluded_prompt_keys(paths: list[Path]) -> set[tuple[str, str, str, str, str]]:
+    keys: set[tuple[str, str, str, str, str]] = set()
     for path in paths:
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -228,9 +294,11 @@ def load_excluded_prompt_keys(paths: list[Path]) -> set[tuple[str, str, str]]:
     return keys
 
 
-def prompt_key(row: dict[str, Any]) -> tuple[str, str, str]:
+def prompt_key(row: dict[str, Any]) -> tuple[str, str, str, str, str]:
     return (
         str(row.get("dataset")),
+        str(row.get("dataset_split")),
+        str(row.get("dataset_config", "")),
         str(row.get("source_index")),
         str(row.get("question_id")),
     )
@@ -257,6 +325,14 @@ def write_outputs(
     summary_obj = {
         "dataset": args.dataset,
         "dataset_split": args.dataset_split,
+        "dataset_specs": [
+            {
+                "dataset": spec.name,
+                "dataset_split": spec.split,
+                "dataset_config": spec.config,
+            }
+            for spec in dataset_specs(args)
+        ],
         "model_name": args.model_name,
         "train_prompt_token_file": str(train_tokens),
         "heldout_prompt_token_file": str(heldout_tokens),
@@ -285,6 +361,7 @@ def token_row(row: dict[str, Any]) -> dict[str, Any]:
         "prompt_token_ids": row["prompt_token_ids"],
         "dataset": row["dataset"],
         "dataset_split": row["dataset_split"],
+        "dataset_config": row.get("dataset_config", ""),
         "source_index": row["source_index"],
         "question_id": row["question_id"],
         "category": row["category"],
@@ -298,6 +375,7 @@ def prompt_row(row: dict[str, Any]) -> dict[str, Any]:
         "messages": row["messages"],
         "dataset": row["dataset"],
         "dataset_split": row["dataset_split"],
+        "dataset_config": row.get("dataset_config", ""),
         "source_index": row["source_index"],
         "question_id": row["question_id"],
         "category": row["category"],

@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--draft-vocab-size", type=int, default=32000)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
+    parser.add_argument("--dataset-config", default="")
     parser.add_argument("--train-prompts", type=int, default=4096)
     parser.add_argument("--heldout-prompts", type=int, default=256)
     parser.add_argument("--max-prompt-tokens", type=int, default=480)
@@ -662,6 +663,7 @@ def build_plan(
         "data": {
             "dataset": args.dataset,
             "dataset_split": args.dataset_split,
+            "dataset_config": args.dataset_config,
             "train_prompts": args.train_prompts,
             "heldout_prompts": args.heldout_prompts,
             "max_prompt_tokens": args.max_prompt_tokens,
@@ -738,6 +740,7 @@ def job_environment(args: argparse.Namespace, output_repo: str, mesh_ref: str) -
         "MESH_LLM_REF": mesh_ref,
         "DATASET": args.dataset,
         "DATASET_SPLIT": args.dataset_split,
+        "DATASET_CONFIG": args.dataset_config,
         "QUALIFICATION_MODE": args.qualification_mode,
     }
 
@@ -826,6 +829,7 @@ def build_commands(
         "python3 evals/spd/build_hf_prompt_tokens.py "
         f"--dataset {shell_quote(args.dataset)} "
         f"--dataset-split {shell_quote(args.dataset_split)} "
+        f"--dataset-config {shell_quote(args.dataset_config)} "
         f"--model-name {shell_quote(args.base_model)} "
         f"--out-dir {prompt_dir} "
         f"--train-prompts {args.train_prompts} "

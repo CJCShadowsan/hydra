@@ -562,7 +562,7 @@ for an HF meshlet needs a broad held-out package-backed gate with margin.
 
 Prepared no-spend fallback for the next quality lane:
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
-SHA256 `981d7a95c314b14a7544250e6a6167a7fe42d64689fa4c08df4e98dfe453b646`.
+SHA256 `5d59c3b025e457d979437171044823b9a92b4220a99678baac800292918a2816`.
 It keeps the same Qwen480 S8 package/topology but raises training to `2048`
 train prompts with `4` verify steps (`8192` native-Q4 samples) and `128`
 held-out prompts. It also moves closer to the paper recipe: one epoch, LR
@@ -573,10 +573,12 @@ draft-vocab teacher logits, `physical-node-count=4`, capture map
 and max cost `$49.49991`. It is not submitted. The generated plan still avoids
 the old full-reference path strings: no `AutoModelForCausalLM`, no
 `hf_train_eval_qwen06`, no `spd-live-tap-parity`, and no `from_pretrained(`.
-Remaining paper gap after that dry run: the prompt source is still UltraChat
-only; the paper used a mixed ShareGPT/UltraChat/SmolTalk/SmolTalk-Chinese
-distribution, so broader data support is the next likely quality lever if
-UltraChat-only scaling improves but still misses the broad package-backed gate.
+The prompt-token builder and planner now accept comma-separated `--dataset`,
+`--dataset-split`, and optional `--dataset-config` values, so the next dry run
+can move toward the paper's mixed ShareGPT/UltraChat/SmolTalk/SmolTalk-Chinese
+distribution instead of staying UltraChat-only. Exact dataset IDs and configs
+should still be verified before spend; the UltraChat-only 8k plan remains the
+known-good no-spend baseline.
 
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving

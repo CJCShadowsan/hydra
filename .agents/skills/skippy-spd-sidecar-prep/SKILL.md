@@ -862,15 +862,17 @@ step as data/recipe scale-up.
 
 Prepared no-spend fallback plan:
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
-SHA256 `981d7a95c314b14a7544250e6a6167a7fe42d64689fa4c08df4e98dfe453b646`.
+SHA256 `5d59c3b025e457d979437171044823b9a92b4220a99678baac800292918a2816`.
 It keeps the same Qwen480 S8 native package-first topology, raises training to
 `8192` native-Q4 samples (`2048` train prompts x `4` verify steps), uses
 `128` held-out prompts, `physical-node-count=4`, capture map
 `CUDA0,CUDA0,CUDA1,CUDA1,CUDA2,CUDA2,CUDA3,CUDA3`, smoke map
 `CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`, one epoch, LR `1e-4`, and KL-only
 native teacher training. It is not submitted; spend still requires explicit
-confirmation. Mixed ShareGPT/UltraChat/SmolTalk prompt support remains the next
-paper-alignment gap if UltraChat-only scaling is insufficient.
+confirmation. `build_hf_prompt_tokens.py` and the HF qualification planner now
+accept comma-separated `--dataset`, `--dataset-split`, and optional
+`--dataset-config` values, so mixed ShareGPT/UltraChat/SmolTalk prompt shards
+can be prepared after exact dataset IDs/configs are verified.
 
 Do not submit spend until the dry run prints model/package ref, dataset shard,
 prompt counts, topology, hardware flavor, timeout, output repo, and max cost.

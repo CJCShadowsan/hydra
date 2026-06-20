@@ -313,7 +313,7 @@ sidecar as a speed candidate.
 
 A larger no-spend fallback plan is now also saved at
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json` with
-SHA256 `981d7a95c314b14a7544250e6a6167a7fe42d64689fa4c08df4e98dfe453b646`.
+SHA256 `5d59c3b025e457d979437171044823b9a92b4220a99678baac800292918a2816`.
 It is not submitted. It keeps Qwen480 S8 native package-first capture, raises
 training to `8192` native-Q4 samples (`2048` prompts x `4` verify steps), uses
 `128` held-out prompts, keeps the proven resident capture map
@@ -322,9 +322,10 @@ map `CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`, and moves closer to the paper
 recipe with one epoch, LR `1e-4`, and KL-only native teacher training. It
 still has the same `$49.49991` planned cap on `rtx-pro-6000x4` and still avoids
 the old full-reference path strings. Since the active job failed the broad
-acceptance/economics gate cleanly, this is the first prepared follow-up; mixed
-ShareGPT/UltraChat/SmolTalk prompt support remains the next data-quality gap
-relative to the paper.
+acceptance/economics gate cleanly, this is the first prepared follow-up.
+Prompt-token generation now supports comma-separated datasets, splits, and
+dataset configs, so a mixed ShareGPT/UltraChat/SmolTalk dry run can be prepared
+once exact dataset IDs/configs are verified.
 
 Predigested SPD splits should be logical artifacts. A sidecar is trained for a
 canonical logical topology and tap set; Mesh may fit contiguous logical stages

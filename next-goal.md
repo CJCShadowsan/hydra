@@ -173,7 +173,7 @@ transport.
    - No-spend fallback dry run prepared:
      `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
      SHA256
-     `981d7a95c314b14a7544250e6a6167a7fe42d64689fa4c08df4e98dfe453b646`.
+     `5d59c3b025e457d979437171044823b9a92b4220a99678baac800292918a2816`.
      It uses the same Qwen480 S8 package/topology, `2048` train prompts with
      `4` verify steps (`8192` native-Q4 train samples), `128` held-out prompts,
      `physical-node-count=4`, capture map
@@ -183,6 +183,10 @@ transport.
      max cost `$49.49991`. `rg` found no `AutoModelForCausalLM`,
      `hf_train_eval_qwen06`, `spd-live-tap-parity`, or `from_pretrained(` in
      the plan. Do not submit it until spend is explicitly approved.
+   - The prompt-token builder and planner now accept comma-separated
+     `--dataset`, `--dataset-split`, and optional `--dataset-config` values, so
+     the next dry run can move toward the paper's mixed
+     ShareGPT/UltraChat/SmolTalk data rather than staying UltraChat-only.
 
 ## Why Not Meshlet Yet
 
