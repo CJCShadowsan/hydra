@@ -722,6 +722,20 @@ build, downloaded the full `69`-file / `276G` Qwen480 package, and entered
 package-smoke, or acceptance result has appeared yet. Do not submit a duplicate
 while this job is active.
 
+Update at 2026-06-20 04:56 UTC: `hf jobs inspect` still reports the diagnostic
+job as `RUNNING`. Bounded `hf jobs logs --tail` calls are not returning useful
+checkpoint lines, but `hf jobs stats` shows real resource use rather than an
+idle job: about `309.8GB / 1.0TB` host memory and roughly `69GB` allocated on
+each of the four RTX PRO 6000 GPUs, with live GPU utilization. The plan was
+reconfirmed as the intended native-package-fresh path: `input_mode=raw`,
+`base_model_load=skipped_autoconfig_only`, mixed paper-like data sources,
+frequency-built `32k` draft vocab, native Q4 teacher logits, Rust fixture
+parity before package smoke, and max planned cost `$42.899922`. Second-opinion
+review agreed that this diagnostic must finish before any 16k/64k/paper-scale
+spend: if parity fails, fix alignment; if parity passes but package smoke still
+accepts `0`, run the prepared overfit-to-serving-prompts control before buying
+more rows.
+
 The mixed prompt sources in that dry run are
 `HuggingFaceH4/ultrachat_200k:train_sft`,
 `HuggingFaceTB/smoltalk:all/train`,

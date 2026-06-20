@@ -43,11 +43,14 @@ real candidate-token round-trip savings under the same logical topology.
   HF Job `meshllm/6a3611dd953ed90bfb945575`, created
   2026-06-20 04:06:53 UTC, label
   `spd-qwen480-quality-8k-diagnostic`. It was last observed `RUNNING` at
-  2026-06-20 04:50 UTC. It has passed setup/release build, downloaded the full
-  `69`-file / `276G` Qwen480 package, and entered `build_prompts[0]` for the
-  mixed dataset plan. No capture, fixed-row parity, package-smoke, or
-  acceptance result has appeared yet. Do not submit a duplicate while this job
-  is active. The refreshed dry-run plan is
+  2026-06-20 04:56 UTC. It has passed setup/release build, downloaded the full
+  `69`-file / `276G` Qwen480 package, and entered the mixed-data plan. The HF
+  log endpoint currently returns no useful tail lines, but `hf jobs stats`
+  showed real work rather than idle time: about `309.8GB / 1.0TB` host memory
+  and roughly `69GB` allocated on each of four RTX PRO 6000 GPUs, with live GPU
+  utilization. No fixed-row parity, package-smoke, or acceptance result has
+  appeared yet. Do not submit a duplicate while this job is active. The
+  refreshed dry-run plan is
   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-diagnostic-plan.json`,
   SHA256
   `44a92e8c759af9304f790a72bb02f196443b0ab1ebe112dc0b6589ca8f0db244`.
@@ -208,6 +211,15 @@ passes and package-backed smoke still serves `0` should the
 overfit-to-serving-prompts control run; only after served acceptance clears
 with saved candidate-token round trips should `16k`/`64k`/paper-scale data be
 submitted.
+
+Second-opinion update at 2026-06-20 04:56 UTC: active job stats show real GPU
+work, so keep waiting for the diagnostic result rather than canceling or
+launching a duplicate. If fixed-row parity passes but served acceptance is
+still `0`, the next spend gate is the already prepared
+`--overfit-serving-prompts` proof, not a larger data jump. Nonzero served
+acceptance from that overfit proof means request-path alignment is good and
+data scale is the lever; zero served acceptance from an overfit head means the
+blocker is still row/projection/live-tap alignment.
 
 ## Success Gate
 

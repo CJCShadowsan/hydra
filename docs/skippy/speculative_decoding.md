@@ -111,6 +111,15 @@ package, and entered `build_prompts[0]`; no capture, fixed-row parity,
 package-smoke, or acceptance result has appeared yet. Do not dispatch a
 duplicate while that job is active.
 
+Update at 2026-06-20 04:56 UTC: the job remains `RUNNING`. HF log tails are
+not currently yielding checkpoint lines, but `hf jobs stats` shows the run is
+using about `309.8GB / 1.0TB` host memory and roughly `69GB` on each of four
+RTX PRO 6000 GPUs with live utilization. Treat this as active model/package
+work and continue to wait for the diagnostic result. Do not scale to
+`16k`/`64k` until fixed-row parity either passes or exposes the alignment fault;
+if parity passes and served acceptance is still zero, run the prepared
+overfit-to-serving-prompts control before buying more data.
+
 The local memory-residency fix keeps verifier semantics unchanged:
 `spd-product-corpus-capture --stream-live-tap-stages` still uses the full native
 Q4 verifier session for greedy target tokens and draft-vocab teacher logits,
