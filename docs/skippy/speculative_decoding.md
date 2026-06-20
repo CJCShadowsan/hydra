@@ -120,6 +120,13 @@ work and continue to wait for the diagnostic result. Do not scale to
 if parity passes and served acceptance is still zero, run the prepared
 overfit-to-serving-prompts control before buying more data.
 
+Update at 2026-06-20 05:03 UTC: raw HF Jobs SSE logs show the diagnostic
+reached `capture[0]` at 2026-06-20 04:29:01 UTC. Prompt building completed with
+`2048` train prompts, `128` held-out prompts, and
+`draft_vocab_unique_train_tokens=45576`. The last observed raw event was still
+inside native capture; there is still no conversion, training, fixed-row
+parity, package-smoke, or acceptance result.
+
 The local memory-residency fix keeps verifier semantics unchanged:
 `spd-product-corpus-capture --stream-live-tap-stages` still uses the full native
 Q4 verifier session for greedy target tokens and draft-vocab teacher logits,

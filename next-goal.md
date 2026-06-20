@@ -221,6 +221,18 @@ acceptance from that overfit proof means request-path alignment is good and
 data scale is the lever; zero served acceptance from an overfit head means the
 blocker is still row/projection/live-tap alignment.
 
+Raw-log update at 2026-06-20 05:03 UTC: the HF CLI log tail was empty, but the
+underlying SSE endpoint
+`https://huggingface.co/api/jobs/meshllm/6a3611dd953ed90bfb945575/logs`
+returned buffered events when called with `HF_TOKEN`. The job reached
+`capture[0]` at 2026-06-20 04:29:01 UTC after prompt building completed with
+`2048` train prompts, `128` held-out prompts, and
+`draft_vocab_unique_train_tokens=45576`. The latest raw log timestamp was
+2026-06-20 05:03:07 UTC inside native capture, with repeated
+`init: embeddings required but some input tokens were not marked as outputs ->
+overriding` messages. No conversion, training, fixed-row parity, package
+smoke, or acceptance result has appeared yet.
+
 ## Success Gate
 
 This goal is done only when a capped HF quality lane produces a larger trained

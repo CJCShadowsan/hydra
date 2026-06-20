@@ -736,6 +736,17 @@ spend: if parity fails, fix alignment; if parity passes but package smoke still
 accepts `0`, run the prepared overfit-to-serving-prompts control before buying
 more rows.
 
+Update at 2026-06-20 05:03 UTC: the raw HF Jobs SSE logs endpoint works even
+when `hf jobs logs --tail` is empty. Calling
+`https://huggingface.co/api/jobs/meshllm/6a3611dd953ed90bfb945575/logs` with
+the active `HF_TOKEN` returned buffered events. The run reached
+`capture[0]` at 2026-06-20 04:29:01 UTC after prompt building completed with
+`2048` train prompts, `128` held-out prompts, and
+`draft_vocab_unique_train_tokens=45576`. The last observed raw event was
+2026-06-20 05:03:07 UTC during native capture. No conversion, head-only train,
+score, fixed-row parity, package-backed smoke, or acceptance result has
+appeared yet.
+
 The mixed prompt sources in that dry run are
 `HuggingFaceH4/ultrachat_200k:train_sft`,
 `HuggingFaceTB/smoltalk:all/train`,
