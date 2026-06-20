@@ -510,6 +510,32 @@ and in `SCHEDULING`; continue by watching bootstrap logs for patch download,
 head-only train/score, export, package-backed rolling smoke, latency
 simulation, and upload.
 
+In-flight quality checkpoint from the same job: setup/build, full `276G`
+package download, prompt-token build, native train/held-out capture, conversion,
+head-only training, held-out scoring, serving export, and pre-smoke upload all
+completed. The first larger Qwen480 lane captured `512` train prompts with
+`4` verify steps (`2048` train samples; `1817` labels in draft-vocab scope) and
+`64` held-out prompts (`256` held-out samples; `224` labels in scope). The
+fresh raw head overfit train (`final_argmax_acc=1.0`, `steps_completed=768`,
+`base_model_load=skipped`) but improved held-out quality versus the tiny lane:
+native-teacher top-1 `96 / 256`, native-teacher top-4 `129 / 256`, hard-label
+top-1 `94 / 224`, hard-label top-4 `123 / 224`. The exported BF16 serving
+head is `8,723,214,136` bytes, `86` tensors, SHA256
+`5cf3c15c54919414809cf409d252c5c4b0fa2b5ec084d91d4966e54976e75936`.
+Package-backed rolling smoke is still the active gate at this checkpoint.
+
+Paper-scale context: `~/Downloads/spd.pdf` says the authors freeze the target
+LLM and train only the Speculation Module with KL distillation against frozen
+teacher logits. Their reported training mix is about `1M` selected samples
+from ShareGPT-70k, UltraChat-200k, SmolTalk, and SmolTalk-Chinese, filtered to
+max sequence length `2048`, yielding about `1.2M` samples, trained for `1`
+epoch with LR `1e-4` and linear decay. They also train with simulated pipeline
+occupancy over the `n+1` depth-block layout. The current Qwen480 `2048`-sample
+lane is therefore a product-path feasibility and first-quality signal, not a
+paper-scale sidecar-quality run. If package smoke does not clear the
+saved-versus-unsaved gate, the next spend should scale native Q4/S8 KD data and
+recipe quality rather than repeat mechanics.
+
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
 artifacts export if training reaches export, package-backed rolling smoke
