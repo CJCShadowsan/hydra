@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-prompts", type=int, default=4096)
     parser.add_argument("--heldout-prompts", type=int, default=256)
     parser.add_argument("--max-prompt-tokens", type=int, default=480)
+    parser.add_argument(
+        "--balance-datasets",
+        action="store_true",
+        help=(
+            "Pass --balance-datasets to build_hf_prompt_tokens.py so capped "
+            "mixed-data runs draw round-robin across dataset specs."
+        ),
+    )
     parser.add_argument("--verify-steps", type=int, default=4)
     parser.add_argument(
         "--stream-live-tap-stages",
@@ -667,8 +675,13 @@ def build_plan(
             "train_prompts": args.train_prompts,
             "heldout_prompts": args.heldout_prompts,
             "max_prompt_tokens": args.max_prompt_tokens,
+            "balance_datasets": bool(args.balance_datasets),
             "verify_steps": args.verify_steps,
             "ctx_size": args.ctx_size,
+            "draft_vocab": (
+                "frequency-built from selected training conversations by "
+                "build_hf_prompt_tokens.py"
+            ),
         },
         "training": {
             "warm_start_repo": args.warm_start_repo if args.qualification_mode == "raw-q4-adapt" else None,
@@ -741,6 +754,7 @@ def job_environment(args: argparse.Namespace, output_repo: str, mesh_ref: str) -
         "DATASET": args.dataset,
         "DATASET_SPLIT": args.dataset_split,
         "DATASET_CONFIG": args.dataset_config,
+        "BALANCE_DATASETS": "true" if args.balance_datasets else "false",
         "QUALIFICATION_MODE": args.qualification_mode,
     }
 
@@ -835,8 +849,11 @@ def build_commands(
         f"--train-prompts {args.train_prompts} "
         f"--heldout-prompts {args.heldout_prompts} "
         f"--max-prompt-tokens {args.max_prompt_tokens} "
+        f"--draft-vocab-size {args.draft_vocab_size} "
         "--shuffle --seed 23"
     )
+    if args.balance_datasets:
+        prompt_command += " --balance-datasets"
     if args.qualification_mode == "reference-train":
         return build_reference_train_commands(
             args=args,
@@ -1047,6 +1064,7 @@ def build_native_package_fresh_commands(
         f"--splits {split_arg} --layer-end {layer_end} "
         f"--hidden-size {activation_width} --vocab-size {vocab_size} "
         f"--draft-vocab-size {args.draft_vocab_size} "
+        f"--draft-token-ids-file {prompt_dir}/draft-token-ids.json "
         f"--num-spec-layers {args.num_spec_layers} "
         f"--ctx-size {args.ctx_size} --n-gpu-layers=-1 "
         + stage_backend_arg
@@ -1318,7 +1336,16 @@ def emit_human_summary(plan: dict[str, Any]) -> None:
         print(f"  capture CUDA map: {fit['capture_stage_backend_devices']}")
     if fit.get("smoke_stage_backend_devices"):
         print(f"  smoke backend map: {fit['smoke_stage_backend_devices']}")
-    print(f"  data: {plan['data']['train_prompts']} train / {plan['data']['heldout_prompts']} heldout prompts")
+    data = plan["data"]
+    print(
+        f"  data: {data['train_prompts']} train / {data['heldout_prompts']} heldout "
+        f"prompts, max tokens {data['max_prompt_tokens']}"
+    )
+    print(f"  dataset: {data['dataset']} [{data['dataset_split']}]")
+    if data.get("dataset_config"):
+        print(f"  dataset config: {data['dataset_config']}")
+    print(f"  balance datasets: {data.get('balance_datasets', False)}")
+    print(f"  draft vocab: {data.get('draft_vocab')}")
     print(
         "  hardware: "
         f"{hardware['flavor']} ({hardware['pretty_name']}), "

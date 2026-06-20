@@ -42,8 +42,12 @@ real candidate-token round-trip savings under the same logical topology.
 
 Conclusion: the Qwen480 S8 request path, tap transport, package source, rolling
 executor integration, and latency simulation path work at broad held-out scale.
-The blocker remains sidecar quality from insufficient or insufficiently aligned
-native-Q4 training data. Do not dispatch a meshlet for this sidecar.
+The blocker is acceptance, but do not reduce that to "more rows" yet. The
+current contradiction is serious: offline held-out scoring reported useful
+top-1 signal, while package-backed serving accepted `0 / 256`. Before spending
+again, close the structural acceptance checks below: serving/Python parity on
+fixed native rows, corpus-derived draft-vocab coverage, and then data scale.
+Do not dispatch a meshlet for this sidecar.
 
 ## Prior Tiny Smoke Evidence
 
@@ -78,11 +82,26 @@ epoch. The completed Qwen480 quality lane is only `2048` native-Q4 train samples
 so it is a first production-path quality signal, not sufficient paper-scale
 evidence.
 
-The next goal remains the same topology but with a larger native-Q4 KD/data
-lane: broaden beyond UltraChat-only where practical, preserve a frozen
+The next goal remains the same topology but with a more paper-faithful
+native-Q4 KD/data lane: broaden beyond UltraChat-only, preserve a frozen
 token-line-disjoint held-out gate, train from native verifier logits rather
-than BF16 full-model teachers, and judge readiness by broad held-out
-package-backed acceptance/economics before any HF meshlet.
+than BF16 full-model teachers, use a frequency-built `32k` draft vocabulary
+from the selected training conversations instead of token IDs `0..31999`, and
+judge readiness by broad held-out package-backed acceptance/economics before
+any HF meshlet.
+
+Second-opinion review agreed that the acceptance focus is correct, but warned
+that the `96 / 256` native-teacher top-1 versus `0 / 256` served acceptance
+gap is not explained by scale alone. The next evidence must separate:
+
+- `teacher_top1`: agreement with the draft-restricted native-teacher argmax;
+- `serving_target_top1`: agreement with the full-vocab greedy target when that
+  target is inside the draft vocabulary;
+- actual package-backed accepted/proposed proposals.
+
+If `serving_target_top1` looks good on fixed rows but serving still accepts
+zero, the missing piece is native Rust/Python fixture parity or live-row
+alignment, not training data.
 
 ## Success Gate
 
@@ -167,9 +186,12 @@ transport.
      fits a capped lane, with `64` to `256` held-out prompts;
    - longer target: move toward paper-scale mixed data if early scaling improves
      broad held-out acceptance;
+   - generate and pass a corpus-frequency `draft-token-ids.json` into native
+     capture so the draft vocab is not the arbitrary `0..31999` token range;
    - keep KL against captured native draft-vocab logits as the core objective;
-   - report offline top-1/top-4, package-backed accepted/proposed, saved/unsaved
-     candidate-token round trips, and realistic latency simulation.
+   - report `serving_target_top1/top4`, draft-vocab target coverage,
+     package-backed accepted/proposed, saved/unsaved candidate-token round
+     trips, and realistic latency simulation.
    - No-spend fallback dry run prepared:
      `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
      SHA256
@@ -187,6 +209,26 @@ transport.
      `--dataset`, `--dataset-split`, and optional `--dataset-config` values, so
      the next dry run can move toward the paper's mixed
      ShareGPT/UltraChat/SmolTalk data rather than staying UltraChat-only.
+
+6. Updated no-spend, paper-aligned dry run prepared:
+   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
+   SHA256
+   `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
+   It keeps the same Qwen480 S8 package/topology, `2048` train prompts with
+   `4` verify steps (`8192` native-Q4 train samples), `128` held-out prompts,
+   `ctx_size=2048`, one epoch, LR `1e-4`, KL-only native teacher training,
+   `rtx-pro-6000x4`, `4.5h`, and planned max cost `$49.49991`.
+   Data sources are balanced round-robin across:
+   `HuggingFaceH4/ultrachat_200k:train_sft`,
+   `HuggingFaceTB/smoltalk:all/train`,
+   `opencsg/smoltalk-chinese:train`, and
+   `mlabonne/WizardLM_evol_instruct_70k-ShareGPT:train`.
+   The prompt builder writes `draft-token-ids.json` from selected training
+   conversations and native capture passes it with `--draft-token-ids-file`.
+   `rg` found no `AutoModelForCausalLM`, `hf_train_eval_qwen06`,
+   `spd-live-tap-parity`, or `from_pretrained(` in the plan. Do not submit it
+   until spend is explicitly approved and the native parity/serving-target
+   checks above are acknowledged.
 
 ## Why Not Meshlet Yet
 

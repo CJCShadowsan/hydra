@@ -307,6 +307,11 @@ def score_rows(
         "hard_label_top1_rate": safe_rate(hard_label_top1, hard_label_count),
         "hard_label_topk_matches": hard_label_topk,
         "hard_label_topk_rate": safe_rate(hard_label_topk, hard_label_count),
+        "serving_target_in_draft_scope": hard_label_count,
+        "serving_target_top1_matches": hard_label_top1,
+        "serving_target_top1_rate": safe_rate(hard_label_top1, hard_label_count),
+        "serving_target_topk_matches": hard_label_topk,
+        "serving_target_topk_rate": safe_rate(hard_label_topk, hard_label_count),
     }
 
 

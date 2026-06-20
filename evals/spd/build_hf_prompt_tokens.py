@@ -49,7 +49,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heldout-prompts", type=int, default=128)
     parser.add_argument("--max-source-rows", type=int, default=0)
     parser.add_argument("--max-prompt-tokens", type=int, default=480)
+    parser.add_argument(
+        "--draft-vocab-size",
+        type=int,
+        default=0,
+        help=(
+            "If positive, write draft-token-ids.json containing the most common "
+            "token ids from selected training conversations, padded with low ids "
+            "to the requested size when needed."
+        ),
+    )
     parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument(
+        "--balance-datasets",
+        action="store_true",
+        help=(
+            "When multiple dataset specs are provided, draw train+held-out rows "
+            "round-robin across sources after filtering. This keeps small capped "
+            "runs from being dominated by one source."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--conversation-field",
@@ -111,8 +130,9 @@ def main() -> None:
             continue
         usable.append(row)
 
-    train_rows = usable[: args.train_prompts]
-    heldout_rows = usable[args.train_prompts : args.train_prompts + args.heldout_prompts]
+    selected = select_usable_rows(args, usable)
+    train_rows = selected[: args.train_prompts]
+    heldout_rows = selected[args.train_prompts : args.train_prompts + args.heldout_prompts]
     write_outputs(args, train_rows, heldout_rows, skipped, excluded)
 
 
@@ -123,6 +143,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("nothing to write: both prompt counts are zero")
     if args.max_source_rows < 0:
         raise SystemExit("--max-source-rows must be non-negative")
+    if args.draft_vocab_size < 0:
+        raise SystemExit("--draft-vocab-size must be non-negative")
     if args.user_turn_limit < 0:
         raise SystemExit("--user-turn-limit must be non-negative")
     dataset_count = len(split_csv_arg(args.dataset))
@@ -189,6 +211,7 @@ def build_rows(
         if not messages:
             continue
         tokens = render_prompt_tokens(tokenizer, messages)
+        draft_vocab_tokens = render_draft_vocab_tokens(tokenizer, obj, args.conversation_field, tokens)
         rows.append(
             {
                 "dataset": spec.name,
@@ -200,10 +223,63 @@ def build_rows(
                 "prompt": first_user_prompt(messages),
                 "messages": messages,
                 "prompt_token_ids": tokens,
+                "draft_vocab_token_ids": draft_vocab_tokens,
                 "prompt_token_count": len(tokens),
             }
         )
     return rows
+
+
+def select_usable_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    total_needed = args.train_prompts + args.heldout_prompts
+    if total_needed <= 0:
+        return []
+    if not args.balance_datasets:
+        return rows[:total_needed]
+    specs = dataset_specs(args)
+    if len(specs) <= 1:
+        return rows[:total_needed]
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {
+        dataset_source_key(
+            {
+                "dataset": spec.name,
+                "dataset_split": spec.split,
+                "dataset_config": spec.config,
+            }
+        ): []
+        for spec in specs
+    }
+    for row in rows:
+        grouped.setdefault(dataset_source_key(row), []).append(row)
+    if args.shuffle:
+        rng = random.Random(args.seed)
+        for group_rows in grouped.values():
+            rng.shuffle(group_rows)
+    selected: list[dict[str, Any]] = []
+    cursors = {key: 0 for key in grouped}
+    while len(selected) < total_needed:
+        made_progress = False
+        for key in grouped:
+            group_rows = grouped[key]
+            cursor = cursors[key]
+            if cursor >= len(group_rows):
+                continue
+            selected.append(group_rows[cursor])
+            cursors[key] = cursor + 1
+            made_progress = True
+            if len(selected) >= total_needed:
+                break
+        if not made_progress:
+            break
+    return selected
+
+
+def dataset_source_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("dataset")),
+        str(row.get("dataset_split")),
+        str(row.get("dataset_config", "")),
+    )
 
 
 def extract_user_messages(
@@ -256,9 +332,53 @@ def first_user_prompt(messages: list[dict[str, str]]) -> str:
 
 
 def render_prompt_tokens(tokenizer: Any, messages: list[dict[str, str]]) -> list[int]:
+    return render_chat_tokens(tokenizer, messages, add_generation_prompt=True)
+
+
+def render_draft_vocab_tokens(
+    tokenizer: Any,
+    obj: dict[str, Any],
+    conversation_field: str,
+    fallback: list[int],
+) -> list[int]:
+    messages = extract_all_messages(obj, conversation_field=conversation_field)
+    if not messages:
+        return fallback
+    try:
+        return render_chat_tokens(tokenizer, messages, add_generation_prompt=False)
+    except Exception:
+        return fallback
+
+
+def extract_all_messages(obj: dict[str, Any], *, conversation_field: str) -> list[dict[str, str]]:
+    raw = obj.get(conversation_field)
+    if raw is None:
+        raw = obj.get("conversations")
+    if raw is None:
+        prompt = obj.get("prompt") or obj.get("question") or obj.get("text")
+        return [{"role": "user", "content": str(prompt)}] if prompt else []
+    if not isinstance(raw, list):
+        return [{"role": "user", "content": str(raw)}] if str(raw).strip() else []
+
+    messages: list[dict[str, str]] = []
+    for item in raw:
+        role, content = message_role_and_content(item)
+        if role not in {"system", "user", "assistant"}:
+            continue
+        if content.strip():
+            messages.append({"role": role, "content": content})
+    return messages
+
+
+def render_chat_tokens(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    add_generation_prompt: bool,
+) -> list[int]:
     kwargs = {
         "tokenize": True,
-        "add_generation_prompt": True,
+        "add_generation_prompt": add_generation_prompt,
     }
     try:
         ids = tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
@@ -316,12 +436,19 @@ def write_outputs(
     heldout_tokens = args.out_dir / "heldout-prompt-token-ids.jsonl"
     train_prompts = args.out_dir / "train-prompts.jsonl"
     heldout_prompts = args.out_dir / "heldout-prompts.jsonl"
+    draft_token_ids = args.out_dir / "draft-token-ids.json"
     summary = args.out_dir / "summary.json"
 
     write_jsonl(train_tokens, [token_row(row) for row in train_rows])
     write_jsonl(heldout_tokens, [token_row(row) for row in heldout_rows])
     write_jsonl(train_prompts, [prompt_row(row) for row in train_rows])
     write_jsonl(heldout_prompts, [prompt_row(row) for row in heldout_rows])
+    draft_vocab = build_draft_token_ids(train_rows, args.draft_vocab_size)
+    if args.draft_vocab_size > 0:
+        draft_token_ids.write_text(
+            json.dumps(draft_vocab, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     summary_obj = {
         "dataset": args.dataset,
         "dataset_split": args.dataset_split,
@@ -336,6 +463,9 @@ def write_outputs(
         "model_name": args.model_name,
         "train_prompt_token_file": str(train_tokens),
         "heldout_prompt_token_file": str(heldout_tokens),
+        "draft_token_ids_file": str(draft_token_ids) if args.draft_vocab_size > 0 else None,
+        "draft_vocab_size": args.draft_vocab_size if args.draft_vocab_size > 0 else None,
+        "draft_vocab_unique_train_tokens": len(set(token for row in train_rows for token in row["draft_vocab_token_ids"])),
         "train_prompt_count": len(train_rows),
         "heldout_prompt_count": len(heldout_rows),
         "skipped_prompt_count": len(skipped),
@@ -343,6 +473,7 @@ def write_outputs(
         "max_prompt_tokens": args.max_prompt_tokens,
         "max_source_rows": args.max_source_rows,
         "shuffle": bool(args.shuffle),
+        "balance_datasets": bool(args.balance_datasets),
         "seed": args.seed,
         "conversation_field": args.conversation_field,
         "user_turn_limit": args.user_turn_limit,
@@ -351,6 +482,8 @@ def write_outputs(
         "heldout_token_stats": token_stats(heldout_rows),
         "skipped_token_stats": token_stats(skipped),
         "excluded_token_stats": token_stats(excluded),
+        "train_source_counts": source_counts(train_rows),
+        "heldout_source_counts": source_counts(heldout_rows),
     }
     summary.write_text(json.dumps(summary_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(summary_obj, indent=2, ensure_ascii=False))
@@ -400,6 +533,35 @@ def token_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "max": counts[-1],
         "mean": sum(counts) / len(counts),
     }
+
+
+def source_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = "/".join(dataset_source_key(row))
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def build_draft_token_ids(rows: list[dict[str, Any]], draft_vocab_size: int) -> list[int]:
+    if draft_vocab_size <= 0:
+        return []
+    counts: dict[int, int] = {}
+    for row in rows:
+        for token in row["draft_vocab_token_ids"]:
+            token = int(token)
+            counts[token] = counts.get(token, 0) + 1
+    ordered = [
+        token for token, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    seen = set(ordered)
+    filler = 0
+    while len(ordered) < draft_vocab_size:
+        if filler not in seen:
+            ordered.append(filler)
+            seen.add(filler)
+        filler += 1
+    return ordered[:draft_vocab_size]
 
 
 if __name__ == "__main__":

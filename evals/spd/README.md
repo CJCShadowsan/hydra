@@ -550,38 +550,58 @@ paper-scale sidecar-quality run. If package smoke does not clear the
 saved-versus-unsaved gate, the next spend should scale native Q4/S8 KD data and
 recipe quality rather than repeat mechanics.
 
-The acceptance-rate work is now the primary research loop. Mechanics have
-reached the broad package-backed proposal path for Qwen480 S8, so another
-meshlet or smoke-existing retry would only re-measure a known quality failure.
-The next capped lane should keep the same logical topology and native
-package-first capture, but raise the number and diversity of training rows,
-keep held-out token lines frozen and disjoint, and optimize for broad
-package-backed accepted/proposed plus saved-versus-unsaved candidate-token
-round trips. A narrow held-out subset can remain a debug smoke, but readiness
-for an HF meshlet needs a broad held-out package-backed gate with margin.
+The acceptance-rate work is now the primary research loop, but the next spend
+should not blindly buy more rows. The current broad lane has an unexplained
+quality gap: offline held-out scoring had native-teacher top-1 `96 / 256` and
+hard-label/serving-target top-1 `94 / 224`, while package-backed serving
+accepted `0 / 256`. That means the next evidence has to separate three things:
+draft-restricted teacher agreement, full-vocab greedy target agreement when
+the target is inside the draft vocabulary, and actual package-backed serving
+acceptance. `score_product_activation_head_only.py` now reports
+`serving_target_*` aliases for the hard-label metrics, and
+`prepare_native_product_teacher_logits.py` now reports
+`full_vocab_target_in_draft_scope` aliases for draft-vocab target coverage.
 
-Prepared no-spend fallback for the next quality lane:
-`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
-SHA256 `5d59c3b025e457d979437171044823b9a92b4220a99678baac800292918a2816`.
+Mechanics have reached the broad package-backed proposal path for Qwen480 S8,
+so another meshlet or smoke-existing retry would only re-measure a known
+quality failure. The next capped lane should keep the same logical topology and
+native package-first capture, but before spending it should either add native
+Rust/Python fixture parity for fixed native rows or explicitly acknowledge that
+this parity gap remains. If fixed-row Python scoring predicts the serving
+target but Rust serving still rejects every proposal, the issue is row/forward
+alignment, not data scale.
+
+Prepared no-spend paper-aligned dry run for the next quality lane:
+`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
+SHA256 `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
 It keeps the same Qwen480 S8 package/topology but raises training to `2048`
-train prompts with `4` verify steps (`8192` native-Q4 samples) and `128`
-held-out prompts. It also moves closer to the paper recipe: one epoch, LR
-`1e-4`, KL-only (`hard_label_weight=0`), raw native-Q4 tap rows, native
-draft-vocab teacher logits, `physical-node-count=4`, capture map
+train prompts with `4` verify steps (`8192` native-Q4 samples), `128` held-out
+prompts, and `ctx_size=2048`. It moves closer to the paper recipe: one epoch,
+LR `1e-4`, KL-only (`hard_label_weight=0`), raw native-Q4 tap rows, native
+teacher logits, balanced mixed data, `physical-node-count=4`, capture map
 `CUDA0,CUDA0,CUDA1,CUDA1,CUDA2,CUDA2,CUDA3,CUDA3`, package-smoke map
 `CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`, `rtx-pro-6000x4`, timeout `4.5h`,
-and max cost `$49.49991`. It is not submitted. The generated plan still avoids
-the old full-reference path strings: no `AutoModelForCausalLM`, no
-`hf_train_eval_qwen06`, no `spd-live-tap-parity`, and no `from_pretrained(`.
-The prompt-token builder and planner now accept comma-separated `--dataset`,
-`--dataset-split`, and optional `--dataset-config` values, so the next dry run
-can move toward the paper's mixed ShareGPT/UltraChat/SmolTalk/SmolTalk-Chinese
-distribution instead of staying UltraChat-only. Exact dataset IDs and configs
-should still be verified before spend; the UltraChat-only 8k plan remains the
-known-good no-spend baseline.
+and max cost `$49.49991`. It is not submitted.
 
-Pass criteria: train/held-out prompt-token shards have zero overlap, native
-teacher argmax matches the quant verifier target on in-scope rows, serving
+The mixed prompt sources in that dry run are
+`HuggingFaceH4/ultrachat_200k:train_sft`,
+`HuggingFaceTB/smoltalk:all/train`,
+`opencsg/smoltalk-chinese:train`, and
+`mlabonne/WizardLM_evol_instruct_70k-ShareGPT:train`, selected round-robin
+after filtering so the capped run is not dominated by one dataset. The prompt
+builder now writes `draft-token-ids.json` from selected training conversations,
+and native capture passes it with `--draft-token-ids-file`; this replaces the
+old default draft vocab of token IDs `0..31999`, which is not paper-aligned and
+can make draft-restricted offline top-1 look better than served acceptance.
+The generated plan still avoids the old full-reference path strings: no
+`AutoModelForCausalLM`, no `hf_train_eval_qwen06`, no `spd-live-tap-parity`,
+and no `from_pretrained(`. The previous UltraChat-only 8k dry run remains a
+known-good fallback, but the mixed balanced plan is the better next candidate.
+
+Pass criteria: train/held-out prompt-token shards have zero overlap,
+`full_vocab_target_in_draft_scope` is reported, native teacher argmax matches
+the quant verifier target on in-scope rows, `serving_target_top1/top4` is
+reported separately from draft-restricted teacher top-1/top-4, serving
 artifacts export if training reaches export, package-backed rolling smoke
 matches baseline content with zero tap failures, broad held-out saved
 candidate-token round trips exceed unsaved round trips with margin, and latency

@@ -198,6 +198,8 @@ def build_tensors(
         "paper_kl_training_ready": True,
         "labels_in_logit_scope": labels_in_scope,
         "labels_missing_from_logit_scope": len(native_rows) - labels_in_scope,
+        "full_vocab_target_in_draft_scope": labels_in_scope,
+        "full_vocab_target_missing_from_draft_scope": len(native_rows) - labels_in_scope,
         "tensor_shapes": {name: list(tensor.shape) for name, tensor in tensors.items()},
     }
     return tensors, summary
