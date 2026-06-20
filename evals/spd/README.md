@@ -547,6 +547,25 @@ saved-versus-unsaved candidate-token round trips. A narrow held-out subset can
 remain a debug smoke, but readiness for an HF meshlet needs a broad held-out
 package-backed gate with margin.
 
+Prepared no-spend fallback if the active package smoke fails the
+acceptance/economics gate cleanly:
+`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
+SHA256 `981d7a95c314b14a7544250e6a6167a7fe42d64689fa4c08df4e98dfe453b646`.
+It keeps the same Qwen480 S8 package/topology but raises training to `2048`
+train prompts with `4` verify steps (`8192` native-Q4 samples) and `128`
+held-out prompts. It also moves closer to the paper recipe: one epoch, LR
+`1e-4`, KL-only (`hard_label_weight=0`), raw native-Q4 tap rows, native
+draft-vocab teacher logits, `physical-node-count=4`, capture map
+`CUDA0,CUDA0,CUDA1,CUDA1,CUDA2,CUDA2,CUDA3,CUDA3`, package-smoke map
+`CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`, `rtx-pro-6000x4`, timeout `4.5h`,
+and max cost `$49.49991`. It is not submitted. The generated plan still avoids
+the old full-reference path strings: no `AutoModelForCausalLM`, no
+`hf_train_eval_qwen06`, no `spd-live-tap-parity`, and no `from_pretrained(`.
+Remaining paper gap after that dry run: the prompt source is still UltraChat
+only; the paper used a mixed ShareGPT/UltraChat/SmolTalk/SmolTalk-Chinese
+distribution, so broader data support is the next likely quality lever if
+UltraChat-only scaling improves but still misses the broad package-backed gate.
+
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
 artifacts export if training reaches export, package-backed rolling smoke

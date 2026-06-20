@@ -137,6 +137,20 @@ transport.
    - keep KL against captured native draft-vocab logits as the core objective;
    - report offline top-1/top-4, package-backed accepted/proposed, saved/unsaved
      candidate-token round trips, and realistic latency simulation.
+   - No-spend fallback dry run prepared:
+     `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-paperlike-plan.json`,
+     SHA256
+     `981d7a95c314b14a7544250e6a6167a7fe42d64689fa4c08df4e98dfe453b646`.
+     It uses the same Qwen480 S8 package/topology, `2048` train prompts with
+     `4` verify steps (`8192` native-Q4 train samples), `128` held-out prompts,
+     `physical-node-count=4`, capture map
+     `CUDA0,CUDA0,CUDA1,CUDA1,CUDA2,CUDA2,CUDA3,CUDA3`, package-smoke map
+     `CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`, one epoch, LR `1e-4`,
+     KL-only (`hard_label_weight=0`), `rtx-pro-6000x4`, `4.5h`, and planned
+     max cost `$49.49991`. `rg` found no `AutoModelForCausalLM`,
+     `hf_train_eval_qwen06`, `spd-live-tap-parity`, or `from_pretrained(` in
+     the plan. Do not submit it until the active job outcome is known and spend
+     is explicitly approved.
 
 ## Why Not Meshlet Yet
 
