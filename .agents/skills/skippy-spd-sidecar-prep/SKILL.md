@@ -889,25 +889,37 @@ range for Qwen480 quality work. The plan now also exports
 `spd-product-parity-fixture.safetensors` and runs
 `skippy-bench spd-fixture-parity` before package smoke.
 
-That mixed 8k lane was submitted as HF Job
+That mixed 8k lane was first submitted as HF Job
 `meshllm/6a35f141953ed90bfb945409`, created 2026-06-20 01:47:45 UTC, label
-`spd-qwen480-quality-8k`, run `20260620T014653Z-724af833`. The first
-post-submit status check showed `SCHEDULING` with no runtime logs yet. Inputs:
-`job-inputs/20260620T014653Z-724af833/` in
+`spd-qwen480-quality-8k`, run `20260620T014653Z-724af833`. It completed
+bootstrap, pinned checkout, patch apply, CUDA/Rust release build, full Qwen480
+package download, and entered prompt building. It was canceled intentionally
+because `build_hf_prompt_tokens.py` had no source-row cap and was tokenizing
+all rows from million-row source datasets before selecting the requested prompt
+counts. This was not a capture, training, parity, or request-path failure.
+Estimated running cost at cancellation was about `$6.64`.
+
+The bounded replacement is HF Job `meshllm/6a35fb70953ed90bfb94547c`, created
+2026-06-20 02:31:12 UTC, label `spd-qwen480-quality-8k-bounded`, run
+`20260620T023047Z-594c0d00`. Inputs:
+`job-inputs/20260620T023047Z-594c0d00/` in
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`, uploaded at Hub
-commit `a297f50747afa0c15e5840b8e88d7410a1346fb7`. The submitted plan is
-pinned to base `f87e69bf9daf88a0b48040c32fd0a06fffea4029` before applying
-patch head `2fa9668e0bd4b560b65c92b0ce2bacb0d98d5c44`. Patch SHA256:
-`55d002d14f77aab050edc0d13da3a08a84c8df5055ae3c0c860b5a50fb6c6704`.
-Bootstrap SHA256:
-`39a62b2dfed65b3885d5e716b9e4b2316542e8ce0f42b671a13db73800e7b9ae`.
+commit `8d5cd9141a88ac12b300b26c55a2dd5a2680aeba`. The bounded plan is
+`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-plan.json`,
+SHA256 `91d09809c79ddd0db0a126c659cc2de124cbdeaa21f8fa26e0495b95071fa426`;
+it keeps the same Qwen480 S8 topology and 8k native-Q4 sample target, adds
+`--max-source-rows 12000`, reduces timeout to `3.9h`, and caps planned cost at
+`$42.899922`. With the canceled run, the combined envelope stays under the
+original `$50` intent. The replacement plan is pinned to base
+`f87e69bf9daf88a0b48040c32fd0a06fffea4029` before applying patch head
+`d4c12243db1fab71b38716979a4ba2d04563130d`. Patch SHA256:
+`d20f6eb5235a4f549356417459f541b284cab990740d3bfb070514f24d9dde02`.
 Submitted pinned-plan SHA256:
-`bb7ab5c3816857df9bd97fd2ecc7ccc5e616bd70c4f904d03dbb9acd876e3b32`.
-The uploaded script, plan, and patch were token-fetch verified before submit,
-and the patch was checked locally with `git apply --check` against the pinned
-base. Next checks are bootstrap fetch, pinned checkout, patch apply, CUDA
-build, native capture, product parity fixture export, `spd-fixture-parity`,
-then package-backed acceptance/economics.
+`c5692cc64cf753ae8091a89cefd95ec8879c89fe059ba9f79a9e6f7d30e8e5b7`.
+Logs show `Job started at 2026-06-20 02:33:01`; next checks are bootstrap
+fetch, pinned checkout, patch apply, CUDA build, bounded prompt build, native
+capture, product parity fixture export, `spd-fixture-parity`, then
+package-backed acceptance/economics.
 
 ## Local Proof Flow
 

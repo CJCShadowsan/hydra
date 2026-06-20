@@ -597,26 +597,38 @@ teacher logits, balanced mixed data, `physical-node-count=4`, capture map
 `CPU,CUDA0,CPU,CUDA1,CPU,CUDA2,CPU,CUDA3`, `rtx-pro-6000x4`, timeout `4.5h`,
 and max cost `$49.49991`.
 
-This mixed 8k lane was submitted after the spend-capped goal resumed as HF Job
-`meshllm/6a35f141953ed90bfb945409` on 2026-06-20 01:47:45 UTC. The job label
-is `spd-qwen480-quality-8k`, run `20260620T014653Z-724af833`, and the first
-post-submit status check showed `SCHEDULING` with no runtime logs yet. The
-input bundle is
-`job-inputs/20260620T014653Z-724af833/` in
+The first mixed 8k submission was HF Job
+`meshllm/6a35f141953ed90bfb945409`, created 2026-06-20 01:47:45 UTC, label
+`spd-qwen480-quality-8k`, run `20260620T014653Z-724af833`. It completed
+bootstrap, pinned checkout, patch apply, CUDA/Rust release build, and full
+Qwen480 package download, then entered `build_prompts[0]`. It was canceled
+intentionally because the prompt builder had no source-row cap and was
+tokenizing all rows from million-row source datasets before selecting the
+requested prompts. This was not a capture, training, parity, or request-path
+failure. Estimated running cost at cancellation was about `$6.64`.
+
+The bounded replacement is HF Job `meshllm/6a35fb70953ed90bfb94547c`, created
+2026-06-20 02:31:12 UTC, label `spd-qwen480-quality-8k-bounded`, run
+`20260620T023047Z-594c0d00`. The input bundle is
+`job-inputs/20260620T023047Z-594c0d00/` in
 `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8`, uploaded at Hub
-commit `a297f50747afa0c15e5840b8e88d7410a1346fb7`; local copy:
-`/tmp/spd-qwen480-native-job-20260620T014653Z-724af833`. Because the branch is
-ahead of origin, the submitted plan is pinned to base
-`f87e69bf9daf88a0b48040c32fd0a06fffea4029` before applying patch head
-`2fa9668e0bd4b560b65c92b0ce2bacb0d98d5c44`. Patch SHA256:
-`55d002d14f77aab050edc0d13da3a08a84c8df5055ae3c0c860b5a50fb6c6704`.
-Bootstrap SHA256:
-`39a62b2dfed65b3885d5e716b9e4b2316542e8ce0f42b671a13db73800e7b9ae`.
-Submitted pinned-plan SHA256:
-`bb7ab5c3816857df9bd97fd2ecc7ccc5e616bd70c4f904d03dbb9acd876e3b32`.
-The uploaded script, plan, and patch were token-fetch verified before submit,
-and the patch was locally checked with `git apply --check` against the pinned
-base.
+commit `8d5cd9141a88ac12b300b26c55a2dd5a2680aeba`; local copy:
+`/tmp/spd-qwen480-native-job-20260620T023047Z-594c0d00`. The replacement plan
+is
+`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-plan.json`,
+SHA256 `91d09809c79ddd0db0a126c659cc2de124cbdeaa21f8fa26e0495b95071fa426`.
+It keeps the same Qwen480 S8 package/topology and 8k native-Q4 sample target,
+adds `--max-source-rows 12000`, reduces timeout to `3.9h`, and caps planned
+cost at `$42.899922`. With the canceled run's estimated cost, the combined
+spend envelope stays under the original `$50` intent. Patch base/head are
+`f87e69bf9daf88a0b48040c32fd0a06fffea4029` and
+`d4c12243db1fab71b38716979a4ba2d04563130d`; patch SHA256
+`d20f6eb5235a4f549356417459f541b284cab990740d3bfb070514f24d9dde02`;
+submitted pinned-plan SHA256
+`c5692cc64cf753ae8091a89cefd95ec8879c89fe059ba9f79a9e6f7d30e8e5b7`.
+Logs show `Job started at 2026-06-20 02:33:01`; next checks are bootstrap
+fetch, pinned checkout, patch apply, CUDA build, bounded prompt build, native
+capture, product fixture parity, and package-backed acceptance/economics.
 
 The mixed prompt sources in that dry run are
 `HuggingFaceH4/ultrachat_200k:train_sft`,
@@ -624,7 +636,7 @@ The mixed prompt sources in that dry run are
 `opencsg/smoltalk-chinese:train`, and
 `mlabonne/WizardLM_evol_instruct_70k-ShareGPT:train`, selected round-robin
 after filtering so the capped run is not dominated by one dataset. The prompt
-builder now writes `draft-token-ids.json` from selected training conversations,
+builder writes `draft-token-ids.json` from selected training conversations,
 and native capture passes it with `--draft-token-ids-file`; this replaces the
 old default draft vocab of token IDs `0..31999`, which is not paper-aligned and
 can make draft-restricted offline top-1 look better than served acceptance.

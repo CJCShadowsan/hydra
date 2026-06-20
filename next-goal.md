@@ -11,21 +11,30 @@ real candidate-token round-trip savings under the same logical topology.
 
 ## Current Checkpoint
 
-- Active HF Job: `meshllm/6a35f141953ed90bfb945409`, submitted
-  2026-06-20 01:47:45 UTC, status last checked as `SCHEDULING`.
-  It is the mixed-data 8k native-Q4 quality lane on `rtx-pro-6000x4`,
-  timeout `4.5h`, planned max cost `$49.49991`.
+- Active HF Job: `meshllm/6a35fb70953ed90bfb94547c`, created
+  2026-06-20 02:31:12 UTC. Logs show `Job started at 2026-06-20 02:33:01`;
+  the metadata endpoint was still catching up on the last check. It is the
+  bounded mixed-data 8k native-Q4 quality lane on `rtx-pro-6000x4`, timeout
+  `3.9h`, planned max cost `$42.899922`.
 - Active job input bundle:
-  `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8/job-inputs/20260620T014653Z-724af833/`,
-  uploaded at Hub commit `a297f50747afa0c15e5840b8e88d7410a1346fb7`.
+  `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8/job-inputs/20260620T023047Z-594c0d00/`,
+  uploaded at Hub commit `8d5cd9141a88ac12b300b26c55a2dd5a2680aeba`.
 - Patch base/head: base `f87e69bf9daf88a0b48040c32fd0a06fffea4029`,
-  head `2fa9668e0bd4b560b65c92b0ce2bacb0d98d5c44`.
+  head `d4c12243db1fab71b38716979a4ba2d04563130d`.
   Patch SHA256:
-  `55d002d14f77aab050edc0d13da3a08a84c8df5055ae3c0c860b5a50fb6c6704`.
+  `d20f6eb5235a4f549356417459f541b284cab990740d3bfb070514f24d9dde02`.
 - Submitted pinned plan SHA256:
-  `bb7ab5c3816857df9bd97fd2ecc7ccc5e616bd70c4f904d03dbb9acd876e3b32`.
-  It is the same Qwen480 S8 plan as the local no-spend dry run, with setup
-  pinned to the exact patch base before applying the uploaded patch.
+  `c5692cc64cf753ae8091a89cefd95ec8879c89fe059ba9f79a9e6f7d30e8e5b7`.
+  The plan is the paper-aligned Qwen480 S8 mixed-data run plus
+  `--max-source-rows 12000`, so prompt preparation cannot burn the GPU cap by
+  tokenizing every row in million-row source datasets before selecting prompts.
+- Canceled HF Job: `meshllm/6a35f141953ed90bfb945409`, submitted
+  2026-06-20 01:47:45 UTC. It completed bootstrap, pinned checkout, patch
+  apply, CUDA/Rust release build, and full Qwen480 package download, then
+  entered prompt-token building. It was canceled intentionally because
+  `build_hf_prompt_tokens.py` was reading/tokenizing all source rows before
+  selection. Estimated running cost at cancellation was about `$6.64`; together
+  with the replacement cap, the lane stays within the original `$50` intent.
 - Latest completed HF Job: `meshllm/6a35cdc03093dba73ce2a9ad`.
 - Artifact repo/path:
   `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8/runs/native-package-fresh`.
@@ -158,21 +167,19 @@ transport.
      not yet been run on Qwen480 artifacts because the previous local download
      retained only final JSONs and the serving bundle, not held-out corpus and
      teacher tensors.
-3. The next spend-bearing candidate has been submitted as HF Job
-   `meshllm/6a35f141953ed90bfb945409` after the spend-capped goal was resumed.
-   The original no-spend plan remains:
-   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
+3. The next spend-bearing candidate is running as bounded HF Job
+   `meshllm/6a35fb70953ed90bfb94547c`. The replacement dry-run plan is:
+   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-plan.json`,
    SHA256
-   `24e9d55378acc68f82f098dab0c954d23b68c0acda0e6bfdd4e804dfbd5ecc0c`.
+   `91d09809c79ddd0db0a126c659cc2de124cbdeaa21f8fa26e0495b95071fa426`.
    It keeps the same Qwen480 S8 package/topology, uses `8192` native-Q4 train
    samples and `128` held-out prompts, builds a corpus-frequency `32k` draft
    vocabulary from selected training conversations, trains KL-only against
-   captured native verifier logits, and keeps the planned cap at `$49.49991`
-   on `rtx-pro-6000x4`. The submitted plan is a pinned copy with SHA256
-   `bb7ab5c3816857df9bd97fd2ecc7ccc5e616bd70c4f904d03dbb9acd876e3b32`.
-   First checks when it starts: bootstrap script fetch, checkout of patch base
-   `f87e69bf9daf88a0b48040c32fd0a06fffea4029`, patch apply, CUDA build,
-   package capture, `export_product_parity_fixture.py`,
+   captured native verifier logits, caps source-row preprocessing at `12000`
+   rows per dataset, and caps planned cost at `$42.899922` on
+   `rtx-pro-6000x4`. First checks after start: bootstrap script fetch,
+   checkout of patch base `f87e69bf9daf88a0b48040c32fd0a06fffea4029`, patch
+   apply, CUDA build, package capture, `export_product_parity_fixture.py`,
    `skippy-bench spd-fixture-parity`, then package-backed smoke.
 4. If the 8k run has clean mechanics and low but nonzero acceptance, scale the
    same recipe to `16k`, then `64k`, and only then toward the paper's mixed-data
@@ -297,7 +304,8 @@ transport.
    until spend is explicitly approved and the native parity/serving-target
    checks above are acknowledged.
 
-7. Mixed-data 8k lane submitted after the spend-capped goal resumed:
+7. Mixed-data 8k lane submitted after the spend-capped goal resumed, then
+   canceled for prompt-preprocessing cost control:
    HF Job `meshllm/6a35f141953ed90bfb945409`, created
    2026-06-20 01:47:45 UTC, label `spd-qwen480-quality-8k`, run
    `20260620T014653Z-724af833`.
@@ -314,8 +322,33 @@ transport.
    `bb7ab5c3816857df9bd97fd2ecc7ccc5e616bd70c4f904d03dbb9acd876e3b32`.
    The input bundle was token-fetch verified before submit, and the patch was
    checked locally with `git apply --check` against the exact pinned base
-   `f87e69bf9daf88a0b48040c32fd0a06fffea4029`. First status check after submit
-   showed `SCHEDULING`; no runtime logs had appeared yet.
+   `f87e69bf9daf88a0b48040c32fd0a06fffea4029`. It later completed bootstrap,
+   pinned checkout, patch apply, CUDA/Rust release build, full package
+   download, and entered `build_prompts[0]`. It was canceled because that
+   prompt-builder invocation had no source-row cap and was tokenizing millions
+   of source rows before selecting `2048` train prompts and `128` held-out
+   prompts. This was not a capture, training, parity, or smoke failure.
+
+8. Bounded replacement submitted:
+   HF Job `meshllm/6a35fb70953ed90bfb94547c`, created
+   2026-06-20 02:31:12 UTC, label `spd-qwen480-quality-8k-bounded`, run
+   `20260620T023047Z-594c0d00`.
+   Input bundle:
+   `job-inputs/20260620T023047Z-594c0d00/`, upload commit
+   `8d5cd9141a88ac12b300b26c55a2dd5a2680aeba`.
+   Local bundle:
+   `/tmp/spd-qwen480-native-job-20260620T023047Z-594c0d00`.
+   Replacement plan:
+   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-plan.json`,
+   SHA256
+   `91d09809c79ddd0db0a126c659cc2de124cbdeaa21f8fa26e0495b95071fa426`.
+   It keeps the same Qwen480 S8 package/topology and 8k native-Q4 sample
+   target, adds `--max-source-rows 12000`, reduces timeout to `3.9h`, and caps
+   planned cost at `$42.899922`. With the canceled run's estimated `$6.64`
+   running cost, this stays under the original `$50` intent. Logs show
+   `Job started at 2026-06-20 02:33:01`; next checks are bootstrap fetch,
+   pinned checkout, patch apply, CUDA build, bounded prompt build, native
+   capture, product fixture parity, and package-backed acceptance/economics.
 
 ## Why Not Meshlet Yet
 
