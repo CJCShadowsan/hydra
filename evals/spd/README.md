@@ -714,18 +714,20 @@ passed for the focused tap-input tests, `cargo check -p skippy-runtime`,
 bootstrap `bash -n`, `git diff --check`, and patch-apply from
 `origin/codex/skippy-spd-proof`. The capped diagnostic retry was submitted as
 HF Job `meshllm/6a3611dd953ed90bfb945575`, created
-2026-06-20 04:06:53 UTC, label `spd-qwen480-quality-8k-diagnostic`. It uses
-`rtx-pro-6000x4`, timeout `3.9h`, and max planned cost `$42.899922`; it was
-last observed `RUNNING` at 2026-06-20 04:50 UTC. It has passed setup/release
-build, downloaded the full `69`-file / `276G` Qwen480 package, and entered
-`build_prompts[0]` for the mixed dataset plan. No capture, fixed-row parity,
-package-smoke, or acceptance result has appeared yet. Do not submit a duplicate
-while this job is active.
+2026-06-20 04:06:53 UTC, label `spd-qwen480-quality-8k-diagnostic`. It used
+`rtx-pro-6000x4`, timeout `3.9h`, and max planned cost `$42.899922`. It passed
+setup/release build, downloaded the full `69`-file / `276G` Qwen480 package,
+built the mixed prompt set, captured native Q4 rows/logits, converted train and
+held-out rows, trained and scored the head-only sidecar, exported the serving
+bundle, exported the product parity fixture, and exported the serving fixture.
+It ended `ERROR` at `rust_fixture_parity[0]` before package-backed smoke, so no
+accepted/proposed serving result exists for this 8k head yet.
 
-Update at 2026-06-20 04:56 UTC: `hf jobs inspect` still reports the diagnostic
-job as `RUNNING`. Bounded `hf jobs logs --tail` calls are not returning useful
-checkpoint lines, but `hf jobs stats` shows real resource use rather than an
-idle job: about `309.8GB / 1.0TB` host memory and roughly `69GB` allocated on
+Runtime observation at 2026-06-20 04:56 UTC: `hf jobs inspect` still reported
+the diagnostic job as `RUNNING`. Bounded `hf jobs logs --tail` calls were not
+returning useful checkpoint lines, but `hf jobs stats` showed real resource use
+rather than an idle job: about `309.8GB / 1.0TB` host memory and roughly
+`69GB` allocated on
 each of the four RTX PRO 6000 GPUs, with live GPU utilization. The plan was
 reconfirmed as the intended native-package-fresh path: `input_mode=raw`,
 `base_model_load=skipped_autoconfig_only`, mixed paper-like data sources,
@@ -746,6 +748,24 @@ the active `HF_TOKEN` returned buffered events. The run reached
 2026-06-20 05:03:07 UTC during native capture. No conversion, head-only train,
 score, fixed-row parity, package-backed smoke, or acceptance result has
 appeared yet.
+
+Update at 2026-06-20 05:19 UTC: the diagnostic run reached
+`rust_fixture_parity[0]` and failed with a useful cause. It reproduced the 8k
+offline signal: `8192` train samples, `final_argmax_acc=0.25`, held-out
+`512` samples, `serving_target_top1=167 / 493`,
+`serving_target_top4=247 / 493`, `teacher_top1=168 / 512`, and
+`teacher_top4=249 / 512`. The exported BF16 serving head was
+`8,723,214,136` bytes with SHA256
+`918109c63849a7f199072da34663efa1ac3673933ac034f836937de04378eacd`, and the
+product parity fixture exported successfully. The Rust failure was:
+`SPD head draft_token_ids must be sorted and unique`. That sorted requirement
+is wrong for the new corpus-frequency draft vocab because the head logits are
+ordered by the draft-token list used during training. The local fix changes
+`skippy-runtime` manifest validation to require non-empty, unique,
+length-matched, in-vocab `draft_token_ids` without requiring sort order. Local
+checks passed: `cargo test -p skippy-runtime draft_token_ids`,
+`cargo check -p skippy-runtime`, `cargo clippy -p skippy-runtime --all-targets
+-- -D warnings`, and `git diff --check`.
 
 The mixed prompt sources in that dry run are
 `HuggingFaceH4/ultrachat_200k:train_sft`,

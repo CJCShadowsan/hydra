@@ -478,7 +478,7 @@ impl SpdHeadTopology {
                     self.draft_vocab_size
                 );
             }
-            validate_sorted_unique_indices("draft_token_ids", ids)?;
+            validate_unique_indices("draft_token_ids", ids)?;
             if ids.iter().any(|id| *id >= self.vocab_size) {
                 bail!(
                     "SPD head draft_token_ids must all be less than vocab_size {}",
@@ -543,6 +543,17 @@ fn validate_sorted_unique_indices(label: &str, values: &[u32]) -> Result<()> {
     }
     if values.windows(2).any(|pair| pair[0] >= pair[1]) {
         bail!("SPD head {label} must be sorted and unique");
+    }
+    Ok(())
+}
+
+fn validate_unique_indices(label: &str, values: &[u32]) -> Result<()> {
+    if values.is_empty() {
+        bail!("SPD head {label} must not be empty");
+    }
+    let unique_count = values.iter().copied().collect::<BTreeSet<_>>().len();
+    if unique_count != values.len() {
+        bail!("SPD head {label} must be unique");
     }
     Ok(())
 }
@@ -736,6 +747,24 @@ mod tests {
         manifest.topology.draft_token_ids = Some(vec![1, 3]);
         let error = manifest.validate().unwrap_err().to_string();
         assert!(error.contains("draft_token_ids length"));
+    }
+
+    #[test]
+    fn accepts_frequency_ordered_draft_token_ids() {
+        let mut manifest = valid_manifest();
+        manifest.topology.draft_token_ids = Some(vec![5, 1, 3]);
+
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_draft_token_ids() {
+        let mut manifest = valid_manifest();
+        manifest.topology.draft_token_ids = Some(vec![5, 1, 5]);
+
+        let error = manifest.validate().unwrap_err().to_string();
+
+        assert!(error.contains("draft_token_ids must be unique"));
     }
 
     #[test]

@@ -39,18 +39,19 @@ real candidate-token round-trip savings under the same logical topology.
   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-plan.json`,
   SHA256
   `91d09809c79ddd0db0a126c659cc2de124cbdeaa21f8fa26e0495b95071fa426`.
-- Current diagnostic retry has been submitted and is the active job to monitor:
+- Current diagnostic retry completed with a new actionable parity blocker:
   HF Job `meshllm/6a3611dd953ed90bfb945575`, created
   2026-06-20 04:06:53 UTC, label
-  `spd-qwen480-quality-8k-diagnostic`. It was last observed `RUNNING` at
-  2026-06-20 04:56 UTC. It has passed setup/release build, downloaded the full
-  `69`-file / `276G` Qwen480 package, and entered the mixed-data plan. The HF
-  log endpoint currently returns no useful tail lines, but `hf jobs stats`
-  showed real work rather than idle time: about `309.8GB / 1.0TB` host memory
-  and roughly `69GB` allocated on each of four RTX PRO 6000 GPUs, with live GPU
-  utilization. No fixed-row parity, package-smoke, or acceptance result has
-  appeared yet. Do not submit a duplicate while this job is active. The
-  refreshed dry-run plan is
+  `spd-qwen480-quality-8k-diagnostic`. It ended `ERROR` at
+  `rust_fixture_parity[0]` around 2026-06-20 05:19 UTC after setup/release
+  build, full package download, bounded mixed prompt build, native capture,
+  conversion, head-only train/score, serving export, product parity fixture
+  export, and serving fixture export. It still did not reach package-backed
+  smoke, so there is no served acceptance result for the 8k head. The exposed
+  cause was not a reconstruction diff: Rust rejected the intentionally
+  frequency-ordered draft vocabulary with
+  `SPD head draft_token_ids must be sorted and unique`. The refreshed dry-run
+  plan is
   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-bounded-diagnostic-plan.json`,
   SHA256
   `44a92e8c759af9304f790a72bb02f196443b0ab1ebe112dc0b6589ca8f0db244`.
@@ -70,6 +71,15 @@ real candidate-token round-trip savings under the same logical topology.
   `/tmp/submit-spd-qwen480-8k-diagnostic.py`. Its dry run prints
   `rtx-pro-6000x4`, timeout `3.9h`, and max planned cost `$42.899922`; it was
   submitted with `--confirm` after the spend-capped goal resumed.
+- Local fix after the diagnostic: `crates/skippy-runtime/src/spd.rs` now
+  validates `draft_token_ids` as non-empty, length-matched, unique, and within
+  `vocab_size`, but does not require sorting. This preserves the trained
+  draft-index order from the corpus-frequency `32k` draft vocab instead of
+  corrupting the head by sorting IDs after training. Local gates passed:
+  `cargo test -p skippy-runtime draft_token_ids`,
+  `cargo check -p skippy-runtime`,
+  `cargo clippy -p skippy-runtime --all-targets -- -D warnings`, and
+  `git diff --check`.
 - Bounded 8k quality signal: `8192` native-Q4 train samples, `512` held-out
   samples, `7979 / 8192` train labels in draft-vocab scope, and
   `493 / 512` held-out labels in scope. Final train hard-label accuracy was
@@ -251,6 +261,23 @@ acceptance. `hf jobs stats` continued to show the job running with about
 `305`-`314GB / 1.0TB` host memory and live GPU memory/use cycling through the
 capture phase. Do not submit a duplicate while this job is active.
 
+Diagnostic result at 2026-06-20 05:19 UTC: HF Job
+`meshllm/6a3611dd953ed90bfb945575` ended `ERROR` at
+`rust_fixture_parity[0]`. The run completed capture/conversion/train/score and
+reproduced the 8k offline signal: `8192` train samples,
+`final_argmax_acc=0.25`, held-out `512` samples,
+`serving_target_top1=167 / 493`, `serving_target_top4=247 / 493`,
+`teacher_top1=168 / 512`, and `teacher_top4=249 / 512`. It exported an
+`8,723,214,136` byte BF16 serving head with SHA256
+`918109c63849a7f199072da34663efa1ac3673933ac034f836937de04378eacd` and a
+product parity fixture, then failed before smoke because Rust manifest
+validation required sorted `draft_token_ids`. That requirement is wrong for
+the paper-aligned corpus-frequency draft vocab: draft-index order must remain
+the order used during training. The local Rust fix now allows unsorted unique
+draft token IDs. The artifact repo still serves the older `2048`-sample JSONs
+under `runs/native-package-fresh`; this failed diagnostic did not publish a new
+package-backed smoke result.
+
 ## Success Gate
 
 This goal is done only when a capped HF quality lane produces a larger trained
@@ -309,11 +336,12 @@ transport.
    the new row/projection context to fix alignment. If parity passes and
    package smoke still accepts `0`, run the overfit-to-serving-prompts control
    before buying `16k`, `64k`, or paper-scale data.
-   The input bundle has been uploaded and the capped retry has been submitted
-   as HF Job `meshllm/6a3611dd953ed90bfb945575`. Next action is to monitor
-   bootstrap, pinned-plan download, patch apply, capture/train/score,
-   fixed-row parity, and package-backed smoke; do not submit another retry
-   unless this one exits or is intentionally canceled.
+   The input bundle was uploaded and the capped retry ran as HF Job
+   `meshllm/6a3611dd953ed90bfb945575`; it failed at the sorted-draft-vocab
+   validator described above. Next action is to submit a capped retry carrying
+   the Rust manifest-validation fix, then monitor fixed-row parity and
+   package-backed smoke. Do not scale data or dispatch a meshlet until that
+   retry reaches served accepted/proposed and saved/unsaved round-trip counts.
 5. If the 8k run has clean mechanics and low but nonzero acceptance, scale the
    same recipe to `16k`, then `64k`, and only then toward the paper's mixed-data
    scale. If the 8k run reaches smoke and still has `0` served acceptance, first

@@ -100,22 +100,23 @@ acceptance measurement; if served acceptance is still zero, run the prepared
 overfit-to-serving-prompts existence proof to separate data scale from
 row/projection/live-tap alignment.
 
-The capped Qwen480 S8 diagnostic retry is live as HF Job
+The capped Qwen480 S8 diagnostic retry ran as HF Job
 `meshllm/6a3611dd953ed90bfb945575`, created 2026-06-20 04:06:53 UTC, label
 `spd-qwen480-quality-8k-diagnostic`, on `rtx-pro-6000x4` with a `3.9h` timeout
-and max planned cost `$42.899922`. It reuses the uploaded pinned mixed-data
+and max planned cost `$42.899922`. It reused the uploaded pinned mixed-data
 plan and diagnostic patch from
-`job-inputs/20260620T040137Z-diagnostic/`. As of 2026-06-20 04:50 UTC it has
-passed setup/release build, downloaded the full `69`-file / `276G` Qwen480
-package, and entered `build_prompts[0]`; no capture, fixed-row parity,
-package-smoke, or acceptance result has appeared yet. Do not dispatch a
-duplicate while that job is active.
+`job-inputs/20260620T040137Z-diagnostic/`. The job passed setup/release build,
+downloaded the full `69`-file / `276G` Qwen480 package, built the mixed prompt
+set, captured native Q4 rows/logits, converted train and held-out rows, trained
+and scored the head-only sidecar, exported the serving bundle, exported the
+product parity fixture, and exported the serving fixture. It then failed before
+package smoke at `rust_fixture_parity[0]`.
 
-Update at 2026-06-20 04:56 UTC: the job remains `RUNNING`. HF log tails are
-not currently yielding checkpoint lines, but `hf jobs stats` shows the run is
+Runtime observation at 2026-06-20 04:56 UTC: the job was still `RUNNING`. HF log tails
+were not yielding checkpoint lines, but `hf jobs stats` showed the run was
 using about `309.8GB / 1.0TB` host memory and roughly `69GB` on each of four
-RTX PRO 6000 GPUs with live utilization. Treat this as active model/package
-work and continue to wait for the diagnostic result. Do not scale to
+RTX PRO 6000 GPUs with live utilization. That confirmed active model/package
+work rather than an idle job. Do not scale to
 `16k`/`64k` until fixed-row parity either passes or exposes the alignment fault;
 if parity passes and served acceptance is still zero, run the prepared
 overfit-to-serving-prompts control before buying more data.
@@ -126,6 +127,23 @@ reached `capture[0]` at 2026-06-20 04:29:01 UTC. Prompt building completed with
 `draft_vocab_unique_train_tokens=45576`. The last observed raw event was still
 inside native capture; there is still no conversion, training, fixed-row
 parity, package-smoke, or acceptance result.
+
+Update at 2026-06-20 05:19 UTC: the diagnostic ended `ERROR` at
+`rust_fixture_parity[0]`. It reproduced the 8k offline signal:
+`8192` train samples with `final_argmax_acc=0.25`, held-out `512` samples,
+`serving_target_top1=167 / 493`, `serving_target_top4=247 / 493`,
+`teacher_top1=168 / 512`, and `teacher_top4=249 / 512`. The exported BF16
+serving head was `8,723,214,136` bytes with SHA256
+`918109c63849a7f199072da34663efa1ac3673933ac034f836937de04378eacd`. The
+actual parity failure was not a `cur_in` reconstruction diff; Rust rejected the
+new corpus-frequency draft vocabulary with
+`SPD head draft_token_ids must be sorted and unique`. That sorted requirement
+is wrong for this lane because the sidecar logits are indexed by the
+frequency-order `draft_token_ids` used during training. The local Rust fix now
+validates `draft_token_ids` as non-empty, unique, length-matched, and in-vocab
+without sorting. Local gates passed for `cargo test -p skippy-runtime
+draft_token_ids`, `cargo check -p skippy-runtime`, `cargo clippy -p
+skippy-runtime --all-targets -- -D warnings`, and `git diff --check`.
 
 The local memory-residency fix keeps verifier semantics unchanged:
 `spd-product-corpus-capture --stream-live-tap-stages` still uses the full native
