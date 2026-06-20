@@ -175,9 +175,17 @@ or multi-node Mesh:
    accepted length, top-k target coverage, and theoretical saved decoder steps.
 2. Export `spd-head.safetensors` and a parity fixture, then run Rust fixture
    parity to prove Python and Rust proposals match on fixed hidden-tap rows.
-3. Run local live-tap parity with localhost stages for the logical split to
+3. For native-package-fresh/product-row lanes, run a live-row alignment gate
+   before package smoke. Product parity fixtures must carry the selected
+   product row's real `prompt_input_ids`; then
+   `skippy-bench spd-live-tap-parity --skip-target-verification` can replay
+   that context through live taps, with explicit `--stage-backend-devices` /
+   `--stream-live-tap-stages` when needed, and compare reconstructed `cur_in`
+   against the saved product row without loading the full verifier alongside
+   tap stages.
+4. Run local live-tap parity with localhost stages for the logical split to
    prove Skippy returns every manifest-required tap.
-4. Run local package-backed baseline versus SPD smoke and require nonzero
+5. Run local package-backed baseline versus SPD smoke and require nonzero
    accepted proposals plus nonzero saved candidate token round trips before
    moving to real nodes.
 

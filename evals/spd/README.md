@@ -44,8 +44,9 @@ raw rows and native teacher logits while loading AutoConfig only, not the full
 base model. `export_product_serving_fixture.py` emits the serving-only fixture
 needed by the Rust request path for row metadata and final norm. The
 `native-package-fresh` planner path now generates only these native-package
-commands; it does not call `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, or
-the old full-base product trainer/scorer.
+commands; it does not call `hf_train_eval_qwen06.py` or the old full-base
+product trainer/scorer. It may call `spd-live-tap-parity` only in
+`--skip-target-verification` mode as a Qwen480-safe live-row alignment gate.
 
 Important remaining gap: the native fresh lane now has a product-row parity
 fixture exporter and planner gate, but the Qwen480 artifacts produced before
@@ -56,6 +57,21 @@ lane writes `spd-product-parity-fixture.safetensors` and
 have not exposed a Qwen3-Coder-480B MoE/AutoConfig compatibility blocker; the
 immediate unproven gate is fixed-row parity followed by package-backed
 acceptance.
+
+Update at 2026-06-20 05:40 UTC: fixed-row parity is necessary but not enough
+for the Qwen480 zero-acceptance failure mode. The next native-package-fresh
+retry should also run a live-row alignment gate before package smoke. Product
+corpus conversion now preserves context-token tensors, product parity fixtures
+write the selected row's real context into `prompt_input_ids`, and
+`skippy-bench spd-live-tap-parity` can run `--skip-target-verification` with
+per-stage backend placement. This lets Qwen480 replay the selected fixture
+context through live taps and compare reconstructed `cur_in` without loading
+the full verifier alongside resident tap stages. Dry-run plan:
+`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-live-row-gate-plan.json`.
+The already-running retry `meshllm/6a36251f3093dba73ce2ab39` does not include
+that new live-row gate. As of 2026-06-20 05:42 UTC it was in `setup[23]`
+downloading the Qwen480 package snapshot, with no capture/train/parity/smoke
+result yet.
 
 HF Jobs rates checked on 2026-06-19 put `rtx-pro-6000x4` at about `$11/hr`,
 `h200x2` at about `$10/hr`, `h200x4` at about `$20/hr`, and
@@ -73,8 +89,10 @@ Dry-run checkpoint on 2026-06-19:
 `plan_hf_spd_qualification.py --qualification-mode native-package-fresh` with
 `--vocab-size 151936`, `rtx-pro-6000x4`, and `4.5h` resolves the package as
 `62` layers / width `6144`, plans max cost `$49.49991`, and emits no
-`AutoModelForCausalLM`, no `hf_train_eval_qwen06.py`, no `spd-live-tap-parity`,
-and no warm-start dependency in the generated native command graph. The setup
+`AutoModelForCausalLM`, no `hf_train_eval_qwen06.py`, and no warm-start
+dependency in the generated native command graph. Older dry runs also emitted
+no `spd-live-tap-parity`; current dry runs add it only as a row-only live-tap
+alignment gate with target verification skipped. The setup
 commands install Rust/`just`/build prerequisites, detect the CUDA architecture,
 build the CUDA stage ABI with `just build-runtime`, and build
 `target/release/skippy-bench` plus `target/release/skippy-server`. After job

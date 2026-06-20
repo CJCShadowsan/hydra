@@ -281,6 +281,7 @@ def build_fixture_tensors(
     label_draft_index = int(product_tensors["label_draft_indices"][0].item())
     target_token = int(product_tensors["target_token_ids"][0].item())
     predicted_token = int(token_ids[0].item())
+    prompt_input_ids = product_prompt_input_ids(product_tensors, torch)
     teacher_logits = teacher_tensors["teacher_logits"].to(device=device, dtype=torch.float32)
     teacher_argmax = int(teacher_logits[0].argmax().item())
     teacher_argmax_token = int(draft_token_tensor[teacher_argmax].item())
@@ -289,7 +290,7 @@ def build_fixture_tensors(
         "cur_in": cur_in.detach().cpu().float().contiguous(),
         "final_norm_weight": final_norm_weight.detach().cpu().float().contiguous(),
         "position_ids": position_ids[0].detach().cpu().long().contiguous(),
-        "prompt_input_ids": torch.zeros((1, 1), dtype=torch.long),
+        "prompt_input_ids": prompt_input_ids,
         "row_i_stages": product_tensors["row_i_stages"].detach().cpu().long().contiguous(),
         "row_positions": product_tensors["row_positions"][0].detach().cpu().long().contiguous(),
         "python_logits": logits.detach().cpu().float().contiguous(),
@@ -315,6 +316,8 @@ def build_fixture_tensors(
         "top_token_ids": [int(value) for value in token_ids.detach().cpu().tolist()],
         "top_draft_indices": [int(value) for value in draft_indices.detach().cpu().tolist()],
         "target_token": target_token,
+        "prompt_token_count": int(prompt_input_ids.shape[1]),
+        "prompt_tokens_available": "context_token_ids" in product_tensors,
         "target_in_draft_scope": label_draft_index >= 0,
         "target_draft_index": label_draft_index if label_draft_index >= 0 else None,
         "predicted_token": predicted_token,
@@ -324,6 +327,22 @@ def build_fixture_tensors(
         "predicted_teacher_match": int(draft_indices[0].item()) == teacher_argmax,
     }
     return tensors, summary
+
+
+def product_prompt_input_ids(product_tensors: dict[str, Any], torch: Any) -> Any:
+    if "context_token_ids" not in product_tensors:
+        return torch.zeros((1, 1), dtype=torch.long)
+    padded = product_tensors["context_token_ids"][0].detach().cpu().long()
+    if "context_token_lengths" in product_tensors:
+        length = int(product_tensors["context_token_lengths"][0].item())
+    else:
+        length = int((padded >= 0).sum().item())
+    if length <= 0:
+        raise ValueError("selected product row has no context tokens")
+    tokens = padded[:length]
+    if bool((tokens < 0).any()):
+        raise ValueError("selected product row context tokens contain negative padding")
+    return tokens.reshape(1, length).contiguous()
 
 
 def forward_with_trace(

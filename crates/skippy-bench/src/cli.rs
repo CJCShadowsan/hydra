@@ -130,6 +130,14 @@ pub struct SpdLiveTapParityArgs {
     pub n_gpu_layers: i32,
     #[arg(long)]
     pub selected_backend_device: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub stage_backend_devices: Vec<String>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Open live-tap stage models one at a time during live-tap parity to reduce peak VRAM."
+    )]
+    pub stream_live_tap_stages: bool,
     #[arg(long, default_value_t = 8)]
     pub top_k: usize,
     #[arg(long, default_value_t = 1)]
@@ -156,6 +164,12 @@ pub struct SpdLiveTapParityArgs {
         help = "When --product-corpus-dir is set, also write native product-verifier logits over the SPD draft vocabulary for paper-faithful Q4 supervision."
     )]
     pub product_native_teacher_logits: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Only compare fixture rows against live tap reconstruction; skip full-target verified generation."
+    )]
+    pub skip_target_verification: bool,
 }
 
 #[derive(Parser)]
@@ -925,10 +939,14 @@ mod tests {
             "32",
             "--selected-backend-device",
             "CPU0",
+            "--stage-backend-devices",
+            "CPU,CUDA0,CPU,CUDA1",
+            "--stream-live-tap-stages",
             "--prompt-token-file",
             "/tmp/spd-prompt-tokens.jsonl",
             "--product-corpus-dir",
             "/tmp/spd-product-corpus",
+            "--skip-target-verification",
         ])
         .unwrap();
 
@@ -945,6 +963,8 @@ mod tests {
         assert_eq!(args.splits, vec![8, 10, 16, 20, 24, 31]);
         assert_eq!(args.layer_end, 32);
         assert_eq!(args.selected_backend_device.as_deref(), Some("CPU0"));
+        assert_eq!(args.stage_backend_devices, ["CPU", "CUDA0", "CPU", "CUDA1"]);
+        assert!(args.stream_live_tap_stages);
         assert_eq!(
             args.prompt_token_file,
             Some(PathBuf::from("/tmp/spd-prompt-tokens.jsonl"))
@@ -956,6 +976,7 @@ mod tests {
         assert_eq!(args.verify_steps, 1);
         assert_eq!(args.cur_in_tol, 0.05);
         assert_eq!(args.logits_tol, 0.25);
+        assert!(args.skip_target_verification);
     }
 
     #[test]

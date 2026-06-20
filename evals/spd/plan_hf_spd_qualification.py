@@ -761,6 +761,12 @@ def build_plan(
             "must_match_content": True,
             "tap_failures_must_equal": 0,
             "rust_fixture_parity": rust_fixture_parity_gate(args.qualification_mode),
+            "live_row_alignment": (
+                "native-package-fresh must replay the product parity fixture context through "
+                "live taps and keep reconstructed cur_in/logits within tolerance before smoke"
+                if args.qualification_mode == "native-package-fresh"
+                else "covered by spd-live-tap-parity when product rows are exported"
+            ),
             "broad_heldout_saved_round_trips": "must exceed unsaved round trips with margin",
             "latency_simulation": (
                 "run simulate_latency.py on the generated OpenAI smoke report using "
@@ -1184,6 +1190,19 @@ def build_native_package_fresh_commands(
         f"--top-k {args.draft_top_k} "
         f"--output {artifact_dir}/product-fixture-parity.json"
     )
+    live_row_parity = (
+        "target/release/skippy-bench spd-live-tap-parity "
+        f"--manifest {artifact_dir}/skippy-spd-head.json "
+        f"--fixture {artifact_dir}/spd-product-parity-fixture.safetensors "
+        f"--model-path {package_dir} "
+        f"--splits {split_arg} --layer-end {layer_end} "
+        f"--ctx-size {args.ctx_size} --n-gpu-layers=-1 "
+        + stage_backend_arg
+        + stream_tap_arg
+        + f"--top-k {args.draft_top_k} --verify-steps 1 "
+        "--skip-target-verification "
+        f"--output {artifact_dir}/product-live-row-parity.json"
+    )
     smoke = (
         "target/release/skippy-bench spd-openai-smoke "
         "--stage-server-bin target/release/skippy-server "
@@ -1223,6 +1242,7 @@ def build_native_package_fresh_commands(
         "score": [score],
         "export_serving_bundle": export,
         "rust_fixture_parity": [rust_fixture_parity],
+        "live_row_parity": [live_row_parity],
         "upload_pre_smoke": [upload],
         "package_smoke": [smoke],
         "latency_simulation": [latency],

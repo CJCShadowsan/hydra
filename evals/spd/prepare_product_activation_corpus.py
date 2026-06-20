@@ -255,6 +255,14 @@ def build_tensors(
     proposal_draft_indices = []
     proposal_logits = []
     proposal_mask = []
+    context_tokens_available = all("context_tokens" in row for row in rows)
+    max_context_length = (
+        max(len(row["context_tokens"]) for row in rows)
+        if context_tokens_available
+        else 0
+    )
+    context_token_ids = []
+    context_token_lengths = []
     for sample_index, row in enumerate(rows):
         assert_sample_index(row, sample_index)
         positions = [int(value) for value in row["position_ids"]]
@@ -293,6 +301,10 @@ def build_tensors(
         proposal_draft_indices.append(pad_ints(draft_indices, max_top_k, -1))
         proposal_logits.append(pad_floats(logits, max_top_k, 0.0))
         proposal_mask.append(pad_ints([1] * len(token_ids), max_top_k, 0))
+        if context_tokens_available:
+            tokens = [int(value) for value in row["context_tokens"]]
+            context_token_ids.append(pad_ints(tokens, max_context_length, -1))
+            context_token_lengths.append(len(tokens))
     missing_labels = sum(1 for value in label_draft_indices if value < 0)
     if require_labels_in_draft_vocab and missing_labels:
         raise ValueError(f"{missing_labels} target labels are missing from draft_token_ids")
@@ -330,6 +342,13 @@ def build_tensors(
         "proposal_topk_logits": torch.tensor(proposal_logits, dtype=torch.float32),
         "proposal_topk_mask": torch.tensor(proposal_mask, dtype=torch.long),
     }
+    if context_tokens_available:
+        tensors.update(
+            {
+                "context_token_ids": torch.tensor(context_token_ids, dtype=torch.long),
+                "context_token_lengths": torch.tensor(context_token_lengths, dtype=torch.long),
+            }
+        )
     if raw_tap_concat is not None:
         if len(raw_tap_widths) != row_count:
             raise ValueError(
@@ -353,6 +372,8 @@ def build_tensors(
         "labels_missing_from_draft_vocab": missing_labels,
         "accepted_count": sum(accepted),
         "acceptance_rate": sum(accepted) / len(rows),
+        "context_tokens_available": context_tokens_available,
+        "max_context_length": max_context_length if context_tokens_available else None,
         "target_logits_available": False,
         "paper_kl_training_ready": False,
         "tensor_shapes": {name: list(tensor.shape) for name, tensor in tensors.items()},

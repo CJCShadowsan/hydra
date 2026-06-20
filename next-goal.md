@@ -11,9 +11,18 @@ real candidate-token round-trip savings under the same logical topology.
 
 ## Current Checkpoint
 
-- Active HF Job to monitor: `meshllm/6a3611dd953ed90bfb945575`, created
-  2026-06-20 04:06:53 UTC, label `spd-qwen480-quality-8k-diagnostic`,
-  `rtx-pro-6000x4`, timeout `3.9h`, max planned cost `$42.899922`.
+- Active HF Job to monitor: `meshllm/6a36251f3093dba73ce2ab39`, created
+  2026-06-20 05:29:03 UTC, label
+  `spd-qwen480-quality-8k-draft-vocab-fix`, `rtx-pro-6000x4`, timeout
+  `3.9h`, max planned cost `$42.899922`. It carries the Rust fix that allows
+  frequency-ordered unique `draft_token_ids`. Raw SSE logs at
+  2026-06-20 05:31:51 UTC showed it in the CUDA release-build phase; no
+  capture, train, parity, package-smoke, or acceptance result had appeared yet.
+  `hf jobs logs --tail 120` at 2026-06-20 05:38 UTC still showed Rust release
+  compilation, so the job had not reached capture/train/parity/smoke.
+  A later tail at 2026-06-20 05:42 UTC showed it had reached `setup[23]` and
+  was downloading the 69-file Qwen480 layer package snapshot; still no
+  capture/train/parity/smoke or acceptance result.
 - Latest HF Job: `meshllm/6a35fb70953ed90bfb94547c`, created
   2026-06-20 02:31:12 UTC, label `spd-qwen480-quality-8k-bounded`, run
   `20260620T023047Z-594c0d00`. It ended `ERROR` after about `3975s` on
@@ -316,10 +325,11 @@ transport.
      and actual served accepted/proposed separately;
    - if fixed-row Python predicts the served target but Rust rejects all rows,
      fix row alignment/forward parity before buying more training data.
-   - This gate is necessary but not sufficient: if it passes and package smoke
-     still accepts zero, add a live-row reconstruction check that compares
-     request-time tap-projected `cur_in` against the saved native corpus row for
-     the same context.
+   - This gate is necessary but not sufficient: before package smoke, run a
+     live-row reconstruction check that replays the selected product fixture
+     context through live taps and compares request-time tap-projected `cur_in`
+     against the saved native corpus row for the same context. This catches the
+     projection/live-row mismatch that fixed-row parity alone can miss.
    - Implemented for the next HF lane: `export_product_parity_fixture.py`
      writes `spd-product-parity-fixture.safetensors`, and
      `plan_hf_spd_qualification.py --qualification-mode native-package-fresh`
@@ -333,15 +343,24 @@ transport.
    conversations, trains KL-only against captured native verifier logits, caps
    source-row preprocessing at `12000` rows per dataset, and caps planned cost
    at `$42.899922` on `rtx-pro-6000x4`. If fixed-row parity fails again, use
-   the new row/projection context to fix alignment. If parity passes and
-   package smoke still accepts `0`, run the overfit-to-serving-prompts control
-   before buying `16k`, `64k`, or paper-scale data.
+   the new row/projection context to fix alignment. If parity passes and the
+   live-row gate passes but package smoke still accepts `0`, run the
+   overfit-to-serving-prompts control before buying `16k`, `64k`, or
+   paper-scale data.
    The input bundle was uploaded and the capped retry ran as HF Job
    `meshllm/6a3611dd953ed90bfb945575`; it failed at the sorted-draft-vocab
    validator described above. Next action is to submit a capped retry carrying
    the Rust manifest-validation fix, then monitor fixed-row parity and
    package-backed smoke. Do not scale data or dispatch a meshlet until that
    retry reaches served accepted/proposed and saved/unsaved round-trip counts.
+   Local follow-up after second-opinion review: product corpus conversion now
+   preserves `context_token_ids`/`context_token_lengths`,
+   `export_product_parity_fixture.py` writes real product-row context tokens
+   into `prompt_input_ids`, and `skippy-bench spd-live-tap-parity` has
+   `--skip-target-verification`, `--stage-backend-devices`, and
+   `--stream-live-tap-stages` so Qwen480 can run a live-row alignment gate
+   without loading the full verifier alongside tap stages. Dry-run plan:
+   `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-live-row-gate-plan.json`.
 5. If the 8k run has clean mechanics and low but nonzero acceptance, scale the
    same recipe to `16k`, then `64k`, and only then toward the paper's mixed-data
    scale. If the 8k run reaches smoke and still has `0` served acceptance, first

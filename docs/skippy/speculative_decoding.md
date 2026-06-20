@@ -77,8 +77,10 @@ For Qwen3-Coder-480B S8, the planner resolves the exact
 `meshllm/Qwen3-Coder-480B-A35B-Instruct-UD-Q4_K_XL-layers` package as `62`
 layers / width `6144`, uses vocab size `151936`, emits S8 taps
 `[0,8,16,24,32,40,48,55,62]`, and keeps the native command graph away from
-`AutoModelForCausalLM`, `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, and
-warm-start/full-reference artifacts. Current status as of 2026-06-20: the
+`AutoModelForCausalLM`, `hf_train_eval_qwen06.py`, and
+warm-start/full-reference artifacts. The graph may now include
+`spd-live-tap-parity --skip-target-verification` only as a live-row alignment
+gate before smoke. Current status as of 2026-06-20: the
 Qwen480 native-package path has captured rows, trained heads, exported serving
 artifacts, run package-backed smoke, and produced latency-simulation output.
 The request path is mechanically alive, but the first broad `2048`-sample
@@ -96,9 +98,11 @@ simulated pipeline occupancy over the `n+1` depth-block layout. Our Qwen480
 lanes are only `2048` and `8192` native-Q4 samples, so they are useful
 production-path quality signals but not paper-scale evidence. Before buying
 more rows, fix the parity diagnostic so the improved 8k head can reach served
-acceptance measurement; if served acceptance is still zero, run the prepared
-overfit-to-serving-prompts existence proof to separate data scale from
-row/projection/live-tap alignment.
+acceptance measurement, then run a live-row alignment gate before package
+smoke. If served acceptance is still zero after fixed-row parity and live-row
+alignment pass, run the prepared overfit-to-serving-prompts existence proof to
+separate data scale from row/projection/live-tap alignment and underfit recipe
+failure.
 
 The capped Qwen480 S8 diagnostic retry ran as HF Job
 `meshllm/6a3611dd953ed90bfb945575`, created 2026-06-20 04:06:53 UTC, label
@@ -144,6 +148,24 @@ validates `draft_token_ids` as non-empty, unique, length-matched, and in-vocab
 without sorting. Local gates passed for `cargo test -p skippy-runtime
 draft_token_ids`, `cargo check -p skippy-runtime`, `cargo clippy -p
 skippy-runtime --all-targets -- -D warnings`, and `git diff --check`.
+
+Update at 2026-06-20 05:40 UTC: second-opinion review agreed that data scale is
+likely eventually important, but not before row alignment is proven. Fixed-row
+fixture parity only proves Rust and Python agree on saved rows; it does not
+prove request-time live taps reconstruct the same rows. The local harness now
+prepares the next retry to close that gap: product corpus conversion preserves
+`context_token_ids`/`context_token_lengths`, product parity fixtures write the
+real selected context tokens into `prompt_input_ids`, and
+`skippy-bench spd-live-tap-parity` has a Qwen480-safe
+`--skip-target-verification` mode plus per-stage backend placement controls.
+The regenerated dry-run plan
+`/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-live-row-gate-plan.json`
+adds `live_row_parity` between `rust_fixture_parity` and package smoke while
+keeping the same `rtx-pro-6000x4`, `3.9h`, `$42.899922` cap. The already
+running HF job `meshllm/6a36251f3093dba73ce2ab39` does not include this new
+gate; `hf jobs logs --tail 120` at 2026-06-20 05:38 UTC still showed release
+compilation, and by 2026-06-20 05:42 UTC it had reached `setup[23]` package
+download. No capture/train/parity/smoke result had appeared yet.
 
 The local memory-residency fix keeps verifier semantics unchanged:
 `spd-product-corpus-capture --stream-live-tap-stages` still uses the full native

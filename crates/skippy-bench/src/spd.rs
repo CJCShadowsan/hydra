@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde_json::json;
+use serde_json::{Value, json};
 use skippy_runtime::{
     ActivationFrame, GGML_TYPE_F16, RuntimeConfig, RuntimeLoadMode, StageModel,
     package::{PackageStageRequest, inspect_layer_package, select_layer_package_parts},
@@ -140,6 +140,12 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
     if args.product_native_teacher_logits && args.product_corpus_dir.is_none() {
         bail!("--product-native-teacher-logits requires --product-corpus-dir");
     }
+    if args.skip_target_verification && args.product_corpus_dir.is_some() {
+        bail!("--skip-target-verification cannot write --product-corpus-dir rows");
+    }
+    if args.skip_target_verification && args.product_native_teacher_logits {
+        bail!("--skip-target-verification cannot write native teacher logits");
+    }
 
     let hidden_size =
         usize::try_from(manifest.topology.hidden_size).context("SPD hidden_size exceeds usize")?;
@@ -207,8 +213,8 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
                 ctx_size: args.ctx_size,
                 n_gpu_layers: args.n_gpu_layers,
                 selected_backend_device: &args.selected_backend_device,
-                stage_backend_devices: &[],
-                stream_live_tap_stages: false,
+                stage_backend_devices: &args.stage_backend_devices,
+                stream_live_tap_stages: args.stream_live_tap_stages,
                 top_k: args.top_k,
                 verify_steps: args.verify_steps,
                 prompt_token_file: args.prompt_token_file.as_deref(),
@@ -237,48 +243,76 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
         )?),
         _ => None,
     };
-    let target_model = open_full_target_model(&args)?;
-    let mut verified_generations = Vec::with_capacity(verified_prompt_tokens.len());
-    for (prompt_index, prompt_tokens) in verified_prompt_tokens.iter().enumerate() {
-        verified_generations.push(
-            run_verified_generation(
-                &args,
-                &live_runner,
-                &spd_head,
-                &tap_projector,
-                VerifiedGenerationInputs {
-                    prompt_index,
-                    prompt_tokens,
-                    target_model: &target_model,
-                    row_i_stages: &row_i_stages,
-                    row_hf_indices: &row_hf_indices,
-                    final_norm_weight: &final_norm_weight,
-                    row_count,
-                    hidden_size,
-                },
-                product_corpus.as_mut(),
-                native_teacher.as_mut(),
-            )
-            .with_context(|| {
-                format!("run live SPD target verification for prompt_index={prompt_index}")
-            })?,
-        );
-    }
-    let product_corpus_report = product_corpus
-        .as_mut()
-        .map(ProductActivationCorpusWriter::finish)
-        .transpose()?;
-    let native_teacher_report = native_teacher
-        .as_mut()
-        .map(NativeTeacherLogitsWriter::finish)
-        .transpose()?;
-    let first_verified_generation = verified_generations
-        .first()
-        .context("no verified-generation prompt sets were provided")?;
-    let target_verification = first_verified_generation
-        .first_step
-        .clone()
-        .context("verified SPD generation produced no steps")?;
+    let (
+        target_verification,
+        first_verified_generation_report,
+        verified_generation_reports,
+        product_corpus_report,
+        native_teacher_report,
+    ) = if args.skip_target_verification {
+        (
+            Value::Null,
+            Value::Null,
+            Vec::new(),
+            Option::<Value>::None,
+            Option::<Value>::None,
+        )
+    } else {
+        let target_model = open_full_target_model(&args)?;
+        let mut verified_generations = Vec::with_capacity(verified_prompt_tokens.len());
+        for (prompt_index, prompt_tokens) in verified_prompt_tokens.iter().enumerate() {
+            verified_generations.push(
+                run_verified_generation(
+                    &args,
+                    &live_runner,
+                    &spd_head,
+                    &tap_projector,
+                    VerifiedGenerationInputs {
+                        prompt_index,
+                        prompt_tokens,
+                        target_model: &target_model,
+                        row_i_stages: &row_i_stages,
+                        row_hf_indices: &row_hf_indices,
+                        final_norm_weight: &final_norm_weight,
+                        row_count,
+                        hidden_size,
+                    },
+                    product_corpus.as_mut(),
+                    native_teacher.as_mut(),
+                )
+                .with_context(|| {
+                    format!("run live SPD target verification for prompt_index={prompt_index}")
+                })?,
+            );
+        }
+        let product_corpus_report = product_corpus
+            .as_mut()
+            .map(ProductActivationCorpusWriter::finish)
+            .transpose()?;
+        let native_teacher_report = native_teacher
+            .as_mut()
+            .map(NativeTeacherLogitsWriter::finish)
+            .transpose()?;
+        let first_verified_generation = verified_generations
+            .first()
+            .context("no verified-generation prompt sets were provided")?;
+        let target_verification = first_verified_generation
+            .first_step
+            .clone()
+            .context("verified SPD generation produced no steps")?;
+        let first_verified_generation_report = first_verified_generation.report.clone();
+        let verified_generation_reports = verified_generations
+            .iter()
+            .map(|generation| generation.report.clone())
+            .collect::<Vec<_>>();
+        (
+            target_verification,
+            first_verified_generation_report,
+            verified_generation_reports,
+            product_corpus_report,
+            native_teacher_report,
+        )
+    };
     let report = json!({
         "mode": "spd-live-tap-parity",
         "manifest": args.manifest,
@@ -286,6 +320,9 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
         "model_path": args.model_path,
         "splits": args.splits,
         "layer_end": args.layer_end,
+        "stage_backend_devices": args.stage_backend_devices,
+        "stream_live_tap_stages": args.stream_live_tap_stages,
+        "skip_target_verification": args.skip_target_verification,
         "prompt_token_count": prompt_tokens.len(),
         "verified_prompt_count": verified_prompt_tokens.len(),
         "prompt_token_file": &args.prompt_token_file,
@@ -329,11 +366,8 @@ pub fn spd_live_tap_parity(args: SpdLiveTapParityArgs) -> Result<()> {
             }
         },
         "target_verification": target_verification,
-        "verified_generation": first_verified_generation.report,
-        "verified_generations": verified_generations
-            .iter()
-            .map(|generation| generation.report.clone())
-            .collect::<Vec<_>>(),
+        "verified_generation": first_verified_generation_report,
+        "verified_generations": verified_generation_reports,
         "product_activation_corpus": product_corpus_report,
         "native_teacher_logits": native_teacher_report,
     });
@@ -1881,8 +1915,8 @@ fn open_live_tap_runner_with_source(
         ctx_size: args.ctx_size,
         n_gpu_layers: args.n_gpu_layers,
         selected_backend_device: args.selected_backend_device.clone(),
-        stage_backend_devices: Vec::new(),
-        stream_stages: false,
+        stage_backend_devices: args.stage_backend_devices.clone(),
+        stream_stages: args.stream_live_tap_stages,
     })
     .context("open live SPD tap runner")
 }
