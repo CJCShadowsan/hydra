@@ -12,10 +12,13 @@ real candidate-token round-trip savings under the same logical topology.
 ## Current Checkpoint
 
 - Active HF Job: `meshllm/6a35fb70953ed90bfb94547c`, created
-  2026-06-20 02:31:12 UTC. Logs show `Job started at 2026-06-20 02:33:01`;
-  the metadata endpoint was still catching up on the last check. It is the
-  bounded mixed-data 8k native-Q4 quality lane on `rtx-pro-6000x4`, timeout
-  `3.9h`, planned max cost `$42.899922`.
+  2026-06-20 02:31:12 UTC. It is the bounded mixed-data 8k native-Q4 quality
+  lane on `rtx-pro-6000x4`, timeout `3.9h`, planned max cost `$42.899922`.
+  Latest observed status at 2026-06-20 02:53:44 UTC: `RUNNING`,
+  `runningSecs=1084`, estimated running cost about `$3.31`.
+  It has passed bootstrap, pinned checkout, patch apply, CUDA/Rust release
+  build, full 69-file Qwen480 package download, and bounded prompt build, and
+  is now in native CUDA capture logs.
 - Active job input bundle:
   `meshllm/skippy-spd-qwen3-coder-480b-a35b-ud-q4-k-xl-s8/job-inputs/20260620T023047Z-594c0d00/`,
   uploaded at Hub commit `8d5cd9141a88ac12b300b26c55a2dd5a2680aeba`.
@@ -354,10 +357,13 @@ transport.
    It keeps the same Qwen480 S8 package/topology and 8k native-Q4 sample
    target, adds `--max-source-rows 12000`, reduces timeout to `3.9h`, and caps
    planned cost at `$42.899922`. With the canceled run's estimated `$6.64`
-   running cost, this stays under the original `$50` intent. Logs show
-   `Job started at 2026-06-20 02:33:01`; next checks are bootstrap fetch,
-   pinned checkout, patch apply, CUDA build, bounded prompt build, native
-   capture, product fixture parity, and package-backed acceptance/economics.
+   running cost, this stays under the original `$50` intent. Observed gate:
+   bootstrap, patch apply, CUDA/Rust release build, full package download
+   (`69 / 69` files in about `3.5min`), and bounded prompt build all passed.
+   At 2026-06-20 02:53:44 UTC the job was running native CUDA capture logs.
+   Next checks are train/held-out capture completion, conversion, head-only
+   train/score, product fixture parity, and package-backed
+   acceptance/economics.
 
 ## Why Not Meshlet Yet
 

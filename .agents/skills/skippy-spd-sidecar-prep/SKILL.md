@@ -920,6 +920,15 @@ Logs show `Job started at 2026-06-20 02:33:01`; next checks are bootstrap
 fetch, pinned checkout, patch apply, CUDA build, bounded prompt build, native
 capture, product parity fixture export, `spd-fixture-parity`, then
 package-backed acceptance/economics.
+Observed update at 2026-06-20 02:53:44 UTC: the bounded replacement was still
+`RUNNING`, `runningSecs=1084`, estimated running cost about `$3.31`. It passed
+bootstrap, pinned checkout, patch apply, CUDA/Rust release build, full Qwen480
+package download (`69 / 69` files in about `3.5min`), and bounded prompt build,
+then entered native CUDA capture logs. This proves the `--max-source-rows
+12000` retry got past the prompt-preprocessing point where the unbounded job
+was canceled. Next checks are train/held-out capture completion, conversion,
+head-only train/score, product parity fixture export, `spd-fixture-parity`, and
+package-backed acceptance/economics.
 If this bounded 8k lane still serves `0` accepted proposals, do not jump
 directly to `16k`/`64k`/paper-scale data. First run a tiny deliberately overfit
 Qwen480 S8 head on the exact package-backed serving prompts. Nonzero served

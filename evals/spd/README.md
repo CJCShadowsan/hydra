@@ -637,6 +637,15 @@ submitted pinned-plan SHA256
 Logs show `Job started at 2026-06-20 02:33:01`; next checks are bootstrap
 fetch, pinned checkout, patch apply, CUDA build, bounded prompt build, native
 capture, product fixture parity, and package-backed acceptance/economics.
+Observed update at 2026-06-20 02:53:44 UTC: the bounded replacement was still
+`RUNNING`, `runningSecs=1084`, estimated running cost about `$3.31`. It passed
+bootstrap, pinned checkout, patch apply, CUDA/Rust release build, full Qwen480
+package download (`69 / 69` files in about `3.5min`), and bounded prompt build,
+then entered native CUDA capture logs. This proves the `--max-source-rows
+12000` retry got past the prompt-preprocessing point where the unbounded job
+was canceled. Next checks are train/held-out capture completion, conversion,
+head-only train/score, product fixture parity, and package-backed
+acceptance/economics.
 
 The mixed prompt sources in that dry run are
 `HuggingFaceH4/ultrachat_200k:train_sft`,
