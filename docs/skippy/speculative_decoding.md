@@ -313,12 +313,13 @@ trips, and `256` unsaved. The latency simulation therefore reports
 sidecar as a speed candidate. The offline-versus-serving gap is now an explicit
 acceptance blocker: future reports must separate draft-restricted
 native-teacher top-1 from `serving_target_top1` against the full-vocab greedy
-target, and the native-package-fresh lane still needs fixed-row Rust/Python
-parity before offline scores can be treated as serving-quality evidence.
+target, and the next native-package-fresh lane must pass fixed-row
+Rust/Python parity before offline scores can be treated as serving-quality
+evidence.
 
 A larger no-spend paper-aligned plan is now saved at
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`
-with SHA256 `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
+with SHA256 `24e9d55378acc68f82f098dab0c954d23b68c0acda0e6bfdd4e804dfbd5ecc0c`.
 It is not submitted. It keeps Qwen480 S8 native package-first capture, raises
 training to `8192` native-Q4 samples (`2048` prompts x `4` verify steps), uses
 `128` held-out prompts and `ctx_size=2048`, keeps the proven resident capture
@@ -333,6 +334,10 @@ from selected training conversations, and native capture passes it with
 draft-token range for Qwen480 quality work. The plan still has the same
 `$49.49991` planned cap on `rtx-pro-6000x4` and still avoids the old
 full-reference path strings.
+It also now exports `spd-product-parity-fixture.safetensors` from held-out
+native product rows and runs `skippy-bench spd-fixture-parity` before package
+smoke; `spd-serving-fixture.safetensors` remains the separate request-path
+fixture for `spd-openai-smoke`.
 
 Acceptance rate is now the primary Qwen480 research loop. The paper's recipe is
 far larger than our completed Qwen480 lane: frozen target, KL-only speculation
@@ -996,9 +1001,9 @@ Run these before making any speedup claim:
      full-HF-reference trainer for this target; the job must train from native
      package tap rows and native Q4 verifier logits without loading the full
      Qwen480 base model through Transformers. The current `native-package-fresh` dry run uses
-     topology-only capture plus head-only train/score, exports
-     `spd-serving-fixture.safetensors`, and skips true Rust/Python fixture
-     parity until a native parity fixture exporter exists. Dry-run
+     topology-only capture plus head-only train/score, exports a product-row
+     parity fixture plus `spd-serving-fixture.safetensors`, and runs Rust
+     fixture parity before package smoke. Dry-run
      model/package ref, dataset shard, topology, row cap, hardware, timeout,
      output repo, max cost, and whether the command is
      topology-only/capture-only/training-capable before submitting spend.

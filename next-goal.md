@@ -132,11 +132,22 @@ transport.
      and actual served accepted/proposed separately;
    - if fixed-row Python predicts the served target but Rust rejects all rows,
      fix row alignment/forward parity before buying more training data.
+   - This gate is necessary but not sufficient: if it passes and package smoke
+     still accepts zero, add a live-row reconstruction check that compares
+     request-time tap-projected `cur_in` against the saved native corpus row for
+     the same context.
+   - Implemented for the next HF lane: `export_product_parity_fixture.py`
+     writes `spd-product-parity-fixture.safetensors`, and
+     `plan_hf_spd_qualification.py --qualification-mode native-package-fresh`
+     now runs `skippy-bench spd-fixture-parity` before package smoke. This has
+     not yet been run on Qwen480 artifacts because the previous local download
+     retained only final JSONs and the serving bundle, not held-out corpus and
+     teacher tensors.
 3. The next spend-bearing candidate is the prepared mixed-data 8k native-Q4
    quality run, only after explicit spend approval:
    `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
    SHA256
-   `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
+   `24e9d55378acc68f82f098dab0c954d23b68c0acda0e6bfdd4e804dfbd5ecc0c`.
    It keeps the same Qwen480 S8 package/topology, uses `8192` native-Q4 train
    samples and `128` held-out prompts, builds a corpus-frequency `32k` draft
    vocabulary from selected training conversations, trains KL-only against
@@ -248,7 +259,7 @@ transport.
 6. Updated no-spend, paper-aligned dry run prepared:
    `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
    SHA256
-   `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
+   `24e9d55378acc68f82f098dab0c954d23b68c0acda0e6bfdd4e804dfbd5ecc0c`.
    It keeps the same Qwen480 S8 package/topology, `2048` train prompts with
    `4` verify steps (`8192` native-Q4 train samples), `128` held-out prompts,
    `ctx_size=2048`, one epoch, LR `1e-4`, KL-only native teacher training,

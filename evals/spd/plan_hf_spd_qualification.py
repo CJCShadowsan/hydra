@@ -775,10 +775,7 @@ def training_base_model_load(qualification_mode: str) -> str:
 
 def rust_fixture_parity_gate(qualification_mode: str) -> str:
     if qualification_mode == "native-package-fresh":
-        return (
-            "skipped for the first native-package-fresh lane; it exports a "
-            "serving fixture only, until native parity fixture export exists"
-        )
+        return "must pass product-row Rust/Python parity before package smoke"
     return "must pass if export runs"
 
 
@@ -1127,11 +1124,28 @@ def build_native_package_fresh_commands(
         f"--manifest {artifact_dir}/skippy-spd-head.json "
         f"--manifest-out {artifact_dir}/skippy-spd-head.json "
         f"--out-dir {artifact_dir} --base-model-path {shell_quote(args.base_model)}",
+        "PYTHONPATH=evals/spd python3 evals/spd/export_product_parity_fixture.py "
+        f"--reference-dir {reference_dir} "
+        f"--checkpoint {artifact_dir}/speculation_head_final.pt "
+        f"--product-corpus {work_dir}/heldout-corpus.safetensors "
+        f"--teacher-logits {work_dir}/heldout-teacher.safetensors "
+        f"--base-model-path {shell_quote(args.base_model)} "
+        f"--out {artifact_dir}/spd-product-parity-fixture.safetensors "
+        f"--summary-json {artifact_dir}/product-parity-fixture-summary.json "
+        f"--row-index 0 --top-k {args.draft_top_k} "
+        "--device cuda --model-torch-dtype bfloat16",
         "python3 evals/spd/export_product_serving_fixture.py "
         f"--product-corpus {work_dir}/heldout-corpus.safetensors "
         f"--out {artifact_dir}/spd-serving-fixture.safetensors "
         f"--summary-json {artifact_dir}/serving-fixture-summary.json",
     ]
+    rust_fixture_parity = (
+        "target/release/skippy-bench spd-fixture-parity "
+        f"--manifest {artifact_dir}/skippy-spd-head.json "
+        f"--fixture {artifact_dir}/spd-product-parity-fixture.safetensors "
+        f"--top-k {args.draft_top_k} "
+        f"--output {artifact_dir}/product-fixture-parity.json"
+    )
     smoke = (
         "target/release/skippy-bench spd-openai-smoke "
         "--stage-server-bin target/release/skippy-server "
@@ -1170,9 +1184,7 @@ def build_native_package_fresh_commands(
         "train": [train],
         "score": [score],
         "export_serving_bundle": export,
-        "rust_fixture_parity": [
-            "printf '%s\\n' 'native-package-fresh exports a serving fixture only; Rust fixture parity is skipped until native fixture export exists'"
-        ],
+        "rust_fixture_parity": [rust_fixture_parity],
         "upload_pre_smoke": [upload],
         "package_smoke": [smoke],
         "latency_simulation": [latency],

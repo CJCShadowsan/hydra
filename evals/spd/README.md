@@ -47,12 +47,15 @@ needed by the Rust request path for row metadata and final norm. The
 commands; it does not call `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, or
 the old full-base product trainer/scorer.
 
-Important remaining gap: the native fresh lane exports a serving fixture, not a
-true Python/reference parity fixture. Do not claim Rust/Python fixture parity
-for Qwen480 S8 until a native parity fixture exporter exists. The current
-capped runs have not exposed a Qwen3-Coder-480B MoE/AutoConfig compatibility
-blocker; the immediate unproven gate is package-backed smoke placement and
-request-path behavior for the uploaded bundle.
+Important remaining gap: the native fresh lane now has a product-row parity
+fixture exporter and planner gate, but the Qwen480 artifacts produced before
+that change retained only final JSONs and the serving bundle locally. Do not
+claim Qwen480 Rust/Python fixture parity until the next native-package-fresh
+lane writes `spd-product-parity-fixture.safetensors` and
+`skippy-bench spd-fixture-parity` exits successfully. The current capped runs
+have not exposed a Qwen3-Coder-480B MoE/AutoConfig compatibility blocker; the
+immediate unproven gate is fixed-row parity followed by package-backed
+acceptance.
 
 HF Jobs rates checked on 2026-06-19 put `rtx-pro-6000x4` at about `$11/hr`,
 `h200x2` at about `$10/hr`, `h200x4` at about `$20/hr`, and
@@ -264,15 +267,14 @@ export wrote `spd-head.safetensors` with SHA
 `8,723,214,136` bytes.
 
 The failure was not allocator, MoE startup, capture, or training. The generated
-`native-package-fresh` parity-skip command was
-`echo native-package-fresh exports a serving fixture only; Rust fixture parity
-is skipped...`, so Bash treated `Rust` as a command and exited `127`.
-`plan_hf_spd_qualification.py` now emits the skip as a single `printf` command.
-Local validation passes: Python compile for the planner/runner, the same
-resident 32/8/1 dry run, and
-`run_hf_spd_qualification_plan.py --groups rust_fixture_parity`. The next retry
-should reuse the same resident-small profile; the first new gate is
-package-backed rolling smoke plus upload.
+native-package-fresh parity-skip shell line had unquoted explanatory text, so
+Bash treated a word from the message as a command and exited `127`. That was
+fixed for the resident-small retry, and current native-package-fresh plans no
+longer skip parity: they export a product-row parity fixture and run
+`skippy-bench spd-fixture-parity` before package-backed rolling smoke. Local
+validation for the historical quoting fix passed with Python compile for the
+planner/runner, the same resident 32/8/1 dry run, and
+`run_hf_spd_qualification_plan.py --groups rust_fixture_parity`.
 
 Fixed resident-small retry submitted on 2026-06-20 local time: HF Job
 `meshllm/6a356b6d3093dba73ce2a5da`, URL
@@ -573,15 +575,19 @@ acceptance. `score_product_activation_head_only.py` now reports
 Mechanics have reached the broad package-backed proposal path for Qwen480 S8,
 so another meshlet or smoke-existing retry would only re-measure a known
 quality failure. The next capped lane should keep the same logical topology and
-native package-first capture, but before spending it should either add native
-Rust/Python fixture parity for fixed native rows or explicitly acknowledge that
-this parity gap remains. If fixed-row Python scoring predicts the serving
-target but Rust serving still rejects every proposal, the issue is row/forward
-alignment, not data scale.
+native package-first capture, and now must export a product parity fixture and
+run Rust fixture parity before package smoke. If fixed-row Python scoring
+predicts the serving target but Rust serving still rejects every proposal, the
+issue is row/forward alignment, not data scale.
+Fixture parity is necessary but not sufficient: it proves Rust and Python agree
+on saved native rows. If it passes and package-backed serving still accepts
+zero, the next structural gate is live-row reconstruction, comparing
+request-time tap-projected `cur_in` against the saved native corpus row for the
+same context.
 
 Prepared no-spend paper-aligned dry run for the next quality lane:
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
-SHA256 `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
+SHA256 `24e9d55378acc68f82f098dab0c954d23b68c0acda0e6bfdd4e804dfbd5ecc0c`.
 It keeps the same Qwen480 S8 package/topology but raises training to `2048`
 train prompts with `4` verify steps (`8192` native-Q4 samples), `128` held-out
 prompts, and `ctx_size=2048`. It moves closer to the paper recipe: one epoch,
@@ -3058,8 +3064,9 @@ capture, native-Q4 teacher-logit conversion, raw-mode training/adaptation,
 held-out scoring, serving export, and a single-machine package-backed
 `spd-openai-smoke`. That is enough to prove predictor quality, artifact
 readiness for serving, and request-path mechanics. It is not a distributed
-wall-clock speed claim. For `native-package-fresh`, true Rust/Python fixture
-parity is explicitly skipped until native parity fixture export exists.
+wall-clock speed claim. For `native-package-fresh`, the job now exports a
+product-row parity fixture and must pass `skippy-bench spd-fixture-parity`
+before package smoke.
 
 Use `evals/spd/simulate_latency.py` as the deterministic bridge from HF/local
 smoke evidence to LAN plausibility. For a Skippy OpenAI smoke report, it reads
@@ -3175,9 +3182,8 @@ optimized/offloaded.
 4. Run the larger native-Q4 product-row training gate on HF, not by thrashing
    the M4. The dry run must print model/package ref, dataset shard, logical
    topology, row cap, hardware, timeout, output repo, and maximum cost. The job
-   should emit held-out scores, the serving bundle, package smoke, and
-   latency-simulation JSON. Fixture parity is not part of the first
-   `native-package-fresh` lane until native parity fixture export exists.
+   should emit held-out scores, the product-row parity fixture, the serving
+   bundle, Rust fixture parity, package smoke, and latency-simulation JSON.
 5. Only after held-out package-backed serving clears a `1.0` paper estimate,
    rerun `spd-openai-smoke` with explicit `--stage-hosts`,
    pre-materialized package directories or Mesh-resolved package artifacts, and

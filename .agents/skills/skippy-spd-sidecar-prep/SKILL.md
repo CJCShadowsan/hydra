@@ -98,6 +98,11 @@ Skippy taps.
   head from raw product tensors while loading AutoConfig only, not full base
   model weights. Use this for large native-package-first lanes such as
   Qwen3-Coder-480B S8.
+- `evals/spd/export_product_parity_fixture.py` exports a true
+  `skippy-spd-parity-fixture/v1` from native product rows plus a head-only
+  checkpoint, without loading base-model weights. Use this before package smoke
+  in `native-package-fresh` lanes so `skippy-bench spd-fixture-parity` proves
+  Rust/Python fixed-row proposal parity.
 - `evals/spd/export_product_serving_fixture.py` exports a serving-only fixture
   carrying row metadata and final norm weights for Rust request-path smoke. It
   is not a Python/reference parity fixture.
@@ -811,8 +816,9 @@ Do not repeat capture/train unless the uploaded artifact is unusable. Next
 retry is smoke-existing only with the current patch uploaded via
 `MESH_LLM_PATCH_PATH`: hydrate the existing artifact, rerun package smoke, then
 latency simulation. Remaining risk is proposal quality on broader held-out
-prompts after request-path proposal generation works. True Rust/Python fixture
-parity is still skipped until native parity fixture export exists.
+prompts after request-path proposal generation works. Historical note: this
+lane skipped true Rust/Python fixture parity before native product parity
+export existed.
 Current retry bundle: `job-inputs/20260619T190753Z-6abc8370/`, Hub revision
 `43940c19fefce860f58c37ebe0517a13d32f8419`, patch SHA256
 `4bca067da32ae42067845663ac345e515feeae8abd57aa0ad883de6b9458f15a`.
@@ -868,7 +874,7 @@ spending on more data.
 
 Prepared no-spend paper-aligned plan:
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
-SHA256 `57abf9ff3146d40a3d5f0338820d3955816ce2490e73b26a220fe794e1d62088`.
+SHA256 `24e9d55378acc68f82f098dab0c954d23b68c0acda0e6bfdd4e804dfbd5ecc0c`.
 It keeps the same Qwen480 S8 native package-first topology, raises training to
 `8192` native-Q4 samples (`2048` train prompts x `4` verify steps), uses
 `128` held-out prompts, `ctx_size=2048`, `physical-node-count=4`, capture map
@@ -879,8 +885,10 @@ SmolTalk, SmolTalk-Chinese, and a ShareGPT-like WizardLM Evol-Instruct shard.
 The prompt builder writes a corpus-frequency `draft-token-ids.json` from
 selected training conversations, and native capture passes it with
 `--draft-token-ids-file`; do not use the old arbitrary `0..31999` draft-token
-range for Qwen480 quality work. It is not submitted; spend still requires
-explicit confirmation.
+range for Qwen480 quality work. The plan now also exports
+`spd-product-parity-fixture.safetensors` and runs
+`skippy-bench spd-fixture-parity` before package smoke. It is not submitted;
+spend still requires explicit confirmation.
 
 Do not submit spend until the dry run prints model/package ref, dataset shard,
 prompt counts, topology, hardware flavor, timeout, output repo, and max cost.
