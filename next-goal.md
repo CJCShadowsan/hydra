@@ -221,6 +221,17 @@ acceptance from that overfit proof means request-path alignment is good and
 data scale is the lever; zero served acceptance from an overfit head means the
 blocker is still row/projection/live-tap alignment.
 
+Second-opinion update at 2026-06-20 05:11 UTC: keep treating sufficient data as
+the likely eventual quality lever, but not the next spend gate. The active 8k
+head has not served yet, so comparing its improved offline score to the older
+`0 / 256` served broad-smoke result is not a controlled data-scale test. The
+next decisive evidence is fixed-row Rust/Python parity and, if served
+acceptance is still zero after that, a tiny overfit-to-serving-prompts control
+on the exact Qwen480 S8 package topology. A nonzero served acceptance result
+from that overfit control makes `16k`/`64k`/paper-scale data the right lever; a
+zero result means data scale is a red herring until row/projection/live-tap
+alignment is fixed.
+
 Raw-log update at 2026-06-20 05:03 UTC: the HF CLI log tail was empty, but the
 underlying SSE endpoint
 `https://huggingface.co/api/jobs/meshllm/6a3611dd953ed90bfb945575/logs`
@@ -232,6 +243,13 @@ returned buffered events when called with `HF_TOKEN`. The job reached
 `init: embeddings required but some input tokens were not marked as outputs ->
 overriding` messages. No conversion, training, fixed-row parity, package
 smoke, or acceptance result has appeared yet.
+
+Raw-log/stats update at 2026-06-20 05:11 UTC: a fresh SSE sample still showed
+the latest log event inside native capture at 2026-06-20 05:09:48 UTC, with no
+command boundary for conversion, training, parity, package smoke, or
+acceptance. `hf jobs stats` continued to show the job running with about
+`305`-`314GB / 1.0TB` host memory and live GPU memory/use cycling through the
+capture phase. Do not submit a duplicate while this job is active.
 
 ## Success Gate
 
