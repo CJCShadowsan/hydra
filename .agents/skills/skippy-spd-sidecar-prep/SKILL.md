@@ -110,6 +110,11 @@ Skippy taps.
   native-package-fresh` plans the capped native package flow: package download,
   topology-only capture, conversion, head-only train/score, serving export,
   package-backed smoke, latency simulation, and upload.
+  Use `--overfit-serving-prompts` only as a diagnostic native-package-fresh
+  fallback after a broad run serves zero accepted proposals; it trains on the
+  same held-out product rows used by package-backed smoke to prove whether the
+  served topology can accept an intentionally overfit head before buying more
+  data.
 - `evals/spd/README.md` is the live progress log and command cookbook for the
   current SPD proof.
 

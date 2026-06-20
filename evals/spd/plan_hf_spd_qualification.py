@@ -115,6 +115,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--kl-weight", type=float, default=1.0)
     parser.add_argument("--hard-label-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--overfit-serving-prompts",
+        action="store_true",
+        help=(
+            "Diagnostic only for native-package-fresh: train on the same "
+            "held-out product rows used by package-backed smoke. Use this to "
+            "prove serving can accept an intentionally overfit head before "
+            "spending on larger data."
+        ),
+    )
     parser.add_argument("--warm-start-repo", default="meshllm/skippy-spd-qwen3-8b-s2-23")
     parser.add_argument("--warm-start-path", default="runs/20260618-122936/train")
     parser.add_argument(
@@ -238,6 +248,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--vocab-size must be non-negative")
     if args.qualification_mode == "raw-q4-adapt" and not args.warm_start_repo.strip():
         raise SystemExit("--warm-start-repo is required for raw-q4-adapt")
+    if args.overfit_serving_prompts and args.qualification_mode != "native-package-fresh":
+        raise SystemExit(
+            "--overfit-serving-prompts requires --qualification-mode native-package-fresh"
+        )
 
 
 def fetch_package_metadata(package_ref: str, revision: str, endpoint: str) -> dict[str, Any]:
@@ -704,6 +718,7 @@ def build_plan(
             "weight_decay": args.weight_decay,
             "kl_weight": args.kl_weight,
             "hard_label_weight": args.hard_label_weight,
+            "overfit_serving_prompts": bool(args.overfit_serving_prompts),
             "input_mode": training_input_mode(args.qualification_mode),
             "torch_dtype": "bfloat16",
             "base_model_load": training_base_model_load(args.qualification_mode),
@@ -1104,11 +1119,21 @@ def build_native_package_fresh_commands(
         f"--corpus-dir {heldout_corpus_dir} --out {work_dir}/heldout-teacher.safetensors "
         f"--summary-json {work_dir}/heldout-teacher-summary.json",
     ]
+    train_product_corpus = (
+        f"{work_dir}/heldout-corpus.safetensors"
+        if args.overfit_serving_prompts
+        else f"{work_dir}/train-corpus.safetensors"
+    )
+    train_teacher_logits = (
+        f"{work_dir}/heldout-teacher.safetensors"
+        if args.overfit_serving_prompts
+        else f"{work_dir}/train-teacher.safetensors"
+    )
     train = (
         "PYTHONPATH=evals/spd python3 evals/spd/train_product_activation_head_only.py "
         f"--reference-dir {reference_dir} "
-        f"--product-corpus {work_dir}/train-corpus.safetensors "
-        f"--teacher-logits {work_dir}/train-teacher.safetensors "
+        f"--product-corpus {train_product_corpus} "
+        f"--teacher-logits {train_teacher_logits} "
         f"--out-checkpoint {artifact_dir}/speculation_head_final.pt "
         f"--manifest-out {artifact_dir}/skippy-spd-head.json "
         f"--base-model-path {shell_quote(args.base_model)} "

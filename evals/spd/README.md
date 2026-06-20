@@ -592,6 +592,17 @@ Qwen480 S8 head on the exact serving prompts. Nonzero served acceptance from an
 overfit head would make data scale the likely lever; `0` served acceptance even
 from an overfit head would isolate the blocker to row/projection/live-tap
 alignment or Rust/Python forward parity.
+That fallback is now a first-class no-spend plan shape:
+`plan_hf_spd_qualification.py --qualification-mode native-package-fresh
+--overfit-serving-prompts` trains on the same held-out product rows used by
+package-backed smoke. The prepared Qwen480 S8 dry run is
+`/tmp/spd-qwen480-s8-overfit-serving-control-plan.json`, capped at about
+`$22.00` on `rtx-pro-6000x4` for `2h`, with `8` held-out prompts x `4` verify
+steps. The generated train command uses `heldout-corpus.safetensors` and
+`heldout-teacher.safetensors`, and the command graph still has no
+`AutoModelForCausalLM`, `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, or
+`from_pretrained(` matches. Treat this as an alignment existence proof only,
+not a generalizing sidecar.
 
 Prepared no-spend paper-aligned dry run for the next quality lane:
 `/tmp/spd-qwen480-s8-quality-8k-native-package-fresh-mixed-balanced-paperlike-plan.json`,
@@ -646,6 +657,11 @@ then entered native CUDA capture logs. This proves the `--max-source-rows
 was canceled. Next checks are train/held-out capture completion, conversion,
 head-only train/score, product fixture parity, and package-backed
 acceptance/economics.
+Observed update at 2026-06-20 03:29:22 UTC: the bounded replacement was still
+`RUNNING`, `runningSecs=3222`, estimated running cost about `$9.84`, with about
+`$33.05` maximum remaining before the HF timeout. The log tail was still native
+CUDA capture chatter, not conversion, training, parity, smoke, upload, or
+failure output.
 
 The mixed prompt sources in that dry run are
 `HuggingFaceH4/ultrachat_200k:train_sft`,

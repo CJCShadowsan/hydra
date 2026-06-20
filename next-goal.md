@@ -14,8 +14,9 @@ real candidate-token round-trip savings under the same logical topology.
 - Active HF Job: `meshllm/6a35fb70953ed90bfb94547c`, created
   2026-06-20 02:31:12 UTC. It is the bounded mixed-data 8k native-Q4 quality
   lane on `rtx-pro-6000x4`, timeout `3.9h`, planned max cost `$42.899922`.
-  Latest observed status at 2026-06-20 02:53:44 UTC: `RUNNING`,
-  `runningSecs=1084`, estimated running cost about `$3.31`.
+  Latest observed status at 2026-06-20 03:29:22 UTC: `RUNNING`,
+  `runningSecs=3222`, estimated running cost about `$9.84`; the maximum
+  remaining spend before timeout is about `$33.05`.
   It has passed bootstrap, pinned checkout, patch apply, CUDA/Rust release
   build, full 69-file Qwen480 package download, and bounded prompt build, and
   is now in native CUDA capture logs.
@@ -204,6 +205,15 @@ transport.
    `full_vocab_target_in_draft_scope`, `serving_target_top1/top4`,
    package-backed accepted/proposed proposals, saved/unsaved candidate-token
    round trips, and a latency simulation using measured sidecar cost.
+6. The overfit fallback is now an explicit no-spend dry run, not an implicit
+   data-size hack. `plan_hf_spd_qualification.py` accepts
+   `--overfit-serving-prompts` for `native-package-fresh`, training on the same
+   held-out product rows used by package-backed smoke. Verified dry-run:
+   `/tmp/spd-qwen480-s8-overfit-serving-control-plan.json`, capped at about
+   `$22.00` on `rtx-pro-6000x4` for `2h`, Qwen480 S8 topology, `8` held-out
+   prompts x `4` verify steps, and no `AutoModelForCausalLM`,
+   `hf_train_eval_qwen06.py`, `spd-live-tap-parity`, or `from_pretrained(`
+   command-graph matches.
 
 ## Historical Work Log
 
