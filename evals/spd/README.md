@@ -536,6 +536,17 @@ paper-scale sidecar-quality run. If package smoke does not clear the
 saved-versus-unsaved gate, the next spend should scale native Q4/S8 KD data and
 recipe quality rather than repeat mechanics.
 
+The acceptance-rate work should now be treated as the primary research loop.
+Mechanics have already reached the package-backed proposal path for Qwen480
+S8, so another meshlet or smoke-existing retry is useful only if this job
+reveals a new request-path failure. Otherwise the next capped lane should keep
+the same logical topology and native package-first capture, but raise the
+number and diversity of training rows, keep held-out token lines frozen and
+disjoint, and optimize for broad package-backed accepted/proposed plus
+saved-versus-unsaved candidate-token round trips. A narrow held-out subset can
+remain a debug smoke, but readiness for an HF meshlet needs a broad held-out
+package-backed gate with margin.
+
 Pass criteria: train/held-out prompt-token shards have zero overlap, native
 teacher argmax matches the quant verifier target on in-scope rows, serving
 artifacts export if training reaches export, package-backed rolling smoke

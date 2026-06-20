@@ -47,6 +47,24 @@ executor integration, and latency simulation path are alive. The blocker is
 sidecar quality from too little native training data, not missing taps or
 package-smoke mechanics.
 
+## Acceptance-Rate Focus
+
+Do not spend the next iteration re-proving taps, package loading, or meshlet
+lifecycle unless the current quality lane exposes a new request-path failure.
+The paper trains the frozen-target SPD speculation module with KL distillation
+over about `1.2M` filtered samples from ShareGPT, UltraChat, SmolTalk, and
+SmolTalk-Chinese, with max length `2048`, LR `1e-4`, linear decay, and one
+epoch. The current Qwen480 quality lane is only `2048` native-Q4 train samples,
+so it is a first production-path quality signal, not sufficient paper-scale
+evidence.
+
+If the current package-backed smoke does not clear saved-versus-unsaved round
+trips, the next goal remains the same topology but with a larger native-Q4
+KD/data lane: broaden beyond UltraChat-only where practical, preserve a frozen
+token-line-disjoint held-out gate, train from native verifier logits rather
+than BF16 full-model teachers, and judge readiness by broad held-out
+package-backed acceptance/economics before any HF meshlet.
+
 ## Success Gate
 
 This goal is done only when a capped HF quality lane produces a larger trained
@@ -108,6 +126,17 @@ transport.
 4. Do not dispatch an HF meshlet yet. Meshlet is a follow-on only after
    package-backed held-out serving saves more candidate-token round trips than
    it wastes, with matched content and zero tap failures.
+
+5. If `meshllm/6a35cdc03093dba73ce2a9ad` fails the acceptance/economics gate
+   while mechanics remain clean, plan the next spend as a data/recipe scale-up,
+   not another smoke-existing rerun:
+   - first larger target: at least `8k` to `16k` native-Q4 train samples if it
+     fits a capped lane, with `64` to `256` held-out prompts;
+   - longer target: move toward paper-scale mixed data if early scaling improves
+     broad held-out acceptance;
+   - keep KL against captured native draft-vocab logits as the core objective;
+   - report offline top-1/top-4, package-backed accepted/proposed, saved/unsaved
+     candidate-token round trips, and realistic latency simulation.
 
 ## Why Not Meshlet Yet
 
