@@ -40,6 +40,9 @@ pub struct EmbeddedOpenAiStageOptions {
     pub draft_model_path: Option<PathBuf>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
+    pub ngram_speculative: bool,
+    pub ngram_size: usize,
+    pub ngram_min_match: usize,
     pub draft_n_gpu_layers: Option<i32>,
 }
 
@@ -53,6 +56,14 @@ impl BinaryStageOptions {
         }
         if args.openai_prefill_chunk_size == 0 {
             bail!("--openai-prefill-chunk-size must be greater than zero");
+        }
+        if args.openai_ngram_speculative && args.openai_speculative_window == 0 {
+            bail!(
+                "--openai-speculative-window must be greater than zero when n-gram speculation is enabled"
+            );
+        }
+        if args.openai_ngram_speculative && args.openai_ngram_size == 0 {
+            bail!("--openai-ngram-size must be greater than zero");
         }
         let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
         let downstream_wire_condition =
@@ -83,6 +94,9 @@ impl BinaryStageOptions {
                 draft_model_path: args.openai_draft_model_path,
                 speculative_window: args.openai_speculative_window,
                 adaptive_speculative_window: args.openai_adaptive_speculative_window,
+                ngram_speculative: args.openai_ngram_speculative,
+                ngram_size: args.openai_ngram_size,
+                ngram_min_match: args.openai_ngram_min_match,
                 draft_n_gpu_layers: args.openai_draft_n_gpu_layers,
             });
         Ok(Self {

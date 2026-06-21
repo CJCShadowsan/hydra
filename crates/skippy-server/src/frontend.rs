@@ -39,7 +39,7 @@ use skippy_metrics::attr as attr_key;
 use skippy_protocol::binary::{
     LLAMA_TOKEN_NULL, MAX_STAGE_LOGIT_BIAS, StageLogitBias as WireLogitBias, StageReply,
     StageReplyStats, StageSamplingConfig as WireSamplingConfig, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, recv_ready, recv_reply, state_flags,
+    WireActivationDType, WireMessageKind, WireReplyKind, recv_reply, send_stage_open, state_flags,
     write_stage_message,
 };
 use skippy_protocol::{MessageBase, SCHEMA_VERSION, StageConfig, StageTopology};
@@ -59,8 +59,8 @@ use crate::{
     binary_transport::{
         DecodeFrameBatcher, PredictionReturnHub, PredictionReturnReceiver, WireCondition,
         connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
-        run_binary_stage_message, send_client_ready_hello_if_enabled,
-        stage_output_activation_capacity, write_stage_message_conditioned,
+        run_binary_stage_message, stage_output_activation_capacity,
+        write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
@@ -194,6 +194,9 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        ngram_speculative: false,
+        ngram_size: 4,
+        ngram_min_match: 3,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
@@ -233,6 +236,9 @@ pub struct EmbeddedOpenAiArgs {
     pub draft_model_path: Option<PathBuf>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
+    pub ngram_speculative: bool,
+    pub ngram_size: usize,
+    pub ngram_min_match: usize,
     pub draft_n_gpu_layers: Option<i32>,
     pub activation_width: i32,
     pub wire_dtype: WireActivationDType,
@@ -475,6 +481,14 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     if args.draft_model_path.is_some() && args.speculative_window == 0 {
         bail!("--openai-speculative-window must be greater than zero when a draft model is set");
     }
+    if args.ngram_speculative && args.speculative_window == 0 {
+        bail!(
+            "--openai-speculative-window must be greater than zero when n-gram speculation is enabled"
+        );
+    }
+    if args.ngram_speculative && args.ngram_size == 0 {
+        bail!("--openai-ngram-size must be greater than zero");
+    }
     if args.config.stage_index != 0 || args.config.layer_start != 0 {
         bail!("embedded OpenAI serving is only supported on stage 0");
     }
@@ -544,6 +558,9 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         draft,
         speculative_window: args.speculative_window,
         adaptive_speculative_window: args.adaptive_speculative_window,
+        ngram_speculative: args.ngram_speculative,
+        ngram_size: args.ngram_size,
+        ngram_min_match: args.ngram_min_match,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
@@ -585,6 +602,9 @@ struct StageOpenAiBackend {
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
+    ngram_speculative: bool,
+    ngram_size: usize,
+    ngram_min_match: usize,
     generation_limit: Arc<Semaphore>,
     generation_queue_depth: Arc<AtomicUsize>,
     generation_queue_limit: usize,
@@ -1065,14 +1085,12 @@ impl PersistentStageLanePool {
         let local_addr = stream.local_addr().ok();
         let peer_addr = stream.peer_addr().ok();
         eprintln!(
-            "openai downstream lane waiting ready: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
+            "openai downstream lane opening: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
             self.config.stage_id
         );
-        send_client_ready_hello_if_enabled(&mut stream)
-            .context("send persistent downstream lane client ready hello")?;
-        recv_ready(&mut stream).context("persistent downstream lane did not become ready")?;
+        send_stage_open(&mut stream).context("open persistent downstream lane")?;
         eprintln!(
-            "openai downstream lane received ready: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
+            "openai downstream lane opened: stage_id={} lane_id={lane_id} local={local_addr:?} peer={peer_addr:?}",
             self.config.stage_id
         );
         let mut attrs = lifecycle_attrs(&self.config);
@@ -1748,6 +1766,9 @@ struct EmbeddedStageZeroGeneration<'a> {
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
+    ngram_speculative: bool,
+    ngram_size: usize,
+    ngram_min_match: usize,
     prompt_token_ids: &'a [i32],
     max_tokens: u32,
     sampling: &'a SamplingConfig,

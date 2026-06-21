@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use skippy_protocol::binary::{
     WireActivationDType, activation_payload_multiplier_from_state_flags,
-    activation_state_flags_from_frame_flags, recv_ready,
+    activation_state_flags_from_frame_flags, send_stage_open,
 };
 
 pub struct ChildGuard {
@@ -56,11 +56,9 @@ pub fn connect_ready(addr: SocketAddr, timeout_secs: u64) -> Result<TcpStream> {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();
-                match recv_ready(&mut stream) {
+                match send_stage_open(&mut stream) {
                     Ok(()) => return Ok(stream),
-                    Err(error) => {
-                        last_error = Some(anyhow!(error).context("ready handshake failed"))
-                    }
+                    Err(error) => last_error = Some(anyhow!(error).context("stage open failed")),
                 }
             }
             Err(error) => last_error = Some(anyhow!(error).context("connect failed")),

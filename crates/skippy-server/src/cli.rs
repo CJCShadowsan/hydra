@@ -128,6 +128,15 @@ pub struct ServeBinaryArgs {
     pub openai_adaptive_speculative_window: bool,
     #[arg(
         long,
+        help = "Enable server-native n-gram speculative proposals on the embedded stage-0 OpenAI surface."
+    )]
+    pub openai_ngram_speculative: bool,
+    #[arg(long, default_value_t = 4)]
+    pub openai_ngram_size: usize,
+    #[arg(long, default_value_t = 3)]
+    pub openai_ngram_min_match: usize,
+    #[arg(
+        long,
         help = "Override n_gpu_layers for the embedded OpenAI draft model. Defaults to the stage config n_gpu_layers."
     )]
     pub openai_draft_n_gpu_layers: Option<i32>,

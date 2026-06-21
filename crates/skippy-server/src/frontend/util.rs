@@ -123,11 +123,9 @@ pub(super) fn connect_endpoint_ready(endpoint: &str, timeout_secs: u64) -> Resul
         match TcpStream::connect(endpoint) {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();
-                match recv_ready(&mut stream) {
+                match skippy_protocol::binary::send_stage_open(&mut stream) {
                     Ok(()) => return Ok(stream),
-                    Err(error) => {
-                        last_error = Some(anyhow!(error).context("ready handshake failed"))
-                    }
+                    Err(error) => last_error = Some(anyhow!(error).context("stage open failed")),
                 }
             }
             Err(error) => last_error = Some(anyhow!(error).context("connect failed")),

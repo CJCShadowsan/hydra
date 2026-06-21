@@ -1,5 +1,100 @@
 use super::*;
 
+pub(super) const DRAFT_MODEL_PROPOSAL_SOURCE: &str = "draft-model";
+pub(super) const NGRAM_PROPOSAL_SOURCE: &str = "ngram";
+pub(super) const NATIVE_MTP_NGRAM_PROPOSAL_SOURCE: &str = "native-mtp+ngram";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NgramProposalConfig {
+    pub(super) enabled: bool,
+    pub(super) ngram_size: usize,
+    pub(super) min_match: usize,
+}
+
+impl NgramProposalConfig {
+    pub(super) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ngram_size: 0,
+            min_match: 0,
+        }
+    }
+
+    pub(super) fn enabled(ngram_size: usize, min_match: usize) -> OpenAiResult<Self> {
+        if ngram_size == 0 {
+            return Err(OpenAiError::invalid_request(
+                "ngram speculative decoding requires ngram_size > 0",
+            ));
+        }
+        Ok(Self {
+            enabled: true,
+            ngram_size,
+            min_match: min_match.max(1).min(ngram_size),
+        })
+    }
+}
+
+pub(super) fn ngram_proposal(
+    context_tokens: &[i32],
+    seed_tokens: &[i32],
+    config: NgramProposalConfig,
+    max_tokens: usize,
+) -> Vec<i32> {
+    if !config.enabled || max_tokens == 0 || context_tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut prefix = Vec::with_capacity(context_tokens.len() + seed_tokens.len() + max_tokens);
+    prefix.extend_from_slice(context_tokens);
+    prefix.extend_from_slice(seed_tokens);
+    let mut proposal = Vec::new();
+    while proposal.len() < max_tokens {
+        let Some(next) = next_ngram_token(context_tokens, &prefix, config) else {
+            break;
+        };
+        proposal.push(next);
+        prefix.push(next);
+    }
+    proposal
+}
+
+pub(super) fn extend_with_ngram(
+    context_tokens: &[i32],
+    draft_tokens: &mut Vec<i32>,
+    config: NgramProposalConfig,
+    max_tokens: usize,
+) -> bool {
+    if draft_tokens.len() >= max_tokens {
+        return false;
+    }
+    let remaining = max_tokens - draft_tokens.len();
+    let extension = ngram_proposal(context_tokens, draft_tokens, config, remaining);
+    let extended = !extension.is_empty();
+    draft_tokens.extend(extension);
+    extended
+}
+
+fn next_ngram_token(history: &[i32], prefix: &[i32], config: NgramProposalConfig) -> Option<i32> {
+    let max_match = config.ngram_size.min(prefix.len()).min(history.len());
+    for match_len in (config.min_match..=max_match).rev() {
+        let suffix = &prefix[prefix.len() - match_len..];
+        if let Some(token) = most_recent_ngram_continuation(history, suffix) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn most_recent_ngram_continuation(history: &[i32], suffix: &[i32]) -> Option<i32> {
+    if suffix.is_empty() || history.len() <= suffix.len() {
+        return None;
+    }
+    let last_start = history.len() - suffix.len() - 1;
+    (0..=last_start)
+        .rev()
+        .find(|start| &history[*start..*start + suffix.len()] == suffix)
+        .map(|start| history[start + suffix.len()])
+}
+
 #[derive(Default)]
 pub(super) struct OpenAiSpeculativeStats {
     pub(super) windows: usize,
@@ -427,5 +522,36 @@ pub(super) fn nonzero_min(current: usize, candidate: usize) -> usize {
         candidate
     } else {
         current.min(candidate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ngram_proposal_copies_most_recent_matching_span() {
+        let config = NgramProposalConfig::enabled(2, 2).unwrap();
+        let proposal = ngram_proposal(&[1, 2, 3, 4, 2, 3], &[], config, 2);
+
+        assert_eq!(proposal, vec![4, 2]);
+    }
+
+    #[test]
+    fn ngram_proposal_uses_seed_tokens_as_anchor() {
+        let config = NgramProposalConfig::enabled(2, 2).unwrap();
+        let proposal = ngram_proposal(&[1, 3, 4, 5, 6, 9, 3], &[4], config, 2);
+
+        assert_eq!(proposal, vec![5, 6]);
+    }
+
+    #[test]
+    fn extend_with_ngram_appends_without_replacing_draft_anchor() {
+        let config = NgramProposalConfig::enabled(2, 2).unwrap();
+        let mut draft = vec![4];
+        let extended = extend_with_ngram(&[1, 3, 4, 5, 6, 9, 3], &mut draft, config, 3);
+
+        assert!(extended);
+        assert_eq!(draft, vec![4, 5, 6]);
     }
 }

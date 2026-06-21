@@ -648,11 +648,10 @@ fn probe_binary_stage_ready(bind_addr: SocketAddr, timeout: Duration) -> Result<
                 stream.set_nodelay(true).ok();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-                match skippy_protocol::binary::recv_ready(&mut stream) {
+                match skippy_protocol::binary::send_stage_open(&mut stream) {
                     Ok(()) => return Ok(()),
                     Err(error) => {
-                        last_error =
-                            Some(anyhow!(error).context("binary stage ready handshake failed"));
+                        last_error = Some(anyhow!(error).context("binary stage open failed"));
                     }
                 }
             }

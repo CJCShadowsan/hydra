@@ -791,11 +791,16 @@ impl StageOpenAiBackend {
             } else {
                 max_speculative_window
             };
+            let ngram_config = if request.ngram_speculative {
+                NgramProposalConfig::enabled(request.ngram_size, request.ngram_min_match)?
+            } else {
+                NgramProposalConfig::disabled()
+            };
             let mut speculative_stats = OpenAiSpeculativeStats {
                 adaptive_window_start: adaptive_window,
                 adaptive_window_final: adaptive_window,
                 adaptive_window_max: max_speculative_window,
-                adaptive_window_min: if request.draft.is_some() {
+                adaptive_window_min: if request.draft.is_some() || ngram_config.enabled {
                     adaptive_window
                 } else {
                     0
@@ -851,6 +856,7 @@ impl StageOpenAiBackend {
                 let can_run_native_mtp_batched_verify = native_mtp_options.batched_verify
                     && native_mtp_reject_cooldown_remaining == 0
                     && draft_guard.is_none()
+                    && !ngram_config.enabled
                     && native_mtp_remaining >= 2;
                 let pending_native_mtp_draft = can_run_native_mtp_batched_verify
                     .then(|| native_mtp.take_pending_draft())
@@ -1121,7 +1127,7 @@ impl StageOpenAiBackend {
                     }
                     continue;
                 }
-                if draft_guard.is_some() {
+                if draft_guard.is_some() || ngram_config.enabled {
                     let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
                     if remaining == 0 {
                         break;
@@ -1130,6 +1136,7 @@ impl StageOpenAiBackend {
                     let proposal_limit = remaining.min(adaptive_window);
                     let propose_timer = PhaseTimer::start();
                     let mut draft_tokens = Vec::new();
+                    let mut native_mtp_ngram_anchor = None;
                     if let (true, Some(draft)) =
                         (draft_tokens.is_empty(), draft_guard.as_deref_mut())
                     {
@@ -1138,7 +1145,37 @@ impl StageOpenAiBackend {
                             .propose(current, proposal_limit)
                             .map_err(openai_backend_error)?;
                         if !draft_tokens.is_empty() {
-                            proposal_source = "draft-model";
+                            proposal_source = DRAFT_MODEL_PROPOSAL_SOURCE;
+                        }
+                    }
+                    if ngram_config.enabled {
+                        let native_mtp_anchor_allowed = native_mtp_options.batched_verify
+                            && native_mtp_reject_cooldown_remaining == 0
+                            && draft_guard.is_none()
+                            && proposal_limit > 0;
+                        if draft_tokens.is_empty() && native_mtp_anchor_allowed {
+                            native_mtp_ngram_anchor = native_mtp.take_pending_draft();
+                            if let Some(anchor) = native_mtp_ngram_anchor {
+                                draft_tokens.push(anchor.token);
+                                proposal_source = NATIVE_MTP_NGRAM_PROPOSAL_SOURCE;
+                            }
+                        }
+                        if draft_tokens.is_empty() {
+                            draft_tokens =
+                                ngram_proposal(&context_tokens, &[], ngram_config, proposal_limit);
+                            if !draft_tokens.is_empty() {
+                                proposal_source = NGRAM_PROPOSAL_SOURCE;
+                            }
+                        } else if extend_with_ngram(
+                            &context_tokens,
+                            &mut draft_tokens,
+                            ngram_config,
+                            proposal_limit,
+                        ) {
+                            proposal_source = match proposal_source {
+                                DRAFT_MODEL_PROPOSAL_SOURCE => "draft-model+ngram",
+                                other => other,
+                            };
                         }
                     }
                     let draft_propose_ms = propose_timer.elapsed_ms();
@@ -1215,6 +1252,17 @@ impl StageOpenAiBackend {
                             request.max_tokens as usize,
                             |token| token_is_eog_with_runtime(&self.runtime, token),
                         )?;
+                        let native_mtp_ngram_decision = native_mtp_ngram_anchor.map(|anchor| {
+                            let accepted = decision.accepted_before_reject > 0;
+                            let verification = native_mtp.observe_taken_draft_verification(
+                                anchor.token,
+                                verify.reply.predicted_tokens[0],
+                                ms_to_us(verify.elapsed_ms),
+                            );
+                            native_mtp_counters
+                                .observe_batched_verification(anchor.origin, accepted);
+                            verification
+                        });
                         speculative_stats.observe_verify_decision(
                             decision,
                             &mut adaptive_window,
@@ -1347,7 +1395,40 @@ impl StageOpenAiBackend {
                             }
                         }
                         speculative_stats.adaptive_window_final = adaptive_window;
-                        if proposal_source == "draft-model" && (decision.rejected() || reached_stop)
+                        if native_mtp_ngram_anchor.is_some() {
+                            let verify_next_mtp_draft =
+                                NativeMtpDraft::from_verify_prediction_tokens(
+                                    &verify.reply.predicted_tokens,
+                                    verify_inputs.len(),
+                                );
+                            let verify_next_mtp_draft_available = verify_next_mtp_draft.is_some();
+                            let verify_next_mtp_draft_adopted = decision.kind
+                                == VerifySpanDecisionKind::FullAccept
+                                && !reached_stop
+                                && decoded_tokens < request.max_tokens as usize
+                                && verify_next_mtp_draft.is_some();
+                            native_mtp_counters.observe_verify_next_draft(
+                                verify_next_mtp_draft_available,
+                                verify_next_mtp_draft_adopted,
+                            );
+                            if verify_next_mtp_draft_adopted {
+                                native_mtp.observe_next_draft(
+                                    verify_next_mtp_draft,
+                                    NativeMtpDraftOrigin::VerifyNext,
+                                );
+                            }
+                            if decision.accepted_before_reject == 0
+                                && native_mtp_options.reject_cooldown_tokens > 0
+                            {
+                                native_mtp_reject_cooldown_remaining =
+                                    native_mtp_options.reject_cooldown_tokens;
+                                native_mtp_suppress_cooldown_drafts_remaining =
+                                    native_mtp_options.suppress_cooldown_draft_limit;
+                                native_mtp.clear_pending_draft();
+                            }
+                        }
+                        if proposal_source == DRAFT_MODEL_PROPOSAL_SOURCE
+                            && (decision.rejected() || reached_stop)
                         {
                             let draft_reset_timer = PhaseTimer::start();
                             if let Some(draft) = draft_guard.as_deref_mut() {
@@ -1390,6 +1471,12 @@ impl StageOpenAiBackend {
                             "llama_stage.spec.proposal_limit".to_string(),
                             json!(proposal_limit),
                         );
+                        if let Some(native_mtp_ngram_decision) = native_mtp_ngram_decision {
+                            token_attrs.insert(
+                                "llama_stage.native_mtp.ngram_anchor_verification".to_string(),
+                                json!(native_mtp_ngram_decision.label()),
+                            );
+                        }
                         token_attrs.insert(
                             "llama_stage.stage0_compute_ms".to_string(),
                             json!(verify.stats.stage0_compute_ms),

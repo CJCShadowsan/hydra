@@ -1,8 +1,5 @@
 use super::*;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use super::inventory::inventory_source_candidates;
 use anyhow::{Result, anyhow};
@@ -301,7 +298,7 @@ fn stage_load_failure_context_identifies_split_stage_shape() {
 
     let context = stage_load_failure_context(
         &request,
-        "binary stage ready handshake failed",
+        "binary stage open failed",
         Some("native loader exited while mapping tensors"),
     );
 
@@ -317,25 +314,27 @@ fn stage_load_failure_context_identifies_split_stage_shape() {
     assert!(context.contains("lanes=3"));
     assert!(context.contains("source_bytes=68719476736"));
     assert!(context.contains("device=CUDA0"));
-    assert!(context.contains("error=binary stage ready handshake failed"));
+    assert!(context.contains("error=binary stage open failed"));
     assert!(context.contains("last_error=native loader exited while mapping tensors"));
 }
 
 #[tokio::test]
-async fn binary_stage_ready_probe_waits_for_wire_handshake() {
+async fn binary_stage_ready_probe_sends_stage_open() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let bind_addr = listener.local_addr().unwrap();
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(75));
         let (mut stream, _) = listener.accept().unwrap();
-        skippy_protocol::binary::send_ready(&mut stream).unwrap();
+        skippy_protocol::binary::recv_stage_open(&mut stream).unwrap();
+        opened_tx.send(()).unwrap();
     });
 
-    let started = Instant::now();
     wait_for_binary_stage_ready(bind_addr, Duration::from_secs(2))
         .await
         .unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(50));
+    opened_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("stage server should receive client-open frame");
     server.join().unwrap();
 }
 

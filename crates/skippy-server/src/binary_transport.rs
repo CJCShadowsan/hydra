@@ -27,11 +27,11 @@ use skippy_metrics::{attr, metric};
 use skippy_protocol::{
     MessageBase, SCHEMA_VERSION, StageConfig, StageTopology,
     binary::{
-        READY_MAGIC, StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader,
-        StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
-        activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
+        StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage,
+        WireActivationDType, WireMessageKind, WireReplyKind,
+        activation_frame_flags_from_state_flags, read_stage_message, recv_reply, recv_stage_open,
         send_reply_ack, send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_tokens_and_stats, state_flags,
+        send_reply_predicted_with_tokens_and_stats, send_stage_open, state_flags,
     },
 };
 use skippy_runtime::{
@@ -67,8 +67,6 @@ pub(crate) use self::wire::write_stage_message_conditioned;
 
 static BINARY_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const NATIVE_MTP_ENABLED_ENV: &str = "SKIPPY_NATIVE_MTP_ENABLED";
-const CLIENT_READY_HELLO_ENV: &str = "SKIPPY_STAGE_CLIENT_READY_HELLO";
-const CLIENT_READY_HELLO_OPT_IN_PEEK_MS: u64 = 500;
 
 #[derive(Default)]
 struct BinaryKvLookupResult {
@@ -270,6 +268,9 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 draft_model_path: openai_options.draft_model_path,
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
+                ngram_speculative: openai_options.ngram_speculative,
+                ngram_size: openai_options.ngram_size,
+                ngram_min_match: openai_options.ngram_min_match,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
                 activation_width,
                 wire_dtype,
@@ -323,17 +324,10 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         thread::spawn(move || {
             let connection_result = (|| -> Result<()> {
                 eprintln!(
-                    "binary sending ready: stage_id={} peer={peer_addr:?}",
+                    "binary receiving stage open: stage_id={} peer={peer_addr:?}",
                     config.stage_id
                 );
-                consume_optional_client_ready_hello(&mut upstream)
-                    .context("consume optional client ready hello")?;
-                send_ready(&mut upstream).context("failed to send binary ready")?;
-                upstream.flush().ok();
-                eprintln!(
-                    "binary sent ready: stage_id={} peer={peer_addr:?}",
-                    config.stage_id
-                );
+                recv_stage_open(&mut upstream).context("receive binary stage open")?;
                 let first_message = match read_stage_message(&mut upstream, activation_width) {
                     Ok(message) => message,
                     Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -391,56 +385,6 @@ fn prepare_binary_stage_connection(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn send_client_ready_hello_if_enabled(stream: &mut TcpStream) -> Result<()> {
-    if !client_ready_hello_enabled() {
-        return Ok(());
-    }
-    send_ready(&mut *stream).context("send client ready hello")?;
-    stream.flush().ok();
-    Ok(())
-}
-
-pub(super) fn consume_optional_client_ready_hello(stream: &mut TcpStream) -> Result<()> {
-    if !client_ready_hello_enabled() {
-        return Ok(());
-    }
-    let previous_timeout = stream
-        .read_timeout()
-        .context("read stage connection timeout")?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(
-            CLIENT_READY_HELLO_OPT_IN_PEEK_MS,
-        )))
-        .context("set client ready hello peek timeout")?;
-    let mut bytes = [0_u8; 4];
-    let peek_result = stream.peek(&mut bytes);
-    stream
-        .set_read_timeout(previous_timeout)
-        .context("restore stage connection timeout")?;
-
-    match peek_result {
-        Ok(4) if i32::from_le_bytes(bytes) == READY_MAGIC => {
-            skippy_protocol::binary::recv_ready(&mut *stream)
-                .context("consume client ready hello")?;
-            eprintln!("binary consumed client ready hello");
-        }
-        Ok(_) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) => {}
-        Err(error) => return Err(error).context("peek optional client ready hello"),
-    }
-    Ok(())
-}
-
-fn client_ready_hello_enabled() -> bool {
-    env::var(CLIENT_READY_HELLO_ENV)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn handle_binary_connection(
     config: &StageConfig,
@@ -462,10 +406,8 @@ fn handle_binary_connection(
     first_message: StageWireMessage,
 ) -> Result<()> {
     if let Some(downstream) = downstream.as_mut() {
-        send_client_ready_hello_if_enabled(&mut *downstream)
-            .context("send downstream client ready hello")?;
-        skippy_protocol::binary::recv_ready(&mut *downstream)
-            .context("downstream binary stage did not become ready")?;
+        send_stage_open(&mut *downstream).context("open downstream binary stage")?;
+        downstream.flush().ok();
     }
 
     let connection_session_id = BINARY_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);

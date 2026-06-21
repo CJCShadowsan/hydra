@@ -15,8 +15,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use skippy_protocol::binary::{
-    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind, recv_ready, recv_reply,
-    write_stage_message,
+    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind, recv_reply,
+    send_stage_open, write_stage_message,
 };
 use skippy_protocol::{LoadMode, StageTopology, StageTopologyEntry};
 use skippy_runtime::{
@@ -2305,11 +2305,9 @@ fn connect_endpoint_ready(endpoint: &str, timeout_secs: u64) -> Result<TcpStream
         match TcpStream::connect(endpoint) {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();
-                match recv_ready(&mut stream) {
+                match send_stage_open(&mut stream) {
                     Ok(()) => return Ok(stream),
-                    Err(error) => {
-                        last_error = Some(anyhow!(error).context("ready handshake failed"))
-                    }
+                    Err(error) => last_error = Some(anyhow!(error).context("stage open failed")),
                 }
             }
             Err(error) => last_error = Some(anyhow!(error).context("connect failed")),

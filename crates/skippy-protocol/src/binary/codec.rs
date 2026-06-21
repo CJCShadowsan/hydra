@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use super::{
     MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
-    MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC, STAGE_STATE_VERSION,
+    MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, STAGE_OPEN_MAGIC, STAGE_STATE_VERSION,
     StageLogitBias, StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader,
     StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
     activation::{
@@ -12,14 +12,14 @@ use super::{
     invalid_data, invalid_input,
 };
 
-pub fn send_ready(mut writer: impl Write) -> io::Result<()> {
-    write_i32(&mut writer, READY_MAGIC)
+pub fn send_stage_open(mut writer: impl Write) -> io::Result<()> {
+    write_i32(&mut writer, STAGE_OPEN_MAGIC)
 }
 
-pub fn recv_ready(mut reader: impl Read) -> io::Result<()> {
+pub fn recv_stage_open(mut reader: impl Read) -> io::Result<()> {
     let magic = read_i32(&mut reader)?;
-    if magic != READY_MAGIC {
-        return Err(invalid_data("stage ready magic mismatch"));
+    if magic != STAGE_OPEN_MAGIC {
+        return Err(invalid_data("stage open magic mismatch"));
     }
     Ok(())
 }

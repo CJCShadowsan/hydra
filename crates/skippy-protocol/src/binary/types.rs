@@ -5,7 +5,7 @@ use super::{
     invalid_data,
 };
 
-pub const STAGE_STATE_VERSION: i32 = 6;
+pub const STAGE_STATE_VERSION: i32 = 7;
 pub const MAX_STAGE_LOGIT_BIAS: usize = 256;
 pub const MAX_STAGE_PREDICTED_TOKENS: usize = 262_144;
 pub const MAX_STAGE_SIDEBAND_VALUES: usize = 1_048_576;
@@ -13,7 +13,7 @@ pub const MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_STAGE_STATE_IMPORT_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_STAGE_ACTIVATION_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_STAGE_DECODED_ACTIVATION_BYTES: usize = 512 * 1024 * 1024;
-pub const READY_MAGIC: i32 = 0x5352_4459; // "SRDY"
+pub const STAGE_OPEN_MAGIC: i32 = 0x534F_504E; // "SOPN"
 pub const LLAMA_TOKEN_NULL: i32 = -1;
 pub const STAGE_STATE_HEADER_BYTES: usize = 10 * 4;
 pub const STAGE_SAMPLING_CONFIG_BASE_BYTES: usize = 10 * 4;

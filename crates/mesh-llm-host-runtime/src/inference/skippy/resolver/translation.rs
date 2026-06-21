@@ -235,6 +235,9 @@ impl ResolvedSkippyConfig {
                 0
             },
             adaptive_speculative_window: false,
+            ngram_speculative: false,
+            ngram_size: 4,
+            ngram_min_match: 3,
             draft_n_gpu_layers: if mode == "draft" {
                 self.speculative.draft_n_gpu_layers
             } else {
@@ -341,6 +344,9 @@ impl ResolvedEmbeddedOpenAiArgs {
             draft_model_path: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
+            ngram_speculative: false,
+            ngram_size: 4,
+            ngram_min_match: 3,
             draft_n_gpu_layers: None,
             activation_width: 0,
             wire_dtype,
@@ -370,6 +376,9 @@ impl ResolvedEmbeddedOpenAiArgs {
             draft_model_path: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
+            ngram_speculative: false,
+            ngram_size: 4,
+            ngram_min_match: 3,
             draft_n_gpu_layers: None,
             activation_width,
             wire_dtype,
@@ -403,6 +412,9 @@ impl ResolvedEmbeddedOpenAiArgs {
             draft_model_path: self.draft_model_path,
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,
+            ngram_speculative: self.ngram_speculative,
+            ngram_size: self.ngram_size,
+            ngram_min_match: self.ngram_min_match,
             draft_n_gpu_layers: self.draft_n_gpu_layers,
             activation_width: self.activation_width,
             wire_dtype: self.wire_dtype,

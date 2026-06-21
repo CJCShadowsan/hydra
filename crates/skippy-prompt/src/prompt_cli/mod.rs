@@ -22,8 +22,8 @@ use openai_frontend::{ReasoningConfig, normalize_reasoning_template_options};
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde_json::Value;
 use skippy_protocol::binary::{
-    LLAMA_TOKEN_NULL, READY_MAGIC, StageReply, StageReplyStats, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, recv_reply, state_flags,
+    LLAMA_TOKEN_NULL, StageReply, StageReplyStats, StageStateHeader, StageWireMessage,
+    WireActivationDType, WireMessageKind, WireReplyKind, recv_reply, send_stage_open, state_flags,
     write_stage_message,
 };
 use skippy_protocol::{

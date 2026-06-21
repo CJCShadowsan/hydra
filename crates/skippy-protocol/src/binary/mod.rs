@@ -8,17 +8,16 @@ pub use activation::{
     encode_f32_activation_payload_with_state_flags,
 };
 pub use codec::{
-    read_stage_message, recv_ready, recv_reply, send_ready, send_reply_ack,
-    send_reply_ack_with_stats, send_reply_predicted, send_reply_predicted_tokens_with_stats,
-    send_reply_predicted_with_stats, send_reply_predicted_with_tokens_and_stats,
-    write_stage_message,
+    read_stage_message, recv_reply, recv_stage_open, send_reply_ack, send_reply_ack_with_stats,
+    send_reply_predicted, send_reply_predicted_tokens_with_stats, send_reply_predicted_with_stats,
+    send_reply_predicted_with_tokens_and_stats, send_stage_open, write_stage_message,
 };
 pub use types::{
     ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_RWKV7_V_FIRST, LLAMA_TOKEN_NULL,
     MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
-    MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC,
-    STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES,
+    MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, STAGE_LOGIT_BIAS_WIRE_BYTES,
+    STAGE_OPEN_MAGIC, STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES,
     STAGE_STATE_VERSION, STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias, StageReply,
     StageReplyStats, StageRequestEpoch, StageSamplingConfig, StageStateHeader, StageWireMessage,
     WireActivationDType, WireMessageKind, WireReplyKind, WireStagePhase,
@@ -89,10 +88,10 @@ mod tests {
     }
 
     #[test]
-    fn ready_round_trips() {
+    fn stage_open_round_trips() {
         let mut bytes = Vec::new();
-        send_ready(&mut bytes).unwrap();
-        recv_ready(Cursor::new(bytes)).unwrap();
+        send_stage_open(&mut bytes).unwrap();
+        recv_stage_open(Cursor::new(bytes)).unwrap();
     }
 
     #[test]

@@ -45,7 +45,7 @@ size without changing the stage execution contract.
 
 - binary stage message and reply codecs
 - activation wire dtype conversion
-- ready handshake encoding
+- mandatory client-open stage stream encoding
 - stage config fields that must survive JSON generation, including K/V cache
   type strings consumed by the runtime layer
 - protocol compatibility constants

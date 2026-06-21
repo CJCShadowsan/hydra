@@ -17,14 +17,13 @@ use skippy_protocol::{
     StageConfig, StageTopology,
     binary::{
         StageReply, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
-        WireReplyKind, read_stage_message, recv_ready, recv_reply, send_ready,
-        send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_tokens_and_stats, write_stage_message,
+        WireReplyKind, read_stage_message, recv_reply, recv_stage_open, send_reply_ack_with_stats,
+        send_reply_predicted_tokens_with_stats, send_reply_predicted_with_tokens_and_stats,
+        send_stage_open, write_stage_message,
     },
 };
 
 use super::socket::{connect_downstream_socket, downstream_source_ip, resolve_downstream_endpoint};
-use super::{consume_optional_client_ready_hello, send_client_ready_hello_if_enabled};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PredictionReturnKey {
@@ -128,9 +127,7 @@ fn handle_prediction_return_connection(
     hub: Arc<PredictionReturnHub>,
     mut stream: TcpStream,
 ) -> Result<()> {
-    consume_optional_client_ready_hello(&mut stream)
-        .context("consume optional direct prediction return client ready hello")?;
-    send_ready(&mut stream).context("send direct prediction return ready")?;
+    recv_stage_open(&mut stream).context("receive direct prediction return stage open")?;
     let open = read_stage_message(&mut stream, 0).context("read direct prediction return open")?;
     hub.handle_return_connection(open, stream)
 }
@@ -304,9 +301,7 @@ pub(crate) fn open_prediction_return_stream(
         match connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2)) {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();
-                send_client_ready_hello_if_enabled(&mut stream)
-                    .context("send prediction return client ready hello")?;
-                recv_ready(&mut stream).context("prediction return sink did not become ready")?;
+                send_stage_open(&mut stream).context("open direct prediction return stage")?;
                 write_stage_message(
                     &mut stream,
                     &prediction_return_open_message(request_id, session_id),
@@ -344,9 +339,7 @@ pub(crate) fn open_downstream_prediction_return_stream(
     let mut stream = connect_downstream_socket(return_addr, source_ip, Duration::from_secs(2))
         .with_context(|| format!("connect downstream prediction return sink at {endpoint}"))?;
     stream.set_nodelay(true).ok();
-    send_client_ready_hello_if_enabled(&mut stream)
-        .context("send downstream prediction return client ready hello")?;
-    recv_ready(&mut stream).context("downstream prediction return sink did not become ready")?;
+    send_stage_open(&mut stream).context("open downstream prediction return stage")?;
     write_stage_message(
         &mut stream,
         &prediction_return_open_message(request_id, session_id),
