@@ -200,6 +200,11 @@ pub struct RunArgs {
     pub splits: String,
     #[arg(long, default_value_t = 40)]
     pub layer_end: u32,
+    #[arg(
+        long,
+        help = "Allow intentionally imbalanced layer ranges for reproducing historical split benchmarks."
+    )]
+    pub allow_imbalanced_splits: bool,
     #[arg(long, default_value_t = 128)]
     pub ctx_size: u32,
     #[arg(long, default_value_t = -1, allow_hyphen_values = true)]

@@ -334,7 +334,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
     let ranges = parse_stage_ranges(&args.splits, args.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_range_balance(&args, &ranges)?;
     validate_driver_args(&args)?;
     let run_id = args.run_id.clone().unwrap_or_else(generate_bench_run_id);
     let run_dir = args.work_dir.join(&run_id);
@@ -648,7 +648,7 @@ fn validate_focused_runtime_topology(run: &RunArgs) -> Result<()> {
     let ranges = parse_stage_ranges(&run.splits, run.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(run, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_range_balance(run, &ranges)?;
     Ok(())
 }
 
@@ -781,7 +781,7 @@ fn focused_runtime_schema_smoke_report(args: &FocusedRuntimeArgs) -> Result<Focu
     let ranges = parse_stage_ranges(&args.run.splits, args.run.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args.run, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_range_balance(&args.run, &ranges)?;
     let stage_count = ranges.len();
     let prompt_count = args.run.prompt_limit.unwrap_or(1);
     let model_identity = ModelIdentity::from_model_id(args.run.model_id.clone());
@@ -2769,6 +2769,13 @@ fn validate_balanced_stage_ranges(ranges: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
+fn validate_stage_range_balance(args: &RunArgs, ranges: &[(u32, u32)]) -> Result<()> {
+    if args.allow_imbalanced_splits {
+        return Ok(());
+    }
+    validate_balanced_stage_ranges(ranges)
+}
+
 fn parse_stage_ranges(splits: &str, layer_end: u32) -> Result<Vec<(u32, u32)>> {
     let mut boundaries = vec![0];
     for split in splits
@@ -2924,6 +2931,7 @@ mod tests {
             stage_load_mode: "layer-package".to_string(),
             splits: "1".to_string(),
             layer_end: 2,
+            allow_imbalanced_splits: false,
             ctx_size: 128,
             n_gpu_layers: 0,
             cache_type_k: "f16".to_string(),
@@ -3000,6 +3008,17 @@ mod tests {
             validate_balanced_stage_ranges(&parse_stage_ranges("12,20,28", 40).unwrap()).is_err()
         );
         assert!(validate_balanced_stage_ranges(&parse_stage_ranges("1,4,7", 40).unwrap()).is_err());
+    }
+
+    #[test]
+    fn imbalanced_stage_ranges_require_explicit_opt_in() {
+        let ranges = parse_stage_ranges("22", 48).unwrap();
+        let mut args = test_run_args();
+
+        assert!(validate_stage_range_balance(&args, &ranges).is_err());
+
+        args.allow_imbalanced_splits = true;
+        validate_stage_range_balance(&args, &ranges).unwrap();
     }
 
     #[test]
@@ -3482,6 +3501,7 @@ mod tests {
             stage_load_mode: "runtime-slice".to_string(),
             splits: "1".to_string(),
             layer_end: 2,
+            allow_imbalanced_splits: false,
             ctx_size: 128,
             n_gpu_layers: 0,
             cache_type_k: "f16".to_string(),
@@ -3673,6 +3693,7 @@ mod tests {
             stage_load_mode: "runtime-slice".to_string(),
             splits: "1".to_string(),
             layer_end: 2,
+            allow_imbalanced_splits: false,
             ctx_size: 128,
             n_gpu_layers: 0,
             cache_type_k: "f16".to_string(),
