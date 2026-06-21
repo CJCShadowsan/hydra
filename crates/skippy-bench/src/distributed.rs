@@ -1324,6 +1324,7 @@ fn driver_return_port(args: &RunArgs) -> u16 {
 fn execute_remote_plan(args: &RunArgs, plan: &DeploymentPlan) -> Result<Vec<ChildGuard>> {
     let mut sessions = Vec::with_capacity(plan.stages.len());
     let mut started_stages = Vec::with_capacity(plan.stages.len());
+    let stage_server_bin_map = parse_path_map(args.stage_server_bin_map.as_deref())?;
     for stage in plan.stages.iter().rev() {
         if stage.local {
             prepare_local_stage(args, stage)?;
@@ -1347,13 +1348,17 @@ fn execute_remote_plan(args: &RunArgs, plan: &DeploymentPlan) -> Result<Vec<Chil
             )
             .with_context(|| format!("create remote stage dir on {}", stage.host))?;
 
-            run_command(
-                Command::new("rsync")
-                    .arg("-az")
-                    .arg(&args.stage_server_bin)
-                    .arg(format!("{}:{remote_stage_dir}/skippy-server", stage.host)),
-            )
-            .with_context(|| format!("rsync stage server to {}", stage.host))?;
+            let remote_bin =
+                remote_stage_server_bin(&stage_server_bin_map, &stage.host, &remote_stage_dir);
+            if remote_bin.rsync_local_bin {
+                run_command(
+                    Command::new("rsync")
+                        .arg("-az")
+                        .arg(&args.stage_server_bin)
+                        .arg(format!("{}:{remote_stage_dir}/skippy-server", stage.host)),
+                )
+                .with_context(|| format!("rsync stage server to {}", stage.host))?;
+            }
 
             run_command(
                 Command::new("rsync")
@@ -1378,8 +1383,7 @@ fn execute_remote_plan(args: &RunArgs, plan: &DeploymentPlan) -> Result<Vec<Chil
                 rsync_model_artifacts(args, stage)?;
             }
 
-            let remote_bin = format!("{remote_stage_dir}/skippy-server");
-            let command = remote_start_command(args, plan, stage, &remote_bin);
+            let command = remote_start_command(args, plan, stage, &remote_bin.path);
             let mut ssh = Command::new("ssh");
             ssh.arg(&stage.host)
                 .arg(command)
@@ -2698,6 +2702,28 @@ fn parse_path_map(value: Option<&str>) -> Result<BTreeMap<String, PathBuf>> {
         .collect())
 }
 
+struct RemoteStageServerBin {
+    path: String,
+    rsync_local_bin: bool,
+}
+
+fn remote_stage_server_bin(
+    stage_server_bin_map: &BTreeMap<String, PathBuf>,
+    host: &str,
+    remote_stage_dir: &str,
+) -> RemoteStageServerBin {
+    if let Some(host_native_bin) = stage_server_bin_map.get(host) {
+        return RemoteStageServerBin {
+            path: path_string(host_native_bin),
+            rsync_local_bin: false,
+        };
+    }
+    RemoteStageServerBin {
+        path: format!("{remote_stage_dir}/skippy-server"),
+        rsync_local_bin: true,
+    }
+}
+
 fn model_ref_for_configs(args: &RunArgs) -> Result<String> {
     match args.stage_load_mode.as_str() {
         "runtime-slice" => args
@@ -2918,10 +2944,37 @@ mod tests {
     }
 
     #[test]
+    fn remote_stage_server_bin_uses_host_native_mapping() {
+        let mappings = parse_path_map(Some(
+            "micstudio=/Users/micn/src/mesh/target/release/skippy-server",
+        ))
+        .unwrap();
+
+        let selected = remote_stage_server_bin(&mappings, "micstudio", "/tmp/remote/run/stage-1");
+
+        assert_eq!(
+            selected.path,
+            "/Users/micn/src/mesh/target/release/skippy-server"
+        );
+        assert!(!selected.rsync_local_bin);
+    }
+
+    #[test]
+    fn remote_stage_server_bin_falls_back_to_rsynced_binary() {
+        let mappings = BTreeMap::new();
+
+        let selected = remote_stage_server_bin(&mappings, "micstudio", "/tmp/remote/run/stage-1");
+
+        assert_eq!(selected.path, "/tmp/remote/run/stage-1/skippy-server");
+        assert!(selected.rsync_local_bin);
+    }
+
+    #[test]
     fn builds_stable_stage_model_cache_key() {
         let args = RunArgs {
             metrics_server_bin: PathBuf::from("metrics-server"),
             stage_server_bin: PathBuf::from("skippy-server"),
+            stage_server_bin_map: None,
             hosts: "shadowfax.local,black.local".to_string(),
             run_id: Some("run-1".to_string()),
             topology_id: "quad/small".to_string(),
@@ -3492,6 +3545,7 @@ mod tests {
         let args = RunArgs {
             metrics_server_bin: PathBuf::from("metrics-server"),
             stage_server_bin: PathBuf::from("skippy-server"),
+            stage_server_bin_map: None,
             hosts: "host.local".to_string(),
             run_id: Some("run-1".to_string()),
             topology_id: "topology".to_string(),
@@ -3684,6 +3738,7 @@ mod tests {
         RunArgs {
             metrics_server_bin: PathBuf::from("metrics-server"),
             stage_server_bin: PathBuf::from("skippy-server"),
+            stage_server_bin_map: None,
             hosts: "host.local".to_string(),
             run_id: Some("run-1".to_string()),
             topology_id: "topology".to_string(),

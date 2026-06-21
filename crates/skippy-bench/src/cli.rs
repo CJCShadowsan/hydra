@@ -177,6 +177,11 @@ pub struct RunArgs {
     pub stage_server_bin: PathBuf,
     #[arg(
         long,
+        help = "Comma-separated host=/path map for host-native skippy-server binaries. When set for a remote host, skippy-bench uses that path in place and skips rsyncing --stage-server-bin to that host."
+    )]
+    pub stage_server_bin_map: Option<String>,
+    #[arg(
+        long,
         help = "Comma-separated unique stage hosts. Distributed lab runs require one separate node per stage."
     )]
     pub hosts: String,
