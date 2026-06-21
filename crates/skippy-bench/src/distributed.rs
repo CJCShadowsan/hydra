@@ -30,7 +30,10 @@ use skippy_topology::{
 };
 
 use crate::{
-    cli::{DEFAULT_RUN_MAX_NEW_TOKENS, FocusedRuntimeArgs, FocusedRuntimeScenario, RunArgs},
+    cli::{
+        DEFAULT_RUN_MAX_NEW_TOKENS, FocusedRuntimeArgs, FocusedRuntimeScenario, RunArgs, RunDriver,
+    },
+    distributed_openai::{OpenAiDriverReport, run_remote_openai_driver, wait_openai_ready},
     model_identity::model_identity_for_path,
     support::{ChildGuard, parse_wire_dtype, retry},
 };
@@ -50,6 +53,7 @@ struct DistributedRunOutcome {
     remote_status_path: Option<PathBuf>,
     driver_result_path: Option<PathBuf>,
     driver_report: Option<PromptDriverReport>,
+    openai_driver_report: Option<OpenAiDriverReport>,
     startup_elapsed: Option<Duration>,
     run_elapsed: Duration,
 }
@@ -330,6 +334,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args, &hosts, &ranges)?;
     validate_balanced_stage_ranges(&ranges)?;
+    validate_driver_args(&args)?;
     let run_id = args.run_id.clone().unwrap_or_else(generate_bench_run_id);
     let run_dir = args.work_dir.join(&run_id);
     let config_dir = run_dir.join("configs");
@@ -398,6 +403,14 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         "stage_downstream_wire_mbps": args.stage_downstream_wire_mbps,
         "stage_telemetry_queue_capacity": args.stage_telemetry_queue_capacity,
         "stage_telemetry_level": args.stage_telemetry_level,
+        "driver": format!("{:?}", args.driver),
+        "stage_native_mtp": args.stage_native_mtp,
+        "openai_port": args.openai_port,
+        "openai_speculative_window": args.openai_speculative_window,
+        "openai_adaptive_speculative_window": args.openai_adaptive_speculative_window,
+        "openai_ngram_speculative": args.openai_ngram_speculative,
+        "openai_ngram_size": args.openai_ngram_size,
+        "openai_ngram_min_match": args.openai_ngram_min_match,
         "stages": plan
             .stages
             .iter()
@@ -438,15 +451,30 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
     let mut protocol_ready = false;
     let mut startup_elapsed = None;
     let mut remote_sessions = Vec::new();
-    let run_result = (|| -> Result<(Value, PathBuf, Option<PromptDriverReport>)> {
+    let run_result =
+        (|| -> Result<(Value, PathBuf, Option<PromptDriverReport>, Option<OpenAiDriverReport>)> {
         let mut driver_result = None;
+        let mut openai_driver_result = None;
         if args.execute_remote {
             remote_sessions = execute_remote_plan(&args, &plan)?;
             wait_remote_readiness(&args, &plan)?;
+            if args.driver == RunDriver::OpenAiChat {
+                let base_url = openai_base_url(&args, &plan)?;
+                wait_openai_ready(&base_url, args.startup_timeout_secs)?;
+            }
             protocol_ready = true;
             startup_elapsed = Some(run_started.elapsed());
-            let result = run_remote_prompt_driver(&args, &plan)?;
-            driver_result = Some(result);
+            match args.driver {
+                RunDriver::Binary => {
+                    let result = run_remote_prompt_driver(&args, &plan)?;
+                    driver_result = Some(result);
+                }
+                RunDriver::OpenAiChat => {
+                    let result =
+                        run_remote_openai_driver(&args, openai_base_url(&args, &plan)?, plan.model_id.clone())?;
+                    openai_driver_result = Some(result);
+                }
+            }
         }
 
         thread::sleep(Duration::from_secs(1));
@@ -473,7 +501,10 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         if let Some(driver_result) = driver_result.as_ref() {
             write_json_file(&run_dir.join("driver-result.json"), driver_result)?;
         }
-        Ok((report, output, driver_result))
+        if let Some(openai_driver_result) = openai_driver_result.as_ref() {
+            write_json_file(&run_dir.join("driver-result.json"), openai_driver_result)?;
+        }
+        Ok((report, output, driver_result, openai_driver_result))
     })();
 
     let mut remote_status_path = None;
@@ -490,10 +521,9 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         }
     }
 
-    let (report, output, driver_report) = run_result?;
-    let driver_result_path = driver_report
-        .as_ref()
-        .map(|_| run_dir.join("driver-result.json"));
+    let (report, output, driver_report, openai_driver_report) = run_result?;
+    let driver_result_path = (driver_report.is_some() || openai_driver_report.is_some())
+        .then(|| run_dir.join("driver-result.json"));
 
     Ok(DistributedRunOutcome {
         run_id,
@@ -510,6 +540,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         remote_status_path,
         driver_result_path,
         driver_report,
+        openai_driver_report,
         startup_elapsed,
         run_elapsed: run_started.elapsed(),
     })
@@ -529,6 +560,14 @@ fn print_distributed_run_outcome(outcome: &DistributedRunOutcome) -> Result<()> 
             "report_counts": outcome.report_counts.clone(),
             "remote_status": outcome.remote_status_path.clone(),
             "driver_result": outcome.driver_result_path.clone(),
+            "openai_driver_summary": outcome
+                .openai_driver_report
+                .as_ref()
+                .map(|report| json!({
+                    "completion_tokens_total": report.summary.completion_tokens_total,
+                    "generated_tokens_per_second": report.summary.generated_tokens_per_second,
+                    "error_count": report.summary.error_count,
+                })),
         }))?
     );
 
@@ -933,6 +972,19 @@ fn validate_topology_plan(args: &RunArgs, hosts: &[String], ranges: &[(u32, u32)
     Ok(())
 }
 
+fn validate_driver_args(args: &RunArgs) -> Result<()> {
+    if args.openai_ngram_speculative && args.openai_speculative_window == 0 {
+        bail!("--openai-ngram-speculative requires --openai-speculative-window > 0");
+    }
+    if args.openai_ngram_speculative && args.openai_ngram_size == 0 {
+        bail!("--openai-ngram-size must be greater than zero");
+    }
+    if args.openai_ngram_min_match > args.openai_ngram_size && args.openai_ngram_speculative {
+        bail!("--openai-ngram-min-match cannot exceed --openai-ngram-size");
+    }
+    Ok(())
+}
+
 fn split_boundaries_from_ranges(ranges: &[(u32, u32)]) -> Vec<u32> {
     ranges
         .iter()
@@ -1239,6 +1291,19 @@ fn endpoint_host(endpoint: &str) -> Result<&str> {
         .with_context(|| format!("endpoint is missing port: {endpoint}"))
 }
 
+fn openai_base_url(args: &RunArgs, plan: &DeploymentPlan) -> Result<String> {
+    let first = plan
+        .stages
+        .first()
+        .context("deployment plan has no stages")?;
+    let endpoint = first
+        .endpoint
+        .strip_prefix("tcp://")
+        .unwrap_or(&first.endpoint);
+    let host = endpoint_host(endpoint)?;
+    Ok(format!("http://{host}:{}/v1", args.openai_port))
+}
+
 fn driver_return_port(args: &RunArgs) -> u16 {
     args.first_stage_port.saturating_add(1000).max(1)
 }
@@ -1458,8 +1523,10 @@ fn stage_server_command(
         .stage_downstream_wire_mbps
         .map(|mbps| format!(" --downstream-wire-mbps {mbps}"))
         .unwrap_or_default();
+    let openai_args = openai_stage_args(args, plan, stage);
     format!(
-        "{} serve-binary --config {} --topology {} --activation-width {} --activation-wire-dtype {} --metrics-otlp-grpc {} --telemetry-queue-capacity {} --telemetry-level {} --max-inflight {}{}{} --downstream-wire-delay-ms {}{}",
+        "{}{} serve-binary --config {} --topology {} --activation-width {} --activation-wire-dtype {} --metrics-otlp-grpc {} --telemetry-queue-capacity {} --telemetry-level {} --max-inflight {}{}{} --downstream-wire-delay-ms {}{}{}",
+        stage_env_prefix(args),
         shell_quote(bin),
         shell_quote(config_path),
         shell_quote(
@@ -1475,7 +1542,52 @@ fn stage_server_command(
         async_prefill_forward_arg,
         args.stage_downstream_wire_delay_ms,
         downstream_wire_mbps_arg,
+        openai_args,
     )
+}
+
+fn stage_env_prefix(args: &RunArgs) -> String {
+    if args.stage_native_mtp {
+        "SKIPPY_NATIVE_MTP_ENABLED=1 ".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn openai_stage_args(args: &RunArgs, plan: &DeploymentPlan, stage: &StageAssignment) -> String {
+    if args.driver != RunDriver::OpenAiChat || stage.stage_index != 0 {
+        return String::new();
+    }
+    let bind_host = endpoint_host(&stage.bind_addr).unwrap_or("0.0.0.0");
+    let mut parts = vec![
+        format!(
+            "--openai-bind-addr {}",
+            shell_quote(&format!("{bind_host}:{}", args.openai_port))
+        ),
+        format!("--openai-model-id {}", shell_quote(&plan.model_id)),
+        format!(
+            "--openai-default-max-tokens {}",
+            effective_run_max_new_tokens(args)
+        ),
+    ];
+    if args.openai_speculative_window > 0 {
+        parts.push(format!(
+            "--openai-speculative-window {}",
+            args.openai_speculative_window
+        ));
+    }
+    if args.openai_adaptive_speculative_window {
+        parts.push("--openai-adaptive-speculative-window".to_string());
+    }
+    if args.openai_ngram_speculative {
+        parts.push("--openai-ngram-speculative".to_string());
+        parts.push(format!("--openai-ngram-size {}", args.openai_ngram_size));
+        parts.push(format!(
+            "--openai-ngram-min-match {}",
+            args.openai_ngram_min_match
+        ));
+    }
+    format!(" {}", parts.join(" "))
 }
 
 fn wait_remote_readiness(args: &RunArgs, plan: &DeploymentPlan) -> Result<Vec<RemoteStageStatus>> {
@@ -2837,6 +2949,15 @@ mod tests {
             stage_downstream_wire_mbps: None,
             stage_telemetry_queue_capacity: 8192,
             stage_telemetry_level: "summary".to_string(),
+            driver: RunDriver::Binary,
+            stage_native_mtp: false,
+            openai_port: 19337,
+            openai_request_timeout_secs: 600,
+            openai_speculative_window: 0,
+            openai_adaptive_speculative_window: false,
+            openai_ngram_speculative: false,
+            openai_ngram_size: 4,
+            openai_ngram_min_match: 3,
         };
 
         assert_eq!(
@@ -3322,6 +3443,15 @@ mod tests {
             stage_downstream_wire_mbps: Some(1000.0),
             stage_telemetry_queue_capacity: 8192,
             stage_telemetry_level: "summary".to_string(),
+            driver: RunDriver::Binary,
+            stage_native_mtp: false,
+            openai_port: 19337,
+            openai_request_timeout_secs: 600,
+            openai_speculative_window: 0,
+            openai_adaptive_speculative_window: false,
+            openai_ngram_speculative: false,
+            openai_ngram_size: 4,
+            openai_ngram_min_match: 3,
         };
         let plan = DeploymentPlan {
             run_id: "run-1".to_string(),
@@ -3383,6 +3513,73 @@ mod tests {
         assert!(command.contains("summary"));
     }
 
+    #[test]
+    fn openai_driver_adds_stage0_serving_and_native_mtp_flags() {
+        let mut args = test_run_args();
+        args.driver = RunDriver::OpenAiChat;
+        args.stage_native_mtp = true;
+        args.openai_port = 19338;
+        args.openai_speculative_window = 4;
+        args.openai_ngram_speculative = true;
+        args.openai_ngram_size = 5;
+        args.openai_ngram_min_match = 3;
+        let plan = DeploymentPlan {
+            run_id: "run-1".to_string(),
+            topology_id: "topology".to_string(),
+            model_id: "test-org/bench-model-GGUF:Q4_K_M".to_string(),
+            model_identity: ModelIdentity::from_model_id("test-org/bench-model-GGUF:Q4_K_M"),
+            hosts: vec!["host.local".to_string()],
+            stage_load_mode: "runtime-slice".to_string(),
+            remote_root: "/tmp/remote".to_string(),
+            remote_roots: BTreeMap::new(),
+            remote_shared_roots: BTreeMap::new(),
+            endpoint_hosts: BTreeMap::new(),
+            work_dir: PathBuf::from("/tmp/work"),
+            metrics_http: "http://127.0.0.1:18080".to_string(),
+            metrics_otlp_grpc: "http://coordinator.local:14317".to_string(),
+            driver_return_endpoint: "host.local:20031".to_string(),
+            stages: Vec::new(),
+            execute_remote: true,
+            keep_remote: false,
+            rsync_model_artifacts: false,
+        };
+        let stage = StageAssignment {
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            host: "host.local".to_string(),
+            local: false,
+            layer_start: 0,
+            layer_end: 1,
+            bind_addr: "0.0.0.0:19031".to_string(),
+            endpoint: "tcp://host.local:19031".to_string(),
+            config_path: PathBuf::from("/tmp/local/stage.json"),
+            remote_config_path: "/tmp/remote/run-1/stage-0/stage.json".to_string(),
+            remote_log_path: "/tmp/remote/run-1/stage-0/stage.log".to_string(),
+            remote_pid_path: "/tmp/remote/run-1/stage-0/stage.pid".to_string(),
+            remote_exit_code_path: "/tmp/remote/run-1/stage-0/stage.exit".to_string(),
+            remote_model_path: None,
+            local_materialized_model_path: None,
+            local_shared_model_path: None,
+            selected_package_files: Vec::new(),
+        };
+
+        let command = remote_start_command(
+            &args,
+            &plan,
+            &stage,
+            "/tmp/remote/run-1/stage-0/skippy-server",
+        );
+
+        assert!(command.contains("SKIPPY_NATIVE_MTP_ENABLED=1"));
+        assert!(command.contains("--openai-bind-addr"));
+        assert!(command.contains("0.0.0.0:19338"));
+        assert!(command.contains("--openai-model-id"));
+        assert!(command.contains("--openai-speculative-window 4"));
+        assert!(command.contains("--openai-ngram-speculative"));
+        assert!(command.contains("--openai-ngram-size 5"));
+        assert!(command.contains("--openai-ngram-min-match 3"));
+    }
+
     fn test_run_args() -> RunArgs {
         RunArgs {
             metrics_server_bin: PathBuf::from("metrics-server"),
@@ -3434,6 +3631,15 @@ mod tests {
             stage_downstream_wire_mbps: None,
             stage_telemetry_queue_capacity: 8192,
             stage_telemetry_level: "summary".to_string(),
+            driver: RunDriver::Binary,
+            stage_native_mtp: false,
+            openai_port: 19337,
+            openai_request_timeout_secs: 600,
+            openai_speculative_window: 0,
+            openai_adaptive_speculative_window: false,
+            openai_ngram_speculative: false,
+            openai_ngram_size: 4,
+            openai_ngram_min_match: 3,
         }
     }
 

@@ -50,6 +50,12 @@ impl FocusedRuntimeScenario {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RunDriver {
+    Binary,
+    OpenAiChat,
+}
+
 #[derive(Parser)]
 pub struct FocusedRuntimeArgs {
     #[arg(long, value_enum, default_value_t = FocusedRuntimeScenario::SteadyDecode)]
@@ -294,6 +300,27 @@ pub struct RunArgs {
         help = "Stage telemetry volume: off, summary, or debug. Perf runs should use summary."
     )]
     pub stage_telemetry_level: String,
+    #[arg(long, value_enum, default_value_t = RunDriver::Binary)]
+    pub driver: RunDriver,
+    #[arg(
+        long,
+        help = "Set SKIPPY_NATIVE_MTP_ENABLED=1 for stage servers so final-stage replies include native MTP sideband drafts."
+    )]
+    pub stage_native_mtp: bool,
+    #[arg(long, default_value_t = 19337)]
+    pub openai_port: u16,
+    #[arg(long, default_value_t = 600)]
+    pub openai_request_timeout_secs: u64,
+    #[arg(long, default_value_t = 0)]
+    pub openai_speculative_window: usize,
+    #[arg(long)]
+    pub openai_adaptive_speculative_window: bool,
+    #[arg(long)]
+    pub openai_ngram_speculative: bool,
+    #[arg(long, default_value_t = 4)]
+    pub openai_ngram_size: usize,
+    #[arg(long, default_value_t = 3)]
+    pub openai_ngram_min_match: usize,
 }
 
 #[derive(Parser)]

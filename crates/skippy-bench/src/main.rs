@@ -1,6 +1,7 @@
 mod chat_corpus;
 mod cli;
 mod distributed;
+mod distributed_openai;
 mod local_single;
 mod local_split;
 mod model_identity;
