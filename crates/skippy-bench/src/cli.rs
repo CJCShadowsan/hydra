@@ -114,6 +114,20 @@ pub struct VerifySpanLocalArgs {
     pub iterations: usize,
     #[arg(long, default_value_t = 8)]
     pub warmup: usize,
+    #[arg(long, default_value_t = 2)]
+    pub verify_width: usize,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Explicit VerifySpan input token ids. When set, overrides post-prefill/native-MTP token selection."
+    )]
+    pub verify_token_ids: Vec<i32>,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub post_prefill_seed: bool,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub chat_template: bool,
+    #[arg(long, default_value = "Answer deterministically and briefly.")]
+    pub chat_system: String,
     #[arg(
         long,
         default_value = "Write a Rust function that parses a list of integers and returns the median."
@@ -537,6 +551,10 @@ mod tests {
         assert_eq!(args.iterations, 3);
         assert_eq!(args.warmup, 1);
         assert_eq!(args.n_gpu_layers, -1);
+        assert_eq!(args.verify_width, 2);
+        assert!(!args.post_prefill_seed);
+        assert!(!args.chat_template);
+        assert_eq!(args.chat_system, "Answer deterministically and briefly.");
     }
 
     #[test]
@@ -556,5 +574,33 @@ mod tests {
         };
 
         assert_eq!(args.split_layer, Some(24));
+    }
+
+    #[test]
+    fn parses_verify_span_local_post_prefill_seed() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-span-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--post-prefill-seed",
+            "true",
+            "--verify-width",
+            "4",
+            "--chat-template",
+            "true",
+            "--chat-system",
+            "Stay terse.",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifySpanLocal(args) = cli.command else {
+            panic!("expected verify-span-local subcommand");
+        };
+
+        assert!(args.post_prefill_seed);
+        assert_eq!(args.verify_width, 4);
+        assert!(args.chat_template);
+        assert_eq!(args.chat_system, "Stay terse.");
     }
 }

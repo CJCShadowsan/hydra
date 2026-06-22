@@ -165,6 +165,7 @@ pub enum PlanReasonCode {
     RecurrentStateTransferAllowed,
     RecurrentStateTransferRejected,
     SharedKvRegionCut,
+    GlmDsaSharedIndexerBoundary,
     TokenSidebandRequired,
     ActivationSidebandRequired,
     DefaultWireDtypeF16,
@@ -252,6 +253,7 @@ pub struct SplitConstraint {
 #[serde(rename_all = "snake_case")]
 pub enum SplitConstraintKind {
     SharedKvProducerConsumer,
+    GlmDsaSharedIndexerBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1375,6 +1377,9 @@ fn apply_family_boundary_rules(
             *decision = BoundaryDecision::Rejected;
             reason_codes.push(match constraint.kind {
                 SplitConstraintKind::SharedKvProducerConsumer => PlanReasonCode::SharedKvRegionCut,
+                SplitConstraintKind::GlmDsaSharedIndexerBoundary => {
+                    PlanReasonCode::GlmDsaSharedIndexerBoundary
+                }
             });
             messages.push(constraint.reason.clone());
         }
@@ -1483,7 +1488,13 @@ fn diagnostics_for(
                     .reason_codes
                     .iter()
                     .copied()
-                    .find(|code| *code == PlanReasonCode::SharedKvRegionCut)
+                    .find(|code| {
+                        matches!(
+                            code,
+                            PlanReasonCode::SharedKvRegionCut
+                                | PlanReasonCode::GlmDsaSharedIndexerBoundary
+                        )
+                    })
                     .unwrap_or(PlanReasonCode::RecurrentStateTransferRejected),
                 message: format!(
                     "boundary at layer {} is rejected: {}",
@@ -1635,6 +1646,52 @@ pub fn glm4_capability(layer_count: u32, activation_width: u32) -> FamilyCapabil
         WireValidation::Rejected,
         ExactStateMobility::Accepted,
     )
+}
+
+pub fn glm_dsa_capability(layer_count: u32, activation_width: u32) -> FamilyCapabilityRecord {
+    FamilyCapabilityRecord {
+        family_id: "glm_dsa".to_string(),
+        layer_count,
+        activation_width,
+        default_wire_dtype: WireDType::F16,
+        q8_wire_validation: WireValidation::Untested,
+        exact_state_mobility: ExactStateMobility::Untested,
+        recurrent_ranges: Vec::new(),
+        split_constraints: glm_dsa_split_constraints(layer_count),
+        sidebands: Vec::new(),
+    }
+}
+
+fn glm_dsa_split_constraints(layer_count: u32) -> Vec<SplitConstraint> {
+    let forbidden_boundaries = glm_dsa_shared_indexer_forbidden_boundaries(layer_count);
+    if forbidden_boundaries.is_empty() {
+        return Vec::new();
+    }
+
+    vec![SplitConstraint {
+        kind: SplitConstraintKind::GlmDsaSharedIndexerBoundary,
+        range: LayerRange {
+            start: 0,
+            end: layer_count,
+        },
+        forbidden_boundaries,
+        reject_boundary_inside: false,
+        reason: "GLM_DSA shared-indexer layers reuse the previous full layer's top-k; until a top-k sideband is carried across activation boundaries, split stages must start on full-indexer layers".to_string(),
+    }]
+}
+
+fn glm_dsa_shared_indexer_forbidden_boundaries(layer_count: u32) -> Vec<u32> {
+    if layer_count != 78 {
+        return Vec::new();
+    }
+
+    (1..layer_count)
+        .filter(|boundary| !glm_dsa_full_indexer_layer(*boundary))
+        .collect()
+}
+
+fn glm_dsa_full_indexer_layer(layer: u32) -> bool {
+    layer < 3 || (layer - 2).is_multiple_of(4)
 }
 
 pub fn gemma2_capability(layer_count: u32, activation_width: u32) -> FamilyCapabilityRecord {
@@ -1970,6 +2027,13 @@ pub fn infer_family_capability(
     }
     if compact.contains("glm4") {
         return Some(glm4_capability(layer_count, activation_width));
+    }
+    if compact.contains("glm52")
+        || compact.contains("glm5.2")
+        || compact.contains("glmdsa")
+        || compact.contains("glmmoedsa")
+    {
+        return Some(glm_dsa_capability(layer_count, activation_width));
     }
     if compact.contains("deepseek2ocr") || compact.contains("deepseekocr") {
         return Some(deepseek2ocr_capability(layer_count, activation_width));

@@ -1,9 +1,12 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 27;
+pub const ABI_VERSION_PATCH: u32 = 30;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
+pub const FEATURE_SESSION_OVERWRITE: u64 = 1 << 26;
+pub const FEATURE_TREE_GATHER: u64 = 1 << 27;
+pub const FEATURE_TREE_VERIFY: u64 = 1 << 28;
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -197,6 +200,7 @@ pub struct RuntimeConfig {
     pub filter_tensors_on_load: bool,
     pub include_embeddings: bool,
     pub include_output: bool,
+    pub tree_sequence_count: i32,
     pub selected_backend_device: *const c_char,
 }
 
@@ -590,6 +594,9 @@ mod dynamic {
         skippy_session_begin_external_decode(session: *mut Session, out_error: *mut *mut Error) -> Status;
         skippy_session_end_external_decode(session: *mut Session, out_error: *mut *mut Error) -> Status;
         skippy_session_set_position(session: *mut Session, n_past: i32, out_error: *mut *mut Error) -> Status;
+        skippy_session_overwrite_suffix(session: *mut Session, token_count: u64, out_error: *mut *mut Error) -> Status;
+        skippy_session_gather_kv_path(session: *mut Session, source_seq_id: i32, dest_start: u64, source_positions: *const u64, position_count: usize, token_ids: *const i32, token_count: usize, out_error: *mut *mut Error) -> Status;
+        skippy_session_gather_tree_path(session: *mut Session, source_leaf_index: u32, dest_start: u64, source_positions: *const u64, position_count: usize, token_ids: *const i32, token_count: usize, out_error: *mut *mut Error) -> Status;
         skippy_session_sample_current(session: *mut Session, sampling: *const SamplingConfig, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
         skippy_session_configure_chat_sampling(session: *mut Session, sampling: *const SamplingConfig, metadata_json: *const c_char, prompt_token_count: u64, out_error: *mut *mut Error) -> Status;
         skippy_session_reset(session: *mut Session, out_error: *mut *mut Error) -> Status;
@@ -608,6 +615,7 @@ mod dynamic {
         skippy_decode_step_frame_sampled_mtp_n1(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_mtp_draft: *mut NativeMtpDraft, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_frame_batch_sampled(sessions: *const *mut Session, token_ids: *const i32, sampling: *const *const SamplingConfig, input_descs: *const *const ActivationDesc, input_payloads: *const *const c_void, output_descs: *mut ActivationDesc, output_payloads: *const *mut c_void, output_payload_capacities: *const usize, out_output_payload_bytes: *mut usize, out_predicted_tokens: *mut i32, predicted_token_capacity: usize, request_count: usize, out_error: *mut *mut Error) -> Status;
         skippy_verify_tokens_frame_sampled(session: *mut Session, token_ids: *const i32, token_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
+        skippy_verify_tree_frame_sampled(session: *mut Session, token_ids: *const i32, parent_indices: *const i32, depths: *const u32, node_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_session_copy_output_activation_frame(session: *mut Session, token_count: usize, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_session_last_token_signal(session: *mut Session, out_signal: *mut TokenSignal, out_error: *mut *mut Error) -> Status;
         skippy_session_signal_window(session: *mut Session, window_tokens: u32, out_window: *mut GenerationSignalWindow, out_error: *mut *mut Error) -> Status;
@@ -810,6 +818,36 @@ unsafe extern "C" {
         out_error: *mut *mut Error,
     ) -> Status;
 
+    pub fn skippy_session_overwrite_suffix(
+        session: *mut Session,
+        token_count: u64,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn skippy_session_gather_kv_path(
+        session: *mut Session,
+        source_seq_id: i32,
+        dest_start: u64,
+        source_positions: *const u64,
+        position_count: usize,
+        token_ids: *const i32,
+        token_count: usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn skippy_session_gather_tree_path(
+        session: *mut Session,
+        source_leaf_index: u32,
+        dest_start: u64,
+        source_positions: *const u64,
+        position_count: usize,
+        token_ids: *const i32,
+        token_count: usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
     pub fn skippy_session_sample_current(
         session: *mut Session,
         sampling: *const SamplingConfig,
@@ -950,6 +988,26 @@ unsafe extern "C" {
         session: *mut Session,
         token_ids: *const i32,
         token_count: usize,
+        sampling: *const SamplingConfig,
+        input_desc: *const ActivationDesc,
+        input_payload: *const c_void,
+        output_desc: *mut ActivationDesc,
+        output_payload: *mut c_void,
+        output_payload_capacity: usize,
+        out_output_payload_bytes: *mut usize,
+        output_tokens: *mut i32,
+        output_token_capacity: usize,
+        out_token_count: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn skippy_verify_tree_frame_sampled(
+        session: *mut Session,
+        token_ids: *const i32,
+        parent_indices: *const i32,
+        depths: *const u32,
+        node_count: usize,
         sampling: *const SamplingConfig,
         input_desc: *const ActivationDesc,
         input_payload: *const c_void,

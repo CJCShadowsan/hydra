@@ -23,6 +23,7 @@ pub(super) struct SplitTopologyPlanInput {
     pub(super) parallel_lanes_override: Option<usize>,
     pub(super) target_decode_tpot_ms: Option<u32>,
     pub(super) minimum_nodes: usize,
+    pub(super) preferred_stage0_node_id: Option<String>,
     pub(super) nodes: Vec<SplitTopologyPlanNode>,
 }
 
@@ -54,12 +55,14 @@ pub(super) struct RuntimeSliceStagePlan {
     pub(super) parameter_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SplitTopologyResourceInputs {
     pub(super) native_context_length: u32,
     pub(super) kv_bytes_per_token: u64,
     pub(super) ctx_size_override: Option<u32>,
     pub(super) parallel_override: Option<usize>,
+    pub(super) preferred_stage0_node_id: Option<iroh::EndpointId>,
+    pub(super) forced_boundaries: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,6 +79,7 @@ pub(super) fn plan_split_topology(input: SplitTopologyPlanInput) -> Result<Split
         model_weight_bytes: input.model_weight_bytes,
         kv_bytes_per_token: input.kv_bytes_per_token,
         minimum_nodes: input.minimum_nodes,
+        preferred_stage0_node_id: input.preferred_stage0_node_id,
         nodes: input
             .nodes
             .into_iter()
@@ -140,20 +144,25 @@ pub(super) fn plan_runtime_slice_topology_with_resources(
         "planning resource-aware split runtime topology"
     );
 
-    let participant_by_id = participant_index_by_id(participants);
-    let plan_input = runtime_slice_plan_input(package, participants, resources);
+    let plan_input = runtime_slice_plan_input(package, participants, &resources);
     let plan = plan_runtime_slice_topology_result(
         topology_id,
         model_ref,
         package,
         participants,
         excluded,
-        resources,
+        resources.clone(),
         plan_input,
     )?;
 
-    let mut stages = map_runtime_slice_stages(plan.stages, &participant_by_id)?;
-    stages.sort_by_key(|stage| stage.stage_index);
+    let stages = runtime_slice_stages_for_plan(
+        topology_id,
+        model_ref,
+        package,
+        participants,
+        &resources,
+        &plan,
+    )?;
     validate_split_capacity(model_ref, package, participants, &stages, excluded)?;
     tracing::info!(
         topology_id,
@@ -170,6 +179,31 @@ pub(super) fn plan_runtime_slice_topology_with_resources(
         context_length: plan.context_length,
         slots: plan.parallel_lanes,
     })
+}
+
+fn runtime_slice_stages_for_plan(
+    topology_id: &str,
+    model_ref: &str,
+    package: &skippy::SkippyPackageIdentity,
+    participants: &[SplitParticipant],
+    resources: &SplitTopologyResourceInputs,
+    plan: &SplitTopologyPlan,
+) -> Result<Vec<RuntimeSliceStagePlan>> {
+    let mut stages = if let Some(boundaries) = resources.forced_boundaries.as_deref() {
+        forced_runtime_slice_stages_with_warning(
+            topology_id,
+            model_ref,
+            package,
+            participants,
+            resources.preferred_stage0_node_id,
+            boundaries,
+        )?
+    } else {
+        let participant_by_id = participant_index_by_id(participants);
+        map_runtime_slice_stages(&plan.stages, &participant_by_id)?
+    };
+    stages.sort_by_key(|stage| stage.stage_index);
+    Ok(stages)
 }
 
 fn plan_runtime_slice_topology_result(
@@ -216,7 +250,7 @@ fn participant_index_by_id(participants: &[SplitParticipant]) -> HashMap<String,
 fn runtime_slice_plan_input(
     package: &skippy::SkippyPackageIdentity,
     participants: &[SplitParticipant],
-    resources: SplitTopologyResourceInputs,
+    resources: &SplitTopologyResourceInputs,
 ) -> SplitTopologyPlanInput {
     SplitTopologyPlanInput {
         native_context_length: resources.native_context_length,
@@ -226,7 +260,10 @@ fn runtime_slice_plan_input(
         context_length_override: resources.ctx_size_override,
         parallel_lanes_override: resources.parallel_override,
         target_decode_tpot_ms: Some(DEFAULT_TARGET_DECODE_TPOT_MS),
-        minimum_nodes: super::local::SPLIT_DEFAULT_MIN_PARTICIPANTS,
+        minimum_nodes: super::local::split_min_participants(),
+        preferred_stage0_node_id: resources
+            .preferred_stage0_node_id
+            .map(|node_id| node_id.to_string()),
         nodes: participants
             .iter()
             .map(|participant| SplitTopologyPlanNode {
@@ -241,17 +278,17 @@ fn runtime_slice_plan_input(
 }
 
 fn map_runtime_slice_stages(
-    stages: Vec<TopologyStagePlan>,
+    stages: &[TopologyStagePlan],
     participant_by_id: &HashMap<String, SplitParticipant>,
 ) -> Result<Vec<RuntimeSliceStagePlan>> {
     stages
-        .into_iter()
+        .iter()
         .map(|stage| {
             let participant = participant_by_id.get(&stage.node_id).ok_or_else(|| {
                 anyhow::anyhow!("topology planner returned unknown node {}", stage.node_id)
             })?;
             Ok(RuntimeSliceStagePlan {
-                stage_id: stage.stage_id,
+                stage_id: stage.stage_id.clone(),
                 stage_index: stage.stage_index,
                 node_id: participant.node_id,
                 layer_start: stage.layer_start,
@@ -260,6 +297,102 @@ fn map_runtime_slice_stages(
             })
         })
         .collect()
+}
+
+fn forced_runtime_slice_stages_with_warning(
+    topology_id: &str,
+    model_ref: &str,
+    package: &skippy::SkippyPackageIdentity,
+    participants: &[SplitParticipant],
+    preferred_stage0_node_id: Option<iroh::EndpointId>,
+    forced_boundaries: &[u32],
+) -> Result<Vec<RuntimeSliceStagePlan>> {
+    tracing::warn!(
+        topology_id,
+        model_ref,
+        boundaries = ?forced_boundaries,
+        "using validation-only forced split boundaries"
+    );
+    forced_runtime_slice_stages(
+        package,
+        participants,
+        preferred_stage0_node_id,
+        forced_boundaries,
+    )
+}
+
+fn forced_runtime_slice_stages(
+    package: &skippy::SkippyPackageIdentity,
+    participants: &[SplitParticipant],
+    preferred_stage0_node_id: Option<iroh::EndpointId>,
+    forced_boundaries: &[u32],
+) -> Result<Vec<RuntimeSliceStagePlan>> {
+    let boundaries = validated_forced_boundaries(package.layer_count, forced_boundaries)?;
+    let stage_count = boundaries.len().saturating_sub(1);
+    anyhow::ensure!(
+        participants.len() >= stage_count,
+        "forced split boundaries require {stage_count} participant(s), have {}",
+        participants.len()
+    );
+    let participants = ordered_forced_split_participants(participants, preferred_stage0_node_id);
+    let bytes_per_layer = package
+        .source_model_bytes
+        .div_ceil(u64::from(package.layer_count.max(1)));
+    boundaries
+        .windows(2)
+        .enumerate()
+        .map(|(stage_index, range)| {
+            let layer_start = range[0];
+            let layer_end = range[1];
+            let layer_span = layer_end.saturating_sub(layer_start);
+            let participant = participants
+                .get(stage_index)
+                .context("forced split participant disappeared")?;
+            Ok(RuntimeSliceStagePlan {
+                stage_id: format!("stage-{stage_index}"),
+                stage_index: stage_index as u32,
+                node_id: participant.node_id,
+                layer_start,
+                layer_end,
+                parameter_bytes: bytes_per_layer.saturating_mul(u64::from(layer_span)),
+            })
+        })
+        .collect()
+}
+
+fn validated_forced_boundaries(layer_count: u32, forced_boundaries: &[u32]) -> Result<Vec<u32>> {
+    anyhow::ensure!(
+        !forced_boundaries.is_empty(),
+        "forced split boundaries cannot be empty"
+    );
+    let mut previous = 0;
+    let mut boundaries = Vec::with_capacity(forced_boundaries.len() + 2);
+    boundaries.push(0);
+    for &boundary in forced_boundaries {
+        anyhow::ensure!(
+            boundary > previous && boundary < layer_count,
+            "invalid forced split boundary {boundary}; expected {previous} < boundary < {layer_count}"
+        );
+        boundaries.push(boundary);
+        previous = boundary;
+    }
+    boundaries.push(layer_count);
+    Ok(boundaries)
+}
+
+fn ordered_forced_split_participants(
+    participants: &[SplitParticipant],
+    preferred_stage0_node_id: Option<iroh::EndpointId>,
+) -> Vec<SplitParticipant> {
+    let mut ordered = participants.to_vec();
+    if let Some(preferred) = preferred_stage0_node_id
+        && let Some(position) = ordered
+            .iter()
+            .position(|participant| participant.node_id == preferred)
+    {
+        ordered[..=position].rotate_right(1);
+    }
+    ordered
 }
 
 fn split_topology_failure_reason(
@@ -623,6 +756,8 @@ mod tests {
                 kv_bytes_per_token: 16 * 1024,
                 ctx_size_override: None,
                 parallel_override: None,
+                preferred_stage0_node_id: None,
+                forced_boundaries: None,
             },
         )
         .expect("resource-aware topology");
@@ -654,6 +789,8 @@ mod tests {
                 kv_bytes_per_token: 64 * 1024,
                 ctx_size_override: None,
                 parallel_override: None,
+                preferred_stage0_node_id: None,
+                forced_boundaries: None,
             },
         )
         .expect("latency-aware runtime topology");
@@ -662,6 +799,111 @@ mod tests {
         assert_eq!(plan.stages.len(), 2);
         assert_eq!(plan.stages.first().unwrap().layer_start, 0);
         assert_eq!(plan.stages.last().unwrap().layer_end, 40);
+    }
+
+    #[test]
+    fn resource_planner_pins_preferred_stage0() {
+        let preferred = participant(1, 16_000_000_000);
+        let larger = participant(2, 48_000_000_000);
+        let participants = vec![preferred, larger];
+
+        let plan = plan_runtime_slice_topology_with_resources(
+            "topology-test",
+            "model-a",
+            &package(40, 40_000_000_000),
+            &participants,
+            &[],
+            SplitTopologyResourceInputs {
+                native_context_length: 65_536,
+                kv_bytes_per_token: 64 * 1024,
+                ctx_size_override: None,
+                parallel_override: None,
+                preferred_stage0_node_id: Some(preferred.node_id),
+                forced_boundaries: None,
+            },
+        )
+        .expect("preferred stage0 runtime topology");
+
+        assert_eq!(plan.stages.first().unwrap().node_id, preferred.node_id);
+        assert_eq!(plan.stages.first().unwrap().layer_start, 0);
+        let preferred_stage = plan
+            .stages
+            .iter()
+            .find(|stage| stage.node_id == preferred.node_id)
+            .unwrap();
+        let larger_stage = plan
+            .stages
+            .iter()
+            .find(|stage| stage.node_id == larger.node_id)
+            .unwrap();
+        assert!(
+            preferred_stage.layer_end - preferred_stage.layer_start
+                < larger_stage.layer_end - larger_stage.layer_start
+        );
+    }
+
+    #[test]
+    fn resource_planner_honors_explicit_context_below_auto_floor() {
+        let participants = vec![
+            participant(1, 16_000_000_000),
+            participant(2, 16_000_000_000),
+        ];
+
+        let plan = plan_runtime_slice_topology_with_resources(
+            "topology-test",
+            "model-a",
+            &package(36, 3_000_000_000),
+            &participants,
+            &[],
+            SplitTopologyResourceInputs {
+                native_context_length: 32_768,
+                kv_bytes_per_token: 32 * 1024,
+                ctx_size_override: Some(512),
+                parallel_override: Some(4),
+                preferred_stage0_node_id: None,
+                forced_boundaries: None,
+            },
+        )
+        .expect("explicit low-context runtime topology");
+
+        assert_eq!(plan.context_length, 512);
+        assert_eq!(plan.slots, 4);
+        assert_eq!(plan.stages.first().unwrap().layer_start, 0);
+        assert_eq!(plan.stages.last().unwrap().layer_end, 36);
+    }
+
+    #[test]
+    fn resource_planner_can_force_validation_boundaries() {
+        let preferred = participant_with_rtt(1, 24_000_000_000, 240);
+        let remote = participant_with_rtt(2, 24_000_000_000, 240);
+        let participants = vec![remote, preferred];
+
+        let plan = plan_runtime_slice_topology_with_resources(
+            "topology-test",
+            "model-a",
+            &package(36, 6_000_000_000),
+            &participants,
+            &[],
+            SplitTopologyResourceInputs {
+                native_context_length: 32_768,
+                kv_bytes_per_token: 32 * 1024,
+                ctx_size_override: Some(512),
+                parallel_override: Some(4),
+                preferred_stage0_node_id: Some(preferred.node_id),
+                forced_boundaries: Some(vec![18]),
+            },
+        )
+        .expect("forced validation topology");
+
+        assert_eq!(plan.context_length, 512);
+        assert_eq!(plan.slots, 4);
+        assert_eq!(
+            plan.stages
+                .iter()
+                .map(|stage| (stage.node_id, stage.layer_start, stage.layer_end))
+                .collect::<Vec<_>>(),
+            vec![(preferred.node_id, 0, 18), (remote.node_id, 18, 36)]
+        );
     }
 
     #[test]
@@ -706,6 +948,8 @@ mod tests {
                 kv_bytes_per_token: 1024,
                 ctx_size_override: None,
                 parallel_override: None,
+                preferred_stage0_node_id: None,
+                forced_boundaries: None,
             },
         );
 

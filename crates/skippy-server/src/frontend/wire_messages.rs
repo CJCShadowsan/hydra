@@ -132,6 +132,28 @@ pub(super) struct VerifySpanMessageArgs<'a> {
     pub(super) checkpoint: bool,
 }
 
+pub(super) struct TreeVerifyMessageArgs<'a> {
+    pub(super) request_id: u64,
+    pub(super) session_id: u64,
+    pub(super) prompt_token_count: usize,
+    pub(super) pos_start: usize,
+    pub(super) decode_step: usize,
+    pub(super) tokens: &'a [i32],
+    pub(super) parents: &'a [i32],
+    pub(super) depths: &'a [u32],
+    pub(super) sampling: Option<WireSamplingConfig>,
+    pub(super) checkpoint: bool,
+    pub(super) gather: Option<TreeGatherMessageArgs<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TreeGatherMessageArgs<'a> {
+    pub(super) source_leaf_index: u32,
+    pub(super) dest_start: usize,
+    pub(super) source_positions: &'a [u64],
+    pub(super) token_ids: &'a [i32],
+}
+
 pub(super) fn embedded_verify_message(
     wire_dtype: WireActivationDType,
     args: VerifySpanMessageArgs<'_>,
@@ -170,6 +192,76 @@ pub(super) fn embedded_verify_message(
     })
 }
 
+pub(super) fn embedded_tree_verify_message(
+    wire_dtype: WireActivationDType,
+    args: TreeVerifyMessageArgs<'_>,
+) -> OpenAiResult<StageWireMessage> {
+    if args.tokens.is_empty() {
+        return Err(OpenAiError::backend(
+            "tree verify requires at least one token",
+        ));
+    }
+    if args.parents.len() != args.tokens.len() || args.depths.len() != args.tokens.len() {
+        return Err(OpenAiError::backend(
+            "tree verify parents and depths must match token count",
+        ));
+    }
+    let mut message = embedded_verify_message(
+        wire_dtype,
+        VerifySpanMessageArgs {
+            request_id: args.request_id,
+            session_id: args.session_id,
+            prompt_token_count: args.prompt_token_count,
+            pos_start: args.pos_start,
+            decode_step: args.decode_step,
+            tokens: args.tokens,
+            sampling: args.sampling,
+            checkpoint: args.checkpoint,
+        },
+    )?;
+    message.state.flags |= state_flags::TREE_VERIFY;
+    if let Some(gather) = args.gather {
+        if gather.source_positions.is_empty()
+            || gather.source_positions.len() != gather.token_ids.len()
+        {
+            return Err(OpenAiError::backend(
+                "tree gather source positions must match token count",
+            ));
+        }
+        message.state.flags |= state_flags::TREE_GATHER;
+        message.tokens.extend_from_slice(gather.token_ids);
+    }
+    message.positions.reserve(args.tokens.len() * 2);
+    message.positions.extend_from_slice(args.parents);
+    for depth in args.depths {
+        message.positions.push(
+            i32::try_from(*depth).map_err(|_| OpenAiError::backend("tree depth exceeds i32"))?,
+        );
+    }
+    if let Some(gather) = args.gather {
+        message.positions.push(
+            i32::try_from(gather.source_leaf_index)
+                .map_err(|_| OpenAiError::backend("tree gather leaf index exceeds i32"))?,
+        );
+        message.positions.push(
+            i32::try_from(gather.dest_start)
+                .map_err(|_| OpenAiError::backend("tree gather destination exceeds i32"))?,
+        );
+        message.positions.push(
+            i32::try_from(gather.source_positions.len())
+                .map_err(|_| OpenAiError::backend("tree gather token count exceeds i32"))?,
+        );
+        for position in gather.source_positions {
+            message
+                .positions
+                .push(i32::try_from(*position).map_err(|_| {
+                    OpenAiError::backend("tree gather source position exceeds i32")
+                })?);
+        }
+    }
+    Ok(message)
+}
+
 pub(super) fn embedded_session_control_message(
     wire_dtype: WireActivationDType,
     kind: WireMessageKind,
@@ -206,6 +298,44 @@ pub(super) fn embedded_trim_session_message(
     );
     message.token_count = i32::try_from(token_count)
         .map_err(|_| OpenAiError::backend("trim token count exceeds i32"))?;
+    Ok(message)
+}
+
+pub(super) fn embedded_gather_tree_path_message(
+    wire_dtype: WireActivationDType,
+    request_id: u64,
+    session_id: u64,
+    source_leaf_index: u32,
+    dest_start: usize,
+    source_positions: &[u64],
+    token_ids: &[i32],
+) -> OpenAiResult<StageWireMessage> {
+    if source_positions.is_empty() || source_positions.len() != token_ids.len() {
+        return Err(OpenAiError::backend(
+            "tree gather source positions must match token count",
+        ));
+    }
+    let mut message = embedded_session_control_message(
+        wire_dtype,
+        WireMessageKind::GatherTreePath,
+        request_id,
+        session_id,
+    );
+    message.pos_start = i32::try_from(dest_start)
+        .map_err(|_| OpenAiError::backend("tree gather destination exceeds i32"))?;
+    message.token_count = i32::try_from(token_ids.len())
+        .map_err(|_| OpenAiError::backend("tree gather token count exceeds i32"))?;
+    message.state.current_token = i32::try_from(source_leaf_index)
+        .map_err(|_| OpenAiError::backend("tree gather leaf index exceeds i32"))?;
+    message.tokens = token_ids.to_vec();
+    message.positions = source_positions
+        .iter()
+        .copied()
+        .map(|position| {
+            i32::try_from(position)
+                .map_err(|_| OpenAiError::backend("tree gather source position exceeds i32"))
+        })
+        .collect::<OpenAiResult<Vec<_>>>()?;
     Ok(message)
 }
 

@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    env,
     future::Future,
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
@@ -38,11 +39,14 @@ use sha2::{Digest, Sha256};
 use skippy_metrics::attr as attr_key;
 use skippy_protocol::binary::{
     LLAMA_TOKEN_NULL, MAX_STAGE_LOGIT_BIAS, StageLogitBias as WireLogitBias, StageReply,
-    StageReplyStats, StageSamplingConfig as WireSamplingConfig, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, recv_ready, recv_reply, state_flags,
-    write_stage_message,
+    StageReplyEnvelope, StageReplyIdentity, StageReplyStats,
+    StageSamplingConfig as WireSamplingConfig, StageStateHeader, StageWireMessage,
+    WireActivationDType, WireMessageKind, WireReplyKind, recv_ready, recv_reply,
+    recv_reply_envelope, state_flags, write_stage_message,
 };
-use skippy_protocol::{MessageBase, SCHEMA_VERSION, StageConfig, StageTopology};
+use skippy_protocol::{
+    FlashAttentionType, MessageBase, SCHEMA_VERSION, StageConfig, StageTopology,
+};
 use skippy_runtime::{
     ActivationFrame, ChatTemplateJsonOptions, ChatTemplateOptions,
     FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow,
@@ -57,10 +61,11 @@ use tokio::{
 
 use crate::{
     binary_transport::{
-        DecodeFrameBatcher, PredictionReturnHub, PredictionReturnReceiver, WireCondition,
-        connect_binary_downstream, forwarded_stage_message, forwarded_stage_message_timed,
-        run_binary_stage_message, send_client_ready_hello_if_enabled,
-        stage_output_activation_capacity, write_stage_message_conditioned,
+        BinaryStageMessageExecution, DecodeFrameBatcher, PredictionReturnHub,
+        PredictionReturnReceiver, WireCondition, connect_binary_downstream,
+        forwarded_stage_message, forwarded_stage_message_timed, run_binary_stage_message,
+        send_client_ready_hello_if_enabled, stage_output_activation_capacity,
+        write_stage_message_conditioned,
     },
     cli::ServeOpenAiArgs,
     config::{load_json, validate_config},
@@ -77,10 +82,12 @@ mod embedded_generation;
 mod generation_flow;
 mod local_generation;
 mod native_mtp;
+mod pipelined_speculative;
 mod prefill;
 mod prefix_cache;
 mod prompting;
 mod request;
+mod shard_pipeline;
 mod speculative;
 mod util;
 mod wire_messages;
@@ -88,9 +95,12 @@ mod wire_messages;
 use self::{
     admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
     decode_batcher::DecodeBatcher,
+    embedded_execution::EmbeddedTreeGatherPath,
     native_mtp::*,
+    pipelined_speculative::*,
     prefill::*,
     request::*,
+    shard_pipeline::*,
     speculative::*,
     util::*,
     wire_messages::*,
@@ -194,6 +204,8 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        pipelined_speculative_depth: 1,
+        tree_speculative: false,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
@@ -233,6 +245,8 @@ pub struct EmbeddedOpenAiArgs {
     pub draft_model_path: Option<PathBuf>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
+    pub pipelined_speculative_depth: usize,
+    pub tree_speculative: bool,
     pub draft_n_gpu_layers: Option<i32>,
     pub activation_width: i32,
     pub wire_dtype: WireActivationDType,
@@ -475,6 +489,22 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
     if args.draft_model_path.is_some() && args.speculative_window == 0 {
         bail!("--openai-speculative-window must be greater than zero when a draft model is set");
     }
+    if args.pipelined_speculative_depth == 0 {
+        bail!("--openai-pipelined-speculative-depth must be greater than zero");
+    }
+    if args.pipelined_speculative_depth > 1 && args.draft_model_path.is_none() {
+        bail!("--openai-pipelined-speculative-depth > 1 requires --openai-draft-model-path");
+    }
+    if args.tree_speculative && args.draft_model_path.is_none() {
+        bail!("--openai-tree-speculative requires --openai-draft-model-path");
+    }
+    ensure_shard_direct_prediction_return(
+        &args.config,
+        args.pipelined_speculative_depth,
+        args.tree_speculative,
+        args.prediction_returns.is_some(),
+    )?;
+    ensure_tree_speculative_flash_attention(args.tree_speculative, &args.config)?;
     if args.config.stage_index != 0 || args.config.layer_start != 0 {
         bail!("embedded OpenAI serving is only supported on stage 0");
     }
@@ -544,6 +574,8 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         draft,
         speculative_window: args.speculative_window,
         adaptive_speculative_window: args.adaptive_speculative_window,
+        pipelined_speculative_depth: args.pipelined_speculative_depth,
+        tree_speculative: args.tree_speculative,
         generation_limit: Arc::new(Semaphore::new(args.generation_concurrency)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: args.generation_concurrency,
@@ -585,6 +617,8 @@ struct StageOpenAiBackend {
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
+    pipelined_speculative_depth: usize,
+    tree_speculative: bool,
     generation_limit: Arc<Semaphore>,
     generation_queue_depth: Arc<AtomicUsize>,
     generation_queue_limit: usize,
@@ -696,6 +730,20 @@ impl GenerationTokenLimit {
     }
 }
 
+fn ensure_tree_speculative_flash_attention(
+    tree_speculative: bool,
+    config: &StageConfig,
+) -> Result<()> {
+    if !tree_speculative || config.flash_attn_type == FlashAttentionType::Disabled {
+        return Ok(());
+    }
+    bail!(
+        "tree speculative OpenAI serving requires flash_attn_type = disabled on stage 0; stage_id={} has {:?}",
+        config.stage_id,
+        config.flash_attn_type
+    )
+}
+
 fn instrumented_openai_router(backend: Arc<dyn OpenAiBackend>, telemetry: Telemetry) -> Router {
     openai_frontend::router_for(backend).layer(middleware::from_fn_with_state(
         telemetry,
@@ -742,6 +790,28 @@ fn prewarm_generation_sessions(
         timer.start_unix_nanos,
         now_unix_nanos() as u64,
     );
+    Ok(())
+}
+
+fn ensure_shard_direct_prediction_return(
+    config: &StageConfig,
+    pipelined_speculative_depth: usize,
+    tree_speculative: bool,
+    direct_return_available: bool,
+) -> Result<()> {
+    if config.downstream.is_none() || direct_return_available {
+        return Ok(());
+    }
+    if pipelined_speculative_depth > 1 {
+        bail!(
+            "Shard-style pipelined speculative serving requires direct prediction return on split stage 0"
+        );
+    }
+    if tree_speculative {
+        bail!(
+            "Shard-style tree speculative serving requires direct prediction return on split stage 0"
+        );
+    }
     Ok(())
 }
 
@@ -1252,6 +1322,93 @@ struct DraftRunner {
     window: usize,
     _model: StageModel,
     session: StageSession,
+    fault: DraftFaultConfig,
+    proposal_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DraftFaultConfig {
+    every: usize,
+    offset: usize,
+    rank: usize,
+}
+
+impl DraftFaultConfig {
+    fn from_env() -> Self {
+        Self::from_values(
+            env::var("SKIPPY_SPEC_DRAFT_FAULT_EVERY").ok().as_deref(),
+            env::var("SKIPPY_SPEC_DRAFT_FAULT_OFFSET").ok().as_deref(),
+            env::var("SKIPPY_SPEC_DRAFT_FAULT_RANK").ok().as_deref(),
+        )
+    }
+
+    fn from_values(every: Option<&str>, offset: Option<&str>, rank: Option<&str>) -> Self {
+        let every = every.and_then(parse_positive_usize).unwrap_or(0);
+        let offset = offset.and_then(parse_usize).unwrap_or(0);
+        let rank = rank
+            .and_then(parse_positive_usize)
+            .unwrap_or(2)
+            .clamp(2, MAX_LOGIT_BIAS + 1);
+        Self {
+            every,
+            offset,
+            rank,
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.every > 0
+    }
+
+    fn should_fault(self, proposal_index: usize) -> bool {
+        self.enabled()
+            && proposal_index
+                .saturating_add(self.offset)
+                .is_multiple_of(self.every)
+    }
+}
+
+fn parse_positive_usize(value: &str) -> Option<usize> {
+    parse_usize(value).filter(|value| *value > 0)
+}
+
+fn parse_usize(value: &str) -> Option<usize> {
+    value.trim().parse().ok()
+}
+
+#[derive(Debug, Clone)]
+struct DraftTreeNode {
+    token: i32,
+    parent: i32,
+    depth: u32,
+    first_leaf_index: u32,
+}
+
+#[derive(Debug, Clone)]
+struct DraftTreeProposal {
+    nodes: Vec<DraftTreeNode>,
+}
+
+impl DraftTreeProposal {
+    fn tokens(&self) -> Vec<i32> {
+        self.nodes.iter().map(|node| node.token).collect()
+    }
+
+    fn parents(&self) -> Vec<i32> {
+        self.nodes.iter().map(|node| node.parent).collect()
+    }
+
+    fn depths(&self) -> Vec<u32> {
+        self.nodes.iter().map(|node| node.depth).collect()
+    }
+
+    fn children_of(&self, node_index: usize) -> impl Iterator<Item = usize> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(move |(_, node)| node.parent == node_index as i32)
+            .map(|(index, _)| index)
+    }
 }
 
 impl DraftRunner {
@@ -1290,6 +1447,7 @@ impl DraftRunner {
                 include_embeddings: true,
                 include_output: true,
                 filter_tensors_on_load: false,
+                tree_sequence_count: 0,
             },
         )
         .with_context(|| format!("open draft model {}", path.display()))?;
@@ -1299,6 +1457,8 @@ impl DraftRunner {
             window,
             _model: model,
             session,
+            fault: DraftFaultConfig::from_env(),
+            proposal_index: 0,
         })
     }
 
@@ -1315,13 +1475,133 @@ impl DraftRunner {
     fn propose(&mut self, mut current: i32, max_tokens: usize) -> Result<Vec<i32>> {
         let mut tokens = Vec::with_capacity(max_tokens);
         for _ in 0..max_tokens {
-            current = self
+            let greedy = self
                 .session
                 .decode_step(current)
                 .context("draft decode step")?;
+            self.proposal_index = self.proposal_index.saturating_add(1);
+            current = if self.fault.should_fault(self.proposal_index) {
+                self.sample_fault_token(greedy)?
+            } else {
+                greedy
+            };
             tokens.push(current);
         }
         Ok(tokens)
+    }
+
+    fn sample_fault_token(&mut self, greedy: i32) -> Result<i32> {
+        let mut blocked = Vec::with_capacity(self.fault.rank.saturating_sub(1));
+        let mut candidate = greedy;
+        for _ in 1..self.fault.rank {
+            blocked.push(candidate);
+            let sampling = SamplingConfig {
+                enabled: true,
+                temperature: 0.0,
+                logit_bias: blocked
+                    .iter()
+                    .copied()
+                    .map(|token_id| RuntimeLogitBias {
+                        token_id,
+                        bias: -1.0e9,
+                    })
+                    .collect(),
+                ..SamplingConfig::default()
+            };
+            candidate = self
+                .session
+                .sample_current(Some(&sampling))
+                .context("sample draft fault token")?;
+            if blocked.contains(&candidate) {
+                return Ok(greedy);
+            }
+        }
+        Ok(candidate)
+    }
+
+    fn propose_tree(
+        &mut self,
+        context_tokens: &[i32],
+        current: i32,
+        max_depth: usize,
+        branch_count: usize,
+    ) -> Result<DraftTreeProposal> {
+        let max_depth = max_depth.max(1);
+        let branch_count = branch_count.max(1);
+        let mut nodes = vec![DraftTreeNode {
+            token: current,
+            parent: -1,
+            depth: 0,
+            first_leaf_index: 0,
+        }];
+        let root_choices = self.sample_next_choices(context_tokens, &[current], branch_count)?;
+        for (leaf_index, first_token) in root_choices.into_iter().enumerate() {
+            let leaf_index =
+                u32::try_from(leaf_index).context("draft tree leaf index exceeds u32")?;
+            let mut parent = 0usize;
+            let mut path = vec![current, first_token];
+            nodes.push(DraftTreeNode {
+                token: first_token,
+                parent: i32::try_from(parent).context("draft tree parent index exceeds i32")?,
+                depth: 1,
+                first_leaf_index: leaf_index,
+            });
+            parent = nodes.len() - 1;
+            for depth in 2..=max_depth {
+                let next = self.sample_next_choices(context_tokens, &path, 1)?;
+                let Some(token) = next.first().copied() else {
+                    break;
+                };
+                path.push(token);
+                nodes.push(DraftTreeNode {
+                    token,
+                    parent: i32::try_from(parent).context("draft tree parent index exceeds i32")?,
+                    depth: u32::try_from(depth).context("draft tree depth exceeds u32")?,
+                    first_leaf_index: leaf_index,
+                });
+                parent = nodes.len() - 1;
+            }
+        }
+        Ok(DraftTreeProposal { nodes })
+    }
+
+    fn sample_next_choices(
+        &mut self,
+        context_tokens: &[i32],
+        path_tokens: &[i32],
+        choice_count: usize,
+    ) -> Result<Vec<i32>> {
+        self.reset_to_context(context_tokens)?;
+        for token in path_tokens {
+            self.session
+                .decode_step(*token)
+                .context("draft tree decode branch token")?;
+        }
+        let mut choices = Vec::with_capacity(choice_count);
+        for _ in 0..choice_count {
+            let sampling = skippy_runtime::SamplingConfig {
+                enabled: true,
+                temperature: 0.0,
+                logit_bias: choices
+                    .iter()
+                    .copied()
+                    .map(|token_id| skippy_runtime::LogitBias {
+                        token_id,
+                        bias: -1.0e9,
+                    })
+                    .collect(),
+                ..skippy_runtime::SamplingConfig::default()
+            };
+            let token = self
+                .session
+                .sample_current(Some(&sampling))
+                .context("sample draft tree choice")?;
+            if choices.contains(&token) {
+                break;
+            }
+            choices.push(token);
+        }
+        Ok(choices)
     }
 }
 
@@ -1748,6 +2028,8 @@ struct EmbeddedStageZeroGeneration<'a> {
     draft: Option<Arc<Mutex<DraftRunner>>>,
     speculative_window: usize,
     adaptive_speculative_window: bool,
+    pipelined_speculative_depth: usize,
+    tree_speculative: bool,
     prompt_token_ids: &'a [i32],
     max_tokens: u32,
     sampling: &'a SamplingConfig,
@@ -1793,8 +2075,15 @@ struct EmbeddedExecutionStats {
 
 struct EmbeddedStageExecution {
     reply: StageReply,
+    reply_identity: Option<StageReplyIdentity>,
     stats: EmbeddedExecutionStats,
     elapsed_ms: f64,
+}
+
+struct EmbeddedStagePendingExecution {
+    timer: PhaseTimer,
+    reply_stats: StageReplyStats,
+    stats: EmbeddedExecutionStats,
 }
 
 struct EmbeddedFusedFirstDecode {

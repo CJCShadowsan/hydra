@@ -21,6 +21,8 @@ pub const STAGE_SUBPROTOCOL_FEATURE_STAGE_GENERATION: &str =
     STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3;
 pub const STAGE_SUBPROTOCOL_FEATURE_ARTIFACT_TRANSFER: &str = "artifact-transfer";
 pub const STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST: &str = "status-list";
+pub const STAGE_SUBPROTOCOL_FEATURE_FORCE_DOWNSTREAM_REPLY: &str = "force-downstream-reply";
+pub const STAGE_SUBPROTOCOL_FEATURE_IDENTIFIED_REPLIES: &str = "identified-replies";
 pub const STAGE_STREAM_CONTROL: u8 = 0x01;
 pub const STAGE_STREAM_TRANSPORT: u8 = 0x02;
 pub const STAGE_STREAM_ARTIFACT_TRANSFER: u8 = 0x03;
@@ -269,6 +271,8 @@ pub struct StageConfig {
     pub flash_attn_type: FlashAttentionType,
     #[serde(default)]
     pub filter_tensors_on_load: bool,
+    #[serde(default)]
+    pub tree_sequence_count: u32,
     #[serde(default)]
     pub selected_device: Option<StageDevice>,
     #[serde(default)]

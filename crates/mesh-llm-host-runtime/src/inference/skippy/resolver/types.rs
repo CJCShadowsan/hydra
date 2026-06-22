@@ -91,6 +91,7 @@ pub(crate) struct ResolvedSpeculativeConfig {
     pub(crate) draft_model_path: Option<PathBuf>,
     pub(crate) pairing_fault: String,
     pub(crate) draft_max_tokens: u32,
+    pub(crate) pipelined_depth: u32,
     pub(crate) explicit: bool,
     pub(crate) draft_n_gpu_layers: Option<i32>,
 }
@@ -147,6 +148,8 @@ pub(crate) struct ResolvedEmbeddedOpenAiArgs {
     pub(crate) draft_model_path: Option<PathBuf>,
     pub(crate) speculative_window: usize,
     pub(crate) adaptive_speculative_window: bool,
+    pub(crate) pipelined_speculative_depth: usize,
+    pub(crate) tree_speculative: bool,
     pub(crate) draft_n_gpu_layers: Option<i32>,
     pub(crate) activation_width: i32,
     pub(crate) wire_dtype: skippy_protocol::binary::WireActivationDType,

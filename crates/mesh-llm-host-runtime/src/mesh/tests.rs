@@ -119,10 +119,37 @@ fn split_stage_path_rejects_relay_path() {
 }
 
 #[test]
+fn split_stage_path_can_allow_relay_path_for_validation() {
+    assert_eq!(
+        SplitStagePathSnapshot::relay(Some(MAX_SPLIT_RTT_MS + 100))
+            .stage_path_rejection_with_policy(SplitStagePathPolicy::allow_relay_stage_paths()),
+        None
+    );
+}
+
+#[test]
 fn split_stage_path_rejects_slow_direct_path() {
     assert_eq!(
         SplitStagePathSnapshot::direct(Some(MAX_SPLIT_RTT_MS + 1)).stage_path_rejection(),
         Some(SplitStagePathRejection::StagePathTooSlow)
+    );
+}
+
+#[test]
+fn split_stage_path_can_allow_slow_direct_path_for_validation() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(Some(MAX_SPLIT_RTT_MS + 200))
+            .stage_path_rejection_with_policy(SplitStagePathPolicy::allow_slow_direct_stage_paths()),
+        None
+    );
+}
+
+#[test]
+fn split_stage_path_slow_direct_override_still_requires_measured_rtt() {
+    assert_eq!(
+        SplitStagePathSnapshot::direct(None)
+            .stage_path_rejection_with_policy(SplitStagePathPolicy::allow_slow_direct_stage_paths()),
+        Some(SplitStagePathRejection::MissingStagePath)
     );
 }
 
@@ -309,6 +336,7 @@ fn stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         cache_type_k: "f16".to_string(),
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
+        tree_sequence_count: 0,
         shutdown_generation: 3,
         coordinator_term: 11,
         coordinator_id: None,
@@ -1179,6 +1207,8 @@ fn make_test_peer_info(peer_id: EndpointId) -> PeerInfo {
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
+        stage_force_downstream_reply_supported: false,
+        stage_identified_replies_supported: false,
         owner_summary: OwnershipSummary::default(),
         advertised_model_throughput: vec![],
 
@@ -2374,6 +2404,7 @@ fn artifact_transfer_authorization_is_limited_to_stage_assignment() {
                 node_id: stage0,
                 layer_start: 0,
                 layer_end: 1,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: String::new(),
                 },
@@ -2384,6 +2415,7 @@ fn artifact_transfer_authorization_is_limited_to_stage_assignment() {
                 node_id: stage1,
                 layer_start: 1,
                 layer_end: 2,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: String::new(),
                 },
@@ -2513,6 +2545,7 @@ async fn artifact_transfer_stream_serves_authorized_stage_artifact() -> Result<(
                 node_id: client_id,
                 layer_start: 0,
                 layer_end: 1,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: String::new(),
                 },
@@ -2647,6 +2680,7 @@ async fn artifact_transfer_stream_rejects_corrupt_same_size_cached_artifact() ->
                 node_id: client_id,
                 layer_start: 0,
                 layer_end: 1,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: String::new(),
                 },
@@ -2725,6 +2759,7 @@ async fn artifact_transfer_stream_rejects_public_mesh_without_opt_in() -> Result
                 node_id: client_id,
                 layer_start: 0,
                 layer_end: 1,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: String::new(),
                 },
@@ -3602,6 +3637,8 @@ fn gossip_frame_roundtrip_preserves_scanned_model_metadata() {
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
+        stage_force_downstream_reply_supported: false,
+        stage_identified_replies_supported: false,
         advertised_model_throughput: vec![],
         latency_ms: None,
         latency_source: None,
@@ -3890,6 +3927,8 @@ fn transitive_peer_update_refreshes_metadata_fields() {
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
+        stage_force_downstream_reply_supported: true,
+        stage_identified_replies_supported: true,
         advertised_model_throughput: vec![],
         latency_ms: None,
         latency_source: None,
@@ -3980,6 +4019,8 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
+        stage_force_downstream_reply_supported: true,
+        stage_identified_replies_supported: true,
         advertised_model_throughput: vec![],
         latency_ms: None,
         latency_source: None,
@@ -4044,6 +4085,8 @@ fn transitive_peer_merge_preserves_richer_direct_address() {
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
+        stage_force_downstream_reply_supported: true,
+        stage_identified_replies_supported: true,
         advertised_model_throughput: vec![],
         latency_ms: None,
         latency_source: None,
@@ -4631,6 +4674,8 @@ fn transitive_peer_update_refreshes_last_mentioned() {
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
+        stage_force_downstream_reply_supported: true,
+        stage_identified_replies_supported: true,
         advertised_model_throughput: vec![],
         latency_ms: None,
         latency_source: None,
@@ -5383,6 +5428,8 @@ fn make_test_peer(id: EndpointId, rtt_ms: Option<u32>, vram_gb: u64) -> PeerInfo
         artifact_transfer_supported: false,
         stage_protocol_generation_supported: false,
         stage_status_list_supported: false,
+        stage_force_downstream_reply_supported: false,
+        stage_identified_replies_supported: false,
         owner_summary: OwnershipSummary::default(),
         advertised_model_throughput: vec![],
 
@@ -5986,6 +6033,8 @@ fn requirement_peer_announcement(
         artifact_transfer_supported: true,
         stage_protocol_generation_supported: true,
         stage_status_list_supported: true,
+        stage_force_downstream_reply_supported: true,
+        stage_identified_replies_supported: true,
         advertised_model_throughput: vec![],
         latency_ms: None,
         latency_source: None,
@@ -6616,6 +6665,8 @@ pub(crate) fn assert_mesh_requirements_add_peer_rejects_untrusted_release_signer
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,
@@ -6705,6 +6756,8 @@ pub(crate) fn assert_mesh_requirements_add_peer_rejects_invalid_release_attestat
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,
@@ -6791,6 +6844,8 @@ pub(crate) fn assert_mesh_requirements_add_peer_rejects_wrong_mesh_id() {
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,
@@ -7432,6 +7487,7 @@ fn test_stage_load_request() -> crate::inference::skippy::StageLoadRequest {
         cache_type_k: "f16".to_string(),
         cache_type_v: "f16".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
+        tree_sequence_count: 0,
         shutdown_generation: 7,
         coordinator_term: 11,
         coordinator_id: Some(make_test_endpoint_id(0x70)),
@@ -7703,6 +7759,7 @@ fn stage_status_updates_materialized_topology_endpoint() {
             node_id,
             layer_start: 12,
             layer_end: 24,
+            tree_sequence_count: 0,
             endpoint: StageEndpoint {
                 bind_addr: "127.0.0.1:0".to_string(),
             },
@@ -7737,6 +7794,7 @@ fn public_stage_topologies_hide_worker_only_load_fragments() {
             node_id,
             layer_start: 12,
             layer_end: 24,
+            tree_sequence_count: 0,
             endpoint: StageEndpoint {
                 bind_addr: "127.0.0.1:0".to_string(),
             },
@@ -7772,6 +7830,7 @@ fn full_stage_topology_remains_visible_after_status_updates() {
                 node_id: host_id,
                 layer_start: 0,
                 layer_end: 12,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:50000".to_string(),
                 },
@@ -7782,6 +7841,7 @@ fn full_stage_topology_remains_visible_after_status_updates() {
                 node_id: worker_id,
                 layer_start: 12,
                 layer_end: 24,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:0".to_string(),
                 },
@@ -7820,6 +7880,7 @@ fn active_stage_topology_replaces_previous_generation_for_model() {
                 node_id: host_id,
                 layer_start: 0,
                 layer_end: 12,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:50000".to_string(),
                 },
@@ -7830,6 +7891,7 @@ fn active_stage_topology_replaces_previous_generation_for_model() {
                 node_id: first_worker_id,
                 layer_start: 12,
                 layer_end: 24,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:0".to_string(),
                 },
@@ -7857,6 +7919,7 @@ fn active_stage_topology_replaces_previous_generation_for_model() {
                 node_id: host_id,
                 layer_start: 0,
                 layer_end: 8,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:50001".to_string(),
                 },
@@ -7867,6 +7930,7 @@ fn active_stage_topology_replaces_previous_generation_for_model() {
                 node_id: second_worker_id,
                 layer_start: 8,
                 layer_end: 24,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:0".to_string(),
                 },
@@ -7898,6 +7962,7 @@ fn stage_topology_withdraw_removes_active_topology_and_statuses() {
                 node_id: host_id,
                 layer_start: 0,
                 layer_end: 12,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:50000".to_string(),
                 },
@@ -7908,6 +7973,7 @@ fn stage_topology_withdraw_removes_active_topology_and_statuses() {
                 node_id: worker_id,
                 layer_start: 12,
                 layer_end: 24,
+                tree_sequence_count: 0,
                 endpoint: StageEndpoint {
                     bind_addr: "127.0.0.1:0".to_string(),
                 },
@@ -7983,7 +8049,7 @@ fn active_stage_refresh_marks_missing_stage_failed() {
 }
 
 #[test]
-fn active_stage_refresh_timeout_marks_cached_stage_failed() {
+fn active_stage_refresh_timeout_keeps_cached_stage_state() {
     let node_id = EndpointId::from(SecretKey::from_bytes(&[0x43; 32]).public());
     let mut state = StageTopologyState::default();
     state.record_status(test_stage_status(
@@ -7995,15 +8061,12 @@ fn active_stage_refresh_timeout_marks_cached_stage_failed() {
     ));
     let cached = state.active_statuses().into_iter().next().unwrap();
 
-    state.record_status_refresh_failure(&cached, "stage status refresh timed out".to_string());
+    state.record_status_refresh_timeout(&cached);
 
     let status = state.runtime_statuses().into_iter().next().unwrap();
     assert_eq!(
         status.state,
-        crate::inference::skippy::StageRuntimeState::Failed
+        crate::inference::skippy::StageRuntimeState::Ready
     );
-    assert_eq!(
-        status.error.as_deref(),
-        Some("stage status refresh timed out")
-    );
+    assert_eq!(status.error.as_deref(), None);
 }

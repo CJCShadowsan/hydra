@@ -4,8 +4,9 @@ use super::{
     MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
     MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC, STAGE_STATE_VERSION,
-    StageLogitBias, StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader,
-    StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+    StageLogitBias, StageReply, StageReplyEnvelope, StageReplyIdentity, StageReplyStats,
+    StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
+    WireReplyKind,
     activation::{
         activation_decoded_f32_bytes_with_state_flags, activation_wire_bytes_with_state_flags,
     },
@@ -56,17 +57,14 @@ pub fn send_reply_predicted_with_tokens_and_stats(
     if predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
         return Err(invalid_input("too many predicted tokens"));
     }
-    write_i32(&mut writer, WireReplyKind::PredictedToken as i32)?;
-    write_i32(&mut writer, predicted)?;
-    write_i32(
+    write_reply_frame(
         &mut writer,
-        i32::try_from(predicted_tokens.len())
-            .map_err(|_| invalid_input("too many predicted tokens"))?,
-    )?;
-    for token in predicted_tokens {
-        write_i32(&mut writer, *token)?;
-    }
-    write_reply_stats(&mut writer, stats)
+        WireReplyKind::PredictedToken,
+        predicted,
+        predicted_tokens,
+        stats,
+        None,
+    )
 }
 
 pub fn send_reply_predicted_tokens_with_stats(
@@ -78,20 +76,33 @@ pub fn send_reply_predicted_tokens_with_stats(
         return Err(invalid_input("too many predicted tokens"));
     }
     let predicted = predicted_tokens.first().copied().unwrap_or(0);
-    write_i32(&mut writer, WireReplyKind::PredictedTokens as i32)?;
-    write_i32(&mut writer, predicted)?;
-    write_i32(
+    write_reply_frame(
         &mut writer,
-        i32::try_from(predicted_tokens.len())
-            .map_err(|_| invalid_input("too many predicted tokens"))?,
-    )?;
-    for token in predicted_tokens {
-        write_i32(&mut writer, *token)?;
-    }
-    write_reply_stats(&mut writer, stats)
+        WireReplyKind::PredictedTokens,
+        predicted,
+        predicted_tokens,
+        stats,
+        None,
+    )
+}
+
+pub fn send_reply_envelope(mut writer: impl Write, envelope: StageReplyEnvelope) -> io::Result<()> {
+    let reply = envelope.reply;
+    write_reply_frame(
+        &mut writer,
+        reply.kind,
+        reply.predicted,
+        &reply.predicted_tokens,
+        reply.stats,
+        envelope.identity,
+    )
 }
 
 pub fn recv_reply(mut reader: impl Read) -> io::Result<StageReply> {
+    Ok(recv_reply_envelope(&mut reader)?.reply)
+}
+
+pub fn recv_reply_envelope(mut reader: impl Read) -> io::Result<StageReplyEnvelope> {
     let kind = WireReplyKind::try_from(read_i32(&mut reader)?)?;
     let predicted = read_i32(&mut reader)?;
     let predicted_count = checked_i32_len(
@@ -100,17 +111,57 @@ pub fn recv_reply(mut reader: impl Read) -> io::Result<StageReply> {
         "negative predicted token count",
         "predicted token count exceeds maximum",
     )?;
+    let identity = if kind.identified() {
+        Some(read_reply_identity(&mut reader)?)
+    } else {
+        None
+    };
     let mut predicted_tokens = Vec::with_capacity(predicted_count);
     for _ in 0..predicted_count {
         predicted_tokens.push(read_i32(&mut reader)?);
     }
     let stats = read_reply_stats(&mut reader)?;
-    Ok(StageReply {
-        kind,
-        predicted,
-        predicted_tokens,
-        stats,
+    Ok(StageReplyEnvelope {
+        reply: StageReply {
+            kind: kind.base_kind(),
+            predicted,
+            predicted_tokens,
+            stats,
+        },
+        identity,
     })
+}
+
+fn write_reply_frame(
+    mut writer: impl Write,
+    kind: WireReplyKind,
+    predicted: i32,
+    predicted_tokens: &[i32],
+    stats: StageReplyStats,
+    identity: Option<StageReplyIdentity>,
+) -> io::Result<()> {
+    if predicted_tokens.len() > MAX_STAGE_PREDICTED_TOKENS {
+        return Err(invalid_input("too many predicted tokens"));
+    }
+    let wire_kind = if identity.is_some() {
+        kind.identified_kind()
+    } else {
+        kind.base_kind()
+    };
+    write_i32(&mut writer, wire_kind as i32)?;
+    write_i32(&mut writer, predicted)?;
+    write_i32(
+        &mut writer,
+        i32::try_from(predicted_tokens.len())
+            .map_err(|_| invalid_input("too many predicted tokens"))?,
+    )?;
+    if let Some(identity) = identity {
+        write_reply_identity(&mut writer, identity)?;
+    }
+    for token in predicted_tokens {
+        write_i32(&mut writer, *token)?;
+    }
+    write_reply_stats(&mut writer, stats)
 }
 
 pub fn write_stage_message(
@@ -433,6 +484,28 @@ fn read_sampling_config(mut reader: impl Read) -> io::Result<StageSamplingConfig
         });
     }
     Ok(sampling)
+}
+
+fn write_reply_identity(mut writer: impl Write, identity: StageReplyIdentity) -> io::Result<()> {
+    write_u64(&mut writer, identity.request_id)?;
+    write_u64(&mut writer, identity.session_id)?;
+    write_i32(&mut writer, identity.checkpoint_generation)?;
+    write_i32(&mut writer, identity.prompt_token_count)?;
+    write_i32(&mut writer, identity.decode_step)?;
+    write_i32(&mut writer, identity.pos_start)?;
+    write_i32(&mut writer, identity.seq_id)
+}
+
+fn read_reply_identity(mut reader: impl Read) -> io::Result<StageReplyIdentity> {
+    Ok(StageReplyIdentity {
+        request_id: read_u64(&mut reader)?,
+        session_id: read_u64(&mut reader)?,
+        checkpoint_generation: read_i32(&mut reader)?,
+        prompt_token_count: read_i32(&mut reader)?,
+        decode_step: read_i32(&mut reader)?,
+        pos_start: read_i32(&mut reader)?,
+        seq_id: read_i32(&mut reader)?,
+    })
 }
 
 const REPLY_STATS_FIELD_COUNT: usize = 39;

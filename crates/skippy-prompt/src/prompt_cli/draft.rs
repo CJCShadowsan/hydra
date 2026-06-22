@@ -58,6 +58,7 @@ impl DraftRunner {
                 include_embeddings: true,
                 include_output: true,
                 filter_tensors_on_load: true,
+                tree_sequence_count: 0,
             },
         )
         .with_context(|| format!("open draft model {}", path.display()))?;

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skippy Shard Tree Validation"
+  short_description: "Validate Shard-style tree speculation across split Skippy meshes"
+  default_prompt: "Validate a target/draft Skippy tree-speculative run across local or Hugging Face worker nodes."

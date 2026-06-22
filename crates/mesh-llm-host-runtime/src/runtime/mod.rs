@@ -1590,7 +1590,7 @@ where
             Err(err) => {
                 drop(startup_load_guard);
                 let err_msg = format!("{err:#}");
-                let is_participant_shortage = err_msg.contains("at least two participating nodes")
+                let is_participant_shortage = err_msg.contains("participating nodes")
                     || err_msg.contains("at least two stage participants");
                 if is_participant_shortage {
                     let _ = emit_event(OutputEvent::Info {
@@ -6077,13 +6077,56 @@ fn runtime_resource_planning_profile(options: &RuntimeOptions) -> RuntimeResourc
     }
 }
 
+fn model_ctx_size_override(model: &plugin::ModelConfigEntry) -> Option<u32> {
+    model
+        .ctx_size
+        .or_else(|| model.model_fit.as_ref().and_then(|fit| fit.ctx_size))
+}
+
+fn default_ctx_size_override(config: &plugin::MeshConfig) -> Option<u32> {
+    config
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.model_fit.as_ref())
+        .and_then(|fit| fit.ctx_size)
+}
+
 fn runtime_model_ctx_size_override(
     options: &RuntimeOptions,
+    config: &plugin::MeshConfig,
     model_overrides: Option<&plugin::ModelConfigEntry>,
 ) -> Option<u32> {
     options
         .ctx_size
-        .or_else(|| model_overrides.and_then(|model| model.ctx_size))
+        .or_else(|| model_overrides.and_then(model_ctx_size_override))
+        .or_else(|| default_ctx_size_override(config))
+}
+
+fn model_parallel_override(model: &plugin::ModelConfigEntry) -> Option<usize> {
+    model.parallel.or_else(|| {
+        model
+            .throughput
+            .as_ref()
+            .and_then(|throughput| throughput.parallel)
+    })
+}
+
+fn default_parallel_override(config: &plugin::MeshConfig) -> Option<usize> {
+    config
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.throughput.as_ref())
+        .and_then(|throughput| throughput.parallel)
+}
+
+fn runtime_model_parallel_override(
+    config: &plugin::MeshConfig,
+    model_overrides: Option<&plugin::ModelConfigEntry>,
+) -> Option<usize> {
+    model_overrides
+        .and_then(model_parallel_override)
+        .or(config.gpu.parallel)
+        .or_else(|| default_parallel_override(config))
 }
 
 fn should_start_relay_health_monitor(mode: mesh_discovery::MeshDiscoveryMode) -> bool {
@@ -6855,14 +6898,10 @@ async fn spawn_run_auto_startup_model_tasks(
         ready_console_port,
     );
     let startup_load_gate = Arc::new(tokio::sync::Mutex::new(()));
-    let primary_parallel_override = primary_startup_model
-        .and_then(|m| m.parallel)
-        .or(config.gpu.parallel);
     let resource_planning_profile = runtime_resource_planning_profile(options);
     let console_state_for_election = console_state.cloned();
     let interactive_console_state = console_state.cloned();
     let primary_mmproj = primary_startup_model.and_then(|model| model.mmproj_path.clone());
-    let primary_ctx_size = primary_startup_model.and_then(|model| model.ctx_size);
     let primary_pinned_gpu = primary_startup_model.and_then(|model| model.pinned_gpu.clone());
     let primary_cache_type_k = primary_startup_model.and_then(|model| model.cache_type_k.clone());
     let primary_cache_type_v = primary_startup_model.and_then(|model| model.cache_type_v.clone());
@@ -6874,6 +6913,16 @@ async fn spawn_run_auto_startup_model_tasks(
     let primary_model_ref = primary_startup_model
         .map(|model| model.declared_ref.clone())
         .unwrap_or_else(|| model_name.to_string());
+    let primary_model_overrides = config
+        .models
+        .iter()
+        .find(|model| model.model == primary_model_ref);
+    let primary_parallel_override =
+        runtime_model_parallel_override(config, primary_model_overrides)
+            .or_else(|| primary_startup_model.and_then(|model| model.parallel));
+    let primary_ctx_size =
+        runtime_model_ctx_size_override(options, config, primary_model_overrides)
+            .or_else(|| primary_startup_model.and_then(|model| model.ctx_size));
     let (primary_stop_tx, primary_stop_rx) = tokio::sync::watch::channel(false);
     let primary_instance_id =
         next_runtime_instance_id(&mut runtime_state.next_runtime_instance_sequence);
@@ -7163,10 +7212,9 @@ async fn run_auto_load_runtime_model(
             })
     };
     let model_overrides = ctx.config.models.iter().find(|m| m.model == spec);
-    let ctx_size_override = runtime_model_ctx_size_override(ctx.options, model_overrides);
-    let parallel_override = model_overrides
-        .and_then(|m| m.parallel)
-        .or(ctx.config.gpu.parallel);
+    let ctx_size_override =
+        runtime_model_ctx_size_override(ctx.options, ctx.config, model_overrides);
+    let parallel_override = runtime_model_parallel_override(ctx.config, model_overrides);
     let instance_id = next_runtime_instance_id(ctx.next_runtime_instance_sequence);
     let capacity_reservation = reserve_runtime_capacity_for_model(
         ctx.runtime_capacity_ledger,
@@ -7995,6 +8043,11 @@ async fn spawn_run_auto_additional_model_tasks(ctx: RunAutoAdditionalModelsConte
         let extra_name = extra_model.declared_ref.clone();
         let (extra_stop_tx, extra_stop_rx) = tokio::sync::watch::channel(false);
         let extra_instance_id = next_runtime_instance_id(ctx.next_runtime_instance_sequence);
+        let extra_model_overrides = ctx
+            .config
+            .models
+            .iter()
+            .find(|model| model.model == extra_model.declared_ref);
         let extra_task = tokio::spawn(Box::pin(startup_local_model_loop(StartupLocalModelTask {
             node: ctx.node.clone(),
             config: ctx.config.clone(),
@@ -8006,7 +8059,9 @@ async fn spawn_run_auto_additional_model_tasks(ctx: RunAutoAdditionalModelsConte
             instance_id: extra_instance_id.clone(),
             primary_model_name: ctx.primary_model_name.to_string(),
             mmproj_path: extra_model.mmproj_path.clone(),
-            ctx_size: extra_model.ctx_size,
+            ctx_size: extra_model.ctx_size.or_else(|| {
+                runtime_model_ctx_size_override(ctx.options, ctx.config, extra_model_overrides)
+            }),
             pinned_gpu: extra_model.pinned_gpu.clone(),
             runtime_capacity_ledger: ctx.runtime_capacity_ledger.clone(),
             cache_type_k: extra_model.cache_type_k.clone(),
@@ -8014,7 +8069,9 @@ async fn spawn_run_auto_additional_model_tasks(ctx: RunAutoAdditionalModelsConte
             n_batch: extra_model.n_batch,
             n_ubatch: extra_model.n_ubatch,
             flash_attention: extra_model.flash_attention,
-            parallel_override: extra_model.parallel.or(ctx.config.gpu.parallel),
+            parallel_override: extra_model
+                .parallel
+                .or_else(|| runtime_model_parallel_override(ctx.config, extra_model_overrides)),
             resource_planning_profile: runtime_resource_planning_profile(ctx.options),
             openai_guardrail_policy: ctx.openai_guardrail_policy.clone(),
             split: ctx.options.split,
@@ -11090,6 +11147,7 @@ mod tests {
     #[test]
     fn runtime_load_ctx_size_uses_model_override_when_cli_is_unset() {
         let options = runtime_options_for_test(&["mesh-llm"]);
+        let config = plugin::MeshConfig::default();
         let model = plugin::ModelConfigEntry {
             model: "runtime/model".to_string(),
             ctx_size: Some(16_384),
@@ -11097,7 +11155,7 @@ mod tests {
         };
 
         assert_eq!(
-            runtime_model_ctx_size_override(&options, Some(&model)),
+            runtime_model_ctx_size_override(&options, &config, Some(&model)),
             Some(16_384)
         );
     }
@@ -11105,6 +11163,7 @@ mod tests {
     #[test]
     fn runtime_load_ctx_size_prefers_cli_override_over_model_override() {
         let options = runtime_options_for_test(&["mesh-llm", "--ctx-size", "8192"]);
+        let config = plugin::MeshConfig::default();
         let model = plugin::ModelConfigEntry {
             model: "runtime/model".to_string(),
             ctx_size: Some(16_384),
@@ -11112,9 +11171,39 @@ mod tests {
         };
 
         assert_eq!(
-            runtime_model_ctx_size_override(&options, Some(&model)),
+            runtime_model_ctx_size_override(&options, &config, Some(&model)),
             Some(8192)
         );
+    }
+
+    #[test]
+    fn runtime_load_ctx_size_uses_defaults_model_fit_when_model_is_unset() {
+        let options = runtime_options_for_test(&["mesh-llm"]);
+        let config: plugin::MeshConfig = toml::from_str(
+            r#"
+[defaults.model_fit]
+ctx_size = 512
+"#,
+        )
+        .expect("defaults config should parse");
+
+        assert_eq!(
+            runtime_model_ctx_size_override(&options, &config, None),
+            Some(512)
+        );
+    }
+
+    #[test]
+    fn runtime_load_parallel_uses_defaults_throughput_when_model_is_unset() {
+        let config: plugin::MeshConfig = toml::from_str(
+            r#"
+[defaults.throughput]
+parallel = 2
+"#,
+        )
+        .expect("defaults config should parse");
+
+        assert_eq!(runtime_model_parallel_override(&config, None), Some(2));
     }
 
     #[test]

@@ -270,7 +270,7 @@ fn open_full_model(path: &Path, ctx_size: u32, n_gpu_layers: i32) -> Result<Stag
             layer_start: 0,
             layer_end: layer_count,
             ctx_size,
-            lane_count: 1,
+            lane_count: 2,
             n_batch: None,
             n_ubatch: None,
             n_threads: None,
@@ -285,6 +285,7 @@ fn open_full_model(path: &Path, ctx_size: u32, n_gpu_layers: i32) -> Result<Stag
             include_embeddings: true,
             include_output: true,
             filter_tensors_on_load: false,
+            tree_sequence_count: 0,
         },
     )
 }

@@ -772,8 +772,10 @@
     {
       "llama_model": "glm-dsa",
       "family": "glm_dsa",
-      "status": "no_public_gguf_candidate",
-      "notes": "HF GGUF search for GLM-DSA did not find a public artifact for this llama.cpp architecture"
+      "status": "package_or_remote_only",
+      "repo": "unsloth/GLM-5.2-GGUF",
+      "include": "UD-Q4_K_M/GLM-5.2-UD-Q4_K_M-00001-of-00011.gguf",
+      "notes": "Public GLM-5.2 GGUF exists and advertises llama.cpp architecture glm-dsa, but this is not certified support. The pinned native runtime now routes GLM_DSA normal decode through the DeepSeek32 DSA/lightning-indexer graph, allocates the DSA indexer rotation input, preserves GLM_DSA indexer metadata for new conversions, infers the legacy GLM-5.2 full/shared indexer schedule for current public GGUFs, reuses previous full-layer top-k on shared-indexer layers, and trims DSA KV during speculative rollback. Before Shard-scale GLM support, certify target-only logit/greedy parity against a reference engine, same-process speculative equivalence, MTP/IndexShare parity, and split/WAN proof. Until a GLM_DSA top-k activation sideband exists, stage boundaries must start on full-indexer layers such as 26 or 54 rather than shared-indexer layers such as 52."
     },
     {
       "llama_model": "grok",

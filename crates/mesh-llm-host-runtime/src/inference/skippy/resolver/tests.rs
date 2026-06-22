@@ -267,6 +267,7 @@ fn assert_explicit_full_surface_openai_args(explicit: &ResolvedSkippyConfig) {
         Some("128,256,384")
     );
     assert_eq!(openai.speculative_window, 8);
+    assert_eq!(openai.pipelined_speculative_depth, 2);
     assert_eq!(openai.draft_n_gpu_layers, Some(12));
     assert_eq!(openai.default_max_tokens, 256);
 }
@@ -677,6 +678,7 @@ draft_model_path = "/models/qwen3-draft.gguf"
 draft_selection_policy = "manual"
 pairing_fault = "fail-open"
 draft_max_tokens = 8
+pipelined_depth = 3
 "#,
     );
     let model_file = temp_model_file();
@@ -702,6 +704,7 @@ draft_max_tokens = 8
     assert_eq!(kv_cache.shared_prefix_stride_tokens, 48);
     assert_eq!(kv_cache.shared_prefix_record_limit, 3);
     assert_eq!(kv_cache.payload, StageKvCachePayload::ResidentKv);
+    assert_eq!(stage_config.tree_sequence_count, 0);
 
     let openai = resolved
         .to_embedded_openai_args(4096, true)
@@ -713,6 +716,7 @@ draft_max_tokens = 8
         Some("128,256,384")
     );
     assert_eq!(openai.speculative_window, 8);
+    assert_eq!(openai.pipelined_speculative_depth, 3);
     assert_eq!(
         openai.draft_model_path.as_deref(),
         Some(Path::new("/models/qwen3-draft.gguf"))
@@ -721,6 +725,124 @@ draft_max_tokens = 8
         openai.wire_dtype,
         skippy_protocol::binary::WireActivationDType::Q8
     );
+}
+
+#[test]
+fn shard_pipeline_mode_defaults_to_linear_pipelined_execution() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "shard-pipeline"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail-open"
+draft_max_tokens = 8
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .expect("shard-pipeline speculative config should resolve");
+
+    assert_eq!(resolved.speculative.mode, "draft");
+    assert_eq!(resolved.speculative.pipelined_depth, 6);
+
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("embedded args should build");
+    assert_eq!(openai.speculative_window, 8);
+    assert_eq!(openai.pipelined_speculative_depth, 6);
+    assert!(!openai.tree_speculative);
+    assert_eq!(
+        openai.draft_model_path.as_deref(),
+        Some(Path::new("/models/qwen3-draft.gguf"))
+    );
+
+    let stage_config = resolved
+        .to_stage_config(None, LoadMode::RuntimeSlice)
+        .expect("stage config should build");
+    assert_eq!(stage_config.tree_sequence_count, 0);
+}
+
+#[test]
+fn shard_pipeline_mode_rejects_serial_depth() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "shard-pipeline"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+draft_max_tokens = 8
+pipelined_depth = 1
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let err = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("pipelined_depth"));
+}
+
+#[test]
+fn tree_speculative_mode_preserves_tree_execution_shape() {
+    let mesh_config = parse_config(
+        r#"
+[defaults.speculative]
+mode = "tree"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_selection_policy = "manual"
+pairing_fault = "fail-open"
+draft_max_tokens = 6
+pipelined_depth = 3
+"#,
+    );
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "Qwen/Qwen3-0.6B:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .expect("tree speculative config should resolve");
+
+    assert_eq!(resolved.speculative.mode, "tree");
+    let openai = resolved
+        .to_embedded_openai_args(4096, true)
+        .expect("embedded args should build");
+    assert!(openai.tree_speculative);
+    assert_eq!(openai.speculative_window, 6);
+    assert_eq!(openai.pipelined_speculative_depth, 1);
+    assert_eq!(
+        openai.draft_model_path.as_deref(),
+        Some(Path::new("/models/qwen3-draft.gguf"))
+    );
+    let stage_config = resolved
+        .to_stage_config(None, LoadMode::RuntimeSlice)
+        .expect("tree stage config should build");
+    assert_eq!(
+        stage_config.flash_attn_type,
+        skippy_protocol::FlashAttentionType::Disabled
+    );
+    assert_eq!(stage_config.tree_sequence_count, 6);
 }
 
 #[test]
@@ -856,6 +978,38 @@ draft_max_tokens = 8
     .to_string();
 
     assert!(err.contains("incompatible speculative draft pairing"));
+}
+
+#[test]
+fn speculative_draft_family_ignores_hf_snapshot_hash_components() {
+    let draft_path = "/Users/micn/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf";
+    let mesh_config = parse_config(&format!(
+        r#"
+[defaults.speculative]
+mode = "draft"
+draft_model_path = "{draft_path}"
+draft_selection_policy = "manual"
+pairing_fault = "fail_closed"
+draft_max_tokens = 8
+"#
+    ));
+    let model_file = temp_model_file();
+
+    let resolved = resolve_skippy_config(SkippyConfigResolveRequest {
+        mesh_config: &mesh_config,
+        model_id: "unsloth/Qwen3-0.6B-GGUF:Q4_K_M",
+        model_path: model_file.path(),
+        model_bytes: 4 * 1024 * 1024 * 1024,
+        allocatable_memory_bytes: None,
+        request_defaults: None,
+    })
+    .expect("snapshot hash must not make a dense qwen3 draft look like qwen3moe");
+
+    assert_eq!(resolved.speculative.mode, "draft");
+    assert_eq!(
+        resolved.speculative.draft_model_path.as_deref(),
+        Some(Path::new(draft_path))
+    );
 }
 
 #[test]

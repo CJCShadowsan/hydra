@@ -4,9 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::failure_context::format_stage_load_failure_context;
 use super::inventory::inventory_source_candidates;
+use super::wire_condition::{StageDownstreamWireConfig, parse_stage_downstream_wire_config};
 use anyhow::{Result, anyhow};
 use skippy_protocol::{FlashAttentionType, LoadMode, StageDevice};
+use skippy_runtime::NativeLogTail;
 use tokio::sync::{Mutex as TokioMutex, oneshot};
 
 fn load_request() -> StageLoadRequest {
@@ -41,6 +44,7 @@ fn load_request() -> StageLoadRequest {
         cache_type_k: "f16".to_string(),
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: FlashAttentionType::Enabled,
+        tree_sequence_count: 0,
         shutdown_generation: 7,
         coordinator_term: 0,
         coordinator_id: None,
@@ -205,6 +209,7 @@ fn assert_stage_config_execution_fields(config: &StageConfig) {
         Some("/models/mmproj.gguf")
     );
     assert_eq!(config.flash_attn_type, FlashAttentionType::Enabled);
+    assert_eq!(config.tree_sequence_count, 0);
     assert_eq!(
         config
             .selected_device
@@ -217,6 +222,18 @@ fn assert_stage_config_execution_fields(config: &StageConfig) {
         Some("stage-1")
     );
     assert!(config.filter_tensors_on_load);
+}
+
+#[test]
+fn stage_config_reserves_tree_sequences_and_disables_flash_attention() {
+    let mut request = load_request();
+    request.flash_attn_type = FlashAttentionType::Enabled;
+    request.tree_sequence_count = 4;
+
+    let config = stage_config(&request, None, None).unwrap();
+
+    assert_eq!(config.tree_sequence_count, 4);
+    assert_eq!(config.flash_attn_type, FlashAttentionType::Disabled);
 }
 
 #[test]
@@ -321,6 +338,33 @@ fn stage_load_failure_context_identifies_split_stage_shape() {
     assert!(context.contains("last_error=native loader exited while mapping tensors"));
 }
 
+#[test]
+fn stage_load_failure_context_appends_native_log_tail() {
+    let mut request = load_request();
+    request.stage_id = "stage-1".to_string();
+    request.stage_index = 1;
+    let native_tail = NativeLogTail {
+        path: "/tmp/mesh-runtime/logs/skippy-native.log".into(),
+        lines: vec![
+            "skippy: context init starting stage_index=1 ctx=512".to_string(),
+            "skippy: context init returned stage_index=1 ctx=(nil)".to_string(),
+        ],
+    };
+
+    let context = format_stage_load_failure_context(
+        &request,
+        "binary stage did not become ready",
+        Some("failed to create llama context"),
+        Some(&native_tail),
+    );
+
+    assert!(context.contains("native_log_path=/tmp/mesh-runtime/logs/skippy-native.log"));
+    assert!(
+        context.contains("skippy: context init returned stage_index=1 ctx=(nil)"),
+        "{context}"
+    );
+}
+
 #[tokio::test]
 async fn binary_stage_ready_probe_waits_for_wire_handshake() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -332,7 +376,7 @@ async fn binary_stage_ready_probe_waits_for_wire_handshake() {
     });
 
     let started = Instant::now();
-    wait_for_binary_stage_ready(bind_addr, Duration::from_secs(2))
+    wait_for_binary_stage_ready(None, bind_addr, Duration::from_secs(2))
         .await
         .unwrap();
     assert!(started.elapsed() >= Duration::from_millis(50));
@@ -731,6 +775,58 @@ fn stage_load_timeout_keeps_existing_floor_without_size_hint() {
     request.load_mode = LoadMode::RuntimeSlice;
 
     assert_eq!(stage_load_timeout(&request), Duration::from_secs(900));
+}
+
+#[test]
+fn stage_load_timeout_override_accepts_positive_seconds() {
+    assert_eq!(
+        stage_load_timeout_override(Some("120")),
+        Some(Duration::from_secs(120))
+    );
+    assert_eq!(
+        stage_load_timeout_override(Some(" 45 ")),
+        Some(Duration::from_secs(45))
+    );
+}
+
+#[test]
+fn stage_load_timeout_override_ignores_empty_zero_and_invalid_values() {
+    assert_eq!(stage_load_timeout_override(None), None);
+    assert_eq!(stage_load_timeout_override(Some("")), None);
+    assert_eq!(stage_load_timeout_override(Some("0")), None);
+    assert_eq!(stage_load_timeout_override(Some("nope")), None);
+}
+
+#[test]
+fn stage_downstream_wire_config_defaults_to_no_condition() {
+    assert_eq!(
+        parse_stage_downstream_wire_config(None, None, None).unwrap(),
+        StageDownstreamWireConfig {
+            delay_ms: 0.0,
+            jitter_ms: 0.0,
+            mbps: None
+        }
+    );
+}
+
+#[test]
+fn stage_downstream_wire_config_parses_delay_jitter_and_bandwidth() {
+    assert_eq!(
+        parse_stage_downstream_wire_config(Some(" 80 "), Some("25.5"), Some("250.5")).unwrap(),
+        StageDownstreamWireConfig {
+            delay_ms: 80.0,
+            jitter_ms: 25.5,
+            mbps: Some(250.5)
+        }
+    );
+}
+
+#[test]
+fn stage_downstream_wire_config_rejects_invalid_values() {
+    assert!(parse_stage_downstream_wire_config(Some("nope"), None, None).is_err());
+    assert!(parse_stage_downstream_wire_config(Some("inf"), None, None).is_err());
+    assert!(parse_stage_downstream_wire_config(None, Some("nan"), None).is_err());
+    assert!(parse_stage_downstream_wire_config(None, None, Some("nan")).is_err());
 }
 
 #[test]

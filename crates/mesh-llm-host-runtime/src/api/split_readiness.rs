@@ -29,6 +29,8 @@ pub(crate) struct SplitReadinessNodeInput {
     pub(crate) available_models: Vec<String>,
     pub(crate) model_source: Option<String>,
     pub(crate) stage_protocol_generation_supported: bool,
+    pub(crate) stage_force_downstream_reply_supported: bool,
+    pub(crate) stage_identified_replies_supported: bool,
     pub(crate) artifact_transfer_supported: bool,
     pub(crate) stage_path: SplitStagePathSnapshot,
 }
@@ -130,6 +132,8 @@ impl MeshApi {
             available_models: node.available_models().await,
             model_source: None,
             stage_protocol_generation_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             artifact_transfer_supported: true,
             stage_path: SplitStagePathSnapshot::unknown(),
         };
@@ -212,6 +216,8 @@ fn peer_readiness_input(
         available_models: peer.available_models,
         model_source: peer.model_source,
         stage_protocol_generation_supported: peer.stage_protocol_generation_supported,
+        stage_force_downstream_reply_supported: peer.stage_force_downstream_reply_supported,
+        stage_identified_replies_supported: peer.stage_identified_replies_supported,
         artifact_transfer_supported: peer.artifact_transfer_supported,
         stage_path,
     }
@@ -241,8 +247,16 @@ fn split_node_exclusion_reason(
     if !node.stage_protocol_generation_supported {
         return Some(SplitReadinessExclusionReason::StageProtocolGeneration);
     }
+    if !node.stage_force_downstream_reply_supported {
+        return Some(SplitReadinessExclusionReason::ForceDownstreamReplyUnsupported);
+    }
+    if !node.stage_identified_replies_supported {
+        return Some(SplitReadinessExclusionReason::IdentifiedRepliesUnsupported);
+    }
     if node.source == SplitReadinessNodeSource::Peer
-        && let Some(rejection) = node.stage_path.stage_path_rejection()
+        && let Some(rejection) = node
+            .stage_path
+            .stage_path_rejection_with_policy(crate::mesh::split_stage_path_policy_from_env())
     {
         return Some(split_readiness_stage_path_rejection(rejection));
     }
@@ -617,7 +631,7 @@ fn split_capacity_shortfall_blocker(
     })
 }
 
-const fn split_readiness_exclusion_reason_order() -> [SplitReadinessExclusionReason; 12] {
+const fn split_readiness_exclusion_reason_order() -> [SplitReadinessExclusionReason; 13] {
     [
         SplitReadinessExclusionReason::StageControlUnreachable,
         SplitReadinessExclusionReason::PackageManifestMismatch,
@@ -627,6 +641,7 @@ const fn split_readiness_exclusion_reason_order() -> [SplitReadinessExclusionRea
         SplitReadinessExclusionReason::MissingStagePath,
         SplitReadinessExclusionReason::StagePathRelayOnly,
         SplitReadinessExclusionReason::StagePathTooSlow,
+        SplitReadinessExclusionReason::ForceDownstreamReplyUnsupported,
         SplitReadinessExclusionReason::StageProtocolGeneration,
         SplitReadinessExclusionReason::MissingVram,
         SplitReadinessExclusionReason::MissingModelInterest,
@@ -766,6 +781,8 @@ enum SplitReadinessExclusionReason {
     MissingVram,
     MissingModelInterest,
     StageProtocolGeneration,
+    ForceDownstreamReplyUnsupported,
+    IdentifiedRepliesUnsupported,
     MissingStagePath,
     StagePathRelayOnly,
     StagePathTooSlow,
@@ -783,6 +800,8 @@ impl SplitReadinessExclusionReason {
             Self::MissingVram => "missing_vram",
             Self::MissingModelInterest => "missing_model_interest",
             Self::StageProtocolGeneration => "stage_protocol_generation",
+            Self::ForceDownstreamReplyUnsupported => "force_downstream_reply_unsupported",
+            Self::IdentifiedRepliesUnsupported => "identified_replies_unsupported",
             Self::MissingStagePath => "missing_stage_path",
             Self::StagePathRelayOnly => "stage_path_relay_only",
             Self::StagePathTooSlow => "stage_path_too_slow",
@@ -805,6 +824,12 @@ impl SplitReadinessExclusionReason {
             }
             Self::StageProtocolGeneration => {
                 "Upgrade this peer; its stage protocol generation is too old for split serving."
+            }
+            Self::ForceDownstreamReplyUnsupported => {
+                "Upgrade this peer so Shard-style split speculation can force repair/control replies through the downstream socket."
+            }
+            Self::IdentifiedRepliesUnsupported => {
+                "Upgrade this peer so Shard-style split speculation can match direct-return verify replies by window identity."
             }
             Self::MissingStagePath => {
                 "Wait for a measured direct path before admitting this peer to split serving."
@@ -875,6 +900,8 @@ mod tests {
             available_models: Vec::new(),
             model_source: None,
             stage_protocol_generation_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             artifact_transfer_supported: true,
             stage_path: crate::mesh::SplitStagePathSnapshot::direct(Some(4)),
         }

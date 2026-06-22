@@ -1,0 +1,4 @@
+interface:
+  display_name: "HF Mesh Jobs"
+  short_description: "Run owned modest HF mesh validation jobs"
+  default_prompt: "Use $hf-mesh-jobs to run a modest Hugging Face mesh validation job safely."

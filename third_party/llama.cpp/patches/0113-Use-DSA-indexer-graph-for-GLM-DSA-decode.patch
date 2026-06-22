@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mesh-llm <mesh-llm@example.invalid>
+Date: Mon, 22 Jun 2026 12:00:00 +0000
+Subject: [PATCH] Use DSA indexer graph for GLM_DSA decode
+
+GLM_DSA loads the DSA/lightning-indexer tensors, but its normal decoder graph
+was still aliased to the DeepSeek2 MLA graph. Route normal GLM_DSA decode
+through the DeepSeek32 DSA graph so the native executor consumes the sparse
+indexer path instead of silently running the dense MLA fallback.
+
+The MTP graph remains on the existing DeepSeek2 MTP path until GLM-5.2
+IndexShare/MTP parity is audited separately.
+---
+ src/models/models.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/models/models.h b/src/models/models.h
+index f1a84e151..5fa220f03 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1110,7 +1110,7 @@ struct llama_model_glm_dsa : public llama_model_base {
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
+-    using graph = llama_model_deepseek2::graph;
++    using graph = llama_model_deepseek32::graph;
+     using graph_mtp = llama_model_deepseek2::graph_mtp;
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+-- 
+2.39.5
+

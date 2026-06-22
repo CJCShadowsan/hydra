@@ -1,5 +1,20 @@
 # mesh-llm TODO
 
+## Shard-Native Speculative Split Serving
+
+Canonical design/status/proof ledger:
+[SHARD_NATIVE_PORT_AUDIT.md](../../docs/skippy/SHARD_NATIVE_PORT_AUDIT.md)
+
+Port the Shard latency-hiding scheduler and runtime semantics into native
+Skippy, not just a compatibility mode name. The required shape is direct tail
+return, fixed `[current] + K draft` verify windows, pipelined in-flight
+windows, stale-window discard, reject correction, draft re-prime, and
+KV/return-channel recovery under churn.
+
+Current rule for this work: debug/unit coverage first, strict local proof
+second, release/HF proof third. A release rebuild before the changed primitive
+has focused tests is not evidence.
+
 ## Mixture of Models (MoM)
 
 Route different requests to specialized models based on task type. Instead of one "best" model, the mesh becomes smarter about which model handles what.

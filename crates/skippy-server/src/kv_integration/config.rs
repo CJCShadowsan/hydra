@@ -427,6 +427,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             filter_tensors_on_load: false,
+            tree_sequence_count: 0,
             selected_device: None,
             kv_cache: None,
             load_mode: LoadMode::RuntimeSlice,

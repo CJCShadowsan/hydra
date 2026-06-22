@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::{File, OpenOptions};
-use std::io::{LineWriter, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, LineWriter, Write};
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -107,6 +107,7 @@ where
 }
 
 static NATIVE_LOG_FILE: OnceLock<Mutex<Option<LineWriter<File>>>> = OnceLock::new();
+static NATIVE_LOG_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 /// Channel sender for filtered native log messages.
 /// Messages matching key patterns (backend init, model load, VRAM, KV cache, tokenizer) are sent here.
@@ -121,6 +122,12 @@ pub struct NativeLogEvent {
     pub message: String,
     pub category: &'static str,
     pub params: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeLogTail {
+    pub path: PathBuf,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -274,6 +281,10 @@ struct NativeLogAggregator {
 
 fn native_log_file() -> &'static Mutex<Option<LineWriter<File>>> {
     NATIVE_LOG_FILE.get_or_init(|| Mutex::new(None))
+}
+
+fn native_log_path() -> &'static Mutex<Option<PathBuf>> {
+    NATIVE_LOG_PATH.get_or_init(|| Mutex::new(None))
 }
 
 fn native_log_aggregator() -> &'static Mutex<NativeLogAggregator> {
@@ -717,6 +728,9 @@ fn clear_native_log_file() {
         flush_native_log_writer(&mut guard);
         *guard = None;
     }
+    if let Ok(mut guard) = native_log_path().lock() {
+        *guard = None;
+    }
 }
 
 fn set_native_log_callback(callback: skippy_ffi::LlamaLogCallback) {
@@ -746,10 +760,68 @@ pub fn redirect_native_logs_to_file(path: impl AsRef<Path>) -> Result<()> {
     flush_native_log_writer(&mut guard);
     *guard = Some(LineWriter::new(file));
     drop(guard);
+    if let Ok(mut path_guard) = native_log_path().lock() {
+        *path_guard = Some(path.to_path_buf());
+    }
 
     set_native_log_callback(Some(write_native_log));
 
     Ok(())
+}
+
+pub fn current_native_log_path() -> Option<PathBuf> {
+    native_log_path()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+pub fn native_log_tail(max_lines: usize, max_line_chars: usize) -> Result<Option<NativeLogTail>> {
+    let Some(path) = current_native_log_path() else {
+        return Ok(None);
+    };
+    flush_current_native_log_writer();
+    let file = File::open(&path)
+        .with_context(|| format!("open skippy native log file {}", path.display()))?;
+    let lines = tail_native_log_lines(file, max_lines, max_line_chars)?;
+    Ok(Some(NativeLogTail { path, lines }))
+}
+
+fn flush_current_native_log_writer() {
+    if let Ok(mut guard) = native_log_file().lock() {
+        flush_native_log_writer(&mut guard);
+    }
+}
+
+fn tail_native_log_lines(
+    file: File,
+    max_lines: usize,
+    max_line_chars: usize,
+) -> Result<Vec<String>> {
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+    let mut tail = VecDeque::with_capacity(max_lines);
+    for line in BufReader::new(file).lines() {
+        let line = line.context("read skippy native log line")?;
+        if tail.len() == max_lines {
+            tail.pop_front();
+        }
+        tail.push_back(truncate_native_log_line(&line, max_line_chars));
+    }
+    Ok(tail.into_iter().collect())
+}
+
+fn truncate_native_log_line(line: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let truncated = line.chars().take(max_chars).collect::<String>();
+    if truncated.len() == line.len() {
+        truncated
+    } else {
+        format!("{truncated}...")
+    }
 }
 
 pub fn suppress_native_logs() {
@@ -836,6 +908,7 @@ pub struct RuntimeConfig {
     pub include_embeddings: bool,
     pub include_output: bool,
     pub filter_tensors_on_load: bool,
+    pub tree_sequence_count: u32,
 }
 
 impl RuntimeConfig {
@@ -919,6 +992,8 @@ impl RuntimeConfig {
                 filter_tensors_on_load: self.filter_tensors_on_load,
                 include_embeddings: self.include_embeddings,
                 include_output: self.include_output,
+                tree_sequence_count: i32::try_from(self.tree_sequence_count)
+                    .context("tree_sequence_count exceeds i32")?,
                 selected_backend_device: selected_backend_device_ptr,
             },
             _selected_backend_device: selected_backend_device,
@@ -931,7 +1006,7 @@ impl RuntimeConfig {
             .unwrap_or_else(|| default_n_batch_for_lane_count(self.lane_count));
         let n_ubatch = self.n_ubatch.unwrap_or(LLAMA_SERVER_DEFAULT_N_UBATCH);
         format!(
-            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} include_embeddings={} include_output={} filter_tensors_on_load={}",
+            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} include_embeddings={} include_output={} filter_tensors_on_load={} tree_sequence_count={}",
             self.stage_index,
             self.layer_start,
             self.layer_end,
@@ -948,6 +1023,7 @@ impl RuntimeConfig {
             self.include_embeddings,
             self.include_output,
             self.filter_tensors_on_load,
+            self.tree_sequence_count,
         )
     }
 }
@@ -987,6 +1063,7 @@ impl Default for RuntimeConfig {
             include_embeddings: true,
             include_output: true,
             filter_tensors_on_load: false,
+            tree_sequence_count: 0,
         }
     }
 }
@@ -2638,6 +2715,80 @@ impl StageSession {
         Ok(())
     }
 
+    pub fn overwrite_suffix(&mut self, token_count: u64) -> Result<()> {
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_session_overwrite_suffix(self.raw, token_count, &mut error)
+        };
+        ensure_ok(status, error)?;
+        self.token_count = token_count;
+        Ok(())
+    }
+
+    pub fn gather_kv_path(
+        &mut self,
+        source_seq_id: i32,
+        dest_start: u64,
+        source_positions: &[u64],
+        token_ids: &[i32],
+    ) -> Result<()> {
+        if !token_ids.is_empty() && token_ids.len() != source_positions.len() {
+            return Err(anyhow!(
+                "token_ids length must match source_positions length"
+            ));
+        }
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_session_gather_kv_path(
+                self.raw,
+                source_seq_id,
+                dest_start,
+                source_positions.as_ptr(),
+                source_positions.len(),
+                token_ids.as_ptr(),
+                token_ids.len(),
+                &mut error,
+            )
+        };
+        ensure_ok(status, error)?;
+        self.token_count = dest_start
+            .checked_add(u64::try_from(source_positions.len()).context("path length exceeds u64")?)
+            .context("gathered path token count overflows u64")?;
+        Ok(())
+    }
+
+    pub fn gather_tree_path(
+        &mut self,
+        source_leaf_index: u32,
+        dest_start: u64,
+        source_positions: &[u64],
+        token_ids: &[i32],
+    ) -> Result<()> {
+        if !token_ids.is_empty() && token_ids.len() != source_positions.len() {
+            return Err(anyhow!(
+                "token_ids length must match source_positions length"
+            ));
+        }
+        let mut error = ptr::null_mut();
+        let status = unsafe {
+            skippy_ffi::skippy_session_gather_tree_path(
+                self.raw,
+                source_leaf_index,
+                dest_start,
+                source_positions.as_ptr(),
+                source_positions.len(),
+                token_ids.as_ptr(),
+                token_ids.len(),
+                &mut error,
+            )
+        };
+        ensure_ok(status, error)?;
+        self.token_count = dest_start
+            .checked_add(u64::try_from(source_positions.len()).context("path length exceeds u64")?)
+            .context("gathered tree path token count overflows u64")?;
+        Ok(())
+    }
+
     pub fn set_position(&mut self, token_count: u64) -> Result<()> {
         let n_past = i32::try_from(token_count).context("session position exceeds i32")?;
         let mut error = ptr::null_mut();
@@ -3510,6 +3661,101 @@ impl StageSession {
         Ok((predicted, output_desc, output_payload))
     }
 
+    pub fn verify_tree_frame_sampled(
+        &mut self,
+        token_ids: &[i32],
+        parent_indices: &[i32],
+        depths: &[u32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
+        if token_ids.is_empty() {
+            return Err(anyhow!("verify_tree_frame requires at least one token"));
+        }
+        if parent_indices.len() != token_ids.len() || depths.len() != token_ids.len() {
+            return Err(anyhow!(
+                "tree parent and depth sidebands must match token count"
+            ));
+        }
+        let (predicted_tokens, output_desc, output_payload) = self.verify_tree_frame_raw(
+            token_ids,
+            parent_indices,
+            depths,
+            sampling,
+            input,
+            output_capacity,
+        )?;
+        Ok((
+            predicted_tokens,
+            ActivationFrame {
+                desc: output_desc.into(),
+                payload: output_payload,
+            },
+        ))
+    }
+
+    fn verify_tree_frame_raw(
+        &mut self,
+        token_ids: &[i32],
+        parent_indices: &[i32],
+        depths: &[u32],
+        sampling: Option<&SamplingConfig>,
+        input: Option<&ActivationFrame>,
+        output_capacity: usize,
+    ) -> Result<(Vec<i32>, RawActivationDesc, Vec<u8>)> {
+        let input_desc = input.map(|frame| frame.desc.as_raw());
+        let input_desc_ptr = input_desc
+            .as_ref()
+            .map_or(ptr::null(), |desc| desc as *const RawActivationDesc);
+        let input_payload_ptr = input.map_or(ptr::null(), |frame| frame.payload.as_ptr().cast());
+        let mut output_desc = empty_raw_activation_desc();
+        let mut output_payload = vec![0_u8; output_capacity];
+        let mut output_bytes = 0usize;
+        let mut predicted = vec![0_i32; token_ids.len()];
+        let mut output_token_count = 0usize;
+        let mut error = ptr::null_mut();
+        let raw_sampling = sampling.map(SamplingConfig::as_raw);
+        let sampling_ptr = raw_sampling
+            .as_ref()
+            .map_or(ptr::null(), |sampling| sampling as *const RawSamplingConfig);
+        let status = unsafe {
+            skippy_ffi::skippy_verify_tree_frame_sampled(
+                self.raw,
+                token_ids.as_ptr(),
+                parent_indices.as_ptr(),
+                depths.as_ptr(),
+                token_ids.len(),
+                sampling_ptr,
+                input_desc_ptr,
+                input_payload_ptr,
+                &mut output_desc,
+                output_payload.as_mut_ptr().cast(),
+                output_payload.len(),
+                &mut output_bytes,
+                predicted.as_mut_ptr(),
+                predicted.len(),
+                &mut output_token_count,
+                &mut error,
+            )
+        };
+        if status == Status::BufferTooSmall && output_bytes > output_payload.len() {
+            free_error(error);
+            return self.verify_tree_frame_raw(
+                token_ids,
+                parent_indices,
+                depths,
+                sampling,
+                input,
+                output_bytes,
+            );
+        }
+        ensure_ok(status, error)?;
+        predicted.truncate(output_token_count);
+        output_payload.truncate(output_bytes);
+        Ok((predicted, output_desc, output_payload))
+    }
+
     pub fn copy_output_activation_frame(
         &mut self,
         token_count: usize,
@@ -4129,10 +4375,10 @@ mod tests {
         LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
         NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
         SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, SamplingConfig, StageModel, Status, TensorRole,
-        flush_native_log_writer, format_skippy_error, parse_cache_type, parse_layer_assign_index,
-        redirect_native_logs_to_file, register_filtered_native_logs, restore_native_logs,
-        set_filtered_native_logs_enabled, unregister_filtered_native_logs, write_native_log,
-        write_native_log_note,
+        current_native_log_path, flush_native_log_writer, format_skippy_error, native_log_tail,
+        parse_cache_type, parse_layer_assign_index, redirect_native_logs_to_file,
+        register_filtered_native_logs, restore_native_logs, set_filtered_native_logs_enabled,
+        unregister_filtered_native_logs, write_native_log, write_native_log_note,
     };
     use std::{
         env,
@@ -4338,6 +4584,43 @@ mod tests {
     }
 
     #[test]
+    fn native_log_tail_returns_bounded_current_log_lines() -> anyhow::Result<()> {
+        let _native_log_guard = native_log_test_guard();
+
+        struct RestoreNativeLogs;
+
+        impl Drop for RestoreNativeLogs {
+            fn drop(&mut self) {
+                restore_native_logs();
+            }
+        }
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!(
+            "skippy-native-log-tail-test-{}-{nanos}.log",
+            std::process::id()
+        ));
+        let _guard = RestoreNativeLogs;
+        redirect_native_logs_to_file(&path)?;
+
+        write_native_log_note("first");
+        write_native_log_note("second line with extra text");
+        write_native_log_note("third");
+
+        let tail = native_log_tail(2, 12)?.expect("native log path should be configured");
+        assert_eq!(current_native_log_path().as_deref(), Some(path.as_path()));
+        restore_native_logs();
+        fs::remove_file(&path)?;
+
+        assert_eq!(tail.path, path);
+        assert_eq!(
+            tail.lines,
+            vec!["mesh-llm: se...".to_string(), "mesh-llm: th...".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runtime_config_raw_preserves_selected_backend_device() -> anyhow::Result<()> {
         let config = RuntimeConfig {
             selected_backend_device: Some("MTL0".to_string()),
@@ -4459,6 +4742,7 @@ mod tests {
             include_embeddings: true,
             include_output: true,
             filter_tensors_on_load: false,
+            tree_sequence_count: 0,
         };
         StageModel::open(model_path, &config)
     }

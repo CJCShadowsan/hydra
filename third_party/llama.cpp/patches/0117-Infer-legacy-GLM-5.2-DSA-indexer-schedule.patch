@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mesh-llm <mesh-llm@example.invalid>
+Date: Mon, 22 Jun 2026 13:10:00 +0000
+Subject: [PATCH] Infer legacy GLM-5.2 DSA indexer schedule
+
+Newly converted GLM_DSA GGUFs can carry `indexer.types` or the periodic
+indexer schedule keys, but current public GLM-5.2 GGUFs predate those keys.
+They still contain per-layer indexer tensors, so treating every layer as a full
+indexer would silently diverge from the HF GLM-5.2 graph, where most layers
+reuse the previous full layer's top-k indices.
+
+When explicit metadata is missing, infer the GLM-5.2 78-decoder-layer schedule:
+the first three layers run full indexers, then every fourth layer runs a full
+indexer and the intervening layers reuse the previous top-k. If future GGUFs
+carry explicit metadata, that metadata wins.
+---
+ src/models/glm-dsa.cpp | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 1857350e3..a1244518d 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -1,5 +1,29 @@
+ #include "models.h"
+ 
++namespace {
++
++void set_glm_dsa_indexer_periodic_schedule(
++        llama_hparams & hparams,
++        uint32_t top_k_frequency,
++        uint32_t skip_top_k_offset) {
++    if (top_k_frequency == 0 || skip_top_k_offset == 0) {
++        throw std::runtime_error("GLM_DSA indexer schedule requires non-zero frequency and offset");
++    }
++
++    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++        const bool force_full = il < skip_top_k_offset;
++        const bool periodic_full =
++            il >= skip_top_k_offset && (il - skip_top_k_offset + 1) % top_k_frequency == 0;
++        hparams.indexer_is_shared[il] = force_full || periodic_full ? 0 : 1;
++    }
++}
++
++bool is_glm52_dsa_decoder_shape(const llama_hparams & hparams) {
++    return hparams.n_layer() == 78 && hparams.n_layer_nextn == 1 && hparams.indexer_top_k == 2048;
++}
++
++} // namespace
++
+ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+@@ -60,6 +84,18 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+                 throw std::runtime_error("unknown GLM_DSA indexer type: " + indexer_types[il]);
+             }
+         }
++    } else if (hparams.indexer_top_k_frequency > 0 && hparams.indexer_skip_top_k_offset > 0) {
++        set_glm_dsa_indexer_periodic_schedule(
++                hparams,
++                hparams.indexer_top_k_frequency,
++                hparams.indexer_skip_top_k_offset);
++    } else if (is_glm52_dsa_decoder_shape(hparams)) {
++        hparams.indexer_top_k_frequency = 4;
++        hparams.indexer_skip_top_k_offset = 3;
++        set_glm_dsa_indexer_periodic_schedule(
++                hparams,
++                hparams.indexer_top_k_frequency,
++                hparams.indexer_skip_top_k_offset);
+     }
+ 
+     switch (hparams.n_layer()) {
+-- 
+2.39.5
+

@@ -34,11 +34,24 @@ use native_runtime_events::skippy_native_model_open_event_reporter;
 
 const SPLIT_PARTICIPANT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SPLIT_PARTICIPANT_STABLE_FOR: Duration = Duration::from_secs(2);
+const SPLIT_STARTUP_PARTICIPANT_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 pub(super) const SPLIT_DEFAULT_MIN_PARTICIPANTS: usize = 2;
 const SPLIT_INITIAL_SHUTDOWN_GENERATION: u64 = 1;
 const SPLIT_COORDINATOR_LEASE_SECS: u64 = 4 * 60 * 60;
+const SPLIT_PREFERRED_STAGE0_ENV: &str = "MESH_LLM_SPLIT_PREFERRED_STAGE0";
+const SPLIT_MIN_PARTICIPANTS_ENV: &str = "MESH_LLM_SPLIT_MIN_PARTICIPANTS";
+const SPLIT_FORCE_BOUNDARIES_ENV: &str = "MESH_LLM_SPLIT_FORCE_BOUNDARIES";
 
 pub(super) type OpenAiGuardrailPolicyHandle = openai_frontend::GuardrailPolicyHandle;
+
+pub(super) fn split_min_participants() -> usize {
+    std::env::var(SPLIT_MIN_PARTICIPANTS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.max(SPLIT_DEFAULT_MIN_PARTICIPANTS))
+        .unwrap_or(SPLIT_DEFAULT_MIN_PARTICIPANTS)
+}
 
 pub(super) fn openai_guardrail_policy_handle(
     mode: openai_frontend::GuardrailMode,
@@ -704,14 +717,17 @@ pub(super) async fn start_runtime_split_model(
 ) -> Result<SplitRuntimeStart> {
     let run_id = format!("mesh-split-{}", now_unix_nanos());
     let topology_id = format!("topology-{run_id}");
-    let split_setup =
-        prepare_split_runtime_start(&spec, model_ref, &topology_id, Duration::from_secs(30))
-            .await?;
+    let split_setup = prepare_split_runtime_start(
+        &spec,
+        model_ref,
+        &topology_id,
+        SPLIT_STARTUP_PARTICIPANT_TIMEOUT,
+    )
+    .await?;
     let SplitRuntimeStartPreparation {
         package,
         participant_snapshot,
-        compact_meta,
-        kv_bytes_per_token,
+        topology_resources,
         planned_topology,
     } = split_setup;
     let stages = planned_topology.stages;
@@ -800,12 +816,7 @@ pub(super) async fn start_runtime_split_model(
         active,
         projector_path,
         ctx_size,
-        topology_resources: SplitTopologyResourceInputs {
-            native_context_length: compact_meta.context_length,
-            kv_bytes_per_token,
-            ctx_size_override: spec.ctx_size_override,
-            parallel_override: spec.parallel_override,
-        },
+        topology_resources,
         cache_type_k_override: spec.cache_type_k_override.map(str::to_string),
         cache_type_v_override: spec.cache_type_v_override.map(str::to_string),
         n_batch_override: spec.n_batch_override,
@@ -825,8 +836,7 @@ pub(super) async fn start_runtime_split_model(
 struct SplitRuntimeStartPreparation {
     package: skippy::SkippyPackageIdentity,
     participant_snapshot: SplitParticipantSnapshot,
-    compact_meta: models::gguf::GgufCompactMeta,
-    kv_bytes_per_token: u64,
+    topology_resources: SplitTopologyResourceInputs,
     planned_topology: PlannedRuntimeSliceTopology,
 }
 
@@ -853,24 +863,28 @@ async fn prepare_split_runtime_start(
         spec.cache_type_k_override,
         spec.cache_type_v_override,
     )?;
+    let preferred_stage0_node_id =
+        resolve_preferred_split_stage0_node(spec.node, &participant_snapshot.participants)?;
+    let topology_resources = SplitTopologyResourceInputs {
+        native_context_length: compact_meta.context_length,
+        kv_bytes_per_token,
+        ctx_size_override: spec.ctx_size_override,
+        parallel_override: spec.parallel_override,
+        preferred_stage0_node_id,
+        forced_boundaries: forced_split_boundaries()?,
+    };
     let planned_topology = plan_runtime_slice_topology_with_resources(
         topology_id,
         model_ref,
         &package,
         &participant_snapshot.participants,
         &participant_snapshot.excluded,
-        SplitTopologyResourceInputs {
-            native_context_length: compact_meta.context_length,
-            kv_bytes_per_token,
-            ctx_size_override: spec.ctx_size_override,
-            parallel_override: spec.parallel_override,
-        },
+        topology_resources.clone(),
     )?;
     Ok(SplitRuntimeStartPreparation {
         package,
         participant_snapshot,
-        compact_meta,
-        kv_bytes_per_token,
+        topology_resources,
         planned_topology,
     })
 }
@@ -901,6 +915,67 @@ fn split_runtime_kv_bytes_per_token(
     kv_cache_quant
         .kv_cache_bytes_per_token(compact_meta)
         .context("split topology planning requires KV cache byte metadata")
+}
+
+fn resolve_preferred_split_stage0_node(
+    node: &mesh::Node,
+    participants: &[SplitParticipant],
+) -> Result<Option<iroh::EndpointId>> {
+    let Some(raw) = std::env::var(SPLIT_PREFERRED_STAGE0_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if raw.eq_ignore_ascii_case("local") {
+        return Ok(Some(node.id()));
+    }
+
+    let matches = participants
+        .iter()
+        .filter(|participant| split_participant_id_matches(participant.node_id, &raw))
+        .map(|participant| participant.node_id)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [preferred] => Ok(Some(*preferred)),
+        [] => {
+            anyhow::bail!("{SPLIT_PREFERRED_STAGE0_ENV}={raw} did not match any split participant")
+        }
+        _ => {
+            anyhow::bail!("{SPLIT_PREFERRED_STAGE0_ENV}={raw} matched multiple split participants")
+        }
+    }
+}
+
+fn forced_split_boundaries() -> Result<Option<Vec<u32>>> {
+    let Some(raw) = std::env::var(SPLIT_FORCE_BOUNDARIES_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mut boundaries = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let boundary = value.parse::<u32>().with_context(|| {
+            format!("{SPLIT_FORCE_BOUNDARIES_ENV} contains invalid boundary {value:?}")
+        })?;
+        boundaries.push(boundary);
+    }
+    anyhow::ensure!(
+        !boundaries.is_empty(),
+        "{SPLIT_FORCE_BOUNDARIES_ENV} must contain at least one boundary"
+    );
+    Ok(Some(boundaries))
+}
+
+fn split_participant_id_matches(node_id: iroh::EndpointId, expected: &str) -> bool {
+    node_id.to_string() == expected || node_id.fmt_short().to_string() == expected
 }
 
 fn split_runtime_standby_start(
@@ -1079,6 +1154,8 @@ pub(super) enum SplitParticipantExclusionReason {
     MissingVram,
     MissingModelInterest,
     StageProtocolGeneration,
+    ForceDownstreamReplyUnsupported,
+    IdentifiedRepliesUnsupported,
     MissingStagePath,
     StagePathRelayOnly,
     StagePathTooSlow,
@@ -1096,6 +1173,8 @@ impl SplitParticipantExclusionReason {
             Self::MissingVram => "missing_vram",
             Self::MissingModelInterest => "missing_model_interest",
             Self::StageProtocolGeneration => "stage_protocol_generation",
+            Self::ForceDownstreamReplyUnsupported => "force_downstream_reply_unsupported",
+            Self::IdentifiedRepliesUnsupported => "identified_replies_unsupported",
             Self::MissingStagePath => "missing_stage_path",
             Self::StagePathRelayOnly => "stage_path_relay_only",
             Self::StagePathTooSlow => "stage_path_too_slow",
@@ -1118,6 +1197,12 @@ impl SplitParticipantExclusionReason {
             }
             Self::StageProtocolGeneration => {
                 "Upgrade this peer so it advertises current stage protocol support."
+            }
+            Self::ForceDownstreamReplyUnsupported => {
+                "Upgrade this peer so Shard-style split speculation can force repair/control replies through the downstream socket."
+            }
+            Self::IdentifiedRepliesUnsupported => {
+                "Upgrade this peer so Shard-style split speculation can match verify replies by window identity."
             }
             Self::MissingStagePath => {
                 "Wait for direct peer latency to be measured or fix direct QUIC connectivity."
@@ -1181,6 +1266,18 @@ struct SplitGenerationLoadSettings<'a> {
     load_mode: LoadMode,
     activation_width: i32,
     activation_wire_dtype: skippy::StageWireDType,
+    tree_sequence_count: u32,
+}
+
+fn split_tree_aware_flash_attn_type(
+    flash_attn_type: FlashAttentionType,
+    tree_sequence_count: u32,
+) -> FlashAttentionType {
+    if tree_sequence_count > 0 {
+        FlashAttentionType::Disabled
+    } else {
+        flash_attn_type
+    }
 }
 
 async fn load_split_runtime_generation(
@@ -1234,6 +1331,7 @@ async fn load_split_runtime_generation_inner(
                 spec.package,
                 &spec.generation.stages,
                 &ready_by_stage,
+                settings.tree_sequence_count,
             ))
             .await;
     }
@@ -1355,6 +1453,7 @@ async fn load_split_runtime_generation_inner(
             spec.package,
             &spec.generation.stages,
             &ready_by_stage,
+            settings.tree_sequence_count,
         ))
         .await;
 
@@ -1497,7 +1596,11 @@ fn split_runtime_stage_load_request(
         n_gpu_layers: resolved_config.n_gpu_layers,
         cache_type_k: resolved_config.cache_type_k.clone(),
         cache_type_v: resolved_config.cache_type_v.clone(),
-        flash_attn_type: resolved_config.flash_attn_type,
+        flash_attn_type: split_tree_aware_flash_attn_type(
+            resolved_config.flash_attn_type,
+            settings.tree_sequence_count,
+        ),
+        tree_sequence_count: settings.tree_sequence_count,
         shutdown_generation: spec.generation.generation,
         coordinator_term: spec.generation.coordinator_term,
         coordinator_id: Some(spec.node.id()),
@@ -1569,6 +1672,7 @@ fn split_generation_load_settings<'a>(
         Some(spec.package.clone()),
         load_mode.clone(),
     )?;
+    let tree_sequence_count = runtime_options.config.tree_sequence_count;
     tracing::info!(
         model = spec.model_ref,
         "KV cache: {} K + {} V",
@@ -1582,6 +1686,7 @@ fn split_generation_load_settings<'a>(
         load_mode,
         activation_width,
         activation_wire_dtype: resolved.skippy.activation_wire_dtype,
+        tree_sequence_count,
     })
 }
 
@@ -2297,7 +2402,7 @@ impl SplitTopologyCoordinator {
         let resources = SplitTopologyResourceInputs {
             ctx_size_override: Some(self.ctx_size),
             parallel_override: Some(self.slots),
-            ..self.topology_resources
+            ..self.topology_resources.clone()
         };
         let planned = plan_runtime_slice_topology_with_resources(
             &topology_id,
@@ -2549,7 +2654,7 @@ fn split_candidate_for_replan(
     participant_count: usize,
     candidate: Option<SplitTopologyGeneration>,
 ) -> Option<SplitTopologyGeneration> {
-    if participant_count < SPLIT_DEFAULT_MIN_PARTICIPANTS {
+    if participant_count < split_min_participants() {
         return None;
     }
     candidate
@@ -2571,11 +2676,11 @@ fn log_split_replan_quorum_not_met(
 }
 
 fn split_participants_meet_minimum(participants: &[SplitParticipant]) -> bool {
-    participants.len() >= SPLIT_DEFAULT_MIN_PARTICIPANTS
+    participants.len() >= split_min_participants()
 }
 
 fn split_stages_meet_minimum(stages: &[RuntimeSliceStagePlan]) -> bool {
-    stages.len() >= SPLIT_DEFAULT_MIN_PARTICIPANTS
+    stages.len() >= split_min_participants()
 }
 
 fn split_active_stage_participant_missing(
@@ -2801,7 +2906,7 @@ fn record_best_split_participants(
 }
 
 fn split_participants_ready(snapshot: &SplitParticipantSnapshot, stable_for: Duration) -> bool {
-    snapshot.participants.len() >= SPLIT_DEFAULT_MIN_PARTICIPANTS
+    snapshot.participants.len() >= split_min_participants()
         && stable_for >= SPLIT_PARTICIPANT_STABLE_FOR
 }
 
@@ -2810,11 +2915,12 @@ fn ensure_split_participant_timeout_has_quorum(
     best: &[SplitParticipant],
     best_excluded: &[SplitParticipantExclusion],
 ) -> Result<()> {
-    if best.len() >= SPLIT_DEFAULT_MIN_PARTICIPANTS {
+    let required = split_min_participants();
+    if best.len() >= required {
         return Ok(());
     }
     anyhow::bail!(
-        "split runtime needs at least two participating nodes for {model_ref}; found {} eligible [{}]; excluded [{}]; blockers [{}]; next_step: {}",
+        "split runtime needs at least {required} participating nodes for {model_ref}; found {} eligible [{}]; excluded [{}]; blockers [{}]; next_step: {}",
         best.len(),
         split_participant_labels(best).join(", "),
         split_participant_exclusion_labels(best_excluded).join(", "),
@@ -2882,7 +2988,7 @@ fn split_participant_blocker(
     })
 }
 
-const fn split_participant_exclusion_reason_order() -> [SplitParticipantExclusionReason; 12] {
+const fn split_participant_exclusion_reason_order() -> [SplitParticipantExclusionReason; 13] {
     [
         SplitParticipantExclusionReason::StageControlUnreachable,
         SplitParticipantExclusionReason::PackageManifestMismatch,
@@ -2892,6 +2998,7 @@ const fn split_participant_exclusion_reason_order() -> [SplitParticipantExclusio
         SplitParticipantExclusionReason::MissingStagePath,
         SplitParticipantExclusionReason::StagePathRelayOnly,
         SplitParticipantExclusionReason::StagePathTooSlow,
+        SplitParticipantExclusionReason::ForceDownstreamReplyUnsupported,
         SplitParticipantExclusionReason::StageProtocolGeneration,
         SplitParticipantExclusionReason::MissingVram,
         SplitParticipantExclusionReason::MissingModelInterest,
@@ -3010,13 +3117,29 @@ fn split_peer_preflight_exclusion_reason(
     if !peer.stage_protocol_generation_supported {
         return Some(SplitParticipantExclusionReason::StageProtocolGeneration);
     }
+    if !peer.stage_force_downstream_reply_supported {
+        return Some(SplitParticipantExclusionReason::ForceDownstreamReplyUnsupported);
+    }
+    if !peer.stage_identified_replies_supported {
+        return Some(SplitParticipantExclusionReason::IdentifiedRepliesUnsupported);
+    }
     None
 }
 
 fn split_peer_stage_path_exclusion_reason(
     snapshot: mesh::SplitStagePathSnapshot,
 ) -> Option<SplitParticipantExclusionReason> {
-    match snapshot.stage_path_rejection()? {
+    split_peer_stage_path_exclusion_reason_with_policy(
+        snapshot,
+        mesh::split_stage_path_policy_from_env(),
+    )
+}
+
+fn split_peer_stage_path_exclusion_reason_with_policy(
+    snapshot: mesh::SplitStagePathSnapshot,
+    policy: mesh::SplitStagePathPolicy,
+) -> Option<SplitParticipantExclusionReason> {
+    match snapshot.stage_path_rejection_with_policy(policy)? {
         mesh::SplitStagePathRejection::MissingStagePath => {
             Some(SplitParticipantExclusionReason::MissingStagePath)
         }
@@ -3509,6 +3632,7 @@ fn split_stage_topology_instance(
     package: &skippy::SkippyPackageIdentity,
     stages: &[RuntimeSliceStagePlan],
     ready_by_stage: &HashMap<String, skippy::StageStatusSnapshot>,
+    tree_sequence_count: u32,
 ) -> mesh::StageTopologyInstance {
     mesh::StageTopologyInstance {
         topology_id: topology_id.to_string(),
@@ -3524,6 +3648,7 @@ fn split_stage_topology_instance(
                 node_id: stage.node_id,
                 layer_start: stage.layer_start,
                 layer_end: stage.layer_end,
+                tree_sequence_count,
                 endpoint: mesh::StageEndpoint {
                     bind_addr: ready_by_stage
                         .get(&stage.stage_id)
@@ -3857,6 +3982,7 @@ mod tests {
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
+            tree_sequence_count: 0,
             shutdown_generation: 1,
             coordinator_term: 1,
             coordinator_id: None,
@@ -3916,6 +4042,8 @@ mod tests {
             artifact_transfer_supported: false,
             stage_protocol_generation_supported,
             stage_status_list_supported: false,
+            stage_force_downstream_reply_supported: stage_protocol_generation_supported,
+            stage_identified_replies_supported: stage_protocol_generation_supported,
             advertised_model_throughput: vec![],
 
             display_rtt: None,
@@ -4140,6 +4268,7 @@ prefill_chunk_size = 96
 mode = "draft"
 draft_model_path = "/models/draft.gguf"
 draft_max_tokens = 7
+pipelined_depth = 3
 draft_gpu_layers = 11
 
 [models.request_defaults]
@@ -4235,7 +4364,109 @@ stop = ["END"]
             Some(Path::new("/models/draft.gguf"))
         );
         assert_eq!(settings.embedded_openai.speculative_window, 7);
+        assert_eq!(settings.embedded_openai.pipelined_speculative_depth, 3);
         assert_eq!(settings.embedded_openai.draft_n_gpu_layers, Some(11));
+        assert_eq!(settings.tree_sequence_count, 0);
+    }
+
+    #[tokio::test]
+    async fn tree_split_settings_propagate_verify_capacity_to_stage_loads() {
+        let node = mesh::Node::new_for_tests(NodeRole::Host { http_port: 9337 })
+            .await
+            .unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let model_path = temp_dir.path().join("qwen.gguf");
+        write_fake_gguf_model(&model_path);
+        let mesh_config: plugin::MeshConfig = toml::from_str(&format!(
+            r#"
+[[models]]
+model = "Qwen"
+
+[models.hardware]
+model_path = "{model_path}"
+
+[models.speculative]
+mode = "tree"
+draft_model_path = "/models/draft.gguf"
+draft_max_tokens = 5
+"#,
+            model_path = model_path.display()
+        ))
+        .expect("test mesh config should parse");
+        let mut package = package(12);
+        package.package_ref = "hf://Mesh-LLM/test-tree-split-package".to_string();
+        let local_id = node.id();
+        let generation = SplitTopologyGeneration::new(
+            "tree-topology".into(),
+            "tree-run".into(),
+            1,
+            vec![SplitParticipant::new(local_id, 24_000_000_000, None)],
+            vec![
+                local_stage(local_id, 0, 0, 4),
+                local_stage(local_id, 1, 4, 12),
+            ],
+        );
+        let spec = SplitGenerationLoadSpec {
+            node: &node,
+            mesh_config: &mesh_config,
+            model_ref: "Qwen",
+            model_path: &model_path,
+            package: &package,
+            generation: &generation,
+            projector_path: None,
+            ctx_size: 512,
+            pinned_gpu: None,
+            slots: 2,
+            cache_type_k_override: None,
+            cache_type_v_override: None,
+            n_batch_override: None,
+            n_ubatch_override: None,
+            flash_attention_override: FlashAttentionType::Auto,
+            openai_guardrail_policy: openai_guardrail_policy_handle(
+                openai_frontend::GuardrailMode::Disabled,
+            ),
+            skippy_telemetry: skippy::SkippyTelemetryOptions::off(),
+            survey_telemetry: survey::SurveyTelemetry::disabled(),
+        };
+        let settings =
+            split_generation_load_settings(&spec).expect("tree split settings should resolve");
+
+        assert_eq!(settings.tree_sequence_count, 5);
+        assert_eq!(settings.runtime_options.config.tree_sequence_count, 5);
+        assert_eq!(
+            settings.runtime_options.config.flash_attn_type,
+            FlashAttentionType::Disabled
+        );
+        assert!(settings.embedded_openai.tree_speculative);
+
+        let downstream_load = split_runtime_stage_load_request(
+            &spec,
+            &settings,
+            &generation.stages[1],
+            None,
+            "127.0.0.1:9000",
+        );
+        assert_eq!(downstream_load.tree_sequence_count, 5);
+        assert_eq!(
+            downstream_load.flash_attn_type,
+            FlashAttentionType::Disabled
+        );
+
+        let topology = split_stage_topology_instance(
+            &generation.topology_id,
+            &generation.run_id,
+            "Qwen",
+            &package,
+            &generation.stages,
+            &HashMap::new(),
+            settings.tree_sequence_count,
+        );
+        assert!(
+            topology
+                .stages
+                .iter()
+                .all(|stage| stage.tree_sequence_count == 5)
+        );
     }
 
     #[tokio::test]
@@ -4684,6 +4915,8 @@ max_tokens = 222
         );
 
         peer.stage_protocol_generation_supported = true;
+        peer.stage_force_downstream_reply_supported = true;
+        peer.stage_identified_replies_supported = true;
         assert_eq!(
             split_peer_preflight_exclusion_reason(
                 &peer,
@@ -4691,6 +4924,38 @@ max_tokens = 222
                 "meshllm/Qwen3-Coder-layers"
             ),
             None
+        );
+    }
+
+    #[test]
+    fn split_peer_preflight_requires_force_downstream_reply_support() {
+        let mut peer = split_test_peer(0x65, "Qwen3-Coder", true);
+        peer.stage_force_downstream_reply_supported = false;
+        peer.stage_identified_replies_supported = true;
+
+        assert_eq!(
+            split_peer_preflight_exclusion_reason(
+                &peer,
+                "Qwen3-Coder",
+                "meshllm/Qwen3-Coder-layers"
+            ),
+            Some(SplitParticipantExclusionReason::ForceDownstreamReplyUnsupported)
+        );
+    }
+
+    #[test]
+    fn split_peer_preflight_requires_identified_reply_support() {
+        let mut peer = split_test_peer(0x66, "Qwen3-Coder", true);
+        peer.stage_force_downstream_reply_supported = true;
+        peer.stage_identified_replies_supported = false;
+
+        assert_eq!(
+            split_peer_preflight_exclusion_reason(
+                &peer,
+                "Qwen3-Coder",
+                "meshllm/Qwen3-Coder-layers"
+            ),
+            Some(SplitParticipantExclusionReason::IdentifiedRepliesUnsupported)
         );
     }
 
@@ -4715,10 +4980,33 @@ max_tokens = 222
     #[test]
     fn split_peer_preflight_rejects_relay_only_stage_path() {
         assert_eq!(
-            split_peer_stage_path_exclusion_reason(mesh::SplitStagePathSnapshot::relay(Some(
-                crate::mesh::MAX_SPLIT_RTT_MS,
-            ))),
+            split_peer_stage_path_exclusion_reason_with_policy(
+                mesh::SplitStagePathSnapshot::relay(Some(crate::mesh::MAX_SPLIT_RTT_MS,)),
+                mesh::SplitStagePathPolicy::strict(),
+            ),
             Some(SplitParticipantExclusionReason::StagePathRelayOnly)
+        );
+    }
+
+    #[test]
+    fn split_peer_preflight_can_allow_relay_stage_path_for_validation() {
+        assert_eq!(
+            split_peer_stage_path_exclusion_reason_with_policy(
+                mesh::SplitStagePathSnapshot::relay(Some(crate::mesh::MAX_SPLIT_RTT_MS + 100)),
+                mesh::SplitStagePathPolicy::allow_relay_stage_paths(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn split_peer_preflight_can_allow_slow_direct_stage_path_for_validation() {
+        assert_eq!(
+            split_peer_stage_path_exclusion_reason_with_policy(
+                mesh::SplitStagePathSnapshot::direct(Some(crate::mesh::MAX_SPLIT_RTT_MS + 200)),
+                mesh::SplitStagePathPolicy::allow_slow_direct_stage_paths(),
+            ),
+            None
         );
     }
 

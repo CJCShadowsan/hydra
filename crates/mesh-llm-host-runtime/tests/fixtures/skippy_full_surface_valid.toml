@@ -107,6 +107,7 @@ draft_model_path = "/models/qwen-draft.gguf"
 draft_selection_policy = "manual"
 pairing_fault = "fail-open"
 draft_max_tokens = 8
+pipelined_depth = 2
 draft_gpu_layers = 12
 
 [models.request_defaults]

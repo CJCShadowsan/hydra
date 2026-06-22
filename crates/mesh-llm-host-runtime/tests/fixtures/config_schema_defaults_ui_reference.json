@@ -848,6 +848,13 @@
       }
     },
     {
+      "canonical_path": "defaults.speculative.pipelined_depth",
+      "support": "supported",
+      "source": {
+        "kind": "built_in"
+      }
+    },
+    {
       "canonical_path": "defaults.speculative.spec_default",
       "support": "supported",
       "source": {

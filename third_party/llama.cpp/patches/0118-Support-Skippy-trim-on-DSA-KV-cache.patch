@@ -1,0 +1,36 @@
+From 3980433a58b8a6678f1c6b8f364dd10c8e53cf45 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Mon, 22 Jun 2026 12:06:00 +1000
+Subject: [PATCH] Support Skippy trim on DSA KV cache
+
+---
+ src/skippy.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 89170ef02..a4bf862fb 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-ext.h"
+ #include "llama-graph.h"
+ #include "llama-kv-cache.h"
++#include "llama-kv-cache-dsa.h"
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+@@ -5123,6 +5124,11 @@ enum skippy_status skippy_trim_session(
+             skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim native KV suffix");
+             return SKIPPY_STATUS_RUNTIME_ERROR;
+         }
++    } else if (auto * dsa = dynamic_cast<llama_kv_cache_dsa *>(memory)) {
++        if (!dsa->seq_rm(session->seq_id, p0, -1)) {
++            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to trim native DSA KV suffix");
++            return SKIPPY_STATUS_RUNTIME_ERROR;
++        }
+     } else if (dynamic_cast<llama_memory_recurrent *>(memory) == nullptr) {
+         skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "runtime memory type is not supported for trim");
+         return SKIPPY_STATUS_UNSUPPORTED;
+-- 
+2.54.0
+

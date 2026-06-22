@@ -63,6 +63,102 @@ fn proactive_eviction_attrs_are_bounded_and_request_free() {
     assert!(!attrs.contains_key("openai.prompt_cache_retention"));
 }
 
+#[test]
+fn non_tree_openai_allows_auto_flash_attention() {
+    let config = prefix_cache_test_config();
+
+    ensure_tree_speculative_flash_attention(false, &config)
+        .expect("non-tree serving should allow auto flash attention");
+}
+
+#[test]
+fn tree_openai_requires_disabled_flash_attention() {
+    let config = prefix_cache_test_config();
+
+    let error = ensure_tree_speculative_flash_attention(true, &config)
+        .expect_err("tree serving should reject auto flash attention")
+        .to_string();
+
+    assert!(error.contains("requires flash_attn_type = disabled"));
+}
+
+#[test]
+fn tree_openai_allows_disabled_flash_attention() {
+    let mut config = prefix_cache_test_config();
+    config.flash_attn_type = skippy_protocol::FlashAttentionType::Disabled;
+
+    ensure_tree_speculative_flash_attention(true, &config)
+        .expect("tree serving should allow disabled flash attention");
+}
+
+#[test]
+fn draft_fault_config_defaults_to_disabled() {
+    let config = DraftFaultConfig::from_values(None, None, None);
+
+    assert_eq!(
+        config,
+        DraftFaultConfig {
+            every: 0,
+            offset: 0,
+            rank: 2
+        }
+    );
+    assert!(!config.enabled());
+    assert!(!config.should_fault(1));
+}
+
+#[test]
+fn draft_fault_config_honors_offset_and_rank() {
+    let config = DraftFaultConfig::from_values(Some("3"), Some("1"), Some("4"));
+
+    assert!(config.enabled());
+    assert_eq!(config.rank, 4);
+    assert!(!config.should_fault(1));
+    assert!(config.should_fault(2));
+    assert!(!config.should_fault(3));
+    assert!(!config.should_fault(4));
+    assert!(config.should_fault(5));
+}
+
+#[test]
+fn draft_fault_config_clamps_rank_and_ignores_invalid_values() {
+    let disabled = DraftFaultConfig::from_values(Some("not-a-number"), Some("bad"), Some("1"));
+
+    assert!(!disabled.enabled());
+    assert_eq!(disabled.offset, 0);
+    assert_eq!(disabled.rank, 2);
+
+    let high_rank = DraftFaultConfig::from_values(Some("1"), None, Some("999999"));
+
+    assert_eq!(high_rank.rank, MAX_LOGIT_BIAS + 1);
+    assert!(high_rank.should_fault(1));
+}
+
+#[test]
+fn split_shard_modes_require_direct_prediction_return() {
+    let mut config = prefix_cache_test_config();
+    config.downstream = Some(PeerConfig {
+        stage_id: "stage-1".to_string(),
+        stage_index: 1,
+        endpoint: "127.0.0.1:9447".to_string(),
+    });
+
+    let pipelined = ensure_shard_direct_prediction_return(&config, 2, false, false)
+        .expect_err("pipelined split speculation should fail without direct return")
+        .to_string();
+    assert!(pipelined.contains("pipelined speculative serving requires direct prediction return"));
+
+    let tree = ensure_shard_direct_prediction_return(&config, 1, true, false)
+        .expect_err("tree split speculation should fail without direct return")
+        .to_string();
+    assert!(tree.contains("tree speculative serving requires direct prediction return"));
+
+    ensure_shard_direct_prediction_return(&config, 1, false, false)
+        .expect("sync speculative baseline can use upstream replies");
+    ensure_shard_direct_prediction_return(&config, 2, true, true)
+        .expect("direct return satisfies Shard-mode admission");
+}
+
 fn prefix_cache_test_config() -> StageConfig {
     StageConfig {
         run_id: "run".to_string(),
@@ -90,6 +186,7 @@ fn prefix_cache_test_config() -> StageConfig {
         cache_type_v: "f16".to_string(),
         flash_attn_type: Default::default(),
         filter_tensors_on_load: false,
+        tree_sequence_count: 0,
         selected_device: None,
         kv_cache: Some(StageKvCacheConfig {
             mode: StageKvCacheMode::LookupRecord,
@@ -1264,6 +1361,7 @@ fn multimodal_stage_config(
         cache_type_v: "f16".to_string(),
         flash_attn_type: skippy_protocol::FlashAttentionType::Auto,
         filter_tensors_on_load: layer_start != 0 || layer_end != fixture.layer_end,
+        tree_sequence_count: 0,
         selected_device: None,
         kv_cache: None,
         load_mode: skippy_protocol::LoadMode::RuntimeSlice,
@@ -1295,6 +1393,8 @@ fn local_openai_backend(config: StageConfig) -> Result<StageOpenAiBackend> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        pipelined_speculative_depth: 1,
+        tree_speculative: false,
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,
@@ -1483,6 +1583,8 @@ async fn real_multimodal_split_smoke_when_fixture_is_set() -> Result<()> {
         draft: None,
         speculative_window: 0,
         adaptive_speculative_window: false,
+        pipelined_speculative_depth: 1,
+        tree_speculative: false,
         generation_limit: Arc::new(Semaphore::new(1)),
         generation_queue_depth: Arc::new(AtomicUsize::new(0)),
         generation_queue_limit: 1,

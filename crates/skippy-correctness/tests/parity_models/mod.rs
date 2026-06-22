@@ -1104,6 +1104,7 @@ fn open_stage_model(path: &StagePath, shape: StageShape, n_gpu_layers: i32) -> R
             include_embeddings: shape.include_embeddings,
             include_output: shape.include_output,
             filter_tensors_on_load: path.filter_tensors_on_load,
+            tree_sequence_count: 0,
         },
     )
     .with_context(|| {

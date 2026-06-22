@@ -1,0 +1,35 @@
+From 81ad56907dcf3bf2b59b3dd437db18238a3cdddf Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 21 Jun 2026 20:23:36 +1000
+Subject: [PATCH] Reserve Skippy checkpoint sequences for every lane
+
+---
+ src/skippy.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 661b89a72..89170ef02 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -3076,15 +3076,15 @@ static enum skippy_status skippy_finish_model_open(
+     params.n_ubatch = config != nullptr && config->n_ubatch > 0 ? static_cast<uint32_t>(config->n_ubatch) : 0u;
+     params.n_threads = config != nullptr && config->n_threads > 0 ? config->n_threads : skippy_default_thread_count();
+     params.n_threads_batch = config != nullptr && config->n_threads_batch > 0 ? config->n_threads_batch : params.n_threads;
+-    params.n_seq_max = stage_model->lane_count;
+-    params.kv_unified = stage_model->lane_count > 1;
++    const uint32_t reserved_lane_sequences = stage_model->lane_count * 2;
++    params.n_seq_max = std::max<uint32_t>(2, reserved_lane_sequences);
++    params.kv_unified = params.n_seq_max > 1;
+     params.type_k = config != nullptr && config->cache_type_k > 0 ? static_cast<ggml_type>(config->cache_type_k) : GGML_TYPE_F16;
+     params.type_v = config != nullptr && config->cache_type_v > 0 ? static_cast<ggml_type>(config->cache_type_v) : GGML_TYPE_F16;
+     params.flash_attn_type = config != nullptr ? static_cast<llama_flash_attn_type>(config->flash_attn_type) : LLAMA_FLASH_ATTN_TYPE_AUTO;
+     params.embeddings = config != nullptr && config->filter_tensors_on_load && !config->include_output;
+     const uint32_t requested_tree_sequences = config != nullptr && config->tree_sequence_count > 0 ?
+             std::min<uint32_t>(static_cast<uint32_t>(config->tree_sequence_count), SKIPPY_TREE_MAX_SEQUENCES_PER_SESSION) : 0;
+-    const uint32_t reserved_lane_sequences = stage_model->lane_count * 2;
+     if (requested_tree_sequences > 0 && reserved_lane_sequences < LLAMA_MAX_SEQ) {
+         const uint32_t available_tree_sequences = LLAMA_MAX_SEQ - reserved_lane_sequences;
+         stage_model->tree_sequence_stride = std::min<uint32_t>(
+-- 
+2.54.0
+

@@ -18,25 +18,27 @@ use crate::{
     config::validate_config,
     frontend::{self, EmbeddedOpenAiArgs},
     kv_integration::{KvStageIntegration, PrefillKvIdentity},
-    runtime_state::{RuntimeSessionStats, RuntimeState, load_runtime},
+    runtime_state::{
+        RuntimeLaunchOverrides, RuntimeSessionStats, RuntimeState, RuntimeTreeVerifyFrame,
+        load_runtime_with_overrides_and_open_events,
+    },
     telemetry::{Telemetry, lifecycle_attrs, now_unix_nanos},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use skippy_metrics::{attr, metric};
 use skippy_protocol::{
-    MessageBase, SCHEMA_VERSION, StageConfig, StageTopology,
+    FlashAttentionType, MessageBase, SCHEMA_VERSION, StageConfig, StageTopology,
     binary::{
         READY_MAGIC, StageReply, StageReplyStats, StageSamplingConfig, StageStateHeader,
         StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
         activation_frame_flags_from_state_flags, read_stage_message, recv_reply, send_ready,
-        send_reply_ack, send_reply_ack_with_stats, send_reply_predicted_tokens_with_stats,
-        send_reply_predicted_with_tokens_and_stats, state_flags,
+        send_reply_ack, send_reply_ack_with_stats, send_reply_envelope, state_flags,
     },
 };
 use skippy_runtime::{
     ActivationDesc, ActivationFrame, LogitBias, MAX_LOGIT_BIAS, NativeMtpDraft,
-    RuntimeActivationDType, RuntimeActivationLayout, SamplingConfig,
+    RuntimeActivationDType, RuntimeActivationLayout, RuntimeEvent, SamplingConfig,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -54,7 +56,7 @@ pub(crate) use self::decode_batcher::DecodeFrameBatcher;
 pub use self::direct_return::PredictionReturnHub;
 pub use self::direct_return::PredictionReturnListener;
 pub(crate) use self::direct_return::PredictionReturnReceiver;
-use self::direct_return::PredictionReturnSinks;
+use self::direct_return::{DirectPredictionReturnWriter, PredictionReturnSinks};
 pub(crate) use self::forwarding::{forwarded_stage_message, forwarded_stage_message_timed};
 use self::kv_eviction::{
     BinaryProactiveEviction, BinaryProactiveEvictionPlan, binary_proactive_eviction_plan,
@@ -69,6 +71,9 @@ static BINARY_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const NATIVE_MTP_ENABLED_ENV: &str = "SKIPPY_NATIVE_MTP_ENABLED";
 const CLIENT_READY_HELLO_ENV: &str = "SKIPPY_STAGE_CLIENT_READY_HELLO";
 const CLIENT_READY_HELLO_OPT_IN_PEEK_MS: u64 = 500;
+const DIRECT_RETURN_DELAY_EVERY_ENV: &str = "SKIPPY_SPEC_RETURN_DELAY_EVERY";
+const DIRECT_RETURN_DELAY_OFFSET_ENV: &str = "SKIPPY_SPEC_RETURN_DELAY_OFFSET";
+const DIRECT_RETURN_DELAY_MS_ENV: &str = "SKIPPY_SPEC_RETURN_DELAY_MS";
 
 #[derive(Default)]
 struct BinaryKvLookupResult {
@@ -87,6 +92,51 @@ struct BinaryKvRecordResult {
     recorded_activation_bytes: u64,
     evicted_activation_entries: usize,
     evicted_activation_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirectReturnDelay {
+    every: usize,
+    offset: usize,
+    delay: Duration,
+}
+
+impl DirectReturnDelay {
+    fn from_env() -> Self {
+        Self::from_values(
+            env::var(DIRECT_RETURN_DELAY_EVERY_ENV).ok().as_deref(),
+            env::var(DIRECT_RETURN_DELAY_OFFSET_ENV).ok().as_deref(),
+            env::var(DIRECT_RETURN_DELAY_MS_ENV).ok().as_deref(),
+        )
+    }
+
+    fn from_values(every: Option<&str>, offset: Option<&str>, delay_ms: Option<&str>) -> Self {
+        let every = every.and_then(parse_positive_usize).unwrap_or(0);
+        let offset = offset.and_then(parse_usize_env_value).unwrap_or(0);
+        let delay = delay_ms
+            .and_then(parse_positive_u64)
+            .map(Duration::from_millis)
+            .unwrap_or_default();
+        Self {
+            every,
+            offset,
+            delay,
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.every > 0 && !self.delay.is_zero()
+    }
+
+    fn should_delay(self, message: &StageWireMessage) -> bool {
+        if !self.enabled() || message.kind != WireMessageKind::VerifySpan {
+            return false;
+        }
+        let Ok(decode_step) = usize::try_from(message.state.decode_step) else {
+            return false;
+        };
+        decode_step.saturating_add(self.offset) % self.every == 0
+    }
 }
 
 #[derive(Default)]
@@ -186,7 +236,7 @@ pub async fn serve_binary_stage_with_shutdown(
 
 fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> Result<()> {
     let BinaryStageOptions {
-        config,
+        mut config,
         topology,
         bind_addr,
         activation_width,
@@ -201,6 +251,12 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         downstream_connect_timeout_secs,
         openai,
     } = options;
+    if openai
+        .as_ref()
+        .is_some_and(|options| options.tree_speculative)
+    {
+        config.flash_attn_type = FlashAttentionType::Disabled;
+    }
     validate_config(&config, topology.as_ref())?;
     let max_inflight = max_inflight.min(config.lane_count as usize);
     let telemetry = Telemetry::new(
@@ -210,15 +266,55 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         telemetry_level,
     );
     telemetry.emit("stage.binary_server_start", lifecycle_attrs(&config));
-    let runtime = load_runtime(&config)?.context("binary stage server requires model_path")?;
+    let runtime_load_started = Instant::now();
+    eprintln!(
+        "binary runtime load starting: stage_id={} stage_index={} layers={}..{} bind={}",
+        config.stage_id, config.stage_index, config.layer_start, config.layer_end, bind_addr
+    );
+    let runtime_overrides = RuntimeLaunchOverrides::default();
+    let stage_id_for_events = config.stage_id.clone();
+    let mut open_event_reporter = move |event: RuntimeEvent| {
+        log_runtime_open_event(&stage_id_for_events, event);
+    };
+    let runtime = load_runtime_with_overrides_and_open_events(
+        &config,
+        &runtime_overrides,
+        Some(&mut open_event_reporter),
+    )?
+    .context("binary stage server requires model_path")?;
+    if downstream_wire_condition.enabled() {
+        eprintln!(
+            "binary downstream wire condition active: stage_id={} delay_ms={:.3} jitter_ms={:.3} mbps={:?}",
+            config.stage_id,
+            downstream_wire_condition.delay_ms(),
+            downstream_wire_condition.jitter_ms(),
+            downstream_wire_condition.mbps()
+        );
+    }
+    eprintln!(
+        "binary runtime load ready: stage_id={} elapsed_ms={:.1}",
+        config.stage_id,
+        runtime_load_started.elapsed().as_secs_f64() * 1000.0
+    );
     let decode_frame_batcher = DecodeFrameBatcher::new(runtime.clone(), max_inflight);
     if max_inflight > 0 {
         let timer = Instant::now();
+        eprintln!(
+            "binary runtime prewarm starting: stage_id={} max_inflight={}",
+            config.stage_id, max_inflight
+        );
         let sessions = runtime
             .lock()
             .map_err(|_| anyhow!("runtime lock poisoned"))?
             .prewarm_idle_sessions(max_inflight)
             .context("prewarm binary stage runtime sessions")?;
+        eprintln!(
+            "binary runtime prewarm ready: stage_id={} elapsed_ms={:.1} active_sessions={} idle_sessions={}",
+            config.stage_id,
+            timer.elapsed().as_secs_f64() * 1000.0,
+            sessions.active_sessions,
+            sessions.idle_sessions
+        );
         let mut attrs = lifecycle_attrs(&config);
         attrs.insert("llama_stage.max_inflight".to_string(), json!(max_inflight));
         attrs.insert(
@@ -244,6 +340,10 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
     let prediction_return_sinks = Arc::new(PredictionReturnSinks::default());
     let listener = TcpListener::bind(bind_addr)?;
     listener.set_nonblocking(true)?;
+    eprintln!(
+        "binary listener bound: stage_id={} bind={}",
+        config.stage_id, bind_addr
+    );
     if let Some(openai_options) = openai {
         if config.stage_index != 0 || config.layer_start != 0 {
             bail!("--openai-bind-addr is only supported on stage 0");
@@ -270,6 +370,8 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 draft_model_path: openai_options.draft_model_path,
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
+                pipelined_speculative_depth: openai_options.pipelined_speculative_depth,
+                tree_speculative: openai_options.tree_speculative,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
                 activation_width,
                 wire_dtype,
@@ -383,6 +485,37 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
     Ok(())
 }
 
+fn log_runtime_open_event(stage_id: &str, event: RuntimeEvent) {
+    let detail = String::from_utf8_lossy(&event.detail_bytes);
+    eprintln!(
+        "binary runtime open event: stage_id={} category={:?} kind={:?} emitter={:?} seq={} progress={}/{} unit={:?} status={:?} failure={:?} detail={}",
+        stage_id,
+        event.category,
+        event.kind,
+        event.emitter,
+        event.sequence,
+        event.progress_current,
+        event.progress_total,
+        event.progress_unit,
+        event.status,
+        event.failure_code,
+        sanitize_runtime_event_detail(&detail),
+    );
+}
+
+fn sanitize_runtime_event_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 240;
+    let mut sanitized = detail
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(MAX_DETAIL_CHARS)
+        .collect::<String>();
+    if detail.chars().count() > MAX_DETAIL_CHARS {
+        sanitized.push_str("...");
+    }
+    sanitized
+}
+
 fn prepare_binary_stage_connection(stream: &TcpStream) -> Result<()> {
     stream
         .set_nonblocking(false)
@@ -458,7 +591,7 @@ fn handle_binary_connection(
     async_prefill_forward: bool,
     downstream_wire_condition: WireCondition,
     downstream_connect_timeout_secs: u64,
-    prediction_return_sinks: &PredictionReturnSinks,
+    prediction_return_sinks: &Arc<PredictionReturnSinks>,
     first_message: StageWireMessage,
 ) -> Result<()> {
     if let Some(downstream) = downstream.as_mut() {
@@ -475,7 +608,8 @@ fn handle_binary_connection(
     let mut pending_reply_stats = StageReplyStats::default();
     let mut request_summary = BinaryRequestSummary::default();
     let mut accumulated_prefill_tokens: BTreeMap<String, Vec<i32>> = BTreeMap::new();
-    let mut prediction_return_streams: BTreeMap<(u64, u64), TcpStream> = BTreeMap::new();
+    let mut prediction_return_writers: BTreeMap<(u64, u64), DirectPredictionReturnWriter> =
+        BTreeMap::new();
     let mut next_message = Some(first_message);
     let mut async_forwarder = if async_prefill_forward {
         downstream
@@ -675,6 +809,20 @@ fn handle_binary_connection(
                     WireMessageKind::TrimSession => runtime
                         .trim_session(&session_key, message.token_count.max(0) as u64)
                         .context("trim binary stage session")?,
+                    WireMessageKind::GatherTreePath => {
+                        let (source_leaf_index, dest_start, source_positions) =
+                            gather_tree_path_args(&message)
+                                .context("parse tree gather session control")?;
+                        runtime
+                            .gather_tree_path(
+                                &session_key,
+                                source_leaf_index,
+                                dest_start,
+                                &source_positions,
+                                &message.tokens,
+                            )
+                            .context("gather tree KV path")?;
+                    }
                     _ => unreachable!("session control checked above"),
                 }
             }
@@ -766,7 +914,7 @@ fn handle_binary_connection(
                     wire_dtype,
                     downstream_connect_timeout_secs,
                     prediction_return_sinks,
-                    &mut prediction_return_streams,
+                    &mut prediction_return_writers,
                 );
             }
             send_reply_ack_with_stats(&mut *upstream, generation_stats)
@@ -804,7 +952,7 @@ fn handle_binary_connection(
                     activation_width,
                     control_started,
                     control_stats,
-                    &mut prediction_return_streams,
+                    &mut prediction_return_writers,
                     downstream_connect_timeout_secs,
                 )
                 .context("handle restore-prefill-decode control")?;
@@ -885,6 +1033,24 @@ fn handle_binary_connection(
         }
 
         let token_ids = token_sideband_or_fill(&message)?;
+        if message_has_lazy_tree_gather(&message) {
+            let gather_started = Instant::now();
+            let applied = {
+                let mut runtime = runtime.lock().expect("runtime lock poisoned");
+                apply_lazy_tree_gather(&mut runtime, &session_key, &message)
+                    .context("apply lazy tree gather before binary verify")?
+            };
+            if let Some(applied) = applied {
+                let gather_ms = elapsed_ms(gather_started);
+                let mut attrs = binary_message_attrs(config, session_id, &message);
+                attrs.insert(
+                    "llama_stage.tree_gather_tokens".to_string(),
+                    json!(applied.token_count),
+                );
+                attrs.insert("llama_stage.elapsed_ms".to_string(), json!(gather_ms));
+                telemetry.emit_debug("stage.binary_lazy_tree_gather", attrs);
+            }
+        }
         let mut session_auto_align_count = 0usize;
         let mut session_auto_align_ms = 0.0;
         let mut session_auto_align_trimmed_tokens = 0u64;
@@ -1048,17 +1214,21 @@ fn handle_binary_connection(
                     )?);
                 }
                 let result = run_binary_stage_message(
+                    config,
                     &mut runtime,
-                    &session_key,
-                    &message,
-                    executable_token_ids,
-                    input.as_ref(),
-                    message.kind == WireMessageKind::PrefillFinalEmbd && downstream.is_none(),
-                    stage_output_activation_capacity(
-                        config,
-                        message.token_count,
-                        activation_width,
-                    )?,
+                    BinaryStageMessageExecution {
+                        session_id: &session_key,
+                        message: &message,
+                        token_ids: executable_token_ids,
+                        input: input.as_ref(),
+                        sample_final_prefill: message.kind == WireMessageKind::PrefillFinalEmbd
+                            && downstream.is_none(),
+                        output_capacity: stage_output_activation_capacity(
+                            config,
+                            message.token_count,
+                            activation_width,
+                        )?,
+                    },
                 )
                 .context("execute binary stage message")?;
                 runtime_sessions_after = Some(runtime.session_stats());
@@ -1453,13 +1623,15 @@ fn handle_binary_connection(
                 predicted_tokens,
                 stats: message_reply_stats,
             };
-            if let Some(return_stream) =
-                prediction_return_streams.get_mut(&(message.request_id, message.session_id))
+            if !message_forces_downstream_reply(&message)
+                && let Some(return_writer) =
+                    prediction_return_writers.get(&(message.request_id, message.session_id))
             {
-                direct_return::send_direct_prediction_return(return_stream, reply)
+                return_writer
+                    .send(&message, reply)
                     .context("send direct predicted reply")?;
             } else {
-                send_stage_reply(&mut *upstream, reply)
+                send_stage_reply(&mut *upstream, &message, reply)
                     .context("send fallback upstream predicted reply")?;
             }
             upstream_reply_end_unix_nanos = Some(now_unix_nanos() as u64);
@@ -1748,16 +1920,28 @@ fn native_mtp_enabled() -> bool {
 }
 
 fn binary_auto_align_session_enabled() -> bool {
-    truthy_env(env::var(AUTO_ALIGN_SESSION_ENV).ok().as_deref())
+    !disabled_env(env::var(AUTO_ALIGN_SESSION_ENV).ok().as_deref())
 }
 
-fn truthy_env(value: Option<&str>) -> bool {
+fn parse_positive_usize(value: &str) -> Option<usize> {
+    parse_usize_env_value(value).filter(|value| *value > 0)
+}
+
+fn parse_usize_env_value(value: &str) -> Option<usize> {
+    value.trim().parse::<usize>().ok()
+}
+
+fn parse_positive_u64(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+fn disabled_env(value: Option<&str>) -> bool {
     matches!(
         value.map(|value| value.trim().to_ascii_lowercase()),
         Some(value)
             if matches!(
                 value.as_str(),
-                "1" | "true" | "on" | "enable" | "enabled" | "yes"
+                "0" | "false" | "off" | "disable" | "disabled" | "no"
             )
     )
 }
@@ -1802,12 +1986,24 @@ pub(crate) fn stage_output_activation_capacity(
 fn estimated_reply_wire_bytes(reply_kind: WireReplyKind, predicted_token_count: usize) -> usize {
     const REPLY_HEADER_BYTES: usize = 3 * std::mem::size_of::<i32>();
     const REPLY_STATS_BYTES: usize = 34 * std::mem::size_of::<i64>();
-    let token_count = match reply_kind {
+    let token_count = match reply_kind.base_kind() {
         WireReplyKind::Ack => 0,
         WireReplyKind::PredictedToken => 1,
         WireReplyKind::PredictedTokens => predicted_token_count,
+        WireReplyKind::PredictionReturnReconnect => 0,
+        WireReplyKind::PredictedTokenIdentified | WireReplyKind::PredictedTokensIdentified => {
+            unreachable!("base_kind normalizes identified reply kinds")
+        }
     };
-    REPLY_HEADER_BYTES + token_count * std::mem::size_of::<i32>() + REPLY_STATS_BYTES
+    let identity_bytes = if reply_kind.identified() {
+        skippy_protocol::binary::STAGE_REPLY_IDENTITY_WIRE_BYTES
+    } else {
+        0
+    };
+    REPLY_HEADER_BYTES
+        + identity_bytes
+        + token_count * std::mem::size_of::<i32>()
+        + REPLY_STATS_BYTES
 }
 
 struct UpstreamReplyWriteSpan {
@@ -2093,6 +2289,10 @@ fn binary_message_request_id(message: &StageWireMessage) -> String {
     }
 }
 
+fn message_forces_downstream_reply(message: &StageWireMessage) -> bool {
+    (message.state.flags & state_flags::FORCE_DOWNSTREAM_REPLY) != 0
+}
+
 fn binary_kv_attrs(config: &StageConfig, kv: &KvStageIntegration) -> BTreeMap<String, Value> {
     let mut attrs = lifecycle_attrs(config);
     for (key, value) in kv.attrs() {
@@ -2312,12 +2512,20 @@ fn configure_prediction_return_stream(
     session_id: u64,
     wire_dtype: WireActivationDType,
     downstream_connect_timeout_secs: u64,
-    prediction_return_sinks: &PredictionReturnSinks,
-    prediction_return_streams: &mut BTreeMap<(u64, u64), TcpStream>,
+    prediction_return_sinks: &Arc<PredictionReturnSinks>,
+    prediction_return_writers: &mut BTreeMap<(u64, u64), DirectPredictionReturnWriter>,
 ) {
     match prediction_return_sinks.take_wait(request_id, session_id, Duration::from_millis(250)) {
         Ok(Some(stream)) => {
-            prediction_return_streams.insert((request_id, session_id), stream);
+            prediction_return_writers.insert(
+                (request_id, session_id),
+                DirectPredictionReturnWriter::new_with_sink_reconnect(
+                    stream,
+                    request_id,
+                    session_id,
+                    prediction_return_sinks.clone(),
+                ),
+            );
             eprintln!("direct prediction return using upstream-opened sink");
             return;
         }
@@ -2336,7 +2544,10 @@ fn configure_prediction_return_stream(
         downstream_connect_timeout_secs,
     ) {
         Ok(stream) => {
-            prediction_return_streams.insert((request_id, session_id), stream);
+            prediction_return_writers.insert(
+                (request_id, session_id),
+                DirectPredictionReturnWriter::new(stream),
+            );
         }
         Err(error) => {
             eprintln!(
@@ -2362,7 +2573,7 @@ fn handle_binary_restore_prefill_decode_control(
     activation_width: i32,
     control_started: Instant,
     mut control_stats: StageReplyStats,
-    prediction_return_streams: &mut BTreeMap<(u64, u64), TcpStream>,
+    prediction_return_writers: &mut BTreeMap<(u64, u64), DirectPredictionReturnWriter>,
     downstream_connect_timeout_secs: u64,
 ) -> Result<()> {
     let (prefix_tokens, current_token) = restore_decode_sideband(&message)?;
@@ -2430,13 +2641,20 @@ fn handle_binary_restore_prefill_decode_control(
             },
         )?;
         let (predicted, _, output) = run_binary_stage_message(
+            config,
             &mut runtime,
-            session_id,
-            &decode_message,
-            &[current_token],
-            input.as_ref(),
-            downstream.is_none(),
-            stage_output_activation_capacity(config, decode_message.token_count, activation_width)?,
+            BinaryStageMessageExecution {
+                session_id,
+                message: &decode_message,
+                token_ids: &[current_token],
+                input: input.as_ref(),
+                sample_final_prefill: downstream.is_none(),
+                output_capacity: stage_output_activation_capacity(
+                    config,
+                    decode_message.token_count,
+                    activation_width,
+                )?,
+            },
         )
         .context("execute restore-decode stage message")?;
         (
@@ -2540,19 +2758,20 @@ fn handle_binary_restore_prefill_decode_control(
     );
     proactive_eviction.insert_attrs(&mut attrs);
     telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
-    let return_stream = prediction_return_streams
-        .get_mut(&(message.request_id, message.session_id))
+    let return_writer = prediction_return_writers
+        .get(&(message.request_id, message.session_id))
         .ok_or_else(|| anyhow!("missing direct prediction return stream"))?;
-    direct_return::send_direct_prediction_return(
-        return_stream,
-        StageReply {
-            kind: WireReplyKind::PredictedToken,
-            predicted: predicted_token,
-            predicted_tokens: vec![predicted_token],
-            stats: control_stats,
-        },
-    )
-    .context("send restore-decode direct predicted reply")?;
+    return_writer
+        .send(
+            &message,
+            StageReply {
+                kind: WireReplyKind::PredictedToken,
+                predicted: predicted_token,
+                predicted_tokens: vec![predicted_token],
+                stats: control_stats,
+            },
+        )
+        .context("send restore-decode direct predicted reply")?;
     Ok(())
 }
 
@@ -2572,24 +2791,19 @@ fn send_one_off_direct_return(
         wire_dtype,
         downstream_connect_timeout_secs,
     )?;
-    direct_return::send_direct_prediction_return(&mut stream, reply)
+    direct_return::send_direct_prediction_return_for_message(&mut stream, message, reply)
 }
 
-fn send_stage_reply(stream: &mut TcpStream, reply: StageReply) -> Result<()> {
-    match reply.kind {
-        WireReplyKind::PredictedToken => send_reply_predicted_with_tokens_and_stats(
-            stream,
-            reply.predicted,
-            &reply.predicted_tokens,
-            reply.stats,
-        )
-        .context("send predicted-token reply"),
-        WireReplyKind::PredictedTokens => {
-            send_reply_predicted_tokens_with_stats(stream, &reply.predicted_tokens, reply.stats)
-                .context("send predicted-tokens reply")
-        }
-        WireReplyKind::Ack => send_reply_ack_with_stats(stream, reply.stats).context("send ACK"),
-    }
+fn send_stage_reply(
+    stream: &mut TcpStream,
+    message: &StageWireMessage,
+    reply: StageReply,
+) -> Result<()> {
+    send_reply_envelope(
+        stream,
+        direct_return::reply_envelope_for_message(message, reply),
+    )
+    .context("send stage reply")
 }
 
 fn emit_binary_proactive_eviction(telemetry: &Telemetry, eviction: &BinaryProactiveEviction) {
@@ -3767,15 +3981,28 @@ pub(crate) fn connect_binary_downstream(
         )))
 }
 
+pub(crate) struct BinaryStageMessageExecution<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) message: &'a StageWireMessage,
+    pub(crate) token_ids: &'a [i32],
+    pub(crate) input: Option<&'a ActivationFrame>,
+    pub(crate) sample_final_prefill: bool,
+    pub(crate) output_capacity: usize,
+}
+
 pub(crate) fn run_binary_stage_message(
+    config: &StageConfig,
     runtime: &mut RuntimeState,
-    session_id: &str,
-    message: &StageWireMessage,
-    token_ids: &[i32],
-    input: Option<&ActivationFrame>,
-    sample_final_prefill: bool,
-    output_capacity: usize,
+    execution: BinaryStageMessageExecution<'_>,
 ) -> Result<(i32, Vec<i32>, ActivationFrame)> {
+    let BinaryStageMessageExecution {
+        session_id,
+        message,
+        token_ids,
+        input,
+        sample_final_prefill,
+        output_capacity,
+    } = execution;
     match message.kind {
         WireMessageKind::PrefillEmbd => {
             let output = runtime.prefill_frame_with_positions(
@@ -3840,14 +4067,31 @@ pub(crate) fn run_binary_stage_message(
             ))
         }
         WireMessageKind::VerifySpan => {
+            ensure_tree_verify_flash_attention_disabled(config, message)?;
             let sampling = runtime_sampling_config(message.sampling.as_ref());
-            let (predicted_tokens, output) = runtime.verify_frame_sampled(
-                session_id,
-                token_ids,
-                sampling.as_ref(),
-                input,
-                output_capacity,
-            )?;
+            let (predicted_tokens, output) = if let Some((parent_indices, depths)) =
+                tree_verify_sidebands(message, token_ids.len())?
+            {
+                runtime.verify_tree_frame_sampled(
+                    session_id,
+                    RuntimeTreeVerifyFrame {
+                        token_ids,
+                        parent_indices: &parent_indices,
+                        depths: &depths,
+                        sampling: sampling.as_ref(),
+                        input,
+                        output_capacity,
+                    },
+                )?
+            } else {
+                runtime.verify_frame_sampled(
+                    session_id,
+                    token_ids,
+                    sampling.as_ref(),
+                    input,
+                    output_capacity,
+                )?
+            };
             let predicted = predicted_tokens.first().copied().unwrap_or(0);
             Ok((predicted, predicted_tokens, output))
         }
@@ -3858,6 +4102,7 @@ pub(crate) fn run_binary_stage_message(
         | WireMessageKind::CheckpointSession
         | WireMessageKind::RestoreSession
         | WireMessageKind::TrimSession
+        | WireMessageKind::GatherTreePath
         | WireMessageKind::ProbePrefill
         | WireMessageKind::RestorePrefill
         | WireMessageKind::TryRestorePrefill
@@ -3866,6 +4111,194 @@ pub(crate) fn run_binary_stage_message(
             bail!("message kind is not executable")
         }
     }
+}
+
+fn ensure_tree_verify_flash_attention_disabled(
+    config: &StageConfig,
+    message: &StageWireMessage,
+) -> Result<()> {
+    if (message.state.flags & state_flags::TREE_VERIFY) == 0
+        || config.flash_attn_type == FlashAttentionType::Disabled
+    {
+        return Ok(());
+    }
+    bail!(
+        "tree speculative verification requires flash_attn_type = disabled on every stage; stage_id={} stage_index={} has {:?}",
+        config.stage_id,
+        config.stage_index,
+        config.flash_attn_type
+    )
+}
+
+fn tree_verify_sidebands(
+    message: &StageWireMessage,
+    token_count: usize,
+) -> Result<Option<(Vec<i32>, Vec<u32>)>> {
+    if (message.state.flags & state_flags::TREE_VERIFY) == 0 {
+        return Ok(None);
+    }
+    let expected = token_count
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("tree verify sideband length overflow"))?;
+    if message.positions.len() < expected {
+        bail!(
+            "tree verify requires parent and depth sidebands for every token; tokens={} positions={}",
+            token_count,
+            message.positions.len()
+        );
+    }
+    if (message.state.flags & state_flags::TREE_GATHER) == 0 && message.positions.len() != expected
+    {
+        bail!(
+            "tree verify sideband count mismatch; tokens={} expected_positions={} positions={}",
+            token_count,
+            expected,
+            message.positions.len()
+        );
+    }
+    if (message.state.flags & state_flags::TREE_GATHER) != 0 {
+        lazy_tree_gather_sideband(message).context("parse lazy tree gather sideband")?;
+    }
+    let (parents, depth_values) = message.positions.split_at(token_count);
+    let depth_values = &depth_values[..token_count];
+    let depths = depth_values
+        .iter()
+        .copied()
+        .map(|depth| u32::try_from(depth).context("tree depth must be non-negative"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some((parents.to_vec(), depths)))
+}
+
+#[derive(Debug)]
+pub(crate) struct AppliedLazyTreeGather {
+    token_count: usize,
+}
+
+struct LazyTreeGatherSideband {
+    source_leaf_index: u32,
+    dest_start: u64,
+    source_positions: Vec<u64>,
+    token_ids: Vec<i32>,
+}
+
+pub(crate) fn apply_lazy_tree_gather(
+    runtime: &mut RuntimeState,
+    session_key: &str,
+    message: &StageWireMessage,
+) -> Result<Option<AppliedLazyTreeGather>> {
+    let Some(gather) = lazy_tree_gather_sideband(message)? else {
+        return Ok(None);
+    };
+    runtime
+        .gather_tree_path(
+            session_key,
+            gather.source_leaf_index,
+            gather.dest_start,
+            &gather.source_positions,
+            &gather.token_ids,
+        )
+        .context("gather lazy tree KV path")?;
+    Ok(Some(AppliedLazyTreeGather {
+        token_count: gather.token_ids.len(),
+    }))
+}
+
+fn message_has_lazy_tree_gather(message: &StageWireMessage) -> bool {
+    (message.state.flags & state_flags::TREE_GATHER) != 0
+}
+
+fn lazy_tree_gather_sideband(message: &StageWireMessage) -> Result<Option<LazyTreeGatherSideband>> {
+    if !message_has_lazy_tree_gather(message) {
+        return Ok(None);
+    }
+    if message.kind != WireMessageKind::VerifySpan {
+        bail!("lazy tree gather is only valid on VerifySpan messages");
+    }
+    let verify_token_count =
+        usize::try_from(message.token_count).context("lazy tree gather token count is negative")?;
+    let tree_sideband_count = if (message.state.flags & state_flags::TREE_VERIFY) != 0 {
+        verify_token_count
+            .checked_mul(2)
+            .ok_or_else(|| anyhow!("tree verify sideband length overflow"))?
+    } else {
+        0
+    };
+    let header_count = tree_sideband_count
+        .checked_add(3)
+        .ok_or_else(|| anyhow!("lazy tree gather sideband length overflow"))?;
+    if message.positions.len() < header_count {
+        bail!(
+            "lazy tree gather requires source leaf, destination, and count sidebands; positions={} required={}",
+            message.positions.len(),
+            header_count
+        );
+    }
+    let source_leaf_index = u32::try_from(message.positions[tree_sideband_count])
+        .context("lazy tree gather source leaf index is negative")?;
+    let dest_start = u64::try_from(message.positions[tree_sideband_count + 1])
+        .context("lazy tree gather destination is negative")?;
+    let gather_count = usize::try_from(message.positions[tree_sideband_count + 2])
+        .context("lazy tree gather token count is negative")?;
+    let expected_position_count = header_count
+        .checked_add(gather_count)
+        .ok_or_else(|| anyhow!("lazy tree gather source positions overflow"))?;
+    if message.positions.len() != expected_position_count {
+        bail!(
+            "lazy tree gather source position sideband mismatch; gather_count={} positions={} expected={}",
+            gather_count,
+            message.positions.len(),
+            expected_position_count
+        );
+    }
+    let expected_token_count = verify_token_count
+        .checked_add(gather_count)
+        .ok_or_else(|| anyhow!("lazy tree gather token sideband overflow"))?;
+    if message.tokens.len() < expected_token_count {
+        bail!(
+            "lazy tree gather token sideband mismatch; gather_count={} tokens={} expected_at_least={}",
+            gather_count,
+            message.tokens.len(),
+            expected_token_count
+        );
+    }
+    let source_positions = message.positions[header_count..expected_position_count]
+        .iter()
+        .copied()
+        .map(|position| {
+            u64::try_from(position).context("lazy tree gather source position is negative")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let token_ids = message.tokens[verify_token_count..expected_token_count].to_vec();
+    Ok(Some(LazyTreeGatherSideband {
+        source_leaf_index,
+        dest_start,
+        source_positions,
+        token_ids,
+    }))
+}
+
+fn gather_tree_path_args(message: &StageWireMessage) -> Result<(u32, u64, Vec<u64>)> {
+    let source_leaf_index =
+        u32::try_from(message.state.current_token).context("tree gather leaf index is negative")?;
+    let dest_start =
+        u64::try_from(message.pos_start).context("tree gather dest_start is negative")?;
+    let token_count =
+        usize::try_from(message.token_count).context("tree gather token count is negative")?;
+    if message.tokens.len() != token_count || message.positions.len() != token_count {
+        bail!(
+            "tree gather path sidebands must match token_count; token_count={} tokens={} positions={}",
+            token_count,
+            message.tokens.len(),
+            message.positions.len()
+        );
+    }
+    let source_positions = message
+        .positions
+        .iter()
+        .copied()
+        .map(|position| u64::try_from(position).context("tree gather source position is negative"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((source_leaf_index, dest_start, source_positions))
 }
 
 fn is_decode_frame_batch_candidate(
@@ -3987,8 +4420,8 @@ fn token_sideband_or_fill(message: &StageWireMessage) -> Result<Vec<i32>> {
     if let Some(token) = decode_execution_token(message, token_count) {
         return Ok(vec![token]);
     }
-    if message.tokens.len() == token_count {
-        return Ok(message.tokens.clone());
+    if message.tokens.len() >= token_count {
+        return Ok(message.tokens[..token_count].to_vec());
     }
     if !message.tokens.is_empty() && token_count == 1 {
         return Ok(vec![message.tokens[0]]);

@@ -932,6 +932,8 @@ alias = "model-alias"
             artifact_transfer_supported: false,
             stage_protocol_generation_supported: false,
             stage_status_list_supported: false,
+            stage_force_downstream_reply_supported: false,
+            stage_identified_replies_supported: false,
             owner_summary: OwnershipSummary::default(),
             advertised_model_throughput: vec![],
 
@@ -1373,6 +1375,8 @@ alias = "model-alias"
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,
@@ -1399,6 +1403,13 @@ alias = "model-alias"
                 .iter()
                 .any(|feature| feature == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST)
         );
+        assert!(
+            skippy.features.iter().any(|feature| feature
+                == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_FORCE_DOWNSTREAM_REPLY)
+        );
+        assert!(skippy.features.iter().any(
+            |feature| feature == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_IDENTIFIED_REPLIES
+        ));
         assert!(skippy.features.iter().any(|feature| feature
             == skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3));
         assert_eq!(
@@ -1497,6 +1508,8 @@ alias = "model-alias"
             artifact_transfer_supported: false,
             stage_protocol_generation_supported: false,
             stage_status_list_supported: false,
+            stage_force_downstream_reply_supported: false,
+            stage_identified_replies_supported: false,
             advertised_model_throughput: vec![
                 expected_hints[0].clone(),
                 crate::network::metrics::ModelThroughputHint {
@@ -1622,6 +1635,8 @@ alias = "model-alias"
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,
@@ -2479,6 +2494,8 @@ alias = "model-alias"
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,
@@ -2535,6 +2552,8 @@ alias = "model-alias"
             artifact_transfer_supported: false,
             stage_protocol_generation_supported: false,
             stage_status_list_supported: false,
+            stage_force_downstream_reply_supported: false,
+            stage_identified_replies_supported: false,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,

@@ -123,7 +123,7 @@ esac
 PATCHES=()
 while IFS= read -r patch; do
   PATCHES+=("$patch")
-done < <(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' | sort)
+done < <(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' ! -name '._*' | sort)
 
 compute_patch_digest() {
   (
@@ -178,7 +178,10 @@ git -C "$LLAMA_WORKDIR" clean -fdx
 printf '%s\n' "$TARGET_SHA" > "$LLAMA_WORKDIR/.mesh-llm-upstream-sha"
 
 if (( ${#PATCHES[@]} > 0 )); then
-  git -C "$LLAMA_WORKDIR" am --3way "${PATCHES[@]}"
+  for patch in "${PATCHES[@]}"; do
+    echo "Applying llama.cpp patch: ${patch#$PATCH_DIR/}"
+    git -C "$LLAMA_WORKDIR" am --3way --patch-format=mbox "$patch"
+  done
 fi
 
 git -C "$LLAMA_WORKDIR" rev-parse HEAD > "$LLAMA_WORKDIR/.mesh-llm-patched-sha"

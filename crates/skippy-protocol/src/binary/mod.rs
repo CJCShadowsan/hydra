@@ -8,21 +8,22 @@ pub use activation::{
     encode_f32_activation_payload_with_state_flags,
 };
 pub use codec::{
-    read_stage_message, recv_ready, recv_reply, send_ready, send_reply_ack,
-    send_reply_ack_with_stats, send_reply_predicted, send_reply_predicted_tokens_with_stats,
-    send_reply_predicted_with_stats, send_reply_predicted_with_tokens_and_stats,
-    write_stage_message,
+    read_stage_message, recv_ready, recv_reply, recv_reply_envelope, send_ready, send_reply_ack,
+    send_reply_ack_with_stats, send_reply_envelope, send_reply_predicted,
+    send_reply_predicted_tokens_with_stats, send_reply_predicted_with_stats,
+    send_reply_predicted_with_tokens_and_stats, write_stage_message,
 };
 pub use types::{
     ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_RWKV7_V_FIRST, LLAMA_TOKEN_NULL,
     MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
     MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC,
-    STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES,
-    STAGE_STATE_VERSION, STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias, StageReply,
-    StageReplyStats, StageRequestEpoch, StageSamplingConfig, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, WireStagePhase,
-    activation_frame_flags_from_state_flags, activation_state_flags_from_frame_flags, state_flags,
+    STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_REPLY_IDENTITY_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES,
+    STAGE_STATE_HEADER_BYTES, STAGE_STATE_VERSION, STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias,
+    StageReply, StageReplyEnvelope, StageReplyIdentity, StageReplyStats, StageRequestEpoch,
+    StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
+    WireReplyKind, WireStagePhase, activation_frame_flags_from_state_flags,
+    activation_state_flags_from_frame_flags, state_flags,
 };
 
 pub(crate) fn invalid_data(message: &'static str) -> std::io::Error {
@@ -148,6 +149,64 @@ mod tests {
         assert_eq!(reply.kind, WireReplyKind::PredictedTokens);
         assert_eq!(reply.predicted, 1);
         assert_eq!(reply.predicted_tokens, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn identified_token_vector_reply_round_trips_as_envelope() {
+        let identity = StageReplyIdentity {
+            request_id: 7,
+            session_id: 11,
+            checkpoint_generation: 3,
+            prompt_token_count: 19,
+            decode_step: 5,
+            pos_start: 24,
+            seq_id: 9,
+        };
+        let envelope = StageReplyEnvelope::identified(
+            StageReply {
+                kind: WireReplyKind::PredictedTokens,
+                predicted: 1,
+                predicted_tokens: vec![1, 2, 3],
+                stats: StageReplyStats::default(),
+            },
+            identity,
+        );
+        let mut bytes = Vec::new();
+
+        send_reply_envelope(&mut bytes, envelope).unwrap();
+        let decoded = recv_reply_envelope(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(decoded.reply.kind, WireReplyKind::PredictedTokens);
+        assert_eq!(decoded.reply.predicted_tokens, vec![1, 2, 3]);
+        assert_eq!(decoded.identity, Some(identity));
+    }
+
+    #[test]
+    fn plain_recv_reply_discards_identified_reply_metadata() {
+        let envelope = StageReplyEnvelope::identified(
+            StageReply {
+                kind: WireReplyKind::PredictedToken,
+                predicted: 42,
+                predicted_tokens: vec![42],
+                stats: StageReplyStats::default(),
+            },
+            StageReplyIdentity {
+                request_id: 7,
+                session_id: 11,
+                checkpoint_generation: 1,
+                prompt_token_count: 2,
+                decode_step: 3,
+                pos_start: 5,
+                seq_id: 8,
+            },
+        );
+        let mut bytes = Vec::new();
+
+        send_reply_envelope(&mut bytes, envelope).unwrap();
+        let reply = recv_reply(Cursor::new(bytes)).unwrap();
+
+        assert_eq!(reply.kind, WireReplyKind::PredictedToken);
+        assert_eq!(reply.predicted, 42);
     }
 
     #[test]

@@ -110,6 +110,15 @@ pub struct RuntimeDecodeFrameBatchRequest<'a> {
     pub input: Option<&'a ActivationFrame>,
 }
 
+pub struct RuntimeTreeVerifyFrame<'a> {
+    pub token_ids: &'a [i32],
+    pub parent_indices: &'a [i32],
+    pub depths: &'a [u32],
+    pub sampling: Option<&'a SamplingConfig>,
+    pub input: Option<&'a ActivationFrame>,
+    pub output_capacity: usize,
+}
+
 #[derive(Debug, Clone)]
 struct ResidentLanePrefix {
     page_id: String,
@@ -414,6 +423,22 @@ impl RuntimeState {
         Ok(output)
     }
 
+    pub fn verify_tree_frame_sampled(
+        &mut self,
+        session_id: &str,
+        frame: RuntimeTreeVerifyFrame<'_>,
+    ) -> Result<(Vec<i32>, ActivationFrame)> {
+        let session = self.session(session_id)?;
+        session.verify_tree_frame_sampled(
+            frame.token_ids,
+            frame.parent_indices,
+            frame.depths,
+            frame.sampling,
+            frame.input,
+            frame.output_capacity,
+        )
+    }
+
     pub fn verify_frame_sampled_serial(
         &mut self,
         session_id: &str,
@@ -477,7 +502,25 @@ impl RuntimeState {
 
     pub fn trim_session(&mut self, session_id: &str, token_count: u64) -> Result<()> {
         let session = self.session(session_id)?;
-        session.trim_session(token_count)?;
+        session.overwrite_suffix(token_count)?;
+        self.session_token_counts
+            .insert(session_id.to_string(), token_count);
+        Ok(())
+    }
+
+    pub fn gather_tree_path(
+        &mut self,
+        session_id: &str,
+        source_leaf_index: u32,
+        dest_start: u64,
+        source_positions: &[u64],
+        token_ids: &[i32],
+    ) -> Result<()> {
+        let token_count = {
+            let session = self.session(session_id)?;
+            session.gather_tree_path(source_leaf_index, dest_start, source_positions, token_ids)?;
+            session.token_count()
+        };
         self.session_token_counts
             .insert(session_id.to_string(), token_count);
         Ok(())
@@ -1284,6 +1327,7 @@ fn runtime_config_from_stage_config(
         include_embeddings: config.layer_start == 0,
         include_output: config.downstream.is_none(),
         filter_tensors_on_load: config.filter_tensors_on_load,
+        tree_sequence_count: config.tree_sequence_count,
     })
 }
 
@@ -1479,6 +1523,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Enabled,
             filter_tensors_on_load: true,
+            tree_sequence_count: 0,
             selected_device: Some(StageDevice {
                 backend_device: "Vulkan1".into(),
                 stable_id: Some("pci:0000:65:00.0".into()),
@@ -1542,6 +1587,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             filter_tensors_on_load: true,
+            tree_sequence_count: 0,
             selected_device: None,
             kv_cache: None,
             load_mode: LoadMode::LayerPackage,
@@ -1589,6 +1635,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             filter_tensors_on_load: false,
+            tree_sequence_count: 0,
             selected_device: None,
             kv_cache: None,
             load_mode: LoadMode::RuntimeSlice,
@@ -1634,6 +1681,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             filter_tensors_on_load: false,
+            tree_sequence_count: 0,
             selected_device: None,
             kv_cache: None,
             load_mode: LoadMode::RuntimeSlice,
@@ -1679,6 +1727,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             filter_tensors_on_load: true,
+            tree_sequence_count: 0,
             selected_device: None,
             kv_cache: None,
             load_mode: LoadMode::LayerPackage,

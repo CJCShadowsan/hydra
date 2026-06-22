@@ -40,6 +40,16 @@ fn edge(source: &str, target: &str, rtt_ms: u32) -> StageEdgeSignal {
         target_node_id: target.to_string(),
         rtt_ms: Some(rtt_ms),
         large_frame_bytes_per_sec: None,
+        direct_prediction_return_supported: false,
+    }
+}
+
+fn direct_return_edge(source: &str, target: &str, rtt_ms: u32) -> StageEdgeSignal {
+    StageEdgeSignal {
+        source_node_id: source.to_string(),
+        target_node_id: target.to_string(),
+        rtt_ms: Some(rtt_ms),
+        large_frame_bytes_per_sec: None,
         direct_prediction_return_supported: true,
     }
 }
@@ -92,6 +102,41 @@ fn transport_aware_plan_orders_same_nodes_by_stage_edge_cost() {
     assert!(plan.diagnostics.iter().any(|diagnostic| diagnostic.code
         == PlanReasonCode::NetworkPipelineCost
         && diagnostic.message.contains("node-a -> node-c")));
+}
+
+#[test]
+fn transport_aware_plan_scores_direct_return_tail_to_head_when_supported() {
+    let request = TopologyPlanRequest {
+        topology_id: "topology-a".into(),
+        model_id: "model-a".into(),
+        layers: dense_attention_layers(9, 10),
+        nodes: vec![
+            weighted_node("node-a", 30),
+            weighted_node("node-b", 30),
+            weighted_node("node-c", 30),
+        ],
+        family: None,
+        policy: PlannerPolicy::default(),
+    };
+
+    let plan = plan_package_aware_contiguous_with_transport(
+        &request,
+        &[],
+        &[
+            edge("node-a", "node-b", 1),
+            edge("node-b", "node-c", 1),
+            direct_return_edge("node-c", "node-a", 500),
+            edge("node-a", "node-c", 50),
+            edge("node-c", "node-b", 50),
+            direct_return_edge("node-b", "node-a", 1),
+        ],
+    )
+    .expect("plan");
+
+    assert_eq!(
+        stage_layout(&plan),
+        vec![("node-a", 0, 3), ("node-c", 3, 6), ("node-b", 6, 9)]
+    );
 }
 
 #[test]
@@ -825,6 +870,70 @@ fn gemma4_e4b_rejects_known_bad_shared_kv_boundaries() {
 }
 
 #[test]
+fn glm_dsa_rejects_boundaries_that_start_on_shared_indexer_layers() {
+    let request = TopologyPlanRequest {
+        topology_id: "glm-dsa-invalid".to_string(),
+        model_id: "glm-5.2".to_string(),
+        layers: dense_attention_layers(78, 10),
+        nodes: nodes(3),
+        family: Some(glm_dsa_capability(78, 6144)),
+        policy: PlannerPolicy::default(),
+    };
+
+    let plan = plan_even_contiguous(&request).expect("plan");
+
+    assert_eq!(
+        plan.boundaries
+            .iter()
+            .map(|boundary| (boundary.layer_boundary, boundary.decision))
+            .collect::<Vec<_>>(),
+        vec![
+            (26, BoundaryDecision::Accepted),
+            (52, BoundaryDecision::Rejected)
+        ]
+    );
+    assert!(
+        plan.boundaries[1]
+            .reason_codes
+            .contains(&PlanReasonCode::GlmDsaSharedIndexerBoundary)
+    );
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == PlanReasonCode::GlmDsaSharedIndexerBoundary
+            && diagnostic.message.contains("shared-indexer")
+    }));
+}
+
+#[test]
+fn glm_dsa_accepts_boundaries_that_start_on_full_indexer_layers() {
+    let request = TopologyPlanRequest {
+        topology_id: "glm-dsa-valid".to_string(),
+        model_id: "glm-5.2".to_string(),
+        layers: dense_attention_layers(78, 10),
+        nodes: nodes(3),
+        family: Some(glm_dsa_capability(78, 6144)),
+        policy: PlannerPolicy::default(),
+    };
+
+    let plan = plan_contiguous_with_splits(&request, &[26, 54]).expect("plan");
+
+    assert_eq!(
+        plan.boundaries
+            .iter()
+            .map(|boundary| (boundary.layer_boundary, boundary.decision))
+            .collect::<Vec<_>>(),
+        vec![
+            (26, BoundaryDecision::Accepted),
+            (54, BoundaryDecision::Accepted)
+        ]
+    );
+    assert!(plan.boundaries.iter().all(|boundary| {
+        !boundary
+            .reason_codes
+            .contains(&PlanReasonCode::GlmDsaSharedIndexerBoundary)
+    }));
+}
+
+#[test]
 fn gemma3n_requires_altup_sideband_and_reviewed_kv_boundary() {
     let request = TopologyPlanRequest {
         topology_id: "gemma3n".to_string(),
@@ -931,6 +1040,22 @@ fn infers_known_family_capabilities_from_model_identity() {
     assert_eq!(gemma4_e4b.q8_wire_validation, WireValidation::Rejected);
     assert!(!gemma4_e4b.split_constraints.is_empty());
     assert!(!gemma4_e4b.sidebands.is_empty());
+
+    let glm_dsa = infer_family_capability("unsloth/GLM-5.2-GGUF:UD-Q4_K_M", 78, 6144)
+        .expect("glm-dsa candidate");
+    assert_eq!(glm_dsa.family_id, "glm_dsa");
+    assert!(
+        glm_dsa
+            .split_constraints
+            .iter()
+            .any(|constraint| constraint.forbidden_boundaries.contains(&52))
+    );
+    assert!(
+        glm_dsa
+            .split_constraints
+            .iter()
+            .all(|constraint| !constraint.forbidden_boundaries.contains(&54))
+    );
 
     assert_eq!(
         infer_family_capability("meshllm/gemma-4-e4b-it", 42, 2560)

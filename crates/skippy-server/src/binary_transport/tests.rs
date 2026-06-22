@@ -1,7 +1,8 @@
 use super::{
-    binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    is_decode_frame_batch_candidate, native_mtp_enabled_from, prepare_binary_stage_connection,
-    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
+    binary_full_prefill_record_identities, decode_record_tokens_sideband, disabled_env,
+    is_decode_frame_batch_candidate, message_forces_downstream_reply, native_mtp_enabled_from,
+    prepare_binary_stage_connection, restore_prefill_decode_as_decode_message,
+    token_sideband_or_fill,
 };
 use std::{
     io,
@@ -15,10 +16,11 @@ use crate::kv_integration::KvStageIntegration;
 use crate::runtime_state::RuntimeState;
 use skippy_protocol::binary::{
     StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType,
-    WireMessageKind,
+    WireMessageKind, state_flags,
 };
 use skippy_protocol::{
-    LoadMode, PeerConfig, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
+    FlashAttentionType, LoadMode, PeerConfig, StageConfig, StageKvCacheConfig, StageKvCacheMode,
+    StageKvCachePayload,
 };
 
 type BinaryEvictionFn = fn(
@@ -61,6 +63,62 @@ fn native_mtp_enabled_flag_defaults_on_and_accepts_false_values() {
     assert!(!native_mtp_enabled_from(Some("0")));
     assert!(!native_mtp_enabled_from(Some("false")));
     assert!(!native_mtp_enabled_from(Some(" disabled ")));
+}
+
+#[test]
+fn auto_align_session_flag_defaults_on_and_accepts_false_values() {
+    assert!(!disabled_env(None));
+    assert!(!disabled_env(Some("1")));
+    assert!(!disabled_env(Some("true")));
+    assert!(disabled_env(Some("0")));
+    assert!(disabled_env(Some("false")));
+    assert!(disabled_env(Some(" disabled ")));
+}
+
+#[test]
+fn direct_return_delay_defaults_to_disabled() {
+    let config = super::DirectReturnDelay::from_values(None, None, None);
+    let message = test_message(WireMessageKind::VerifySpan, 2);
+
+    assert_eq!(config, super::DirectReturnDelay::default());
+    assert!(!config.enabled());
+    assert!(!config.should_delay(&message));
+}
+
+#[test]
+fn direct_return_delay_matches_verify_span_decode_steps() {
+    let config = super::DirectReturnDelay::from_values(Some("3"), Some("1"), Some("25"));
+    let mut message = test_message(WireMessageKind::VerifySpan, 2);
+
+    message.state.decode_step = 1;
+    assert!(!config.should_delay(&message));
+    message.state.decode_step = 2;
+    assert!(config.should_delay(&message));
+    message.state.decode_step = 5;
+    assert!(config.should_delay(&message));
+}
+
+#[test]
+fn direct_return_delay_ignores_invalid_values_and_non_verify_messages() {
+    let disabled = super::DirectReturnDelay::from_values(Some("bad"), Some("bad"), Some("0"));
+    let mut message = test_message(WireMessageKind::VerifySpan, 2);
+
+    assert!(!disabled.enabled());
+    assert!(!disabled.should_delay(&message));
+
+    let enabled = super::DirectReturnDelay::from_values(Some("1"), None, Some("10"));
+    message.kind = WireMessageKind::DecodeEmbd;
+    message.state.decode_step = 0;
+    assert!(!enabled.should_delay(&message));
+}
+
+#[test]
+fn force_downstream_reply_flag_bypasses_direct_return() {
+    let mut message = test_message(WireMessageKind::DecodeEmbd, 1);
+
+    assert!(!message_forces_downstream_reply(&message));
+    message.state.flags |= state_flags::FORCE_DOWNSTREAM_REPLY;
+    assert!(message_forces_downstream_reply(&message));
 }
 
 #[test]
@@ -192,6 +250,70 @@ fn required_binary_proactive_eviction_is_fallible_before_decode() {
     accepts_fallible_eviction(super::evict_binary_resident_prefix_for_decode);
 }
 
+#[test]
+fn plain_verify_allows_auto_flash_attention() {
+    let config = prefix_cache_test_config();
+    let message = test_message(WireMessageKind::VerifySpan, 2);
+
+    super::ensure_tree_verify_flash_attention_disabled(&config, &message)
+        .expect("plain verify should not require flash attention override");
+}
+
+#[test]
+fn tree_verify_requires_disabled_flash_attention() {
+    let config = prefix_cache_test_config();
+    let mut message = test_message(WireMessageKind::VerifySpan, 2);
+    message.state.flags |= state_flags::TREE_VERIFY;
+
+    let error = super::ensure_tree_verify_flash_attention_disabled(&config, &message)
+        .expect_err("tree verify should reject auto flash attention")
+        .to_string();
+
+    assert!(error.contains("requires flash_attn_type = disabled"));
+}
+
+#[test]
+fn tree_verify_allows_disabled_flash_attention() {
+    let mut config = prefix_cache_test_config();
+    config.flash_attn_type = FlashAttentionType::Disabled;
+    let mut message = test_message(WireMessageKind::VerifySpan, 2);
+    message.state.flags |= state_flags::TREE_VERIFY;
+
+    super::ensure_tree_verify_flash_attention_disabled(&config, &message)
+        .expect("tree verify should allow disabled flash attention");
+}
+
+#[test]
+fn lazy_tree_gather_verify_uses_verify_token_prefix() {
+    let mut message = test_message(WireMessageKind::VerifySpan, 3);
+    message.state.flags |= state_flags::TREE_VERIFY | state_flags::TREE_GATHER;
+    message.tokens = vec![100, 10, 11, 100, 10];
+    message.positions = vec![-1, 0, 1, 0, 1, 2, 0, 7, 2, 7, 8];
+
+    assert_eq!(token_sideband_or_fill(&message).unwrap(), vec![100, 10, 11]);
+    let (parents, depths) = super::tree_verify_sidebands(&message, 3)
+        .unwrap()
+        .expect("tree sidebands");
+    assert_eq!(parents, vec![-1, 0, 1]);
+    assert_eq!(depths, vec![0, 1, 2]);
+}
+
+#[test]
+fn lazy_tree_gather_sideband_parses_appended_path() {
+    let mut message = test_message(WireMessageKind::VerifySpan, 3);
+    message.state.flags |= state_flags::TREE_VERIFY | state_flags::TREE_GATHER;
+    message.tokens = vec![100, 10, 11, 100, 10];
+    message.positions = vec![-1, 0, 1, 0, 1, 2, 0, 7, 2, 7, 8];
+
+    let gather = super::lazy_tree_gather_sideband(&message)
+        .unwrap()
+        .expect("lazy gather");
+    assert_eq!(gather.source_leaf_index, 0);
+    assert_eq!(gather.dest_start, 7);
+    assert_eq!(gather.source_positions, vec![7, 8]);
+    assert_eq!(gather.token_ids, vec![100, 10]);
+}
+
 fn prefix_cache_test_config() -> StageConfig {
     StageConfig {
         run_id: "run".to_string(),
@@ -219,6 +341,7 @@ fn prefix_cache_test_config() -> StageConfig {
         cache_type_v: "f16".to_string(),
         flash_attn_type: Default::default(),
         filter_tensors_on_load: false,
+        tree_sequence_count: 0,
         selected_device: None,
         kv_cache: Some(StageKvCacheConfig {
             mode: StageKvCacheMode::LookupRecord,

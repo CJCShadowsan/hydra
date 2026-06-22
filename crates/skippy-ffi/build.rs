@@ -133,7 +133,7 @@ fn main() {
         "ggml/src/ggml-cuda/ggml-cuda.lib",
     );
     if has_cuda {
-        println!("cargo:rustc-link-lib=static=ggml-cuda");
+        link_static_backend_archive("ggml-cuda");
     }
     let has_hip = static_archive_exists(
         &build_dir,
@@ -141,7 +141,7 @@ fn main() {
         "ggml/src/ggml-hip/ggml-hip.lib",
     );
     if has_hip {
-        println!("cargo:rustc-link-lib=static=ggml-hip");
+        link_static_backend_archive("ggml-hip");
     }
     let has_vulkan = static_archive_exists(
         &build_dir,
@@ -149,7 +149,7 @@ fn main() {
         "ggml/src/ggml-vulkan/ggml-vulkan.lib",
     );
     if has_vulkan {
-        println!("cargo:rustc-link-lib=static=ggml-vulkan");
+        link_static_backend_archive("ggml-vulkan");
     }
     println!("cargo:rustc-link-lib=static=ggml-cpu");
     if static_archive_exists(
@@ -164,7 +164,7 @@ fn main() {
         "ggml/src/ggml-metal/libggml-metal.a",
         "ggml/src/ggml-metal/ggml-metal.lib",
     ) {
-        println!("cargo:rustc-link-lib=static=ggml-metal");
+        link_static_backend_archive("ggml-metal");
     }
     println!("cargo:rustc-link-lib=static=ggml-base");
 
@@ -365,6 +365,10 @@ fn static_archive_exists(
     msvc_archive: &str,
 ) -> bool {
     build_dir.join(unix_archive).exists() || build_dir.join(msvc_archive).exists()
+}
+
+fn link_static_backend_archive(lib: &str) {
+    println!("cargo:rustc-link-lib=static:+whole-archive={lib}");
 }
 
 fn link_linux_cuda_libs(cmake_cache: &std::path::Path) {

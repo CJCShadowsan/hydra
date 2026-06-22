@@ -1,0 +1,658 @@
+From da5f684b59f61034499c1edb2b53b52a8c2f1a1a Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 21 Jun 2026 09:49:47 +1000
+Subject: [PATCH] Add Skippy tree verify ABI
+
+---
+ include/skippy.h        |  28 +++
+ include/skippy/common.h |   3 +-
+ src/skippy.cpp          | 436 +++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 464 insertions(+), 3 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 452a84af5..ec0641f5b 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -223,6 +223,16 @@ LLAMA_API enum skippy_status skippy_session_gather_kv_path(
+         size_t token_count,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_session_gather_tree_path(
++        struct skippy_session * session,
++        uint32_t source_leaf_index,
++        uint64_t dest_start,
++        const uint64_t * source_positions,
++        size_t position_count,
++        const llama_token * token_ids,
++        size_t token_count,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_session_sample_current(
+         struct skippy_session * session,
+         const struct skippy_sampling_config * sampling,
+@@ -409,6 +419,24 @@ LLAMA_API enum skippy_status skippy_verify_tokens_frame_sampled(
+         size_t * out_token_count,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_verify_tree_frame_sampled(
++        struct skippy_session * session,
++        const llama_token * token_ids,
++        const int32_t * parent_indices,
++        const uint32_t * depths,
++        size_t node_count,
++        const struct skippy_sampling_config * sampling,
++        const struct skippy_activation_desc * input_desc,
++        const void * input_payload,
++        struct skippy_activation_desc * output_desc,
++        void * output_payload,
++        size_t output_payload_capacity,
++        size_t * out_output_payload_bytes,
++        llama_token * output_tokens,
++        size_t output_token_capacity,
++        size_t * out_token_count,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_session_copy_output_activation_frame(
+         struct skippy_session * session,
+         size_t token_count,
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 69edf1345..84c1d213b 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 28
++#define SKIPPY_ABI_VERSION_PATCH 29
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+@@ -57,6 +57,7 @@ enum skippy_feature {
+     SKIPPY_FEATURE_NATIVE_MTP_N1          = 1 << 25,
+     SKIPPY_FEATURE_SESSION_OVERWRITE      = 1 << 26,
+     SKIPPY_FEATURE_TREE_GATHER            = 1 << 27,
++    SKIPPY_FEATURE_TREE_VERIFY            = 1 << 28,
+ };
+ 
+ enum skippy_status {
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index a780789e7..6059867cd 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -43,6 +43,8 @@
+ 
+ using json = nlohmann::ordered_json;
+ 
++static constexpr uint32_t SKIPPY_TREE_MAX_SEQUENCES_PER_SESSION = 64;
++
+ struct skippy_model {
+     llama_model * model = nullptr;
+     llama_context * ctx = nullptr;
+@@ -50,6 +52,7 @@ struct skippy_model {
+     skippy_runtime_config config = {};
+     bool executable = true;
+     uint32_t lane_count = 1;
++    uint32_t tree_sequence_stride = 0;
+     std::vector<bool> lane_in_use;
+     std::vector<std::vector<llama_token>> lane_resident_prefix_tokens;
+ };
+@@ -2349,6 +2352,442 @@ static enum skippy_status skippy_verify_activation_frame(
+     return status;
+ }
+ 
++struct skippy_tree_batch_shape {
++    std::vector<llama_token> tokens;
++    std::vector<size_t> row_node_indices;
++    std::vector<int32_t> first_row_for_node;
++    std::vector<llama_seq_id> row_seq_ids;
++    std::vector<llama_seq_id *> seq_id_storage;
++    std::vector<int32_t> n_seq_id_storage;
++    std::vector<llama_pos> positions;
++    std::vector<llama_seq_id> leaf_sequences;
++};
++
++static uint32_t skippy_tree_sequence_stride(const skippy_session * session) {
++    return session != nullptr && session->stage_model != nullptr ?
++            session->stage_model->tree_sequence_stride : 0;
++}
++
++static llama_seq_id skippy_tree_sequence_base(const skippy_session * session) {
++    if (session == nullptr || session->stage_model == nullptr || session->seq_id < 0) {
++        return -1;
++    }
++    const uint64_t lane_count = session->stage_model->lane_count;
++    const uint64_t stride = skippy_tree_sequence_stride(session);
++    const uint64_t seq_id = static_cast<uint64_t>(session->seq_id);
++    const uint64_t base = lane_count * 2 + seq_id * stride;
++    if (base > static_cast<uint64_t>(std::numeric_limits<llama_seq_id>::max())) {
++        return -1;
++    }
++    return static_cast<llama_seq_id>(base);
++}
++
++static enum skippy_status skippy_tree_leaf_sequence_id(
++        const skippy_session * session,
++        uint32_t leaf_index,
++        llama_seq_id * out_seq_id,
++        struct skippy_error ** out_error) {
++    if (session == nullptr || session->stage_model == nullptr || out_seq_id == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and out_seq_id are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    const uint32_t stride = skippy_tree_sequence_stride(session);
++    if (stride == 0 || leaf_index >= stride) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree verification sequence capacity is unavailable");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++    const llama_seq_id base = skippy_tree_sequence_base(session);
++    if (base < 0 || base + static_cast<llama_seq_id>(leaf_index) >= LLAMA_MAX_SEQ) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree verification sequence id exceeds llama sequence capacity");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++    *out_seq_id = base + static_cast<llama_seq_id>(leaf_index);
++    return SKIPPY_STATUS_OK;
++}
++
++static void skippy_fill_tree_position(
++        std::vector<llama_pos> & positions,
++        int32_t node_index,
++        int32_t node_count,
++        int32_t n_pos_per_embd,
++        llama_pos position) {
++    if (n_pos_per_embd == 4) {
++        positions[static_cast<size_t>(node_index)] = position;
++        positions[static_cast<size_t>(node_count) + node_index] = position;
++        positions[2 * static_cast<size_t>(node_count) + node_index] = position;
++        positions[3 * static_cast<size_t>(node_count) + node_index] = 0;
++        return;
++    }
++    for (int32_t pos_index = 0; pos_index < n_pos_per_embd; ++pos_index) {
++        positions[static_cast<size_t>(pos_index) * node_count + node_index] = position;
++    }
++}
++
++static enum skippy_status skippy_prepare_tree_batch_shape(
++        skippy_session * session,
++        const llama_token * token_ids,
++        const int32_t * parent_indices,
++        const uint32_t * depths,
++        size_t node_count,
++        skippy_tree_batch_shape * out_shape,
++        struct skippy_error ** out_error) {
++    if (session == nullptr || session->stage_model == nullptr || out_shape == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and output tree shape are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (token_ids == nullptr || parent_indices == nullptr || depths == nullptr || node_count == 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree parents, depths, and nodes are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (node_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree node count exceeds int32_t range");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    const uint32_t stride = skippy_tree_sequence_stride(session);
++    if (stride == 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree verification sequence capacity is unavailable");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++
++    const int32_t n_nodes = static_cast<int32_t>(node_count);
++    if (parent_indices[0] != -1 || depths[0] != 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree root must have parent -1 and depth 0");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    std::vector<uint32_t> child_counts(node_count, 0);
++    std::vector<size_t> leaves;
++    for (int32_t i = 1; i < n_nodes; ++i) {
++        const int32_t parent = parent_indices[i];
++        if (parent < 0 || parent >= i) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree parents must refer to earlier nodes");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        if (depths[i] != depths[parent] + 1) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree depth must be parent depth plus one");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        child_counts[static_cast<size_t>(parent)]++;
++    }
++    for (size_t i = 0; i < node_count; ++i) {
++        if (child_counts[i] == 0) {
++            leaves.push_back(i);
++        }
++    }
++    if (leaves.empty() || leaves.size() > stride) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree leaf count exceeds native sequence capacity");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++
++    skippy_tree_batch_shape shape;
++    shape.first_row_for_node.resize(node_count, -1);
++    const int32_t n_pos_per_embd = session->stage_model->model->hparams.n_pos_per_embd();
++    std::vector<std::vector<size_t>> leaf_paths;
++    leaf_paths.reserve(leaves.size());
++    size_t expanded_row_count = 0;
++    for (size_t leaf : leaves) {
++        std::vector<size_t> path;
++        for (int32_t node = static_cast<int32_t>(leaf); node >= 0; node = parent_indices[node]) {
++            path.push_back(static_cast<size_t>(node));
++            if (node == 0) {
++                break;
++            }
++        }
++        std::reverse(path.begin(), path.end());
++        expanded_row_count += path.size();
++        leaf_paths.push_back(std::move(path));
++    }
++    if (expanded_row_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "expanded tree row count exceeds int32_t range");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    shape.tokens.reserve(expanded_row_count);
++    shape.row_node_indices.reserve(expanded_row_count);
++    shape.row_seq_ids.reserve(expanded_row_count);
++    shape.n_seq_id_storage.resize(expanded_row_count, 1);
++    shape.positions.resize(expanded_row_count * static_cast<size_t>(n_pos_per_embd));
++
++    for (size_t leaf_index = 0; leaf_index < leaf_paths.size(); ++leaf_index) {
++        llama_seq_id leaf_seq_id = -1;
++        enum skippy_status status = skippy_tree_leaf_sequence_id(
++                session,
++                static_cast<uint32_t>(leaf_index),
++                &leaf_seq_id,
++                out_error);
++        if (status != SKIPPY_STATUS_OK) {
++            return status;
++        }
++        shape.leaf_sequences.push_back(leaf_seq_id);
++        for (size_t node : leaf_paths[leaf_index]) {
++            if (depths[node] > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
++                    session->n_past > std::numeric_limits<int32_t>::max() - static_cast<int32_t>(depths[node])) {
++                skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree node position exceeds int32_t range");
++                return SKIPPY_STATUS_INVALID_ARGUMENT;
++            }
++            const size_t row = shape.tokens.size();
++            if (shape.first_row_for_node[node] < 0) {
++                shape.first_row_for_node[node] = static_cast<int32_t>(row);
++            }
++            shape.tokens.push_back(token_ids[node]);
++            shape.row_node_indices.push_back(node);
++            shape.row_seq_ids.push_back(leaf_seq_id);
++            const llama_pos position = session->n_past + static_cast<int32_t>(depths[node]);
++            skippy_fill_tree_position(
++                    shape.positions,
++                    static_cast<int32_t>(row),
++                    static_cast<int32_t>(expanded_row_count),
++                    n_pos_per_embd,
++                    position);
++        }
++    }
++    for (size_t node = 0; node < node_count; ++node) {
++        if (shape.first_row_for_node[node] < 0) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree node has no descendant leaf");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++    }
++    shape.seq_id_storage.resize(expanded_row_count);
++    for (size_t row = 0; row < expanded_row_count; ++row) {
++        shape.seq_id_storage[row] = &shape.row_seq_ids[row];
++    }
++
++    *out_shape = std::move(shape);
++    return SKIPPY_STATUS_OK;
++}
++
++static enum skippy_status skippy_seed_tree_sequences(
++        skippy_session * session,
++        const std::vector<llama_seq_id> & leaf_sequences,
++        struct skippy_error ** out_error) {
++    llama_memory_t memory = session->ctx->get_memory();
++    if (memory == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "runtime memory is unavailable");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    const llama_seq_id base = skippy_tree_sequence_base(session);
++    const uint32_t stride = skippy_tree_sequence_stride(session);
++    if (base < 0 || base + static_cast<llama_seq_id>(stride) > LLAMA_MAX_SEQ) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree verification sequence range exceeds llama sequence capacity");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++    for (uint32_t i = 0; i < stride; ++i) {
++        if (!llama_memory_seq_rm(memory, base + static_cast<llama_seq_id>(i), -1, -1)) {
++            skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to clear tree verification sequence");
++            return SKIPPY_STATUS_RUNTIME_ERROR;
++        }
++    }
++    if (session->n_past > 0) {
++        for (llama_seq_id seq_id : leaf_sequences) {
++            llama_memory_seq_cp(memory, session->seq_id, seq_id, 0, session->n_past);
++        }
++    }
++    return SKIPPY_STATUS_OK;
++}
++
++static enum skippy_status skippy_copy_tree_output_activation_frame(
++        skippy_session * session,
++        size_t node_count,
++        const skippy_tree_batch_shape & shape,
++        void * output_payload,
++        const skippy_activation_desc * input_desc,
++        struct skippy_error ** out_error) {
++    if (!skippy_emits_activation_frame(session)) {
++        return skippy_success(out_error);
++    }
++    const uint64_t output_flags = skippy_output_activation_flags(session, input_desc);
++    if ((output_flags & (SKIPPY_ACTIVATION_FLAG_GEMMA3N_ALTUP | SKIPPY_ACTIVATION_FLAG_RWKV7_V_FIRST)) != 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree activation row mapping does not support sideband activation payloads yet");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++    float * embeddings = llama_get_embeddings(session->ctx);
++    if (embeddings == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "llama embeddings output was not available");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
++    const size_t node_bytes = static_cast<size_t>(n_embd) * sizeof(float);
++    uint8_t * output = static_cast<uint8_t *>(output_payload);
++    for (size_t node = 0; node < node_count; ++node) {
++        const int32_t row = shape.first_row_for_node[node];
++        if (row < 0) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree node has no expanded output row");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        std::memcpy(
++                output + node * node_bytes,
++                embeddings + static_cast<size_t>(row) * static_cast<size_t>(n_embd),
++                node_bytes);
++    }
++    return skippy_success(out_error);
++}
++
++static enum skippy_status skippy_decode_tree_frame(
++        skippy_session * session,
++        const llama_token * token_ids,
++        const int32_t * parent_indices,
++        const uint32_t * depths,
++        size_t node_count,
++        const skippy_sampling_config * sampling,
++        const skippy_activation_desc * input_desc,
++        const void * input_payload,
++        skippy_activation_desc * output_desc,
++        void * output_payload,
++        size_t output_payload_capacity,
++        size_t * out_output_payload_bytes,
++        llama_token * output_tokens,
++        size_t output_token_capacity,
++        size_t * out_token_count,
++        struct skippy_error ** out_error) {
++    if (out_token_count != nullptr) {
++        *out_token_count = 0;
++    }
++    if (session == nullptr || session->ctx == nullptr || session->stage_model == nullptr || token_ids == nullptr || node_count == 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and at least one tree token are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (node_count > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "tree node count exceeds activation descriptor range");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    enum skippy_status status = skippy_validate_frame_input(
++            session,
++            input_desc,
++            input_payload,
++            node_count,
++            out_error);
++    if (status != SKIPPY_STATUS_OK) {
++        return status;
++    }
++
++    status = skippy_prepare_output_activation_frame(
++            session,
++            node_count,
++            output_payload,
++            output_payload_capacity,
++            out_output_payload_bytes,
++            output_desc,
++            input_desc,
++            out_error);
++    if (status != SKIPPY_STATUS_OK) {
++        return status;
++    }
++
++    const bool request_logits = session->stage_model->config.include_output;
++    if (request_logits) {
++        if (out_token_count == nullptr) {
++            skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "out_token_count is required for output stages");
++            return SKIPPY_STATUS_INVALID_ARGUMENT;
++        }
++        *out_token_count = node_count;
++        if (output_tokens == nullptr || output_token_capacity < node_count) {
++            skippy_set_error(out_error, SKIPPY_STATUS_BUFFER_TOO_SMALL, "token output buffer is too small");
++            return SKIPPY_STATUS_BUFFER_TOO_SMALL;
++        }
++    }
++
++    skippy_tree_batch_shape shape;
++    status = skippy_prepare_tree_batch_shape(
++            session,
++            token_ids,
++            parent_indices,
++            depths,
++            node_count,
++            &shape,
++            out_error);
++    if (status != SKIPPY_STATUS_OK) {
++        return status;
++    }
++    status = skippy_seed_tree_sequences(session, shape.leaf_sequences, out_error);
++    if (status != SKIPPY_STATUS_OK) {
++        return status;
++    }
++
++    const size_t row_count = shape.tokens.size();
++    if (row_count == 0 || row_count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "expanded tree row count is invalid");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    const int32_t n_rows = static_cast<int32_t>(row_count);
++    const int32_t n_embd = llama_model_n_embd(session->stage_model->model);
++    const int32_t n_embd_inp = llama_model_n_embd_inp(session->stage_model->model);
++    const int32_t n_altup = static_cast<int32_t>(session->stage_model->model->hparams.n_altup);
++    const bool activation_input = input_desc != nullptr;
++    const size_t hidden_bytes = skippy_activation_hidden_bytes(session, node_count);
++    std::vector<float> embd_storage;
++    if (activation_input) {
++        if ((input_desc->flags & (SKIPPY_ACTIVATION_FLAG_GEMMA3N_ALTUP | SKIPPY_ACTIVATION_FLAG_RWKV7_V_FIRST)) != 0) {
++            skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree activation row mapping does not support sideband activation payloads yet");
++            return SKIPPY_STATUS_UNSUPPORTED;
++        }
++        embd_storage.resize(row_count * static_cast<size_t>(n_embd_inp));
++        if ((input_desc->flags & SKIPPY_ACTIVATION_FLAG_GEMMA3N_ALTUP) != 0) {
++            const float * input = static_cast<const float *>(input_payload);
++            for (int32_t i = 0; i < n_rows; ++i) {
++                const size_t node = shape.row_node_indices[static_cast<size_t>(i)];
++                float * dst = embd_storage.data() + static_cast<size_t>(i) * n_embd_inp;
++                std::memcpy(dst, input + node * static_cast<size_t>(n_embd), static_cast<size_t>(n_embd) * sizeof(float));
++                if (n_embd_inp > n_embd) {
++                    std::memset(dst + n_embd, 0, static_cast<size_t>(n_embd_inp - n_embd) * sizeof(float));
++                }
++            }
++        } else if (n_embd_inp == n_embd) {
++            const float * input = static_cast<const float *>(input_payload);
++            for (int32_t i = 0; i < n_rows; ++i) {
++                const size_t node = shape.row_node_indices[static_cast<size_t>(i)];
++                std::memcpy(
++                        embd_storage.data() + static_cast<size_t>(i) * n_embd_inp,
++                        input + node * static_cast<size_t>(n_embd),
++                        static_cast<size_t>(n_embd) * sizeof(float));
++            }
++        } else {
++            const float * input = static_cast<const float *>(input_payload);
++            for (int32_t i = 0; i < n_rows; ++i) {
++                const size_t node = shape.row_node_indices[static_cast<size_t>(i)];
++                float * dst = embd_storage.data() + static_cast<size_t>(i) * n_embd_inp;
++                std::memcpy(dst, input + node * static_cast<size_t>(n_embd), static_cast<size_t>(n_embd) * sizeof(float));
++                std::memset(dst + n_embd, 0, static_cast<size_t>(n_embd_inp - n_embd) * sizeof(float));
++            }
++        }
++    }
++
++    std::vector<int8_t> logits_storage(row_count, request_logits ? 1 : 0);
++    llama_batch batch = {
++        /*n_tokens =*/ n_rows,
++        /*token    =*/ activation_input ? nullptr : shape.tokens.data(),
++        /*embd     =*/ activation_input ? embd_storage.data() : nullptr,
++        /*pos      =*/ shape.positions.data(),
++        /*n_seq_id =*/ shape.n_seq_id_storage.data(),
++        /*seq_id   =*/ shape.seq_id_storage.data(),
++        /*logits   =*/ logits_storage.data(),
++    };
++
++    skippy_activation_tokens_scope activation_tokens_scope(shape.tokens.data(), row_count);
++    skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
++    skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
++    skippy_graph_filter_scope graph_filter_scope(&session->stage_model->config);
++    const int32_t saved_n_past = session->n_past;
++    const int32_t rc = llama_decode(session->ctx, batch);
++    session->n_past = saved_n_past;
++    if (rc != 0) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "llama_decode failed for tree verification");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++
++    status = skippy_copy_tree_output_activation_frame(session, node_count, shape, output_payload, input_desc, out_error);
++    if (status != SKIPPY_STATUS_OK) {
++        return status;
++    }
++
++    if (request_logits) {
++        for (size_t i = 0; i < node_count; ++i) {
++            output_tokens[i] = skippy_sample_token_ith(session, sampling, shape.first_row_for_node[i]);
++        }
++    }
++    skippy_mtp_clear_session_state(session);
++    return skippy_success(out_error);
++}
++
+ extern "C" {
+ 
+ struct skippy_abi_version skippy_abi_version(void) {
+@@ -2383,7 +2734,8 @@ uint64_t skippy_abi_features(void) {
+            SKIPPY_FEATURE_BACKEND_DEVICES |
+            SKIPPY_FEATURE_NATIVE_MTP_N1 |
+            SKIPPY_FEATURE_SESSION_OVERWRITE |
+-           SKIPPY_FEATURE_TREE_GATHER;
++           SKIPPY_FEATURE_TREE_GATHER |
++           SKIPPY_FEATURE_TREE_VERIFY;
+ }
+ 
+ void skippy_error_free(struct skippy_error * error) {
+@@ -2642,8 +2994,23 @@ static enum skippy_status skippy_finish_model_open(
+     params.type_v = config != nullptr && config->cache_type_v > 0 ? static_cast<ggml_type>(config->cache_type_v) : GGML_TYPE_F16;
+     params.flash_attn_type = config != nullptr ? static_cast<llama_flash_attn_type>(config->flash_attn_type) : LLAMA_FLASH_ATTN_TYPE_AUTO;
+     params.embeddings = config != nullptr && config->filter_tensors_on_load && !config->include_output;
++    const uint32_t reserved_lane_sequences = stage_model->lane_count * 2;
++    if (reserved_lane_sequences < LLAMA_MAX_SEQ) {
++        const uint32_t available_tree_sequences = LLAMA_MAX_SEQ - reserved_lane_sequences;
++        stage_model->tree_sequence_stride = std::min<uint32_t>(
++                SKIPPY_TREE_MAX_SEQUENCES_PER_SESSION,
++                available_tree_sequences / stage_model->lane_count);
++        if (stage_model->tree_sequence_stride > 0) {
++            params.n_seq_max = std::max<uint32_t>(
++                    params.n_seq_max,
++                    reserved_lane_sequences + stage_model->tree_sequence_stride * stage_model->lane_count);
++            params.kv_unified = true;
++        }
++    }
+     if (llm_arch_is_recurrent(model->arch) || llm_arch_is_hybrid(model->arch)) {
+-        params.n_seq_max = std::max<uint32_t>(2, stage_model->lane_count * 2);
++        params.n_seq_max = std::max<uint32_t>(
++                params.n_seq_max,
++                std::max<uint32_t>(2, stage_model->lane_count * 2));
+         params.n_rs_seq = std::max<uint32_t>(params.n_rs_seq, 2);
+         params.kv_unified = true;
+     }
+@@ -3119,6 +3486,35 @@ enum skippy_status skippy_session_gather_kv_path(
+     return skippy_success(out_error);
+ }
+ 
++enum skippy_status skippy_session_gather_tree_path(
++        struct skippy_session * session,
++        uint32_t source_leaf_index,
++        uint64_t dest_start,
++        const uint64_t * source_positions,
++        size_t position_count,
++        const llama_token * token_ids,
++        size_t token_count,
++        struct skippy_error ** out_error) {
++    llama_seq_id source_seq_id = -1;
++    enum skippy_status status = skippy_tree_leaf_sequence_id(
++            session,
++            source_leaf_index,
++            &source_seq_id,
++            out_error);
++    if (status != SKIPPY_STATUS_OK) {
++        return status;
++    }
++    return skippy_session_gather_kv_path(
++            session,
++            source_seq_id,
++            dest_start,
++            source_positions,
++            position_count,
++            token_ids,
++            token_count,
++            out_error);
++}
++
+ enum skippy_status skippy_session_sample_current(
+         struct skippy_session * session,
+         const struct skippy_sampling_config * sampling,
+@@ -4071,6 +4467,42 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+     return skippy_success(out_error);
+ }
+ 
++enum skippy_status skippy_verify_tree_frame_sampled(
++        struct skippy_session * session,
++        const llama_token * token_ids,
++        const int32_t * parent_indices,
++        const uint32_t * depths,
++        size_t node_count,
++        const struct skippy_sampling_config * sampling,
++        const struct skippy_activation_desc * input_desc,
++        const void * input_payload,
++        struct skippy_activation_desc * output_desc,
++        void * output_payload,
++        size_t output_payload_capacity,
++        size_t * out_output_payload_bytes,
++        llama_token * output_tokens,
++        size_t output_token_capacity,
++        size_t * out_token_count,
++        struct skippy_error ** out_error) {
++    return skippy_decode_tree_frame(
++            session,
++            token_ids,
++            parent_indices,
++            depths,
++            node_count,
++            sampling,
++            input_desc,
++            input_payload,
++            output_desc,
++            output_payload,
++            output_payload_capacity,
++            out_output_payload_bytes,
++            output_tokens,
++            output_token_capacity,
++            out_token_count,
++            out_error);
++}
++
+ enum skippy_status skippy_session_copy_output_activation_frame(
+         struct skippy_session * session,
+         size_t token_count,
+-- 
+2.54.0

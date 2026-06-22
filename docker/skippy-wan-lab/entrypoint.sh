@@ -628,6 +628,22 @@ run_stage() {
       --openai-prefill-adaptive-step "${OPENAI_PREFILL_ADAPTIVE_STEP:-128}"
       --openai-prefill-adaptive-max "${OPENAI_PREFILL_ADAPTIVE_MAX:-512}"
     )
+    if [[ -n "${OPENAI_DRAFT_MODEL_PATH:-}" ]]; then
+      args+=(
+        --openai-draft-model-path "$OPENAI_DRAFT_MODEL_PATH"
+        --openai-speculative-window "${OPENAI_SPECULATIVE_WINDOW:-4}"
+        --openai-pipelined-speculative-depth "${OPENAI_PIPELINED_SPECULATIVE_DEPTH:-1}"
+      )
+      if [[ "${OPENAI_ADAPTIVE_SPECULATIVE_WINDOW:-0}" == "1" || "${OPENAI_ADAPTIVE_SPECULATIVE_WINDOW:-0}" == "true" ]]; then
+        args+=(--openai-adaptive-speculative-window)
+      fi
+      if [[ "${OPENAI_TREE_SPECULATIVE:-0}" == "1" || "${OPENAI_TREE_SPECULATIVE:-0}" == "true" ]]; then
+        args+=(--openai-tree-speculative)
+      fi
+      if [[ -n "${OPENAI_DRAFT_N_GPU_LAYERS:-}" ]]; then
+        args+=(--openai-draft-n-gpu-layers "$OPENAI_DRAFT_N_GPU_LAYERS")
+      fi
+    fi
   fi
 
   exec skippy-server "${args[@]}"

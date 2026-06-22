@@ -23,7 +23,19 @@ pub(crate) struct StageDeploymentContext<'a> {
     pub(crate) n_ubatch: Option<u32>,
     pub(crate) kv_cache: KvCachePolicy,
     pub(crate) flash_attn_type: FlashAttentionType,
+    pub(crate) tree_sequence_count: u32,
     pub(crate) projector_path: Option<String>,
+}
+
+fn tree_aware_flash_attn_type(
+    flash_attn_type: FlashAttentionType,
+    tree_sequence_count: u32,
+) -> FlashAttentionType {
+    if tree_sequence_count > 0 {
+        FlashAttentionType::Disabled
+    } else {
+        flash_attn_type
+    }
 }
 
 pub(crate) fn remote_stage_load_request(
@@ -56,7 +68,11 @@ pub(crate) fn remote_stage_load_request(
         n_gpu_layers: -1,
         cache_type_k: context.kv_cache.cache_type_k().to_string(),
         cache_type_v: context.kv_cache.cache_type_v().to_string(),
-        flash_attn_type: context.flash_attn_type,
+        flash_attn_type: tree_aware_flash_attn_type(
+            context.flash_attn_type,
+            context.tree_sequence_count,
+        ),
+        tree_sequence_count: context.tree_sequence_count,
         shutdown_generation: 1,
         coordinator_term: 0,
         coordinator_id: None,
@@ -101,8 +117,12 @@ pub(crate) fn stage0_config(
         n_gpu_layers: -1,
         cache_type_k: context.kv_cache.cache_type_k().to_string(),
         cache_type_v: context.kv_cache.cache_type_v().to_string(),
-        flash_attn_type: context.flash_attn_type,
+        flash_attn_type: tree_aware_flash_attn_type(
+            context.flash_attn_type,
+            context.tree_sequence_count,
+        ),
         filter_tensors_on_load: true,
+        tree_sequence_count: context.tree_sequence_count,
         selected_device,
         kv_cache: None,
         load_mode: LoadMode::LayerPackage,
@@ -154,6 +174,7 @@ pub(crate) fn stage_topology_instance(
                 node_id: stage.node_id,
                 layer_start: stage.layer_start,
                 layer_end: stage.layer_end,
+                tree_sequence_count: context.tree_sequence_count,
                 endpoint: mesh::StageEndpoint {
                     bind_addr: ready_statuses
                         .get(&stage.stage_id)
@@ -229,6 +250,7 @@ mod tests {
             n_ubatch: None,
             kv_cache: KvCachePolicy::for_model_size(0),
             flash_attn_type: FlashAttentionType::Auto,
+            tree_sequence_count: 0,
             projector_path: Some("/models/mmproj.gguf".to_string()),
         };
         let request = remote_stage_load_request(

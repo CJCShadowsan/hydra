@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     net::SocketAddr,
     sync::{
         Arc,
@@ -12,22 +13,29 @@ use anyhow::{Context, Result, anyhow};
 use skippy_coordinator::{ClaimDecision, ClaimFence, LoadClaimRef};
 use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig};
 use skippy_server::{
-    EmbeddedServerHandle,
-    binary_transport::{BinaryStageOptions, WireCondition},
-    telemetry::TelemetryLevel,
+    EmbeddedServerHandle, binary_transport::BinaryStageOptions, telemetry::TelemetryLevel,
 };
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 
+mod failure_context;
 mod inventory;
+mod readiness;
 #[cfg(test)]
 mod tests;
 mod types;
+mod wire_condition;
 
+use failure_context::stage_load_failure_context;
 use inventory::{resolve_inventory_source, run_stage_prepare_task};
+use readiness::wait_for_binary_stage_ready;
 pub(crate) use types::*;
+use wire_condition::stage_downstream_wire_condition_from_env;
+pub(crate) use wire_condition::stage_downstream_wire_condition_value_from_env;
+
+const STAGE_LOAD_TIMEOUT_ENV: &str = "MESH_LLM_STAGE_LOAD_TIMEOUT_SECS";
 
 struct RunningStage {
     load: StageLoadRequest,
@@ -35,6 +43,12 @@ struct RunningStage {
     materialized: Option<super::materialization::MaterializedStageArtifact>,
     package: Option<super::materialization::ResolvedStagePackage>,
     _materialized_pin: Option<super::materialization::MaterializedStagePin>,
+}
+
+struct StartedStage {
+    load: StageLoadRequest,
+    server: EmbeddedServerHandle,
+    package: Option<super::materialization::ResolvedStagePackage>,
 }
 
 #[derive(Default)]
@@ -334,88 +348,61 @@ impl StageControlState {
             "unsupported stage backend '{}'",
             load.backend
         );
-        if let Some(error) = self.validate_load_claim(&load) {
-            return Ok(StageReadyResponse {
-                accepted: false,
-                status: failed_status_from_load(&load, error.clone()),
-                error: Some(error),
-            });
+        if let Some(response) = self.load_rejection_response(&load) {
+            return Ok(response);
         }
         let key = stage_key(&load.topology_id, &load.run_id, &load.stage_id);
-        if let Some(existing) = self.stages.remove(&key) {
-            existing.server.shutdown().await?;
-        }
+        self.shutdown_existing_stage(&key).await?;
 
-        let bind_addr = materialize_stage_bind_addr(parse_bind_addr(&load.bind_addr)?)?;
-        let mut effective_load = load;
-        effective_load.bind_addr = bind_addr.to_string();
-        super::configure_materialized_stage_cache();
-        let package_request = effective_load.clone();
-        let mut resolved_package = None;
-        if let Some(package) = tokio::task::spawn_blocking(move || {
-            super::materialization::resolve_stage_load_package(&package_request)
-        })
-        .await
-        .context("join resolve stage load package task")??
-        {
-            effective_load.model_path = Some(package.local_ref.clone());
-            effective_load.source_model_bytes = package.source_model_bytes;
-            resolved_package = Some(package);
-        }
-        let config = stage_config(&effective_load, None, resolved_package.as_ref())?;
-        let server = skippy_server::start_binary_stage(BinaryStageOptions {
-            config,
-            topology: None,
-            bind_addr,
-            activation_width: effective_load.activation_width,
-            wire_dtype: effective_load.wire_dtype.into(),
-            metrics_otlp_grpc: None,
-            telemetry_queue_capacity: 0,
-            telemetry_level: TelemetryLevel::Off,
-            max_inflight: effective_load.lane_count as usize,
-            reply_credit_limit: None,
-            async_prefill_forward: true,
-            downstream_wire_condition: WireCondition::new(0.0, None)?,
-            downstream_connect_timeout_secs: 30,
-            openai: None,
-        });
-        if let Err(error) =
-            wait_for_binary_stage_ready(bind_addr, stage_load_timeout(&effective_load)).await
-        {
-            let last_error = server.status().last_error;
-            let context = stage_load_failure_context(
-                &effective_load,
-                "binary stage did not become ready",
-                last_error.as_deref(),
-            );
-            let _ = server.shutdown().await;
-            return Err(error.context(context));
-        }
-
-        self.stages.insert(
-            key,
-            RunningStage {
-                load: effective_load.clone(),
-                server,
-                materialized: None,
-                package: resolved_package,
-                _materialized_pin: None,
-            },
-        );
-        let status = self
-            .statuses(&StageStatusFilter {
-                topology_id: Some(effective_load.topology_id.clone()),
-                run_id: Some(effective_load.run_id.clone()),
-                stage_id: Some(effective_load.stage_id.clone()),
-            })
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("stage status missing after load"))?;
+        let started = start_split_stage(load).await?;
+        let status = self.insert_running_stage(key, started)?;
         Ok(StageReadyResponse {
             accepted: true,
             status,
             error: None,
         })
+    }
+
+    fn load_rejection_response(&self, load: &StageLoadRequest) -> Option<StageReadyResponse> {
+        let error = self.validate_load_claim(load)?;
+        Some(StageReadyResponse {
+            accepted: false,
+            status: failed_status_from_load(load, error.clone()),
+            error: Some(error),
+        })
+    }
+
+    async fn shutdown_existing_stage(&mut self, key: &str) -> Result<()> {
+        if let Some(existing) = self.stages.remove(key) {
+            existing.server.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    fn insert_running_stage(
+        &mut self,
+        key: String,
+        started: StartedStage,
+    ) -> Result<StageStatusSnapshot> {
+        let load = started.load.clone();
+        self.stages.insert(
+            key,
+            RunningStage {
+                load: started.load,
+                server: started.server,
+                materialized: None,
+                package: started.package,
+                _materialized_pin: None,
+            },
+        );
+        self.statuses(&StageStatusFilter {
+            topology_id: Some(load.topology_id),
+            run_id: Some(load.run_id),
+            stage_id: Some(load.stage_id),
+        })
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("stage status missing after load"))
     }
 
     async fn stop(&mut self, stop: StageStopRequest) -> Result<StageReadyResponse> {
@@ -524,6 +511,152 @@ impl StageControlState {
     }
 }
 
+async fn start_split_stage(load: StageLoadRequest) -> Result<StartedStage> {
+    let bind_addr = materialize_stage_bind_addr(parse_bind_addr(&load.bind_addr)?)?;
+    let mut effective_load = load;
+    effective_load.bind_addr = bind_addr.to_string();
+    log_stage_load_starting(&effective_load);
+    let resolved_package = resolve_split_stage_package(&mut effective_load).await?;
+    log_stage_package_resolved(&effective_load);
+
+    let server = start_split_stage_binary(&effective_load, bind_addr, resolved_package.as_ref())?;
+    wait_for_started_stage_ready(&effective_load, bind_addr, server)
+        .await
+        .map(|server| StartedStage {
+            load: effective_load,
+            server,
+            package: resolved_package,
+        })
+}
+
+fn log_stage_load_starting(load: &StageLoadRequest) {
+    tracing::info!(
+        model = load.model_id,
+        topology_id = load.topology_id,
+        run_id = load.run_id,
+        stage_id = load.stage_id,
+        stage_index = load.stage_index,
+        layer_start = load.layer_start,
+        layer_end = load.layer_end,
+        bind_addr = load.bind_addr,
+        load_mode = ?load.load_mode,
+        "split stage load starting"
+    );
+}
+
+async fn resolve_split_stage_package(
+    load: &mut StageLoadRequest,
+) -> Result<Option<super::materialization::ResolvedStagePackage>> {
+    super::configure_materialized_stage_cache();
+    let package_request = load.clone();
+    let resolved_package = tokio::task::spawn_blocking(move || {
+        super::materialization::resolve_stage_load_package(&package_request)
+    })
+    .await
+    .context("join resolve stage load package task")??;
+    if let Some(package) = resolved_package.as_ref() {
+        load.model_path = Some(package.local_ref.clone());
+        load.source_model_bytes = package.source_model_bytes;
+    }
+    Ok(resolved_package)
+}
+
+fn log_stage_package_resolved(load: &StageLoadRequest) {
+    tracing::info!(
+        model = load.model_id,
+        topology_id = load.topology_id,
+        run_id = load.run_id,
+        stage_id = load.stage_id,
+        model_path = load.model_path.as_deref().unwrap_or(""),
+        source_model_bytes = load.source_model_bytes,
+        "split stage package resolved"
+    );
+}
+
+fn start_split_stage_binary(
+    load: &StageLoadRequest,
+    bind_addr: SocketAddr,
+    package: Option<&super::materialization::ResolvedStagePackage>,
+) -> Result<EmbeddedServerHandle> {
+    let config = stage_config(load, None, package)?;
+    let downstream_wire = stage_downstream_wire_condition_from_env()?;
+    tracing::info!(
+        model = load.model_id,
+        topology_id = load.topology_id,
+        run_id = load.run_id,
+        stage_id = load.stage_id,
+        bind_addr = load.bind_addr,
+        downstream_wire_delay_ms = downstream_wire.delay_ms,
+        downstream_wire_jitter_ms = downstream_wire.jitter_ms,
+        downstream_wire_mbps = downstream_wire.mbps,
+        "split stage binary runtime starting"
+    );
+    if downstream_wire.enabled() {
+        tracing::warn!(
+            model = load.model_id,
+            topology_id = load.topology_id,
+            run_id = load.run_id,
+            stage_id = load.stage_id,
+            downstream_wire_delay_ms = downstream_wire.delay_ms,
+            downstream_wire_jitter_ms = downstream_wire.jitter_ms,
+            downstream_wire_mbps = downstream_wire.mbps,
+            "applying artificial split-stage downstream wire condition"
+        );
+    }
+    Ok(skippy_server::start_binary_stage(BinaryStageOptions {
+        config,
+        topology: None,
+        bind_addr,
+        activation_width: load.activation_width,
+        wire_dtype: load.wire_dtype.into(),
+        metrics_otlp_grpc: None,
+        telemetry_queue_capacity: 0,
+        telemetry_level: TelemetryLevel::Off,
+        max_inflight: load.lane_count as usize,
+        reply_credit_limit: None,
+        async_prefill_forward: true,
+        downstream_wire_condition: downstream_wire.condition,
+        downstream_connect_timeout_secs: 30,
+        openai: None,
+    }))
+}
+
+async fn wait_for_started_stage_ready(
+    load: &StageLoadRequest,
+    bind_addr: SocketAddr,
+    server: EmbeddedServerHandle,
+) -> Result<EmbeddedServerHandle> {
+    let ready_timeout = stage_load_timeout(load);
+    tracing::info!(
+        model = load.model_id,
+        topology_id = load.topology_id,
+        run_id = load.run_id,
+        stage_id = load.stage_id,
+        bind_addr = load.bind_addr,
+        timeout_secs = ready_timeout.as_secs(),
+        "waiting for split stage binary ready handshake"
+    );
+    if let Err(error) = wait_for_binary_stage_ready(Some(&server), bind_addr, ready_timeout).await {
+        let last_error = server.status().last_error;
+        let context = stage_load_failure_context(
+            load,
+            "binary stage did not become ready",
+            last_error.as_deref(),
+        );
+        let _ = server.shutdown().await;
+        return Err(error.context(context));
+    }
+    tracing::info!(
+        model = load.model_id,
+        topology_id = load.topology_id,
+        run_id = load.run_id,
+        stage_id = load.stage_id,
+        bind_addr = load.bind_addr,
+        "split stage binary ready"
+    );
+    Ok(server)
+}
+
 impl StageStatusFilter {
     fn matches(&self, load: &StageLoadRequest) -> bool {
         self.topology_id
@@ -580,19 +713,19 @@ fn materialize_stage_bind_addr(bind_addr: SocketAddr) -> Result<SocketAddr> {
         .context("read reserved ephemeral stage bind address")
 }
 
-async fn wait_for_binary_stage_ready(bind_addr: SocketAddr, timeout: Duration) -> Result<()> {
-    tokio::task::spawn_blocking(move || probe_binary_stage_ready(bind_addr, timeout))
-        .await
-        .context("join binary stage readiness probe")?
+pub(crate) fn stage_load_timeout(load: &StageLoadRequest) -> Duration {
+    if let Some(timeout) = stage_load_timeout_env_override() {
+        return timeout;
+    }
+    stage_load_timeout_for_bytes(load.source_model_bytes)
 }
 
-pub(crate) fn stage_load_timeout(load: &StageLoadRequest) -> Duration {
+fn stage_load_timeout_for_bytes(source_model_bytes: Option<u64>) -> Duration {
     const MIN_STAGE_LOAD_TIMEOUT_SECS: u64 = 900;
     const MAX_STAGE_LOAD_TIMEOUT_SECS: u64 = 4 * 60 * 60;
     const STAGE_LOAD_BYTES_PER_SEC: u64 = 128 * 1024 * 1024;
 
-    let scaled_secs = load
-        .source_model_bytes
+    let scaled_secs = source_model_bytes
         .map(|bytes| {
             bytes.saturating_add(STAGE_LOAD_BYTES_PER_SEC.saturating_sub(1))
                 / STAGE_LOAD_BYTES_PER_SEC
@@ -605,68 +738,20 @@ pub(crate) fn stage_load_timeout(load: &StageLoadRequest) -> Duration {
     )
 }
 
-fn stage_load_failure_context(
-    load: &StageLoadRequest,
-    error: &str,
-    last_error: Option<&str>,
-) -> String {
-    let source_bytes = load
-        .source_model_bytes
-        .map(|bytes| bytes.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let device = load
-        .selected_device
-        .as_ref()
-        .map(|device| device.backend_device.as_str())
-        .unwrap_or("auto");
-    format!(
-        "split stage load failed: model={} topology={} run={} stage={} index={} layers={}..{} mode={:?} bind={} ctx={} lanes={} source_bytes={} device={} error={} last_error={}",
-        load.model_id,
-        load.topology_id,
-        load.run_id,
-        load.stage_id,
-        load.stage_index,
-        load.layer_start,
-        load.layer_end,
-        load.load_mode,
-        load.bind_addr,
-        load.ctx_size,
-        load.lane_count,
-        source_bytes,
-        device,
-        error,
-        last_error.unwrap_or("none"),
-    )
+fn stage_load_timeout_env_override() -> Option<Duration> {
+    stage_load_timeout_override(env::var(STAGE_LOAD_TIMEOUT_ENV).ok().as_deref())
 }
 
-fn probe_binary_stage_ready(bind_addr: SocketAddr, timeout: Duration) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut last_error = None;
-    while std::time::Instant::now() < deadline {
-        match std::net::TcpStream::connect(bind_addr) {
-            Ok(mut stream) => {
-                stream.set_nodelay(true).ok();
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-                match skippy_protocol::binary::recv_ready(&mut stream) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        last_error =
-                            Some(anyhow!(error).context("binary stage ready handshake failed"));
-                    }
-                }
-            }
-            Err(error) => {
-                last_error = Some(anyhow!(error).context("connect binary stage listener"));
-            }
-        }
-        std::thread::sleep(Duration::from_millis(250));
+fn stage_load_timeout_override(value: Option<&str>) -> Option<Duration> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
     }
-    Err(last_error
-        .unwrap_or_else(|| anyhow!("timed out waiting for binary stage ready at {bind_addr}"))
-        .context(format!(
-            "binary stage did not become ready at {bind_addr} before timeout"
-        )))
+    let secs = raw.parse::<u64>().ok()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs))
 }
 
 fn stage_config(
@@ -690,6 +775,12 @@ fn stage_config(
             "selected backend device must not be empty"
         );
     }
+    let tree_sequence_count = load.tree_sequence_count;
+    let flash_attn_type = if tree_sequence_count > 0 {
+        FlashAttentionType::Disabled
+    } else {
+        load.flash_attn_type
+    };
     let mut config = StageConfig {
         run_id: load.run_id.clone(),
         topology_id: load.topology_id.clone(),
@@ -722,11 +813,12 @@ fn stage_config(
         n_gpu_layers: load.n_gpu_layers,
         cache_type_k: empty_to_default(&load.cache_type_k, "f16"),
         cache_type_v: empty_to_default(&load.cache_type_v, "f16"),
-        flash_attn_type: load.flash_attn_type,
+        flash_attn_type,
         filter_tensors_on_load: matches!(
             load.load_mode,
             LoadMode::RuntimeSlice | LoadMode::LayerPackage
         ),
+        tree_sequence_count,
         selected_device: load.selected_device.clone(),
         kv_cache: None,
         load_mode: load.load_mode.clone(),

@@ -14,6 +14,7 @@ pub struct TopologyPlanningInput {
     pub model_weight_bytes: u64,
     pub kv_bytes_per_token: u64,
     pub minimum_nodes: usize,
+    pub preferred_stage0_node_id: Option<String>,
     pub nodes: Vec<TopologyNode>,
     pub context_length_override: Option<u32>,
     pub parallel_lanes_override: Option<usize>,
@@ -155,10 +156,10 @@ fn context_candidates(
                 native: native_context,
             });
         }
-        if requested < minimum_context {
+        if requested == 0 {
             return Err(TopologyPlanError::ContextBelowMinimum {
                 requested,
-                minimum: minimum_context,
+                minimum: 1,
             });
         }
         return Ok(vec![requested]);
@@ -330,6 +331,7 @@ fn fit_candidate(
             })
             .then_with(|| left_node.node_id.cmp(&right_node.node_id))
     });
+    pin_preferred_stage0(&mut capacities, input.preferred_stage0_node_id.as_deref())?;
 
     if capacities.iter().any(|(_, max_layers)| *max_layers == 0) {
         return None;
@@ -398,6 +400,20 @@ fn fit_candidate(
         minimum_remaining_vram,
         total_remaining_vram,
     })
+}
+
+fn pin_preferred_stage0(
+    capacities: &mut [(UsableNode, usize)],
+    preferred_stage0_node_id: Option<&str>,
+) -> Option<()> {
+    let Some(preferred) = preferred_stage0_node_id else {
+        return Some(());
+    };
+    let position = capacities
+        .iter()
+        .position(|(node, _)| node.node_id == preferred)?;
+    capacities[..=position].rotate_right(1);
+    Some(())
 }
 
 fn latency_aware_planning(_input: &TopologyPlanningInput, nodes: &[UsableNode]) -> bool {
@@ -522,6 +538,7 @@ mod tests {
             model_weight_bytes: 40 * GIB,
             kv_bytes_per_token: 64 * 1024,
             minimum_nodes: 1,
+            preferred_stage0_node_id: None,
             nodes,
             context_length_override: None,
             parallel_lanes_override: None,
@@ -536,6 +553,7 @@ mod tests {
             model_weight_bytes: QWEN_CODER_480B_WEIGHT_BYTES,
             kv_bytes_per_token: QWEN_CODER_480B_Q8_KV_BYTES_PER_TOKEN,
             minimum_nodes: 2,
+            preferred_stage0_node_id: None,
             nodes,
             context_length_override: None,
             parallel_lanes_override: None,
@@ -607,6 +625,42 @@ mod tests {
             .find(|stage| stage.node_id == "large")
             .unwrap();
         assert!(small.layer_end - small.layer_start < large.layer_end - large.layer_start);
+    }
+
+    #[test]
+    fn preferred_stage0_node_is_pinned_when_it_fits() {
+        let mut request = input(vec![node("small", 16), node("large", 48)]);
+        request.minimum_nodes = 2;
+        request.preferred_stage0_node_id = Some("small".to_string());
+        let plan = plan_topology(&request).unwrap();
+
+        assert_eq!(plan.stages.first().unwrap().node_id, "small");
+        assert_eq!(plan.stages.first().unwrap().layer_start, 0);
+        let small = plan
+            .stages
+            .iter()
+            .find(|stage| stage.node_id == "small")
+            .unwrap();
+        let large = plan
+            .stages
+            .iter()
+            .find(|stage| stage.node_id == "large")
+            .unwrap();
+        assert!(small.layer_end - small.layer_start < large.layer_end - large.layer_start);
+    }
+
+    #[test]
+    fn preferred_stage0_node_is_required() {
+        let mut request = input(vec![node("a", 48), node("b", 48)]);
+        request.minimum_nodes = 2;
+        request.preferred_stage0_node_id = Some("missing".to_string());
+
+        assert_eq!(
+            plan_topology(&request).unwrap_err(),
+            TopologyPlanError::NoValidTopology {
+                minimum_context: 65_536
+            }
+        );
     }
 
     #[test]
@@ -684,16 +738,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_context_override_below_minimum_floor() {
+    fn accepts_explicit_context_override_below_auto_floor() {
         let mut request = input(vec![node("a", 80), node("b", 80)]);
         request.native_context_length = 262_144;
         request.context_length_override = Some(32_768);
 
+        let plan = plan_topology(&request).expect("explicit low context should be honored");
+
+        assert_eq!(plan.context_length, 32_768);
+    }
+
+    #[test]
+    fn rejects_zero_context_override() {
+        let mut request = input(vec![node("a", 80), node("b", 80)]);
+        request.context_length_override = Some(0);
+
         assert_eq!(
             plan_topology(&request),
             Err(TopologyPlanError::ContextBelowMinimum {
-                requested: 32_768,
-                minimum: 65_536,
+                requested: 0,
+                minimum: 1,
             })
         );
     }

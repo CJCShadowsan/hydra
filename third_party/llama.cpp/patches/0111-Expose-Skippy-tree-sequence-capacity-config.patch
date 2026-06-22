@@ -1,0 +1,87 @@
+From 6c0e53d481a41e3320bc83e9267ea81eeb65d8fd Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 21 Jun 2026 17:43:32 +1000
+Subject: [PATCH] Expose Skippy tree sequence capacity config
+
+---
+ include/skippy.h        |  1 +
+ include/skippy/common.h |  2 +-
+ src/skippy.cpp          | 26 ++++++++++++++++++++++++--
+ 3 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index ec0641f5b..c102375ac 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -70,6 +70,7 @@ struct skippy_runtime_config {
+     bool filter_tensors_on_load;
+     bool include_embeddings;
+     bool include_output;
++    int32_t tree_sequence_count;
+ 
+     // Optional ggml backend device name, for example "CUDA0", "MTL0",
+     // "Vulkan1", or "CPU". When set, skippy loads the model only on that
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index 84c1d213b..22f4baeee 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 29
++#define SKIPPY_ABI_VERSION_PATCH 30
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index ea886e59e..661b89a72 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -3082,11 +3082,13 @@ static enum skippy_status skippy_finish_model_open(
+     params.type_v = config != nullptr && config->cache_type_v > 0 ? static_cast<ggml_type>(config->cache_type_v) : GGML_TYPE_F16;
+     params.flash_attn_type = config != nullptr ? static_cast<llama_flash_attn_type>(config->flash_attn_type) : LLAMA_FLASH_ATTN_TYPE_AUTO;
+     params.embeddings = config != nullptr && config->filter_tensors_on_load && !config->include_output;
++    const uint32_t requested_tree_sequences = config != nullptr && config->tree_sequence_count > 0 ?
++            std::min<uint32_t>(static_cast<uint32_t>(config->tree_sequence_count), SKIPPY_TREE_MAX_SEQUENCES_PER_SESSION) : 0;
+     const uint32_t reserved_lane_sequences = stage_model->lane_count * 2;
+-    if (reserved_lane_sequences < LLAMA_MAX_SEQ) {
++    if (requested_tree_sequences > 0 && reserved_lane_sequences < LLAMA_MAX_SEQ) {
+         const uint32_t available_tree_sequences = LLAMA_MAX_SEQ - reserved_lane_sequences;
+         stage_model->tree_sequence_stride = std::min<uint32_t>(
+-                SKIPPY_TREE_MAX_SEQUENCES_PER_SESSION,
++                requested_tree_sequences,
+                 available_tree_sequences / stage_model->lane_count);
+         if (stage_model->tree_sequence_stride > 0) {
+             params.n_seq_max = std::max<uint32_t>(
+@@ -3104,7 +3106,27 @@ static enum skippy_status skippy_finish_model_open(
+     }
+ 
+     skippy_graph_filter_scope graph_filter_scope(config);
++    fprintf(stderr,
++            "skippy: context init starting stage_index=%d layers=%d..%d ctx=%u lanes=%u n_seq_max=%u kv_unified=%d embeddings=%d include_output=%d filter_tensors_on_load=%d tree_sequence_count=%u tree_sequence_stride=%u\n",
++            config != nullptr ? config->stage_index : -1,
++            config != nullptr ? config->layer_start : 0,
++            config != nullptr ? config->layer_end : skippy_stage_layer_count(model),
++            params.n_ctx,
++            stage_model->lane_count,
++            params.n_seq_max,
++            params.kv_unified ? 1 : 0,
++            params.embeddings ? 1 : 0,
++            config != nullptr && config->include_output ? 1 : 0,
++            config != nullptr && config->filter_tensors_on_load ? 1 : 0,
++            requested_tree_sequences,
++            stage_model->tree_sequence_stride);
++    fflush(stderr);
+     stage_model->ctx = llama_init_from_model(model, params);
++    fprintf(stderr,
++            "skippy: context init returned stage_index=%d ctx=%p\n",
++            config != nullptr ? config->stage_index : -1,
++            static_cast<void *>(stage_model->ctx));
++    fflush(stderr);
+     if (stage_model->ctx == nullptr) {
+         const char * message = "failed to create llama context";
+         if (event_scope != nullptr) {
+-- 
+2.54.0
+

@@ -727,11 +727,15 @@ fn validate_skippy(config: &SkippyConfig, base_path: &str) -> DiagnosticResult {
 }
 
 fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> DiagnosticResult {
-    validate_optional_enum(
-        config.mode.as_deref(),
-        &["auto", "disabled", "draft", "ngram"],
-        &format!("{base_path}.mode"),
-    )?;
+    const MODES: &[&str] = &[
+        "auto",
+        "disabled",
+        "draft",
+        "shard-pipeline",
+        "tree",
+        "ngram",
+    ];
+    validate_optional_enum(config.mode.as_deref(), MODES, &format!("{base_path}.mode"))?;
     validate_hf_pair(
         config.draft_hf_repo.as_deref(),
         config.draft_hf_file.as_deref(),
@@ -776,6 +780,18 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
         config.draft_split_probability,
         &format!("{base_path}.draft_split_probability"),
     )?;
+    validate_optional_positive_u32(
+        config.pipelined_depth,
+        &format!("{base_path}.pipelined_depth"),
+    )?;
+    if config.mode.as_deref() == Some("shard-pipeline") && config.pipelined_depth == Some(1) {
+        return Err(validation_diagnostic(
+            &format!("{base_path}.pipelined_depth"),
+            format!(
+                "{base_path}.pipelined_depth must be greater than 1 when {base_path}.mode = \"shard-pipeline\""
+            ),
+        ));
+    }
     if let Some(gpu_layers) = config.draft_gpu_layers
         && gpu_layers < -1
     {
@@ -811,15 +827,18 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
         config.spec_default.as_ref(),
         &format!("{base_path}.spec_default"),
     )?;
-    if config.mode.as_deref() == Some("draft")
-        && config.draft_model_path.is_none()
+    if matches!(
+        config.mode.as_deref(),
+        Some("draft" | "shard-pipeline" | "tree")
+    ) && config.draft_model_path.is_none()
         && config.draft_hf_repo.is_none()
         && config.draft_selection_policy.is_none()
     {
+        let mode = config.mode.as_deref().unwrap_or("draft");
         return Err(validation_diagnostic(
             &format!("{base_path}.draft_selection_policy"),
             format!(
-                "{base_path}.draft_selection_policy must be set when {base_path}.mode = \"draft\" and no explicit draft model source is configured"
+                "{base_path}.draft_selection_policy must be set when {base_path}.mode = \"{mode}\" and no explicit draft model source is configured"
             ),
         ));
     }
@@ -1541,6 +1560,70 @@ gpu_id = "metal:0"
         assert_eq!(
             diagnostic.message,
             "models[0].hardware.device must not be set when gpu.assignment = \"auto\""
+        );
+    }
+
+    #[test]
+    fn shard_pipeline_speculative_mode_is_valid_with_parallel_depth() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+
+[models.speculative]
+mode = "shard-pipeline"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_max_tokens = 8
+pipelined_depth = 6
+"#,
+        )
+        .expect("config should parse before validation");
+
+        validate_config(&config).expect("shard-pipeline mode should validate");
+    }
+
+    #[test]
+    fn shard_pipeline_speculative_mode_rejects_serial_depth() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+
+[models.speculative]
+mode = "shard-pipeline"
+draft_model_path = "/models/qwen3-draft.gguf"
+draft_max_tokens = 8
+pipelined_depth = 1
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let err =
+            validate_config(&config).expect_err("shard-pipeline mode must reject serial depth");
+        assert_eq!(
+            err.to_string(),
+            "models[0].speculative.pipelined_depth must be greater than 1 when models[0].speculative.mode = \"shard-pipeline\""
+        );
+    }
+
+    #[test]
+    fn shard_pipeline_speculative_mode_requires_policy_without_draft_source() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[[models]]
+model = "Qwen/Qwen3-0.6B:Q4_K_M"
+
+[models.speculative]
+mode = "shard-pipeline"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let err = validate_config(&config)
+            .expect_err("shard-pipeline mode should require an explicit draft source or policy");
+        assert_eq!(
+            err.to_string(),
+            "models[0].speculative.draft_selection_policy must be set when models[0].speculative.mode = \"shard-pipeline\" and no explicit draft model source is configured"
         );
     }
 

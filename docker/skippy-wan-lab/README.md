@@ -98,6 +98,28 @@ The OpenAI-compatible endpoint is:
 curl -s http://127.0.0.1:9337/v1/models | jq
 ```
 
+## Shard Speculative Runs
+
+The lab can exercise Shard-style speculative serving on stage0 while Linux
+`tc netem` shapes stage-to-stage traffic. Set `OPENAI_DRAFT_MODEL_PATH` to a
+GGUF visible inside the container and raise `OPENAI_PIPELINED_SPECULATIVE_DEPTH`
+above `1` for pipelined fixed-window verification:
+
+```bash
+OPENAI_DRAFT_MODEL_PATH=/hf-cache/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/<commit>/Qwen3-0.6B-Q4_K_M.gguf
+OPENAI_SPECULATIVE_WINDOW=4
+OPENAI_PIPELINED_SPECULATIVE_DEPTH=3
+WAN_DELAY_MS=120
+WAN_JITTER_MS=80
+WAN_LOSS_PERCENT=0.1
+```
+
+For rejection-path validation, set `SKIPPY_SPEC_DRAFT_FAULT_EVERY`, for example
+`SKIPPY_SPEC_DRAFT_FAULT_EVERY=2`, and compare deterministic target-only output
+against the speculative output before treating throughput as meaningful. This
+Docker lane proves Skippy behavior under real Linux traffic control; it does not
+replace the mesh/HF proof for QUIC peer join and split placement.
+
 Example request:
 
 ```bash

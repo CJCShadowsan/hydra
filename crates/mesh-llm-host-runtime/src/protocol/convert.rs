@@ -13,6 +13,8 @@ fn skippy_stage_subprotocols(
     artifact_transfer_supported: bool,
     stage_protocol_generation_supported: bool,
     status_list_supported: bool,
+    force_downstream_reply_supported: bool,
+    identified_replies_supported: bool,
 ) -> Vec<crate::proto::node::MeshSubprotocol> {
     let mut features = vec![skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL.to_string()];
     if stage_protocol_generation_supported {
@@ -25,6 +27,13 @@ fn skippy_stage_subprotocols(
     }
     if status_list_supported {
         features.push(skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST.to_string());
+    }
+    if force_downstream_reply_supported {
+        features
+            .push(skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_FORCE_DOWNSTREAM_REPLY.to_string());
+    }
+    if identified_replies_supported {
+        features.push(skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_IDENTIFIED_REPLIES.to_string());
     }
     vec![crate::proto::node::MeshSubprotocol {
         name: skippy_protocol::STAGE_SUBPROTOCOL_NAME.to_string(),
@@ -44,6 +53,24 @@ fn supports_skippy_status_list(subprotocols: &[crate::proto::node::MeshSubprotoc
     supports_skippy_stage_feature(
         subprotocols,
         skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST,
+    )
+}
+
+fn supports_skippy_force_downstream_reply(
+    subprotocols: &[crate::proto::node::MeshSubprotocol],
+) -> bool {
+    supports_skippy_stage_feature(
+        subprotocols,
+        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_FORCE_DOWNSTREAM_REPLY,
+    )
+}
+
+fn supports_skippy_identified_replies(
+    subprotocols: &[crate::proto::node::MeshSubprotocol],
+) -> bool {
+    supports_skippy_stage_feature(
+        subprotocols,
+        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_IDENTIFIED_REPLIES,
     )
 }
 
@@ -697,6 +724,8 @@ pub(crate) fn local_ann_to_proto_ann(
             ann.artifact_transfer_supported,
             ann.stage_protocol_generation_supported,
             ann.stage_status_list_supported,
+            ann.stage_force_downstream_reply_supported,
+            ann.stage_identified_replies_supported,
         ),
     }
 }
@@ -884,6 +913,10 @@ pub(crate) fn proto_ann_to_local(
         artifact_transfer_supported: supports_skippy_artifact_transfer(&pa.subprotocols),
         stage_protocol_generation_supported: supports_skippy_stage_generation(&pa.subprotocols),
         stage_status_list_supported: supports_skippy_status_list(&pa.subprotocols),
+        stage_force_downstream_reply_supported: supports_skippy_force_downstream_reply(
+            &pa.subprotocols,
+        ),
+        stage_identified_replies_supported: supports_skippy_identified_replies(&pa.subprotocols),
         advertised_model_throughput: pa
             .advertised_model_throughput
             .iter()

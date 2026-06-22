@@ -49,6 +49,15 @@ More work around using ngrams, drafting models is in progress.
 Some experimental work around predictive prompt completion into prefile has been done (yet to be proven, prefil is parallel so latency tolerant)
 MTP work with llama.cpp ongoing, but should be part of this to accelerate inference and especially reduce vulnerability to latency between layers. 
 
+The current high-priority path is the Shard-native split scheduler: direct tail
+return, fixed `[current] + K draft` verify windows, pipelined in-flight windows,
+reject rollback, stale-window discard, and strict target-reference proof before
+performance claims. The goal is WAN latency amortization for split serving, not
+only single-node speculative decoding. The canonical status and proof ledger is
+[docs/skippy/SHARD_NATIVE_PORT_AUDIT.md](docs/skippy/SHARD_NATIVE_PORT_AUDIT.md);
+keep detailed Shard goals and evidence there so this roadmap does not become a
+second source of truth.
+
 ## Demand-based rebalancing
 
 Partially done. Unified demand map via gossip, standby nodes promote to serve, and large-VRAM hosts can opt into fresh active-demand upgrades for local artifacts. Next: download-backed upgrades, split-aware upgrades, and replica-count balancing.

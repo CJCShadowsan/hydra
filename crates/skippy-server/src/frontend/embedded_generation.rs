@@ -1,5 +1,34 @@
 use super::*;
 
+struct PendingTreeGatherPath {
+    source_leaf_index: u32,
+    dest_start: usize,
+    source_positions: Vec<u64>,
+    token_ids: Vec<i32>,
+}
+
+impl PendingTreeGatherPath {
+    fn as_message_args(&self) -> TreeGatherMessageArgs<'_> {
+        TreeGatherMessageArgs {
+            source_leaf_index: self.source_leaf_index,
+            dest_start: self.dest_start,
+            source_positions: &self.source_positions,
+            token_ids: &self.token_ids,
+        }
+    }
+
+    fn as_embedded_path(&self, request_id: u64, session_id: u64) -> EmbeddedTreeGatherPath<'_> {
+        EmbeddedTreeGatherPath {
+            request_id,
+            session_id,
+            source_leaf_index: self.source_leaf_index,
+            dest_start: self.dest_start,
+            source_positions: &self.source_positions,
+            token_ids: &self.token_ids,
+        }
+    }
+}
+
 impl StageOpenAiBackend {
     pub(super) fn generate_embedded_stage_zero_tokens(
         &self,
@@ -32,6 +61,9 @@ impl StageOpenAiBackend {
             .ok_or_else(|| OpenAiError::backend("embedded stage 0 has no downstream lane pool"))?;
         let mut lane = lane_pool.checkout(request.ids)?;
         if let Some(prediction_return) = request.prediction_return.as_ref() {
+            prediction_return
+                .enable_downstream_reconnect(request.config, request.wire_dtype)
+                .map_err(openai_backend_error)?;
             match crate::binary_transport::direct_return::open_downstream_prediction_return_stream(
                 request.config,
                 request_id,
@@ -242,13 +274,16 @@ impl StageOpenAiBackend {
                             prefill_runtime_sessions_before
                                 .get_or_insert_with(|| runtime.session_stats());
                             let output = run_binary_stage_message(
+                                request.config,
                                 &mut runtime,
-                                &session_key,
-                                &message,
-                                chunk,
-                                None,
-                                false,
-                                0,
+                                BinaryStageMessageExecution {
+                                    session_id: &session_key,
+                                    message: &message,
+                                    token_ids: chunk,
+                                    input: None,
+                                    sample_final_prefill: false,
+                                    output_capacity: 0,
+                                },
                             )
                             .map_err(openai_backend_error)?
                             .2;
@@ -802,6 +837,7 @@ impl StageOpenAiBackend {
                 },
                 adaptive_window_max_seen: adaptive_window,
                 adaptive_window_enabled: request.adaptive_speculative_window,
+                pipelined_depth: request.pipelined_speculative_depth,
                 ..OpenAiSpeculativeStats::default()
             };
             let mut draft_guard = match request.draft.as_ref() {
@@ -832,6 +868,7 @@ impl StageOpenAiBackend {
                 }
                 _ => None,
             };
+            let mut pending_tree_gather: Option<PendingTreeGatherPath> = None;
             for decode_step in decoded_tokens as u32..request.max_tokens {
                 if fused_reached_stop {
                     break;
@@ -843,6 +880,285 @@ impl StageOpenAiBackend {
                     .cancellation
                     .is_some_and(openai_frontend::CancellationToken::is_cancelled)
                 {
+                    break;
+                }
+                if request.tree_speculative
+                    && draft_guard.is_some()
+                    && sampling_is_tree_greedy_equivalent(request.sampling)
+                {
+                    let remaining = (request.max_tokens as usize).saturating_sub(decoded_tokens);
+                    if remaining == 0 {
+                        break;
+                    }
+                    let draft_window = draft_guard
+                        .as_deref()
+                        .map_or(request.speculative_window, |draft| draft.window);
+                    let tree_depth = remaining.min(adaptive_window).min(draft_window).max(1);
+                    let propose_timer = PhaseTimer::start();
+                    let tree = draft_guard
+                        .as_deref_mut()
+                        .ok_or_else(|| OpenAiError::backend("missing draft runner"))?
+                        .propose_tree(&context_tokens, current, tree_depth, 2)
+                        .map_err(openai_backend_error)?;
+                    let draft_propose_ms = propose_timer.elapsed_ms();
+                    speculative_stats.draft_propose_ms += draft_propose_ms;
+                    if tree.nodes.len() > 1 {
+                        let tree_tokens = tree.tokens();
+                        let tree_parents = tree.parents();
+                        let tree_depths = tree.depths();
+                        let gather_for_verify = pending_tree_gather.take();
+                        let message = embedded_tree_verify_message(
+                            request.wire_dtype,
+                            TreeVerifyMessageArgs {
+                                request_id,
+                                session_id,
+                                prompt_token_count: request.prompt_token_ids.len(),
+                                pos_start: prefill_token_count + decoded_tokens,
+                                decode_step: decoded_tokens,
+                                tokens: &tree_tokens,
+                                parents: &tree_parents,
+                                depths: &tree_depths,
+                                sampling: wire_sampling.clone(),
+                                checkpoint: false,
+                                gather: gather_for_verify
+                                    .as_ref()
+                                    .map(PendingTreeGatherPath::as_message_args),
+                            },
+                        )?;
+                        let verify = self.execute_embedded_stage_message(
+                            &request,
+                            downstream,
+                            &session_key,
+                            &message,
+                            &tree_tokens,
+                            WireReplyKind::PredictedTokens,
+                        )?;
+                        speculative_stats.windows += 1;
+                        speculative_stats.tree_windows += 1;
+                        speculative_stats.tree_nodes += tree.nodes.len();
+                        speculative_stats.draft_tokens += tree.nodes.len().saturating_sub(1);
+                        speculative_stats.primary_verify_requests += 1;
+                        speculative_stats.primary_verify_tokens += tree_tokens.len();
+                        speculative_stats.primary_verify_elapsed_ms += verify.elapsed_ms;
+                        speculative_stats.primary_verify_stage0_compute_ms +=
+                            verify.stats.stage0_compute_ms;
+                        speculative_stats.primary_verify_runtime_lock_wait_ms +=
+                            verify.stats.runtime_lock_wait_ms;
+                        speculative_stats.primary_verify_runtime_lock_hold_ms +=
+                            verify.stats.runtime_lock_hold_ms;
+                        speculative_stats.primary_verify_activation_encode_ms +=
+                            verify.stats.activation_encode_ms;
+                        speculative_stats.primary_verify_forward_write_ms +=
+                            verify.stats.forward_write_ms;
+                        speculative_stats.primary_verify_downstream_wait_ms +=
+                            verify.stats.downstream_wait_ms;
+                        speculative_stats.primary_verify_output_activation_bytes =
+                            speculative_stats
+                                .primary_verify_output_activation_bytes
+                                .saturating_add(verify.stats.output_activation_bytes);
+                        speculative_stats.primary_verify_forward_activation_bytes =
+                            speculative_stats
+                                .primary_verify_forward_activation_bytes
+                                .saturating_add(verify.stats.forward_activation_bytes);
+                        decode_stage0_compute_ms += verify.stats.stage0_compute_ms;
+                        decode_runtime_lock_wait_ms += verify.stats.runtime_lock_wait_ms;
+                        decode_runtime_lock_wait_max_ms =
+                            decode_runtime_lock_wait_max_ms.max(verify.stats.runtime_lock_wait_ms);
+                        decode_runtime_lock_hold_ms += verify.stats.runtime_lock_hold_ms;
+                        decode_runtime_lock_hold_max_ms =
+                            decode_runtime_lock_hold_max_ms.max(verify.stats.runtime_lock_hold_ms);
+                        decode_runtime_lock_acquires += 1;
+                        decode_forward_activation_encode_ms += verify.stats.activation_encode_ms;
+                        decode_output_activation_bytes = decode_output_activation_bytes
+                            .saturating_add(verify.stats.output_activation_bytes);
+                        decode_forward_activation_bytes = decode_forward_activation_bytes
+                            .saturating_add(verify.stats.forward_activation_bytes);
+                        decode_forward_write_ms += verify.stats.forward_write_ms;
+                        decode_downstream_wait_ms += verify.stats.downstream_wait_ms;
+
+                        let decision = accept_tree_path(
+                            &tree,
+                            &verify.reply.predicted_tokens,
+                            decoded_tokens,
+                            request.max_tokens as usize,
+                            |token| token_is_eog_with_runtime(&self.runtime, token),
+                        )?;
+                        let dest_start = prefill_token_count + decoded_tokens;
+                        let source_positions = decision
+                            .path_node_indices
+                            .iter()
+                            .map(|node_index| {
+                                let node_depth = usize::try_from(tree.nodes[*node_index].depth)
+                                    .map_err(|_| {
+                                        OpenAiError::backend("tree node depth exceeds usize")
+                                    })?;
+                                let position =
+                                    dest_start.checked_add(node_depth).ok_or_else(|| {
+                                        OpenAiError::backend("tree gather source position overflow")
+                                    })?;
+                                u64::try_from(position).map_err(|_| {
+                                    OpenAiError::backend("tree gather source position exceeds u64")
+                                })
+                            })
+                            .collect::<OpenAiResult<Vec<_>>>()?;
+                        let path_tokens = decision
+                            .path_node_indices
+                            .iter()
+                            .map(|node_index| tree.nodes[*node_index].token)
+                            .collect::<Vec<_>>();
+                        if self.telemetry.is_debug_enabled() {
+                            let mut attrs = self.openai_attrs(request.ids);
+                            attrs.insert("llama_stage.decode_step".to_string(), json!(decode_step));
+                            attrs.insert(
+                                "llama_stage.spec.tree_tokens".to_string(),
+                                json!(&tree_tokens),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_parents".to_string(),
+                                json!(&tree_parents),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_depths".to_string(),
+                                json!(&tree_depths),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_predicted_tokens".to_string(),
+                                json!(&verify.reply.predicted_tokens),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_commit_tokens".to_string(),
+                                json!(&decision.commit_tokens),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_path_node_indices".to_string(),
+                                json!(&decision.path_node_indices),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_source_positions".to_string(),
+                                json!(&source_positions),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_source_leaf_index".to_string(),
+                                json!(decision.source_leaf_index),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_rejected".to_string(),
+                                json!(decision.rejected),
+                            );
+                            attrs.insert(
+                                "llama_stage.spec.tree_reached_stop".to_string(),
+                                json!(decision.reached_stop),
+                            );
+                            self.telemetry
+                                .emit_debug("stage.openai_tree_decision", attrs);
+                        }
+                        pending_tree_gather = Some(PendingTreeGatherPath {
+                            source_leaf_index: decision.source_leaf_index,
+                            dest_start,
+                            source_positions,
+                            token_ids: path_tokens,
+                        });
+                        speculative_stats.accepted_tokens +=
+                            decision.path_node_indices.len().saturating_sub(1);
+                        if decision.rejected {
+                            speculative_stats.rejected_tokens += 1;
+                            speculative_stats.rejected_windows += 1;
+                            speculative_stats.first_reject_position_sum = speculative_stats
+                                .first_reject_position_sum
+                                .saturating_add(decision.path_node_indices.len());
+                        } else if decision.reached_stop {
+                            speculative_stats.accepted_stop_windows += 1;
+                        } else {
+                            speculative_stats.full_accept_windows += 1;
+                            speculative_stats.grow_adaptive_window(
+                                &mut adaptive_window,
+                                request.adaptive_speculative_window,
+                                max_speculative_window,
+                            );
+                        }
+                        let mut reached_stop = false;
+                        for token in decision.commit_tokens {
+                            let token_decode_step = decoded_tokens;
+                            current = token;
+                            decoded_tokens += 1;
+                            exact_replay_tokens.push(current);
+                            context_tokens.push(current);
+                            self.emit_speculative_commit_token_debug(
+                                request.ids,
+                                token_decode_step,
+                                current,
+                                "TreeVerify",
+                                "tree",
+                                None,
+                            );
+                            if on_token(current)? == TokenControl::Stop {
+                                reached_stop = true;
+                            }
+                            if reached_stop || decoded_tokens >= request.max_tokens as usize {
+                                break;
+                            }
+                        }
+                        speculative_stats.adaptive_window_final = adaptive_window;
+                        if reached_stop || decision.reached_stop {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if let Some(gather) = pending_tree_gather.take() {
+                    let gather = self.gather_embedded_stage_tree_path(
+                        &request,
+                        downstream,
+                        &session_key,
+                        gather.as_embedded_path(request_id, session_id),
+                    )?;
+                    speculative_stats.tree_gather_ms += gather.elapsed_ms;
+                }
+                if request.pipelined_speculative_depth > 1
+                    && request.prediction_return.is_some()
+                    && draft_guard.is_some()
+                    && let Some(draft) = request.draft.as_ref().cloned()
+                {
+                    let draft_window = draft_guard
+                        .as_deref()
+                        .map_or(request.speculative_window, |draft| draft.window);
+                    drop(draft_guard.take());
+                    let outcome = self.generate_pipelined_speculative_tokens(
+                        PipelinedSpeculativeTask {
+                            request: &request,
+                            downstream,
+                            session_key: &session_key,
+                            request_id,
+                            session_id,
+                            prefill_token_count,
+                            wire_sampling: wire_sampling.clone(),
+                            draft,
+                            draft_window,
+                            context_tokens: &mut context_tokens,
+                            current,
+                            decoded_tokens,
+                            adaptive_window: &mut adaptive_window,
+                            max_speculative_window,
+                            speculative_stats: &mut speculative_stats,
+                        },
+                        &mut on_token,
+                    )?;
+                    decoded_tokens = outcome.decoded_tokens;
+                    decode_stage0_compute_ms += outcome.stats.stage0_compute_ms;
+                    decode_runtime_lock_wait_ms += outcome.stats.runtime_lock_wait_ms;
+                    decode_runtime_lock_wait_max_ms =
+                        decode_runtime_lock_wait_max_ms.max(outcome.stats.runtime_lock_wait_max_ms);
+                    decode_runtime_lock_hold_ms += outcome.stats.runtime_lock_hold_ms;
+                    decode_runtime_lock_hold_max_ms =
+                        decode_runtime_lock_hold_max_ms.max(outcome.stats.runtime_lock_hold_max_ms);
+                    decode_runtime_lock_acquires += outcome.stats.runtime_lock_acquires;
+                    decode_forward_activation_encode_ms += outcome.stats.activation_encode_ms;
+                    decode_output_activation_bytes = decode_output_activation_bytes
+                        .saturating_add(outcome.stats.output_activation_bytes);
+                    decode_forward_activation_bytes = decode_forward_activation_bytes
+                        .saturating_add(outcome.stats.forward_activation_bytes);
+                    decode_forward_write_ms += outcome.stats.forward_write_ms;
+                    decode_downstream_wait_ms += outcome.stats.downstream_wait_ms;
                     break;
                 }
                 let token_timer = PhaseTimer::start();
@@ -1155,7 +1471,7 @@ impl StageOpenAiBackend {
                                 decode_step: decoded_tokens,
                                 tokens: &verify_inputs,
                                 sampling: wire_sampling.clone(),
-                                checkpoint: true,
+                                checkpoint: false,
                             },
                         )?;
                         let verify = self.execute_embedded_stage_message(
@@ -1221,124 +1537,45 @@ impl StageOpenAiBackend {
                             request.adaptive_speculative_window,
                             max_speculative_window,
                         );
-                        let mut commit_tokens =
-                            verify.reply.predicted_tokens[..decision.commit_count].to_vec();
-                        if decision.requires_repair() {
+                        let commit_count = shard_linear_commit_count(&decision, draft_tokens.len());
+                        let commit_tokens = verify.reply.predicted_tokens[..commit_count].to_vec();
+                        if decision.rejected() {
+                            let repair =
+                                self.repair_rejected_verify_span_kv(VerifySpanKvRepair {
+                                    request: &request,
+                                    downstream,
+                                    session_key: &session_key,
+                                    request_id,
+                                    session_id,
+                                    prefill_token_count,
+                                    decoded_tokens,
+                                    current,
+                                    commit_tokens: &commit_tokens,
+                                    wire_sampling: wire_sampling.clone(),
+                                })?;
                             speculative_stats.recovery_restores += 1;
-                            let restore = self.restore_embedded_stage_session(
-                                &request,
-                                downstream,
-                                &session_key,
-                                request_id,
-                                session_id,
-                            )?;
-                            speculative_stats.recovery_ms += restore.elapsed_ms;
-                            speculative_stats.recovery_restore_ms += restore.elapsed_ms;
-                            speculative_stats.recovery_restore_local_ms += restore.local_ms;
+                            speculative_stats.recovery_ms += repair.elapsed_ms;
+                            speculative_stats.recovery_restore_local_ms += repair.trim.local_ms;
                             speculative_stats.recovery_restore_downstream_write_ms +=
-                                restore.downstream_write_ms;
+                                repair.trim.downstream_write_ms;
                             speculative_stats.recovery_restore_downstream_wait_ms +=
-                                restore.downstream_wait_ms;
-                            let repair_input_count = decision
-                                .repair_input_count
-                                .ok_or_else(|| OpenAiError::backend("missing repair count"))?;
-                            if repair_input_count == 1 {
-                                let repair_message = embedded_decode_message(
-                                    request.wire_dtype,
-                                    DecodeMessageArgs {
-                                        request_id,
-                                        session_id,
-                                        prompt_token_count: request.prompt_token_ids.len(),
-                                        pos_start: prefill_token_count + decoded_tokens,
-                                        decode_step: decoded_tokens,
-                                        current,
-                                        sampling: wire_sampling.clone(),
-                                    },
-                                )?;
-                                let repair = self.execute_embedded_stage_message(
-                                    &request,
-                                    downstream,
-                                    &session_key,
-                                    &repair_message,
-                                    &[current],
-                                    WireReplyKind::PredictedToken,
-                                )?;
-                                commit_tokens = vec![repair.reply.predicted];
-                                decode_stage0_compute_ms += repair.stats.stage0_compute_ms;
-                                decode_runtime_lock_wait_ms += repair.stats.runtime_lock_wait_ms;
-                                decode_runtime_lock_wait_max_ms = decode_runtime_lock_wait_max_ms
-                                    .max(repair.stats.runtime_lock_wait_ms);
-                                decode_runtime_lock_hold_ms += repair.stats.runtime_lock_hold_ms;
-                                decode_runtime_lock_hold_max_ms = decode_runtime_lock_hold_max_ms
-                                    .max(repair.stats.runtime_lock_hold_ms);
-                                decode_runtime_lock_acquires += 1;
-                                decode_forward_activation_encode_ms +=
-                                    repair.stats.activation_encode_ms;
-                                decode_output_activation_bytes = decode_output_activation_bytes
-                                    .saturating_add(repair.stats.output_activation_bytes);
-                                decode_forward_activation_bytes = decode_forward_activation_bytes
-                                    .saturating_add(repair.stats.forward_activation_bytes);
-                                decode_forward_write_ms += repair.stats.forward_write_ms;
-                                decode_downstream_wait_ms += repair.stats.downstream_wait_ms;
-                                speculative_stats.recovery_decode_repairs += 1;
-                                speculative_stats.recovery_ms += repair.elapsed_ms;
-                                speculative_stats.recovery_decode_elapsed_ms += repair.elapsed_ms;
-                            } else {
-                                let repair_inputs = &verify_inputs[..repair_input_count];
-                                let repair_message = embedded_verify_message(
-                                    request.wire_dtype,
-                                    VerifySpanMessageArgs {
-                                        request_id,
-                                        session_id,
-                                        prompt_token_count: request.prompt_token_ids.len(),
-                                        pos_start: prefill_token_count + decoded_tokens,
-                                        decode_step: decoded_tokens,
-                                        tokens: repair_inputs,
-                                        sampling: wire_sampling.clone(),
-                                        checkpoint: false,
-                                    },
-                                )?;
-                                let repair = self.execute_embedded_stage_message(
-                                    &request,
-                                    downstream,
-                                    &session_key,
-                                    &repair_message,
-                                    repair_inputs,
-                                    WireReplyKind::PredictedTokens,
-                                )?;
-                                commit_tokens = repaired_commit_tokens(
-                                    &draft_tokens,
-                                    decision.accepted_before_reject,
-                                    repair_input_count,
-                                    &repair.reply.predicted_tokens,
-                                )?;
-                                decode_stage0_compute_ms += repair.stats.stage0_compute_ms;
-                                decode_runtime_lock_wait_ms += repair.stats.runtime_lock_wait_ms;
-                                decode_runtime_lock_wait_max_ms = decode_runtime_lock_wait_max_ms
-                                    .max(repair.stats.runtime_lock_wait_ms);
-                                decode_runtime_lock_hold_ms += repair.stats.runtime_lock_hold_ms;
-                                decode_runtime_lock_hold_max_ms = decode_runtime_lock_hold_max_ms
-                                    .max(repair.stats.runtime_lock_hold_ms);
-                                decode_runtime_lock_acquires += 1;
-                                decode_forward_activation_encode_ms +=
-                                    repair.stats.activation_encode_ms;
-                                decode_output_activation_bytes = decode_output_activation_bytes
-                                    .saturating_add(repair.stats.output_activation_bytes);
-                                decode_forward_activation_bytes = decode_forward_activation_bytes
-                                    .saturating_add(repair.stats.forward_activation_bytes);
-                                decode_forward_write_ms += repair.stats.forward_write_ms;
-                                decode_downstream_wait_ms += repair.stats.downstream_wait_ms;
-                                speculative_stats.recovery_reverify_tokens += repair_inputs.len();
-                                speculative_stats.recovery_ms += repair.elapsed_ms;
-                                speculative_stats.recovery_reverify_elapsed_ms += repair.elapsed_ms;
-                            }
+                                repair.trim.downstream_wait_ms;
                         }
 
                         let mut reached_stop = false;
                         for token in commit_tokens {
+                            let token_decode_step = decoded_tokens;
                             current = token;
                             decoded_tokens += 1;
                             context_tokens.push(current);
+                            self.emit_speculative_commit_token_debug(
+                                request.ids,
+                                token_decode_step,
+                                current,
+                                "VerifySpan",
+                                "sync-draft",
+                                None,
+                            );
                             if on_token(current)? == TokenControl::Stop {
                                 reached_stop = true;
                             }
@@ -1369,6 +1606,10 @@ impl StageOpenAiBackend {
                         token_attrs.insert(
                             "llama_stage.spec.proposed".to_string(),
                             json!(draft_tokens.len()),
+                        );
+                        token_attrs.insert(
+                            "llama_stage.spec.verify_inputs".to_string(),
+                            json!(verify_inputs.len()),
                         );
                         token_attrs.insert(
                             "llama_stage.spec.accepted".to_string(),
@@ -1762,6 +2003,106 @@ impl StageOpenAiBackend {
     }
 }
 
+pub(super) struct VerifySpanKvRepairStats {
+    pub(super) elapsed_ms: f64,
+    pub(super) trim: EmbeddedSessionControl,
+}
+
+pub(super) struct VerifySpanKvRepair<'a, 'b> {
+    pub(super) request: &'a EmbeddedStageZeroGeneration<'b>,
+    pub(super) downstream: &'a mut TcpStream,
+    pub(super) session_key: &'a str,
+    pub(super) request_id: u64,
+    pub(super) session_id: u64,
+    pub(super) prefill_token_count: usize,
+    pub(super) decoded_tokens: usize,
+    pub(super) current: i32,
+    pub(super) commit_tokens: &'a [i32],
+    pub(super) wire_sampling: Option<WireSamplingConfig>,
+}
+
+impl StageOpenAiBackend {
+    pub(super) fn repair_rejected_verify_span_kv(
+        &self,
+        repair: VerifySpanKvRepair<'_, '_>,
+    ) -> OpenAiResult<VerifySpanKvRepairStats> {
+        let VerifySpanKvRepair {
+            request,
+            downstream,
+            session_key,
+            request_id,
+            session_id,
+            prefill_token_count,
+            decoded_tokens,
+            current,
+            commit_tokens,
+            wire_sampling,
+        } = repair;
+        let timer = PhaseTimer::start();
+        let token_count = prefill_token_count.saturating_add(decoded_tokens);
+        let trim = self.trim_embedded_stage_session(
+            request,
+            downstream,
+            session_key,
+            request_id,
+            session_id,
+            token_count,
+        )?;
+        for (offset, input_token) in verify_span_repair_inputs(current, commit_tokens)
+            .into_iter()
+            .enumerate()
+        {
+            let decode_step = decoded_tokens.saturating_add(offset);
+            let mut message = embedded_decode_message(
+                request.wire_dtype,
+                DecodeMessageArgs {
+                    request_id,
+                    session_id,
+                    prompt_token_count: request.prompt_token_ids.len(),
+                    pos_start: prefill_token_count.saturating_add(decode_step),
+                    decode_step,
+                    current: input_token,
+                    sampling: wire_sampling.clone(),
+                },
+            )?;
+            message.state.flags |= state_flags::FORCE_DOWNSTREAM_REPLY;
+            let replay = self.execute_embedded_stage_message(
+                request,
+                downstream,
+                session_key,
+                &message,
+                &[input_token],
+                WireReplyKind::PredictedToken,
+            )?;
+            if replay.reply.predicted != commit_tokens[offset] {
+                return Err(OpenAiError::backend(format!(
+                    "verify span reject repair replay diverged at offset {offset}: predicted {} expected {}",
+                    replay.reply.predicted, commit_tokens[offset]
+                )));
+            }
+        }
+        Ok(VerifySpanKvRepairStats {
+            elapsed_ms: timer.elapsed_ms(),
+            trim,
+        })
+    }
+}
+
+fn verify_span_repair_inputs(current: i32, commit_tokens: &[i32]) -> Vec<i32> {
+    if commit_tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut inputs = Vec::with_capacity(commit_tokens.len());
+    inputs.push(current);
+    inputs.extend(
+        commit_tokens
+            .iter()
+            .copied()
+            .take(commit_tokens.len().saturating_sub(1)),
+    );
+    inputs
+}
+
 fn decode_uses_context_sideband(
     context_token_ids: &[i32],
     current: i32,
@@ -1769,4 +2110,19 @@ fn decode_uses_context_sideband(
 ) -> bool {
     context_token_ids.len() <= sideband_capacity
         && context_token_ids.last().copied() == Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_span_repair_inputs;
+
+    #[test]
+    fn verify_span_repair_inputs_replays_current_then_committed_prefix() {
+        assert_eq!(verify_span_repair_inputs(7, &[10, 11, 12]), vec![7, 10, 11]);
+    }
+
+    #[test]
+    fn verify_span_repair_inputs_handles_empty_commits() {
+        assert!(verify_span_repair_inputs(7, &[]).is_empty());
+    }
 }

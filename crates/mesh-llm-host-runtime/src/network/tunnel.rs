@@ -129,6 +129,16 @@ async fn handle_inbound_stage_transport(
     }
 
     let bind_addr = resolve_stage_transport_bind_addr(&node, &open).await?;
+    if crate::mesh::stage_transport_debug_enabled() {
+        eprintln!(
+            "inbound stage transport resolved: remote={} topology_id={} run_id={} stage_id={} bind={}",
+            remote.fmt_short(),
+            open.topology_id,
+            open.run_id,
+            open.stage_id,
+            bind_addr
+        );
+    }
     let tcp_stream = TcpStream::connect(&bind_addr).await?;
     tcp_stream.set_nodelay(true)?;
     tracing::info!(

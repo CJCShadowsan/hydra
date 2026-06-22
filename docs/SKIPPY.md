@@ -836,6 +836,18 @@ Important policy changes:
   validation;
 - stage assignments and readiness should be visible in status/gossip.
 
+For Shard-style WAN validation, `MESH_LLM_ALLOW_SLOW_DIRECT_STAGE_PATHS=1`
+admits measured direct split paths above the default RTT guard so the topology
+planner can price them as pipeline cost. This is an explicit validation knob,
+not a production default.
+
+When validating latency amortization rather than production placement,
+`MESH_LLM_SPLIT_FORCE_BOUNDARIES=18` (or a comma-separated boundary list)
+forces explicit layer split boundaries after the normal context/lane plan is
+computed. Use it only for controlled benchmark topology, for example keeping a
+Qwen3-8B two-node proof at `0..18` and `18..36` instead of letting the planner
+minimize WAN hops by assigning a one-layer tail.
+
 ### 10. Preserve Auto LLM Hooks
 
 Move the patched `llama-server` hook behavior into the mesh/skippy path.

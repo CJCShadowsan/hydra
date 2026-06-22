@@ -150,6 +150,65 @@ impl SplitStagePathRejection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SplitStagePathPolicy {
+    allow_relay_stage_paths: bool,
+    allow_slow_direct_stage_paths: bool,
+}
+
+impl SplitStagePathPolicy {
+    #[cfg(test)]
+    pub(crate) const fn strict() -> Self {
+        Self {
+            allow_relay_stage_paths: false,
+            allow_slow_direct_stage_paths: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn allow_relay_stage_paths() -> Self {
+        Self {
+            allow_relay_stage_paths: true,
+            allow_slow_direct_stage_paths: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn allow_slow_direct_stage_paths() -> Self {
+        Self {
+            allow_relay_stage_paths: false,
+            allow_slow_direct_stage_paths: true,
+        }
+    }
+}
+
+pub(crate) fn split_stage_path_policy_from_env() -> SplitStagePathPolicy {
+    SplitStagePathPolicy {
+        allow_relay_stage_paths: env_enabled("MESH_LLM_ALLOW_RELAY_STAGE_PATHS"),
+        allow_slow_direct_stage_paths: env_enabled("MESH_LLM_ALLOW_SLOW_DIRECT_STAGE_PATHS"),
+    }
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| env_flag_enabled(&value))
+        .unwrap_or(false)
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    let value = value.trim();
+    matches!(value, "1")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+}
+
+pub(crate) fn stage_transport_debug_enabled() -> bool {
+    std::env::var("MESH_LLM_STAGE_TRANSPORT_DEBUG")
+        .map(|value| env_flag_enabled(&value))
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SplitStagePathSnapshot {
     pub(crate) kind: SplitStagePathKind,
     pub(crate) rtt_ms: Option<u32>,
@@ -196,13 +255,26 @@ impl SplitStagePathSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn stage_path_rejection(self) -> Option<SplitStagePathRejection> {
+        self.stage_path_rejection_with_policy(SplitStagePathPolicy::strict())
+    }
+
+    pub(crate) const fn stage_path_rejection_with_policy(
+        self,
+        policy: SplitStagePathPolicy,
+    ) -> Option<SplitStagePathRejection> {
         match self.kind {
             SplitStagePathKind::Direct => match self.rtt_ms {
-                Some(rtt_ms) if rtt_ms <= MAX_SPLIT_RTT_MS => None,
+                Some(rtt_ms)
+                    if rtt_ms <= MAX_SPLIT_RTT_MS || policy.allow_slow_direct_stage_paths =>
+                {
+                    None
+                }
                 Some(_) => Some(SplitStagePathRejection::StagePathTooSlow),
                 None => Some(SplitStagePathRejection::MissingStagePath),
             },
+            SplitStagePathKind::Relay if policy.allow_relay_stage_paths => None,
             SplitStagePathKind::Relay => Some(SplitStagePathRejection::StagePathRelayOnly),
             SplitStagePathKind::Unknown => Some(SplitStagePathRejection::MissingStagePath),
         }
@@ -265,7 +337,7 @@ fn stage_transport_path_rejection(
     }
     split_stage_path_snapshot_from_connection(conn)
         .with_peer_path_fallback(fallback)
-        .stage_path_rejection()
+        .stage_path_rejection_with_policy(split_stage_path_policy_from_env())
 }
 
 fn endpoint_id_capture_fields(id: EndpointId) -> serde_json::Value {
@@ -1565,6 +1637,8 @@ pub(crate) struct PeerAnnouncement {
     pub(crate) artifact_transfer_supported: bool,
     pub(crate) stage_protocol_generation_supported: bool,
     pub(crate) stage_status_list_supported: bool,
+    pub(crate) stage_force_downstream_reply_supported: bool,
+    pub(crate) stage_identified_replies_supported: bool,
     pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     pub(crate) latency_ms: Option<u32>,
     pub(crate) latency_source: Option<crate::proto::node::LatencySource>,
@@ -1663,6 +1737,8 @@ pub struct PeerInfo {
     pub artifact_transfer_supported: bool,
     pub stage_protocol_generation_supported: bool,
     pub stage_status_list_supported: bool,
+    pub stage_force_downstream_reply_supported: bool,
+    pub stage_identified_replies_supported: bool,
     pub(crate) advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     /// Most recent direct RTT sample for display purposes (refreshed periodically).
     pub display_rtt: Option<DirectLatencyObservation>,
@@ -1746,6 +1822,8 @@ impl PeerInfo {
             artifact_transfer_supported: ann.artifact_transfer_supported,
             stage_protocol_generation_supported: ann.stage_protocol_generation_supported,
             stage_status_list_supported: ann.stage_status_list_supported,
+            stage_force_downstream_reply_supported: ann.stage_force_downstream_reply_supported,
+            stage_identified_replies_supported: ann.stage_identified_replies_supported,
             advertised_model_throughput: ann.advertised_model_throughput.clone(),
             display_rtt: None,
             selected_path: None,
@@ -2591,6 +2669,7 @@ pub struct StageAssignment {
     pub node_id: EndpointId,
     pub layer_start: u32,
     pub layer_end: u32,
+    pub tree_sequence_count: u32,
     pub endpoint: StageEndpoint,
 }
 
@@ -2732,6 +2811,8 @@ impl StageTopologyState {
             ),
         ));
     }
+
+    fn record_status_refresh_timeout(&mut self, _status: &StageRuntimeStatus) {}
 
     fn active_statuses(&self) -> Vec<StageRuntimeStatus> {
         self.statuses
@@ -3225,16 +3306,13 @@ impl Node {
                     self.stage_topologies
                         .lock()
                         .await
-                        .record_status_refresh_failure(
-                            &status,
-                            "stage status refresh timed out".to_string(),
-                        );
+                        .record_status_refresh_timeout(&status);
                     tracing::debug!(
                         topology_id = %status.topology_id,
                         run_id = %status.run_id,
                         stage_id = %status.stage_id,
                         peer = %peer_id.fmt_short(),
-                        "stage status refresh timed out; marking stage failed"
+                        "stage status refresh timed out; keeping cached stage state"
                     );
                 }
             }
@@ -3420,7 +3498,20 @@ impl Node {
         let conn = self.stage_connection_to_peer(peer_id).await?;
         let snapshot = split_stage_path_snapshot_from_connection(&conn)
             .with_peer_path_fallback(self.peer_stage_path_fallback(peer_id).await);
-        if let Some(rejection) = snapshot.stage_path_rejection() {
+        if stage_transport_debug_enabled() {
+            eprintln!(
+                "stage transport opening: peer={} topology_id={} run_id={} stage_id={} path_kind={:?} rtt_ms={:?}",
+                peer_id.fmt_short(),
+                open.topology_id,
+                open.run_id,
+                open.stage_id,
+                snapshot.kind,
+                snapshot.rtt_ms
+            );
+        }
+        if let Some(rejection) =
+            snapshot.stage_path_rejection_with_policy(split_stage_path_policy_from_env())
+        {
             anyhow::bail!(
                 "stage transport path to {} is not eligible for split serving: {}",
                 peer_id.fmt_short(),
@@ -3453,6 +3544,24 @@ impl Node {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let bind_addr = listener.local_addr()?.to_string();
+        tracing::info!(
+            peer = %peer_id.fmt_short(),
+            topology_id = %topology_id,
+            run_id = %run_id,
+            stage_id = %stage_id,
+            bind_addr = %bind_addr,
+            "stage transport bridge listening"
+        );
+        if stage_transport_debug_enabled() {
+            eprintln!(
+                "stage transport bridge listening: peer={} topology_id={} run_id={} stage_id={} bind={}",
+                peer_id.fmt_short(),
+                topology_id,
+                run_id,
+                stage_id,
+                bind_addr
+            );
+        }
         let node = self.clone();
         let topology_for_task = topology_id.clone();
         let run_for_task = run_id.clone();
@@ -3469,6 +3578,15 @@ impl Node {
                 tokio::spawn(async move {
                     if let Err(err) = async {
                         tcp_stream.set_nodelay(true)?;
+                        let local_addr = tcp_stream.local_addr().ok();
+                        let peer_addr = tcp_stream.peer_addr().ok();
+                        if stage_transport_debug_enabled() {
+                            eprintln!(
+                                "stage transport bridge accepted: target_peer={} stage_id={} local={local_addr:?} peer={peer_addr:?}",
+                                peer_id.fmt_short(),
+                                stage_id,
+                            );
+                        }
                         let (send, recv) = node
                             .open_stage_transport_stream(peer_id, topology_id, run_id, stage_id)
                             .await?;
@@ -7702,6 +7820,12 @@ impl Node {
             skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STATUS_LIST => {
                 peer.stage_status_list_supported
             }
+            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_FORCE_DOWNSTREAM_REPLY => {
+                peer.stage_force_downstream_reply_supported
+            }
+            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_IDENTIFIED_REPLIES => {
+                peer.stage_identified_replies_supported
+            }
             _ => false,
         }
     }
@@ -9044,6 +9168,7 @@ fn stage_topology_from_load(
             node_id,
             layer_start: load.layer_start,
             layer_end: load.layer_end,
+            tree_sequence_count: load.tree_sequence_count,
             endpoint: StageEndpoint {
                 bind_addr: load.bind_addr.clone(),
             },
@@ -9144,6 +9269,7 @@ fn stage_load_to_proto(
         cache_type_k: load.cache_type_k,
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_to_proto(load.flash_attn_type) as i32,
+        tree_sequence_count: load.tree_sequence_count,
         shutdown_generation: load.shutdown_generation,
         coordinator_term: load.coordinator_term,
         coordinator_id: load.coordinator_id.map(|id| id.to_string()),
@@ -9318,6 +9444,7 @@ fn stage_load_from_proto(
         cache_type_k: load.cache_type_k,
         cache_type_v: load.cache_type_v,
         flash_attn_type: stage_flash_attn_type_from_proto(load.flash_attn_type),
+        tree_sequence_count: load.tree_sequence_count,
         shutdown_generation: load.shutdown_generation,
         coordinator_term: load.coordinator_term,
         coordinator_id: load

@@ -19,6 +19,7 @@ pub const STAGE_STATE_HEADER_BYTES: usize = 10 * 4;
 pub const STAGE_SAMPLING_CONFIG_BASE_BYTES: usize = 10 * 4;
 pub const STAGE_LOGIT_BIAS_WIRE_BYTES: usize = 4 + 4;
 pub const STAGE_WIRE_FIXED_HEADER_BYTES: usize = 5 * 4 + STAGE_STATE_HEADER_BYTES + 2 * 8;
+pub const STAGE_REPLY_IDENTITY_WIRE_BYTES: usize = 2 * 8 + 5 * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -64,6 +65,7 @@ pub enum WireMessageKind {
     TryRestorePrefillDecode = 18,
     TrimSession = 19,
     PredictionReturnOpen = 20,
+    GatherTreePath = 21,
 }
 
 impl WireMessageKind {
@@ -94,7 +96,10 @@ impl WireMessageKind {
     pub fn is_session_control(self) -> bool {
         matches!(
             self,
-            Self::CheckpointSession | Self::RestoreSession | Self::TrimSession
+            Self::CheckpointSession
+                | Self::RestoreSession
+                | Self::TrimSession
+                | Self::GatherTreePath
         )
     }
 
@@ -145,6 +150,7 @@ impl TryFrom<i32> for WireMessageKind {
             18 => Ok(Self::TryRestorePrefillDecode),
             19 => Ok(Self::TrimSession),
             20 => Ok(Self::PredictionReturnOpen),
+            21 => Ok(Self::GatherTreePath),
             _ => Err(invalid_data("unknown stage message kind")),
         }
     }
@@ -156,6 +162,9 @@ pub enum WireReplyKind {
     Ack = 1,
     PredictedToken = 2,
     PredictedTokens = 3,
+    PredictedTokenIdentified = 4,
+    PredictedTokensIdentified = 5,
+    PredictionReturnReconnect = 6,
 }
 
 impl TryFrom<i32> for WireReplyKind {
@@ -166,7 +175,35 @@ impl TryFrom<i32> for WireReplyKind {
             1 => Ok(Self::Ack),
             2 => Ok(Self::PredictedToken),
             3 => Ok(Self::PredictedTokens),
+            4 => Ok(Self::PredictedTokenIdentified),
+            5 => Ok(Self::PredictedTokensIdentified),
+            6 => Ok(Self::PredictionReturnReconnect),
             _ => Err(invalid_data("unknown stage reply kind")),
+        }
+    }
+}
+
+impl WireReplyKind {
+    pub fn base_kind(self) -> Self {
+        match self {
+            Self::PredictedTokenIdentified => Self::PredictedToken,
+            Self::PredictedTokensIdentified => Self::PredictedTokens,
+            other => other,
+        }
+    }
+
+    pub fn identified(self) -> bool {
+        matches!(
+            self,
+            Self::PredictedTokenIdentified | Self::PredictedTokensIdentified
+        )
+    }
+
+    pub fn identified_kind(self) -> Self {
+        match self.base_kind() {
+            Self::PredictedToken => Self::PredictedTokenIdentified,
+            Self::PredictedTokens => Self::PredictedTokensIdentified,
+            other => other,
         }
     }
 }
@@ -189,6 +226,10 @@ pub mod state_flags {
     pub const CHAT_SAMPLING_METADATA: i32 = 1 << 5;
     pub const RWKV7_V_FIRST_SIDEBAND: i32 = 1 << 6;
     pub const GEMMA3N_ALTUP_SIDEBAND: i32 = 1 << 7;
+    pub const TREE_VERIFY: i32 = 1 << 8;
+    pub const TREE_GATHER: i32 = 1 << 9;
+    pub const FORCE_DOWNSTREAM_REPLY: i32 = 1 << 10;
+    pub const IDENTIFIED_REPLY: i32 = 1 << 11;
 }
 
 pub const ACTIVATION_FLAG_RWKV7_V_FIRST: u64 = 1 << 0;
@@ -350,6 +391,35 @@ pub struct StageRequestEpoch {
     pub checkpoint_generation: i32,
     pub prompt_token_count: i32,
     pub decode_step: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageReplyIdentity {
+    pub request_id: u64,
+    pub session_id: u64,
+    pub checkpoint_generation: i32,
+    pub prompt_token_count: i32,
+    pub decode_step: i32,
+    pub pos_start: i32,
+    pub seq_id: i32,
+}
+
+impl StageReplyIdentity {
+    pub fn from_message(message: &StageWireMessage) -> Self {
+        Self {
+            request_id: message.request_id,
+            session_id: message.session_id,
+            checkpoint_generation: message.state.checkpoint_generation,
+            prompt_token_count: message.state.prompt_token_count,
+            decode_step: message.state.decode_step,
+            pos_start: message.pos_start,
+            seq_id: message.state.seq_id,
+        }
+    }
+
+    pub fn matches_message(self, message: &StageWireMessage) -> bool {
+        self == Self::from_message(message)
+    }
 }
 
 impl StageRequestEpoch {
@@ -539,6 +609,28 @@ pub struct StageReply {
     pub predicted: i32,
     pub predicted_tokens: Vec<i32>,
     pub stats: StageReplyStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageReplyEnvelope {
+    pub reply: StageReply,
+    pub identity: Option<StageReplyIdentity>,
+}
+
+impl StageReplyEnvelope {
+    pub fn plain(reply: StageReply) -> Self {
+        Self {
+            reply,
+            identity: None,
+        }
+    }
+
+    pub fn identified(reply: StageReply, identity: StageReplyIdentity) -> Self {
+        Self {
+            reply,
+            identity: Some(identity),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

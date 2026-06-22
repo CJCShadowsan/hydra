@@ -12,6 +12,19 @@ Do not treat it as the architecture for this work. The new path should start
 from native MTP proposal semantics and add batching only after one-token
 correctness is proven.
 
+## Relationship To Shard GLM-5.2
+
+Do not conflate this native-MTP design with the Shard GLM-5.2 WAN path. Shard's
+GLM-5.2 proof uses an external tokenizer-compatible draft model plus target
+verification; it is not the GLM-4.7 native MTP sidecar described here.
+
+The Shard GLM-5.2 path has its own gates: GLM_DSA target execution parity,
+safe split boundaries around shared-indexer layers, speculative rollback for
+MLA/DSA KV, GLM draft tokenizer/vocab compatibility, and WAN proof with direct
+return plus pipelined `[current] + K draft` verify windows. Track that work in
+[`../skippy/SHARD_NATIVE_PORT_AUDIT.md`](../skippy/SHARD_NATIVE_PORT_AUDIT.md)
+and do not use MTP progress as evidence for GLM-5.2 Shard readiness.
+
 ## Current GLM-4.7 Evidence
 
 HF metadata checked on 2026-06-15 shows `zai-org/GLM-4.7-Flash` is the native

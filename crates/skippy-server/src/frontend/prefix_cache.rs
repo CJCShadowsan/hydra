@@ -928,18 +928,21 @@ impl StageOpenAiBackend {
                 },
             )?;
             let output = run_binary_stage_message(
+                request.config,
                 &mut runtime,
-                session_key,
-                &decode_message,
-                &[current],
-                None,
-                false,
-                stage_output_activation_capacity(
-                    request.config,
-                    decode_message.token_count,
-                    request.activation_width,
-                )
-                .map_err(openai_backend_error)?,
+                BinaryStageMessageExecution {
+                    session_id: session_key,
+                    message: &decode_message,
+                    token_ids: &[current],
+                    input: None,
+                    sample_final_prefill: false,
+                    output_capacity: stage_output_activation_capacity(
+                        request.config,
+                        decode_message.token_count,
+                        request.activation_width,
+                    )
+                    .map_err(openai_backend_error)?,
+                },
             )
             .map_err(openai_backend_error)?
             .2;

@@ -1,0 +1,417 @@
+From 34174ff64f55545fcc1bbceece29c02ec353d9d4 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 21 Jun 2026 09:41:58 +1000
+Subject: [PATCH] Add Skippy tree KV gather ABI
+
+---
+ include/skippy.h        |  15 +++
+ include/skippy/common.h |   4 +-
+ src/llama-kv-cache.cpp  | 204 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-kv-cache.h    |   8 ++
+ src/skippy.cpp          |  94 +++++++++++++++++-
+ 5 files changed, 323 insertions(+), 2 deletions(-)
+
+diff --git a/include/skippy.h b/include/skippy.h
+index 0e94e95bd..452a84af5 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -208,6 +208,21 @@ LLAMA_API enum skippy_status skippy_session_set_position(
+         int32_t n_past,
+         struct skippy_error ** out_error);
+ 
++LLAMA_API enum skippy_status skippy_session_overwrite_suffix(
++        struct skippy_session * session,
++        uint64_t token_count,
++        struct skippy_error ** out_error);
++
++LLAMA_API enum skippy_status skippy_session_gather_kv_path(
++        struct skippy_session * session,
++        int32_t source_seq_id,
++        uint64_t dest_start,
++        const uint64_t * source_positions,
++        size_t position_count,
++        const llama_token * token_ids,
++        size_t token_count,
++        struct skippy_error ** out_error);
++
+ LLAMA_API enum skippy_status skippy_session_sample_current(
+         struct skippy_session * session,
+         const struct skippy_sampling_config * sampling,
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index cfb4a8fa9..69edf1345 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 27
++#define SKIPPY_ABI_VERSION_PATCH 28
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+@@ -55,6 +55,8 @@ enum skippy_feature {
+     SKIPPY_FEATURE_BACKEND_DEVICES        = 1 << 23,
+     SKIPPY_FEATURE_RUNTIME_EVENTS         = 1 << 24,
+     SKIPPY_FEATURE_NATIVE_MTP_N1          = 1 << 25,
++    SKIPPY_FEATURE_SESSION_OVERWRITE      = 1 << 26,
++    SKIPPY_FEATURE_TREE_GATHER            = 1 << 27,
+ };
+ 
+ enum skippy_status {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 0957c6c8b..aaa50328f 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1237,6 +1237,23 @@ static void llama_kv_cache_copy_tensor_bytes(
+     ggml_backend_tensor_set(tensor, bytes.data(), dst_offset, size);
+ }
+ 
++static void llama_kv_cache_copy_tensor_bytes_between(
++        ggml_tensor * src,
++        size_t src_offset,
++        ggml_tensor * dst,
++        size_t dst_offset,
++        size_t size) {
++    if (src == nullptr || dst == nullptr || size == 0) {
++        return;
++    }
++    if (src == dst && src_offset == dst_offset) {
++        return;
++    }
++    std::vector<uint8_t> bytes(size);
++    ggml_backend_tensor_get(src, bytes.data(), src_offset, size);
++    ggml_backend_tensor_set(dst, bytes.data(), dst_offset, size);
++}
++
+ void llama_kv_cache::copy_compacted_cells(const std::vector<compaction_move> & moves) const {
+     for (const auto & layer : layers) {
+         for (const compaction_move & move : moves) {
+@@ -1692,6 +1709,193 @@ bool llama_kv_cache::stage_import_kv_page(
+     return src == static_cast<const char *>(input) + input_bytes;
+ }
+ 
++bool llama_kv_cache::stage_gather_kv_path(
++        llama_seq_id source_seq_id,
++        llama_seq_id dest_seq_id,
++        uint64_t dest_start,
++        const uint64_t * source_positions,
++        uint64_t position_count,
++        std::string & error) {
++    if (position_count == 0) {
++        error = "position_count must be greater than zero";
++        return false;
++    }
++    if (source_positions == nullptr) {
++        error = "source_positions are required";
++        return false;
++    }
++    if (source_seq_id == dest_seq_id) {
++        error = "source and destination sequence ids must differ";
++        return false;
++    }
++    if (position_count > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
++            dest_start > static_cast<uint64_t>(std::numeric_limits<llama_pos>::max()) ||
++            dest_start + position_count < dest_start ||
++            dest_start + position_count > static_cast<uint64_t>(std::numeric_limits<llama_pos>::max())) {
++        error = "gather token range is too large";
++        return false;
++    }
++    if (seq_to_stream.empty() || v_cells.empty()) {
++        error = "KV cache has no stream";
++        return false;
++    }
++    if (source_seq_id < 0 || static_cast<size_t>(source_seq_id) >= seq_to_stream.size() || source_seq_id >= LLAMA_MAX_SEQ ||
++            dest_seq_id < 0 || static_cast<size_t>(dest_seq_id) >= seq_to_stream.size() || dest_seq_id >= LLAMA_MAX_SEQ) {
++        error = "sequence id is mapped to an invalid KV stream";
++        return false;
++    }
++
++    const uint32_t source_strm = seq_to_stream[source_seq_id];
++    const uint32_t dest_strm = seq_to_stream[dest_seq_id];
++    if (source_strm >= v_cells.size() || dest_strm >= v_cells.size()) {
++        error = "sequence id is mapped to an invalid KV stream";
++        return false;
++    }
++
++    const auto & source_cells = v_cells[source_strm];
++    const uint32_t n_tokens = static_cast<uint32_t>(position_count);
++    std::vector<uint32_t> source_cell_idxs(n_tokens, std::numeric_limits<uint32_t>::max());
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        const uint64_t raw_pos = source_positions[i];
++        if (raw_pos > static_cast<uint64_t>(std::numeric_limits<llama_pos>::max())) {
++            error = "source position exceeds llama position range";
++            return false;
++        }
++        const llama_pos pos = static_cast<llama_pos>(raw_pos);
++        for (uint32_t cell = 0; cell < source_cells.size(); ++cell) {
++            if (source_cells.seq_has(cell, source_seq_id) && source_cells.pos_get(cell) == pos) {
++                source_cell_idxs[i] = cell;
++                break;
++            }
++        }
++        if (source_cell_idxs[i] == std::numeric_limits<uint32_t>::max()) {
++            error = "source position is not present in the KV cache";
++            return false;
++        }
++    }
++
++    llama_ubatch ubatch = {};
++    auto udata = std::make_shared<llama_ubatch::data_t>();
++    const uint32_t n_pos = hparams.n_pos_per_embd();
++    udata->token.resize(n_tokens);
++    udata->pos.resize(static_cast<size_t>(n_tokens) * n_pos);
++    udata->n_seq_id.resize(n_tokens, 1);
++    udata->seq_id.resize(n_tokens);
++    udata->seq_id_unq = { dest_seq_id };
++    udata->seq_idx.resize(LLAMA_MAX_SEQ, -1);
++    udata->seq_idx[dest_seq_id] = 0;
++    udata->output.resize(n_tokens, 0);
++    udata->seq_id_data.resize(n_tokens, 0);
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        const llama_pos pos = static_cast<llama_pos>(dest_start + i);
++        for (uint32_t j = 0; j < n_pos; ++j) {
++            udata->pos[static_cast<size_t>(j) * n_tokens + i] = pos;
++        }
++        udata->seq_id_data[i] = dest_seq_id;
++        udata->seq_id[i] = &udata->seq_id_data[i];
++    }
++    ubatch.b_equal_seqs = true;
++    ubatch.n_tokens = n_tokens;
++    ubatch.n_seq_tokens = n_tokens;
++    ubatch.n_seqs = 1;
++    ubatch.n_seqs_unq = 1;
++    ubatch.n_pos = n_pos;
++    ubatch.token = udata->token.data();
++    ubatch.embd = nullptr;
++    ubatch.pos = udata->pos.data();
++    ubatch.n_seq_id = udata->n_seq_id.data();
++    ubatch.seq_id = udata->seq_id.data();
++    ubatch.seq_id_unq = udata->seq_id_unq.data();
++    ubatch.seq_idx = udata->seq_idx.data();
++    ubatch.output = udata->output.data();
++    ubatch.data = std::move(udata);
++
++    seq_rm(dest_seq_id, static_cast<llama_pos>(dest_start), -1);
++    const slot_info sinfo = find_slot(ubatch, false);
++    if (sinfo.empty()) {
++        error = "failed to allocate KV cache cells for gathered path";
++        return false;
++    }
++    apply_ubatch(sinfo, ubatch);
++
++    auto & dest_cells = v_cells[dest_strm];
++    bool copied_any_layer = false;
++    for (const auto & layer : layers) {
++        if (layer.k_stream.size() <= source_strm || layer.k_stream.size() <= dest_strm) {
++            continue;
++        }
++        auto * k_src = layer.k_stream[source_strm];
++        auto * k_dst = layer.k_stream[dest_strm];
++        if (k_src == nullptr || k_dst == nullptr) {
++            continue;
++        }
++        copied_any_layer = true;
++        const size_t k_row_bytes = ggml_row_size(k_src->type, hparams.n_embd_k_gqa(layer.il));
++        if (k_row_bytes != ggml_row_size(k_dst->type, hparams.n_embd_k_gqa(layer.il))) {
++            error = "source and destination K row layouts differ";
++            return false;
++        }
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            llama_kv_cache_copy_tensor_bytes_between(
++                    k_src,
++                    static_cast<size_t>(source_cell_idxs[i]) * k_row_bytes,
++                    k_dst,
++                    static_cast<size_t>(sinfo.idxs[0][i]) * k_row_bytes,
++                    k_row_bytes);
++        }
++
++        const bool has_source_v = layer.v_stream.size() > source_strm && layer.v_stream[source_strm] != nullptr;
++        const bool has_dest_v = layer.v_stream.size() > dest_strm && layer.v_stream[dest_strm] != nullptr;
++        if (has_source_v != has_dest_v) {
++            error = "source and destination V stream layouts differ";
++            return false;
++        }
++        if (!has_source_v) {
++            continue;
++        }
++        auto * v_src = layer.v_stream[source_strm];
++        auto * v_dst = layer.v_stream[dest_strm];
++        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
++        if (!v_trans) {
++            const size_t v_row_bytes = ggml_row_size(v_src->type, n_embd_v_gqa);
++            if (v_row_bytes != ggml_row_size(v_dst->type, n_embd_v_gqa)) {
++                error = "source and destination V row layouts differ";
++                return false;
++            }
++            for (uint32_t i = 0; i < n_tokens; ++i) {
++                llama_kv_cache_copy_tensor_bytes_between(
++                        v_src,
++                        static_cast<size_t>(source_cell_idxs[i]) * v_row_bytes,
++                        v_dst,
++                        static_cast<size_t>(sinfo.idxs[0][i]) * v_row_bytes,
++                        v_row_bytes);
++            }
++        } else {
++            const size_t v_element_bytes = ggml_type_size(v_src->type);
++            if (v_element_bytes != ggml_type_size(v_dst->type)) {
++                error = "source and destination V element layouts differ";
++                return false;
++            }
++            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
++                for (uint32_t i = 0; i < n_tokens; ++i) {
++                    llama_kv_cache_copy_tensor_bytes_between(
++                            v_src,
++                            (static_cast<size_t>(source_cell_idxs[i]) + static_cast<size_t>(j) * source_cells.size()) * v_element_bytes,
++                            v_dst,
++                            (static_cast<size_t>(sinfo.idxs[0][i]) + static_cast<size_t>(j) * dest_cells.size()) * v_element_bytes,
++                            v_element_bytes);
++                }
++            }
++        }
++    }
++
++    if (!copied_any_layer) {
++        error = "no KV cache layers were available for gathered path";
++        return false;
++    }
++    return true;
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c1fdfbd5c..a433d1a94 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -188,6 +188,14 @@ public:
+             size_t input_bytes,
+             std::string & error);
+ 
++    bool stage_gather_kv_path(
++            llama_seq_id source_seq_id,
++            llama_seq_id dest_seq_id,
++            uint64_t dest_start,
++            const uint64_t * source_positions,
++            uint64_t position_count,
++            std::string & error);
++
+     //
+     // graph_build API
+     //
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 8f7205d20..a780789e7 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -2381,7 +2381,9 @@ uint64_t skippy_abi_features(void) {
+            SKIPPY_FEATURE_EXTERNAL_MEDIA_PREFILL |
+            SKIPPY_FEATURE_RUNTIME_EVENTS |
+            SKIPPY_FEATURE_BACKEND_DEVICES |
+-           SKIPPY_FEATURE_NATIVE_MTP_N1;
++           SKIPPY_FEATURE_NATIVE_MTP_N1 |
++           SKIPPY_FEATURE_SESSION_OVERWRITE |
++           SKIPPY_FEATURE_TREE_GATHER;
+ }
+ 
+ void skippy_error_free(struct skippy_error * error) {
+@@ -3027,6 +3029,96 @@ enum skippy_status skippy_session_set_position(
+     return skippy_success(out_error);
+ }
+ 
++enum skippy_status skippy_session_overwrite_suffix(
++        struct skippy_session * session,
++        uint64_t token_count,
++        struct skippy_error ** out_error) {
++    return skippy_trim_session(session, token_count, out_error);
++}
++
++enum skippy_status skippy_session_gather_kv_path(
++        struct skippy_session * session,
++        int32_t source_seq_id,
++        uint64_t dest_start,
++        const uint64_t * source_positions,
++        size_t position_count,
++        const llama_token * token_ids,
++        size_t token_count,
++        struct skippy_error ** out_error) {
++    if (session == nullptr || session->ctx == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session is required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (position_count == 0 || source_positions == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "source_positions and position_count are required");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (token_count > 0 && token_ids == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "token_ids are required when token_count is non-zero");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (token_count > 0 && token_count != position_count) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "token_count must match position_count");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (dest_start > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
++            position_count > static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
++            dest_start + position_count < dest_start ||
++            dest_start + position_count > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "gather destination range exceeds int32_t session positions");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++    if (dest_start > static_cast<uint64_t>(session->n_past)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "cannot gather beyond current session position");
++        return SKIPPY_STATUS_INVALID_ARGUMENT;
++    }
++
++    session->ctx->synchronize();
++    llama_memory_t memory = session->ctx->get_memory();
++    if (memory == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "runtime memory is unavailable");
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++    auto * kv = dynamic_cast<llama_kv_cache *>(memory);
++    if (kv == nullptr) {
++        skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "tree KV gather is currently supported for dense KV cache memory only");
++        return SKIPPY_STATUS_UNSUPPORTED;
++    }
++
++    std::string error;
++    if (!kv->stage_gather_kv_path(
++                source_seq_id,
++                session->seq_id,
++                dest_start,
++                source_positions,
++                static_cast<uint64_t>(position_count),
++                error)) {
++        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, error.c_str());
++        return SKIPPY_STATUS_RUNTIME_ERROR;
++    }
++
++    session->n_past = static_cast<int32_t>(dest_start + position_count);
++    if (session->token_history.size() > static_cast<size_t>(dest_start)) {
++        session->token_history.resize(static_cast<size_t>(dest_start));
++        skippy_clear_chat_sampling(session);
++    }
++    if (token_count > 0) {
++        session->token_history.insert(session->token_history.end(), token_ids, token_ids + token_count);
++        skippy_clear_chat_sampling(session);
++    }
++    if (session->signal_history.size() > static_cast<size_t>(dest_start)) {
++        session->signal_history.resize(static_cast<size_t>(dest_start));
++    }
++    session->checkpoint_valid = false;
++    session->checkpoint_n_past = 0;
++    session->checkpoint_token_history_size = 0;
++    session->checkpoint_signal_history_size = 0;
++    skippy_mtp_clear_session_state(session);
++    session->ctx->synchronize();
++
++    return skippy_success(out_error);
++}
++
+ enum skippy_status skippy_session_sample_current(
+         struct skippy_session * session,
+         const struct skippy_sampling_config * sampling,
+-- 
+2.54.0
+

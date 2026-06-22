@@ -1995,6 +1995,7 @@ impl DriverTokenizer {
                 include_embeddings: true,
                 include_output: plan.stages.len() == 1,
                 filter_tensors_on_load: args.stage_load_mode != "runtime-slice",
+                tree_sequence_count: 0,
             },
         )
         .with_context(|| format!("open tokenizer model {}", model_path.display()))?;

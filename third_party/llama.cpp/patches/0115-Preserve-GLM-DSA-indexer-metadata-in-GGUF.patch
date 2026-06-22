@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mesh-llm <mesh-llm@example.invalid>
+Date: Mon, 22 Jun 2026 12:20:00 +0000
+Subject: [PATCH] Preserve GLM_DSA indexer metadata in GGUF
+
+GLM-5.2's DSA path is not the same as DeepSeek32's all-full indexer
+schedule. The upstream config carries full/shared indexer layers,
+top-k cadence, MTP index sharing, and RoPE-layout flags, but the GGUF
+converter and native loader only preserved the basic indexer dimensions.
+
+Add optional GGUF keys and loader storage for those GLM_DSA fields so newly
+converted artifacts can describe the real architecture. Existing GGUFs keep
+the old all-full behavior because the new keys are optional. Also identify
+GLM-5.2 by its 78 decoder layers after excluding the appended MTP layer.
+
+This patch only preserves metadata; wiring full/shared indexer reuse into the
+decode graph remains a separate parity step.
+---
+ conversion/glm.py             | 20 ++++++++++++++++++++
+ gguf-py/gguf/constants.py     |  8 +++++++-
+ gguf-py/gguf/gguf_writer.py   | 18 ++++++++++++++++++
+ src/llama-arch.cpp            |  7 +++++++
+ src/llama-arch.h              |  6 ++++++
+ src/llama-hparams.h           |  6 ++++++
+ src/models/glm-dsa.cpp        | 26 +++++++++++++++++++++++++-
+ 7 files changed, 89 insertions(+), 2 deletions(-)
+
+diff --git a/conversion/glm.py b/conversion/glm.py
+index 87d443fee..b68a83e87 100644
+--- a/conversion/glm.py
++++ b/conversion/glm.py
+@@ -248,6 +248,20 @@ class GlmMoeDsaModel(DeepseekV2Model):
+         self.gguf_writer.add_indexer_head_count(self.hparams["index_n_heads"])
+         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
+         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
++        if (indexer_types := self.hparams.get("indexer_types")) is not None:
++            self.gguf_writer.add_indexer_types(indexer_types)
++        if (index_topk_freq := self.hparams.get("index_topk_freq")) is not None:
++            self.gguf_writer.add_indexer_top_k_frequency(index_topk_freq)
++        if (index_skip_topk_offset := self.hparams.get("index_skip_topk_offset")) is not None:
++            self.gguf_writer.add_indexer_skip_top_k_offset(index_skip_topk_offset)
++        if (
++            index_share_for_mtp_iteration := self.hparams.get("index_share_for_mtp_iteration")
++        ) is not None:
++            self.gguf_writer.add_indexer_share_for_mtp_iteration(index_share_for_mtp_iteration)
++        if (indexer_rope_interleave := self.hparams.get("indexer_rope_interleave")) is not None:
++            self.gguf_writer.add_indexer_rope_interleave(indexer_rope_interleave)
++        if (rope_interleave := self.hparams.get("rope_interleave")) is not None:
++            self.gguf_writer.add_rope_interleave(rope_interleave)
+ 
+ 
+ @ModelBase.register("SolarOpenForCausalLM")
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index e0d7ad81a..846976a46 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -191,14 +191,20 @@ class Keys:
+         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
+ 
+         class Indexer:
+-            HEAD_COUNT = "{arch}.attention.indexer.head_count"
+-            KEY_LENGTH = "{arch}.attention.indexer.key_length"
+-            TOP_K      = "{arch}.attention.indexer.top_k"
++            HEAD_COUNT                  = "{arch}.attention.indexer.head_count"
++            KEY_LENGTH                  = "{arch}.attention.indexer.key_length"
++            TOP_K                       = "{arch}.attention.indexer.top_k"
++            TYPES                       = "{arch}.attention.indexer.types"
++            TOP_K_FREQUENCY             = "{arch}.attention.indexer.top_k_frequency"
++            SKIP_TOP_K_OFFSET           = "{arch}.attention.indexer.skip_top_k_offset"
++            SHARE_FOR_MTP_ITERATION     = "{arch}.attention.indexer.share_for_mtp_iteration"
++            ROPE_INTERLEAVE             = "{arch}.attention.indexer.rope_interleave"
+ 
+     class Rope:
+         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
+         DIMENSION_COUNT_SWA       = "{arch}.rope.dimension_count_swa"
+         DIMENSION_SECTIONS        = "{arch}.rope.dimension_sections"
++        INTERLEAVE                = "{arch}.rope.interleave"
+         FREQ_BASE                 = "{arch}.rope.freq_base"
+         FREQ_BASE_SWA             = "{arch}.rope.freq_base_swa"
+         SCALING_TYPE              = "{arch}.rope.scaling.type"
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index bfb0a38d7..ad8cdf462 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -832,6 +832,24 @@ class GGUFWriter:
+     def add_indexer_top_k(self, top_k: int) -> None:
+         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
+ 
++    def add_indexer_types(self, types: Sequence[str]) -> None:
++        self.add_array(Keys.Attention.Indexer.TYPES.format(arch=self.arch), types)
++
++    def add_indexer_top_k_frequency(self, frequency: int) -> None:
++        self.add_uint32(Keys.Attention.Indexer.TOP_K_FREQUENCY.format(arch=self.arch), frequency)
++
++    def add_indexer_skip_top_k_offset(self, offset: int) -> None:
++        self.add_uint32(Keys.Attention.Indexer.SKIP_TOP_K_OFFSET.format(arch=self.arch), offset)
++
++    def add_indexer_share_for_mtp_iteration(self, enabled: bool) -> None:
++        self.add_bool(Keys.Attention.Indexer.SHARE_FOR_MTP_ITERATION.format(arch=self.arch), enabled)
++
++    def add_indexer_rope_interleave(self, enabled: bool) -> None:
++        self.add_bool(Keys.Attention.Indexer.ROPE_INTERLEAVE.format(arch=self.arch), enabled)
++
++    def add_rope_interleave(self, enabled: bool) -> None:
++        self.add_bool(Keys.Rope.INTERLEAVE.format(arch=self.arch), enabled)
++
+     def add_max_alibi_bias(self, bias: float) -> None:
+         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
+ 
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 4a52d9772..b18dc5601 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -249,12 +249,19 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,           "%s.attention.indexer.head_count"           },
+     { LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,           "%s.attention.indexer.key_length"           },
+     { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
++    { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
++    { LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,      "%s.attention.indexer.top_k_frequency"      },
++    { LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,    "%s.attention.indexer.skip_top_k_offset"    },
++    { LLM_KV_ATTENTION_INDEXER_SHARE_FOR_MTP_ITERATION,
++                                                           "%s.attention.indexer.share_for_mtp_iteration" },
++    { LLM_KV_ATTENTION_INDEXER_ROPE_INTERLEAVE,      "%s.attention.indexer.rope_interleave"      },
+     { LLM_KV_ATTENTION_SHARED_KV_LAYERS,             "%s.attention.shared_kv_layers"             },
+     { LLM_KV_ATTENTION_RECURRENT_LAYERS,             "%s.attention.recurrent_layers"             },
+ 
+     { LLM_KV_ROPE_DIMENSION_COUNT,           "%s.rope.dimension_count"                 },
+     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,       "%s.rope.dimension_count_swa"             },
+     { LLM_KV_ROPE_DIMENSION_SECTIONS,        "%s.rope.dimension_sections"              },
++    { LLM_KV_ROPE_INTERLEAVE,                "%s.rope.interleave"                       },
+     { LLM_KV_ROPE_FREQ_BASE,                 "%s.rope.freq_base"                       },
+     { LLM_KV_ROPE_FREQ_BASE_SWA,             "%s.rope.freq_base_swa"                   },
+     { LLM_KV_ROPE_SCALE_LINEAR,              "%s.rope.scale_linear"                    },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 989da06d8..cf4251505 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -254,12 +254,18 @@ enum llm_kv {
+     LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,
+     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+     LLM_KV_ATTENTION_INDEXER_TOP_K,
++    LLM_KV_ATTENTION_INDEXER_TYPES,
++    LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,
++    LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,
++    LLM_KV_ATTENTION_INDEXER_SHARE_FOR_MTP_ITERATION,
++    LLM_KV_ATTENTION_INDEXER_ROPE_INTERLEAVE,
+     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
+     LLM_KV_ATTENTION_RECURRENT_LAYERS,
+ 
+     LLM_KV_ROPE_DIMENSION_COUNT,
+     LLM_KV_ROPE_DIMENSION_COUNT_SWA,
+     LLM_KV_ROPE_DIMENSION_SECTIONS,
++    LLM_KV_ROPE_INTERLEAVE,
+     LLM_KV_ROPE_FREQ_BASE,
+     LLM_KV_ROPE_FREQ_BASE_SWA,
+     LLM_KV_ROPE_SCALE_LINEAR,
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 2eadeb214..e92be6b92 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -225,6 +225,12 @@ struct llama_hparams {
+     uint32_t indexer_n_head    = 0;
+     uint32_t indexer_head_size = 0;
+     uint32_t indexer_top_k     = 0;
++    uint32_t indexer_top_k_frequency          = 0;
++    uint32_t indexer_skip_top_k_offset        = 0;
++    bool     indexer_share_for_mtp_iteration = false;
++    bool     indexer_rope_interleave         = false;
++    bool     rope_interleave                 = false;
++    std::array<int32_t, LLAMA_MAX_LAYERS> indexer_is_shared = {};
+ 
+     // qwen3vl deepstack
+     // When parsed from GGUF, this implies the first N layers consume the first
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index d70673471..a643d2cf4 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -25,6 +25,15 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY,
++            hparams.indexer_top_k_frequency, false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET,
++            hparams.indexer_skip_top_k_offset, false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_SHARE_FOR_MTP_ITERATION,
++            hparams.indexer_share_for_mtp_iteration, false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_ROPE_INTERLEAVE,
++            hparams.indexer_rope_interleave, false);
++    ml.get_key(LLM_KV_ROPE_INTERLEAVE, hparams.rope_interleave, false);
+ 
+     // Expert gating function (GLM-4.5 uses sigmoid)
+     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+@@ -36,8 +45,25 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
+ 
++    std::vector<std::string> indexer_types;
++    if (ml.get_arr(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types, false)) {
++        if (indexer_types.size() != hparams.n_layer()) {
++            throw std::runtime_error("GLM_DSA indexer type count must match decoder layer count");
++        }
++
++        for (uint32_t il = 0; il < indexer_types.size(); ++il) {
++            if (indexer_types[il] == "full") {
++                hparams.indexer_is_shared[il] = 0;
++            } else if (indexer_types[il] == "shared") {
++                hparams.indexer_is_shared[il] = 1;
++            } else {
++                throw std::runtime_error("unknown GLM_DSA indexer type: " + indexer_types[il]);
++            }
++        }
++    }
++
+     switch (hparams.n_layer()) {
+-        case 79: type = LLM_TYPE_744B_A40B; break;
++        case 78: type = LLM_TYPE_744B_A40B; break;
+         default: type = LLM_TYPE_UNKNOWN;
+     }
+ }
+-- 
+2.39.5
+

@@ -40,6 +40,8 @@ pub struct EmbeddedOpenAiStageOptions {
     pub draft_model_path: Option<PathBuf>,
     pub speculative_window: usize,
     pub adaptive_speculative_window: bool,
+    pub pipelined_speculative_depth: usize,
+    pub tree_speculative: bool,
     pub draft_n_gpu_layers: Option<i32>,
 }
 
@@ -55,8 +57,11 @@ impl BinaryStageOptions {
             bail!("--openai-prefill-chunk-size must be greater than zero");
         }
         let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
-        let downstream_wire_condition =
-            WireCondition::new(args.downstream_wire_delay_ms, args.downstream_wire_mbps)?;
+        let downstream_wire_condition = WireCondition::with_jitter(
+            args.downstream_wire_delay_ms,
+            args.downstream_wire_jitter_ms,
+            args.downstream_wire_mbps,
+        )?;
         let config = load_json::<StageConfig>(&args.config)
             .with_context(|| format!("load stage config {}", args.config.display()))?;
         let topology = match args.topology.as_ref() {
@@ -83,6 +88,8 @@ impl BinaryStageOptions {
                 draft_model_path: args.openai_draft_model_path,
                 speculative_window: args.openai_speculative_window,
                 adaptive_speculative_window: args.openai_adaptive_speculative_window,
+                pipelined_speculative_depth: args.openai_pipelined_speculative_depth,
+                tree_speculative: args.openai_tree_speculative,
                 draft_n_gpu_layers: args.openai_draft_n_gpu_layers,
             });
         Ok(Self {

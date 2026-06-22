@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use skippy_runtime::{
-    FlashAttentionType, RuntimeConfig, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
-    parse_cache_type,
+    ChatTemplateMessage, FlashAttentionType, RuntimeConfig, RuntimeLoadMode, SamplingConfig,
+    StageModel, StageSession, parse_cache_type,
 };
 
 use crate::cli::VerifySpanLocalArgs;
@@ -46,8 +46,13 @@ struct VerifySpanLocalReport {
     n_ubatch: Option<u32>,
     cache_type_k: String,
     cache_type_v: String,
+    chat_template: bool,
+    chat_system: String,
     prompt_token_count: usize,
+    post_prefill_seed: bool,
+    prefill_prediction: i32,
     verify_tokens: Vec<i32>,
+    verify_token_count: usize,
     warmup: usize,
     iterations: usize,
     batched_width2: TimingStats,
@@ -58,6 +63,9 @@ struct VerifySpanLocalReport {
     serial_token_per_sec: f64,
     first_batched_prediction: Vec<i32>,
     first_serial_prediction: Vec<i32>,
+    full_batched_serial_primary_match: bool,
+    split_batched_matches_full_batched: Option<bool>,
+    split_serial_matches_full_serial: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,6 +83,8 @@ struct SplitInprocessReport {
     serial_total_token_per_sec: f64,
     total_avg_vs_full_batched_avg: f64,
     total_avg_vs_serial_total_avg: f64,
+    prefill_prediction: i32,
+    batched_serial_primary_match: bool,
     diagnostics: SplitTimingDiagnostics,
     first_prediction: Vec<i32>,
     first_serial_prediction: Vec<i32>,
@@ -122,6 +132,9 @@ fn validate_args(args: &VerifySpanLocalArgs) -> Result<()> {
     if args.iterations == 0 {
         bail!("iterations must be greater than zero");
     }
+    if args.verify_width == 0 {
+        bail!("verify_width must be greater than zero");
+    }
     if let Some(split_layer) = args.split_layer
         && (split_layer == 0 || split_layer >= args.layer_end)
     {
@@ -151,11 +164,13 @@ fn full_runtime_config(args: &VerifySpanLocalArgs) -> Result<RuntimeConfig> {
         include_embeddings: true,
         include_output: true,
         filter_tensors_on_load: false,
+        tree_sequence_count: 0,
     })
 }
 
 struct FullModelSamples {
     tokens: Vec<i32>,
+    prefill_prediction: i32,
     verify_tokens: Vec<i32>,
     samples: SampleSet,
 }
@@ -164,24 +179,25 @@ fn run_full_model_samples(args: &VerifySpanLocalArgs) -> Result<FullModelSamples
     let config = full_runtime_config(args)?;
     let model = StageModel::open(&args.model_path, &config)
         .with_context(|| format!("failed to open {}", args.model_path.display()))?;
+    let rendered_prompt = render_verify_span_prompt(&model, args)?;
     let tokens = model
-        .tokenize(&args.prompt, true)
+        .tokenize(&rendered_prompt, true)
         .context("failed to tokenize prompt")?;
     if tokens.is_empty() {
         bail!("prompt produced no tokens");
     }
 
     let mut session = model.create_session().context("failed to create session")?;
-    session
-        .prefill_chunked(&tokens)
-        .context("failed to prefill prompt")?;
+    let prefill_prediction = prefill_full_session(&mut session, &tokens)?;
     let base_token_count = session.token_count();
     let verify_tokens = choose_verify_tokens(
         &mut session,
         base_token_count,
         &tokens,
+        prefill_prediction,
         &args.prompt,
         &config,
+        args,
     )?;
     let samples = run_samples(
         &mut session,
@@ -192,24 +208,53 @@ fn run_full_model_samples(args: &VerifySpanLocalArgs) -> Result<FullModelSamples
     )?;
     Ok(FullModelSamples {
         tokens,
+        prefill_prediction,
         verify_tokens,
         samples,
     })
+}
+
+fn render_verify_span_prompt(model: &StageModel, args: &VerifySpanLocalArgs) -> Result<String> {
+    if !args.chat_template {
+        return Ok(args.prompt.clone());
+    }
+    model
+        .apply_chat_template(
+            &[
+                ChatTemplateMessage::new("system", args.chat_system.clone()),
+                ChatTemplateMessage::new("user", args.prompt.clone()),
+            ],
+            true,
+        )
+        .context("failed to apply chat template")
+}
+
+fn prefill_full_session(session: &mut StageSession, tokens: &[i32]) -> Result<i32> {
+    let (predicted, _frame) = session
+        .prefill_chunk_frame_sampled(tokens, Some(&SamplingConfig::default()), None, 0)
+        .context("failed to prefill prompt")?;
+    Ok(predicted)
 }
 
 fn choose_verify_tokens(
     session: &mut StageSession,
     base_token_count: u64,
     prompt_tokens: &[i32],
+    prefill_prediction: i32,
     prompt: &str,
     config: &RuntimeConfig,
+    args: &VerifySpanLocalArgs,
 ) -> Result<Vec<i32>> {
+    if !args.verify_token_ids.is_empty() {
+        return Ok(args.verify_token_ids.clone());
+    }
     session
         .trim_session(base_token_count)
         .context("failed to trim session before choosing verify tokens")?;
-    let current = *prompt_tokens
-        .first()
-        .context("prompt produced no token for verify-token seed")?;
+    let current = verify_seed_token(prompt_tokens, prefill_prediction, args.post_prefill_seed)?;
+    if args.post_prefill_seed {
+        return choose_greedy_verify_tokens(session, base_token_count, current, args.verify_width);
+    }
     let (_after_current, native_mtp, _frame) = session
         .decode_step_frame_sampled_mtp_n1(current, Some(&SamplingConfig::default()), None, 0)
         .with_context(|| {
@@ -226,6 +271,48 @@ fn choose_verify_tokens(
         .trim_session(base_token_count)
         .context("failed to trim session after choosing verify tokens")?;
     Ok(vec![current, draft.token_id])
+}
+
+fn verify_seed_token(
+    prompt_tokens: &[i32],
+    prefill_prediction: i32,
+    post_prefill_seed: bool,
+) -> Result<i32> {
+    if post_prefill_seed {
+        if prefill_prediction < 0 {
+            bail!("post-prefill seed requested but prefill did not return a predicted token");
+        }
+        return Ok(prefill_prediction);
+    }
+    prompt_tokens
+        .first()
+        .copied()
+        .context("prompt produced no token for verify-token seed")
+}
+
+fn choose_greedy_verify_tokens(
+    session: &mut StageSession,
+    base_token_count: u64,
+    current: i32,
+    verify_width: usize,
+) -> Result<Vec<i32>> {
+    let mut verify_tokens = Vec::with_capacity(verify_width);
+    let mut token = current;
+    verify_tokens.push(token);
+    while verify_tokens.len() < verify_width {
+        let (predicted, _native_mtp, _frame) = session
+            .decode_step_frame_sampled_mtp_n1(token, Some(&SamplingConfig::default()), None, 0)
+            .context("failed to extend post-prefill verify-token seed")?;
+        if predicted < 0 {
+            bail!("post-prefill verify-token seed produced no next token");
+        }
+        token = predicted;
+        verify_tokens.push(token);
+    }
+    session
+        .trim_session(base_token_count)
+        .context("failed to trim session after choosing post-prefill verify tokens")?;
+    Ok(verify_tokens)
 }
 
 fn run_samples(
@@ -393,7 +480,7 @@ fn run_split_inprocess_samples(
     let mut session1 = stage1
         .create_session()
         .context("failed to create in-process split stage 1 session")?;
-    prefill_split_sessions(&mut session0, &mut session1, tokens)?;
+    let prefill_prediction = prefill_split_sessions(&mut session0, &mut session1, tokens)?;
     let base0 = session0.token_count();
     let base1 = session1.token_count();
     let samples = run_split_samples(
@@ -405,7 +492,13 @@ fn run_split_inprocess_samples(
         args.warmup,
         args.iterations,
     )?;
-    split_report(split_layer, samples, full_batched_avg_us)
+    split_report(
+        split_layer,
+        samples,
+        full_batched_avg_us,
+        verify_tokens.len(),
+        prefill_prediction,
+    )
 }
 
 fn split_runtime_configs(
@@ -434,6 +527,7 @@ fn split_runtime_configs(
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
+        tree_sequence_count: 0,
     };
     let stage1 = RuntimeConfig {
         stage_index: 1,
@@ -455,6 +549,7 @@ fn split_runtime_configs(
         include_embeddings: false,
         include_output: true,
         filter_tensors_on_load: true,
+        tree_sequence_count: 0,
     };
     Ok((stage0, stage1))
 }
@@ -463,17 +558,17 @@ fn prefill_split_sessions(
     session0: &mut StageSession,
     session1: &mut StageSession,
     tokens: &[i32],
-) -> Result<()> {
+) -> Result<i32> {
     let (_stage0_prediction, boundary) = session0
         .prefill_chunk_frame_sampled(tokens, Some(&SamplingConfig::default()), None, 0)
         .context("in-process split stage 0 failed to prefill")?;
     if boundary.payload.is_empty() {
         bail!("in-process split stage 0 produced an empty prefill activation frame");
     }
-    session1
+    let (predicted, _frame) = session1
         .prefill_chunk_frame_sampled(tokens, Some(&SamplingConfig::default()), Some(&boundary), 0)
         .context("in-process split stage 1 failed to prefill")?;
-    Ok(())
+    Ok(predicted)
 }
 
 fn run_split_samples(
@@ -691,6 +786,8 @@ fn split_report(
     split_layer: u32,
     samples: SplitSampleSet,
     full_batched_avg_us: f64,
+    verify_token_count: usize,
+    prefill_prediction: i32,
 ) -> Result<SplitInprocessReport> {
     let total = timing_stats(&samples.total)?;
     let serial_total = timing_stats(&samples.serial_total)?;
@@ -706,10 +803,16 @@ fn split_report(
         serial_stage1: timing_stats(&samples.serial_stage1)?,
         total,
         serial_total,
-        total_token_per_sec: verified_tokens_per_sec(total_avg, 2),
-        serial_total_token_per_sec: verified_tokens_per_sec(serial_total_avg, 2),
+        total_token_per_sec: verified_tokens_per_sec(total_avg, verify_token_count),
+        serial_total_token_per_sec: verified_tokens_per_sec(serial_total_avg, verify_token_count),
         total_avg_vs_full_batched_avg: total_avg / full_batched_avg_us,
         total_avg_vs_serial_total_avg: total_avg / serial_total_avg,
+        prefill_prediction,
+        batched_serial_primary_match: predictions_match_primary(
+            &samples.first_prediction,
+            &samples.first_serial_prediction,
+            verify_token_count,
+        ),
         diagnostics: split_timing_diagnostics(&samples)?,
         first_prediction: samples.first_prediction,
         first_serial_prediction: samples.first_serial_prediction,
@@ -750,6 +853,26 @@ fn build_report(
     let serial_two_decode_mtp_n1 = timing_stats(&full.samples.serial)?;
     let batched_avg = batched_width2.avg_us;
     let serial_avg = serial_two_decode_mtp_n1.avg_us;
+    let verify_token_count = full.verify_tokens.len();
+    let full_batched_serial_primary_match = predictions_match_primary(
+        &full.samples.first_batched_prediction,
+        &full.samples.first_serial_prediction,
+        verify_token_count,
+    );
+    let split_batched_matches_full_batched = split_inprocess_width2.as_ref().map(|split| {
+        predictions_match_primary(
+            &split.first_prediction,
+            &full.samples.first_batched_prediction,
+            verify_token_count,
+        )
+    });
+    let split_serial_matches_full_serial = split_inprocess_width2.as_ref().map(|split| {
+        predictions_match_primary(
+            &split.first_serial_prediction,
+            &full.samples.first_serial_prediction,
+            verify_token_count,
+        )
+    });
     Ok(VerifySpanLocalReport {
         mode: "verify-span-local",
         model_path: args.model_path,
@@ -761,19 +884,33 @@ fn build_report(
         n_ubatch: args.n_ubatch,
         cache_type_k: args.cache_type_k,
         cache_type_v: args.cache_type_v,
+        chat_template: args.chat_template,
+        chat_system: args.chat_system,
         prompt_token_count: full.tokens.len(),
+        post_prefill_seed: args.post_prefill_seed,
+        prefill_prediction: full.prefill_prediction,
         verify_tokens: full.verify_tokens,
+        verify_token_count,
         warmup: args.warmup,
         iterations: args.iterations,
         batched_width2,
         serial_two_decode_mtp_n1,
         split_inprocess_width2,
         batched_avg_vs_serial_avg: batched_avg / serial_avg,
-        batched_token_per_sec: verified_tokens_per_sec(batched_avg, 2),
-        serial_token_per_sec: verified_tokens_per_sec(serial_avg, 2),
+        batched_token_per_sec: verified_tokens_per_sec(batched_avg, verify_token_count),
+        serial_token_per_sec: verified_tokens_per_sec(serial_avg, verify_token_count),
         first_batched_prediction: full.samples.first_batched_prediction,
         first_serial_prediction: full.samples.first_serial_prediction,
+        full_batched_serial_primary_match,
+        split_batched_matches_full_batched,
+        split_serial_matches_full_serial,
     })
+}
+
+fn predictions_match_primary(left: &[i32], right: &[i32], verify_token_count: usize) -> bool {
+    left.len() >= verify_token_count
+        && right.len() >= verify_token_count
+        && left[..verify_token_count] == right[..verify_token_count]
 }
 
 fn timing_stats(samples: &[Duration]) -> Result<TimingStats> {

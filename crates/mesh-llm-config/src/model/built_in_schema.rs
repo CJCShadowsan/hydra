@@ -580,7 +580,17 @@ fn skippy_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
 
 fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
     vec![
-        basic_setting(&format!("{prefix}.mode"), ConfigValueSchema::String),
+        basic_setting(
+            &format!("{prefix}.mode"),
+            string_enum([
+                "auto",
+                "disabled",
+                "draft",
+                "shard-pipeline",
+                "tree",
+                "ngram",
+            ]),
+        ),
         basic_setting(
             &format!("{prefix}.draft_model_path"),
             ConfigValueSchema::String,
@@ -616,6 +626,10 @@ fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
         basic_setting(
             &format!("{prefix}.draft_split_probability"),
             ConfigValueSchema::Float,
+        ),
+        basic_setting(
+            &format!("{prefix}.pipelined_depth"),
+            ConfigValueSchema::Integer,
         ),
         basic_setting(
             &format!("{prefix}.draft_gpu_layers"),

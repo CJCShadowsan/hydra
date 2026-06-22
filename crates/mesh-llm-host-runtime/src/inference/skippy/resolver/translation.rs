@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use openai_frontend::OpenAiHookPolicy;
-use skippy_protocol::{LoadMode, StageConfig, StageKvCacheConfig, StageKvCachePayload};
+use skippy_protocol::{
+    FlashAttentionType, LoadMode, StageConfig, StageKvCacheConfig, StageKvCachePayload,
+};
 use skippy_server::{
     EmbeddedOpenAiArgs, EmbeddedOpenAiRequestDefaults, EmbeddedRuntimeOptions, telemetry::Telemetry,
 };
@@ -105,6 +107,9 @@ impl ResolvedSkippyConfig {
     ) -> Result<StageConfig> {
         self.ensure_embedded_openai_safe(true)?;
         let mut load_options = self.base_model_load_options(SkippyTelemetryOptions::off());
+        if self.speculative_mode_for_embedded(true) == "tree" {
+            load_options.flash_attn_type = FlashAttentionType::Disabled;
+        }
         if let Some(package_identity) = package_identity {
             load_options.package_identity = Some(package_identity.clone());
             if self.hardware.stage_layer_end.is_none() {
@@ -122,6 +127,7 @@ impl ResolvedSkippyConfig {
         stage_config.filter_tensors_on_load =
             !matches!(stage_config.load_mode, LoadMode::RuntimeSlice)
                 || stage_config.layer_start > 0;
+        stage_config.tree_sequence_count = self.tree_sequence_count_for_stage();
         if matches!(stage_config.load_mode, LoadMode::LayerPackage)
             && load_options.package_identity.is_none()
         {
@@ -224,18 +230,24 @@ impl ResolvedSkippyConfig {
             prefill_adaptive_start: BUILTIN_PREFILL_ADAPTIVE_START,
             prefill_adaptive_step: BUILTIN_PREFILL_ADAPTIVE_STEP,
             prefill_adaptive_max: BUILTIN_PREFILL_ADAPTIVE_MAX,
-            draft_model_path: if mode == "draft" {
+            draft_model_path: if uses_draft_model(mode) {
                 self.speculative.draft_model_path.clone()
             } else {
                 None
             },
-            speculative_window: if mode == "draft" {
+            speculative_window: if uses_draft_model(mode) {
                 self.speculative.draft_max_tokens as usize
             } else {
                 0
             },
             adaptive_speculative_window: false,
-            draft_n_gpu_layers: if mode == "draft" {
+            pipelined_speculative_depth: if uses_linear_pipelined_draft(mode) {
+                self.speculative.pipelined_depth as usize
+            } else {
+                1
+            },
+            tree_speculative: mode == "tree",
+            draft_n_gpu_layers: if uses_draft_model(mode) {
                 self.speculative.draft_n_gpu_layers
             } else {
                 None
@@ -269,12 +281,22 @@ impl ResolvedSkippyConfig {
         Ok(())
     }
 
-    fn speculative_mode_for_embedded(&self, staged: bool) -> &'static str {
+    fn tree_sequence_count_for_stage(&self) -> u32 {
+        if self.speculative_mode_for_embedded(true) != "tree" {
+            return 0;
+        }
+        // This is an upper-bound proxy until the Shard tree planner owns width,
+        // depth, and leaf-count explicitly. Non-tree modes must keep this at 0
+        // so baseline and linear speculation do not pay tree KV overhead.
+        self.speculative.draft_max_tokens.clamp(2, 64)
+    }
+
+    fn speculative_mode_for_embedded(&self, staged: bool) -> &str {
         if !staged {
             return "disabled";
         }
-        if self.speculative.mode == "draft" && self.speculative.draft_model_path.is_some() {
-            "draft"
+        if uses_draft_model(&self.speculative.mode) && self.speculative.draft_model_path.is_some() {
+            self.speculative.mode.as_str()
         } else {
             "disabled"
         }
@@ -320,6 +342,14 @@ impl ResolvedSkippyConfig {
     }
 }
 
+fn uses_draft_model(mode: &str) -> bool {
+    matches!(mode, "draft" | "tree")
+}
+
+fn uses_linear_pipelined_draft(mode: &str) -> bool {
+    mode == "draft"
+}
+
 impl ResolvedEmbeddedOpenAiArgs {
     pub(crate) fn direct_single_stage_defaults(
         model_id: String,
@@ -341,6 +371,8 @@ impl ResolvedEmbeddedOpenAiArgs {
             draft_model_path: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
+            pipelined_speculative_depth: 1,
+            tree_speculative: false,
             draft_n_gpu_layers: None,
             activation_width: 0,
             wire_dtype,
@@ -370,6 +402,8 @@ impl ResolvedEmbeddedOpenAiArgs {
             draft_model_path: None,
             speculative_window: 0,
             adaptive_speculative_window: false,
+            pipelined_speculative_depth: 1,
+            tree_speculative: false,
             draft_n_gpu_layers: None,
             activation_width,
             wire_dtype,
@@ -403,6 +437,8 @@ impl ResolvedEmbeddedOpenAiArgs {
             draft_model_path: self.draft_model_path,
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,
+            pipelined_speculative_depth: self.pipelined_speculative_depth,
+            tree_speculative: self.tree_speculative,
             draft_n_gpu_layers: self.draft_n_gpu_layers,
             activation_width: self.activation_width,
             wire_dtype: self.wire_dtype,

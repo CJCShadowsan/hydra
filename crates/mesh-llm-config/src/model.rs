@@ -445,6 +445,8 @@ pub struct SpeculativeConfig {
     #[serde(default)]
     pub draft_split_probability: Option<f64>,
     #[serde(default)]
+    pub pipelined_depth: Option<u32>,
+    #[serde(default)]
     pub draft_gpu_layers: Option<i32>,
     #[serde(default)]
     pub draft_device: Option<String>,

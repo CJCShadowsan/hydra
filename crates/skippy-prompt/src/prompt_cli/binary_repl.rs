@@ -36,6 +36,7 @@ pub fn binary_repl(args: BinaryReplArgs) -> Result<()> {
             include_embeddings: true,
             include_output: false,
             filter_tensors_on_load: true,
+            tree_sequence_count: 0,
         },
     )
     .with_context(|| format!("open tokenizer model {}", tokenizer_path.display()))?;
@@ -80,6 +81,7 @@ pub fn binary_repl(args: BinaryReplArgs) -> Result<()> {
                 include_embeddings: true,
                 include_output: false,
                 filter_tensors_on_load: true,
+                tree_sequence_count: 0,
             },
         )
         .with_context(|| format!("open chat template model {}", args.model_path.display()))?;

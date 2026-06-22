@@ -75,6 +75,12 @@ pub struct ServeBinaryArgs {
     pub downstream_wire_delay_ms: f64,
     #[arg(
         long,
+        default_value_t = 0.0,
+        help = "Artificial downstream write jitter in milliseconds per binary stage message."
+    )]
+    pub downstream_wire_jitter_ms: f64,
+    #[arg(
+        long,
         help = "Artificial downstream activation bandwidth cap in megabits per second."
     )]
     pub downstream_wire_mbps: Option<f64>,
@@ -126,6 +132,17 @@ pub struct ServeBinaryArgs {
     pub openai_speculative_window: usize,
     #[arg(long)]
     pub openai_adaptive_speculative_window: bool,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Maximum number of speculative VerifySpan windows to keep in flight for embedded stage-0 OpenAI serving. 1 keeps synchronous speculative decoding."
+    )]
+    pub openai_pipelined_speculative_depth: usize,
+    #[arg(
+        long,
+        help = "Use tree speculative verification for embedded stage-0 OpenAI serving. Requires --openai-draft-model-path."
+    )]
+    pub openai_tree_speculative: bool,
     #[arg(
         long,
         help = "Override n_gpu_layers for the embedded OpenAI draft model. Defaults to the stage config n_gpu_layers."

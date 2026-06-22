@@ -203,6 +203,8 @@ struct LocalAnnouncementData {
     served_model_runtime: Vec<ModelRuntimeDescriptor>,
     owner_attestation: Option<SignedNodeOwnership>,
     artifact_transfer_supported: bool,
+    stage_force_downstream_reply_supported: bool,
+    stage_identified_replies_supported: bool,
     advertised_model_throughput: Vec<crate::network::metrics::ModelThroughputHint>,
     gpu_mem_bandwidth_gbps: Option<String>,
     gpu_compute_tflops_fp32: Option<String>,
@@ -252,6 +254,8 @@ pub(super) fn peer_meaningfully_changed(old: &PeerInfo, new: &PeerInfo) -> bool 
         || old.artifact_transfer_supported != new.artifact_transfer_supported
         || old.stage_protocol_generation_supported != new.stage_protocol_generation_supported
         || old.stage_status_list_supported != new.stage_status_list_supported
+        || old.stage_force_downstream_reply_supported != new.stage_force_downstream_reply_supported
+        || old.stage_identified_replies_supported != new.stage_identified_replies_supported
         || old.version != new.version
         || old.owner_summary != new.owner_summary
         || old.gpu_reserved_bytes != new.gpu_reserved_bytes
@@ -331,6 +335,8 @@ pub(super) fn apply_transitive_ann(
     existing.artifact_transfer_supported = ann.artifact_transfer_supported;
     existing.stage_protocol_generation_supported = ann.stage_protocol_generation_supported;
     existing.stage_status_list_supported = ann.stage_status_list_supported;
+    existing.stage_force_downstream_reply_supported = ann.stage_force_downstream_reply_supported;
+    existing.stage_identified_replies_supported = ann.stage_identified_replies_supported;
     existing.advertised_model_throughput = ann.advertised_model_throughput.clone();
     if ann.experts_summary.is_some() {
         existing.experts_summary = ann.experts_summary.clone();
@@ -655,6 +661,9 @@ impl Node {
         existing.artifact_transfer_supported = ann.artifact_transfer_supported;
         existing.stage_protocol_generation_supported = ann.stage_protocol_generation_supported;
         existing.stage_status_list_supported = ann.stage_status_list_supported;
+        existing.stage_force_downstream_reply_supported =
+            ann.stage_force_downstream_reply_supported;
+        existing.stage_identified_replies_supported = ann.stage_identified_replies_supported;
         existing.advertised_model_throughput = ann.advertised_model_throughput.clone();
         if ann.version.is_some() {
             existing.version = ann.version.clone();
@@ -908,6 +917,8 @@ impl Node {
             owner_attestation: self.owner_attestation.lock().await.clone(),
             artifact_transfer_supported:
                 crate::models::artifact_transfer::artifact_transfer_advertised(&owner_summary),
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput,
             gpu_mem_bandwidth_gbps: Self::format_optional_locked_f32_list(
                 &self.gpu_mem_bandwidth_gbps,
@@ -976,6 +987,8 @@ impl Node {
             artifact_transfer_supported: peer.artifact_transfer_supported,
             stage_protocol_generation_supported: peer.stage_protocol_generation_supported,
             stage_status_list_supported: peer.stage_status_list_supported,
+            stage_force_downstream_reply_supported: peer.stage_force_downstream_reply_supported,
+            stage_identified_replies_supported: peer.stage_identified_replies_supported,
             advertised_model_throughput: peer.advertised_model_throughput.clone(),
             latency_ms: latency.latency_ms,
             latency_source: Some(match latency.source {
@@ -1040,6 +1053,8 @@ impl Node {
             artifact_transfer_supported: data.artifact_transfer_supported,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: data.stage_force_downstream_reply_supported,
+            stage_identified_replies_supported: data.stage_identified_replies_supported,
             advertised_model_throughput: data.advertised_model_throughput,
             latency_ms: None,
             latency_source: None,
@@ -1833,6 +1848,8 @@ mod tests {
             artifact_transfer_supported: true,
             stage_protocol_generation_supported: true,
             stage_status_list_supported: true,
+            stage_force_downstream_reply_supported: true,
+            stage_identified_replies_supported: true,
             advertised_model_throughput: vec![],
             latency_ms: None,
             latency_source: None,

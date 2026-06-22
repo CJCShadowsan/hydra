@@ -8,7 +8,7 @@ Certification process lives in `docs/FAMILY_CERTIFY.md`. Payload measurements
 and topology constraints are summarized here so this file stays the only
 customer-facing source of truth.
 
-Last updated: 2026-05-07.
+Last updated: 2026-06-22.
 
 ## Customer Support Matrix
 
@@ -25,6 +25,7 @@ Last updated: 2026-05-07.
 | GLM-4.7 Flash | Supported | `unsloth/GLM-4.7-Flash-GGUF:Q4_K_M` | `layer_end=47`, `splits=15,31`, activation width `2048` | `f16`; q8 validated | `baseline,ngram,ngram-adaptive` | None | GGUF uses the DeepSeek2/MLA runtime path. |
 | GLM4-MoE | Supported | `noctrex/GLM-4.7-Flash-REAP-23B-A3B-MXFP4_MOE-GGUF:MXFP4_MOE` | `layer_end=47`, `splits=15,31`, activation width `2048` | `f16`; q8 validated | `baseline,ngram,ngram-adaptive` | None | Exact state mobility accepted; `ResidentKv` native sequence remap cache smoke passed. |
 | GLM4 9B | Supported | `meshllm/glm-4-9b-0414-parity-q4_k_m-gguf:Q4_K_M` | `layer_end=40`, `splits=13,27`, activation width `4096` | `f16`; q8 rejected | `baseline,ngram,ngram-adaptive` | None | Exact state mobility accepted. |
+| GLM-5.2 / GLM_DSA | Not yet supported | `unsloth/GLM-5.2-GGUF:UD-Q4_K_M` is a package-scale candidate; regenerated GGUFs should preserve GLM_DSA indexer metadata | `layer_end=78`, activation width `6144`; until a top-k activation sideband exists, split stages must start on full-indexer layers such as `26` or `54`, not shared-indexer layers such as `52` | Untested | Shard pipeline blocked on native GLM_DSA parity | Requires GLM_DSA proof ladder | The pinned native runtime now routes GLM_DSA normal decode through the DSA/lightning-indexer graph, allocates the required indexer rotation input, reads/writes GLM's optional indexer metadata, reuses previous full-layer top-k on shared-indexer layers, infers the GLM-5.2 schedule for legacy GGUFs without those keys, and trims DSA KV on speculative rollback. It is still not support: target-only GLM_DSA greedy/logit parity, same-process speculative equivalence with acceptance metrics, MTP/IndexShare parity, and split/WAN proof must pass before certification. |
 | Baichuan | Supported | `lucasxx/Baichuan2-7B-Chat-Q4_K_M-GGUF:Q4_K_M` | `layer_end=32`, `splits=10,21`, activation width `4096` | `f16`; q8 validated | `baseline,ngram,ngram-adaptive` | None | Exact state mobility accepted; `ResidentKv` native sequence remap cache smoke passed. |
 | Bloom | Supported | `QuantFactory/bloomz-560m-GGUF:Q4_K_M` | `layer_end=24`, `splits=8,16`, activation width `1024` | `f16`; q8 validated | `baseline,ngram,ngram-adaptive` | None | Exact state mobility accepted; `ResidentKv` native sequence remap cache smoke passed. |
 | GPT2 | Supported | `QuantFactory/gpt2-GGUF:Q4_K_M` | `layer_end=12`, `splits=4,8`, activation width `768` | `f16`; q8 rejected | `baseline,ngram,ngram-adaptive` | None | Exact state mobility accepted; `ResidentKv` native sequence remap cache smoke passed. |
@@ -122,6 +123,7 @@ Gemma text
 | DeepSeek3 | Package evidence uses selected stage parts only. The local gate covered real-input `0..1`, real-upstream expert layer `3..4`, and synthetic-upstream late layers `30..31` and `60..61`; full llama-server baseline requires a full GGUF and is intentionally not part of this package-only gate. |
 | Gemma4 E4B | Use split `21`. Avoid `12`, `14`, `24`, and `28`. Downstream slices need token-id sideband. |
 | MiniMax M2.7 | Sharded GGUF is supported. Materialize stage artifacts first; prompt tokenizer uses `stage-0.gguf` CPU-only. Do not keep full-model and staged-server residency alive together unless memory has been budgeted. |
+| GLM-5.2 / GLM_DSA | Not supported yet. Current topology policy rejects stage boundaries that begin on GLM_DSA shared-indexer layers because those layers reuse the previous full layer's top-k tensor. For the 78-layer GLM-5.2 decoder, safe nonzero stage starts are `1`, `2`, `6`, `10`, `14`, `18`, `22`, `26`, `30`, `34`, `38`, `42`, `46`, `50`, `54`, `58`, `62`, `66`, `70`, and `74`. Arbitrary splits require a native activation sideband for the indexer top-k or an equivalent boundary replay mechanism. |
 
 ## q8 Activation Wire
 

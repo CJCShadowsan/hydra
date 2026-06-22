@@ -7,6 +7,9 @@ use super::support::{pick_owned, pick_string, pick_string_owned};
 use super::types::ResolvedSpeculativeConfig;
 use crate::plugin::{BoolOrAuto, SpeculativeConfig};
 
+const SHARD_PIPELINE_MODE: &str = "shard-pipeline";
+const SHARD_PIPELINE_DEFAULT_DEPTH: u32 = 6;
+
 pub(super) fn resolve_speculative_config(
     model_config: Option<&SpeculativeConfig>,
     global_config: Option<&SpeculativeConfig>,
@@ -105,6 +108,10 @@ pub(super) fn resolve_speculative_config(
         global_config.and_then(|config| config.draft_max_tokens),
         0,
     );
+    let pipelined_depth = resolve_pipelined_depth(model_config, global_config, &mode)?;
+    if mode == SHARD_PIPELINE_MODE {
+        mode = "draft".to_string();
+    }
     let draft_n_gpu_layers = pick_owned(
         model_config.and_then(|config| config.draft_gpu_layers),
         global_config.and_then(|config| config.draft_gpu_layers),
@@ -117,18 +124,25 @@ pub(super) fn resolve_speculative_config(
     let explicit = mode != "auto"
         || draft_model_path.is_some()
         || draft_max_tokens > 0
+        || pipelined_depth > 1
         || draft_n_gpu_layers.is_some();
-    if mode == "disabled" && draft_model_path.is_some() {
-        bail!("skippy speculative draft source cannot be set when speculative.mode = \"disabled\"");
+    if mode == "disabled"
+        && (draft_model_path.is_some() || draft_max_tokens > 0 || pipelined_depth > 1)
+    {
+        bail!(
+            "skippy speculative draft controls cannot be set when speculative.mode = \"disabled\""
+        );
     }
-    if mode == "draft" || (mode == "auto" && draft_model_path.is_some()) {
+    if uses_draft_model(&mode) || (mode == "auto" && draft_model_path.is_some()) {
         if draft_model_path.is_none() {
             bail!("skippy speculative draft mode requires an explicit draft_model_path");
         }
         if draft_max_tokens == 0 {
             bail!("skippy speculative draft mode requires draft_max_tokens > 0");
         }
-        mode = "draft".to_string();
+        if mode == "auto" {
+            mode = "draft".to_string();
+        }
         let draft_path = draft_model_path.as_ref().expect("checked above");
         if let Some(reason) = incompatible_draft_pair_reason(model_id, model_path, draft_path) {
             match pairing_fault.as_str() {
@@ -150,9 +164,35 @@ pub(super) fn resolve_speculative_config(
         draft_model_path,
         pairing_fault,
         draft_max_tokens,
+        pipelined_depth,
         explicit,
         draft_n_gpu_layers,
     })
+}
+
+fn resolve_pipelined_depth(
+    model_config: Option<&SpeculativeConfig>,
+    global_config: Option<&SpeculativeConfig>,
+    mode: &str,
+) -> Result<u32> {
+    let configured = pick_owned(
+        model_config.and_then(|config| config.pipelined_depth),
+        global_config.and_then(|config| config.pipelined_depth),
+    );
+    if mode == SHARD_PIPELINE_MODE {
+        return match configured {
+            Some(1) => bail!(
+                "skippy speculative.pipelined_depth must be greater than 1 when speculative.mode = \"shard-pipeline\""
+            ),
+            Some(depth) => Ok(depth),
+            None => Ok(SHARD_PIPELINE_DEFAULT_DEPTH),
+        };
+    }
+    Ok(configured.unwrap_or(1))
+}
+
+fn uses_draft_model(mode: &str) -> bool {
+    matches!(mode, "draft" | "tree")
 }
 
 fn normalize_pairing_fault(value: &str) -> String {
@@ -177,6 +217,42 @@ fn incompatible_draft_pair_reason(
 }
 
 fn infer_family_from_path_string(path: &Path) -> Option<String> {
-    infer_family_capability(&path.display().to_string(), 0, 0)
-        .map(|capability| capability.family_id.to_string())
+    family_path_candidates(path)
+        .into_iter()
+        .find_map(|candidate| {
+            infer_family_capability(&candidate, 0, 0)
+                .map(|capability| capability.family_id.to_string())
+        })
+}
+
+fn family_path_candidates(path: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        candidates.push(file_name.to_string());
+    }
+    for component in path.components().rev() {
+        let Some(raw) = component.as_os_str().to_str() else {
+            continue;
+        };
+        if skip_family_path_component(raw) {
+            continue;
+        }
+        let candidate = raw.replace("--", "/");
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn skip_family_path_component(component: &str) -> bool {
+    let lower = component.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "." | ".." | "hub" | "models" | "snapshots" | "blobs" | "refs"
+    ) || looks_like_cache_hash(&lower)
+}
+
+fn looks_like_cache_hash(component: &str) -> bool {
+    component.len() >= 16 && component.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
