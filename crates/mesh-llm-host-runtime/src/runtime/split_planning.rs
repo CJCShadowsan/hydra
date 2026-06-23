@@ -684,6 +684,7 @@ mod tests {
             layer_count,
             activation_width: 896,
             tensor_count: 100,
+            generation: None,
         }
     }
 

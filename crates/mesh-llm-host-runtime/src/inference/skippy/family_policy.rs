@@ -446,6 +446,7 @@ mod tests {
             tree_sequence_count: 0,
             selected_device: None,
             kv_cache: None,
+            native_mtp_enabled: true,
             load_mode: LoadMode::RuntimeSlice,
             bind_addr: "127.0.0.1:0".to_string(),
             upstream: None,

@@ -71,6 +71,7 @@ fn write_local_configs(
             tree_sequence_count: 0,
             selected_device: None,
             kv_cache,
+            native_mtp_enabled: true,
             load_mode,
             bind_addr: stage.bind_addr.clone(),
             upstream,

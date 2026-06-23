@@ -45,6 +45,7 @@ fn load_request() -> StageLoadRequest {
         cache_type_v: "q8_0".to_string(),
         flash_attn_type: FlashAttentionType::Enabled,
         tree_sequence_count: 0,
+        native_mtp_enabled: true,
         shutdown_generation: 7,
         coordinator_term: 0,
         coordinator_id: None,

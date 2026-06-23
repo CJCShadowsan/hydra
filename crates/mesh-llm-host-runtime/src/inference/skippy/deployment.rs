@@ -25,6 +25,7 @@ pub(crate) struct StageDeploymentContext<'a> {
     pub(crate) flash_attn_type: FlashAttentionType,
     pub(crate) tree_sequence_count: u32,
     pub(crate) projector_path: Option<String>,
+    pub(crate) native_mtp_enabled: bool,
 }
 
 fn tree_aware_flash_attn_type(
@@ -73,6 +74,8 @@ pub(crate) fn remote_stage_load_request(
             context.tree_sequence_count,
         ),
         tree_sequence_count: context.tree_sequence_count,
+        native_mtp_enabled: context.native_mtp_enabled,
+
         shutdown_generation: 1,
         coordinator_term: 0,
         coordinator_id: None,
@@ -125,6 +128,7 @@ pub(crate) fn stage0_config(
         tree_sequence_count: context.tree_sequence_count,
         selected_device,
         kv_cache: None,
+        native_mtp_enabled: context.native_mtp_enabled,
         load_mode: LoadMode::LayerPackage,
         bind_addr: "127.0.0.1:0".to_string(),
         upstream: None,
@@ -221,6 +225,7 @@ mod tests {
             source_model_bytes: Some(100),
             layer_count: 4,
             activation_width: 1024,
+            generation: None,
             projector_path: Some("/tmp/package/projectors/mmproj.gguf".to_string()),
             layers: vec![StagePackageLayerInfo {
                 layer_index: 0,
@@ -252,6 +257,7 @@ mod tests {
             flash_attn_type: FlashAttentionType::Auto,
             tree_sequence_count: 0,
             projector_path: Some("/models/mmproj.gguf".to_string()),
+            native_mtp_enabled: false,
         };
         let request = remote_stage_load_request(
             &context,
@@ -276,6 +282,7 @@ mod tests {
         );
         assert_eq!((request.layer_start, request.layer_end), (4, 8));
         assert!(request.projector_path.is_none());
+        assert!(!request.native_mtp_enabled);
 
         let stage0 = stage0_config(
             &context,
@@ -302,5 +309,6 @@ mod tests {
             stage0.projector_path.as_deref(),
             Some("/models/mmproj.gguf")
         );
+        assert!(!stage0.native_mtp_enabled);
     }
 }

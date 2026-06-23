@@ -1223,6 +1223,7 @@ mod tests {
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
+            native_mtp_enabled: false,
             filter_tensors_on_load: true,
             tree_sequence_count: 0,
             selected_device: None,

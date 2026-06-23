@@ -580,6 +580,7 @@ fn skippy_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
 
 fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
     vec![
+        basic_setting(&format!("{prefix}.strategy"), ConfigValueSchema::String),
         basic_setting(
             &format!("{prefix}.mode"),
             string_enum([

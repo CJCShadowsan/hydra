@@ -78,6 +78,7 @@ impl StageOpenAiBackend {
                         request.activation_width,
                     )
                     .map_err(openai_backend_error)?,
+                    native_mtp_enabled: request.native_mtp_enabled,
                 },
             )
             .map_err(openai_backend_error)?

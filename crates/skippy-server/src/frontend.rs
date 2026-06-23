@@ -31,7 +31,6 @@ use openai_frontend::{
     MessageContentPart, ModelId, ModelObject, OpenAiBackend, OpenAiError, OpenAiErrorKind,
     OpenAiHookPolicy, OpenAiRequestContext, OpenAiResult, PrefillHookSignals, ReasoningEffort,
     StreamingGuardrailMode, Usage, apply_chat_hook_outcome, chat_mesh_hooks_enabled,
-    normalize_reasoning_template_options,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -248,6 +247,7 @@ pub struct EmbeddedOpenAiArgs {
     pub pipelined_speculative_depth: usize,
     pub tree_speculative: bool,
     pub draft_n_gpu_layers: Option<i32>,
+    pub native_mtp_enabled: bool,
     pub activation_width: i32,
     pub wire_dtype: WireActivationDType,
     pub reply_credit_limit: Option<usize>,
@@ -546,6 +546,7 @@ pub fn embedded_openai_backend(args: EmbeddedOpenAiArgs) -> Result<EmbeddedOpenA
         prefill_reply_credit_limit,
         lane_pool,
         prediction_returns: args.prediction_returns.clone(),
+        native_mtp_enabled: args.native_mtp_enabled,
     };
     args.telemetry
         .emit("stage.openai_server_start", lifecycle_attrs(&args.config));
@@ -900,6 +901,7 @@ enum OpenAiBackendMode {
         prefill_reply_credit_limit: usize,
         lane_pool: Option<Arc<PersistentStageLanePool>>,
         prediction_returns: Option<Arc<PredictionReturnHub>>,
+        native_mtp_enabled: bool,
     },
 }
 
@@ -1797,9 +1799,9 @@ fn tool_calls_requested(request: &ChatCompletionRequest) -> bool {
 
 fn chat_output_parser_required(
     request: &ChatCompletionRequest,
-    template_options: &ChatTemplateOptions,
+    _template_options: &ChatTemplateOptions,
 ) -> bool {
-    tool_calls_requested(request) || template_options.enable_thinking == Some(true)
+    tool_calls_requested(request)
 }
 
 fn chat_response_from_generated_text(
@@ -2030,6 +2032,7 @@ struct EmbeddedStageZeroGeneration<'a> {
     adaptive_speculative_window: bool,
     pipelined_speculative_depth: usize,
     tree_speculative: bool,
+    native_mtp_enabled: bool,
     prompt_token_ids: &'a [i32],
     max_tokens: u32,
     sampling: &'a SamplingConfig,

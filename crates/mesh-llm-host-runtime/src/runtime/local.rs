@@ -349,6 +349,7 @@ fn resolve_runtime_skippy_config(
         model_bytes,
         allocatable_memory_bytes,
         request_defaults: None,
+        package_generation: None,
     })?;
     resolved.model_id = model_name.to_string();
     apply_runtime_skippy_launch_overrides(
@@ -1601,6 +1602,7 @@ fn split_runtime_stage_load_request(
             settings.tree_sequence_count,
         ),
         tree_sequence_count: settings.tree_sequence_count,
+        native_mtp_enabled: resolved_config.native_mtp_enabled,
         shutdown_generation: spec.generation.generation,
         coordinator_term: spec.generation.coordinator_term,
         coordinator_id: Some(spec.node.id()),
@@ -1642,6 +1644,7 @@ fn split_generation_load_settings<'a>(
         model_bytes: spec.package.source_model_bytes,
         allocatable_memory_bytes: spec.pinned_gpu.map(|gpu| gpu.vram_bytes),
         request_defaults: None,
+        package_generation: spec.package.generation.as_ref(),
     })?;
     resolved.model_fit.ctx_size = spec.ctx_size;
     resolved.throughput.parallel = spec.slots;
@@ -3947,6 +3950,7 @@ mod tests {
             layer_count,
             activation_width: 2048,
             tensor_count: 100,
+            generation: None,
         }
     }
 
@@ -3983,6 +3987,7 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             tree_sequence_count: 0,
+            native_mtp_enabled: true,
             shutdown_generation: 1,
             coordinator_term: 1,
             coordinator_id: None,
@@ -4265,6 +4270,7 @@ prefill_chunking = "fixed"
 prefill_chunk_size = 96
 
 [models.speculative]
+strategy = "disabled"
 mode = "draft"
 draft_model_path = "/models/draft.gguf"
 draft_max_tokens = 7
@@ -4347,6 +4353,8 @@ stop = ["END"]
             settings.runtime_options.config.projector_path.as_deref(),
             Some(projector_path.to_string_lossy().as_ref())
         );
+        assert!(!settings.runtime_options.config.native_mtp_enabled);
+        assert!(!settings.embedded_openai.native_mtp_enabled);
         assert_eq!(settings.embedded_openai.generation_concurrency, 4);
         assert_eq!(settings.embedded_openai.default_max_tokens, 321);
         assert_eq!(

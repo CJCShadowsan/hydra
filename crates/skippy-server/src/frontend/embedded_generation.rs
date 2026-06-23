@@ -283,6 +283,7 @@ impl StageOpenAiBackend {
                                     input: None,
                                     sample_final_prefill: false,
                                     output_capacity: 0,
+                                    native_mtp_enabled: request.native_mtp_enabled,
                                 },
                             )
                             .map_err(openai_backend_error)?

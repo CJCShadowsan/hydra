@@ -92,6 +92,7 @@ message LoadStage {
   optional string coordinator_id = 31;
   uint64 lease_until_unix_ms = 32;
   uint32 tree_sequence_count = 33;
+  optional bool native_mtp_enabled = 34;
 }
 
 message StopStage {
