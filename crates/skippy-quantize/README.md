@@ -436,19 +436,24 @@ GGUF shards can be treated as disposable staging once the package preflight
 passes:
 
 ```bash
-scripts/skippy-bf16-to-quant-layer-package.sh \
-  --bf16-root /Users/lab/glm52-work/bf16-gguf \
-  --bf16-prefix BF16 \
-  --quant-root /Users/lab/glm52-work/quantized \
+skippy-quantize quantize-layer-package \
+  --source /Users/lab/glm52-work/bf16-gguf \
+  --source-prefix BF16 \
+  --target /Users/lab/glm52-work/quantized \
+  --target-prefix Q2_K-MTP-Q8 \
+  --manifest /Users/lab/glm52-work/work/q2-k-mtp-q8-package/quant-manifest.json \
   --package-dir /Users/lab/glm52-work/packages/GLM-5.2-Q2_K-MTP-Q8-layers \
-  --work-dir /Users/lab/glm52-work/work/q2-k-mtp-q8-package \
+  --package-model-id meshllm/GLM-5.2-Q2_K-MTP-Q8-GGUF:Q2_K-MTP-Q8 \
+  --package-source-repo meshllm/GLM-5.2-Q2_K-MTP-Q8-GGUF \
+  --package-source-revision local \
+  --work-dir /Users/lab/glm52-work/work/q2-k-mtp-q8-package/native-work \
+  --spool-dir /Users/lab/glm52-work/work/q2-k-mtp-q8-package/spool \
+  --record-dir /Users/lab/glm52-work/work/q2-k-mtp-q8-package/records \
+  --json-event-file /Users/lab/glm52-work/work/q2-k-mtp-q8-package/status.json \
   --quant Q2_K-MTP-Q8 \
-  --quant-prefix Q2_K-MTP-Q8 \
   --output-basename GLM-5.2-Q2_K-MTP-Q8 \
-  --model-id meshllm/GLM-5.2-Q2_K-MTP-Q8-GGUF:Q2_K-MTP-Q8 \
-  --source-repo meshllm/GLM-5.2-Q2_K-MTP-Q8-GGUF \
-  --source-revision local \
   --stages 2 \
+  --replace-package \
   --watchdog-seconds 120
 ```
 
@@ -459,9 +464,13 @@ just skippy-quantize-standalone-release-build
 cargo build --release --locked -p skippy-model-package
 ```
 
-The wrapper runs `init-quant`, `run-quant`, `verify-job`, `write-package`, and
-`preflight` in order. It does not pass `--max-memory` to quantization because
-the unpatched llama API quant backend does not expose a memory-budget knob.
+The command validates the source split, writes the package artifacts from the
+BF16 GGUF source, quantizes each artifact in place, then runs package preflight.
+It does not materialize a complete quantized GGUF repo first. By default, the
+temporary quant scratch directory is deleted after package preflight passes;
+pass `--keep-quant` to retain it. It does not pass `--max-memory` to
+quantization because the unpatched llama API quant backend does not expose a
+memory-budget knob.
 
 ## Validation
 
