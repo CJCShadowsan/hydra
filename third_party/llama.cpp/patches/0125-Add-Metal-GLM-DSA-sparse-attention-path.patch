@@ -1,4 +1,4 @@
-From 8367c8adb97368f65e4254db677816d6ad36fd13 Mon Sep 17 00:00:00 2001
+From a80282747c3e8905395a976a9a20f874ab0382ea Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 26 Jun 2026 07:31:46 +1000
 Subject: [PATCH] Add Metal GLM-DSA sparse attention path
@@ -8,14 +8,14 @@ Subject: [PATCH] Add Metal GLM-DSA sparse attention path
  ggml/src/ggml-metal/ggml-metal-device.h   |   1 +
  ggml/src/ggml-metal/ggml-metal-device.m   |  26 ++++
  ggml/src/ggml-metal/ggml-metal-impl.h     |  52 ++++++++
- ggml/src/ggml-metal/ggml-metal-ops.cpp    |  58 +++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  58 ++++++++
  ggml/src/ggml-metal/ggml-metal-ops.h      |   1 +
- ggml/src/ggml-metal/ggml-metal.metal      | 131 +++++++++++++++++++
- src/llama-graph.cpp                       |  89 ++++++++++++-
+ ggml/src/ggml-metal/ggml-metal.metal      | 131 ++++++++++++++++++
+ src/llama-graph.cpp                       |  81 +++++++++++-
  src/llama-graph.h                         |  10 ++
  src/skippy.cpp                            |   3 +
- tests/test-backend-ops.cpp                | 149 +++++++++++++++++++++-
- 11 files changed, 529 insertions(+), 11 deletions(-)
+ tests/test-backend-ops.cpp                | 153 +++++++++++++++++++++-
+ 11 files changed, 525 insertions(+), 11 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
 index 72fd52938..751cbf845 100644
@@ -391,7 +391,7 @@ index 81c385976..6795398b4 100644
          constant ggml_metal_kargs_diag & args,
          device   const char * src0,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index eef53f1a3..047fd6740 100644
+index eef53f1a3..57093e2dc 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -25,11 +25,19 @@ static thread_local skippy_activation_rwkv7_v_first g_skippy_rwkv7_v_first;
@@ -416,7 +416,7 @@ index eef53f1a3..047fd6740 100644
  void skippy_graph_set_filter(const skippy_graph_filter & filter) {
      g_skippy_graph_filter = filter;
  }
-@@ -2372,6 +2380,53 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -2372,6 +2380,45 @@ ggml_tensor * llm_graph_context::build_attn_mha(
      return cur;
  }
  
@@ -443,14 +443,6 @@ index eef53f1a3..047fd6740 100644
 +        v = ggml_transpose(ctx0, v);
 +    }
 +
-+    if (k->type == GGML_TYPE_F32) {
-+        k = ggml_cast(ctx0, k, GGML_TYPE_F16);
-+    }
-+
-+    if (v->type == GGML_TYPE_F32) {
-+        v = ggml_cast(ctx0, v, GGML_TYPE_F16);
-+    }
-+
 +    ggml_tensor * cur = ggml_dsa_sparse_attn(ctx0, q, k, v, kq_mask_rows, top_k, kq_scale);
 +    cb(cur, "dsa_sparse_attn", il);
 +
@@ -470,7 +462,7 @@ index eef53f1a3..047fd6740 100644
  llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
      auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
  
-@@ -2686,6 +2741,32 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -2686,6 +2733,32 @@ ggml_tensor * llm_graph_context::build_attn(
      // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
      ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[3], top_k->nb[2], 0);
  
@@ -503,7 +495,7 @@ index eef53f1a3..047fd6740 100644
      ggml_tensor * kq_mask_top_k = nullptr;
      if (skippy_glm_dsa_fused_sparse_mask_enabled()) {
          kq_mask_top_k = ggml_dsa_sparse_mask(ctx0, kq_mask_rows, top_k_3d);
-@@ -2711,10 +2792,6 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -2711,10 +2784,6 @@ ggml_tensor * llm_graph_context::build_attn(
      // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
      kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
  
@@ -550,7 +542,7 @@ index b8286cf7d..8df6a0b1d 100644
          return SKIPPY_GLM_DSA_OP_MLA_ATTENTION;
      }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 551c50f79..aa85ceb21 100644
+index 551c50f79..497a1bfcb 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -6654,18 +6654,33 @@ struct test_dsa_sparse_attn : public test_case {
@@ -630,17 +622,20 @@ index 551c50f79..aa85ceb21 100644
          double err = 0.0;
          for (int64_t i_stream = 0; i_stream < n_stream; ++i_stream) {
              for (int64_t i_head = 0; i_head < n_head; ++i_head) {
-@@ -6724,6 +6754,9 @@ struct test_dsa_sparse_attn : public test_case {
+@@ -6724,6 +6754,12 @@ struct test_dsa_sparse_attn : public test_case {
  
      double max_err(ggml_backend_t backend) override {
          (void) backend;
++        if (graph_equiv && type_k == GGML_TYPE_F32 && type_v == GGML_TYPE_F32 && type_mask == GGML_TYPE_F32 && dk >= 512) {
++            return 2e-4;
++        }
 +        if (graph_equiv && (type_k == GGML_TYPE_F16 || type_v == GGML_TYPE_F16 || type_mask == GGML_TYPE_F16)) {
 +            return 5e-3;
 +        }
          return type_k == GGML_TYPE_F16 || type_v == GGML_TYPE_F16 || type_mask == GGML_TYPE_F16 ? 2e-3 : 1e-5;
      }
  
-@@ -6740,6 +6773,93 @@ private:
+@@ -6740,6 +6776,93 @@ private:
          return 1.0f / sqrtf((float) dk);
      }
  
@@ -734,7 +729,7 @@ index 551c50f79..aa85ceb21 100644
      float q_value(int64_t i_dk, int64_t i_batch, int64_t i_head, int64_t i_stream) const {
          return 0.01f * (float) (1 + i_dk + 3*i_batch + 5*i_head + 7*i_stream);
      }
-@@ -6776,6 +6896,21 @@ private:
+@@ -6776,6 +6899,21 @@ private:
          ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
      }
  
@@ -756,7 +751,7 @@ index 551c50f79..aa85ceb21 100644
      template <typename ValueFn>
      void init_typed_row_tensor(ggml_tensor * t, ggml_type type, int64_t width, ValueFn value) const {
          std::vector<float> data(ggml_nelements(t));
-@@ -9600,6 +9735,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9600,6 +9738,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 16, 12, 33, 2, 4, 1, 4, 1));
      test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, 16, 12, 33, 2, 4, 1, 4, 1));
      test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, 32, 24, 65, 4, 8, 2, 8, 2));
@@ -764,6 +759,7 @@ index 551c50f79..aa85ceb21 100644
 +    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, 32, 24, 65, 4, 8, 2, 8, 2, true));
 +    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 16, 12, 33, 2, 4, 1, 4, 1, false, true));
 +    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_F16, 32, 24, 65, 4, 8, 2, 8, 2, false, true));
++    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 1, 4, 1, 64, 1, false, true));
  
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
