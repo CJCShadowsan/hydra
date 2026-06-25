@@ -1178,6 +1178,14 @@ fn handle_binary_connection(
                     "llama_stage.output_activation_bytes".to_string(),
                     json!(output.payload.len()),
                 );
+                downstream_write_attrs.insert(
+                    "llama_stage.glm_dsa_top_k_sideband_bytes".to_string(),
+                    json!(forwarded.glm_dsa_top_k_sideband_bytes),
+                );
+                downstream_write_attrs.insert(
+                    "llama_stage.glm_dsa_top_k_sideband_count".to_string(),
+                    json!(forwarded.glm_dsa_top_k_sideband_count),
+                );
             }
             let forward_start_unix_nanos = now_unix_nanos() as u64;
             forward_write_start_unix_nanos = Some(forward_start_unix_nanos);
@@ -2411,6 +2419,14 @@ fn handle_binary_restore_prefill_decode_control(
         attrs.insert(
             "llama_stage.activation_encode_ms".to_string(),
             json!(forwarded.activation_encode_ms),
+        );
+        attrs.insert(
+            "llama_stage.glm_dsa_top_k_sideband_bytes".to_string(),
+            json!(forwarded.glm_dsa_top_k_sideband_bytes),
+        );
+        attrs.insert(
+            "llama_stage.glm_dsa_top_k_sideband_count".to_string(),
+            json!(forwarded.glm_dsa_top_k_sideband_count),
         );
         telemetry.emit_debug("stage.binary_prefix_cache_decode_control", attrs);
         let downstream_reply =

@@ -23,6 +23,8 @@ pub(crate) fn forwarded_stage_message(
 pub(crate) struct ForwardedStageMessage {
     pub message: StageWireMessage,
     pub activation_encode_ms: f64,
+    pub glm_dsa_top_k_sideband_bytes: usize,
+    pub glm_dsa_top_k_sideband_count: usize,
 }
 
 pub(crate) fn forwarded_stage_message_timed(
@@ -37,7 +39,7 @@ pub(crate) fn forwarded_stage_message_timed(
     state.reserved = wire_dtype as i32;
     state.flags |= activation_state_flags_from_frame_flags(output.desc.flags);
     let encode_started = Instant::now();
-    let (activation_payload, raw_bytes) =
+    let (activation_payload, raw_bytes, sideband_stats) =
         split_activation_payload_sidebands(incoming, output, activation_width, state.flags)
             .with_context(|| {
                 format!(
@@ -51,6 +53,20 @@ pub(crate) fn forwarded_stage_message_timed(
                     state.flags,
                 )
             })?;
+    if sideband_stats.glm_dsa_top_k_count > 0 {
+        eprintln!(
+            "skippy: glm_dsa_top_k_sideband_forward stage={} request={} session={} kind={:?} pos_start={} tokens={} hidden_bytes={} sideband_bytes={} sideband_i32={}",
+            config.stage_id,
+            incoming.request_id,
+            incoming.session_id,
+            incoming.kind,
+            incoming.pos_start,
+            incoming.token_count,
+            sideband_stats.hidden_activation_bytes,
+            sideband_stats.glm_dsa_top_k_bytes,
+            sideband_stats.glm_dsa_top_k_count,
+        );
+    }
     let activation = encode_output_activation_payload(
         wire_dtype,
         incoming,
@@ -87,7 +103,16 @@ pub(crate) fn forwarded_stage_message_timed(
             raw_bytes,
         },
         activation_encode_ms: encode_started.elapsed().as_secs_f64() * 1000.0,
+        glm_dsa_top_k_sideband_bytes: sideband_stats.glm_dsa_top_k_bytes,
+        glm_dsa_top_k_sideband_count: sideband_stats.glm_dsa_top_k_count,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActivationSidebandStats {
+    hidden_activation_bytes: usize,
+    glm_dsa_top_k_bytes: usize,
+    glm_dsa_top_k_count: usize,
 }
 
 fn split_activation_payload_sidebands<'a>(
@@ -95,9 +120,16 @@ fn split_activation_payload_sidebands<'a>(
     output: &'a ActivationFrame,
     activation_width: i32,
     state_flags: i32,
-) -> Result<(&'a [u8], Vec<u8>)> {
+) -> Result<(&'a [u8], Vec<u8>, ActivationSidebandStats)> {
     if (state_flags & skippy_protocol::binary::state_flags::GLM_DSA_TOP_K_SIDEBAND) == 0 {
-        return Ok((&output.payload, Vec::new()));
+        return Ok((
+            &output.payload,
+            Vec::new(),
+            ActivationSidebandStats {
+                hidden_activation_bytes: output.payload.len(),
+                ..ActivationSidebandStats::default()
+            },
+        ));
     }
     let hidden_bytes = skippy_protocol::binary::activation_wire_bytes_with_state_flags(
         WireActivationDType::F32,
@@ -111,9 +143,15 @@ fn split_activation_payload_sidebands<'a>(
     if (output.payload.len() - hidden_bytes) & 3 != 0 {
         bail!("GLM-DSA top-k sideband payload is not i32-aligned");
     }
+    let sideband_bytes = output.payload.len() - hidden_bytes;
     Ok((
         &output.payload[..hidden_bytes],
         output.payload[hidden_bytes..].to_vec(),
+        ActivationSidebandStats {
+            hidden_activation_bytes: hidden_bytes,
+            glm_dsa_top_k_bytes: sideband_bytes,
+            glm_dsa_top_k_count: sideband_bytes / std::mem::size_of::<i32>(),
+        },
     ))
 }
 
@@ -351,6 +389,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(forwarded.message.activation.len(), 8);
+        assert_eq!(forwarded.glm_dsa_top_k_sideband_bytes, 8);
+        assert_eq!(forwarded.glm_dsa_top_k_sideband_count, 2);
         assert_eq!(
             forwarded.message.raw_bytes,
             [17_i32.to_le_bytes(), 23_i32.to_le_bytes()].concat()
