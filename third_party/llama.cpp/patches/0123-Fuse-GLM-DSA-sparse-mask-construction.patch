@@ -1,0 +1,576 @@
+From 352ec9ae28d6149dffbabb254fb777d4bf6b93d4 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 25 Jun 2026 23:25:06 +1000
+Subject: [PATCH] Fuse GLM-DSA sparse mask construction
+
+---
+ ggml/include/ggml-rpc.h                   |  4 +-
+ ggml/include/ggml.h                       |  6 +++
+ ggml/src/ggml-cpu/ggml-cpu.c              |  5 ++
+ ggml/src/ggml-cpu/ops.cpp                 | 66 +++++++++++++++++++++++
+ ggml/src/ggml-cpu/ops.h                   |  1 +
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 24 +++++++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  2 +
+ ggml/src/ggml-metal/ggml-metal-device.m   | 12 +++++
+ ggml/src/ggml-metal/ggml-metal-impl.h     | 21 ++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 60 +++++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.h      |  1 +
+ ggml/src/ggml-metal/ggml-metal.metal      | 54 +++++++++++++++++++
+ ggml/src/ggml.c                           | 30 ++++++++++-
+ src/llama-graph.cpp                       | 46 +++++++++-------
+ 14 files changed, 310 insertions(+), 22 deletions(-)
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index efa5420a6..9089c1575 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    4
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    2
++#define RPC_PROTO_PATCH_VERSION    3
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index df516d414..5c960f9c2 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -569,6 +569,7 @@ extern "C" {
+         GGML_OP_SOLVE_TRI,
+         GGML_OP_GATED_DELTA_NET,
+         GGML_OP_LIGHTNING_INDEXER,
++        GGML_OP_DSA_SPARSE_MASK,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2582,6 +2583,11 @@ extern "C" {
+             float                 scale_embd,
+             float                 scale_heads);
+ 
++    GGML_API struct ggml_tensor * ggml_dsa_sparse_mask(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * kq_mask,
++            struct ggml_tensor  * top_k);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 2e65cdbff..7516d2b0b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2055,6 +2055,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_lightning_indexer(params, tensor);
+             } break;
++        case GGML_OP_DSA_SPARSE_MASK:
++            {
++                ggml_compute_forward_dsa_sparse_mask(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2376,6 +2380,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SSM_CONV:
+         case GGML_OP_SSM_SCAN:
+         case GGML_OP_LIGHTNING_INDEXER:
++        case GGML_OP_DSA_SPARSE_MASK:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 0fec6ca47..4438634d4 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -10862,6 +10862,72 @@ void ggml_compute_forward_lightning_indexer(
+     }
+ }
+ 
++// ggml_compute_forward_dsa_sparse_mask
++
++void ggml_compute_forward_dsa_sparse_mask(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0]; // kq_mask rows: [1, n_kv, n_batch, n_stream]
++    const ggml_tensor * src1 = dst->src[1]; // top_k
++
++    GGML_ASSERT(dst->type == src0->type);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
++    GGML_ASSERT(src1->type == GGML_TYPE_I32);
++    GGML_ASSERT(dst->ne[0] == src0->ne[0]);
++    GGML_ASSERT(dst->ne[1] == src0->ne[1]);
++    GGML_ASSERT(dst->ne[2] == src0->ne[2]);
++    GGML_ASSERT(dst->ne[3] == src0->ne[3]);
++    GGML_ASSERT(src0->ne[0] == 1);
++    GGML_ASSERT(src1->ne[1] == src0->ne[2]);
++    GGML_ASSERT(src0->ne[3] % src1->ne[2] == 0);
++    GGML_ASSERT(src1->ne[3] == 1);
++
++    const int64_t n_kv     = src0->ne[1];
++    const int64_t n_batch  = src0->ne[2];
++    const int64_t n_stream = src0->ne[3];
++    const int64_t n_top_k  = src1->ne[0];
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t total = n_batch * n_stream;
++    const int64_t dr    = (total + nth - 1) / nth;
++    const int64_t i0    = dr * ith;
++    const int64_t i1    = MIN(i0 + dr, total);
++
++    for (int64_t i = i0; i < i1; ++i) {
++        const int64_t i_batch  = i % n_batch;
++        const int64_t i_stream = i / n_batch;
++
++        for (int64_t i_kv = 0; i_kv < n_kv; ++i_kv) {
++            char * dst_data = (char *) dst->data + i_kv * dst->nb[1] + i_batch * dst->nb[2] + i_stream * dst->nb[3];
++
++            if (dst->type == GGML_TYPE_F32) {
++                *(float *) dst_data = -INFINITY;
++            } else {
++                *(ggml_fp16_t *) dst_data = GGML_CPU_FP32_TO_FP16(-INFINITY);
++            }
++        }
++
++        const int64_t i12 = i_stream % src1->ne[2];
++        for (int64_t i_top = 0; i_top < n_top_k; ++i_top) {
++            const char * top_k_data =
++                (const char *) src1->data + i_top * src1->nb[0] + i_batch * src1->nb[1] + i12 * src1->nb[2];
++            const int32_t i_kv = *(const int32_t *) top_k_data;
++            GGML_ASSERT(i_kv >= 0 && i_kv < n_kv);
++
++            const char * src = (const char *) src0->data + i_kv * src0->nb[1] + i_batch * src0->nb[2] + i_stream * src0->nb[3];
++            char * dst_data = (char *) dst->data + i_kv * dst->nb[1] + i_batch * dst->nb[2] + i_stream * dst->nb[3];
++
++            if (dst->type == GGML_TYPE_F32) {
++                *(float *) dst_data = *(const float *) src;
++            } else {
++                *(ggml_fp16_t *) dst_data = *(const ggml_fp16_t *) src;
++            }
++        }
++    }
++}
++
+ // ggml_compute_forward_rwkv_wkv7
+ 
+ static void ggml_compute_forward_rwkv_wkv7_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index e956c25d3..ac94ca2fb 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -106,6 +106,7 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
+ void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsa_sparse_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 35cad06c0..72fd52938 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -176,6 +176,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows(ggml_me
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_mask_fill(ggml_metal_library_t lib) {
++    const char * base = "kernel_dsa_sparse_mask_fill";
++    const char * name = "kernel_dsa_sparse_mask_fill";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_mask_set(ggml_metal_library_t lib) {
++    const char * base = "kernel_dsa_sparse_mask_set";
++    const char * name = "kernel_dsa_sparse_mask_set";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char base[256];
+     char name[256];
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index bd470eda4..04864a38d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -113,6 +113,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, enum ggml_type tidx, enum ggml_type tdst);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_mask_fill(ggml_metal_library_t lib);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_mask_set (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index de44cbc07..927cbaca0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1267,6 +1267,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                    op->src[2]->ne[2] == 1 &&
+                    op->src[0]->ne[3] == op->src[1]->ne[3] &&
+                    op->src[1]->ne[3] == op->src[2]->ne[3];
++        case GGML_OP_DSA_SPARSE_MASK:
++            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
++                   op->src[0]->type == op->type &&
++                   op->src[1]->type == GGML_TYPE_I32 &&
++                   op->src[0]->ne[0] == 1 &&
++                   op->src[0]->ne[2] == op->src[1]->ne[1] &&
++                   op->src[0]->ne[3] % op->src[1]->ne[2] == 0 &&
++                   op->src[1]->ne[3] == 1 &&
++                   op->ne[0] == op->src[0]->ne[0] &&
++                   op->ne[1] == op->src[0]->ne[1] &&
++                   op->ne[2] == op->src[0]->ne[2] &&
++                   op->ne[3] == op->src[0]->ne[3];
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index d77336cb3..ac3ca761b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -984,6 +984,27 @@ typedef struct {
+     uint64_t nb3;
+ } ggml_metal_kargs_set_rows;
+ 
++typedef struct {
++    int32_t  n_kv;
++    int32_t  n_batch;
++    int32_t  n_stream;
++    int32_t  n_top_k;
++    int32_t  n_top_stream;
++    int32_t  elem_size;
++    int32_t  _pad1;
++    int32_t  _pad2;
++    uint64_t nb01;
++    uint64_t nb02;
++    uint64_t nb03;
++    uint64_t nb10;
++    uint64_t nb11;
++    uint64_t nb12;
++    uint64_t nb0;
++    uint64_t nb1;
++    uint64_t nb2;
++    uint64_t nb3;
++} ggml_metal_kargs_dsa_sparse_mask;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index d558cd018..0e07e018e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -341,6 +341,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
+             } break;
++        case GGML_OP_DSA_SPARSE_MASK:
++            {
++                n_fuse = ggml_metal_op_dsa_sparse_mask(ctx, idx);
++            } break;
+         case GGML_OP_SOLVE_TRI:
+             {
+                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
+@@ -4410,6 +4414,62 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_dsa_sparse_mask(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
++
++    ggml_metal_kargs_dsa_sparse_mask args = {
++        /*.n_kv     =*/ ne01,
++        /*.n_batch  =*/ ne02,
++        /*.n_stream =*/ ne03,
++        /*.n_top_k  =*/ ne10,
++        /*.n_top_stream =*/ ne12,
++        /*.elem_size =*/ (int32_t) ggml_type_size(op->type),
++        /*._pad1    =*/ 0,
++        /*._pad2    =*/ 0,
++        /*.nb01     =*/ nb01,
++        /*.nb02     =*/ nb02,
++        /*.nb03     =*/ nb03,
++        /*.nb10     =*/ nb10,
++        /*.nb11     =*/ nb11,
++        /*.nb12     =*/ nb12,
++        /*.nb0      =*/ nb0,
++        /*.nb1      =*/ nb1,
++        /*.nb2      =*/ nb2,
++        /*.nb3      =*/ nb3,
++    };
++
++    auto pipeline_fill = ggml_metal_library_get_pipeline_dsa_sparse_mask_fill(lib);
++    auto pipeline_set  = ggml_metal_library_get_pipeline_dsa_sparse_mask_set(lib);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline_fill);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),          0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 1);
++
++    const int nth_fill = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_fill));
++    ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nth_fill - 1)/nth_fill, ne02, ne03, nth_fill, 1, 1);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline_set);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
++
++    const int nth_set = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_set));
++    ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + nth_set - 1)/nth_set, ne11, ne03, nth_set, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index a2b15d544..32345c1e4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -60,6 +60,7 @@ int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_dsa_sparse_mask   (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index a6afe5805..81c385976 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9426,6 +9426,60 @@ kernel void kernel_set_rows_f(
+     }
+ }
+ 
++kernel void kernel_dsa_sparse_mask_fill(
++        constant ggml_metal_kargs_dsa_sparse_mask & args,
++        device             char                   * dst,
++        uint3                                       tgpig[[threadgroup_position_in_grid]],
++        uint                                        tiitg[[thread_index_in_threadgroup]],
++        uint3                                       tptg [[threads_per_threadgroup]]) {
++    const int32_t i_kv = tgpig.x*tptg.x + tiitg;
++    if (i_kv >= args.n_kv) {
++        return;
++    }
++
++    const int32_t i_batch  = tgpig.y;
++    const int32_t i_stream = tgpig.z;
++
++    device char * dst_ptr = dst + i_kv*args.nb1 + i_batch*args.nb2 + i_stream*args.nb3;
++    if (args.elem_size == 2) {
++        ((device half *) dst_ptr)[0] = (half) -INFINITY;
++    } else {
++        ((device float *) dst_ptr)[0] = -INFINITY;
++    }
++}
++
++kernel void kernel_dsa_sparse_mask_set(
++        constant ggml_metal_kargs_dsa_sparse_mask & args,
++        device const       char                   * kq_mask,
++        device const       int32_t                * top_k,
++        device             char                   * dst,
++        uint3                                       tgpig[[threadgroup_position_in_grid]],
++        uint                                        tiitg[[thread_index_in_threadgroup]],
++        uint3                                       tptg [[threads_per_threadgroup]]) {
++    const int32_t i_top = tgpig.x*tptg.x + tiitg;
++    if (i_top >= args.n_top_k) {
++        return;
++    }
++
++    const int32_t i_batch  = tgpig.y;
++    const int32_t i_stream = tgpig.z;
++    const int32_t i12      = i_stream%args.n_top_stream;
++    const int32_t i_kv     = ((device const int32_t *) ((device const char *) top_k + i_top*args.nb10 + i_batch*args.nb11 + i12*args.nb12))[0];
++
++    if (i_kv < 0 || i_kv >= args.n_kv) {
++        return;
++    }
++
++    const device char * src_ptr = kq_mask + i_kv*args.nb01 + i_batch*args.nb02 + i_stream*args.nb03;
++          device char * dst_ptr = dst     + i_kv*args.nb1  + i_batch*args.nb2  + i_stream*args.nb3;
++
++    if (args.elem_size == 2) {
++        ((device half *) dst_ptr)[0] = ((const device half *) src_ptr)[0];
++    } else {
++        ((device float *) dst_ptr)[0] = ((const device float *) src_ptr)[0];
++    }
++}
++
+ kernel void kernel_diag_f32(
+         constant ggml_metal_kargs_diag & args,
+         device   const char * src0,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 68a759e88..aa72ad1cd 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1065,6 +1065,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "SOLVE_TRI",
+     "GATED_DELTA_NET",
+     "LIGHTNING_INDEXER",
++    "DSA_SPARSE_MASK",
+ 
+     "UNARY",
+ 
+@@ -1082,7 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1177,6 +1178,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "A X = B, A triangular, solve X",
+     "gated_delta_net(q, k, v, g, beta, s)",
+     "lightning_indexer(q, k, weights, scale_embd, scale_heads)",
++    "dsa_sparse_mask(kq_mask, top_k)",
+ 
+     "unary(x)",
+ 
+@@ -1194,7 +1196,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6307,6 +6309,30 @@ struct ggml_tensor * ggml_lightning_indexer(
+     return result;
+ }
+ 
++// ggml_dsa_sparse_mask
++
++struct ggml_tensor * ggml_dsa_sparse_mask(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * kq_mask_rows,
++        struct ggml_tensor  * top_k) {
++
++    GGML_ASSERT(kq_mask_rows->type == GGML_TYPE_F32 || kq_mask_rows->type == GGML_TYPE_F16);
++    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
++    GGML_ASSERT(kq_mask_rows->ne[0] == 1);
++    GGML_ASSERT(kq_mask_rows->ne[2] == top_k->ne[1]);
++    GGML_ASSERT(kq_mask_rows->ne[3] % top_k->ne[2] == 0);
++    GGML_ASSERT(top_k->ne[3] == 1);
++
++    int64_t ne[4] = { kq_mask_rows->ne[0], kq_mask_rows->ne[1], kq_mask_rows->ne[2], kq_mask_rows->ne[3] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, kq_mask_rows->type, 4, ne);
++
++    result->op     = GGML_OP_DSA_SPARSE_MASK;
++    result->src[0] = kq_mask_rows;
++    result->src[1] = top_k;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 54f3213ca..fe5538f78 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -25,6 +25,11 @@ static thread_local skippy_activation_rwkv7_v_first g_skippy_rwkv7_v_first;
+ static thread_local skippy_activation_gemma3n_altup g_skippy_gemma3n_altup;
+ static thread_local skippy_activation_glm_dsa_top_k g_skippy_glm_dsa_top_k;
+ 
++static bool skippy_glm_dsa_fused_sparse_mask_enabled() {
++    const char * value = getenv("SKIPPY_GLM_DSA_ENABLE_FUSED_SPARSE_MASK");
++    return value != nullptr && strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
++}
++
+ void skippy_graph_set_filter(const skippy_graph_filter & filter) {
+     g_skippy_graph_filter = filter;
+ }
+@@ -2671,31 +2676,36 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+     const auto & kq_mask = inp->get_kq_mask_mla();
+ 
+-    // prepare new kq mask - starts filled with -INFINITY
+-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+-    cb(kq_mask_all, "dsa_sparse_mask_fill", il);
+-
+     // reshape KQ mask into tensor with rows of size 1:
+     // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
+-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+-
+-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
+-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+-
+-    // gather causal mask values for the top-k indices:
+-    // ggml_get_rows([1, n_kv, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
+-    //   -> [1, n_top_k, n_batch, n_stream]
+     ggml_tensor * kq_mask_rows = ggml_view_4d(
+             ctx0, kq_mask,
+             1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+             kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+-    ggml_tensor * kq_mask_top_k_values = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
+-    cb(kq_mask_top_k_values, "dsa_sparse_mask_topk", il);
+ 
+-    // modify KQ mask by copying causal mask values into elements that are in top_k indices
+-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
+-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, kq_mask_top_k_values, top_k_3d);
+-    cb(kq_mask_top_k, "dsa_sparse_mask_topk", il);
++    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
++    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
++
++    ggml_tensor * kq_mask_top_k = nullptr;
++    if (skippy_glm_dsa_fused_sparse_mask_enabled()) {
++        kq_mask_top_k = ggml_dsa_sparse_mask(ctx0, kq_mask_rows, top_k_3d);
++        cb(kq_mask_top_k, "dsa_sparse_mask_topk", il);
++    } else {
++        // prepare new kq mask - starts filled with -INFINITY
++        ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
++        cb(kq_mask_all, "dsa_sparse_mask_fill", il);
++
++        kq_mask_all = ggml_view_4d(
++                ctx0, kq_mask_all,
++                1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
++                kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
++
++        ggml_tensor * kq_mask_top_k_values = ggml_get_rows(ctx0, kq_mask_rows, top_k_3d);
++        cb(kq_mask_top_k_values, "dsa_sparse_mask_topk", il);
++
++        kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, kq_mask_top_k_values, top_k_3d);
++        cb(kq_mask_top_k, "dsa_sparse_mask_topk", il);
++    }
+ 
+     // reshape to restore the original shape of KQ mask:
+     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
+-- 
+2.54.0 (Apple Git-157)
+
