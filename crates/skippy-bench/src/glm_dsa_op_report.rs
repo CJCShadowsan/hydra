@@ -5,7 +5,8 @@ use serde::Serialize;
 
 use crate::cli::GlmDsaOpReportArgs;
 
-const PREFIX: &str = "skippy: glm_dsa_op_timing ";
+const OP_TIMING_PREFIX: &str = "skippy: glm_dsa_op_timing ";
+const SIDEBAND_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +40,7 @@ struct LogSummary {
     path: PathBuf,
     records: usize,
     stage_records: BTreeMap<i32, BTreeMap<Phase, PhaseSummary>>,
+    sideband_records: BTreeMap<String, BTreeMap<Phase, SidebandSummary>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,6 +65,28 @@ struct TimingRecord {
     shared_expert_us: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+struct SidebandSummary {
+    records: usize,
+    tokens: u64,
+    hidden_bytes: u64,
+    sideband_bytes: u64,
+    sideband_i32: u64,
+    avg_hidden_bytes_per_token: Option<f64>,
+    avg_sideband_bytes_per_token: Option<f64>,
+    sideband_to_hidden_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebandRecord {
+    stage: String,
+    kind: String,
+    tokens: u64,
+    hidden_bytes: u64,
+    sideband_bytes: u64,
+    sideband_i32: u64,
+}
+
 pub fn glm_dsa_op_report(args: GlmDsaOpReportArgs) -> Result<()> {
     let output = args.output.clone();
     let report = build_report(&args)?;
@@ -78,28 +102,38 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
     let mut logs = Vec::with_capacity(args.log.len());
     for path in &args.log {
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let records = parse_records(&text)
+        let records = parse_timing_records(&text)
             .with_context(|| format!("parse GLM-DSA op timing records in {}", path.display()))?;
         if records.is_empty() {
             bail!("{} contains no GLM-DSA op timing records", path.display());
         }
+        let sideband_records = parse_sideband_records(&text).with_context(|| {
+            format!("parse GLM-DSA top-k sideband records in {}", path.display())
+        })?;
         let records = match args.first_records {
             Some(limit) => records.into_iter().take(limit).collect::<Vec<_>>(),
             None => records,
         };
-        logs.push(summarize_log(path.clone(), &records));
+        let sideband_records = match args.first_records {
+            Some(limit) => sideband_records.into_iter().take(limit).collect::<Vec<_>>(),
+            None => sideband_records,
+        };
+        logs.push(summarize_log(path.clone(), &records, &sideband_records));
     }
     Ok(GlmDsaOpReport { logs })
 }
 
-fn parse_records(text: &str) -> Result<Vec<TimingRecord>> {
+fn parse_timing_records(text: &str) -> Result<Vec<TimingRecord>> {
     text.lines()
-        .filter_map(|line| line.find(PREFIX).map(|index| &line[index + PREFIX.len()..]))
-        .map(parse_record)
+        .filter_map(|line| {
+            line.find(OP_TIMING_PREFIX)
+                .map(|index| &line[index + OP_TIMING_PREFIX.len()..])
+        })
+        .map(parse_timing_record)
         .collect()
 }
 
-fn parse_record(line: &str) -> Result<TimingRecord> {
+fn parse_timing_record(line: &str) -> Result<TimingRecord> {
     let fields = line
         .split_whitespace()
         .filter_map(|field| field.split_once('='))
@@ -121,6 +155,31 @@ fn parse_record(line: &str) -> Result<TimingRecord> {
     })
 }
 
+fn parse_sideband_records(text: &str) -> Result<Vec<SidebandRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(SIDEBAND_PREFIX)
+                .map(|index| &line[index + SIDEBAND_PREFIX.len()..])
+        })
+        .map(parse_sideband_record)
+        .collect()
+}
+
+fn parse_sideband_record(line: &str) -> Result<SidebandRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(SidebandRecord {
+        stage: parse_string_field(&fields, "stage")?,
+        kind: parse_string_field(&fields, "kind")?,
+        tokens: parse_field(&fields, "tokens")?,
+        hidden_bytes: parse_field(&fields, "hidden_bytes")?,
+        sideband_bytes: parse_field(&fields, "sideband_bytes")?,
+        sideband_i32: parse_field(&fields, "sideband_i32")?,
+    })
+}
+
 fn parse_field<T>(fields: &BTreeMap<&str, &str>, name: &str) -> Result<T>
 where
     T: std::str::FromStr,
@@ -133,7 +192,18 @@ where
         .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
 }
 
-fn summarize_log(path: PathBuf, records: &[TimingRecord]) -> LogSummary {
+fn parse_string_field(fields: &BTreeMap<&str, &str>, name: &str) -> Result<String> {
+    Ok(fields
+        .get(name)
+        .with_context(|| format!("missing {name}"))?
+        .to_string())
+}
+
+fn summarize_log(
+    path: PathBuf,
+    records: &[TimingRecord],
+    sideband_records: &[SidebandRecord],
+) -> LogSummary {
     let mut stage_records: BTreeMap<i32, BTreeMap<Phase, PhaseSummary>> = BTreeMap::new();
     for record in records {
         let phase = if record.tokens == 1 {
@@ -181,10 +251,49 @@ fn summarize_log(path: PathBuf, records: &[TimingRecord]) -> LogSummary {
             summary.avg_total_us_per_token = nonzero_div(summary.total_us, summary.tokens);
         }
     }
+    let sideband_records = summarize_sideband_records(sideband_records);
     LogSummary {
         path,
         records: records.len(),
         stage_records,
+        sideband_records,
+    }
+}
+
+fn summarize_sideband_records(
+    records: &[SidebandRecord],
+) -> BTreeMap<String, BTreeMap<Phase, SidebandSummary>> {
+    let mut stages: BTreeMap<String, BTreeMap<Phase, SidebandSummary>> = BTreeMap::new();
+    for record in records {
+        let phase = sideband_phase(&record.kind, record.tokens);
+        let summary = stages
+            .entry(record.stage.clone())
+            .or_default()
+            .entry(phase)
+            .or_default();
+        summary.records += 1;
+        summary.tokens += record.tokens;
+        summary.hidden_bytes += record.hidden_bytes;
+        summary.sideband_bytes += record.sideband_bytes;
+        summary.sideband_i32 += record.sideband_i32;
+    }
+    for phases in stages.values_mut() {
+        for summary in phases.values_mut() {
+            summary.avg_hidden_bytes_per_token = nonzero_div(summary.hidden_bytes, summary.tokens);
+            summary.avg_sideband_bytes_per_token =
+                nonzero_div(summary.sideband_bytes, summary.tokens);
+            summary.sideband_to_hidden_ratio =
+                nonzero_div(summary.sideband_bytes, summary.hidden_bytes);
+        }
+    }
+    stages
+}
+
+fn sideband_phase(kind: &str, tokens: u64) -> Phase {
+    if kind == "DecodeEmbd" || tokens == 1 {
+        Phase::Decode
+    } else {
+        Phase::Prefill
     }
 }
 
@@ -199,13 +308,17 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Phase, parse_record, parse_records, summarize_log};
+    use super::{
+        Phase, parse_sideband_record, parse_sideband_records, parse_timing_record,
+        parse_timing_records, summarize_log,
+    };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
+    const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
 
     #[test]
     fn parses_timing_record_with_prefix() {
-        let records = parse_records(LINE).unwrap();
+        let records = parse_timing_records(LINE).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].stage, 1);
         assert_eq!(records[0].tokens, 128);
@@ -215,7 +328,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_fields() {
-        let error = parse_record("stage=0 tokens=1").unwrap_err().to_string();
+        let error = parse_timing_record("stage=0 tokens=1")
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("missing total_us"));
     }
 
@@ -226,8 +341,8 @@ mod tests {
             LINE.replace("tokens=128", "tokens=1")
                 .replace("total_us=1475800", "total_us=200")
         );
-        let records = parse_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &records);
+        let records = parse_timing_records(&text).unwrap();
+        let summary = summarize_log("stage1.log".into(), &records, &[]);
         let stages = summary.stage_records.get(&1).unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
@@ -236,5 +351,38 @@ mod tests {
         assert_eq!(decode.records, 1);
         assert_eq!(decode.tokens, 1);
         assert_eq!(decode.total_us, 200);
+    }
+
+    #[test]
+    fn parses_sideband_record_with_prefix() {
+        let records = parse_sideband_records(SIDEBAND_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].stage, "stage-0");
+        assert_eq!(records[0].kind, "DecodeEmbd");
+        assert_eq!(records[0].sideband_bytes, 3072);
+        assert_eq!(records[0].sideband_i32, 768);
+    }
+
+    #[test]
+    fn rejects_malformed_sideband_record() {
+        let error = parse_sideband_record("stage=stage-0 kind=DecodeEmbd")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing tokens"));
+    }
+
+    #[test]
+    fn summarizes_sideband_payload_ratios() {
+        let timing = parse_timing_records(LINE).unwrap();
+        let sideband = parse_sideband_records(SIDEBAND_LINE).unwrap();
+        let summary = summarize_log("stage0.log".into(), &timing, &sideband);
+        let stages = summary.sideband_records.get("stage-0").unwrap();
+        let decode = stages.get(&Phase::Decode).unwrap();
+        assert_eq!(decode.records, 1);
+        assert_eq!(decode.tokens, 1);
+        assert_eq!(decode.hidden_bytes, 24576);
+        assert_eq!(decode.sideband_bytes, 3072);
+        assert_eq!(decode.avg_sideband_bytes_per_token, Some(3072.0));
+        assert_eq!(decode.sideband_to_hidden_ratio, Some(0.125));
     }
 }
