@@ -193,6 +193,20 @@ pub fn write_stage_message(
         write_i32(&mut writer, *position)?;
     }
     writer.write_all(&message.activation)?;
+    if (state.flags & super::state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0 {
+        if message.raw_bytes.len() & 3 != 0 {
+            return Err(invalid_input("GLM-DSA top-k sideband is not i32-aligned"));
+        }
+        if message.raw_bytes.len() > MAX_STAGE_SIDEBAND_VALUES * std::mem::size_of::<i32>() {
+            return Err(invalid_input("GLM-DSA top-k sideband is too large"));
+        }
+        write_i32(
+            &mut writer,
+            i32::try_from(message.raw_bytes.len() / std::mem::size_of::<i32>())
+                .map_err(|_| invalid_input("GLM-DSA top-k sideband is too large"))?,
+        )?;
+        writer.write_all(&message.raw_bytes)?;
+    }
     Ok(())
 }
 
@@ -318,6 +332,22 @@ pub fn read_stage_message(mut reader: impl Read, n_embd: i32) -> io::Result<Stag
     if activation_bytes > 0 {
         reader.read_exact(&mut activation)?;
     }
+    let raw_bytes = if (state.flags & super::state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0 {
+        let top_k_count = checked_i32_len(
+            read_i32(&mut reader)?,
+            MAX_STAGE_SIDEBAND_VALUES,
+            "negative GLM-DSA top-k sideband count",
+            "GLM-DSA top-k sideband count exceeds maximum",
+        )?;
+        let raw_byte_count = top_k_count
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| invalid_data("GLM-DSA top-k sideband byte count overflow"))?;
+        let mut raw_bytes = vec![0; raw_byte_count];
+        reader.read_exact(&mut raw_bytes)?;
+        raw_bytes
+    } else {
+        Vec::new()
+    };
     Ok(StageWireMessage {
         kind,
         pos_start,
@@ -330,7 +360,7 @@ pub fn read_stage_message(mut reader: impl Read, n_embd: i32) -> io::Result<Stag
         tokens,
         positions,
         activation,
-        raw_bytes: Vec::new(),
+        raw_bytes,
     })
 }
 

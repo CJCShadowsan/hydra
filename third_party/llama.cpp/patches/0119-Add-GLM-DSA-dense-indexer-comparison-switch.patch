@@ -1,0 +1,99 @@
+From ddbdbcdeaadaedc6ed4ef3343f1505f2b12b09e0 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 25 Jun 2026 18:31:23 +1000
+Subject: [PATCH] Add GLM-DSA dense indexer comparison switch
+
+---
+ src/llama-context.cpp  |  7 +++++-
+ src/models/glm-dsa.cpp | 49 ++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 58c79921..eb5b7cf2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -598,7 +598,12 @@ void llama_context::sched_reserve() {
+         cparams.auto_fgdn = false;
+     }
+ 
+-    if (model.arch == LLM_ARCH_GLM_DSA) {
++    const char * LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER = getenv("LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER");
++    const bool glm_dsa_disable_lightning_indexer =
++            LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER && atoi(LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER) != 0;
++    if (model.arch == LLM_ARCH_GLM_DSA && glm_dsa_disable_lightning_indexer) {
++        LLAMA_LOG_WARN("%s: GLM-DSA lightning indexer disabled by LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER\n", __func__);
++    } else if (model.arch == LLM_ARCH_GLM_DSA) {
+         LLAMA_LOG_INFO("%s: resolving GLM-DSA lightning indexer support:\n", __func__);
+ 
+         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 3d2c2e20..2a466f3e 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -2,6 +2,13 @@
+ 
+ #include "llama-kv-cache-dsa.h"
+ 
++#include <cstdlib>
++
++static bool llama_glm_dsa_disable_lightning_indexer() {
++    const char * value = getenv("LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER");
++    return value != nullptr && atoi(value) != 0;
++}
++
+ static bool llama_glm_dsa_layer_has_indexer(const llama_layer & layer) {
+     const bool has_any =
+             layer.indexer_k_norm   ||
+@@ -320,14 +327,42 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+                 indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+                 indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
+ 
+-                // The fused indexer consumes cached K as [head_size, 1, n_kv, n_stream].
+-                // Do not apply the dense KQ path's K permutation here.
+-                cb(indexer_k, "indexer_k", il);
++                ggml_tensor * indexer_score = nullptr;
++                if (llama_glm_dsa_disable_lightning_indexer()) {
++                    indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
++                    cb(indexer_q, "indexer_q", il);
++                    indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
++                    cb(indexer_k, "indexer_k", il);
++
++                    ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
++                    cb(indexer_kq, "indexer_kq", il);
++
++                    indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
++                    cb(indexer_kq, "indexer_kq", il);
++
++                    indexer_score = ggml_relu(ctx0, indexer_kq);
++                    cb(indexer_score, "indexer_score", il);
++
++                    indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
++                    cb(indexer_weights, "indexer_weights", il);
++
++                    indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
++                    cb(indexer_score, "indexer_score", il);
++
++                    indexer_score = ggml_sum_rows(ctx0, indexer_score);
++                    cb(indexer_score, "indexer_score", il);
++
++                    indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
++                } else {
++                    // The fused indexer consumes cached K as [head_size, 1, n_kv, n_stream].
++                    // Do not apply the dense KQ path's K permutation here.
++                    cb(indexer_k, "indexer_k", il);
+ 
+-                ggml_tensor * indexer_score = ggml_lightning_indexer(
+-                    ctx0, indexer_q, indexer_k, indexer_weights,
+-                    1.0f / sqrtf(float(n_embd_indexer_head)),
+-                    1.0f / sqrtf(float(n_indexer_head)));
++                    indexer_score = ggml_lightning_indexer(
++                        ctx0, indexer_q, indexer_k, indexer_weights,
++                        1.0f / sqrtf(float(n_embd_indexer_head)),
++                        1.0f / sqrtf(float(n_indexer_head)));
++                }
+                 cb(indexer_score, "indexer_score", il);
+ 
+                 ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
+-- 
+2.54.0 (Apple Git-157)
+

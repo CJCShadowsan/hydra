@@ -3851,9 +3851,15 @@ fn input_activation_frame(
     if message.activation.is_empty() {
         return Ok(None);
     }
-    let payload = message
+    let mut payload = message
         .take_activation_f32_payload(activation_width)
         .context("decode wire activation payload")?;
+    if (message.state.flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0 {
+        if message.raw_bytes.len() & 3 != 0 {
+            bail!("GLM-DSA top-k sideband payload is not i32-aligned");
+        }
+        payload.extend_from_slice(&message.raw_bytes);
+    }
     let (layer_start, layer_end) = upstream_layer_range(config, topology, message);
     Ok(Some(ActivationFrame {
         desc: ActivationDesc {

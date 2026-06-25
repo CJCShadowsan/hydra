@@ -14,8 +14,8 @@ pub use codec::{
     write_stage_message,
 };
 pub use types::{
-    ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_RWKV7_V_FIRST, LLAMA_TOKEN_NULL,
-    MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
+    ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_GLM_DSA_TOP_K, ACTIVATION_FLAG_RWKV7_V_FIRST,
+    LLAMA_TOKEN_NULL, MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
     MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC,
     STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES,
@@ -775,6 +775,50 @@ mod tests {
         assert_eq!(
             activation_frame_flags_from_state_flags(decoded.state.flags),
             ACTIVATION_FLAG_RWKV7_V_FIRST
+        );
+        assert_eq!(
+            decoded.activation_f32_payload(2).unwrap(),
+            message.activation
+        );
+    }
+
+    #[test]
+    fn glm_dsa_top_k_sideband_activation_round_trips() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+        state.source_stage_index = 0;
+        state.flags |= state_flags::GLM_DSA_TOP_K_SIDEBAND;
+        let mut activation = Vec::new();
+        for value in [1.0_f32, 2.0] {
+            activation.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut raw_bytes = Vec::new();
+        for value in [17_i32, 23] {
+            raw_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let message = StageWireMessage {
+            kind: WireMessageKind::DecodeEmbd,
+            pos_start: 0,
+            token_count: 1,
+            state,
+            request_id: 7,
+            session_id: 9,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![42],
+            positions: Vec::new(),
+            activation,
+            raw_bytes,
+        };
+        let mut bytes = Vec::new();
+        write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
+        let decoded = read_stage_message(Cursor::new(bytes), 2).unwrap();
+
+        assert_eq!(decoded.activation.len(), 8);
+        assert_eq!(decoded.raw_bytes, message.raw_bytes);
+        assert_eq!(
+            activation_frame_flags_from_state_flags(decoded.state.flags),
+            ACTIVATION_FLAG_GLM_DSA_TOP_K
         );
         assert_eq!(
             decoded.activation_f32_payload(2).unwrap(),

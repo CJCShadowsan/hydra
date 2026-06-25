@@ -37,11 +37,11 @@ pub(crate) fn forwarded_stage_message_timed(
     state.reserved = wire_dtype as i32;
     state.flags |= activation_state_flags_from_frame_flags(output.desc.flags);
     let encode_started = Instant::now();
-    let activation =
-        encode_output_activation_payload(wire_dtype, incoming, output, activation_width, state.flags)
+    let (activation_payload, raw_bytes) =
+        split_activation_payload_sidebands(incoming, output, activation_width, state.flags)
             .with_context(|| {
                 format!(
-                    "encode output activation payload; wire_dtype={wire_dtype:?} frame_dtype={:?} incoming_tokens={} output_tokens={} activation_width={} payload_bytes={} frame_payload_bytes={} state_flags={}",
+                    "split output activation payload; frame_dtype={:?} incoming_tokens={} output_tokens={} activation_width={} payload_bytes={} frame_payload_bytes={} state_flags={}",
                     output.desc.dtype,
                     incoming.token_count,
                     output.desc.token_count,
@@ -51,6 +51,26 @@ pub(crate) fn forwarded_stage_message_timed(
                     state.flags,
                 )
             })?;
+    let activation = encode_output_activation_payload(
+        wire_dtype,
+        incoming,
+        output,
+        activation_width,
+        state.flags,
+        activation_payload,
+    )
+    .with_context(|| {
+        format!(
+            "encode output activation payload; wire_dtype={wire_dtype:?} frame_dtype={:?} incoming_tokens={} output_tokens={} activation_width={} payload_bytes={} frame_payload_bytes={} state_flags={}",
+            output.desc.dtype,
+            incoming.token_count,
+            output.desc.token_count,
+            activation_width,
+            output.payload.len(),
+            output.desc.payload_bytes,
+            state.flags,
+        )
+    })?;
     Ok(ForwardedStageMessage {
         message: StageWireMessage {
             kind: incoming.kind,
@@ -64,10 +84,37 @@ pub(crate) fn forwarded_stage_message_timed(
             tokens: incoming.tokens.clone(),
             positions: incoming.positions.clone(),
             activation,
-            raw_bytes: Vec::new(),
+            raw_bytes,
         },
         activation_encode_ms: encode_started.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+fn split_activation_payload_sidebands<'a>(
+    incoming: &StageWireMessage,
+    output: &'a ActivationFrame,
+    activation_width: i32,
+    state_flags: i32,
+) -> Result<(&'a [u8], Vec<u8>)> {
+    if (state_flags & skippy_protocol::binary::state_flags::GLM_DSA_TOP_K_SIDEBAND) == 0 {
+        return Ok((&output.payload, Vec::new()));
+    }
+    let hidden_bytes = skippy_protocol::binary::activation_wire_bytes_with_state_flags(
+        WireActivationDType::F32,
+        incoming.token_count,
+        activation_width,
+        state_flags & !skippy_protocol::binary::state_flags::GLM_DSA_TOP_K_SIDEBAND,
+    )?;
+    if output.payload.len() < hidden_bytes {
+        bail!("GLM-DSA activation payload is smaller than hidden activation payload");
+    }
+    if (output.payload.len() - hidden_bytes) & 3 != 0 {
+        bail!("GLM-DSA top-k sideband payload is not i32-aligned");
+    }
+    Ok((
+        &output.payload[..hidden_bytes],
+        output.payload[hidden_bytes..].to_vec(),
+    ))
 }
 
 fn encode_output_activation_payload(
@@ -76,6 +123,7 @@ fn encode_output_activation_payload(
     output: &ActivationFrame,
     activation_width: i32,
     state_flags: i32,
+    activation_payload: &[u8],
 ) -> Result<Vec<u8>> {
     match (output.desc.dtype, wire_dtype) {
         (RuntimeActivationDType::F32, _) => Ok(
@@ -83,13 +131,16 @@ fn encode_output_activation_payload(
                 wire_dtype,
                 incoming.token_count,
                 activation_width,
-                &output.payload,
+                activation_payload,
                 state_flags,
             )?,
         ),
         (RuntimeActivationDType::F16, WireActivationDType::F16) => {
+            if (state_flags & skippy_protocol::binary::state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0 {
+                bail!("GLM-DSA top-k sideband does not support F16 passthrough payloads");
+            }
             validate_f16_passthrough_payload(incoming, output, activation_width, state_flags)?;
-            Ok(output.payload.clone())
+            Ok(activation_payload.to_vec())
         }
         (dtype, wire_dtype) => {
             bail!("unsupported activation dtype conversion: {dtype:?} to {wire_dtype:?}")
@@ -217,6 +268,19 @@ mod tests {
         )
     }
 
+    fn glm_dsa_top_k_sideband_frame() -> ActivationFrame {
+        let mut frame = f32_frame(
+            skippy_protocol::binary::ACTIVATION_FLAG_GLM_DSA_TOP_K,
+            1,
+            &[1.0_f32, 2.0],
+        );
+        for value in [17_i32, 23] {
+            frame.payload.extend_from_slice(&value.to_le_bytes());
+        }
+        frame.desc.payload_bytes = frame.payload.len() as u64;
+        frame
+    }
+
     fn f16_frame() -> ActivationFrame {
         ActivationFrame {
             desc: ActivationDesc {
@@ -272,6 +336,32 @@ mod tests {
         assert_ne!(
             forwarded.message.state.flags & state_flags::RWKV7_V_FIRST_SIDEBAND,
             0
+        );
+    }
+
+    #[test]
+    fn forwarded_stage_message_carries_glm_dsa_top_k_as_raw_sideband() {
+        let forwarded = forwarded_stage_message_timed(
+            &stage_config(),
+            &incoming_message(),
+            &glm_dsa_top_k_sideband_frame(),
+            WireActivationDType::F32,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(forwarded.message.activation.len(), 8);
+        assert_eq!(
+            forwarded.message.raw_bytes,
+            [17_i32.to_le_bytes(), 23_i32.to_le_bytes()].concat()
+        );
+        assert_ne!(
+            forwarded.message.state.flags & state_flags::GLM_DSA_TOP_K_SIDEBAND,
+            0
+        );
+        assert_eq!(
+            activation_frame_flags_from_state_flags(forwarded.message.state.flags),
+            skippy_protocol::binary::ACTIVATION_FLAG_GLM_DSA_TOP_K
         );
     }
 
