@@ -90,6 +90,7 @@ struct SidebandSummary {
     sideband_i32: u64,
     avg_hidden_bytes_per_token: Option<f64>,
     avg_sideband_bytes_per_token: Option<f64>,
+    avg_sideband_i32_per_token: Option<f64>,
     sideband_to_hidden_ratio: Option<f64>,
 }
 
@@ -363,6 +364,7 @@ fn summarize_sideband_records(
             summary.avg_hidden_bytes_per_token = nonzero_div(summary.hidden_bytes, summary.tokens);
             summary.avg_sideband_bytes_per_token =
                 nonzero_div(summary.sideband_bytes, summary.tokens);
+            summary.avg_sideband_i32_per_token = nonzero_div(summary.sideband_i32, summary.tokens);
             summary.sideband_to_hidden_ratio =
                 nonzero_div(summary.sideband_bytes, summary.hidden_bytes);
         }
@@ -522,7 +524,9 @@ mod tests {
         assert_eq!(decode.tokens, 1);
         assert_eq!(decode.hidden_bytes, 24576);
         assert_eq!(decode.sideband_bytes, 3072);
+        assert_eq!(decode.sideband_i32, 768);
         assert_eq!(decode.avg_sideband_bytes_per_token, Some(3072.0));
+        assert_eq!(decode.avg_sideband_i32_per_token, Some(768.0));
         assert_eq!(decode.sideband_to_hidden_ratio, Some(0.125));
     }
 }

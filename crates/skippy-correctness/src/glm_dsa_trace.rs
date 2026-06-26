@@ -181,6 +181,31 @@ fn run_variant(
         .map(|message| message.top_k_count)
         .max()
         .unwrap_or(0);
+    let fake_downstream_total_top_k_count = fake_messages
+        .iter()
+        .map(|message| message.top_k_count)
+        .sum();
+    let fake_downstream_top_k_token_count = fake_messages
+        .iter()
+        .filter(|message| message.top_k_count > 0)
+        .map(message_token_count)
+        .sum::<usize>();
+    let fake_downstream_avg_top_k_per_token = nonzero_div_usize(
+        fake_downstream_total_top_k_count,
+        fake_downstream_top_k_token_count,
+    );
+    let fake_downstream_max_top_k_per_token = fake_messages
+        .iter()
+        .filter(|message| message.top_k_count > 0)
+        .filter_map(|message| nonzero_div_usize(message.top_k_count, message_token_count(message)))
+        .reduce(f64::max);
+    let fake_downstream_top_k_sideband_to_f16_hidden_ratio = fake_downstream_avg_top_k_per_token
+        .map(|top_k| {
+            let sideband_bytes_per_token = top_k * std::mem::size_of::<i32>() as f64;
+            let hidden_bytes_per_token =
+                f64::from(args.activation_width) * std::mem::size_of::<u16>() as f64;
+            sideband_bytes_per_token / hidden_bytes_per_token
+        });
 
     Ok(GlmDsaTraceVariantReport {
         variant: variant.name,
@@ -196,12 +221,20 @@ fn run_variant(
         fake_downstream_prefill_token_count,
         fake_downstream_top_k_message_count,
         fake_downstream_max_top_k_count,
+        fake_downstream_total_top_k_count,
+        fake_downstream_avg_top_k_per_token,
+        fake_downstream_max_top_k_per_token,
+        fake_downstream_top_k_sideband_to_f16_hidden_ratio,
         trace_line_count,
         timing_line_count,
         prompt_prefill_tok_s,
         prompt_decode_tok_s,
         avg_128_token_timing,
     })
+}
+
+fn message_token_count(message: &FakeDownstreamMessage) -> usize {
+    usize::try_from(message.token_count.max(0)).unwrap_or(0)
 }
 
 fn write_stage_config(
@@ -546,6 +579,10 @@ fn timing_speedup(
     let fused = fused?;
     let direct = direct?;
     (fused.total_us > 0.0).then_some(direct.total_us / fused.total_us)
+}
+
+fn nonzero_div_usize(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator > 0).then_some(numerator as f64 / denominator as f64)
 }
 
 fn stage_model_path(args: &GlmDsaStage0TraceArgs) -> Result<PathBuf> {
