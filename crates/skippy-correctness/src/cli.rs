@@ -303,6 +303,11 @@ pub struct GlmDsaStage0TraceArgs {
     pub trace_filter: String,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub trace_stats_max_bytes: u32,
+    #[arg(
+        long,
+        help = "Allow fused/direct traced tensor digest mismatches. By default, matching trace points must be byte-identical."
+    )]
+    pub allow_trace_mismatch: bool,
     #[arg(long)]
     pub case_root: Option<PathBuf>,
 }

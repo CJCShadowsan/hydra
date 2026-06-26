@@ -1105,6 +1105,8 @@ fn open_stage_model(path: &StagePath, shape: StageShape, n_gpu_layers: i32) -> R
             include_output: shape.include_output,
             filter_tensors_on_load: path.filter_tensors_on_load,
             use_mmap: true,
+            use_mmap_prefetch: true,
+            use_mmap_buffer: true,
         },
     )
     .with_context(|| {

@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{ErrorKind, Write},
     net::{SocketAddr, TcpListener},
@@ -22,7 +23,10 @@ use skippy_protocol::binary::{
 
 use crate::{
     cli::{FlashAttentionArg, GlmDsaStage0TraceArgs, StageLoadMode},
-    report::{GlmDsaStage0TraceReport, GlmDsaTimingReport, GlmDsaTraceVariantReport},
+    report::{
+        GlmDsaStage0TraceReport, GlmDsaTimingReport, GlmDsaTraceKeyReport,
+        GlmDsaTraceParityMismatchReport, GlmDsaTraceParityReport, GlmDsaTraceVariantReport,
+    },
     support::{ChildGuard, connect_ready, parse_wire_dtype},
 };
 
@@ -81,6 +85,16 @@ pub fn glm_dsa_stage0_trace(args: GlmDsaStage0TraceArgs) -> Result<()> {
     )?;
 
     let both_variants_completed = fused.prompt_success && direct.prompt_success;
+    let trace_parity = compare_variant_traces(
+        &fused.stage_log,
+        &direct.stage_log,
+        !args.allow_trace_mismatch,
+    )?;
+    let status = if both_variants_completed && trace_parity.matched {
+        "pass"
+    } else {
+        "fail"
+    };
     let fused_prefill_speedup_vs_direct =
         speedup(fused.prompt_prefill_tok_s, direct.prompt_prefill_tok_s);
     let fused_glm_dsa_op_speedup_vs_direct = timing_speedup(
@@ -89,11 +103,7 @@ pub fn glm_dsa_stage0_trace(args: GlmDsaStage0TraceArgs) -> Result<()> {
     );
     let report = GlmDsaStage0TraceReport {
         mode: "glm-dsa-stage0-trace",
-        status: if both_variants_completed {
-            "pass"
-        } else {
-            "fail"
-        },
+        status,
         run_id,
         model_id: args
             .runtime
@@ -111,11 +121,15 @@ pub fn glm_dsa_stage0_trace(args: GlmDsaStage0TraceArgs) -> Result<()> {
         both_variants_completed,
         fused_prefill_speedup_vs_direct,
         fused_glm_dsa_op_speedup_vs_direct,
+        trace_parity,
         variants: vec![fused, direct],
     };
     emit_report(&report, args.output.report_out.as_deref())?;
     if !report.both_variants_completed {
         bail!("GLM-DSA stage0 trace did not complete both variants");
+    }
+    if report.trace_parity.required && !report.trace_parity.matched {
+        bail!("GLM-DSA fused/direct trace parity failed");
     }
     Ok(())
 }
@@ -272,6 +286,167 @@ fn run_variant(
         prompt_decode_tok_s,
         avg_128_token_timing,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorTraceRecord {
+    key: TensorTraceKey,
+    tensor_type: String,
+    shape: [i64; 4],
+    stats: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TensorTraceKey {
+    tokens: u64,
+    name: String,
+    occurrence: usize,
+}
+
+fn compare_variant_traces(
+    fused_log_path: &str,
+    direct_log_path: &str,
+    required: bool,
+) -> Result<GlmDsaTraceParityReport> {
+    let fused_log =
+        fs::read_to_string(fused_log_path).with_context(|| format!("read {fused_log_path}"))?;
+    let direct_log =
+        fs::read_to_string(direct_log_path).with_context(|| format!("read {direct_log_path}"))?;
+    let fused = parse_tensor_trace_records(&fused_log);
+    let direct = parse_tensor_trace_records(&direct_log);
+    Ok(compare_tensor_traces(required, fused, direct))
+}
+
+fn parse_tensor_trace_records(log: &str) -> BTreeMap<TensorTraceKey, TensorTraceRecord> {
+    let mut seen = BTreeMap::<(u64, String), usize>::new();
+    let mut records = BTreeMap::new();
+    for line in log
+        .lines()
+        .filter(|line| line.contains("glm_dsa_tensor_trace"))
+    {
+        let Some(record) = parse_tensor_trace_record(line, &mut seen) else {
+            continue;
+        };
+        records.insert(record.key.clone(), record);
+    }
+    records
+}
+
+fn parse_tensor_trace_record(
+    line: &str,
+    seen: &mut BTreeMap<(u64, String), usize>,
+) -> Option<TensorTraceRecord> {
+    let fields = parse_trace_fields(line);
+    let tokens = fields.get("tokens")?.parse::<u64>().ok()?;
+    let name = fields.get("name")?.to_string();
+    let occurrence_key = (tokens, name.clone());
+    let occurrence = *seen
+        .entry(occurrence_key)
+        .and_modify(|count| *count += 1)
+        .or_insert(0);
+    Some(TensorTraceRecord {
+        key: TensorTraceKey {
+            tokens,
+            name,
+            occurrence,
+        },
+        tensor_type: fields.get("type")?.to_string(),
+        shape: parse_trace_shape(fields.get("ne")?)?,
+        stats: fields.get("stats").map(|value| value.to_string()),
+    })
+}
+
+fn parse_trace_fields(line: &str) -> BTreeMap<&str, &str> {
+    line.split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect()
+}
+
+fn parse_trace_shape(value: &str) -> Option<[i64; 4]> {
+    let values = value
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .split(',')
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    <[i64; 4]>::try_from(values).ok()
+}
+
+fn compare_tensor_traces(
+    required: bool,
+    fused: BTreeMap<TensorTraceKey, TensorTraceRecord>,
+    direct: BTreeMap<TensorTraceKey, TensorTraceRecord>,
+) -> GlmDsaTraceParityReport {
+    let fused_keys = fused.keys().cloned().collect::<BTreeSet<_>>();
+    let direct_keys = direct.keys().cloned().collect::<BTreeSet<_>>();
+    let shared_keys = fused_keys
+        .intersection(&direct_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_in_fused = direct_keys
+        .difference(&fused_keys)
+        .map(trace_key_report)
+        .collect::<Vec<_>>();
+    let missing_in_direct = fused_keys
+        .difference(&direct_keys)
+        .map(trace_key_report)
+        .collect::<Vec<_>>();
+    let mismatches = shared_keys
+        .iter()
+        .filter_map(|key| compare_tensor_trace_record(key, &fused[key], &direct[key]))
+        .collect::<Vec<_>>();
+    let compared_trace_count = shared_keys.len();
+    let matched = !required || (compared_trace_count > 0 && mismatches.is_empty());
+    GlmDsaTraceParityReport {
+        required,
+        matched,
+        fused_trace_count: fused.len(),
+        direct_trace_count: direct.len(),
+        compared_trace_count,
+        mismatched_trace_count: mismatches.len(),
+        missing_in_fused_count: missing_in_fused.len(),
+        missing_in_direct_count: missing_in_direct.len(),
+        mismatches,
+        missing_in_fused,
+        missing_in_direct,
+    }
+}
+
+fn compare_tensor_trace_record(
+    key: &TensorTraceKey,
+    fused: &TensorTraceRecord,
+    direct: &TensorTraceRecord,
+) -> Option<GlmDsaTraceParityMismatchReport> {
+    let reason = if fused.tensor_type != direct.tensor_type {
+        Some("type mismatch")
+    } else if fused.shape != direct.shape {
+        Some("shape mismatch")
+    } else if fused.stats.is_none() || direct.stats.is_none() {
+        Some("missing stats")
+    } else if fused.stats != direct.stats {
+        Some("stats digest mismatch")
+    } else {
+        None
+    }?;
+    Some(GlmDsaTraceParityMismatchReport {
+        key: trace_key_report(key),
+        reason: reason.to_string(),
+        fused_stats: fused.stats.clone(),
+        direct_stats: direct.stats.clone(),
+        fused_type: fused.tensor_type.clone(),
+        direct_type: direct.tensor_type.clone(),
+        fused_shape: fused.shape,
+        direct_shape: direct.shape,
+    })
+}
+
+fn trace_key_report(key: &TensorTraceKey) -> GlmDsaTraceKeyReport {
+    GlmDsaTraceKeyReport {
+        tokens: key.tokens,
+        name: key.name.clone(),
+        occurrence: key.occurrence,
+    }
 }
 
 fn message_token_count(message: &FakeDownstreamMessage) -> usize {
@@ -746,7 +921,8 @@ fn path_str(path: &Path) -> Result<&str> {
 mod tests {
     use super::{
         FakeDownstreamMessage, WireMessageKind, active_top_k_window_count,
-        causal_visible_top_k_count, finite_top_k_count,
+        causal_visible_top_k_count, compare_tensor_traces, finite_top_k_count,
+        parse_tensor_trace_records,
     };
 
     #[test]
@@ -780,5 +956,52 @@ mod tests {
         assert_eq!(causal_visible_top_k_count(&message), 7);
         assert_eq!(finite_top_k_count(&message), 3);
         assert_eq!(active_top_k_window_count(&message), 5);
+    }
+
+    #[test]
+    fn parses_tensor_trace_records_with_digest_stats() {
+        let traces = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=128 op=mla_attention node=1 name=kqv_out-0 type=f16 ne=[6144,128,1,1] nb=[2,12288,1572864,1572864] contiguous=1 nbytes=1572864 values=[0,1] stats=fnv64:abcd count=786432 sum=1 mean=2 max_abs=3\n",
+        );
+
+        let record = traces.values().next().expect("trace record");
+        assert_eq!(record.key.tokens, 128);
+        assert_eq!(record.key.name, "kqv_out-0");
+        assert_eq!(record.tensor_type, "f16");
+        assert_eq!(record.shape, [6144, 128, 1, 1]);
+        assert_eq!(record.stats.as_deref(), Some("fnv64:abcd"));
+    }
+
+    #[test]
+    fn trace_parity_passes_with_direct_only_trace_points() {
+        let fused = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=128 op=mla_attention node=1 name=kqv_out-0 type=f16 ne=[6144,128,1,1] nb=[2,12288,1572864,1572864] contiguous=1 nbytes=1572864 values=[0] stats=fnv64:aaaa count=1 sum=0 mean=0 max_abs=0\n",
+        );
+        let direct = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=128 op=dsa_sparse_attn node=1 name=dsa_sparse_attn-0 type=f16 ne=[6144,128,1,1] nb=[2,12288,1572864,1572864] contiguous=1 nbytes=1572864 values=[0] stats=fnv64:bbbb count=1 sum=0 mean=0 max_abs=0\n\
+             skippy: glm_dsa_tensor_trace stage=0 tokens=128 op=mla_attention node=2 name=kqv_out-0 type=f16 ne=[6144,128,1,1] nb=[2,12288,1572864,1572864] contiguous=1 nbytes=1572864 values=[0] stats=fnv64:aaaa count=1 sum=0 mean=0 max_abs=0\n",
+        );
+
+        let report = compare_tensor_traces(true, fused, direct);
+        assert!(report.matched);
+        assert_eq!(report.compared_trace_count, 1);
+        assert_eq!(report.missing_in_fused_count, 1);
+        assert_eq!(report.mismatched_trace_count, 0);
+    }
+
+    #[test]
+    fn trace_parity_fails_on_shared_digest_mismatch() {
+        let fused = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=128 op=mla_attention node=1 name=kqv_out-0 type=f16 ne=[6144,128,1,1] nb=[2,12288,1572864,1572864] contiguous=1 nbytes=1572864 values=[0] stats=fnv64:aaaa count=1 sum=0 mean=0 max_abs=0\n",
+        );
+        let direct = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=128 op=mla_attention node=2 name=kqv_out-0 type=f16 ne=[6144,128,1,1] nb=[2,12288,1572864,1572864] contiguous=1 nbytes=1572864 values=[0] stats=fnv64:bbbb count=1 sum=0 mean=0 max_abs=0\n",
+        );
+
+        let report = compare_tensor_traces(true, fused, direct);
+        assert!(!report.matched);
+        assert_eq!(report.compared_trace_count, 1);
+        assert_eq!(report.mismatched_trace_count, 1);
+        assert_eq!(report.mismatches[0].reason, "stats digest mismatch");
     }
 }

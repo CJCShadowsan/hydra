@@ -311,7 +311,45 @@ pub struct GlmDsaStage0TraceReport {
     pub both_variants_completed: bool,
     pub fused_prefill_speedup_vs_direct: Option<f64>,
     pub fused_glm_dsa_op_speedup_vs_direct: Option<f64>,
+    pub trace_parity: GlmDsaTraceParityReport,
     pub variants: Vec<GlmDsaTraceVariantReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlmDsaTraceParityReport {
+    pub required: bool,
+    pub matched: bool,
+    pub fused_trace_count: usize,
+    pub direct_trace_count: usize,
+    pub compared_trace_count: usize,
+    pub mismatched_trace_count: usize,
+    pub missing_in_fused_count: usize,
+    pub missing_in_direct_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mismatches: Vec<GlmDsaTraceParityMismatchReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_in_fused: Vec<GlmDsaTraceKeyReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_in_direct: Vec<GlmDsaTraceKeyReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GlmDsaTraceKeyReport {
+    pub tokens: u64,
+    pub name: String,
+    pub occurrence: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlmDsaTraceParityMismatchReport {
+    pub key: GlmDsaTraceKeyReport,
+    pub reason: String,
+    pub fused_stats: Option<String>,
+    pub direct_stats: Option<String>,
+    pub fused_type: String,
+    pub direct_type: String,
+    pub fused_shape: [i64; 4],
+    pub direct_shape: [i64; 4],
 }
 
 #[derive(Debug, Serialize)]
