@@ -1,0 +1,63 @@
+From 873b1049cf71931f3ec4389e6a8edc31034c647b Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Fri, 26 Jun 2026 12:41:42 +1000
+Subject: [PATCH] Pair GLM-DSA sparse attention V accumulation on Metal
+
+---
+ ggml/src/ggml-metal/ggml-metal.metal | 30 ++++++++++++++++++++--------
+ 1 file changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 714ccd8fa..70bca1e2f 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9595,8 +9595,10 @@ kernel void kernel_dsa_sparse_attn_impl(
+ 
+     const float sum_score = reduce[0];
+ 
+-    for (int32_t i_dv = tid; i_dv < args.ne20; i_dv += nth) {
+-        float acc = 0.0f;
++    for (int32_t i_dv0 = tid*2; i_dv0 < args.ne20; i_dv0 += nth*2) {
++        const int32_t i_dv1 = i_dv0 + 1;
++        float acc0 = 0.0f;
++        float acc1 = 0.0f;
+ 
+         if (sum_score > 0.0f && isfinite(sum_score)) {
+             for (int32_t i_top = 0; i_top < active_top_end; ++i_top) {
+@@ -9611,15 +9613,27 @@ kernel void kernel_dsa_sparse_attn_impl(
+                     continue;
+                 }
+ 
+-                device const V * v_ptr = (device const V *) (v +
+-                        i_dv*args.nb20 + i_kv*args.nb21 + i_v_head*args.nb22 + i_stream*args.nb23);
+-                acc += p * float(*v_ptr);
++                device const V * v0_ptr = (device const V *) (v +
++                        i_dv0*args.nb20 + i_kv*args.nb21 + i_v_head*args.nb22 + i_stream*args.nb23);
++                acc0 += p * float(*v0_ptr);
++
++                if (i_dv1 < args.ne20) {
++                    device const V * v1_ptr = (device const V *) (v +
++                            i_dv1*args.nb20 + i_kv*args.nb21 + i_v_head*args.nb22 + i_stream*args.nb23);
++                    acc1 += p * float(*v1_ptr);
++                }
+             }
+         }
+ 
+-        device float * dst_ptr = (device float *) (dst +
+-                i_dv*args.nb0 + i_batch*args.nb1 + i_head*args.nb2 + i_stream*args.nb3);
+-        *dst_ptr = acc;
++        device float * dst0_ptr = (device float *) (dst +
++                i_dv0*args.nb0 + i_batch*args.nb1 + i_head*args.nb2 + i_stream*args.nb3);
++        *dst0_ptr = acc0;
++
++        if (i_dv1 < args.ne20) {
++            device float * dst1_ptr = (device float *) (dst +
++                    i_dv1*args.nb0 + i_batch*args.nb1 + i_head*args.nb2 + i_stream*args.nb3);
++            *dst1_ptr = acc1;
++        }
+     }
+ }
+ 
+-- 
+2.53.0
+
