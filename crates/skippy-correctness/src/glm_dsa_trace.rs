@@ -30,6 +30,7 @@ use crate::{
 struct FakeDownstreamMessage {
     kind: WireMessageKind,
     token_count: i32,
+    activation_bytes: usize,
     top_k_count: usize,
 }
 
@@ -190,6 +191,11 @@ fn run_variant(
         .filter(|message| message.top_k_count > 0)
         .map(message_token_count)
         .sum::<usize>();
+    let fake_downstream_top_k_activation_bytes = fake_messages
+        .iter()
+        .filter(|message| message.top_k_count > 0)
+        .map(|message| message.activation_bytes)
+        .sum::<usize>();
     let fake_downstream_avg_top_k_per_token = nonzero_div_usize(
         fake_downstream_total_top_k_count,
         fake_downstream_top_k_token_count,
@@ -199,13 +205,10 @@ fn run_variant(
         .filter(|message| message.top_k_count > 0)
         .filter_map(|message| nonzero_div_usize(message.top_k_count, message_token_count(message)))
         .reduce(f64::max);
-    let fake_downstream_top_k_sideband_to_f16_hidden_ratio = fake_downstream_avg_top_k_per_token
-        .map(|top_k| {
-            let sideband_bytes_per_token = top_k * std::mem::size_of::<i32>() as f64;
-            let hidden_bytes_per_token =
-                f64::from(args.activation_width) * std::mem::size_of::<u16>() as f64;
-            sideband_bytes_per_token / hidden_bytes_per_token
-        });
+    let fake_downstream_top_k_sideband_to_hidden_ratio = nonzero_div_usize(
+        fake_downstream_total_top_k_count * std::mem::size_of::<i32>(),
+        fake_downstream_top_k_activation_bytes,
+    );
 
     Ok(GlmDsaTraceVariantReport {
         variant: variant.name,
@@ -224,7 +227,7 @@ fn run_variant(
         fake_downstream_total_top_k_count,
         fake_downstream_avg_top_k_per_token,
         fake_downstream_max_top_k_per_token,
-        fake_downstream_top_k_sideband_to_f16_hidden_ratio,
+        fake_downstream_top_k_sideband_to_hidden_ratio,
         trace_line_count,
         timing_line_count,
         prompt_prefill_tok_s,
@@ -417,6 +420,7 @@ impl FakeDownstreamGuard {
                             let summary = FakeDownstreamMessage {
                                 kind: message.kind,
                                 token_count: message.token_count,
+                                activation_bytes: message.activation.len(),
                                 top_k_count: message.raw_bytes.len() / std::mem::size_of::<i32>(),
                             };
                             thread_messages
