@@ -1,0 +1,64 @@
+From eab80fa95418e251bf612f8aa555f05b9361b699 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Fri, 26 Jun 2026 12:34:18 +1000
+Subject: [PATCH] Cache GLM-DSA sparse attention Q row on Metal
+
+---
+ ggml/src/ggml-metal/ggml-metal.metal | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 714ccd8fa..d049c3709 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9494,9 +9494,11 @@ kernel void kernel_dsa_sparse_attn_impl(
+         uint3                 tptg  [[threads_per_threadgroup]]) {
+     constexpr int32_t DSA_SPARSE_ATTN_MAX_TOP_K = 4096;
+     constexpr int32_t DSA_SPARSE_ATTN_MAX_THREADS = 256;
++    constexpr int32_t DSA_SPARSE_ATTN_MAX_Q_DK = 2048;
+ 
+     threadgroup float scores[DSA_SPARSE_ATTN_MAX_TOP_K];
+     threadgroup float reduce[DSA_SPARSE_ATTN_MAX_THREADS];
++    threadgroup float q_cache[DSA_SPARSE_ATTN_MAX_Q_DK];
+ 
+     const int32_t i_batch  = tgpig.x;
+     const int32_t i_head   = tgpig.y;
+@@ -9513,6 +9515,16 @@ kernel void kernel_dsa_sparse_attn_impl(
+     const int32_t i_kv_head     = i_head/n_head_per_kv;
+     const int32_t i_v_head      = i_head/n_head_per_v;
+     const int32_t i_top_stream  = i_stream%args.ne42;
++    const bool use_q_cache      = args.ne00 <= DSA_SPARSE_ATTN_MAX_Q_DK;
++
++    if (use_q_cache) {
++        for (int32_t i_dk = tid; i_dk < args.ne00; i_dk += nth) {
++            device const float * q_ptr = (device const float *) (q +
++                    i_dk*args.nb00 + i_batch*args.nb01 + i_head*args.nb02 + i_stream*args.nb03);
++            q_cache[i_dk] = *q_ptr;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+     float local_max = -FLT_MAX;
+     float local_active_top_end = 0.0f;
+@@ -9533,11 +9545,15 @@ kernel void kernel_dsa_sparse_attn_impl(
+                 float qk = 0.0f;
+ 
+                 for (int32_t i_dk = 0; i_dk < args.ne00; ++i_dk) {
+-                    device const float * q_ptr = (device const float *) (q +
+-                            i_dk*args.nb00 + i_batch*args.nb01 + i_head*args.nb02 + i_stream*args.nb03);
+                     device const K * k_ptr = (device const K *) (k +
+                             i_dk*args.nb10 + i_kv*args.nb11 + i_kv_head*args.nb12 + i_stream*args.nb13);
+-                    qk += (*q_ptr) * float(*k_ptr);
++                    if (use_q_cache) {
++                        qk += q_cache[i_dk] * float(*k_ptr);
++                    } else {
++                        device const float * q_ptr = (device const float *) (q +
++                                i_dk*args.nb00 + i_batch*args.nb01 + i_head*args.nb02 + i_stream*args.nb03);
++                        qk += (*q_ptr) * float(*k_ptr);
++                    }
+                 }
+ 
+                 score = qk*args.scale + mask;
+-- 
+2.53.0
+
