@@ -294,6 +294,57 @@ pub struct NativeMtpOpenAiCaseReport {
     pub metrics: NativeMtpOpenAiMetricsReport,
 }
 
+#[derive(Debug, Serialize)]
+pub struct GlmDsaStage0TraceReport {
+    pub mode: &'static str,
+    pub status: &'static str,
+    pub run_id: String,
+    pub model_id: String,
+    pub model_path: String,
+    pub case_root: String,
+    pub stage_layer_end: u32,
+    pub activation_width: i32,
+    pub activation_wire_dtype: String,
+    pub prefill_chunk_size: u32,
+    pub max_new_tokens: u32,
+    pub trace_filter: String,
+    pub both_variants_completed: bool,
+    pub fused_prefill_speedup_vs_direct: Option<f64>,
+    pub fused_glm_dsa_op_speedup_vs_direct: Option<f64>,
+    pub variants: Vec<GlmDsaTraceVariantReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlmDsaTraceVariantReport {
+    pub variant: &'static str,
+    pub direct_sparse_attn: bool,
+    pub fused_sparse_mask: bool,
+    pub prompt_exit_code: Option<i32>,
+    pub prompt_success: bool,
+    pub stage_log: String,
+    pub prompt_log: String,
+    pub fake_downstream_message_count: usize,
+    pub fake_downstream_prefill_message_count: usize,
+    pub fake_downstream_decode_message_count: usize,
+    pub fake_downstream_prefill_token_count: usize,
+    pub fake_downstream_top_k_message_count: usize,
+    pub fake_downstream_max_top_k_count: usize,
+    pub trace_line_count: usize,
+    pub timing_line_count: usize,
+    pub prompt_prefill_tok_s: Option<f64>,
+    pub prompt_decode_tok_s: Option<f64>,
+    pub avg_128_token_timing: Option<GlmDsaTimingReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GlmDsaTimingReport {
+    pub chunk_count: usize,
+    pub total_us: f64,
+    pub indexer_topk_us: f64,
+    pub sparse_mask_us: f64,
+    pub mla_attention_us: f64,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct NativeMtpOpenAiMetricsReport {
     pub native_mtp_enabled: bool,
