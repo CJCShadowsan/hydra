@@ -338,6 +338,12 @@ pub struct RunArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Allow intentionally unbalanced stage layer counts for heterogeneous lab hosts."
+    )]
+    pub allow_unbalanced_stages: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Enable llama.cpp GLM-DSA op/group timing logs in every launched stage."
     )]
     pub glm_dsa_op_timing: bool,

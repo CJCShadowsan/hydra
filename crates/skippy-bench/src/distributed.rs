@@ -329,7 +329,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
     let ranges = parse_stage_ranges(&args.splits, args.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_balance_for_run(&args, &ranges)?;
     let run_id = args.run_id.clone().unwrap_or_else(generate_bench_run_id);
     let run_dir = args.work_dir.join(&run_id);
     let config_dir = run_dir.join("configs");
@@ -398,6 +398,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         "stage_downstream_wire_mbps": args.stage_downstream_wire_mbps,
         "stage_telemetry_queue_capacity": args.stage_telemetry_queue_capacity,
         "stage_telemetry_level": args.stage_telemetry_level,
+        "allow_unbalanced_stages": args.allow_unbalanced_stages,
         "glm_dsa_op_timing": args.glm_dsa_op_timing,
         "stages": plan
             .stages
@@ -609,7 +610,7 @@ fn validate_focused_runtime_topology(run: &RunArgs) -> Result<()> {
     let ranges = parse_stage_ranges(&run.splits, run.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(run, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_balance_for_run(run, &ranges)?;
     Ok(())
 }
 
@@ -742,7 +743,7 @@ fn focused_runtime_schema_smoke_report(args: &FocusedRuntimeArgs) -> Result<Focu
     let ranges = parse_stage_ranges(&args.run.splits, args.run.layer_end)?;
     validate_distinct_stage_hosts(&hosts, ranges.len())?;
     validate_topology_plan(&args.run, &hosts, &ranges)?;
-    validate_balanced_stage_ranges(&ranges)?;
+    validate_stage_balance_for_run(&args.run, &ranges)?;
     let stage_count = ranges.len();
     let prompt_count = args.run.prompt_limit.unwrap_or(1);
     let model_identity = ModelIdentity::from_model_id(args.run.model_id.clone());
@@ -2618,6 +2619,14 @@ fn validate_balanced_stage_ranges(ranges: &[(u32, u32)]) -> Result<()> {
     Ok(())
 }
 
+fn validate_stage_balance_for_run(args: &RunArgs, ranges: &[(u32, u32)]) -> Result<()> {
+    if args.allow_unbalanced_stages {
+        Ok(())
+    } else {
+        validate_balanced_stage_ranges(ranges)
+    }
+}
+
 fn parse_stage_ranges(splits: &str, layer_end: u32) -> Result<Vec<(u32, u32)>> {
     let mut boundaries = vec![0];
     for split in splits
@@ -2811,6 +2820,7 @@ mod tests {
             stage_downstream_wire_mbps: None,
             stage_telemetry_queue_capacity: 8192,
             stage_telemetry_level: "summary".to_string(),
+            allow_unbalanced_stages: false,
             glm_dsa_op_timing: false,
         };
 
@@ -2840,6 +2850,18 @@ mod tests {
             validate_balanced_stage_ranges(&parse_stage_ranges("12,20,28", 40).unwrap()).is_err()
         );
         assert!(validate_balanced_stage_ranges(&parse_stage_ranges("1,4,7", 40).unwrap()).is_err());
+    }
+
+    #[test]
+    fn run_args_can_allow_unbalanced_stage_ranges() {
+        let ranges = parse_stage_ranges("50", 79).unwrap();
+        let mut args = test_run_args();
+
+        let err = validate_stage_balance_for_run(&args, &ranges).unwrap_err();
+        assert!(err.to_string().contains("evenly balanced"));
+
+        args.allow_unbalanced_stages = true;
+        validate_stage_balance_for_run(&args, &ranges).unwrap();
     }
 
     #[test]
@@ -3297,6 +3319,7 @@ mod tests {
             stage_downstream_wire_mbps: Some(1000.0),
             stage_telemetry_queue_capacity: 8192,
             stage_telemetry_level: "summary".to_string(),
+            allow_unbalanced_stages: false,
             glm_dsa_op_timing: false,
         };
         let plan = DeploymentPlan {
@@ -3420,6 +3443,7 @@ mod tests {
             stage_downstream_wire_mbps: None,
             stage_telemetry_queue_capacity: 8192,
             stage_telemetry_level: "summary".to_string(),
+            allow_unbalanced_stages: false,
             glm_dsa_op_timing: false,
         }
     }
