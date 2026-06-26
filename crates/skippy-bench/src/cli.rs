@@ -30,6 +30,8 @@ pub enum CommandKind {
     FocusedRuntime(FocusedRuntimeArgs),
     #[command(name = "glm-dsa-op-report")]
     GlmDsaOpReport(GlmDsaOpReportArgs),
+    #[command(name = "glm-dsa-op-compare")]
+    GlmDsaOpCompare(GlmDsaOpCompareArgs),
     Run(RunArgs),
 }
 
@@ -101,6 +103,24 @@ pub struct GlmDsaOpReportArgs {
         help = "Only include the first N timing records from each log. Use this for one request when a REPL log contains follow-up prompts."
     )]
     pub first_records: Option<usize>,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub struct GlmDsaOpCompareArgs {
+    #[arg(
+        long,
+        required = true,
+        help = "Baseline glm-dsa-op-report JSON. Repeat for multiple per-stage reports."
+    )]
+    pub baseline_report: Vec<PathBuf>,
+    #[arg(
+        long,
+        required = true,
+        help = "Candidate glm-dsa-op-report JSON. Repeat for multiple per-stage reports."
+    )]
+    pub candidate_report: Vec<PathBuf>,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }

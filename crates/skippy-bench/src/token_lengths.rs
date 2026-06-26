@@ -88,6 +88,8 @@ pub fn token_lengths(args: TokenLengthsArgs) -> Result<()> {
             load_mode: RuntimeLoadMode::RuntimeSlice,
             projector_path: None,
             use_mmap: true,
+            use_mmap_prefetch: true,
+            use_mmap_buffer: true,
             include_embeddings: true,
             include_output: false,
             filter_tensors_on_load: true,

@@ -1,27 +1,27 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::cli::GlmDsaOpReportArgs;
+use crate::cli::{GlmDsaOpCompareArgs, GlmDsaOpReportArgs};
 
 const OP_TIMING_PREFIX: &str = "skippy: glm_dsa_op_timing ";
 const SIDEBAND_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Phase {
     Prefill,
     Decode,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct OpBucket {
     nodes: u64,
     elapsed_us: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PhaseSummary {
     records: usize,
     tokens: u64,
@@ -47,7 +47,7 @@ struct PhaseSummary {
     shared_expert: OpBucket,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct LogSummary {
     path: PathBuf,
     records: usize,
@@ -55,7 +55,7 @@ struct LogSummary {
     sideband_records: BTreeMap<String, BTreeMap<Phase, SidebandSummary>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GlmDsaOpReport {
     logs: Vec<LogSummary>,
 }
@@ -89,7 +89,7 @@ struct TimingRecord {
     shared_expert_us: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct SidebandSummary {
     records: usize,
     tokens: u64,
@@ -128,6 +128,17 @@ pub fn glm_dsa_op_report(args: GlmDsaOpReportArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn glm_dsa_op_compare(args: GlmDsaOpCompareArgs) -> Result<()> {
+    let output = args.output.clone();
+    let report = build_comparison_report(&args)?;
+    let encoded = serde_json::to_vec_pretty(&report)?;
+    if let Some(path) = output {
+        fs::write(&path, &encoded).with_context(|| format!("write {}", path.display()))?;
+    }
+    println!("{}", String::from_utf8(encoded)?);
+    Ok(())
+}
+
 fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
     let mut logs = Vec::with_capacity(args.log.len());
     for path in &args.log {
@@ -151,6 +162,219 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         logs.push(summarize_log(path.clone(), &records, &sideband_records));
     }
     Ok(GlmDsaOpReport { logs })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct ComparisonKey {
+    stage: i32,
+    phase: Phase,
+}
+
+#[derive(Debug, Serialize)]
+struct GlmDsaOpComparisonReport {
+    baseline_reports: Vec<PathBuf>,
+    candidate_reports: Vec<PathBuf>,
+    summary: GlmDsaOpComparisonSummary,
+    rows: Vec<GlmDsaOpComparisonRow>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct GlmDsaOpComparisonSummary {
+    rows: usize,
+    candidate_sparse_mask_eliminated_rows: usize,
+    candidate_direct_sparse_rows: usize,
+    faster_rows: usize,
+    slower_rows: usize,
+    prefill_rows: usize,
+    prefill_slower_rows: usize,
+    decode_rows: usize,
+    decode_faster_rows: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct GlmDsaOpComparisonRow {
+    stage: i32,
+    phase: Phase,
+    baseline_tokens: u64,
+    candidate_tokens: u64,
+    baseline_total_us: u64,
+    candidate_total_us: u64,
+    total_us_ratio: Option<f64>,
+    baseline_avg_total_us_per_token: Option<f64>,
+    candidate_avg_total_us_per_token: Option<f64>,
+    avg_total_us_per_token_ratio: Option<f64>,
+    baseline_sparse_mask_us: u64,
+    candidate_sparse_mask_us: u64,
+    sparse_mask_us_delta: i128,
+    candidate_eliminated_sparse_mask: bool,
+    baseline_dsa_sparse_attn_us: u64,
+    candidate_dsa_sparse_attn_us: u64,
+    dsa_sparse_attn_us_delta: i128,
+    candidate_uses_direct_sparse_attn: bool,
+    baseline_indexer_topk_us: u64,
+    candidate_indexer_topk_us: u64,
+    indexer_topk_us_ratio: Option<f64>,
+    baseline_shared_expert_us: u64,
+    candidate_shared_expert_us: u64,
+    shared_expert_us_ratio: Option<f64>,
+}
+
+fn build_comparison_report(args: &GlmDsaOpCompareArgs) -> Result<GlmDsaOpComparisonReport> {
+    let baseline = load_phase_summaries(&args.baseline_report, "baseline")?;
+    let candidate = load_phase_summaries(&args.candidate_report, "candidate")?;
+    let mut rows = Vec::with_capacity(baseline.len());
+    for (key, baseline_summary) in &baseline {
+        let candidate_summary = candidate.get(key).with_context(|| {
+            format!(
+                "candidate report is missing stage {} {:?}",
+                key.stage, key.phase
+            )
+        })?;
+        rows.push(compare_phase(*key, baseline_summary, candidate_summary));
+    }
+    for key in candidate.keys() {
+        if !baseline.contains_key(key) {
+            bail!(
+                "candidate report has no matching baseline for stage {} {:?}",
+                key.stage,
+                key.phase
+            );
+        }
+    }
+    let summary = summarize_comparison_rows(&rows);
+    Ok(GlmDsaOpComparisonReport {
+        baseline_reports: args.baseline_report.clone(),
+        candidate_reports: args.candidate_report.clone(),
+        summary,
+        rows,
+    })
+}
+
+fn load_phase_summaries(
+    paths: &[PathBuf],
+    label: &str,
+) -> Result<BTreeMap<ComparisonKey, PhaseSummary>> {
+    let mut summaries = BTreeMap::new();
+    for path in paths {
+        let text = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let report = serde_json::from_slice::<GlmDsaOpReport>(&text)
+            .with_context(|| format!("parse {label} report {}", path.display()))?;
+        for log in report.logs {
+            for (stage, phases) in log.stage_records {
+                for (phase, summary) in phases {
+                    let key = ComparisonKey { stage, phase };
+                    if summaries.insert(key, summary).is_some() {
+                        bail!("{label} report contains duplicate stage {stage} {phase:?}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(summaries)
+}
+
+fn compare_phase(
+    key: ComparisonKey,
+    baseline: &PhaseSummary,
+    candidate: &PhaseSummary,
+) -> GlmDsaOpComparisonRow {
+    let baseline_dsa_sparse_attn_us = optional_elapsed_us(&baseline.dsa_sparse_attn);
+    let candidate_dsa_sparse_attn_us = optional_elapsed_us(&candidate.dsa_sparse_attn);
+    GlmDsaOpComparisonRow {
+        stage: key.stage,
+        phase: key.phase,
+        baseline_tokens: baseline.tokens,
+        candidate_tokens: candidate.tokens,
+        baseline_total_us: baseline.total_us,
+        candidate_total_us: candidate.total_us,
+        total_us_ratio: ratio(candidate.total_us, baseline.total_us),
+        baseline_avg_total_us_per_token: baseline.avg_total_us_per_token,
+        candidate_avg_total_us_per_token: candidate.avg_total_us_per_token,
+        avg_total_us_per_token_ratio: option_ratio(
+            candidate.avg_total_us_per_token,
+            baseline.avg_total_us_per_token,
+        ),
+        baseline_sparse_mask_us: baseline.sparse_mask.elapsed_us,
+        candidate_sparse_mask_us: candidate.sparse_mask.elapsed_us,
+        sparse_mask_us_delta: delta(
+            candidate.sparse_mask.elapsed_us,
+            baseline.sparse_mask.elapsed_us,
+        ),
+        candidate_eliminated_sparse_mask: candidate.sparse_mask.elapsed_us == 0
+            && baseline.sparse_mask.elapsed_us > 0,
+        baseline_dsa_sparse_attn_us,
+        candidate_dsa_sparse_attn_us,
+        dsa_sparse_attn_us_delta: delta(candidate_dsa_sparse_attn_us, baseline_dsa_sparse_attn_us),
+        candidate_uses_direct_sparse_attn: candidate_dsa_sparse_attn_us > 0,
+        baseline_indexer_topk_us: baseline.indexer_topk.elapsed_us,
+        candidate_indexer_topk_us: candidate.indexer_topk.elapsed_us,
+        indexer_topk_us_ratio: ratio(
+            candidate.indexer_topk.elapsed_us,
+            baseline.indexer_topk.elapsed_us,
+        ),
+        baseline_shared_expert_us: baseline.shared_expert.elapsed_us,
+        candidate_shared_expert_us: candidate.shared_expert.elapsed_us,
+        shared_expert_us_ratio: ratio(
+            candidate.shared_expert.elapsed_us,
+            baseline.shared_expert.elapsed_us,
+        ),
+    }
+}
+
+fn summarize_comparison_rows(rows: &[GlmDsaOpComparisonRow]) -> GlmDsaOpComparisonSummary {
+    let mut summary = GlmDsaOpComparisonSummary {
+        rows: rows.len(),
+        ..Default::default()
+    };
+    for row in rows {
+        if row.candidate_eliminated_sparse_mask {
+            summary.candidate_sparse_mask_eliminated_rows += 1;
+        }
+        if row.candidate_uses_direct_sparse_attn {
+            summary.candidate_direct_sparse_rows += 1;
+        }
+        if matches!(row.avg_total_us_per_token_ratio, Some(ratio) if ratio < 1.0) {
+            summary.faster_rows += 1;
+        }
+        if matches!(row.avg_total_us_per_token_ratio, Some(ratio) if ratio > 1.0) {
+            summary.slower_rows += 1;
+        }
+        match row.phase {
+            Phase::Prefill => {
+                summary.prefill_rows += 1;
+                if matches!(row.avg_total_us_per_token_ratio, Some(ratio) if ratio > 1.0) {
+                    summary.prefill_slower_rows += 1;
+                }
+            }
+            Phase::Decode => {
+                summary.decode_rows += 1;
+                if matches!(row.avg_total_us_per_token_ratio, Some(ratio) if ratio < 1.0) {
+                    summary.decode_faster_rows += 1;
+                }
+            }
+        }
+    }
+    summary
+}
+
+fn optional_elapsed_us(bucket: &Option<OpBucket>) -> u64 {
+    bucket.as_ref().map_or(0, |bucket| bucket.elapsed_us)
+}
+
+fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    (denominator != 0).then(|| numerator as f64 / denominator as f64)
+}
+
+fn option_ratio(numerator: Option<f64>, denominator: Option<f64>) -> Option<f64> {
+    numerator
+        .zip(denominator)
+        .and_then(|(numerator, denominator)| {
+            (denominator != 0.0).then_some(numerator / denominator)
+        })
+}
+
+fn delta(candidate: u64, baseline: u64) -> i128 {
+    i128::from(candidate) - i128::from(baseline)
 }
 
 fn parse_timing_records(text: &str) -> Result<Vec<TimingRecord>> {
@@ -453,8 +677,9 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Phase, parse_sideband_record, parse_sideband_records, parse_timing_record,
-        parse_timing_records, summarize_log,
+        ComparisonKey, OpBucket, Phase, PhaseSummary, compare_phase, parse_sideband_record,
+        parse_sideband_records, parse_timing_record, parse_timing_records,
+        summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -638,5 +863,92 @@ mod tests {
             Some(576.5)
         );
         assert_eq!(prefill.sideband_padding_ratio, Some(24_512.0 / 98_304.0));
+    }
+
+    #[test]
+    fn compares_sparse_mask_elimination_and_direct_sparse_cost() {
+        let baseline = phase_summary(128, 12_800, 2_000, 0, 1_000, 2_000);
+        let candidate = phase_summary(128, 25_600, 0, 7_500, 1_100, 2_100);
+        let row = compare_phase(
+            ComparisonKey {
+                stage: 0,
+                phase: Phase::Prefill,
+            },
+            &baseline,
+            &candidate,
+        );
+
+        assert_eq!(row.avg_total_us_per_token_ratio, Some(2.0));
+        assert_eq!(row.sparse_mask_us_delta, -2_000);
+        assert!(row.candidate_eliminated_sparse_mask);
+        assert_eq!(row.dsa_sparse_attn_us_delta, 7_500);
+        assert!(row.candidate_uses_direct_sparse_attn);
+    }
+
+    #[test]
+    fn summarizes_prefill_regression_and_decode_improvement() {
+        let baseline_prefill = phase_summary(128, 12_800, 2_000, 0, 1_000, 2_000);
+        let candidate_prefill = phase_summary(128, 25_600, 0, 7_500, 1_100, 2_100);
+        let baseline_decode = phase_summary(1, 400, 50, 0, 20, 100);
+        let candidate_decode = phase_summary(1, 300, 0, 80, 21, 100);
+        let rows = vec![
+            compare_phase(
+                ComparisonKey {
+                    stage: 0,
+                    phase: Phase::Prefill,
+                },
+                &baseline_prefill,
+                &candidate_prefill,
+            ),
+            compare_phase(
+                ComparisonKey {
+                    stage: 0,
+                    phase: Phase::Decode,
+                },
+                &baseline_decode,
+                &candidate_decode,
+            ),
+        ];
+
+        let summary = summarize_comparison_rows(&rows);
+        assert_eq!(summary.rows, 2);
+        assert_eq!(summary.candidate_sparse_mask_eliminated_rows, 2);
+        assert_eq!(summary.candidate_direct_sparse_rows, 2);
+        assert_eq!(summary.prefill_slower_rows, 1);
+        assert_eq!(summary.decode_faster_rows, 1);
+    }
+
+    fn phase_summary(
+        tokens: u64,
+        total_us: u64,
+        sparse_mask_us: u64,
+        dsa_sparse_attn_us: u64,
+        indexer_topk_us: u64,
+        shared_expert_us: u64,
+    ) -> PhaseSummary {
+        PhaseSummary {
+            records: 1,
+            tokens,
+            total_us,
+            avg_total_us_per_record: Some(total_us as f64),
+            avg_total_us_per_token: Some(total_us as f64 / tokens as f64),
+            indexer_topk: OpBucket {
+                nodes: 1,
+                elapsed_us: indexer_topk_us,
+            },
+            sparse_mask: OpBucket {
+                nodes: u64::from(sparse_mask_us > 0),
+                elapsed_us: sparse_mask_us,
+            },
+            dsa_sparse_attn: (dsa_sparse_attn_us > 0).then_some(OpBucket {
+                nodes: 1,
+                elapsed_us: dsa_sparse_attn_us,
+            }),
+            shared_expert: OpBucket {
+                nodes: 1,
+                elapsed_us: shared_expert_us,
+            },
+            ..PhaseSummary::default()
+        }
     }
 }

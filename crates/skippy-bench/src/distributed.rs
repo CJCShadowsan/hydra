@@ -1993,6 +1993,8 @@ impl DriverTokenizer {
                 load_mode,
                 projector_path: None,
                 use_mmap: true,
+                use_mmap_prefetch: true,
+                use_mmap_buffer: true,
                 include_embeddings: true,
                 include_output: plan.stages.len() == 1,
                 filter_tensors_on_load: args.stage_load_mode != "runtime-slice",
