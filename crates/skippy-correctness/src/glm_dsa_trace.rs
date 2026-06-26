@@ -472,6 +472,7 @@ fn avg_128_token_timing(stage_log: &str) -> Option<GlmDsaTimingReport> {
     let mut total_us = 0.0;
     let mut indexer_topk_us = 0.0;
     let mut sparse_mask_us = 0.0;
+    let mut dsa_sparse_attn_us = 0.0;
     let mut mla_attention_us = 0.0;
     for line in stage_log
         .lines()
@@ -484,6 +485,7 @@ fn avg_128_token_timing(stage_log: &str) -> Option<GlmDsaTimingReport> {
         total_us += timing_value(line, "total_us")?;
         indexer_topk_us += timing_value(line, "indexer_topk_us")?;
         sparse_mask_us += timing_value(line, "sparse_mask_us")?;
+        dsa_sparse_attn_us += timing_value(line, "dsa_sparse_attn_us").unwrap_or(0.0);
         mla_attention_us += timing_value(line, "mla_attention_us")?;
     }
     if count == 0 {
@@ -495,6 +497,7 @@ fn avg_128_token_timing(stage_log: &str) -> Option<GlmDsaTimingReport> {
         total_us: total_us / count_f,
         indexer_topk_us: indexer_topk_us / count_f,
         sparse_mask_us: sparse_mask_us / count_f,
+        dsa_sparse_attn_us: dsa_sparse_attn_us / count_f,
         mla_attention_us: mla_attention_us / count_f,
     })
 }

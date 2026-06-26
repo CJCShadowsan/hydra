@@ -342,6 +342,7 @@ pub struct GlmDsaTimingReport {
     pub total_us: f64,
     pub indexer_topk_us: f64,
     pub sparse_mask_us: f64,
+    pub dsa_sparse_attn_us: f64,
     pub mla_attention_us: f64,
 }
 

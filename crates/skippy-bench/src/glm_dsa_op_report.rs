@@ -36,6 +36,8 @@ struct PhaseSummary {
     sparse_mask_topk: Option<OpBucket>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sparse_mask_add: Option<OpBucket>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dsa_sparse_attn: Option<OpBucket>,
     mla_attention: OpBucket,
     routed_moe: OpBucket,
     shared_expert: OpBucket,
@@ -69,6 +71,8 @@ struct TimingRecord {
     sparse_mask_topk_us: Option<u64>,
     sparse_mask_add_nodes: Option<u64>,
     sparse_mask_add_us: Option<u64>,
+    dsa_sparse_attn_nodes: Option<u64>,
+    dsa_sparse_attn_us: Option<u64>,
     mla_attention_nodes: u64,
     mla_attention_us: u64,
     routed_moe_nodes: u64,
@@ -153,6 +157,7 @@ fn parse_timing_record(line: &str) -> Result<TimingRecord> {
     let sparse_mask_fill = parse_optional_bucket(&fields, "sparse_mask_fill")?;
     let sparse_mask_topk = parse_optional_bucket(&fields, "sparse_mask_topk")?;
     let sparse_mask_add = parse_optional_bucket(&fields, "sparse_mask_add")?;
+    let dsa_sparse_attn = parse_optional_bucket(&fields, "dsa_sparse_attn")?;
     Ok(TimingRecord {
         stage: parse_field(&fields, "stage")?,
         tokens: parse_field(&fields, "tokens")?,
@@ -167,6 +172,8 @@ fn parse_timing_record(line: &str) -> Result<TimingRecord> {
         sparse_mask_topk_us: sparse_mask_topk.elapsed_us,
         sparse_mask_add_nodes: sparse_mask_add.nodes,
         sparse_mask_add_us: sparse_mask_add.elapsed_us,
+        dsa_sparse_attn_nodes: dsa_sparse_attn.nodes,
+        dsa_sparse_attn_us: dsa_sparse_attn.elapsed_us,
         mla_attention_nodes: parse_field(&fields, "mla_attention_nodes")?,
         mla_attention_us: parse_field(&fields, "mla_attention_us")?,
         routed_moe_nodes: parse_field(&fields, "routed_moe_nodes")?,
@@ -298,6 +305,11 @@ fn summarize_log(
             record.sparse_mask_add_nodes,
             record.sparse_mask_add_us,
         );
+        add_optional_bucket(
+            &mut summary.dsa_sparse_attn,
+            record.dsa_sparse_attn_nodes,
+            record.dsa_sparse_attn_us,
+        );
         add_bucket(
             &mut summary.mla_attention,
             record.mla_attention_nodes,
@@ -394,6 +406,7 @@ mod tests {
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const LINE_WITH_SPARSE_BREAKDOWN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 sparse_mask_fill_nodes=47 sparse_mask_fill_us=1000 sparse_mask_topk_nodes=47 sparse_mask_topk_us=2000 sparse_mask_add_nodes=47 sparse_mask_add_us=3000 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
+    const LINE_WITH_DSA_SPARSE_ATTN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=0 sparse_mask_us=0 dsa_sparse_attn_nodes=47 dsa_sparse_attn_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
 
     #[test]
@@ -424,6 +437,22 @@ mod tests {
         assert_eq!(prefill.sparse_mask_fill.as_ref().unwrap().elapsed_us, 1000);
         assert_eq!(prefill.sparse_mask_topk.as_ref().unwrap().elapsed_us, 2000);
         assert_eq!(prefill.sparse_mask_add.as_ref().unwrap().elapsed_us, 3000);
+    }
+
+    #[test]
+    fn parses_optional_dsa_sparse_attention_breakdown() {
+        let record = parse_timing_record(LINE_WITH_DSA_SPARSE_ATTN).unwrap();
+        assert_eq!(record.dsa_sparse_attn_nodes, Some(47));
+        assert_eq!(record.dsa_sparse_attn_us, Some(114543));
+
+        let summary = summarize_log("stage1.log".into(), &[record], &[]);
+        let prefill = summary
+            .stage_records
+            .get(&1)
+            .unwrap()
+            .get(&Phase::Prefill)
+            .unwrap();
+        assert_eq!(prefill.dsa_sparse_attn.as_ref().unwrap().elapsed_us, 114543);
     }
 
     #[test]
