@@ -88,12 +88,12 @@ struct SidebandSummary {
     hidden_bytes: u64,
     sideband_bytes: u64,
     sideband_i32: u64,
-    logical_sideband_i32: u64,
+    causal_visible_sideband_i32: u64,
     padded_sideband_i32: u64,
     avg_hidden_bytes_per_token: Option<f64>,
     avg_sideband_bytes_per_token: Option<f64>,
     avg_sideband_i32_per_token: Option<f64>,
-    avg_logical_sideband_i32_per_token: Option<f64>,
+    avg_causal_visible_sideband_i32_per_token: Option<f64>,
     sideband_padding_ratio: Option<f64>,
     sideband_to_hidden_ratio: Option<f64>,
 }
@@ -364,9 +364,11 @@ fn summarize_sideband_records(
         summary.hidden_bytes += record.hidden_bytes;
         summary.sideband_bytes += record.sideband_bytes;
         summary.sideband_i32 += record.sideband_i32;
-        let logical_sideband_i32 = logical_sideband_i32(record);
-        summary.logical_sideband_i32 += logical_sideband_i32;
-        summary.padded_sideband_i32 += record.sideband_i32.saturating_sub(logical_sideband_i32);
+        let causal_visible_sideband_i32 = causal_visible_sideband_i32(record);
+        summary.causal_visible_sideband_i32 += causal_visible_sideband_i32;
+        summary.padded_sideband_i32 += record
+            .sideband_i32
+            .saturating_sub(causal_visible_sideband_i32);
     }
     for phases in stages.values_mut() {
         for summary in phases.values_mut() {
@@ -374,8 +376,8 @@ fn summarize_sideband_records(
             summary.avg_sideband_bytes_per_token =
                 nonzero_div(summary.sideband_bytes, summary.tokens);
             summary.avg_sideband_i32_per_token = nonzero_div(summary.sideband_i32, summary.tokens);
-            summary.avg_logical_sideband_i32_per_token =
-                nonzero_div(summary.logical_sideband_i32, summary.tokens);
+            summary.avg_causal_visible_sideband_i32_per_token =
+                nonzero_div(summary.causal_visible_sideband_i32, summary.tokens);
             summary.sideband_padding_ratio =
                 nonzero_div(summary.padded_sideband_i32, summary.sideband_i32);
             summary.sideband_to_hidden_ratio =
@@ -385,13 +387,20 @@ fn summarize_sideband_records(
     stages
 }
 
-fn logical_sideband_i32(record: &SidebandRecord) -> u64 {
+fn causal_visible_sideband_i32(record: &SidebandRecord) -> u64 {
     if record.tokens == 0 || record.sideband_i32 == 0 {
         return 0;
     }
     let sideband_width = record.sideband_i32 / record.tokens;
-    let logical_width = record.pos_start.saturating_add(record.tokens);
-    sideband_width.min(logical_width) * record.tokens
+    (0..record.tokens)
+        .map(|token_index| {
+            let causal_visible_width = record
+                .pos_start
+                .saturating_add(token_index)
+                .saturating_add(1);
+            sideband_width.min(causal_visible_width)
+        })
+        .sum()
 }
 
 fn sideband_phase(kind: &str, tokens: u64) -> Phase {
@@ -549,11 +558,14 @@ mod tests {
         assert_eq!(decode.hidden_bytes, 24576);
         assert_eq!(decode.sideband_bytes, 3072);
         assert_eq!(decode.sideband_i32, 768);
-        assert_eq!(decode.logical_sideband_i32, 719);
+        assert_eq!(decode.causal_visible_sideband_i32, 719);
         assert_eq!(decode.padded_sideband_i32, 49);
         assert_eq!(decode.avg_sideband_bytes_per_token, Some(3072.0));
         assert_eq!(decode.avg_sideband_i32_per_token, Some(768.0));
-        assert_eq!(decode.avg_logical_sideband_i32_per_token, Some(719.0));
+        assert_eq!(
+            decode.avg_causal_visible_sideband_i32_per_token,
+            Some(719.0)
+        );
         assert_eq!(decode.sideband_padding_ratio, Some(49.0 / 768.0));
         assert_eq!(decode.sideband_to_hidden_ratio, Some(0.125));
     }
@@ -567,9 +579,12 @@ mod tests {
         let prefill = stages.get(&Phase::Prefill).unwrap();
         assert_eq!(prefill.tokens, 128);
         assert_eq!(prefill.sideband_i32, 98_304);
-        assert_eq!(prefill.logical_sideband_i32, 81_920);
-        assert_eq!(prefill.padded_sideband_i32, 16_384);
-        assert_eq!(prefill.avg_logical_sideband_i32_per_token, Some(640.0));
-        assert_eq!(prefill.sideband_padding_ratio, Some(16_384.0 / 98_304.0));
+        assert_eq!(prefill.causal_visible_sideband_i32, 73_792);
+        assert_eq!(prefill.padded_sideband_i32, 24_512);
+        assert_eq!(
+            prefill.avg_causal_visible_sideband_i32_per_token,
+            Some(576.5)
+        );
+        assert_eq!(prefill.sideband_padding_ratio, Some(24_512.0 / 98_304.0));
     }
 }

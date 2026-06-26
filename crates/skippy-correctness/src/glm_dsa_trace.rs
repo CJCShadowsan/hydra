@@ -33,6 +33,7 @@ struct FakeDownstreamMessage {
     token_count: i32,
     activation_bytes: usize,
     top_k_count: usize,
+    top_k_values: Vec<i32>,
 }
 
 struct FakeDownstreamGuard {
@@ -187,10 +188,18 @@ fn run_variant(
         .iter()
         .map(|message| message.top_k_count)
         .sum();
-    let fake_downstream_total_logical_top_k_count =
-        fake_messages.iter().map(logical_top_k_count).sum::<usize>();
-    let fake_downstream_total_padded_top_k_count =
-        fake_downstream_total_top_k_count.saturating_sub(fake_downstream_total_logical_top_k_count);
+    let fake_downstream_total_causal_visible_top_k_count = fake_messages
+        .iter()
+        .map(causal_visible_top_k_count)
+        .sum::<usize>();
+    let fake_downstream_total_active_top_k_window_count = fake_messages
+        .iter()
+        .map(active_top_k_window_count)
+        .sum::<usize>();
+    let fake_downstream_total_finite_top_k_count =
+        fake_messages.iter().map(finite_top_k_count).sum::<usize>();
+    let fake_downstream_total_padded_top_k_count = fake_downstream_total_top_k_count
+        .saturating_sub(fake_downstream_total_causal_visible_top_k_count);
     let fake_downstream_top_k_token_count = fake_messages
         .iter()
         .filter(|message| message.top_k_count > 0)
@@ -205,8 +214,16 @@ fn run_variant(
         fake_downstream_total_top_k_count,
         fake_downstream_top_k_token_count,
     );
-    let fake_downstream_avg_logical_top_k_per_token = nonzero_div_usize(
-        fake_downstream_total_logical_top_k_count,
+    let fake_downstream_avg_causal_visible_top_k_per_token = nonzero_div_usize(
+        fake_downstream_total_causal_visible_top_k_count,
+        fake_downstream_top_k_token_count,
+    );
+    let fake_downstream_avg_active_top_k_window_per_token = nonzero_div_usize(
+        fake_downstream_total_active_top_k_window_count,
+        fake_downstream_top_k_token_count,
+    );
+    let fake_downstream_avg_finite_top_k_per_token = nonzero_div_usize(
+        fake_downstream_total_finite_top_k_count,
         fake_downstream_top_k_token_count,
     );
     let fake_downstream_max_top_k_per_token = fake_messages
@@ -238,10 +255,14 @@ fn run_variant(
         fake_downstream_top_k_message_count,
         fake_downstream_max_top_k_count,
         fake_downstream_total_top_k_count,
-        fake_downstream_total_logical_top_k_count,
+        fake_downstream_total_causal_visible_top_k_count,
+        fake_downstream_total_active_top_k_window_count,
+        fake_downstream_total_finite_top_k_count,
         fake_downstream_total_padded_top_k_count,
         fake_downstream_avg_top_k_per_token,
-        fake_downstream_avg_logical_top_k_per_token,
+        fake_downstream_avg_causal_visible_top_k_per_token,
+        fake_downstream_avg_active_top_k_window_per_token,
+        fake_downstream_avg_finite_top_k_per_token,
         fake_downstream_max_top_k_per_token,
         fake_downstream_top_k_padding_ratio,
         fake_downstream_top_k_sideband_to_hidden_ratio,
@@ -257,15 +278,71 @@ fn message_token_count(message: &FakeDownstreamMessage) -> usize {
     usize::try_from(message.token_count.max(0)).unwrap_or(0)
 }
 
-fn logical_top_k_count(message: &FakeDownstreamMessage) -> usize {
+fn causal_visible_top_k_count(message: &FakeDownstreamMessage) -> usize {
     let token_count = message_token_count(message);
     if token_count == 0 || message.top_k_count == 0 {
         return 0;
     }
     let sideband_width = message.top_k_count / token_count;
-    let logical_width =
-        usize::try_from(message.pos_start.saturating_add(message.token_count).max(0)).unwrap_or(0);
-    sideband_width.min(logical_width) * token_count
+    (0..token_count)
+        .map(|token_index| sideband_width.min(causal_visible_width(message.pos_start, token_index)))
+        .sum()
+}
+
+fn active_top_k_window_count(message: &FakeDownstreamMessage) -> usize {
+    let token_count = message_token_count(message);
+    if token_count == 0 || message.top_k_values.is_empty() {
+        return 0;
+    }
+    let sideband_width = message.top_k_values.len() / token_count;
+    (0..token_count)
+        .map(|token_index| {
+            let visible_width = i32::try_from(causal_visible_width(message.pos_start, token_index))
+                .unwrap_or(i32::MAX);
+            let row_start = token_index * sideband_width;
+            message.top_k_values[row_start..row_start + sideband_width]
+                .iter()
+                .rposition(|i_kv| *i_kv >= 0 && *i_kv < visible_width)
+                .map_or(0, |i_top| i_top + 1)
+        })
+        .sum()
+}
+
+fn finite_top_k_count(message: &FakeDownstreamMessage) -> usize {
+    let token_count = message_token_count(message);
+    if token_count == 0 || message.top_k_values.is_empty() {
+        return 0;
+    }
+    let sideband_width = message.top_k_values.len() / token_count;
+    (0..token_count)
+        .map(|token_index| {
+            let visible_width = i32::try_from(causal_visible_width(message.pos_start, token_index))
+                .unwrap_or(i32::MAX);
+            let row_start = token_index * sideband_width;
+            message.top_k_values[row_start..row_start + sideband_width]
+                .iter()
+                .filter(|i_kv| **i_kv >= 0 && **i_kv < visible_width)
+                .count()
+        })
+        .sum()
+}
+
+fn causal_visible_width(pos_start: i32, token_index: usize) -> usize {
+    let token_offset = i32::try_from(token_index).unwrap_or(i32::MAX);
+    usize::try_from(
+        pos_start
+            .saturating_add(token_offset)
+            .saturating_add(1)
+            .max(0),
+    )
+    .unwrap_or(0)
+}
+
+fn decode_i32_values(raw_bytes: &[u8]) -> Vec<i32> {
+    raw_bytes
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("exact i32 chunk")))
+        .collect()
 }
 
 fn write_stage_config(
@@ -451,6 +528,7 @@ impl FakeDownstreamGuard {
                                 token_count: message.token_count,
                                 activation_bytes: message.activation.len(),
                                 top_k_count: message.raw_bytes.len() / std::mem::size_of::<i32>(),
+                                top_k_values: decode_i32_values(&message.raw_bytes),
                             };
                             thread_messages
                                 .lock()
@@ -662,4 +740,45 @@ fn generate_glm_dsa_run_id() -> String {
 fn path_str(path: &Path) -> Result<&str> {
     path.to_str()
         .with_context(|| format!("path is not valid UTF-8: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FakeDownstreamMessage, WireMessageKind, active_top_k_window_count,
+        causal_visible_top_k_count, finite_top_k_count,
+    };
+
+    #[test]
+    fn causal_visible_top_k_counts_prefill_positions_per_token() {
+        let message = FakeDownstreamMessage {
+            kind: WireMessageKind::PrefillEmbd,
+            pos_start: 512,
+            token_count: 128,
+            activation_bytes: 0,
+            top_k_count: 98_304,
+            top_k_values: Vec::new(),
+        };
+
+        assert_eq!(causal_visible_top_k_count(&message), 73_792);
+    }
+
+    #[test]
+    fn active_top_k_window_counts_last_visible_index_per_token() {
+        let message = FakeDownstreamMessage {
+            kind: WireMessageKind::PrefillEmbd,
+            pos_start: 2,
+            token_count: 2,
+            activation_bytes: 0,
+            top_k_count: 8,
+            top_k_values: vec![
+                7, 1, 9, 2, //
+                3, 8, 9, 7,
+            ],
+        };
+
+        assert_eq!(causal_visible_top_k_count(&message), 7);
+        assert_eq!(finite_top_k_count(&message), 3);
+        assert_eq!(active_top_k_window_count(&message), 5);
+    }
 }
