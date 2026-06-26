@@ -88,9 +88,13 @@ struct SidebandSummary {
     hidden_bytes: u64,
     sideband_bytes: u64,
     sideband_i32: u64,
+    logical_sideband_i32: u64,
+    padded_sideband_i32: u64,
     avg_hidden_bytes_per_token: Option<f64>,
     avg_sideband_bytes_per_token: Option<f64>,
     avg_sideband_i32_per_token: Option<f64>,
+    avg_logical_sideband_i32_per_token: Option<f64>,
+    sideband_padding_ratio: Option<f64>,
     sideband_to_hidden_ratio: Option<f64>,
 }
 
@@ -98,6 +102,7 @@ struct SidebandSummary {
 struct SidebandRecord {
     stage: String,
     kind: String,
+    pos_start: u64,
     tokens: u64,
     hidden_bytes: u64,
     sideband_bytes: u64,
@@ -220,6 +225,7 @@ fn parse_sideband_record(line: &str) -> Result<SidebandRecord> {
     Ok(SidebandRecord {
         stage: parse_string_field(&fields, "stage")?,
         kind: parse_string_field(&fields, "kind")?,
+        pos_start: parse_field(&fields, "pos_start")?,
         tokens: parse_field(&fields, "tokens")?,
         hidden_bytes: parse_field(&fields, "hidden_bytes")?,
         sideband_bytes: parse_field(&fields, "sideband_bytes")?,
@@ -358,6 +364,9 @@ fn summarize_sideband_records(
         summary.hidden_bytes += record.hidden_bytes;
         summary.sideband_bytes += record.sideband_bytes;
         summary.sideband_i32 += record.sideband_i32;
+        let logical_sideband_i32 = logical_sideband_i32(record);
+        summary.logical_sideband_i32 += logical_sideband_i32;
+        summary.padded_sideband_i32 += record.sideband_i32.saturating_sub(logical_sideband_i32);
     }
     for phases in stages.values_mut() {
         for summary in phases.values_mut() {
@@ -365,11 +374,24 @@ fn summarize_sideband_records(
             summary.avg_sideband_bytes_per_token =
                 nonzero_div(summary.sideband_bytes, summary.tokens);
             summary.avg_sideband_i32_per_token = nonzero_div(summary.sideband_i32, summary.tokens);
+            summary.avg_logical_sideband_i32_per_token =
+                nonzero_div(summary.logical_sideband_i32, summary.tokens);
+            summary.sideband_padding_ratio =
+                nonzero_div(summary.padded_sideband_i32, summary.sideband_i32);
             summary.sideband_to_hidden_ratio =
                 nonzero_div(summary.sideband_bytes, summary.hidden_bytes);
         }
     }
     stages
+}
+
+fn logical_sideband_i32(record: &SidebandRecord) -> u64 {
+    if record.tokens == 0 || record.sideband_i32 == 0 {
+        return 0;
+    }
+    let sideband_width = record.sideband_i32 / record.tokens;
+    let logical_width = record.pos_start.saturating_add(record.tokens);
+    sideband_width.min(logical_width) * record.tokens
 }
 
 fn sideband_phase(kind: &str, tokens: u64) -> Phase {
@@ -410,6 +432,7 @@ mod tests {
     const LINE_WITH_SPARSE_BREAKDOWN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 sparse_mask_fill_nodes=47 sparse_mask_fill_us=1000 sparse_mask_topk_nodes=47 sparse_mask_topk_us=2000 sparse_mask_add_nodes=47 sparse_mask_add_us=3000 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const LINE_WITH_DSA_SPARSE_ATTN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=0 sparse_mask_us=0 dsa_sparse_attn_nodes=47 dsa_sparse_attn_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
+    const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
 
     #[test]
     fn parses_timing_record_with_prefix() {
@@ -501,13 +524,14 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].stage, "stage-0");
         assert_eq!(records[0].kind, "DecodeEmbd");
+        assert_eq!(records[0].pos_start, 718);
         assert_eq!(records[0].sideband_bytes, 3072);
         assert_eq!(records[0].sideband_i32, 768);
     }
 
     #[test]
     fn rejects_malformed_sideband_record() {
-        let error = parse_sideband_record("stage=stage-0 kind=DecodeEmbd")
+        let error = parse_sideband_record("stage=stage-0 kind=DecodeEmbd pos_start=0")
             .unwrap_err()
             .to_string();
         assert!(error.contains("missing tokens"));
@@ -525,8 +549,27 @@ mod tests {
         assert_eq!(decode.hidden_bytes, 24576);
         assert_eq!(decode.sideband_bytes, 3072);
         assert_eq!(decode.sideband_i32, 768);
+        assert_eq!(decode.logical_sideband_i32, 719);
+        assert_eq!(decode.padded_sideband_i32, 49);
         assert_eq!(decode.avg_sideband_bytes_per_token, Some(3072.0));
         assert_eq!(decode.avg_sideband_i32_per_token, Some(768.0));
+        assert_eq!(decode.avg_logical_sideband_i32_per_token, Some(719.0));
+        assert_eq!(decode.sideband_padding_ratio, Some(49.0 / 768.0));
         assert_eq!(decode.sideband_to_hidden_ratio, Some(0.125));
+    }
+
+    #[test]
+    fn summarizes_sideband_padding_for_prefill() {
+        let timing = parse_timing_records(LINE).unwrap();
+        let sideband = parse_sideband_records(PADDED_PREFILL_SIDEBAND_LINE).unwrap();
+        let summary = summarize_log("stage0.log".into(), &timing, &sideband);
+        let stages = summary.sideband_records.get("stage-0").unwrap();
+        let prefill = stages.get(&Phase::Prefill).unwrap();
+        assert_eq!(prefill.tokens, 128);
+        assert_eq!(prefill.sideband_i32, 98_304);
+        assert_eq!(prefill.logical_sideband_i32, 81_920);
+        assert_eq!(prefill.padded_sideband_i32, 16_384);
+        assert_eq!(prefill.avg_logical_sideband_i32_per_token, Some(640.0));
+        assert_eq!(prefill.sideband_padding_ratio, Some(16_384.0 / 98_304.0));
     }
 }

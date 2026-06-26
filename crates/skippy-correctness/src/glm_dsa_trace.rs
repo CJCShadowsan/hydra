@@ -29,6 +29,7 @@ use crate::{
 #[derive(Debug, Clone)]
 struct FakeDownstreamMessage {
     kind: WireMessageKind,
+    pos_start: i32,
     token_count: i32,
     activation_bytes: usize,
     top_k_count: usize,
@@ -182,10 +183,14 @@ fn run_variant(
         .map(|message| message.top_k_count)
         .max()
         .unwrap_or(0);
-    let fake_downstream_total_top_k_count = fake_messages
+    let fake_downstream_total_top_k_count: usize = fake_messages
         .iter()
         .map(|message| message.top_k_count)
         .sum();
+    let fake_downstream_total_logical_top_k_count =
+        fake_messages.iter().map(logical_top_k_count).sum::<usize>();
+    let fake_downstream_total_padded_top_k_count =
+        fake_downstream_total_top_k_count.saturating_sub(fake_downstream_total_logical_top_k_count);
     let fake_downstream_top_k_token_count = fake_messages
         .iter()
         .filter(|message| message.top_k_count > 0)
@@ -200,11 +205,19 @@ fn run_variant(
         fake_downstream_total_top_k_count,
         fake_downstream_top_k_token_count,
     );
+    let fake_downstream_avg_logical_top_k_per_token = nonzero_div_usize(
+        fake_downstream_total_logical_top_k_count,
+        fake_downstream_top_k_token_count,
+    );
     let fake_downstream_max_top_k_per_token = fake_messages
         .iter()
         .filter(|message| message.top_k_count > 0)
         .filter_map(|message| nonzero_div_usize(message.top_k_count, message_token_count(message)))
         .reduce(f64::max);
+    let fake_downstream_top_k_padding_ratio = nonzero_div_usize(
+        fake_downstream_total_padded_top_k_count,
+        fake_downstream_total_top_k_count,
+    );
     let fake_downstream_top_k_sideband_to_hidden_ratio = nonzero_div_usize(
         fake_downstream_total_top_k_count * std::mem::size_of::<i32>(),
         fake_downstream_top_k_activation_bytes,
@@ -225,8 +238,12 @@ fn run_variant(
         fake_downstream_top_k_message_count,
         fake_downstream_max_top_k_count,
         fake_downstream_total_top_k_count,
+        fake_downstream_total_logical_top_k_count,
+        fake_downstream_total_padded_top_k_count,
         fake_downstream_avg_top_k_per_token,
+        fake_downstream_avg_logical_top_k_per_token,
         fake_downstream_max_top_k_per_token,
+        fake_downstream_top_k_padding_ratio,
         fake_downstream_top_k_sideband_to_hidden_ratio,
         trace_line_count,
         timing_line_count,
@@ -238,6 +255,17 @@ fn run_variant(
 
 fn message_token_count(message: &FakeDownstreamMessage) -> usize {
     usize::try_from(message.token_count.max(0)).unwrap_or(0)
+}
+
+fn logical_top_k_count(message: &FakeDownstreamMessage) -> usize {
+    let token_count = message_token_count(message);
+    if token_count == 0 || message.top_k_count == 0 {
+        return 0;
+    }
+    let sideband_width = message.top_k_count / token_count;
+    let logical_width =
+        usize::try_from(message.pos_start.saturating_add(message.token_count).max(0)).unwrap_or(0);
+    sideband_width.min(logical_width) * token_count
 }
 
 fn write_stage_config(
@@ -419,6 +447,7 @@ impl FakeDownstreamGuard {
                             };
                             let summary = FakeDownstreamMessage {
                                 kind: message.kind,
+                                pos_start: message.pos_start,
                                 token_count: message.token_count,
                                 activation_bytes: message.activation.len(),
                                 top_k_count: message.raw_bytes.len() / std::mem::size_of::<i32>(),
