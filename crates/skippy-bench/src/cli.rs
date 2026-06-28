@@ -30,6 +30,8 @@ pub enum CommandKind {
     FocusedRuntime(FocusedRuntimeArgs),
     #[command(name = "drive-existing")]
     DriveExisting(DriveExistingArgs),
+    #[command(name = "glm-dsa-layer-microbench")]
+    GlmDsaLayerMicrobench(GlmDsaLayerMicrobenchArgs),
     #[command(name = "glm-dsa-op-report")]
     GlmDsaOpReport(GlmDsaOpReportArgs),
     #[command(name = "glm-dsa-op-compare")]
@@ -176,6 +178,53 @@ pub struct GlmDsaOpReportArgs {
         help = "Only include the first N timing records from each log. Use this for one request when a REPL log contains follow-up prompts."
     )]
     pub first_records: Option<usize>,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+pub struct GlmDsaLayerMicrobenchArgs {
+    #[arg(
+        long,
+        help = "Local Skippy layer-package directory containing model-package.json."
+    )]
+    pub stage_model: PathBuf,
+    #[arg(long, default_value = "meshllm/GLM-5.2-Q2_K-MTP-Q8-layers")]
+    pub model_id: String,
+    #[arg(long, default_value_t = 30)]
+    pub layer_start: u32,
+    #[arg(long, default_value_t = 31)]
+    pub layer_end: u32,
+    #[arg(long, default_value_t = 131072)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = 6144)]
+    pub activation_width: u32,
+    #[arg(long, default_value_t = 1)]
+    pub tokens: usize,
+    #[arg(long, default_value_t = 3)]
+    pub iterations: usize,
+    #[arg(long, default_value_t = 1)]
+    pub warmup: usize,
+    #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+    pub n_gpu_layers: i32,
+    #[arg(long)]
+    pub n_batch: Option<u32>,
+    #[arg(long)]
+    pub n_ubatch: Option<u32>,
+    #[arg(long, default_value = "f16")]
+    pub cache_type_k: String,
+    #[arg(long, default_value = "f16")]
+    pub cache_type_v: String,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub direct_sparse_attn: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub direct_sparse_prefill: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub fused_sparse_mask: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub parallel_lightning_indexer: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub op_timing: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -770,5 +819,31 @@ mod tests {
         };
 
         assert_eq!(args.split_layer, Some(24));
+    }
+
+    #[test]
+    fn parses_glm_dsa_layer_microbench_command() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "glm-dsa-layer-microbench",
+            "--stage-model",
+            "/tmp/glm52-layers",
+            "--layer-start",
+            "30",
+            "--layer-end",
+            "31",
+            "--tokens",
+            "128",
+        ])
+        .unwrap();
+
+        let CommandKind::GlmDsaLayerMicrobench(args) = cli.command else {
+            panic!("expected glm-dsa-layer-microbench subcommand");
+        };
+
+        assert_eq!(args.stage_model, PathBuf::from("/tmp/glm52-layers"));
+        assert_eq!(args.layer_start, 30);
+        assert_eq!(args.layer_end, 31);
+        assert_eq!(args.tokens, 128);
     }
 }

@@ -1,6 +1,7 @@
 mod chat_corpus;
 mod cli;
 mod distributed;
+mod glm_dsa_layer_microbench;
 mod glm_dsa_op_report;
 mod local_single;
 mod local_split;
@@ -16,6 +17,7 @@ use crate::{
     chat_corpus::chat_corpus,
     cli::{Cli, CommandKind},
     distributed::{drive_existing, focused_runtime, run_distributed},
+    glm_dsa_layer_microbench::glm_dsa_layer_microbench,
     glm_dsa_op_report::{glm_dsa_op_compare, glm_dsa_op_report},
     local_single::local_single,
     local_split::{
@@ -37,6 +39,7 @@ fn main() -> Result<()> {
         CommandKind::TokenLengths(args) => token_lengths(args),
         CommandKind::FocusedRuntime(args) => focused_runtime(args),
         CommandKind::DriveExisting(args) => drive_existing(args),
+        CommandKind::GlmDsaLayerMicrobench(args) => glm_dsa_layer_microbench(args),
         CommandKind::GlmDsaOpReport(args) => glm_dsa_op_report(args),
         CommandKind::GlmDsaOpCompare(args) => glm_dsa_op_compare(args),
         CommandKind::Run(args) => run_distributed(args),
