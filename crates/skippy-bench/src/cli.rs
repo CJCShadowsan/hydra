@@ -235,6 +235,12 @@ pub struct GlmDsaLayerMicrobenchArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Fail unless the optimized dispatch profile has at least one GLM-DSA route-fusion encode candidate, no skipped encode candidates, and at least one fused route dispatch."
+    )]
+    pub require_optimized_route_fusion: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Run a dense-mask fallback baseline and compare it with the requested direct sparse settings."
     )]
     pub compare_dense_fallback: bool,
@@ -857,6 +863,7 @@ mod tests {
             "31",
             "--tokens",
             "128",
+            "--require-optimized-route-fusion",
             "--compare-dense-fallback",
         ])
         .unwrap();
@@ -869,6 +876,7 @@ mod tests {
         assert_eq!(args.layer_start, 30);
         assert_eq!(args.layer_end, 31);
         assert_eq!(args.tokens, 128);
+        assert!(args.require_optimized_route_fusion);
         assert!(args.compare_dense_fallback);
         assert!(!args.compare_cpu_direct_sparse);
     }

@@ -124,6 +124,9 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         &timing_summary,
         optimized_dispatch_probe.as_ref(),
     );
+    let route_fusion_guard = args
+        .require_optimized_route_fusion
+        .then(|| build_route_fusion_guard(&case, optimized_dispatch_probe.as_ref()));
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -153,6 +156,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         op_timing_summary,
         routed_moe_timing_summary,
         profile_integrity,
+        route_fusion_guard,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
@@ -168,6 +172,18 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         .is_none_or(|comparison| comparison.parity.passed);
 
     write_report(args.output.as_deref(), &report)?;
+    if let Some(guard) = &report.route_fusion_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA optimized route-fusion guard failed for {}: candidates={} skipped={} fused_dispatches={} reasons={}",
+            guard.checked_case,
+            guard.encode_candidate_records,
+            guard.encode_skipped_candidate_records,
+            guard.fused_dispatch_records,
+            guard.reason_summary
+        );
+    }
     if !parity_passed {
         bail!("GLM-DSA layer microbench parity comparison failed");
     }
@@ -1381,6 +1397,8 @@ struct MicrobenchReport {
     #[serde(skip_serializing_if = "RoutedMoeTimingSummary::is_empty")]
     routed_moe_timing_summary: RoutedMoeTimingSummary,
     profile_integrity: ProfileIntegrityReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_fusion_guard: Option<RouteFusionGuardReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1396,6 +1414,53 @@ struct MicrobenchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<MicrobenchComparisonReport>,
     timings: Vec<IterationTiming>,
+}
+
+#[derive(Serialize)]
+struct RouteFusionGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    encode_candidate_records: usize,
+    encode_fused_candidate_records: usize,
+    encode_skipped_candidate_records: usize,
+    fused_dispatch_records: usize,
+    reason_summary: String,
+}
+
+fn build_route_fusion_guard(
+    candidate: &MicrobenchCaseSummary,
+    optimized_probe: Option<&MicrobenchCaseSummary>,
+) -> RouteFusionGuardReport {
+    let checked = optimized_probe.unwrap_or(candidate);
+    let dispatch = &checked.metal_dispatch_summary;
+    let encode_candidate_records = dispatch.topk_moe_route_encode_candidate_records;
+    let encode_fused_candidate_records = dispatch.topk_moe_route_encode_fused_candidate_records;
+    let encode_skipped_candidate_records = dispatch.topk_moe_route_encode_skipped_candidate_records;
+    let fused_dispatch_records = dispatch.topk_moe_route_fused_records;
+    let passed = encode_candidate_records > 0
+        && encode_skipped_candidate_records == 0
+        && fused_dispatch_records > 0;
+    RouteFusionGuardReport {
+        checked_case: checked.label,
+        passed,
+        encode_candidate_records,
+        encode_fused_candidate_records,
+        encode_skipped_candidate_records,
+        fused_dispatch_records,
+        reason_summary: summarize_route_fusion_reasons(dispatch),
+    }
+}
+
+fn summarize_route_fusion_reasons(dispatch: &GlmDsaDispatchSummary) -> String {
+    if dispatch.route_fusion_reasons.is_empty() {
+        return "none".to_string();
+    }
+    dispatch
+        .route_fusion_reasons
+        .iter()
+        .map(|reason| format!("{}:{}={}", reason.op, reason.reason, reason.records))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Serialize)]
@@ -1632,4 +1697,77 @@ struct IterationTiming {
     elapsed_ms: f64,
     output_payload_bytes: usize,
     output_flags: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_fusion_guard_checks_optimized_probe_when_present() {
+        let candidate = case_summary("candidate", 4, 4, 0);
+        let optimized_probe = case_summary("optimized_dispatch_probe", 4, 0, 4);
+
+        let guard = build_route_fusion_guard(&candidate, Some(&optimized_probe));
+
+        assert!(guard.passed);
+        assert_eq!(guard.checked_case, "optimized_dispatch_probe");
+        assert_eq!(guard.encode_candidate_records, 4);
+        assert_eq!(guard.encode_skipped_candidate_records, 0);
+        assert_eq!(guard.fused_dispatch_records, 4);
+    }
+
+    #[test]
+    fn route_fusion_guard_fails_without_fused_dispatches() {
+        let candidate = case_summary("candidate", 4, 4, 0);
+
+        let guard = build_route_fusion_guard(&candidate, None);
+
+        assert!(!guard.passed);
+        assert_eq!(guard.checked_case, "candidate");
+        assert_eq!(guard.encode_candidate_records, 4);
+        assert_eq!(guard.encode_skipped_candidate_records, 4);
+        assert_eq!(guard.fused_dispatch_records, 0);
+    }
+
+    fn case_summary(
+        label: &'static str,
+        encode_candidate_records: usize,
+        encode_skipped_candidate_records: usize,
+        fused_dispatch_records: usize,
+    ) -> MicrobenchCaseSummary {
+        let dispatch = GlmDsaDispatchSummary {
+            records: encode_candidate_records + fused_dispatch_records,
+            topk_moe_route_encode_candidate_records: encode_candidate_records,
+            topk_moe_route_encode_fused_candidate_records: encode_candidate_records
+                - encode_skipped_candidate_records,
+            topk_moe_route_encode_skipped_candidate_records: encode_skipped_candidate_records,
+            topk_moe_route_fused_records: fused_dispatch_records,
+            ..GlmDsaDispatchSummary::default()
+        };
+        MicrobenchCaseSummary {
+            label,
+            flags: MicrobenchFlags {
+                direct_sparse_attn: true,
+                direct_sparse_prefill: true,
+                fused_sparse_mask: true,
+                parallel_lightning_indexer: false,
+                op_timing: false,
+                metal_dispatch_log: true,
+            },
+            n_gpu_layers: -1,
+            native_log_path: None,
+            direct_sparse_decision_summary: DirectSparseDecisionSummary::default(),
+            timing_summary: TimingDistributionSummary::default(),
+            metal_dispatch_summary: dispatch,
+            op_timing_summary: GlmDsaOpTimingSummary::default(),
+            routed_moe_timing_summary: RoutedMoeTimingSummary::default(),
+            direct_sparse_decision_records: Vec::new(),
+            metal_dispatch_records: Vec::new(),
+            op_timing_records: Vec::new(),
+            group_timing_records: Vec::new(),
+            hot_tensor_records: Vec::new(),
+            timings: Vec::new(),
+        }
+    }
 }
