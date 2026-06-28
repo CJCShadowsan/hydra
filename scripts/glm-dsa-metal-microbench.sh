@@ -12,6 +12,8 @@ CTX_SIZE="${CTX_SIZE:-4096}"
 ACTIVATION_WIDTH="${ACTIVATION_WIDTH:-6144}"
 ITERATIONS="${ITERATIONS:-1}"
 WARMUP="${WARMUP:-0}"
+TOKENS="${TOKENS:-}"
+LAYERS="${LAYERS:-}"
 FORCE_REBUILD=1
 BUILD_ONLY=0
 DRY_RUN=0
@@ -38,6 +40,8 @@ Options:
   --activation-width N     Synthetic activation width. Default: 6144.
   --iterations N           Measured iterations per case. Default: 1.
   --warmup N               Warmup iterations per case. Default: 0.
+  --tokens LIST            Comma-separated token sweep, e.g. 1,8,16,32,33,64.
+  --layers LIST            Comma-separated single-layer starts, e.g. 30,45,60.
   --no-force-rebuild       Skip forced static-metal rebuild/relink.
   --build-only             Rebuild/relink only; do not run cases.
   --dry-run                Print commands without executing.
@@ -45,7 +49,7 @@ Options:
 
 Environment overrides mirror option names:
   STAGE_MODEL, MODEL_ID, OUTPUT_DIR, LAYER_START, LAYER_END, CTX_SIZE,
-  ACTIVATION_WIDTH, ITERATIONS, WARMUP.
+  ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS.
 EOF
 }
 
@@ -85,6 +89,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --warmup)
       WARMUP="$2"
+      shift 2
+      ;;
+    --tokens)
+      TOKENS="$2"
+      shift 2
+      ;;
+    --layers)
+      LAYERS="$2"
       shift 2
       ;;
     --no-force-rebuild)
@@ -128,6 +140,14 @@ require_path() {
   fi
 }
 
+split_csv() {
+  local value="$1"
+  tr ',' '\n' <<<"$value" | while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    printf '%s\n' "$item"
+  done
+}
+
 prepare_static_metal_bench() {
   if [[ "$FORCE_REBUILD" == "1" ]]; then
     run_cmd rm -rf "$ROOT/.deps/llama-build/build-stage-abi-static-metal"
@@ -139,8 +159,10 @@ prepare_static_metal_bench() {
 
 run_case() {
   local name="$1"
-  local tokens="$2"
-  shift 2
+  local layer_start="$2"
+  local layer_end="$3"
+  local tokens="$4"
+  shift 4
 
   local report="$OUTPUT_DIR/${name}.json"
   local stdout="$OUTPUT_DIR/${name}.stdout"
@@ -149,8 +171,8 @@ run_case() {
     glm-dsa-layer-microbench
     --stage-model "$STAGE_MODEL"
     --model-id "$MODEL_ID"
-    --layer-start "$LAYER_START"
-    --layer-end "$LAYER_END"
+    --layer-start "$layer_start"
+    --layer-end "$layer_end"
     --tokens "$tokens"
     --ctx-size "$CTX_SIZE"
     --activation-width "$ACTIVATION_WIDTH"
@@ -181,35 +203,61 @@ write_summary() {
   python3 - "$OUTPUT_DIR" >"$summary" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 base = pathlib.Path(sys.argv[1])
-cases = [
-    "default-1",
-    "default-33",
-    "optin-prefill-32",
-    "optin-prefill-33",
-]
+
+def case_sort_key(path):
+    name = path.stem
+    layer = re.search(r"l(\d+)", name)
+    token = re.search(r"t(\d+)|-(\d+)$", name)
+    variant = 0 if name.startswith("default") else 1
+    token_value = 0
+    if token:
+        token_value = int(next(group for group in token.groups() if group is not None))
+    layer_value = int(layer.group(1)) if layer else 0
+    return layer_value, token_value, variant, name
+
+cases = sorted(base.glob("*.json"), key=case_sort_key)
+paired = {}
 
 print(f"output_dir={base}")
-for name in cases:
-    path = base / f"{name}.json"
+for path in cases:
+    name = path.stem
     print()
     print(name)
-    if not path.exists():
-        print("  missing")
-        continue
     report = json.loads(path.read_text())
     comparison = report["comparison"]
     parity = comparison["parity"]
     candidate = comparison["candidate"]
     timing = candidate["op_timing_records"][0]
-    decisions = candidate.get("direct_sparse_decision_records", [])
-    use_direct = sum(1 for record in decisions if record.get("use_direct"))
-    fallback = len(decisions) - use_direct
+    decision_summary = candidate.get("direct_sparse_decision_summary", {})
+    elapsed_ms = candidate.get("timings", [{}])[0].get("elapsed_ms")
+    total_us = timing.get("total_us")
+    pair = re.match(r"(default|optin)-l(\d+)-t(\d+)$", name)
+    if pair:
+        variant, layer, tokens = pair.groups()
+        paired.setdefault((int(layer), int(tokens)), {})[variant] = {
+            "elapsed_ms": elapsed_ms,
+            "total_us": total_us,
+            "use_direct": decision_summary.get("use_direct", 0),
+            "fallback": decision_summary.get("fallback", 0),
+            "dsa_sparse_attn_nodes": timing.get("dsa_sparse_attn_nodes"),
+            "sparse_mask_nodes": timing.get("sparse_mask_nodes"),
+        }
     print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
     print(f"  dsa_sparse_attn_nodes={timing.get('dsa_sparse_attn_nodes')} sparse_mask_nodes={timing.get('sparse_mask_nodes')}")
-    print(f"  decisions={len(decisions)} use_direct={use_direct} fallback={fallback}")
+    print(f"  elapsed_ms={elapsed_ms} native_total_us={total_us}")
+    print(
+        "  decisions="
+        f"{decision_summary.get('records', 0)} "
+        f"use_direct={decision_summary.get('use_direct', 0)} "
+        f"fallback={decision_summary.get('fallback', 0)} "
+        f"decode_shape={decision_summary.get('decode_shape', 0)} "
+        f"prefill_shape={decision_summary.get('prefill_shape', 0)}"
+    )
+    decisions = candidate.get("direct_sparse_decision_records", [])
     if decisions:
         last = decisions[-1]
         print(
@@ -217,6 +265,28 @@ for name in cases:
             f"tokens={last['ubatch_tokens']} sparse_batch={last['sparse_batch']} "
             f"prefill_enabled={last['prefill_enabled']} prefill_shape={last['prefill_shape']} "
             f"decode_shape={last['decode_shape']} use_direct={last['use_direct']}"
+        )
+
+if paired:
+    print()
+    print("pairwise_optin_vs_default")
+    print("layer tokens default_ms optin_ms elapsed_ratio default_native_us optin_native_us native_ratio optin_direct optin_fallback")
+    for (layer, tokens), variants in sorted(paired.items()):
+        default = variants.get("default")
+        optin = variants.get("optin")
+        if not default or not optin:
+            continue
+        elapsed_ratio = None
+        native_ratio = None
+        if default["elapsed_ms"] not in (None, 0) and optin["elapsed_ms"] is not None:
+            elapsed_ratio = optin["elapsed_ms"] / default["elapsed_ms"]
+        if default["total_us"] not in (None, 0) and optin["total_us"] is not None:
+            native_ratio = optin["total_us"] / default["total_us"]
+        print(
+            f"{layer} {tokens} "
+            f"{default['elapsed_ms']:.3f} {optin['elapsed_ms']:.3f} {elapsed_ratio:.3f} "
+            f"{default['total_us']} {optin['total_us']} {native_ratio:.3f} "
+            f"{optin['use_direct']} {optin['fallback']}"
         )
 PY
   printf 'summary=%s\n' "$summary"
@@ -234,8 +304,32 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
   exit 0
 fi
 
-run_case default-1 1
-run_case default-33 33
-run_case optin-prefill-32 32 --direct-sparse-prefill true
-run_case optin-prefill-33 33 --direct-sparse-prefill true
+run_default_cases() {
+  run_case default-1 "$LAYER_START" "$LAYER_END" 1
+  run_case default-33 "$LAYER_START" "$LAYER_END" 33
+  run_case optin-prefill-32 "$LAYER_START" "$LAYER_END" 32 --direct-sparse-prefill true
+  run_case optin-prefill-33 "$LAYER_START" "$LAYER_END" 33 --direct-sparse-prefill true
+}
+
+run_sweep_cases() {
+  local layers="$LAYERS"
+  if [[ -z "$layers" ]]; then
+    layers="$LAYER_START"
+  fi
+  local layer_start
+  local tokens
+  while IFS= read -r layer_start; do
+    local layer_end=$((layer_start + 1))
+    while IFS= read -r tokens; do
+      run_case "default-l${layer_start}-t${tokens}" "$layer_start" "$layer_end" "$tokens"
+      run_case "optin-l${layer_start}-t${tokens}" "$layer_start" "$layer_end" "$tokens" --direct-sparse-prefill true
+    done < <(split_csv "$TOKENS")
+  done < <(split_csv "$layers")
+}
+
+if [[ -n "$TOKENS" ]]; then
+  run_sweep_cases
+else
+  run_default_cases
+fi
 write_summary
