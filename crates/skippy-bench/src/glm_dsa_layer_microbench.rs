@@ -1450,8 +1450,14 @@ struct ProfileIntegrityReport {
     op_timing_enabled: bool,
     metal_dispatch_log_enabled: bool,
     route_fusion_active: bool,
+    route_fusion_encode_candidate_records: usize,
+    route_fusion_encode_skipped_candidate_records: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     optimized_probe_route_fusion_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optimized_probe_route_fusion_encode_candidate_records: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optimized_probe_route_fusion_encode_skipped_candidate_records: Option<usize>,
     diagnostic_timing_may_disable_route_fusion: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic_mean_ms: Option<f64>,
@@ -1469,8 +1475,23 @@ impl ProfileIntegrityReport {
         optimized_probe: Option<&MicrobenchCaseSummary>,
     ) -> Self {
         let route_fusion_active = dispatch.topk_moe_route_fused_records > 0;
+        let route_fusion_encode_candidate_records =
+            dispatch.topk_moe_route_encode_candidate_records;
+        let route_fusion_encode_skipped_candidate_records =
+            dispatch.topk_moe_route_encode_skipped_candidate_records;
         let optimized_probe_route_fusion_active = optimized_probe
             .map(|probe| probe.metal_dispatch_summary.topk_moe_route_fused_records > 0);
+        let optimized_probe_route_fusion_encode_candidate_records = optimized_probe.map(|probe| {
+            probe
+                .metal_dispatch_summary
+                .topk_moe_route_encode_candidate_records
+        });
+        let optimized_probe_route_fusion_encode_skipped_candidate_records =
+            optimized_probe.map(|probe| {
+                probe
+                    .metal_dispatch_summary
+                    .topk_moe_route_encode_skipped_candidate_records
+            });
         let diagnostic_timing_may_disable_route_fusion =
             flags.op_timing && matches!(optimized_probe_route_fusion_active, Some(true));
         let diagnostic_mean_ms = timing.mean_ms;
@@ -1487,7 +1508,11 @@ impl ProfileIntegrityReport {
             op_timing_enabled: flags.op_timing,
             metal_dispatch_log_enabled: flags.metal_dispatch_log,
             route_fusion_active,
+            route_fusion_encode_candidate_records,
+            route_fusion_encode_skipped_candidate_records,
             optimized_probe_route_fusion_active,
+            optimized_probe_route_fusion_encode_candidate_records,
+            optimized_probe_route_fusion_encode_skipped_candidate_records,
             diagnostic_timing_may_disable_route_fusion,
             diagnostic_mean_ms,
             optimized_probe_mean_ms,

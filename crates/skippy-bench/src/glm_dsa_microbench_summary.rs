@@ -100,6 +100,12 @@ pub(crate) struct GlmDsaDispatchSummary {
     pub(crate) topk_moe_route_fused_records: usize,
     pub(crate) topk_moe_route_pack_records: usize,
     pub(crate) topk_moe_route_encode_records: usize,
+    pub(crate) topk_moe_route_pack_candidate_records: usize,
+    pub(crate) topk_moe_route_packed_candidate_records: usize,
+    pub(crate) topk_moe_route_pack_skipped_candidate_records: usize,
+    pub(crate) topk_moe_route_encode_candidate_records: usize,
+    pub(crate) topk_moe_route_encode_fused_candidate_records: usize,
+    pub(crate) topk_moe_route_encode_skipped_candidate_records: usize,
     pub(crate) dsa_sparse_attn_records: usize,
     pub(crate) mul_mat_id_records: usize,
     pub(crate) moe_weighted_sum_records: usize,
@@ -114,6 +120,8 @@ pub(crate) struct GlmDsaDispatchSummary {
     pub(crate) max_grid_z: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) dispatch_shapes: Vec<DispatchShapeSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) route_fusion_reasons: Vec<RouteFusionReasonSummary>,
 }
 
 impl GlmDsaDispatchSummary {
@@ -141,12 +149,20 @@ pub(crate) struct DispatchShapeSummary {
     pub(crate) records: usize,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RouteFusionReasonSummary {
+    pub(crate) op: String,
+    pub(crate) reason: String,
+    pub(crate) records: usize,
+}
+
 pub(crate) fn summarize_metal_dispatch(records: &[MetalDispatchRecord]) -> GlmDsaDispatchSummary {
     let mut summary = GlmDsaDispatchSummary {
         records: records.len(),
         ..GlmDsaDispatchSummary::default()
     };
     let mut shapes = BTreeMap::<DispatchShapeKey, usize>::new();
+    let mut route_fusion_reasons = BTreeMap::<RouteFusionReasonKey, usize>::new();
 
     for record in records {
         summary.max_grid_x = summary.max_grid_x.max(record.grid_x);
@@ -168,6 +184,23 @@ pub(crate) fn summarize_metal_dispatch(records: &[MetalDispatchRecord]) -> GlmDs
             _ => {}
         }
 
+        if is_topk_moe_route_pack_candidate(record) {
+            summary.topk_moe_route_pack_candidate_records += 1;
+            if record.reason.as_deref() == Some("packed") {
+                summary.topk_moe_route_packed_candidate_records += 1;
+            } else {
+                summary.topk_moe_route_pack_skipped_candidate_records += 1;
+            }
+        }
+        if is_topk_moe_route_encode_candidate(record) {
+            summary.topk_moe_route_encode_candidate_records += 1;
+            if record.reason.as_deref() == Some("fused") {
+                summary.topk_moe_route_encode_fused_candidate_records += 1;
+            } else {
+                summary.topk_moe_route_encode_skipped_candidate_records += 1;
+            }
+        }
+
         if record.tensor.contains("ffn_moe_gate") {
             summary.routed_moe_gate_records += 1;
         }
@@ -185,13 +218,33 @@ pub(crate) fn summarize_metal_dispatch(records: &[MetalDispatchRecord]) -> GlmDs
         }
 
         *shapes.entry(DispatchShapeKey::from(record)).or_insert(0) += 1;
+        if let Some(reason) = &record.reason {
+            *route_fusion_reasons
+                .entry(RouteFusionReasonKey {
+                    op: record.op.clone(),
+                    reason: reason.clone(),
+                })
+                .or_insert(0) += 1;
+        }
     }
 
     summary.dispatch_shapes = shapes
         .into_iter()
         .map(|(shape, records)| shape.into_summary(records))
         .collect();
+    summary.route_fusion_reasons = route_fusion_reasons
+        .into_iter()
+        .map(|(reason, records)| reason.into_summary(records))
+        .collect();
     summary
+}
+
+fn is_topk_moe_route_pack_candidate(record: &MetalDispatchRecord) -> bool {
+    record.op == "topk_moe_route_pack" && record.reason.is_some()
+}
+
+fn is_topk_moe_route_encode_candidate(record: &MetalDispatchRecord) -> bool {
+    record.op == "topk_moe_route_encode" && record.reason.is_some()
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -435,6 +488,22 @@ struct DispatchShapeKey {
     threads_y: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RouteFusionReasonKey {
+    op: String,
+    reason: String,
+}
+
+impl RouteFusionReasonKey {
+    fn into_summary(self, records: usize) -> RouteFusionReasonSummary {
+        RouteFusionReasonSummary {
+            op: self.op,
+            reason: self.reason,
+            records,
+        }
+    }
+}
+
 impl DispatchShapeKey {
     fn from(record: &MetalDispatchRecord) -> Self {
         Self {
@@ -485,8 +554,16 @@ mod tests {
 
     #[test]
     fn metal_dispatch_summary_counts_glm_dsa_shapes() {
+        let mut fused_candidate =
+            dispatch("topk_moe_route_encode", None, "blk.45.ffn_moe_probs", None);
+        fused_candidate.reason = Some("fused".to_string());
+        let mut skipped_candidate =
+            dispatch("topk_moe_route_encode", None, "blk.46.ffn_moe_probs", None);
+        skipped_candidate.reason = Some("shape_or_sequence".to_string());
         let records = vec![
             dispatch("topk_moe_route_fused", None, "route", None),
+            fused_candidate,
+            skipped_candidate,
             dispatch("moe_weighted_sum", Some("f32x4"), "weighted", None),
             dispatch(
                 "mul_mat_id",
@@ -504,13 +581,25 @@ mod tests {
 
         let summary = summarize_metal_dispatch(&records);
 
-        assert_eq!(summary.records, 4);
+        assert_eq!(summary.records, 6);
         assert_eq!(summary.topk_moe_route_fused_records, 1);
+        assert_eq!(summary.topk_moe_route_encode_records, 2);
+        assert_eq!(summary.topk_moe_route_pack_candidate_records, 0);
+        assert_eq!(summary.topk_moe_route_packed_candidate_records, 0);
+        assert_eq!(summary.topk_moe_route_pack_skipped_candidate_records, 0);
+        assert_eq!(summary.topk_moe_route_encode_candidate_records, 2);
+        assert_eq!(summary.topk_moe_route_encode_fused_candidate_records, 1);
+        assert_eq!(summary.topk_moe_route_encode_skipped_candidate_records, 1);
         assert_eq!(summary.mul_mat_id_records, 2);
         assert_eq!(summary.moe_weighted_sum_f32x4_records, 1);
         assert_eq!(summary.routed_moe_down_q3_k_records, 2);
         assert_eq!(summary.routed_moe_down_expanded_grid_records, 2);
-        assert_eq!(summary.dispatch_shapes.len(), 3);
+        assert_eq!(summary.route_fusion_reasons.len(), 2);
+        assert_eq!(summary.route_fusion_reasons[0].reason, "fused");
+        assert_eq!(summary.route_fusion_reasons[0].records, 1);
+        assert_eq!(summary.route_fusion_reasons[1].reason, "shape_or_sequence");
+        assert_eq!(summary.route_fusion_reasons[1].records, 1);
+        assert_eq!(summary.dispatch_shapes.len(), 5);
     }
 
     #[test]
@@ -620,6 +709,7 @@ mod tests {
             op: op.to_string(),
             kernel: kernel.map(str::to_string),
             tensor: tensor.to_string(),
+            reason: None,
             parallel: None,
             q_type: None,
             k_type: None,

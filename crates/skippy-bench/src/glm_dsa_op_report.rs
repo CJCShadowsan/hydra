@@ -167,6 +167,7 @@ pub(crate) struct MetalDispatchRecord {
     pub(crate) op: String,
     pub(crate) kernel: Option<String>,
     pub(crate) tensor: String,
+    pub(crate) reason: Option<String>,
     pub(crate) parallel: Option<bool>,
     pub(crate) q_type: Option<String>,
     pub(crate) k_type: Option<String>,
@@ -605,6 +606,7 @@ fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
         op: parse_string_field(&fields, "op")?,
         kernel: parse_optional_string_field(&fields, "kernel"),
         tensor: parse_string_field(&fields, "tensor")?,
+        reason: parse_optional_string_field(&fields, "reason"),
         parallel: parse_optional_bool_int_field(&fields, "parallel")?,
         q_type: parse_optional_string_field(&fields, "q_type"),
         k_type: parse_optional_string_field(&fields, "k_type"),
@@ -1071,6 +1073,7 @@ mod tests {
     const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 grid_x=32 grid_y=4 grid_z=1 threads_x=256";
     const METAL_MUL_MAT_ID_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=mul_mat_id kernel=mul_mv_id tensor=ffn_moe_down-45 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 ne00=5120 ne01=6144 experts=256 used_experts=8 tokens=1 min_tokens=128 nr0=2 nr1=1 nsg=1 grid_x=1536 grid_y=1 grid_z=8 threads_x=32 threads_y=2";
+    const METAL_ROUTE_ENCODE_CANDIDATE_LINE: &str = "skippy: glm_dsa_metal_dispatch op=topk_moe_route_encode tensor=blk.45.ffn_moe_probs candidate=UNARY/blk.45.ffn_moe_probs,RESHAPE/view reason=fused filtered_nodes=65 graph_nodes=71 graph_idx=30 grid_x=1 grid_y=1 grid_z=1 threads_x=1";
 
     #[test]
     fn parses_timing_record_with_prefix() {
@@ -1190,6 +1193,18 @@ mod tests {
         assert_eq!(record.grid_x, 1536);
         assert_eq!(record.grid_z, 8);
         assert_eq!(record.threads_y, Some(2));
+    }
+
+    #[test]
+    fn parses_metal_dispatch_route_candidate_reason() {
+        let records = parse_metal_dispatch_records(METAL_ROUTE_ENCODE_CANDIDATE_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.op, "topk_moe_route_encode");
+        assert_eq!(record.tensor, "blk.45.ffn_moe_probs");
+        assert_eq!(record.reason.as_deref(), Some("fused"));
+        assert_eq!(record.grid_x, 1);
+        assert_eq!(record.threads_x, 1);
     }
 
     #[test]
