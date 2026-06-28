@@ -22,6 +22,8 @@ MUL_MM_ID_MIN_TOKENS="${MUL_MM_ID_MIN_TOKENS:-32}"
 SYNTHETIC_TOP_K_SIDEBAND="${SYNTHETIC_TOP_K_SIDEBAND:-off}"
 SYNTHETIC_TOP_K_WIDTH="${SYNTHETIC_TOP_K_WIDTH:-256}"
 REAL_TOP_K_SOURCE_LAYER_START="${REAL_TOP_K_SOURCE_LAYER_START:-}"
+REAL_TOP_K_CHAIN_SOURCES="${REAL_TOP_K_CHAIN_SOURCES:-}"
+REAL_TOP_K_MAX_SOURCE_BYTES="${REAL_TOP_K_MAX_SOURCE_BYTES:-}"
 REAL_TOP_K_CACHE_DIR="${REAL_TOP_K_CACHE_DIR:-}"
 WARM_REAL_TOP_K_CACHE="${WARM_REAL_TOP_K_CACHE:-off}"
 FORCE_REBUILD=1
@@ -77,6 +79,15 @@ Options:
                            Generate input with real GLM-DSA top-k sideband by
                            running local source range N..<target layer>.
                            Cannot be combined with --synthetic-top-k-sideband on.
+  --real-top-k-chain-sources LIST
+                           Comma-separated source starts used to build real
+                           top-k inputs for deeper consumer source spans, e.g.
+                           30 lets layer 75 run as 30..60 -> 60..75 -> 75..76.
+  --real-top-k-max-source-bytes N|off
+                           Refuse to generate a real top-k source span when
+                           selected layer artifacts exceed N bytes. Default is
+                           skippy-bench's built-in 120 GiB guard. Use off only
+                           for deliberate stress testing.
   --real-top-k-cache-dir PATH
                            Reuse generated real top-k activation frames from
                            PATH. Defaults to <output-dir>/real-top-k-cache when
@@ -95,7 +106,8 @@ Environment overrides mirror option names:
   ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS, INDEXER_MODE,
   SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK, SPARSE_ATTN_DECODE_GROUP_HEADS,
   MUL_MM_ID_MIN_TOKENS, SYNTHETIC_TOP_K_SIDEBAND, SYNTHETIC_TOP_K_WIDTH,
-  REAL_TOP_K_SOURCE_LAYER_START, REAL_TOP_K_CACHE_DIR, WARM_REAL_TOP_K_CACHE.
+  REAL_TOP_K_SOURCE_LAYER_START, REAL_TOP_K_CHAIN_SOURCES,
+  REAL_TOP_K_MAX_SOURCE_BYTES, REAL_TOP_K_CACHE_DIR, WARM_REAL_TOP_K_CACHE.
 EOF
 }
 
@@ -179,6 +191,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --real-top-k-source-layer-start)
       REAL_TOP_K_SOURCE_LAYER_START="$2"
+      shift 2
+      ;;
+    --real-top-k-chain-sources)
+      REAL_TOP_K_CHAIN_SOURCES="$2"
+      shift 2
+      ;;
+    --real-top-k-max-source-bytes)
+      REAL_TOP_K_MAX_SOURCE_BYTES="$2"
       shift 2
       ;;
     --real-top-k-cache-dir)
@@ -332,6 +352,10 @@ validate_synthetic_top_k_sideband() {
 validate_real_top_k_source_layer_start() {
   case "$REAL_TOP_K_SOURCE_LAYER_START" in
     ''|off|0)
+      if [[ -n "$REAL_TOP_K_CHAIN_SOURCES" ]]; then
+        echo "--real-top-k-chain-sources requires --real-top-k-source-layer-start" >&2
+        exit 2
+      fi
       return
       ;;
     *[!0-9]*)
@@ -346,6 +370,43 @@ validate_real_top_k_source_layer_start() {
   if [[ -z "$REAL_TOP_K_CACHE_DIR" ]]; then
     REAL_TOP_K_CACHE_DIR="$OUTPUT_DIR/real-top-k-cache"
   fi
+}
+
+validate_real_top_k_chain_sources() {
+  [[ -n "$REAL_TOP_K_CHAIN_SOURCES" ]] || return 0
+  local source
+  while IFS= read -r source; do
+    case "$source" in
+      ''|*[!0-9]*)
+        echo "invalid --real-top-k-chain-sources entry: $source (expected positive integer)" >&2
+        exit 2
+        ;;
+      *)
+        if [[ "$source" -lt 1 ]]; then
+          echo "invalid --real-top-k-chain-sources entry: $source (expected positive integer)" >&2
+          exit 2
+        fi
+        ;;
+    esac
+  done < <(split_csv "$REAL_TOP_K_CHAIN_SOURCES")
+}
+
+validate_real_top_k_max_source_bytes() {
+  [[ -n "$REAL_TOP_K_MAX_SOURCE_BYTES" ]] || return 0
+  case "$REAL_TOP_K_MAX_SOURCE_BYTES" in
+    off|OFF|Off|0)
+      ;;
+    *[!0-9]*)
+      echo "invalid --real-top-k-max-source-bytes: $REAL_TOP_K_MAX_SOURCE_BYTES (expected positive integer, 0, or off)" >&2
+      exit 2
+      ;;
+    *)
+      if [[ "$REAL_TOP_K_MAX_SOURCE_BYTES" -lt 1 ]]; then
+        echo "invalid --real-top-k-max-source-bytes: $REAL_TOP_K_MAX_SOURCE_BYTES (expected positive integer, 0, or off)" >&2
+        exit 2
+      fi
+      ;;
+  esac
 }
 
 validate_warm_real_top_k_cache() {
@@ -444,6 +505,8 @@ run_cache_warm_case() {
     "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=0"
     "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=0"
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=$REAL_TOP_K_SOURCE_LAYER_START"
+    "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES=$REAL_TOP_K_CHAIN_SOURCES"
+    "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES=$REAL_TOP_K_MAX_SOURCE_BYTES"
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=$REAL_TOP_K_CACHE_DIR"
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE=0"
     "$ROOT/target/debug/skippy-bench"
@@ -547,6 +610,23 @@ def dispatch_counts(records):
 
 def format_dispatch_counts(records):
     counts = dispatch_counts(records)
+    if not counts:
+        return "none"
+    return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
+
+def route_fusion_reason_counts(records):
+    counts = {}
+    for record in records:
+        op = record.get("op", "unknown")
+        if not op.startswith("topk_moe_route_"):
+            continue
+        reason = record.get("reason") or record.get("kernel") or "unknown"
+        key = f"{op}/{reason}"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+def format_route_fusion_reasons(records):
+    counts = route_fusion_reason_counts(records)
     if not counts:
         return "none"
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
@@ -671,7 +751,7 @@ for path in cases:
         "routed_moe_aggregate": median_field(op_timing_records, "routed_moe_aggregate_us"),
         "shared_expert": median_field(op_timing_records, "shared_expert_us"),
     }
-    pair = re.match(r"(default|optin)(?:-(serial|parallel))?(?:-th(\d+))?(?:-(cachetopk|nocachetopk))?(?:-hgrp(\d+))?(?:-mmid(\d+))?(?:-(syntopk\d+|realtopk\d+))?-l(\d+)-t(\d+)$", name)
+    pair = re.match(r"(default|optin)(?:-(serial|parallel))?(?:-th(\d+))?(?:-(cachetopk|nocachetopk))?(?:-hgrp(\d+))?(?:-mmid(\d+))?(?:-(syntopk\d+|realtopk\d+(?:-chain[0-9_]+)?))?-l(\d+)-t(\d+)$", name)
     if pair:
         variant, mode, threads, cache_topk, decode_group, mm_id_min_tokens, topk_input, layer, tokens = pair.groups()
         mode = mode or case_mode_from_name(name)
@@ -729,6 +809,7 @@ for path in cases:
             f"aggregate={format_float(op_stats['routed_moe_aggregate'])}"
         )
     print(f"  metal_dispatch={format_dispatch_counts(dispatch_records)}")
+    print(f"  route_fusion_reasons={format_route_fusion_reasons(dispatch_records)}")
     print(f"  hot_tensors={format_hot_tensors(hot_tensor_records)}")
     sparse_attn_shapes = sparse_attn_dispatch_shapes(dispatch_records)
     if sparse_attn_shapes:
@@ -830,6 +911,8 @@ validate_sparse_attn_decode_group_heads
 validate_mul_mm_id_min_tokens
 validate_synthetic_top_k_sideband
 validate_real_top_k_source_layer_start
+validate_real_top_k_chain_sources
+validate_real_top_k_max_source_bytes
 validate_warm_real_top_k_cache
 mkdir -p "$OUTPUT_DIR"
 
@@ -928,6 +1011,12 @@ case_env() {
   fi
   if [[ -n "$REAL_TOP_K_SOURCE_LAYER_START" && "$REAL_TOP_K_SOURCE_LAYER_START" != "off" && "$REAL_TOP_K_SOURCE_LAYER_START" != "0" ]]; then
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=$REAL_TOP_K_SOURCE_LAYER_START"
+    if [[ -n "$REAL_TOP_K_CHAIN_SOURCES" ]]; then
+      printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES=$REAL_TOP_K_CHAIN_SOURCES"
+    fi
+    if [[ -n "$REAL_TOP_K_MAX_SOURCE_BYTES" ]]; then
+      printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES=$REAL_TOP_K_MAX_SOURCE_BYTES"
+    fi
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=$REAL_TOP_K_CACHE_DIR"
     if [[ "$WARM_REAL_TOP_K_CACHE" == "on" ]]; then
       printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE=1"
@@ -1009,6 +1098,10 @@ case_name() {
     sideband_suffix="-syntopk${SYNTHETIC_TOP_K_WIDTH}"
   elif [[ -n "$REAL_TOP_K_SOURCE_LAYER_START" && "$REAL_TOP_K_SOURCE_LAYER_START" != "off" && "$REAL_TOP_K_SOURCE_LAYER_START" != "0" ]]; then
     sideband_suffix="-realtopk${REAL_TOP_K_SOURCE_LAYER_START}"
+    if [[ -n "$REAL_TOP_K_CHAIN_SOURCES" ]]; then
+      local chain_suffix="${REAL_TOP_K_CHAIN_SOURCES//,/_}"
+      sideband_suffix="${sideband_suffix}-chain${chain_suffix}"
+    fi
   fi
   if [[ "$INDEXER_MODE" == "parallel" && "$mode" == "parallel" && -z "$threads_suffix" && -z "$cache_suffix" && -z "$decode_group_suffix" && -z "$mm_id_suffix" && -z "$sideband_suffix" ]]; then
     printf '%s\n' "$base_name"

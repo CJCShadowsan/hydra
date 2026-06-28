@@ -35,7 +35,9 @@ const ENV_REAL_TOP_K_SOURCE_LAYER_START: &str =
 const ENV_REAL_TOP_K_CACHE_DIR: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR";
 const ENV_REAL_TOP_K_REQUIRE_CACHE: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE";
 const ENV_REAL_TOP_K_CHAIN_SOURCES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES";
+const ENV_REAL_TOP_K_MAX_SOURCE_BYTES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
+const DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES: u64 = 120 * 1024 * 1024 * 1024;
 const INPUT_FRAME_CACHE_MAGIC: &[u8; 16] = b"SKPGLMDSAFRM1\0\0\0";
 
 pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
@@ -571,6 +573,8 @@ fn generate_real_top_k_frame(
     let source_request = package_request_for_range(args, source_layer_start, source_layer_end);
     let source_selected = select_layer_package_parts(&source_request)
         .context("select GLM-DSA real top-k source layer package parts")?;
+    guard_real_top_k_source_size(&source_selected.selected_parts)
+        .context("check GLM-DSA real top-k source span size")?;
     let source_config = runtime_config_for_range(args, source_layer_start, source_layer_end)?;
     let source_flags = MicrobenchFlags {
         direct_sparse_attn: false,
@@ -669,6 +673,52 @@ fn parse_real_top_k_chain_sources(value: &str) -> Result<Vec<u32>> {
         );
     }
     Ok(sources)
+}
+
+fn guard_real_top_k_source_size(selected_parts: &[PackagePart]) -> Result<()> {
+    let Some(max_bytes) = real_top_k_max_source_bytes()? else {
+        return Ok(());
+    };
+    guard_real_top_k_source_size_with_limit(selected_parts, max_bytes)
+}
+
+fn guard_real_top_k_source_size_with_limit(
+    selected_parts: &[PackagePart],
+    max_bytes: u64,
+) -> Result<()> {
+    let artifact_bytes = selected_parts
+        .iter()
+        .try_fold(0_u64, |sum, part| sum.checked_add(part.artifact_bytes))
+        .context("real top-k source artifact byte count overflow")?;
+    if artifact_bytes > max_bytes {
+        bail!(
+            "real top-k source span selects {} bytes of layer artifacts, above {} byte limit; use {ENV_REAL_TOP_K_CHAIN_SOURCES} to split the source span or set {ENV_REAL_TOP_K_MAX_SOURCE_BYTES}=off to override",
+            artifact_bytes,
+            max_bytes
+        );
+    }
+    Ok(())
+}
+
+fn real_top_k_max_source_bytes() -> Result<Option<u64>> {
+    let Ok(value) = std::env::var(ENV_REAL_TOP_K_MAX_SOURCE_BYTES) else {
+        return Ok(Some(DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES));
+    };
+    parse_real_top_k_max_source_bytes(&value)
+}
+
+fn parse_real_top_k_max_source_bytes(value: &str) -> Result<Option<u64>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES));
+    }
+    if trimmed.eq_ignore_ascii_case("off") || trimmed == "0" {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u64>()
+        .map(Some)
+        .with_context(|| format!("parse {ENV_REAL_TOP_K_MAX_SOURCE_BYTES}"))
 }
 
 fn real_top_k_prepared_input(
@@ -1835,6 +1885,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES"));
+    }
+
+    #[test]
+    fn parses_real_top_k_max_source_bytes() {
+        assert_eq!(
+            parse_real_top_k_max_source_bytes("").unwrap(),
+            Some(DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES)
+        );
+        assert_eq!(parse_real_top_k_max_source_bytes("off").unwrap(), None);
+        assert_eq!(parse_real_top_k_max_source_bytes("0").unwrap(), None);
+        assert_eq!(parse_real_top_k_max_source_bytes("123").unwrap(), Some(123));
+    }
+
+    #[test]
+    fn rejects_oversized_real_top_k_source_span() {
+        let parts = vec![test_package_part(70), test_package_part(40)];
+
+        let error = guard_real_top_k_source_size_with_limit(&parts, 100)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("real top-k source span selects 110 bytes"));
+        assert!(error.contains("SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES"));
+    }
+
+    #[test]
+    fn accepts_real_top_k_source_span_under_limit() {
+        let parts = vec![test_package_part(70), test_package_part(30)];
+
+        guard_real_top_k_source_size_with_limit(&parts, 100).unwrap();
+    }
+
+    fn test_package_part(artifact_bytes: u64) -> PackagePart {
+        PackagePart {
+            role: "layer".to_string(),
+            layer_index: Some(0),
+            path: PathBuf::from("layers/layer-000.gguf"),
+            sha256: "test".to_string(),
+            artifact_bytes,
+        }
     }
 
     fn case_summary(
