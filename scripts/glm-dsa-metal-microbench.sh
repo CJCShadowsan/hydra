@@ -631,6 +631,21 @@ def format_route_fusion_reasons(records):
         return "none"
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
 
+def timing_summary_stats(summary):
+    if not summary:
+        return {
+            "count": 0,
+            "min": None,
+            "median": None,
+            "max": None,
+        }
+    return {
+        "count": summary.get("samples", 0),
+        "min": summary.get("min_ms"),
+        "median": summary.get("p50_ms"),
+        "max": summary.get("max_ms"),
+    }
+
 def format_hot_tensors(records, limit=8):
     if not records:
         return "none"
@@ -724,9 +739,11 @@ for path in cases:
     print(name)
     report = json.loads(path.read_text())
     input_source = report.get("input_source", {})
-    comparison = report["comparison"]
-    parity = comparison["parity"]
-    candidate = comparison["candidate"]
+    comparison = report.get("comparison")
+    parity = comparison.get("parity") if comparison else None
+    candidate = comparison["candidate"] if comparison else report
+    optimized_probe = report.get("optimized_dispatch_probe")
+    profile_integrity = report.get("profile_integrity", {})
     op_timing_records = candidate.get("op_timing_records", [])
     timing = op_timing_records[0] if op_timing_records else {}
     dispatch_records = candidate.get("metal_dispatch_records", [])
@@ -772,7 +789,10 @@ for path in cases:
         paired.setdefault((mode, threads, cache_topk, decode_group, mm_id_min_tokens, topk_input, int(layer), int(tokens)), {})[variant] = case_summary
         mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk, decode_group, mm_id_min_tokens, topk_input)] = case_summary
     print(f"  input_source={format_input_source(input_source)}")
-    print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
+    if parity:
+        print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
+    else:
+        print("  parity=n/a")
     print(f"  dsa_sparse_attn_nodes={timing.get('dsa_sparse_attn_nodes')} sparse_mask_nodes={timing.get('sparse_mask_nodes')}")
     print(
         "  elapsed_ms="
@@ -810,6 +830,27 @@ for path in cases:
         )
     print(f"  metal_dispatch={format_dispatch_counts(dispatch_records)}")
     print(f"  route_fusion_reasons={format_route_fusion_reasons(dispatch_records)}")
+    if profile_integrity:
+        print(
+            "  profile_integrity="
+            f"route_fusion_active={profile_integrity.get('route_fusion_active')} "
+            f"optimized_route_fusion_active={profile_integrity.get('optimized_probe_route_fusion_active')} "
+            f"diagnostic_may_disable_route_fusion={profile_integrity.get('diagnostic_timing_may_disable_route_fusion')} "
+            f"diagnostic_ms={format_float(profile_integrity.get('diagnostic_mean_ms'))} "
+            f"optimized_ms={format_float(profile_integrity.get('optimized_probe_mean_ms'))} "
+            f"diagnostic_slowdown={format_float(profile_integrity.get('diagnostic_slowdown_vs_optimized_probe'))}"
+        )
+    if optimized_probe:
+        optimized_dispatch = optimized_probe.get("metal_dispatch_records", [])
+        optimized_stats = timing_summary_stats(optimized_probe.get("timing_summary", {}))
+        print(
+            "  optimized_probe_elapsed_ms="
+            f"count={optimized_stats['count']} "
+            f"min={format_float(optimized_stats['min'])} "
+            f"median={format_float(optimized_stats['median'])} "
+            f"max={format_float(optimized_stats['max'])}"
+        )
+        print(f"  optimized_probe_route_fusion_reasons={format_route_fusion_reasons(optimized_dispatch)}")
     print(f"  hot_tensors={format_hot_tensors(hot_tensor_records)}")
     sparse_attn_shapes = sparse_attn_dispatch_shapes(dispatch_records)
     if sparse_attn_shapes:
