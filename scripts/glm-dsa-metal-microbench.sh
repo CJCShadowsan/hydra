@@ -723,6 +723,20 @@ def format_input_source(source):
         f"cache_path={source.get('cache_path', 'none')}"
     )
 
+def format_indexshare_policy(report):
+    policy = report.get("indexshare_policy")
+    if not policy:
+        return "disabled"
+    parts = []
+    if policy.get("freq") is not None:
+        parts.append(f"freq={policy['freq']}")
+    if policy.get("pattern") is not None:
+        pattern = policy["pattern"]
+        if len(pattern) > 24:
+            pattern = f"{pattern[:12]}...{pattern[-8:]}"
+        parts.append(f"pattern={pattern}")
+    return ",".join(parts) if parts else "disabled"
+
 def sparse_attn_dispatch_shape(record):
     return (
         f"batch={record.get('batch')} "
@@ -828,6 +842,7 @@ for path in cases:
             "elapsed_ms": elapsed_stats,
             "total_us": native_stats,
             "op_stats": op_stats,
+            "indexshare_policy": format_indexshare_policy(report),
             "use_direct": decision_summary.get("use_direct", 0),
             "fallback": decision_summary.get("fallback", 0),
             "dsa_sparse_attn_nodes": timing.get("dsa_sparse_attn_nodes"),
@@ -836,6 +851,7 @@ for path in cases:
         paired.setdefault((mode, threads, cache_topk, decode_group, mm_id_min_tokens, topk_input, int(layer), int(tokens)), {})[variant] = case_summary
         mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk, decode_group, mm_id_min_tokens, topk_input)] = case_summary
     print(f"  input_source={format_input_source(input_source)}")
+    print(f"  indexshare_policy={format_indexshare_policy(report)}")
     if parity:
         print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
     else:
@@ -923,7 +939,7 @@ for path in cases:
 if paired:
     print()
     print("pairwise_optin_vs_default")
-    print("mode sparse_attn_threads cache_topk decode_group_heads mul_mm_id_min_tokens top_k_input layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
+    print("mode sparse_attn_threads cache_topk decode_group_heads mul_mm_id_min_tokens top_k_input layer tokens samples indexshare_policy default_ms_median optin_ms_median elapsed_ratio elapsed_delta_ms default_native_us_median optin_native_us_median native_ratio native_delta_us indexer_topk_delta_us sparse_mask_delta_us dsa_sparse_attn_delta_us routed_moe_delta_us shared_expert_delta_us indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
     for (mode, threads, cache_topk, decode_group, mm_id_min_tokens, topk_input, layer, tokens), variants in sorted(paired.items()):
         default = variants.get("default")
         optin = variants.get("optin")
@@ -937,16 +953,28 @@ if paired:
         elapsed_ratio = optin_elapsed / default_elapsed if default_elapsed not in (None, 0) and optin_elapsed is not None else None
         native_ratio = optin_native / default_native if default_native not in (None, 0) and optin_native is not None else None
         op_ratios = {}
+        op_deltas = {}
         for op_name in ("indexer_topk", "sparse_mask", "dsa_sparse_attn", "routed_moe", "shared_expert"):
             default_op = default["op_stats"][op_name]
             optin_op = optin["op_stats"][op_name]
             op_ratios[op_name] = optin_op / default_op if default_op not in (None, 0) and optin_op is not None else None
+            op_deltas[op_name] = optin_op - default_op if default_op is not None and optin_op is not None else None
+        elapsed_delta = optin_elapsed - default_elapsed if default_elapsed is not None and optin_elapsed is not None else None
+        native_delta = optin_native - default_native if default_native is not None and optin_native is not None else None
         print(
             f"{mode} {threads} {cache_topk} {decode_group} {mm_id_min_tokens} "
             f"{topk_input} {layer} {tokens} "
             f"{samples} "
+            f"{optin['indexshare_policy']} "
             f"{format_float(default_elapsed)} {format_float(optin_elapsed)} {format_float(elapsed_ratio)} "
+            f"{format_float(elapsed_delta)} "
             f"{format_float(default_native)} {format_float(optin_native)} {format_float(native_ratio)} "
+            f"{format_float(native_delta)} "
+            f"{format_float(op_deltas['indexer_topk'])} "
+            f"{format_float(op_deltas['sparse_mask'])} "
+            f"{format_float(op_deltas['dsa_sparse_attn'])} "
+            f"{format_float(op_deltas['routed_moe'])} "
+            f"{format_float(op_deltas['shared_expert'])} "
             f"{format_float(op_ratios['indexer_topk'])} "
             f"{format_float(op_ratios['sparse_mask'])} "
             f"{format_float(op_ratios['dsa_sparse_attn'])} "
