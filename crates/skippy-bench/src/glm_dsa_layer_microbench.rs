@@ -27,7 +27,9 @@ const ENV_SYNTHETIC_TOP_K_SIDEBAND: &str = "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K
 const ENV_SYNTHETIC_TOP_K_WIDTH: &str = "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_WIDTH";
 const ENV_REAL_TOP_K_SOURCE_LAYER_START: &str =
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START";
+const ENV_REAL_TOP_K_CACHE_DIR: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
+const INPUT_FRAME_CACHE_MAGIC: &[u8; 16] = b"SKPGLMDSAFRM1\0\0\0";
 
 pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     validate_args(&args)?;
@@ -444,6 +446,23 @@ fn real_top_k_activation_frame(
     source_layer_start: u32,
 ) -> Result<PreparedInputActivation> {
     let source_layer_end = args.layer_start;
+    let cache_path = real_top_k_cache_path(args, flags, source_layer_start)?;
+    if let Some(path) = cache_path.as_ref()
+        && path.exists()
+    {
+        let frame = read_activation_frame_cache(path)
+            .with_context(|| format!("read real top-k input cache {}", path.display()))?;
+        validate_real_top_k_frame(args, &frame, source_layer_start, source_layer_end)?;
+        return real_top_k_prepared_input(
+            args,
+            frame,
+            source_layer_start,
+            source_layer_end,
+            Vec::new(),
+            cache_path,
+            true,
+        );
+    }
     let source_request = package_request_for_range(args, source_layer_start, source_layer_end);
     let source_selected = select_layer_package_parts(&source_request)
         .context("select GLM-DSA real top-k source layer package parts")?;
@@ -468,19 +487,212 @@ fn real_top_k_activation_frame(
             format!("run GLM-DSA real top-k source {source_layer_start}..{source_layer_end}")
         })?;
     validate_real_top_k_frame(args, &frame, source_layer_start, source_layer_end)?;
+    if let Some(path) = cache_path.as_ref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create real top-k input cache dir {}", parent.display())
+            })?;
+        }
+        write_activation_frame_cache(path, &frame)
+            .with_context(|| format!("write real top-k input cache {}", path.display()))?;
+    }
+    real_top_k_prepared_input(
+        args,
+        frame,
+        source_layer_start,
+        source_layer_end,
+        source_selected
+            .selected_parts
+            .iter()
+            .map(package_part_summary)
+            .collect(),
+        cache_path,
+        false,
+    )
+}
+
+fn real_top_k_prepared_input(
+    args: &GlmDsaLayerMicrobenchArgs,
+    frame: ActivationFrame,
+    source_layer_start: u32,
+    source_layer_end: u32,
+    selected_parts: Vec<PackagePartSummary>,
+    cache_path: Option<PathBuf>,
+    cache_hit: bool,
+) -> Result<PreparedInputActivation> {
     let report = InputSourceReport::RealTopK {
         layer_start: source_layer_start,
         layer_end: source_layer_end,
         output_flags: frame.desc.flags,
         output_payload_bytes: frame.payload.len(),
         sideband_bytes: real_top_k_sideband_bytes(args, &frame)?,
-        selected_parts: source_selected
-            .selected_parts
-            .iter()
-            .map(package_part_summary)
-            .collect(),
+        cache_path,
+        cache_hit,
+        selected_parts,
     };
     Ok(PreparedInputActivation { frame, report })
+}
+
+fn real_top_k_cache_path(
+    args: &GlmDsaLayerMicrobenchArgs,
+    flags: MicrobenchFlags,
+    source_layer_start: u32,
+) -> Result<Option<PathBuf>> {
+    let Ok(value) = std::env::var(ENV_REAL_TOP_K_CACHE_DIR) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let n_batch = args.n_batch.unwrap_or_else(|| bounded_u32(args.tokens));
+    let n_ubatch = args.n_ubatch.unwrap_or_else(|| bounded_u32(args.tokens));
+    let file_name = format!(
+        "real-topk-src{}-dst{}-tok{}-ctx{}-act{}-ngpu{}-nb{}-nub{}-pi{}.skippy-frame",
+        source_layer_start,
+        args.layer_start,
+        args.tokens,
+        args.ctx_size,
+        args.activation_width,
+        args.n_gpu_layers,
+        n_batch,
+        n_ubatch,
+        u8::from(flags.parallel_lightning_indexer)
+    );
+    Ok(Some(PathBuf::from(trimmed).join(file_name)))
+}
+
+fn write_activation_frame_cache(path: &Path, frame: &ActivationFrame) -> Result<()> {
+    let mut encoded = Vec::with_capacity(INPUT_FRAME_CACHE_MAGIC.len() + 64 + frame.payload.len());
+    encoded.extend_from_slice(INPUT_FRAME_CACHE_MAGIC);
+    push_u32(&mut encoded, frame.desc.version);
+    push_i32(&mut encoded, frame.desc.dtype as i32);
+    push_i32(&mut encoded, frame.desc.layout as i32);
+    push_i32(&mut encoded, frame.desc.producer_stage_index);
+    push_i32(&mut encoded, frame.desc.layer_start);
+    push_i32(&mut encoded, frame.desc.layer_end);
+    push_u32(&mut encoded, frame.desc.token_count);
+    push_u32(&mut encoded, frame.desc.sequence_count);
+    push_u64(&mut encoded, frame.desc.payload_bytes);
+    push_u64(&mut encoded, frame.desc.flags);
+    encoded.extend_from_slice(&frame.payload);
+    fs::write(path, encoded).with_context(|| format!("write {}", path.display()))
+}
+
+fn read_activation_frame_cache(path: &Path) -> Result<ActivationFrame> {
+    let encoded = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut cursor = CacheCursor::new(&encoded);
+    cursor.expect_magic()?;
+    let desc = ActivationDesc {
+        version: cursor.read_u32("version")?,
+        dtype: activation_dtype_from_i32(cursor.read_i32("dtype")?)?,
+        layout: activation_layout_from_i32(cursor.read_i32("layout")?)?,
+        producer_stage_index: cursor.read_i32("producer_stage_index")?,
+        layer_start: cursor.read_i32("layer_start")?,
+        layer_end: cursor.read_i32("layer_end")?,
+        token_count: cursor.read_u32("token_count")?,
+        sequence_count: cursor.read_u32("sequence_count")?,
+        payload_bytes: cursor.read_u64("payload_bytes")?,
+        flags: cursor.read_u64("flags")?,
+    };
+    let payload = cursor.remaining().to_vec();
+    if u64::try_from(payload.len()).context("cached payload length exceeds u64")?
+        != desc.payload_bytes
+    {
+        bail!(
+            "cached activation payload has {} bytes, descriptor says {}",
+            payload.len(),
+            desc.payload_bytes
+        );
+    }
+    Ok(ActivationFrame { desc, payload })
+}
+
+fn push_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_i32(output: &mut Vec<u8>, value: i32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn activation_dtype_from_i32(value: i32) -> Result<RuntimeActivationDType> {
+    match value {
+        0 => Ok(RuntimeActivationDType::Unknown),
+        1 => Ok(RuntimeActivationDType::F32),
+        2 => Ok(RuntimeActivationDType::F16),
+        3 => Ok(RuntimeActivationDType::Bf16),
+        _ => bail!("cached activation frame has unsupported dtype {value}"),
+    }
+}
+
+fn activation_layout_from_i32(value: i32) -> Result<RuntimeActivationLayout> {
+    match value {
+        0 => Ok(RuntimeActivationLayout::Opaque),
+        1 => Ok(RuntimeActivationLayout::TokenMajor),
+        _ => bail!("cached activation frame has unsupported layout {value}"),
+    }
+}
+
+struct CacheCursor<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CacheCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn expect_magic(&mut self) -> Result<()> {
+        let magic = self.read_bytes(INPUT_FRAME_CACHE_MAGIC.len(), "magic")?;
+        if magic != INPUT_FRAME_CACHE_MAGIC {
+            bail!("cached activation frame has invalid magic");
+        }
+        Ok(())
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32> {
+        let bytes = self.read_array::<4>(field)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_i32(&mut self, field: &str) -> Result<i32> {
+        let bytes = self.read_array::<4>(field)?;
+        Ok(i32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64> {
+        let bytes = self.read_array::<8>(field)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn read_array<const N: usize>(&mut self, field: &str) -> Result<[u8; N]> {
+        self.read_bytes(N, field)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("cached activation frame field {field} had wrong size"))
+    }
+
+    fn read_bytes(&mut self, len: usize, field: &str) -> Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .context("cached activation frame offset overflow")?;
+        if end > self.data.len() {
+            bail!("cached activation frame ended while reading {field}");
+        }
+        let bytes = &self.data[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.data[self.offset..]
+    }
 }
 
 fn validate_real_top_k_frame(
@@ -1100,6 +1312,9 @@ enum InputSourceReport {
         output_flags: u64,
         output_payload_bytes: usize,
         sideband_bytes: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_path: Option<PathBuf>,
+        cache_hit: bool,
         selected_parts: Vec<PackagePartSummary>,
     },
 }

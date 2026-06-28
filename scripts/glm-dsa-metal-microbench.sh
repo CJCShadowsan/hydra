@@ -20,6 +20,7 @@ SPARSE_ATTN_CACHE_TOPK="${SPARSE_ATTN_CACHE_TOPK:-off}"
 SYNTHETIC_TOP_K_SIDEBAND="${SYNTHETIC_TOP_K_SIDEBAND:-off}"
 SYNTHETIC_TOP_K_WIDTH="${SYNTHETIC_TOP_K_WIDTH:-256}"
 REAL_TOP_K_SOURCE_LAYER_START="${REAL_TOP_K_SOURCE_LAYER_START:-}"
+REAL_TOP_K_CACHE_DIR="${REAL_TOP_K_CACHE_DIR:-}"
 FORCE_REBUILD=1
 BUILD_ONLY=0
 DRY_RUN=0
@@ -67,6 +68,10 @@ Options:
                            Generate input with real GLM-DSA top-k sideband by
                            running local source range N..<target layer>.
                            Cannot be combined with --synthetic-top-k-sideband on.
+  --real-top-k-cache-dir PATH
+                           Reuse generated real top-k activation frames from
+                           PATH. Defaults to <output-dir>/real-top-k-cache when
+                           --real-top-k-source-layer-start is set.
   --no-force-rebuild       Skip forced static-metal rebuild/relink.
   --build-only             Rebuild/relink only; do not run cases.
   --dry-run                Print commands without executing.
@@ -76,7 +81,7 @@ Environment overrides mirror option names:
   STAGE_MODEL, MODEL_ID, OUTPUT_DIR, LAYER_START, LAYER_END, CTX_SIZE,
   ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS, INDEXER_MODE,
   SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK, SYNTHETIC_TOP_K_SIDEBAND,
-  SYNTHETIC_TOP_K_WIDTH, REAL_TOP_K_SOURCE_LAYER_START.
+  SYNTHETIC_TOP_K_WIDTH, REAL_TOP_K_SOURCE_LAYER_START, REAL_TOP_K_CACHE_DIR.
 EOF
 }
 
@@ -152,6 +157,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --real-top-k-source-layer-start)
       REAL_TOP_K_SOURCE_LAYER_START="$2"
+      shift 2
+      ;;
+    --real-top-k-cache-dir)
+      REAL_TOP_K_CACHE_DIR="$2"
       shift 2
       ;;
     --no-force-rebuild)
@@ -275,6 +284,9 @@ validate_real_top_k_source_layer_start() {
   if [[ "$SYNTHETIC_TOP_K_SIDEBAND" == "on" ]]; then
     echo "--real-top-k-source-layer-start cannot be combined with --synthetic-top-k-sideband on" >&2
     exit 2
+  fi
+  if [[ -z "$REAL_TOP_K_CACHE_DIR" ]]; then
+    REAL_TOP_K_CACHE_DIR="$OUTPUT_DIR/real-top-k-cache"
   fi
 }
 
@@ -412,6 +424,20 @@ def format_dispatch_counts(records):
         return "none"
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
 
+def format_input_source(source):
+    if not source:
+        return "unknown"
+    kind = source.get("kind", "unknown")
+    if kind != "real_top_k":
+        top_k_sideband = source.get("top_k_sideband")
+        return kind if top_k_sideband is None else f"{kind}/topk{top_k_sideband}"
+    return (
+        f"real_top_k source={source.get('layer_start')}..{source.get('layer_end')} "
+        f"sideband_bytes={source.get('sideband_bytes')} "
+        f"cache_hit={source.get('cache_hit')} "
+        f"cache_path={source.get('cache_path', 'none')}"
+    )
+
 def sparse_attn_dispatch_shape(record):
     return (
         f"batch={record.get('batch')} "
@@ -466,6 +492,7 @@ for path in cases:
     print()
     print(name)
     report = json.loads(path.read_text())
+    input_source = report.get("input_source", {})
     comparison = report["comparison"]
     parity = comparison["parity"]
     candidate = comparison["candidate"]
@@ -502,6 +529,7 @@ for path in cases:
         }
         paired.setdefault((mode, threads, cache_topk, topk_input, int(layer), int(tokens)), {})[variant] = case_summary
         mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk, topk_input)] = case_summary
+    print(f"  input_source={format_input_source(input_source)}")
     print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
     print(f"  dsa_sparse_attn_nodes={timing.get('dsa_sparse_attn_nodes')} sparse_mask_nodes={timing.get('sparse_mask_nodes')}")
     print(
@@ -688,8 +716,10 @@ case_env() {
   fi
   if [[ -n "$REAL_TOP_K_SOURCE_LAYER_START" && "$REAL_TOP_K_SOURCE_LAYER_START" != "off" && "$REAL_TOP_K_SOURCE_LAYER_START" != "0" ]]; then
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=$REAL_TOP_K_SOURCE_LAYER_START"
+    printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=$REAL_TOP_K_CACHE_DIR"
   else
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=off"
+    printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=off"
   fi
 }
 
