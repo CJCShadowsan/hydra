@@ -9,6 +9,7 @@ const OP_TIMING_PREFIX: &str = "skippy: glm_dsa_op_timing ";
 const GROUP_TIMING_PREFIX: &str = "skippy: glm_dsa_group_timing ";
 const SIDEBAND_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
 const DIRECT_SPARSE_DECISION_PREFIX: &str = "skippy: glm_dsa_direct_sparse_decision ";
+const METAL_DISPATCH_PREFIX: &str = "skippy: glm_dsa_metal_dispatch ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +127,33 @@ pub(crate) struct DirectSparseDecisionRecord {
     pub(crate) alibi_ok: bool,
     pub(crate) soft_cap_ok: bool,
     pub(crate) use_direct: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct MetalDispatchRecord {
+    pub(crate) op: String,
+    pub(crate) kernel: Option<String>,
+    pub(crate) tensor: String,
+    pub(crate) parallel: Option<bool>,
+    pub(crate) q_type: Option<String>,
+    pub(crate) k_type: Option<String>,
+    pub(crate) v_type: Option<String>,
+    pub(crate) mask_type: Option<String>,
+    pub(crate) top_k_type: Option<String>,
+    pub(crate) src_type: Option<String>,
+    pub(crate) dst_type: Option<String>,
+    pub(crate) q_width: Option<u64>,
+    pub(crate) v_width: Option<u64>,
+    pub(crate) batch: Option<u64>,
+    pub(crate) heads: Option<u64>,
+    pub(crate) stream: Option<u64>,
+    pub(crate) kv: Option<u64>,
+    pub(crate) top_k: Option<u64>,
+    pub(crate) top_stream: Option<u64>,
+    pub(crate) grid_x: u64,
+    pub(crate) grid_y: u64,
+    pub(crate) grid_z: u64,
+    pub(crate) threads_x: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -480,6 +508,16 @@ pub(crate) fn parse_direct_sparse_decision_records(
         .collect()
 }
 
+pub(crate) fn parse_metal_dispatch_records(text: &str) -> Result<Vec<MetalDispatchRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(METAL_DISPATCH_PREFIX)
+                .map(|index| &line[index + METAL_DISPATCH_PREFIX.len()..])
+        })
+        .map(parse_metal_dispatch_record)
+        .collect()
+}
+
 fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisionRecord> {
     let fields = line
         .split_whitespace()
@@ -501,6 +539,38 @@ fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisio
         alibi_ok: parse_bool_int_field(&fields, "alibi_ok")?,
         soft_cap_ok: parse_bool_int_field(&fields, "soft_cap_ok")?,
         use_direct: parse_bool_int_field(&fields, "use_direct")?,
+    })
+}
+
+fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(MetalDispatchRecord {
+        op: parse_string_field(&fields, "op")?,
+        kernel: parse_optional_string_field(&fields, "kernel"),
+        tensor: parse_string_field(&fields, "tensor")?,
+        parallel: parse_optional_bool_int_field(&fields, "parallel")?,
+        q_type: parse_optional_string_field(&fields, "q_type"),
+        k_type: parse_optional_string_field(&fields, "k_type"),
+        v_type: parse_optional_string_field(&fields, "v_type"),
+        mask_type: parse_optional_string_field(&fields, "mask_type"),
+        top_k_type: parse_optional_string_field(&fields, "top_k_type"),
+        src_type: parse_optional_string_field(&fields, "src_type"),
+        dst_type: parse_optional_string_field(&fields, "dst_type"),
+        q_width: parse_optional_field(&fields, "q_width")?,
+        v_width: parse_optional_field(&fields, "v_width")?,
+        batch: parse_optional_field(&fields, "batch")?,
+        heads: parse_optional_field(&fields, "heads")?,
+        stream: parse_optional_field(&fields, "stream")?,
+        kv: parse_optional_field(&fields, "kv")?,
+        top_k: parse_optional_field(&fields, "top_k")?,
+        top_stream: parse_optional_field(&fields, "top_stream")?,
+        grid_x: parse_field(&fields, "grid_x")?,
+        grid_y: parse_field(&fields, "grid_y")?,
+        grid_z: parse_field(&fields, "grid_z")?,
+        threads_x: parse_field(&fields, "threads_x")?,
     })
 }
 
@@ -628,11 +698,22 @@ fn parse_bool_int_field(fields: &BTreeMap<&str, &str>, name: &str) -> Result<boo
     Ok(value != 0)
 }
 
+fn parse_optional_bool_int_field(
+    fields: &BTreeMap<&str, &str>,
+    name: &str,
+) -> Result<Option<bool>> {
+    parse_optional_field::<u8>(fields, name).map(|value| value.map(|value| value != 0))
+}
+
 fn parse_string_field(fields: &BTreeMap<&str, &str>, name: &str) -> Result<String> {
     Ok(fields
         .get(name)
         .with_context(|| format!("missing {name}"))?
         .to_string())
+}
+
+fn parse_optional_string_field(fields: &BTreeMap<&str, &str>, name: &str) -> Option<String> {
+    fields.get(name).map(ToString::to_string)
 }
 
 fn summarize_log(
@@ -873,9 +954,9 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 mod tests {
     use super::{
         ComparisonKey, OpBucket, Phase, PhaseSummary, compare_phase,
-        parse_direct_sparse_decision_records, parse_sideband_record, parse_sideband_records,
-        parse_timing_group_records, parse_timing_record, parse_timing_records,
-        summarize_comparison_rows, summarize_log,
+        parse_direct_sparse_decision_records, parse_metal_dispatch_records, parse_sideband_record,
+        parse_sideband_records, parse_timing_group_records, parse_timing_record,
+        parse_timing_records, summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -887,6 +968,7 @@ mod tests {
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
     const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
+    const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 grid_x=32 grid_y=4 grid_z=1 threads_x=256";
 
     #[test]
     fn parses_timing_record_with_prefix() {
@@ -973,6 +1055,23 @@ mod tests {
         assert!(record.alibi_ok);
         assert!(record.soft_cap_ok);
         assert!(!record.use_direct);
+    }
+
+    #[test]
+    fn parses_metal_dispatch_records() {
+        let records = parse_metal_dispatch_records(METAL_DISPATCH_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.op, "dsa_sparse_attn");
+        assert_eq!(record.tensor, "blk.30.dsa_sparse_attn");
+        assert_eq!(record.q_width, Some(576));
+        assert_eq!(record.v_width, Some(512));
+        assert_eq!(record.batch, Some(32));
+        assert_eq!(record.heads, Some(4));
+        assert_eq!(record.top_k, Some(1024));
+        assert_eq!(record.grid_x, 32);
+        assert_eq!(record.grid_y, 4);
+        assert_eq!(record.threads_x, 256);
     }
 
     #[test]

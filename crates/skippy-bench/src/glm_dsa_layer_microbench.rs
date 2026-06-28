@@ -16,8 +16,9 @@ use skippy_runtime::{
 use crate::{
     cli::GlmDsaLayerMicrobenchArgs,
     glm_dsa_op_report::{
-        DirectSparseDecisionRecord, TimingGroupRecord, TimingRecord,
-        parse_direct_sparse_decision_records, parse_timing_group_records, parse_timing_records,
+        DirectSparseDecisionRecord, MetalDispatchRecord, TimingGroupRecord, TimingRecord,
+        parse_direct_sparse_decision_records, parse_metal_dispatch_records,
+        parse_timing_group_records, parse_timing_records,
     },
 };
 
@@ -98,6 +99,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         native_log_path: case.native_log_path,
         direct_sparse_decision_summary,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
+        metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
         group_timing_records: case.group_timing_records,
         comparison,
@@ -255,6 +257,7 @@ fn run_microbench_case(
             native_timings.direct_sparse_decision_records,
             args.tokens,
         ),
+        metal_dispatch_records: native_timings.metal_dispatch_records,
         op_timing_records: skip_warmup_records(native_timings.op_timing_records, args.warmup),
         group_timing_records: skip_warmup_group_records(
             native_timings.group_timing_records,
@@ -311,6 +314,7 @@ fn configure_env_flags(flags: MicrobenchFlags) {
         "SKIPPY_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS",
         flags.op_timing,
     );
+    set_env_flag("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH", flags.op_timing);
 }
 
 fn set_env_flag(name: &str, enabled: bool) {
@@ -461,6 +465,8 @@ impl NativeLogCapture {
             log_path: Some(path),
             direct_sparse_decision_records: parse_direct_sparse_decision_records(&text)
                 .context("parse native direct sparse decisions")?,
+            metal_dispatch_records: parse_metal_dispatch_records(&text)
+                .context("parse native Metal dispatch records")?,
             op_timing_records: parse_timing_records(&text).context("parse native op timings")?,
             group_timing_records: parse_timing_group_records(&text)
                 .context("parse native group timings")?,
@@ -481,6 +487,7 @@ impl Drop for NativeLogCapture {
 struct NativeTimingCapture {
     log_path: Option<PathBuf>,
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
 }
@@ -767,6 +774,7 @@ struct MicrobenchCase {
     n_gpu_layers: i32,
     native_log_path: Option<PathBuf>,
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
     timings: Vec<IterationTiming>,
@@ -784,6 +792,7 @@ impl MicrobenchCase {
                 &self.direct_sparse_decision_records,
             ),
             direct_sparse_decision_records: self.direct_sparse_decision_records.clone(),
+            metal_dispatch_records: self.metal_dispatch_records.clone(),
             op_timing_records: self.op_timing_records.clone(),
             group_timing_records: self.group_timing_records.clone(),
             timings: self.timings.clone(),
@@ -830,6 +839,8 @@ struct MicrobenchReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    metal_dispatch_records: Vec<MetalDispatchRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     op_timing_records: Vec<TimingRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_timing_records: Vec<TimingGroupRecord>,
@@ -870,6 +881,8 @@ struct MicrobenchCaseSummary {
     direct_sparse_decision_summary: DirectSparseDecisionSummary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    metal_dispatch_records: Vec<MetalDispatchRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     op_timing_records: Vec<TimingRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]

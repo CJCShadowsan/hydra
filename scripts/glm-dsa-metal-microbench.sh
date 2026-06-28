@@ -254,6 +254,24 @@ def format_int(value):
         return "n/a"
     return str(int(value))
 
+def median_field(records, field):
+    return sample_stats(record.get(field) for record in records)["median"]
+
+def dispatch_counts(records):
+    counts = {}
+    for record in records:
+        op = record.get("op", "unknown")
+        kernel = record.get("kernel")
+        key = f"{op}/{kernel}" if kernel else op
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+def format_dispatch_counts(records):
+    counts = dispatch_counts(records)
+    if not counts:
+        return "none"
+    return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
+
 print(f"output_dir={base}")
 for path in cases:
     name = path.stem
@@ -265,17 +283,26 @@ for path in cases:
     candidate = comparison["candidate"]
     op_timing_records = candidate.get("op_timing_records", [])
     timing = op_timing_records[0] if op_timing_records else {}
+    dispatch_records = candidate.get("metal_dispatch_records", [])
     decision_summary = candidate.get("direct_sparse_decision_summary", {})
     elapsed_stats = sample_stats(
         timing.get("elapsed_ms") for timing in candidate.get("timings", [])
     )
     native_stats = sample_stats(record.get("total_us") for record in op_timing_records)
+    op_stats = {
+        "indexer_topk": median_field(op_timing_records, "indexer_topk_us"),
+        "sparse_mask": median_field(op_timing_records, "sparse_mask_us"),
+        "dsa_sparse_attn": median_field(op_timing_records, "dsa_sparse_attn_us"),
+        "routed_moe": median_field(op_timing_records, "routed_moe_us"),
+        "shared_expert": median_field(op_timing_records, "shared_expert_us"),
+    }
     pair = re.match(r"(default|optin)-l(\d+)-t(\d+)$", name)
     if pair:
         variant, layer, tokens = pair.groups()
         paired.setdefault((int(layer), int(tokens)), {})[variant] = {
             "elapsed_ms": elapsed_stats,
             "total_us": native_stats,
+            "op_stats": op_stats,
             "use_direct": decision_summary.get("use_direct", 0),
             "fallback": decision_summary.get("fallback", 0),
             "dsa_sparse_attn_nodes": timing.get("dsa_sparse_attn_nodes"),
@@ -298,6 +325,25 @@ for path in cases:
         f"max={format_int(native_stats['max'])}"
     )
     print(
+        "  native_op_median_us="
+        f"indexer_topk={format_float(op_stats['indexer_topk'])} "
+        f"sparse_mask={format_float(op_stats['sparse_mask'])} "
+        f"dsa_sparse_attn={format_float(op_stats['dsa_sparse_attn'])} "
+        f"routed_moe={format_float(op_stats['routed_moe'])} "
+        f"shared_expert={format_float(op_stats['shared_expert'])}"
+    )
+    print(f"  metal_dispatch={format_dispatch_counts(dispatch_records)}")
+    sparse_attn_dispatch = next((record for record in dispatch_records if record.get("op") == "dsa_sparse_attn"), None)
+    if sparse_attn_dispatch:
+        print(
+            "  dsa_sparse_attn_dispatch="
+            f"batch={sparse_attn_dispatch.get('batch')} heads={sparse_attn_dispatch.get('heads')} "
+            f"stream={sparse_attn_dispatch.get('stream')} kv={sparse_attn_dispatch.get('kv')} "
+            f"top_k={sparse_attn_dispatch.get('top_k')} grid="
+            f"{sparse_attn_dispatch.get('grid_x')}x{sparse_attn_dispatch.get('grid_y')}x{sparse_attn_dispatch.get('grid_z')} "
+            f"threads_x={sparse_attn_dispatch.get('threads_x')}"
+        )
+    print(
         "  decisions="
         f"{decision_summary.get('records', 0)} "
         f"use_direct={decision_summary.get('use_direct', 0)} "
@@ -318,7 +364,7 @@ for path in cases:
 if paired:
     print()
     print("pairwise_optin_vs_default")
-    print("layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio optin_direct optin_fallback")
+    print("layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
     for (layer, tokens), variants in sorted(paired.items()):
         default = variants.get("default")
         optin = variants.get("optin")
@@ -331,11 +377,21 @@ if paired:
         samples = min(default["elapsed_ms"]["count"], optin["elapsed_ms"]["count"])
         elapsed_ratio = optin_elapsed / default_elapsed if default_elapsed not in (None, 0) and optin_elapsed is not None else None
         native_ratio = optin_native / default_native if default_native not in (None, 0) and optin_native is not None else None
+        op_ratios = {}
+        for op_name in ("indexer_topk", "sparse_mask", "dsa_sparse_attn", "routed_moe", "shared_expert"):
+            default_op = default["op_stats"][op_name]
+            optin_op = optin["op_stats"][op_name]
+            op_ratios[op_name] = optin_op / default_op if default_op not in (None, 0) and optin_op is not None else None
         print(
             f"{layer} {tokens} "
             f"{samples} "
             f"{format_float(default_elapsed)} {format_float(optin_elapsed)} {format_float(elapsed_ratio)} "
             f"{format_float(default_native)} {format_float(optin_native)} {format_float(native_ratio)} "
+            f"{format_float(op_ratios['indexer_topk'])} "
+            f"{format_float(op_ratios['sparse_mask'])} "
+            f"{format_float(op_ratios['dsa_sparse_attn'])} "
+            f"{format_float(op_ratios['routed_moe'])} "
+            f"{format_float(op_ratios['shared_expert'])} "
             f"{optin['use_direct']} {optin['fallback']}"
         )
 PY
