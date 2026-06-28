@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::glm_dsa_op_report::MetalDispatchRecord;
+use crate::glm_dsa_op_report::{MetalDispatchRecord, TimingRecord};
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub(crate) struct TimingDistributionSummary {
@@ -194,6 +194,233 @@ pub(crate) fn summarize_metal_dispatch(records: &[MetalDispatchRecord]) -> GlmDs
     summary
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct GlmDsaOpTimingSummary {
+    pub(crate) records: usize,
+    pub(crate) total_us: u64,
+    pub(crate) indexer_topk: TimingBucketSummary,
+    pub(crate) sparse_mask: TimingBucketSummary,
+    pub(crate) dsa_sparse_attn: TimingBucketSummary,
+    pub(crate) mla_attention: TimingBucketSummary,
+    pub(crate) routed_moe: TimingBucketSummary,
+    pub(crate) shared_expert: TimingBucketSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dsa_sparse_attn_share_of_total: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) routed_moe_share_of_total: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shared_expert_share_of_total: Option<f64>,
+}
+
+impl GlmDsaOpTimingSummary {
+    pub(crate) fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
+}
+
+pub(crate) fn summarize_glm_dsa_op_timing(records: &[TimingRecord]) -> GlmDsaOpTimingSummary {
+    let mut summary = GlmDsaOpTimingSummary {
+        records: records.len(),
+        ..GlmDsaOpTimingSummary::default()
+    };
+
+    for record in records {
+        summary.total_us += record.total_us;
+        add_timing(
+            &mut summary.indexer_topk,
+            record.indexer_topk_nodes,
+            record.indexer_topk_us,
+        );
+        add_timing(
+            &mut summary.sparse_mask,
+            record.sparse_mask_nodes,
+            record.sparse_mask_us,
+        );
+        add_optional_timing(
+            &mut summary.dsa_sparse_attn,
+            record.dsa_sparse_attn_nodes,
+            record.dsa_sparse_attn_us,
+        );
+        add_timing(
+            &mut summary.mla_attention,
+            record.mla_attention_nodes,
+            record.mla_attention_us,
+        );
+        add_timing(
+            &mut summary.routed_moe,
+            record.routed_moe_nodes,
+            record.routed_moe_us,
+        );
+        add_timing(
+            &mut summary.shared_expert,
+            record.shared_expert_nodes,
+            record.shared_expert_us,
+        );
+    }
+
+    finalize_timing_bucket(&mut summary.indexer_topk);
+    finalize_timing_bucket(&mut summary.sparse_mask);
+    finalize_timing_bucket(&mut summary.dsa_sparse_attn);
+    finalize_timing_bucket(&mut summary.mla_attention);
+    finalize_timing_bucket(&mut summary.routed_moe);
+    finalize_timing_bucket(&mut summary.shared_expert);
+    summary.dsa_sparse_attn_share_of_total =
+        ratio(summary.dsa_sparse_attn.elapsed_us, summary.total_us);
+    summary.routed_moe_share_of_total = ratio(summary.routed_moe.elapsed_us, summary.total_us);
+    summary.shared_expert_share_of_total =
+        ratio(summary.shared_expert.elapsed_us, summary.total_us);
+    summary
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct RoutedMoeTimingSummary {
+    pub(crate) records: usize,
+    pub(crate) total_us: u64,
+    pub(crate) routed_moe_nodes: u64,
+    pub(crate) routed_moe_us: u64,
+    pub(crate) route: TimingBucketSummary,
+    pub(crate) gate_up: TimingBucketSummary,
+    pub(crate) gate: TimingBucketSummary,
+    pub(crate) up: TimingBucketSummary,
+    pub(crate) activation: TimingBucketSummary,
+    pub(crate) down: TimingBucketSummary,
+    pub(crate) weighted: TimingBucketSummary,
+    pub(crate) aggregate: TimingBucketSummary,
+    pub(crate) weighted_or_aggregate: TimingBucketSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) routed_moe_share_of_total: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) down_share_of_routed_moe: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) weighted_share_of_routed_moe: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) weighted_or_aggregate_share_of_routed_moe: Option<f64>,
+}
+
+impl RoutedMoeTimingSummary {
+    pub(crate) fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct TimingBucketSummary {
+    pub(crate) nodes: u64,
+    pub(crate) elapsed_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) avg_us_per_node: Option<f64>,
+}
+
+pub(crate) fn summarize_routed_moe_timing(records: &[TimingRecord]) -> RoutedMoeTimingSummary {
+    let mut summary = RoutedMoeTimingSummary {
+        records: records.len(),
+        ..RoutedMoeTimingSummary::default()
+    };
+
+    for record in records {
+        summary.total_us += record.total_us;
+        summary.routed_moe_nodes += record.routed_moe_nodes;
+        summary.routed_moe_us += record.routed_moe_us;
+        add_optional_timing(
+            &mut summary.route,
+            record.routed_moe_route_nodes,
+            record.routed_moe_route_us,
+        );
+        add_optional_timing(
+            &mut summary.gate_up,
+            record.routed_moe_gate_up_nodes,
+            record.routed_moe_gate_up_us,
+        );
+        add_optional_timing(
+            &mut summary.gate,
+            record.routed_moe_gate_nodes,
+            record.routed_moe_gate_us,
+        );
+        add_optional_timing(
+            &mut summary.up,
+            record.routed_moe_up_nodes,
+            record.routed_moe_up_us,
+        );
+        add_optional_timing(
+            &mut summary.activation,
+            record.routed_moe_act_nodes,
+            record.routed_moe_act_us,
+        );
+        add_optional_timing(
+            &mut summary.down,
+            record.routed_moe_down_nodes,
+            record.routed_moe_down_us,
+        );
+        add_optional_timing(
+            &mut summary.weighted,
+            record.routed_moe_weighted_nodes,
+            record.routed_moe_weighted_us,
+        );
+        add_optional_timing(
+            &mut summary.aggregate,
+            record.routed_moe_aggregate_nodes,
+            record.routed_moe_aggregate_us,
+        );
+    }
+
+    finalize_timing_bucket(&mut summary.route);
+    finalize_timing_bucket(&mut summary.gate_up);
+    finalize_timing_bucket(&mut summary.gate);
+    finalize_timing_bucket(&mut summary.up);
+    finalize_timing_bucket(&mut summary.activation);
+    finalize_timing_bucket(&mut summary.down);
+    finalize_timing_bucket(&mut summary.weighted);
+    finalize_timing_bucket(&mut summary.aggregate);
+    summary.weighted_or_aggregate = merge_timing_buckets(&summary.weighted, &summary.aggregate);
+    summary.routed_moe_share_of_total = ratio(summary.routed_moe_us, summary.total_us);
+    summary.down_share_of_routed_moe = ratio(summary.down.elapsed_us, summary.routed_moe_us);
+    summary.weighted_share_of_routed_moe =
+        ratio(summary.weighted.elapsed_us, summary.routed_moe_us);
+    summary.weighted_or_aggregate_share_of_routed_moe = ratio(
+        summary.weighted_or_aggregate.elapsed_us,
+        summary.routed_moe_us,
+    );
+    summary
+}
+
+fn add_optional_timing(
+    bucket: &mut TimingBucketSummary,
+    nodes: Option<u64>,
+    elapsed_us: Option<u64>,
+) {
+    add_timing(bucket, nodes.unwrap_or(0), elapsed_us.unwrap_or(0));
+}
+
+fn add_timing(bucket: &mut TimingBucketSummary, nodes: u64, elapsed_us: u64) {
+    bucket.nodes += nodes;
+    bucket.elapsed_us += elapsed_us;
+}
+
+fn finalize_timing_bucket(bucket: &mut TimingBucketSummary) {
+    bucket.avg_us_per_node = ratio(bucket.elapsed_us, bucket.nodes);
+}
+
+fn merge_timing_buckets(
+    left: &TimingBucketSummary,
+    right: &TimingBucketSummary,
+) -> TimingBucketSummary {
+    let mut merged = TimingBucketSummary {
+        nodes: left.nodes + right.nodes,
+        elapsed_us: left.elapsed_us + right.elapsed_us,
+        avg_us_per_node: None,
+    };
+    finalize_timing_bucket(&mut merged);
+    merged
+}
+
+fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        None
+    } else {
+        Some(numerator as f64 / denominator as f64)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct DispatchShapeKey {
     op: String,
@@ -284,6 +511,103 @@ mod tests {
         assert_eq!(summary.routed_moe_down_q3_k_records, 2);
         assert_eq!(summary.routed_moe_down_expanded_grid_records, 2);
         assert_eq!(summary.dispatch_shapes.len(), 3);
+    }
+
+    #[test]
+    fn routed_moe_timing_summary_reports_cost_split() {
+        let summary = summarize_routed_moe_timing(&[
+            timing_record(1_000, 600, Some((2, 200)), Some((1, 250)), Some((1, 50))),
+            timing_record(2_000, 1_400, Some((2, 700)), Some((1, 350)), Some((1, 70))),
+        ]);
+
+        assert_eq!(summary.records, 2);
+        assert_eq!(summary.total_us, 3_000);
+        assert_eq!(summary.routed_moe_us, 2_000);
+        assert_eq!(summary.down.nodes, 4);
+        assert_eq!(summary.down.elapsed_us, 900);
+        assert_eq!(summary.down.avg_us_per_node, Some(225.0));
+        assert_eq!(summary.weighted.elapsed_us, 600);
+        assert_eq!(summary.aggregate.elapsed_us, 120);
+        assert_eq!(summary.weighted_or_aggregate.elapsed_us, 720);
+        assert_eq!(summary.down_share_of_routed_moe, Some(0.45));
+        assert_eq!(summary.weighted_share_of_routed_moe, Some(0.3));
+        assert_eq!(
+            summary.weighted_or_aggregate_share_of_routed_moe,
+            Some(0.36)
+        );
+    }
+
+    #[test]
+    fn glm_dsa_op_timing_summary_reports_major_buckets() {
+        let mut first = timing_record(1_000, 600, Some((2, 200)), Some((1, 250)), Some((1, 50)));
+        first.dsa_sparse_attn_nodes = Some(1);
+        first.dsa_sparse_attn_us = Some(150);
+        first.mla_attention_nodes = 1;
+        first.mla_attention_us = 100;
+        first.shared_expert_nodes = 1;
+        first.shared_expert_us = 50;
+
+        let summary = summarize_glm_dsa_op_timing(&[first]);
+
+        assert_eq!(summary.records, 1);
+        assert_eq!(summary.total_us, 1_000);
+        assert_eq!(summary.dsa_sparse_attn.elapsed_us, 150);
+        assert_eq!(summary.routed_moe.elapsed_us, 600);
+        assert_eq!(summary.shared_expert.elapsed_us, 50);
+        assert_eq!(summary.dsa_sparse_attn_share_of_total, Some(0.15));
+        assert_eq!(summary.routed_moe_share_of_total, Some(0.6));
+    }
+
+    fn timing_record(
+        total_us: u64,
+        routed_moe_us: u64,
+        down: Option<(u64, u64)>,
+        weighted: Option<(u64, u64)>,
+        aggregate: Option<(u64, u64)>,
+    ) -> TimingRecord {
+        TimingRecord {
+            stage: 0,
+            tokens: 1,
+            total_us,
+            indexer_topk_nodes: 0,
+            indexer_topk_us: 0,
+            indexer_nodes: None,
+            indexer_us: None,
+            top_k_nodes: None,
+            top_k_us: None,
+            sparse_mask_nodes: 0,
+            sparse_mask_us: 0,
+            sparse_mask_fill_nodes: None,
+            sparse_mask_fill_us: None,
+            sparse_mask_topk_nodes: None,
+            sparse_mask_topk_us: None,
+            sparse_mask_add_nodes: None,
+            sparse_mask_add_us: None,
+            dsa_sparse_attn_nodes: None,
+            dsa_sparse_attn_us: None,
+            mla_attention_nodes: 0,
+            mla_attention_us: 0,
+            routed_moe_nodes: 0,
+            routed_moe_us,
+            routed_moe_route_nodes: None,
+            routed_moe_route_us: None,
+            routed_moe_gate_up_nodes: None,
+            routed_moe_gate_up_us: None,
+            routed_moe_gate_nodes: None,
+            routed_moe_gate_us: None,
+            routed_moe_up_nodes: None,
+            routed_moe_up_us: None,
+            routed_moe_act_nodes: None,
+            routed_moe_act_us: None,
+            routed_moe_down_nodes: down.map(|bucket| bucket.0),
+            routed_moe_down_us: down.map(|bucket| bucket.1),
+            routed_moe_weighted_nodes: weighted.map(|bucket| bucket.0),
+            routed_moe_weighted_us: weighted.map(|bucket| bucket.1),
+            routed_moe_aggregate_nodes: aggregate.map(|bucket| bucket.0),
+            routed_moe_aggregate_us: aggregate.map(|bucket| bucket.1),
+            shared_expert_nodes: 0,
+            shared_expert_us: 0,
+        }
     }
 
     fn dispatch(

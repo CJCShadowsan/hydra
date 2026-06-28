@@ -16,8 +16,9 @@ use skippy_runtime::{
 use crate::{
     cli::GlmDsaLayerMicrobenchArgs,
     glm_dsa_microbench_summary::{
-        GlmDsaDispatchSummary, TimingDistributionSummary, summarize_elapsed_ms,
-        summarize_metal_dispatch,
+        GlmDsaDispatchSummary, GlmDsaOpTimingSummary, RoutedMoeTimingSummary,
+        TimingDistributionSummary, summarize_elapsed_ms, summarize_glm_dsa_op_timing,
+        summarize_metal_dispatch, summarize_routed_moe_timing,
     },
     glm_dsa_op_report::{
         DirectSparseDecisionRecord, HotTensorRecord, MetalDispatchRecord, TimingGroupRecord,
@@ -91,6 +92,8 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         summarize_direct_sparse_decisions(&case.direct_sparse_decision_records);
     let timing_summary = case.timing_summary.clone();
     let metal_dispatch_summary = case.metal_dispatch_summary.clone();
+    let op_timing_summary = case.op_timing_summary.clone();
+    let routed_moe_timing_summary = case.routed_moe_timing_summary.clone();
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -117,6 +120,8 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         direct_sparse_decision_summary,
         timing_summary,
         metal_dispatch_summary,
+        op_timing_summary,
+        routed_moe_timing_summary,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
@@ -1286,6 +1291,8 @@ impl MicrobenchCase {
                 self.timings.iter().map(|timing| timing.elapsed_ms),
             ),
             metal_dispatch_summary: summarize_metal_dispatch(&self.metal_dispatch_records),
+            op_timing_summary: summarize_glm_dsa_op_timing(&self.op_timing_records),
+            routed_moe_timing_summary: summarize_routed_moe_timing(&self.op_timing_records),
             direct_sparse_decision_records: self.direct_sparse_decision_records.clone(),
             metal_dispatch_records: self.metal_dispatch_records.clone(),
             op_timing_records: self.op_timing_records.clone(),
@@ -1337,6 +1344,10 @@ struct MicrobenchReport {
     timing_summary: TimingDistributionSummary,
     #[serde(skip_serializing_if = "GlmDsaDispatchSummary::is_empty")]
     metal_dispatch_summary: GlmDsaDispatchSummary,
+    #[serde(skip_serializing_if = "GlmDsaOpTimingSummary::is_empty")]
+    op_timing_summary: GlmDsaOpTimingSummary,
+    #[serde(skip_serializing_if = "RoutedMoeTimingSummary::is_empty")]
+    routed_moe_timing_summary: RoutedMoeTimingSummary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1412,6 +1423,10 @@ struct MicrobenchCaseSummary {
     timing_summary: TimingDistributionSummary,
     #[serde(skip_serializing_if = "GlmDsaDispatchSummary::is_empty")]
     metal_dispatch_summary: GlmDsaDispatchSummary,
+    #[serde(skip_serializing_if = "GlmDsaOpTimingSummary::is_empty")]
+    op_timing_summary: GlmDsaOpTimingSummary,
+    #[serde(skip_serializing_if = "RoutedMoeTimingSummary::is_empty")]
+    routed_moe_timing_summary: RoutedMoeTimingSummary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
