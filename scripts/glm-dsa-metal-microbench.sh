@@ -17,6 +17,8 @@ LAYERS="${LAYERS:-}"
 INDEXER_MODE="${INDEXER_MODE:-parallel}"
 SPARSE_ATTN_THREADS="${SPARSE_ATTN_THREADS:-256}"
 SPARSE_ATTN_CACHE_TOPK="${SPARSE_ATTN_CACHE_TOPK:-off}"
+SYNTHETIC_TOP_K_SIDEBAND="${SYNTHETIC_TOP_K_SIDEBAND:-off}"
+SYNTHETIC_TOP_K_WIDTH="${SYNTHETIC_TOP_K_WIDTH:-256}"
 FORCE_REBUILD=1
 BUILD_ONLY=0
 DRY_RUN=0
@@ -55,6 +57,11 @@ Options:
   --sparse-attn-cache-topk MODE
                            Cache top-k indices in dsa_sparse_attn threadgroup
                            memory: off, on, or both. Default: off.
+  --synthetic-top-k-sideband MODE
+                           Append synthetic GLM-DSA top-k sideband to input
+                           activations: off or on. Default: off.
+  --synthetic-top-k-width N
+                           Synthetic top-k sideband width. Default: 256.
   --no-force-rebuild       Skip forced static-metal rebuild/relink.
   --build-only             Rebuild/relink only; do not run cases.
   --dry-run                Print commands without executing.
@@ -63,7 +70,8 @@ Options:
 Environment overrides mirror option names:
   STAGE_MODEL, MODEL_ID, OUTPUT_DIR, LAYER_START, LAYER_END, CTX_SIZE,
   ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS, INDEXER_MODE,
-  SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK.
+  SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK, SYNTHETIC_TOP_K_SIDEBAND,
+  SYNTHETIC_TOP_K_WIDTH.
 EOF
 }
 
@@ -127,6 +135,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sparse-attn-cache-topk)
       SPARSE_ATTN_CACHE_TOPK="$2"
+      shift 2
+      ;;
+    --synthetic-top-k-sideband)
+      SYNTHETIC_TOP_K_SIDEBAND="$2"
+      shift 2
+      ;;
+    --synthetic-top-k-width)
+      SYNTHETIC_TOP_K_WIDTH="$2"
       shift 2
       ;;
     --no-force-rebuild)
@@ -210,6 +226,29 @@ validate_sparse_attn_cache_topk() {
     *)
       echo "invalid --sparse-attn-cache-topk: $SPARSE_ATTN_CACHE_TOPK (expected off, on, or both)" >&2
       exit 2
+      ;;
+  esac
+}
+
+validate_synthetic_top_k_sideband() {
+  case "$SYNTHETIC_TOP_K_SIDEBAND" in
+    off|on)
+      ;;
+    *)
+      echo "invalid --synthetic-top-k-sideband: $SYNTHETIC_TOP_K_SIDEBAND (expected off or on)" >&2
+      exit 2
+      ;;
+  esac
+  case "$SYNTHETIC_TOP_K_WIDTH" in
+    ''|*[!0-9]*)
+      echo "invalid --synthetic-top-k-width: $SYNTHETIC_TOP_K_WIDTH (expected positive integer)" >&2
+      exit 2
+      ;;
+    *)
+      if [[ "$SYNTHETIC_TOP_K_WIDTH" -lt 1 ]]; then
+        echo "invalid --synthetic-top-k-width: $SYNTHETIC_TOP_K_WIDTH (expected positive integer)" >&2
+        exit 2
+      fi
       ;;
   esac
 }
@@ -389,6 +428,11 @@ def case_cache_topk_from_name(name):
         return "off"
     return "off"
 
+def case_sideband_from_name(name):
+    if "-syntopk" in name:
+        return "on"
+    return "off"
+
 print(f"output_dir={base}")
 for path in cases:
     name = path.stem
@@ -413,12 +457,13 @@ for path in cases:
         "routed_moe": median_field(op_timing_records, "routed_moe_us"),
         "shared_expert": median_field(op_timing_records, "shared_expert_us"),
     }
-    pair = re.match(r"(default|optin)(?:-(serial|parallel))?(?:-th(\d+))?(?:-(cachetopk|nocachetopk))?-l(\d+)-t(\d+)$", name)
+    pair = re.match(r"(default|optin)(?:-(serial|parallel))?(?:-th(\d+))?(?:-(cachetopk|nocachetopk))?(?:-(syntopk\d+))?-l(\d+)-t(\d+)$", name)
     if pair:
-        variant, mode, threads, cache_topk, layer, tokens = pair.groups()
+        variant, mode, threads, cache_topk, sideband, layer, tokens = pair.groups()
         mode = mode or case_mode_from_name(name)
         threads = int(threads) if threads else case_threads_from_name(name)
         cache_topk = "on" if cache_topk == "cachetopk" else case_cache_topk_from_name(name)
+        sideband = "on" if sideband else case_sideband_from_name(name)
         case_summary = {
             "elapsed_ms": elapsed_stats,
             "total_us": native_stats,
@@ -428,8 +473,8 @@ for path in cases:
             "dsa_sparse_attn_nodes": timing.get("dsa_sparse_attn_nodes"),
             "sparse_mask_nodes": timing.get("sparse_mask_nodes"),
         }
-        paired.setdefault((mode, threads, cache_topk, int(layer), int(tokens)), {})[variant] = case_summary
-        mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk)] = case_summary
+        paired.setdefault((mode, threads, cache_topk, sideband, int(layer), int(tokens)), {})[variant] = case_summary
+        mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk, sideband)] = case_summary
     print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
     print(f"  dsa_sparse_attn_nodes={timing.get('dsa_sparse_attn_nodes')} sparse_mask_nodes={timing.get('sparse_mask_nodes')}")
     print(
@@ -479,8 +524,8 @@ for path in cases:
 if paired:
     print()
     print("pairwise_optin_vs_default")
-    print("mode sparse_attn_threads cache_topk layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
-    for (mode, threads, cache_topk, layer, tokens), variants in sorted(paired.items()):
+    print("mode sparse_attn_threads cache_topk synthetic_top_k_sideband layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
+    for (mode, threads, cache_topk, sideband, layer, tokens), variants in sorted(paired.items()):
         default = variants.get("default")
         optin = variants.get("optin")
         if not default or not optin:
@@ -498,7 +543,7 @@ if paired:
             optin_op = optin["op_stats"][op_name]
             op_ratios[op_name] = optin_op / default_op if default_op not in (None, 0) and optin_op is not None else None
         print(
-            f"{mode} {threads} {cache_topk} {layer} {tokens} "
+            f"{mode} {threads} {cache_topk} {sideband} {layer} {tokens} "
             f"{samples} "
             f"{format_float(default_elapsed)} {format_float(optin_elapsed)} {format_float(elapsed_ratio)} "
             f"{format_float(default_native)} {format_float(optin_native)} {format_float(native_ratio)} "
@@ -513,11 +558,11 @@ if paired:
 if mode_cases:
     print()
     print("parallel_vs_serial")
-    print("variant sparse_attn_threads cache_topk layer tokens samples serial_ms_median parallel_ms_median elapsed_ratio serial_native_us_median parallel_native_us_median native_ratio indexer_topk_ratio")
-    keys = sorted({(variant, layer, tokens, threads, cache_topk) for (variant, layer, tokens, _mode, threads, cache_topk) in mode_cases})
-    for variant, layer, tokens, threads, cache_topk in keys:
-        serial = mode_cases.get((variant, layer, tokens, "serial", threads, cache_topk))
-        parallel = mode_cases.get((variant, layer, tokens, "parallel", threads, cache_topk))
+    print("variant sparse_attn_threads cache_topk synthetic_top_k_sideband layer tokens samples serial_ms_median parallel_ms_median elapsed_ratio serial_native_us_median parallel_native_us_median native_ratio indexer_topk_ratio")
+    keys = sorted({(variant, layer, tokens, threads, cache_topk, sideband) for (variant, layer, tokens, _mode, threads, cache_topk, sideband) in mode_cases})
+    for variant, layer, tokens, threads, cache_topk, sideband in keys:
+        serial = mode_cases.get((variant, layer, tokens, "serial", threads, cache_topk, sideband))
+        parallel = mode_cases.get((variant, layer, tokens, "parallel", threads, cache_topk, sideband))
         if not serial or not parallel:
             continue
         serial_elapsed = serial["elapsed_ms"]["median"]
@@ -531,7 +576,7 @@ if mode_cases:
         native_ratio = parallel_native / serial_native if serial_native not in (None, 0) and parallel_native is not None else None
         indexer_ratio = parallel_indexer / serial_indexer if serial_indexer not in (None, 0) and parallel_indexer is not None else None
         print(
-            f"{variant} {threads} {cache_topk} {layer} {tokens} "
+            f"{variant} {threads} {cache_topk} {sideband} {layer} {tokens} "
             f"{samples} "
             f"{format_float(serial_elapsed)} {format_float(parallel_elapsed)} {format_float(elapsed_ratio)} "
             f"{format_float(serial_native)} {format_float(parallel_native)} {format_float(native_ratio)} "
@@ -549,6 +594,7 @@ require_path "$STAGE_MODEL"
 validate_indexer_mode
 validate_sparse_attn_threads
 validate_sparse_attn_cache_topk
+validate_synthetic_top_k_sideband
 mkdir -p "$OUTPUT_DIR"
 
 prepare_static_metal_bench
@@ -606,6 +652,12 @@ case_env() {
   else
     printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=0"
   fi
+  if [[ "$SYNTHETIC_TOP_K_SIDEBAND" == "on" ]]; then
+    printf '%s\n' "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=1"
+    printf '%s\n' "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_WIDTH=$SYNTHETIC_TOP_K_WIDTH"
+  else
+    printf '%s\n' "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=0"
+  fi
 }
 
 sparse_attn_thread_counts() {
@@ -641,6 +693,7 @@ case_name() {
   local cache_topk="$4"
   local threads_suffix=""
   local cache_suffix=""
+  local sideband_suffix=""
   if [[ "$SPARSE_ATTN_THREADS" != "256" || "$threads" != "256" ]]; then
     threads_suffix="-th${threads}"
   fi
@@ -653,15 +706,18 @@ case_name() {
   elif [[ "$cache_topk" == "on" ]]; then
     cache_suffix="-cachetopk"
   fi
-  if [[ "$INDEXER_MODE" == "parallel" && "$mode" == "parallel" && -z "$threads_suffix" && -z "$cache_suffix" ]]; then
+  if [[ "$SYNTHETIC_TOP_K_SIDEBAND" == "on" ]]; then
+    sideband_suffix="-syntopk${SYNTHETIC_TOP_K_WIDTH}"
+  fi
+  if [[ "$INDEXER_MODE" == "parallel" && "$mode" == "parallel" && -z "$threads_suffix" && -z "$cache_suffix" && -z "$sideband_suffix" ]]; then
     printf '%s\n' "$base_name"
   else
     case "$base_name" in
       default-l*|optin-l*)
-        printf '%s-%s%s%s-l%s\n' "${base_name%%-l*}" "$mode" "$threads_suffix" "$cache_suffix" "${base_name#*-l}"
+        printf '%s-%s%s%s%s-l%s\n' "${base_name%%-l*}" "$mode" "$threads_suffix" "$cache_suffix" "$sideband_suffix" "${base_name#*-l}"
         ;;
       *)
-        printf '%s-%s%s%s\n' "$base_name" "$mode" "$threads_suffix" "$cache_suffix"
+        printf '%s-%s%s%s%s\n' "$base_name" "$mode" "$threads_suffix" "$cache_suffix" "$sideband_suffix"
         ;;
     esac
   fi

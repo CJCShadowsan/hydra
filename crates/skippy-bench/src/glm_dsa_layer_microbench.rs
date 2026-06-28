@@ -22,6 +22,11 @@ use crate::{
     },
 };
 
+const ACTIVATION_FLAG_GLM_DSA_TOP_K: u64 = 1 << 3;
+const ENV_SYNTHETIC_TOP_K_SIDEBAND: &str = "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND";
+const ENV_SYNTHETIC_TOP_K_WIDTH: &str = "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_WIDTH";
+const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
+
 pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     validate_args(&args)?;
 
@@ -370,6 +375,7 @@ fn bounded_u32(value: usize) -> u32 {
 
 fn synthetic_activation_frame(args: &GlmDsaLayerMicrobenchArgs) -> Result<ActivationFrame> {
     let width = usize::try_from(args.activation_width).context("activation_width exceeds usize")?;
+    let top_k_sideband = synthetic_top_k_sideband_config()?;
     let value_count = args
         .tokens
         .checked_mul(width)
@@ -377,6 +383,11 @@ fn synthetic_activation_frame(args: &GlmDsaLayerMicrobenchArgs) -> Result<Activa
     let payload_bytes = value_count
         .checked_mul(std::mem::size_of::<f32>())
         .context("synthetic activation payload size overflow")?;
+    let sideband_bytes = top_k_sideband
+        .as_ref()
+        .map(|sideband| synthetic_top_k_sideband_bytes(args.tokens, sideband.width))
+        .transpose()?
+        .unwrap_or(0);
     let mut payload = Vec::with_capacity(payload_bytes);
     for token in 0..args.tokens {
         for dim in 0..width {
@@ -384,6 +395,14 @@ fn synthetic_activation_frame(args: &GlmDsaLayerMicrobenchArgs) -> Result<Activa
             payload.extend_from_slice(&value.to_ne_bytes());
         }
     }
+    if let Some(sideband) = top_k_sideband {
+        append_synthetic_top_k_sideband(&mut payload, args.tokens, sideband.width)?;
+    }
+    let flags = if sideband_bytes > 0 {
+        ACTIVATION_FLAG_GLM_DSA_TOP_K
+    } else {
+        0
+    };
     Ok(ActivationFrame {
         desc: ActivationDesc {
             version: 1,
@@ -396,10 +415,62 @@ fn synthetic_activation_frame(args: &GlmDsaLayerMicrobenchArgs) -> Result<Activa
             token_count: u32::try_from(args.tokens).context("tokens exceeds u32")?,
             sequence_count: 1,
             payload_bytes: u64::try_from(payload.len()).context("payload length exceeds u64")?,
-            flags: 0,
+            flags,
         },
         payload,
     })
+}
+
+#[derive(Clone, Copy)]
+struct SyntheticTopKSideband {
+    width: usize,
+}
+
+fn synthetic_top_k_sideband_config() -> Result<Option<SyntheticTopKSideband>> {
+    if !env_flag_enabled(ENV_SYNTHETIC_TOP_K_SIDEBAND) {
+        return Ok(None);
+    }
+    let width = match std::env::var(ENV_SYNTHETIC_TOP_K_WIDTH) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("parse {ENV_SYNTHETIC_TOP_K_WIDTH}"))?,
+        _ => DEFAULT_SYNTHETIC_TOP_K_WIDTH,
+    };
+    if width == 0 {
+        bail!("{ENV_SYNTHETIC_TOP_K_WIDTH} must be greater than zero");
+    }
+    Ok(Some(SyntheticTopKSideband { width }))
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
+fn synthetic_top_k_sideband_bytes(tokens: usize, width: usize) -> Result<usize> {
+    tokens
+        .checked_mul(width)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<i32>()))
+        .context("synthetic GLM-DSA top-k sideband size overflow")
+}
+
+fn append_synthetic_top_k_sideband(
+    payload: &mut Vec<u8>,
+    tokens: usize,
+    width: usize,
+) -> Result<()> {
+    let bytes = synthetic_top_k_sideband_bytes(tokens, width)?;
+    payload.reserve(bytes);
+    for _token in 0..tokens {
+        for i_top in 0..width {
+            let index = i32::try_from(i_top).context("synthetic top-k index exceeds i32")?;
+            payload.extend_from_slice(&index.to_ne_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn synthetic_activation_value(token: usize, dim: usize) -> f32 {
