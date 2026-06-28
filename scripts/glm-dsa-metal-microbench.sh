@@ -17,10 +17,12 @@ LAYERS="${LAYERS:-}"
 INDEXER_MODE="${INDEXER_MODE:-parallel}"
 SPARSE_ATTN_THREADS="${SPARSE_ATTN_THREADS:-256}"
 SPARSE_ATTN_CACHE_TOPK="${SPARSE_ATTN_CACHE_TOPK:-off}"
+SPARSE_ATTN_DECODE_GROUP_HEADS="${SPARSE_ATTN_DECODE_GROUP_HEADS:-1}"
 SYNTHETIC_TOP_K_SIDEBAND="${SYNTHETIC_TOP_K_SIDEBAND:-off}"
 SYNTHETIC_TOP_K_WIDTH="${SYNTHETIC_TOP_K_WIDTH:-256}"
 REAL_TOP_K_SOURCE_LAYER_START="${REAL_TOP_K_SOURCE_LAYER_START:-}"
 REAL_TOP_K_CACHE_DIR="${REAL_TOP_K_CACHE_DIR:-}"
+WARM_REAL_TOP_K_CACHE="${WARM_REAL_TOP_K_CACHE:-off}"
 FORCE_REBUILD=1
 BUILD_ONLY=0
 DRY_RUN=0
@@ -59,6 +61,9 @@ Options:
   --sparse-attn-cache-topk MODE
                            Cache top-k indices in dsa_sparse_attn threadgroup
                            memory: off, on, or both. Default: off.
+  --sparse-attn-decode-group-heads LIST
+                           Comma-separated decode head group sizes to sweep.
+                           Allowed: 1,2,4. Default: 1.
   --synthetic-top-k-sideband MODE
                            Append synthetic GLM-DSA top-k sideband to input
                            activations: off or on. Default: off.
@@ -72,6 +77,10 @@ Options:
                            Reuse generated real top-k activation frames from
                            PATH. Defaults to <output-dir>/real-top-k-cache when
                            --real-top-k-source-layer-start is set.
+  --warm-real-top-k-cache MODE
+                           Pre-generate real top-k cache frames before measured
+                           cases and require cache hits during measurement:
+                           off or on. Default: off.
   --no-force-rebuild       Skip forced static-metal rebuild/relink.
   --build-only             Rebuild/relink only; do not run cases.
   --dry-run                Print commands without executing.
@@ -80,8 +89,9 @@ Options:
 Environment overrides mirror option names:
   STAGE_MODEL, MODEL_ID, OUTPUT_DIR, LAYER_START, LAYER_END, CTX_SIZE,
   ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS, INDEXER_MODE,
-  SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK, SYNTHETIC_TOP_K_SIDEBAND,
-  SYNTHETIC_TOP_K_WIDTH, REAL_TOP_K_SOURCE_LAYER_START, REAL_TOP_K_CACHE_DIR.
+  SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK, SPARSE_ATTN_DECODE_GROUP_HEADS,
+  SYNTHETIC_TOP_K_SIDEBAND, SYNTHETIC_TOP_K_WIDTH,
+  REAL_TOP_K_SOURCE_LAYER_START, REAL_TOP_K_CACHE_DIR, WARM_REAL_TOP_K_CACHE.
 EOF
 }
 
@@ -147,6 +157,10 @@ while [[ $# -gt 0 ]]; do
       SPARSE_ATTN_CACHE_TOPK="$2"
       shift 2
       ;;
+    --sparse-attn-decode-group-heads)
+      SPARSE_ATTN_DECODE_GROUP_HEADS="$2"
+      shift 2
+      ;;
     --synthetic-top-k-sideband)
       SYNTHETIC_TOP_K_SIDEBAND="$2"
       shift 2
@@ -161,6 +175,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --real-top-k-cache-dir)
       REAL_TOP_K_CACHE_DIR="$2"
+      shift 2
+      ;;
+    --warm-real-top-k-cache)
+      WARM_REAL_TOP_K_CACHE="$2"
       shift 2
       ;;
     --no-force-rebuild)
@@ -248,6 +266,20 @@ validate_sparse_attn_cache_topk() {
   esac
 }
 
+validate_sparse_attn_decode_group_heads() {
+  local value
+  while IFS= read -r value; do
+    case "$value" in
+      1|2|4)
+        ;;
+      *)
+        echo "invalid --sparse-attn-decode-group-heads value: $value (expected 1,2,4)" >&2
+        exit 2
+        ;;
+    esac
+  done < <(split_csv "$SPARSE_ATTN_DECODE_GROUP_HEADS")
+}
+
 validate_synthetic_top_k_sideband() {
   case "$SYNTHETIC_TOP_K_SIDEBAND" in
     off|on)
@@ -287,6 +319,25 @@ validate_real_top_k_source_layer_start() {
   fi
   if [[ -z "$REAL_TOP_K_CACHE_DIR" ]]; then
     REAL_TOP_K_CACHE_DIR="$OUTPUT_DIR/real-top-k-cache"
+  fi
+}
+
+validate_warm_real_top_k_cache() {
+  case "$WARM_REAL_TOP_K_CACHE" in
+    off|on)
+      ;;
+    *)
+      echo "invalid --warm-real-top-k-cache: $WARM_REAL_TOP_K_CACHE (expected off or on)" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$WARM_REAL_TOP_K_CACHE" == "on" ]]; then
+    case "$REAL_TOP_K_SOURCE_LAYER_START" in
+      ''|off|0)
+        echo "--warm-real-top-k-cache on requires --real-top-k-source-layer-start" >&2
+        exit 2
+        ;;
+    esac
   fi
 }
 
@@ -347,6 +398,54 @@ run_case() {
     else
       local rc=$?
       printf 'case=%s tokens=%s exit=%s report=%s\n' "$name" "$tokens" "$rc" "$report"
+      return "$rc"
+    fi
+  fi
+}
+
+run_cache_warm_case() {
+  local layer_start="$1"
+  local layer_end="$2"
+  local tokens="$3"
+
+  local warm_dir="$OUTPUT_DIR/cache-warm"
+  local report="$warm_dir/warm-realtopk${REAL_TOP_K_SOURCE_LAYER_START}-l${layer_start}-t${tokens}.json"
+  local stdout="$warm_dir/warm-realtopk${REAL_TOP_K_SOURCE_LAYER_START}-l${layer_start}-t${tokens}.stdout"
+  mkdir -p "$warm_dir"
+  local -a cmd=(
+    env
+    "SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS=256"
+    "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=0"
+    "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=0"
+    "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=$REAL_TOP_K_SOURCE_LAYER_START"
+    "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=$REAL_TOP_K_CACHE_DIR"
+    "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE=0"
+    "$ROOT/target/debug/skippy-bench"
+    glm-dsa-layer-microbench
+    --stage-model "$STAGE_MODEL"
+    --model-id "$MODEL_ID"
+    --layer-start "$layer_start"
+    --layer-end "$layer_end"
+    --tokens "$tokens"
+    --ctx-size "$CTX_SIZE"
+    --activation-width "$ACTIVATION_WIDTH"
+    --iterations 1
+    --warmup 0
+    --compare-dense-fallback
+    --output "$report"
+    --op-timing false
+    --parallel-lightning-indexer false
+  )
+
+  printf '+'
+  printf ' %q' "${cmd[@]}"
+  printf ' >%q 2>&1\n' "$stdout"
+  if [[ "$DRY_RUN" == "0" ]]; then
+    if "${cmd[@]}" >"$stdout" 2>&1; then
+      printf 'cache_warm layer=%s tokens=%s exit=0 report=%s\n' "$layer_start" "$tokens" "$report"
+    else
+      local rc=$?
+      printf 'cache_warm layer=%s tokens=%s exit=%s report=%s\n' "$layer_start" "$tokens" "$rc" "$report"
       return "$rc"
     fi
   fi
@@ -446,7 +545,7 @@ def sparse_attn_dispatch_shape(record):
         f"kv={record.get('kv')} "
         f"top_k={record.get('top_k')} "
         f"grid={record.get('grid_x')}x{record.get('grid_y')}x{record.get('grid_z')} "
-        f"threads_x={record.get('threads_x')}"
+        f"threads={record.get('threads_x')}x{record.get('threads_y') or 1}"
     )
 
 def sparse_attn_dispatch_shapes(records):
@@ -478,6 +577,10 @@ def case_cache_topk_from_name(name):
     if "-nocachetopk-" in name:
         return "off"
     return "off"
+
+def case_decode_group_from_name(name):
+    match = re.search(r"-hgrp(\d+)(?:-|$)", name)
+    return int(match.group(1)) if match else 1
 
 def case_topk_input_from_name(name):
     if "-syntopk" in name:
@@ -511,12 +614,13 @@ for path in cases:
         "routed_moe": median_field(op_timing_records, "routed_moe_us"),
         "shared_expert": median_field(op_timing_records, "shared_expert_us"),
     }
-    pair = re.match(r"(default|optin)(?:-(serial|parallel))?(?:-th(\d+))?(?:-(cachetopk|nocachetopk))?(?:-(syntopk\d+|realtopk\d+))?-l(\d+)-t(\d+)$", name)
+    pair = re.match(r"(default|optin)(?:-(serial|parallel))?(?:-th(\d+))?(?:-(cachetopk|nocachetopk))?(?:-hgrp(\d+))?(?:-(syntopk\d+|realtopk\d+))?-l(\d+)-t(\d+)$", name)
     if pair:
-        variant, mode, threads, cache_topk, topk_input, layer, tokens = pair.groups()
+        variant, mode, threads, cache_topk, decode_group, topk_input, layer, tokens = pair.groups()
         mode = mode or case_mode_from_name(name)
         threads = int(threads) if threads else case_threads_from_name(name)
         cache_topk = "on" if cache_topk == "cachetopk" else case_cache_topk_from_name(name)
+        decode_group = int(decode_group) if decode_group else case_decode_group_from_name(name)
         topk_input = case_topk_input_from_name(name)
         case_summary = {
             "elapsed_ms": elapsed_stats,
@@ -527,8 +631,8 @@ for path in cases:
             "dsa_sparse_attn_nodes": timing.get("dsa_sparse_attn_nodes"),
             "sparse_mask_nodes": timing.get("sparse_mask_nodes"),
         }
-        paired.setdefault((mode, threads, cache_topk, topk_input, int(layer), int(tokens)), {})[variant] = case_summary
-        mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk, topk_input)] = case_summary
+        paired.setdefault((mode, threads, cache_topk, decode_group, topk_input, int(layer), int(tokens)), {})[variant] = case_summary
+        mode_cases[(variant, int(layer), int(tokens), mode, threads, cache_topk, decode_group, topk_input)] = case_summary
     print(f"  input_source={format_input_source(input_source)}")
     print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
     print(f"  dsa_sparse_attn_nodes={timing.get('dsa_sparse_attn_nodes')} sparse_mask_nodes={timing.get('sparse_mask_nodes')}")
@@ -579,8 +683,8 @@ for path in cases:
 if paired:
     print()
     print("pairwise_optin_vs_default")
-    print("mode sparse_attn_threads cache_topk top_k_input layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
-    for (mode, threads, cache_topk, topk_input, layer, tokens), variants in sorted(paired.items()):
+    print("mode sparse_attn_threads cache_topk decode_group_heads top_k_input layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
+    for (mode, threads, cache_topk, decode_group, topk_input, layer, tokens), variants in sorted(paired.items()):
         default = variants.get("default")
         optin = variants.get("optin")
         if not default or not optin:
@@ -598,7 +702,7 @@ if paired:
             optin_op = optin["op_stats"][op_name]
             op_ratios[op_name] = optin_op / default_op if default_op not in (None, 0) and optin_op is not None else None
         print(
-            f"{mode} {threads} {cache_topk} {topk_input} {layer} {tokens} "
+            f"{mode} {threads} {cache_topk} {decode_group} {topk_input} {layer} {tokens} "
             f"{samples} "
             f"{format_float(default_elapsed)} {format_float(optin_elapsed)} {format_float(elapsed_ratio)} "
             f"{format_float(default_native)} {format_float(optin_native)} {format_float(native_ratio)} "
@@ -613,11 +717,11 @@ if paired:
 if mode_cases:
     print()
     print("parallel_vs_serial")
-    print("variant sparse_attn_threads cache_topk top_k_input layer tokens samples serial_ms_median parallel_ms_median elapsed_ratio serial_native_us_median parallel_native_us_median native_ratio indexer_topk_ratio")
-    keys = sorted({(variant, layer, tokens, threads, cache_topk, topk_input) for (variant, layer, tokens, _mode, threads, cache_topk, topk_input) in mode_cases})
-    for variant, layer, tokens, threads, cache_topk, topk_input in keys:
-        serial = mode_cases.get((variant, layer, tokens, "serial", threads, cache_topk, topk_input))
-        parallel = mode_cases.get((variant, layer, tokens, "parallel", threads, cache_topk, topk_input))
+    print("variant sparse_attn_threads cache_topk decode_group_heads top_k_input layer tokens samples serial_ms_median parallel_ms_median elapsed_ratio serial_native_us_median parallel_native_us_median native_ratio indexer_topk_ratio")
+    keys = sorted({(variant, layer, tokens, threads, cache_topk, decode_group, topk_input) for (variant, layer, tokens, _mode, threads, cache_topk, decode_group, topk_input) in mode_cases})
+    for variant, layer, tokens, threads, cache_topk, decode_group, topk_input in keys:
+        serial = mode_cases.get((variant, layer, tokens, "serial", threads, cache_topk, decode_group, topk_input))
+        parallel = mode_cases.get((variant, layer, tokens, "parallel", threads, cache_topk, decode_group, topk_input))
         if not serial or not parallel:
             continue
         serial_elapsed = serial["elapsed_ms"]["median"]
@@ -631,7 +735,7 @@ if mode_cases:
         native_ratio = parallel_native / serial_native if serial_native not in (None, 0) and parallel_native is not None else None
         indexer_ratio = parallel_indexer / serial_indexer if serial_indexer not in (None, 0) and parallel_indexer is not None else None
         print(
-            f"{variant} {threads} {cache_topk} {topk_input} {layer} {tokens} "
+            f"{variant} {threads} {cache_topk} {decode_group} {topk_input} {layer} {tokens} "
             f"{samples} "
             f"{format_float(serial_elapsed)} {format_float(parallel_elapsed)} {format_float(elapsed_ratio)} "
             f"{format_float(serial_native)} {format_float(parallel_native)} {format_float(native_ratio)} "
@@ -649,8 +753,10 @@ require_path "$STAGE_MODEL"
 validate_indexer_mode
 validate_sparse_attn_threads
 validate_sparse_attn_cache_topk
+validate_sparse_attn_decode_group_heads
 validate_synthetic_top_k_sideband
 validate_real_top_k_source_layer_start
+validate_warm_real_top_k_cache
 mkdir -p "$OUTPUT_DIR"
 
 prepare_static_metal_bench
@@ -665,10 +771,13 @@ run_default_cases() {
     for threads in $(sparse_attn_thread_counts); do
       local cache_topk
       for cache_topk in $(sparse_attn_cache_topk_modes); do
-        run_case "$(case_name "default-1" "$mode" "$threads" "$cache_topk")" "$LAYER_START" "$LAYER_END" 1 $(case_env "$threads" "$cache_topk") $(indexer_args "$mode")
-        run_case "$(case_name "default-33" "$mode" "$threads" "$cache_topk")" "$LAYER_START" "$LAYER_END" 33 $(case_env "$threads" "$cache_topk") $(indexer_args "$mode")
-        run_case "$(case_name "optin-prefill-32" "$mode" "$threads" "$cache_topk")" "$LAYER_START" "$LAYER_END" 32 $(case_env "$threads" "$cache_topk") --direct-sparse-prefill true $(indexer_args "$mode")
-        run_case "$(case_name "optin-prefill-33" "$mode" "$threads" "$cache_topk")" "$LAYER_START" "$LAYER_END" 33 $(case_env "$threads" "$cache_topk") --direct-sparse-prefill true $(indexer_args "$mode")
+        local decode_group_heads
+        for decode_group_heads in $(sparse_attn_decode_group_head_counts); do
+          run_case "$(case_name "default-1" "$mode" "$threads" "$cache_topk" "$decode_group_heads")" "$LAYER_START" "$LAYER_END" 1 $(case_env "$threads" "$cache_topk" "$decode_group_heads") $(indexer_args "$mode")
+          run_case "$(case_name "default-33" "$mode" "$threads" "$cache_topk" "$decode_group_heads")" "$LAYER_START" "$LAYER_END" 33 $(case_env "$threads" "$cache_topk" "$decode_group_heads") $(indexer_args "$mode")
+          run_case "$(case_name "optin-prefill-32" "$mode" "$threads" "$cache_topk" "$decode_group_heads")" "$LAYER_START" "$LAYER_END" 32 $(case_env "$threads" "$cache_topk" "$decode_group_heads") --direct-sparse-prefill true $(indexer_args "$mode")
+          run_case "$(case_name "optin-prefill-33" "$mode" "$threads" "$cache_topk" "$decode_group_heads")" "$LAYER_START" "$LAYER_END" 33 $(case_env "$threads" "$cache_topk" "$decode_group_heads") --direct-sparse-prefill true $(indexer_args "$mode")
+        done
       done
     done
   done
@@ -690,8 +799,11 @@ run_sweep_cases() {
         for threads in $(sparse_attn_thread_counts); do
           local cache_topk
           for cache_topk in $(sparse_attn_cache_topk_modes); do
-            run_case "$(case_name "default-l${layer_start}-t${tokens}" "$mode" "$threads" "$cache_topk")" "$layer_start" "$layer_end" "$tokens" $(case_env "$threads" "$cache_topk") $(indexer_args "$mode")
-            run_case "$(case_name "optin-l${layer_start}-t${tokens}" "$mode" "$threads" "$cache_topk")" "$layer_start" "$layer_end" "$tokens" $(case_env "$threads" "$cache_topk") --direct-sparse-prefill true $(indexer_args "$mode")
+            local decode_group_heads
+            for decode_group_heads in $(sparse_attn_decode_group_head_counts); do
+              run_case "$(case_name "default-l${layer_start}-t${tokens}" "$mode" "$threads" "$cache_topk" "$decode_group_heads")" "$layer_start" "$layer_end" "$tokens" $(case_env "$threads" "$cache_topk" "$decode_group_heads") $(indexer_args "$mode")
+              run_case "$(case_name "optin-l${layer_start}-t${tokens}" "$mode" "$threads" "$cache_topk" "$decode_group_heads")" "$layer_start" "$layer_end" "$tokens" $(case_env "$threads" "$cache_topk" "$decode_group_heads") --direct-sparse-prefill true $(indexer_args "$mode")
+            done
           done
         done
       done
@@ -699,10 +811,28 @@ run_sweep_cases() {
   done < <(split_csv "$layers")
 }
 
+warm_real_top_k_cache() {
+  [[ "$WARM_REAL_TOP_K_CACHE" == "on" ]] || return 0
+  local layers="$LAYERS"
+  if [[ -z "$layers" ]]; then
+    layers="$LAYER_START"
+  fi
+  local layer_start
+  local tokens
+  while IFS= read -r layer_start; do
+    local layer_end=$((layer_start + 1))
+    while IFS= read -r tokens; do
+      run_cache_warm_case "$layer_start" "$layer_end" "$tokens"
+    done < <(split_csv "$TOKENS")
+  done < <(split_csv "$layers")
+}
+
 case_env() {
   local threads="$1"
   local cache_topk="$2"
+  local decode_group_heads="$3"
   printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS=$threads"
+  printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_DECODE_GROUP_HEADS=$decode_group_heads"
   if [[ "$cache_topk" == "on" ]]; then
     printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=1"
   else
@@ -717,9 +847,15 @@ case_env() {
   if [[ -n "$REAL_TOP_K_SOURCE_LAYER_START" && "$REAL_TOP_K_SOURCE_LAYER_START" != "off" && "$REAL_TOP_K_SOURCE_LAYER_START" != "0" ]]; then
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=$REAL_TOP_K_SOURCE_LAYER_START"
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=$REAL_TOP_K_CACHE_DIR"
+    if [[ "$WARM_REAL_TOP_K_CACHE" == "on" ]]; then
+      printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE=1"
+    else
+      printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE=0"
+    fi
   else
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=off"
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR=off"
+    printf '%s\n' "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE=0"
   fi
 }
 
@@ -738,6 +874,10 @@ sparse_attn_cache_topk_modes() {
   esac
 }
 
+sparse_attn_decode_group_head_counts() {
+  split_csv "$SPARSE_ATTN_DECODE_GROUP_HEADS"
+}
+
 indexer_modes() {
   case "$INDEXER_MODE" in
     both)
@@ -754,8 +894,10 @@ case_name() {
   local mode="$2"
   local threads="$3"
   local cache_topk="$4"
+  local decode_group_heads="$5"
   local threads_suffix=""
   local cache_suffix=""
+  local decode_group_suffix=""
   local sideband_suffix=""
   if [[ "$SPARSE_ATTN_THREADS" != "256" || "$threads" != "256" ]]; then
     threads_suffix="-th${threads}"
@@ -769,20 +911,23 @@ case_name() {
   elif [[ "$cache_topk" == "on" ]]; then
     cache_suffix="-cachetopk"
   fi
+  if [[ "$SPARSE_ATTN_DECODE_GROUP_HEADS" != "1" || "$decode_group_heads" != "1" ]]; then
+    decode_group_suffix="-hgrp${decode_group_heads}"
+  fi
   if [[ "$SYNTHETIC_TOP_K_SIDEBAND" == "on" ]]; then
     sideband_suffix="-syntopk${SYNTHETIC_TOP_K_WIDTH}"
   elif [[ -n "$REAL_TOP_K_SOURCE_LAYER_START" && "$REAL_TOP_K_SOURCE_LAYER_START" != "off" && "$REAL_TOP_K_SOURCE_LAYER_START" != "0" ]]; then
     sideband_suffix="-realtopk${REAL_TOP_K_SOURCE_LAYER_START}"
   fi
-  if [[ "$INDEXER_MODE" == "parallel" && "$mode" == "parallel" && -z "$threads_suffix" && -z "$cache_suffix" && -z "$sideband_suffix" ]]; then
+  if [[ "$INDEXER_MODE" == "parallel" && "$mode" == "parallel" && -z "$threads_suffix" && -z "$cache_suffix" && -z "$decode_group_suffix" && -z "$sideband_suffix" ]]; then
     printf '%s\n' "$base_name"
   else
     case "$base_name" in
       default-l*|optin-l*)
-        printf '%s-%s%s%s%s-l%s\n' "${base_name%%-l*}" "$mode" "$threads_suffix" "$cache_suffix" "$sideband_suffix" "${base_name#*-l}"
+        printf '%s-%s%s%s%s%s-l%s\n' "${base_name%%-l*}" "$mode" "$threads_suffix" "$cache_suffix" "$decode_group_suffix" "$sideband_suffix" "${base_name#*-l}"
         ;;
       *)
-        printf '%s-%s%s%s%s\n' "$base_name" "$mode" "$threads_suffix" "$cache_suffix" "$sideband_suffix"
+        printf '%s-%s%s%s%s%s\n' "$base_name" "$mode" "$threads_suffix" "$cache_suffix" "$decode_group_suffix" "$sideband_suffix"
         ;;
     esac
   fi
@@ -799,6 +944,8 @@ indexer_args() {
       ;;
   esac
 }
+
+warm_real_top_k_cache
 
 if [[ -n "$TOKENS" ]]; then
   run_sweep_cases

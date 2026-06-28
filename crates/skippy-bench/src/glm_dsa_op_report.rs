@@ -154,6 +154,7 @@ pub(crate) struct MetalDispatchRecord {
     pub(crate) grid_y: u64,
     pub(crate) grid_z: u64,
     pub(crate) threads_x: u64,
+    pub(crate) threads_y: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -571,6 +572,7 @@ fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
         grid_y: parse_field(&fields, "grid_y")?,
         grid_z: parse_field(&fields, "grid_z")?,
         threads_x: parse_field(&fields, "threads_x")?,
+        threads_y: parse_optional_field(&fields, "threads_y")?,
     })
 }
 
@@ -1072,6 +1074,7 @@ mod tests {
         assert_eq!(record.grid_x, 32);
         assert_eq!(record.grid_y, 4);
         assert_eq!(record.threads_x, 256);
+        assert_eq!(record.threads_y, None);
     }
 
     #[test]

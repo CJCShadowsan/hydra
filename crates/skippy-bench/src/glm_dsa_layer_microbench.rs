@@ -28,6 +28,7 @@ const ENV_SYNTHETIC_TOP_K_WIDTH: &str = "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_WI
 const ENV_REAL_TOP_K_SOURCE_LAYER_START: &str =
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START";
 const ENV_REAL_TOP_K_CACHE_DIR: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DIR";
+const ENV_REAL_TOP_K_REQUIRE_CACHE: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
 const INPUT_FRAME_CACHE_MAGIC: &[u8; 16] = b"SKPGLMDSAFRM1\0\0\0";
 
@@ -462,6 +463,13 @@ fn real_top_k_activation_frame(
             cache_path,
             true,
         );
+    }
+    if env_flag_enabled(ENV_REAL_TOP_K_REQUIRE_CACHE) {
+        let cache = cache_path.as_ref().map_or_else(
+            || "<disabled>".to_string(),
+            |path| path.display().to_string(),
+        );
+        bail!("real top-k input cache is required but missing: {cache}");
     }
     let source_request = package_request_for_range(args, source_layer_start, source_layer_end);
     let source_selected = select_layer_package_parts(&source_request)
