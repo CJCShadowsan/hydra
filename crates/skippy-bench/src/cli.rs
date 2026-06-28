@@ -559,6 +559,28 @@ pub struct RunArgs {
         help = "Also enable llama.cpp GLM-DSA direct sparse-attention execution for prefill microbatches. Use only for sparse-prefill experiments."
     )]
     pub glm_dsa_direct_sparse_prefill: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable native Metal GLM-DSA top-k MoE route fusion in every launched stage."
+    )]
+    pub glm_dsa_metal_topk_moe_route_fusion: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable native Metal GLM-DSA dispatch-shape logs in every launched stage."
+    )]
+    pub glm_dsa_metal_dispatch_log: bool,
+    #[arg(
+        long,
+        help = "Set LLAMA_GLM_DSA_INDEXSHARE_FREQ in every launched stage so every Nth GLM-DSA layer recomputes top-k and intervening layers reuse it."
+    )]
+    pub glm_dsa_indexshare_freq: Option<u32>,
+    #[arg(
+        long,
+        help = "Set LLAMA_GLM_DSA_INDEXSHARE_PATTERN in every launched stage. Use F/S characters for Full/reused-Shared GLM-DSA layers."
+    )]
+    pub glm_dsa_indexshare_pattern: Option<String>,
 }
 
 #[derive(Parser)]

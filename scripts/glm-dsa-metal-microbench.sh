@@ -86,7 +86,7 @@ Options:
   --real-top-k-max-source-bytes N|off
                            Refuse to generate a real top-k source span when
                            selected layer artifacts exceed N bytes. Default is
-                           skippy-bench's built-in 120 GiB guard. Use off only
+                           skippy-bench's built-in 110 GiB guard. Use off only
                            for deliberate stress testing.
   --real-top-k-cache-dir PATH
                            Reuse generated real top-k activation frames from

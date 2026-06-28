@@ -434,6 +434,21 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
     configure_child_logs(&mut metrics_command, args.child_logs);
     let _metrics = ChildGuard::spawn(metrics_command)?;
 
+    let stage_reports = plan
+        .stages
+        .iter()
+        .map(|stage| {
+            json!({
+                "stage_id": stage.stage_id,
+                "stage_index": stage.stage_index,
+                "host": stage.host,
+                "layer_start": stage.layer_start,
+                "layer_end": stage.layer_end,
+                "bind_addr": stage.bind_addr,
+                "endpoint": stage.endpoint,
+            })
+        })
+        .collect::<Vec<_>>();
     let run_config = json!({
         "run_id": run_id,
         "topology_id": args.topology_id,
@@ -467,21 +482,11 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         "glm_dsa_op_timing": args.glm_dsa_op_timing,
         "glm_dsa_direct_sparse_attn": args.glm_dsa_direct_sparse_attn,
         "glm_dsa_direct_sparse_prefill": args.glm_dsa_direct_sparse_prefill,
-        "stages": plan
-            .stages
-            .iter()
-            .map(|stage| {
-                json!({
-                    "stage_id": stage.stage_id,
-                    "stage_index": stage.stage_index,
-                    "host": stage.host,
-                    "layer_start": stage.layer_start,
-                    "layer_end": stage.layer_end,
-                    "bind_addr": stage.bind_addr,
-                    "endpoint": stage.endpoint,
-                })
-            })
-            .collect::<Vec<_>>(),
+        "glm_dsa_metal_topk_moe_route_fusion": args.glm_dsa_metal_topk_moe_route_fusion,
+        "glm_dsa_metal_dispatch_log": args.glm_dsa_metal_dispatch_log,
+        "glm_dsa_indexshare_freq": args.glm_dsa_indexshare_freq,
+        "glm_dsa_indexshare_pattern": args.glm_dsa_indexshare_pattern,
+        "stages": stage_reports,
         "execute_remote": args.execute_remote,
         "keep_remote": args.keep_remote,
         "rsync_model_artifacts": args.rsync_model_artifacts,
@@ -768,6 +773,10 @@ fn run_args_for_existing_driver(
         glm_dsa_op_timing: false,
         glm_dsa_direct_sparse_attn: false,
         glm_dsa_direct_sparse_prefill: false,
+        glm_dsa_metal_topk_moe_route_fusion: false,
+        glm_dsa_metal_dispatch_log: false,
+        glm_dsa_indexshare_freq: None,
+        glm_dsa_indexshare_pattern: None,
     })
 }
 
@@ -1623,7 +1632,7 @@ fn stage_server_command(
     bin: &str,
     config_path: &str,
 ) -> String {
-    let env_prefix = stage_server_env_prefix(args);
+    let env_exports = stage_server_env_exports(args);
     let reply_credit_arg = args
         .stage_reply_credit_limit
         .map(|limit| format!(" --reply-credit-limit {limit}"))
@@ -1639,7 +1648,7 @@ fn stage_server_command(
         .unwrap_or_default();
     format!(
         "{}{} serve-binary --config {} --topology {} --activation-width {} --activation-wire-dtype {} --metrics-otlp-grpc {} --telemetry-queue-capacity {} --telemetry-level {} --max-inflight {}{}{} --downstream-wire-delay-ms {}{}",
-        env_prefix,
+        env_exports,
         shell_quote(bin),
         shell_quote(config_path),
         shell_quote(
@@ -1658,22 +1667,57 @@ fn stage_server_command(
     )
 }
 
-fn stage_server_env_prefix(args: &RunArgs) -> String {
+fn stage_server_env_exports(args: &RunArgs) -> String {
     let mut env = Vec::new();
     if args.glm_dsa_op_timing {
-        env.push("SKIPPY_GLM_DSA_OP_TIMING=1");
+        env.push(("SKIPPY_GLM_DSA_OP_TIMING", "1".to_string()));
     }
     if args.glm_dsa_direct_sparse_attn {
-        env.push("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN=1");
+        env.push(("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN", "1".to_string()));
     }
     if args.glm_dsa_direct_sparse_prefill {
-        env.push("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL=1");
+        env.push((
+            "SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL",
+            "1".to_string(),
+        ));
+    }
+    if args.glm_dsa_metal_topk_moe_route_fusion
+        || env_flag_enabled("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION")
+    {
+        env.push((
+            "SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION",
+            "1".to_string(),
+        ));
+    }
+    if args.glm_dsa_metal_dispatch_log || env_flag_enabled("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH") {
+        env.push(("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH", "1".to_string()));
+    }
+    if let Some(freq) = args.glm_dsa_indexshare_freq {
+        env.push(("LLAMA_GLM_DSA_INDEXSHARE_FREQ", freq.to_string()));
+    }
+    if let Some(pattern) = args.glm_dsa_indexshare_pattern.as_ref() {
+        env.push(("LLAMA_GLM_DSA_INDEXSHARE_PATTERN", pattern.clone()));
+    }
+    if env_flag_enabled("LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER") {
+        env.push(("LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER", "1".to_string()));
+    }
+    if env_flag_enabled("SKIPPY_BINARY_WARM_PRECONNECT") {
+        env.push(("SKIPPY_BINARY_WARM_PRECONNECT", "1".to_string()));
+    }
+    if let Ok(value) = std::env::var("MESH_LLM_NATIVE_RUNTIME_CACHE_DIR") {
+        env.push(("MESH_LLM_NATIVE_RUNTIME_CACHE_DIR", value));
     }
     if env.is_empty() {
         String::new()
     } else {
-        format!("{} ", env.join(" "))
+        env.into_iter()
+            .map(|(name, value)| format!("export {name}={}; ", shell_quote(&value)))
+            .collect()
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value != "0")
 }
 
 fn probe_stage_chain_connectivity(args: &RunArgs, plan: &DeploymentPlan) -> Result<()> {
@@ -3314,6 +3358,10 @@ mod tests {
             glm_dsa_op_timing: false,
             glm_dsa_direct_sparse_attn: false,
             glm_dsa_direct_sparse_prefill: false,
+            glm_dsa_metal_topk_moe_route_fusion: false,
+            glm_dsa_metal_dispatch_log: false,
+            glm_dsa_indexshare_freq: None,
+            glm_dsa_indexshare_pattern: None,
         };
 
         assert_eq!(
@@ -3865,6 +3913,10 @@ mod tests {
             glm_dsa_op_timing: false,
             glm_dsa_direct_sparse_attn: false,
             glm_dsa_direct_sparse_prefill: false,
+            glm_dsa_metal_topk_moe_route_fusion: false,
+            glm_dsa_metal_dispatch_log: false,
+            glm_dsa_indexshare_freq: None,
+            glm_dsa_indexshare_pattern: None,
         };
         let plan = DeploymentPlan {
             run_id: "run-1".to_string(),
@@ -3924,22 +3976,32 @@ mod tests {
         assert!(command.contains("--downstream-wire-mbps 1000"));
         assert!(command.contains("--telemetry-level"));
         assert!(command.contains("summary"));
-        assert!(!command.contains("SKIPPY_GLM_DSA_OP_TIMING=1"));
-        assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN=1"));
-        assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL=1"));
+        assert!(!command.contains("SKIPPY_GLM_DSA_OP_TIMING"));
+        assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN"));
+        assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL"));
+        assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION"));
+        assert!(!command.contains("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH"));
 
         args.glm_dsa_op_timing = true;
         args.glm_dsa_direct_sparse_attn = true;
         args.glm_dsa_direct_sparse_prefill = true;
+        args.glm_dsa_metal_topk_moe_route_fusion = true;
+        args.glm_dsa_metal_dispatch_log = true;
+        args.glm_dsa_indexshare_freq = Some(4);
+        args.glm_dsa_indexshare_pattern = Some("FSSS".to_string());
         let command = remote_start_command(
             &args,
             &plan,
             &stage,
             "/tmp/remote/run-1/stage-0/skippy-server",
         );
-        assert!(command.contains("SKIPPY_GLM_DSA_OP_TIMING=1"));
-        assert!(command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN=1"));
-        assert!(command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL=1"));
+        assert!(command.contains("SKIPPY_GLM_DSA_OP_TIMING"));
+        assert!(command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN"));
+        assert!(command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL"));
+        assert!(command.contains("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION"));
+        assert!(command.contains("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH"));
+        assert!(command.contains("LLAMA_GLM_DSA_INDEXSHARE_FREQ"));
+        assert!(command.contains("LLAMA_GLM_DSA_INDEXSHARE_PATTERN"));
     }
 
     #[test]
@@ -4095,6 +4157,10 @@ mod tests {
             glm_dsa_op_timing: false,
             glm_dsa_direct_sparse_attn: false,
             glm_dsa_direct_sparse_prefill: false,
+            glm_dsa_metal_topk_moe_route_fusion: false,
+            glm_dsa_metal_dispatch_log: false,
+            glm_dsa_indexshare_freq: None,
+            glm_dsa_indexshare_pattern: None,
         }
     }
 
