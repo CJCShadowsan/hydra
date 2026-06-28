@@ -551,6 +551,22 @@ def format_dispatch_counts(records):
         return "none"
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
 
+def format_hot_tensors(records, limit=8):
+    if not records:
+        return "none"
+    by_record = {}
+    for record in records:
+        by_record.setdefault(record.get("record_index", 0), []).append(record)
+    latest_index = max(by_record)
+    latest = sorted(by_record[latest_index], key=lambda record: record.get("rank", 0))
+    formatted = []
+    for record in latest[:limit]:
+        formatted.append(
+            f"{record.get('rank')}:{record.get('kind')}/{record.get('op')}"
+            f"/{record.get('name')}={record.get('elapsed_us')}us"
+        )
+    return "; ".join(formatted)
+
 def format_input_source(source):
     if not source:
         return "unknown"
@@ -634,6 +650,7 @@ for path in cases:
     op_timing_records = candidate.get("op_timing_records", [])
     timing = op_timing_records[0] if op_timing_records else {}
     dispatch_records = candidate.get("metal_dispatch_records", [])
+    hot_tensor_records = candidate.get("hot_tensor_records", [])
     decision_summary = candidate.get("direct_sparse_decision_summary", {})
     elapsed_stats = sample_stats(
         timing.get("elapsed_ms") for timing in candidate.get("timings", [])
@@ -712,6 +729,7 @@ for path in cases:
             f"aggregate={format_float(op_stats['routed_moe_aggregate'])}"
         )
     print(f"  metal_dispatch={format_dispatch_counts(dispatch_records)}")
+    print(f"  hot_tensors={format_hot_tensors(hot_tensor_records)}")
     sparse_attn_shapes = sparse_attn_dispatch_shapes(dispatch_records)
     if sparse_attn_shapes:
         print(f"  dsa_sparse_attn_dispatch_shapes={format_shape_counts(sparse_attn_shapes)}")

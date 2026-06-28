@@ -16,9 +16,9 @@ use skippy_runtime::{
 use crate::{
     cli::GlmDsaLayerMicrobenchArgs,
     glm_dsa_op_report::{
-        DirectSparseDecisionRecord, MetalDispatchRecord, TimingGroupRecord, TimingRecord,
-        parse_direct_sparse_decision_records, parse_metal_dispatch_records,
-        parse_timing_group_records, parse_timing_records,
+        DirectSparseDecisionRecord, HotTensorRecord, MetalDispatchRecord, TimingGroupRecord,
+        TimingRecord, parse_direct_sparse_decision_records, parse_hot_tensor_records,
+        parse_metal_dispatch_records, parse_timing_group_records, parse_timing_records,
     },
 };
 
@@ -113,6 +113,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
         group_timing_records: case.group_timing_records,
+        hot_tensor_records: case.hot_tensor_records,
         comparison,
         timings: case.timings,
     };
@@ -272,6 +273,10 @@ fn run_microbench_case(
         op_timing_records: skip_warmup_records(native_timings.op_timing_records, args.warmup),
         group_timing_records: skip_warmup_group_records(
             native_timings.group_timing_records,
+            args.warmup,
+        ),
+        hot_tensor_records: skip_warmup_hot_tensor_records(
+            native_timings.hot_tensor_records,
             args.warmup,
         ),
         timings,
@@ -927,6 +932,8 @@ impl NativeLogCapture {
             op_timing_records: parse_timing_records(&text).context("parse native op timings")?,
             group_timing_records: parse_timing_group_records(&text)
                 .context("parse native group timings")?,
+            hot_tensor_records: parse_hot_tensor_records(&text)
+                .context("parse native hot tensor timings")?,
         })
     }
 }
@@ -947,6 +954,7 @@ struct NativeTimingCapture {
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
+    hot_tensor_records: Vec<HotTensorRecord>,
 }
 
 fn native_log_capture_path() -> Result<PathBuf> {
@@ -976,6 +984,20 @@ fn skip_warmup_group_records(
             }
             record.record_index -= warmup;
             Some(record)
+        })
+        .collect()
+}
+
+fn skip_warmup_hot_tensor_records(
+    records: Vec<HotTensorRecord>,
+    warmup: usize,
+) -> Vec<HotTensorRecord> {
+    records
+        .into_iter()
+        .filter(|record| record.record_index >= warmup)
+        .map(|mut record| {
+            record.record_index -= warmup;
+            record
         })
         .collect()
 }
@@ -1234,6 +1256,7 @@ struct MicrobenchCase {
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
+    hot_tensor_records: Vec<HotTensorRecord>,
     timings: Vec<IterationTiming>,
     outputs: Vec<ActivationFrame>,
 }
@@ -1252,6 +1275,7 @@ impl MicrobenchCase {
             metal_dispatch_records: self.metal_dispatch_records.clone(),
             op_timing_records: self.op_timing_records.clone(),
             group_timing_records: self.group_timing_records.clone(),
+            hot_tensor_records: self.hot_tensor_records.clone(),
             timings: self.timings.clone(),
         }
     }
@@ -1302,6 +1326,8 @@ struct MicrobenchReport {
     op_timing_records: Vec<TimingRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_timing_records: Vec<TimingGroupRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hot_tensor_records: Vec<HotTensorRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<MicrobenchComparisonReport>,
     timings: Vec<IterationTiming>,
@@ -1365,6 +1391,8 @@ struct MicrobenchCaseSummary {
     op_timing_records: Vec<TimingRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_timing_records: Vec<TimingGroupRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hot_tensor_records: Vec<HotTensorRecord>,
     timings: Vec<IterationTiming>,
 }
 

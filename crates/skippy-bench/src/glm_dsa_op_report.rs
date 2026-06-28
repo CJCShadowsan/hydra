@@ -10,6 +10,7 @@ const GROUP_TIMING_PREFIX: &str = "skippy: glm_dsa_group_timing ";
 const SIDEBAND_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
 const DIRECT_SPARSE_DECISION_PREFIX: &str = "skippy: glm_dsa_direct_sparse_decision ";
 const METAL_DISPATCH_PREFIX: &str = "skippy: glm_dsa_metal_dispatch ";
+const HOT_TENSOR_PREFIX: &str = "skippy: glm_dsa_hot_tensor ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +125,22 @@ pub(crate) struct TimingGroupRecord {
     pub(crate) record_index: usize,
     pub(crate) group: String,
     pub(crate) timing: TimingRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HotTensorRecord {
+    pub(crate) record_index: usize,
+    pub(crate) stage: i32,
+    pub(crate) tokens: u64,
+    pub(crate) rank: u64,
+    pub(crate) op: String,
+    pub(crate) kind: String,
+    pub(crate) elapsed_us: u64,
+    pub(crate) name: String,
+    pub(crate) ne0: i64,
+    pub(crate) ne1: i64,
+    pub(crate) ne2: i64,
+    pub(crate) ne3: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -513,6 +530,26 @@ pub(crate) fn parse_timing_group_records(text: &str) -> Result<Vec<TimingGroupRe
     Ok(records)
 }
 
+pub(crate) fn parse_hot_tensor_records(text: &str) -> Result<Vec<HotTensorRecord>> {
+    let mut records = Vec::new();
+    let mut timing_record_count = 0usize;
+    for line in text.lines() {
+        if line.contains(OP_TIMING_PREFIX) {
+            timing_record_count += 1;
+            continue;
+        }
+        let Some(index) = line.find(HOT_TENSOR_PREFIX) else {
+            continue;
+        };
+        let record_index = timing_record_count.saturating_sub(1);
+        records.push(parse_hot_tensor_record(
+            record_index,
+            &line[index + HOT_TENSOR_PREFIX.len()..],
+        )?);
+    }
+    Ok(records)
+}
+
 pub(crate) fn parse_direct_sparse_decision_records(
     text: &str,
 ) -> Result<Vec<DirectSparseDecisionRecord>> {
@@ -601,6 +638,27 @@ fn parse_timing_group_record(record_index: usize, line: &str) -> Result<TimingGr
         record_index,
         group: parse_string_field(&fields, "group")?,
         timing: parse_timing_fields(&fields)?,
+    })
+}
+
+fn parse_hot_tensor_record(record_index: usize, line: &str) -> Result<HotTensorRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(HotTensorRecord {
+        record_index,
+        stage: parse_field(&fields, "stage")?,
+        tokens: parse_field(&fields, "tokens")?,
+        rank: parse_field(&fields, "rank")?,
+        op: parse_string_field(&fields, "op")?,
+        kind: parse_string_field(&fields, "kind")?,
+        elapsed_us: parse_field(&fields, "elapsed_us")?,
+        name: parse_string_field(&fields, "name")?,
+        ne0: parse_field(&fields, "ne0")?,
+        ne1: parse_field(&fields, "ne1")?,
+        ne2: parse_field(&fields, "ne2")?,
+        ne3: parse_field(&fields, "ne3")?,
     })
 }
 
