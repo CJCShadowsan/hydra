@@ -272,6 +272,31 @@ def format_dispatch_counts(records):
         return "none"
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items()))
 
+def sparse_attn_dispatch_shape(record):
+    return (
+        f"batch={record.get('batch')} "
+        f"heads={record.get('heads')} "
+        f"stream={record.get('stream')} "
+        f"kv={record.get('kv')} "
+        f"top_k={record.get('top_k')} "
+        f"grid={record.get('grid_x')}x{record.get('grid_y')}x{record.get('grid_z')} "
+        f"threads_x={record.get('threads_x')}"
+    )
+
+def sparse_attn_dispatch_shapes(records):
+    counts = {}
+    for record in records:
+        if record.get("op") != "dsa_sparse_attn":
+            continue
+        shape = sparse_attn_dispatch_shape(record)
+        counts[shape] = counts.get(shape, 0) + 1
+    return counts
+
+def format_shape_counts(counts):
+    if not counts:
+        return "none"
+    return "; ".join(f"{shape} count={count}" for shape, count in sorted(counts.items()))
+
 print(f"output_dir={base}")
 for path in cases:
     name = path.stem
@@ -333,16 +358,9 @@ for path in cases:
         f"shared_expert={format_float(op_stats['shared_expert'])}"
     )
     print(f"  metal_dispatch={format_dispatch_counts(dispatch_records)}")
-    sparse_attn_dispatch = next((record for record in dispatch_records if record.get("op") == "dsa_sparse_attn"), None)
-    if sparse_attn_dispatch:
-        print(
-            "  dsa_sparse_attn_dispatch="
-            f"batch={sparse_attn_dispatch.get('batch')} heads={sparse_attn_dispatch.get('heads')} "
-            f"stream={sparse_attn_dispatch.get('stream')} kv={sparse_attn_dispatch.get('kv')} "
-            f"top_k={sparse_attn_dispatch.get('top_k')} grid="
-            f"{sparse_attn_dispatch.get('grid_x')}x{sparse_attn_dispatch.get('grid_y')}x{sparse_attn_dispatch.get('grid_z')} "
-            f"threads_x={sparse_attn_dispatch.get('threads_x')}"
-        )
+    sparse_attn_shapes = sparse_attn_dispatch_shapes(dispatch_records)
+    if sparse_attn_shapes:
+        print(f"  dsa_sparse_attn_dispatch_shapes={format_shape_counts(sparse_attn_shapes)}")
     print(
         "  decisions="
         f"{decision_summary.get('records', 0)} "
