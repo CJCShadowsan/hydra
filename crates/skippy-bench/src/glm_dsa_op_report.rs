@@ -8,6 +8,7 @@ use crate::cli::{GlmDsaOpCompareArgs, GlmDsaOpReportArgs};
 const OP_TIMING_PREFIX: &str = "skippy: glm_dsa_op_timing ";
 const GROUP_TIMING_PREFIX: &str = "skippy: glm_dsa_group_timing ";
 const SIDEBAND_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
+const DIRECT_SPARSE_DECISION_PREFIX: &str = "skippy: glm_dsa_direct_sparse_decision ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +107,25 @@ pub(crate) struct TimingGroupRecord {
     pub(crate) record_index: usize,
     pub(crate) group: String,
     pub(crate) timing: TimingRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DirectSparseDecisionRecord {
+    pub(crate) layer: i32,
+    pub(crate) ubatch_tokens: i64,
+    pub(crate) sparse_batch: i64,
+    pub(crate) sparse_streams: i64,
+    pub(crate) prefill_cap: i64,
+    pub(crate) direct_enabled: bool,
+    pub(crate) prefill_enabled: bool,
+    pub(crate) decode_shape: bool,
+    pub(crate) prefill_shape: bool,
+    pub(crate) token_shape_allowed: bool,
+    pub(crate) kq_b_ok: bool,
+    pub(crate) sinks_ok: bool,
+    pub(crate) alibi_ok: bool,
+    pub(crate) soft_cap_ok: bool,
+    pub(crate) use_direct: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -448,6 +468,42 @@ pub(crate) fn parse_timing_group_records(text: &str) -> Result<Vec<TimingGroupRe
     Ok(records)
 }
 
+pub(crate) fn parse_direct_sparse_decision_records(
+    text: &str,
+) -> Result<Vec<DirectSparseDecisionRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(DIRECT_SPARSE_DECISION_PREFIX)
+                .map(|index| &line[index + DIRECT_SPARSE_DECISION_PREFIX.len()..])
+        })
+        .map(parse_direct_sparse_decision_record)
+        .collect()
+}
+
+fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisionRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(DirectSparseDecisionRecord {
+        layer: parse_field(&fields, "layer")?,
+        ubatch_tokens: parse_field(&fields, "ubatch_tokens")?,
+        sparse_batch: parse_field(&fields, "sparse_batch")?,
+        sparse_streams: parse_field(&fields, "sparse_streams")?,
+        prefill_cap: parse_field(&fields, "prefill_cap")?,
+        direct_enabled: parse_bool_int_field(&fields, "direct_enabled")?,
+        prefill_enabled: parse_bool_int_field(&fields, "prefill_enabled")?,
+        decode_shape: parse_bool_int_field(&fields, "decode_shape")?,
+        prefill_shape: parse_bool_int_field(&fields, "prefill_shape")?,
+        token_shape_allowed: parse_bool_int_field(&fields, "token_shape_allowed")?,
+        kq_b_ok: parse_bool_int_field(&fields, "kq_b_ok")?,
+        sinks_ok: parse_bool_int_field(&fields, "sinks_ok")?,
+        alibi_ok: parse_bool_int_field(&fields, "alibi_ok")?,
+        soft_cap_ok: parse_bool_int_field(&fields, "soft_cap_ok")?,
+        use_direct: parse_bool_int_field(&fields, "use_direct")?,
+    })
+}
+
 fn parse_timing_group_record(record_index: usize, line: &str) -> Result<TimingGroupRecord> {
     let fields = line
         .split_whitespace()
@@ -565,6 +621,11 @@ where
                 .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
         })
         .transpose()
+}
+
+fn parse_bool_int_field(fields: &BTreeMap<&str, &str>, name: &str) -> Result<bool> {
+    let value: u8 = parse_field(fields, name)?;
+    Ok(value != 0)
 }
 
 fn parse_string_field(fields: &BTreeMap<&str, &str>, name: &str) -> Result<String> {
@@ -811,9 +872,10 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComparisonKey, OpBucket, Phase, PhaseSummary, compare_phase, parse_sideband_record,
-        parse_sideband_records, parse_timing_group_records, parse_timing_record,
-        parse_timing_records, summarize_comparison_rows, summarize_log,
+        ComparisonKey, OpBucket, Phase, PhaseSummary, compare_phase,
+        parse_direct_sparse_decision_records, parse_sideband_record, parse_sideband_records,
+        parse_timing_group_records, parse_timing_record, parse_timing_records,
+        summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -824,6 +886,7 @@ mod tests {
     const GROUP_LINE_LAYER_1: &str = "skippy: glm_dsa_group_timing stage=1 tokens=128 group=layer_1 total_us=875800 indexer_topk_nodes=175 indexer_topk_us=79065 indexer_nodes=155 indexer_us=50000 top_k_nodes=20 top_k_us=29065 sparse_mask_nodes=195 sparse_mask_us=113543 sparse_mask_fill_nodes=47 sparse_mask_fill_us=1000 sparse_mask_topk_nodes=47 sparse_mask_topk_us=2000 sparse_mask_add_nodes=47 sparse_mask_add_us=3000 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 mla_attention_nodes=46 mla_attention_us=26234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
+    const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
 
     #[test]
     fn parses_timing_record_with_prefix() {
@@ -889,6 +952,27 @@ mod tests {
             .get(&Phase::Prefill)
             .unwrap();
         assert_eq!(prefill.dsa_sparse_attn.as_ref().unwrap().elapsed_us, 114543);
+    }
+
+    #[test]
+    fn parses_direct_sparse_decision_records() {
+        let records = parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.layer, 30);
+        assert_eq!(record.ubatch_tokens, 33);
+        assert_eq!(record.sparse_batch, 33);
+        assert_eq!(record.prefill_cap, 32);
+        assert!(record.direct_enabled);
+        assert!(record.prefill_enabled);
+        assert!(!record.decode_shape);
+        assert!(!record.prefill_shape);
+        assert!(!record.token_shape_allowed);
+        assert!(record.kq_b_ok);
+        assert!(record.sinks_ok);
+        assert!(record.alibi_ok);
+        assert!(record.soft_cap_ok);
+        assert!(!record.use_direct);
     }
 
     #[test]

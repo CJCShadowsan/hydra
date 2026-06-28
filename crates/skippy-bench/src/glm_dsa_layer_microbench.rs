@@ -16,7 +16,8 @@ use skippy_runtime::{
 use crate::{
     cli::GlmDsaLayerMicrobenchArgs,
     glm_dsa_op_report::{
-        TimingGroupRecord, TimingRecord, parse_timing_group_records, parse_timing_records,
+        DirectSparseDecisionRecord, TimingGroupRecord, TimingRecord,
+        parse_direct_sparse_decision_records, parse_timing_group_records, parse_timing_records,
     },
 };
 
@@ -93,6 +94,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             .collect(),
         input_payload_bytes: input.payload.len(),
         native_log_path: case.native_log_path,
+        direct_sparse_decision_records: case.direct_sparse_decision_records,
         op_timing_records: case.op_timing_records,
         group_timing_records: case.group_timing_records,
         comparison,
@@ -215,9 +217,9 @@ fn run_microbench_case(
     collect_outputs: bool,
 ) -> Result<MicrobenchCase> {
     configure_env_flags(flags);
+    let native_logs = NativeLogCapture::start(flags.op_timing)?;
     let model = StageModel::open_from_parts(selected_paths, runtime_config)
         .with_context(|| format!("open GLM-DSA layer microbench model for {label}"))?;
-    let native_logs = NativeLogCapture::start(flags.op_timing)?;
     let mut timings = Vec::with_capacity(args.iterations);
     let mut outputs = Vec::with_capacity(if collect_outputs { args.iterations } else { 0 });
     let total_runs = args.warmup + args.iterations;
@@ -246,6 +248,10 @@ fn run_microbench_case(
         flags,
         n_gpu_layers: runtime_config.n_gpu_layers,
         native_log_path: native_timings.log_path,
+        direct_sparse_decision_records: retain_case_decision_records(
+            native_timings.direct_sparse_decision_records,
+            args.tokens,
+        ),
         op_timing_records: skip_warmup_records(native_timings.op_timing_records, args.warmup),
         group_timing_records: skip_warmup_group_records(
             native_timings.group_timing_records,
@@ -298,6 +304,10 @@ fn configure_env_flags(flags: MicrobenchFlags) {
         flags.parallel_lightning_indexer,
     );
     set_env_flag("SKIPPY_GLM_DSA_OP_TIMING", flags.op_timing);
+    set_env_flag(
+        "SKIPPY_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS",
+        flags.op_timing,
+    );
 }
 
 fn set_env_flag(name: &str, enabled: bool) {
@@ -446,6 +456,8 @@ impl NativeLogCapture {
             .with_context(|| format!("read native timing log {}", path.display()))?;
         Ok(NativeTimingCapture {
             log_path: Some(path),
+            direct_sparse_decision_records: parse_direct_sparse_decision_records(&text)
+                .context("parse native direct sparse decisions")?,
             op_timing_records: parse_timing_records(&text).context("parse native op timings")?,
             group_timing_records: parse_timing_group_records(&text)
                 .context("parse native group timings")?,
@@ -465,6 +477,7 @@ impl Drop for NativeLogCapture {
 #[derive(Default)]
 struct NativeTimingCapture {
     log_path: Option<PathBuf>,
+    direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
 }
@@ -497,6 +510,19 @@ fn skip_warmup_group_records(
             record.record_index -= warmup;
             Some(record)
         })
+        .collect()
+}
+
+fn retain_case_decision_records(
+    records: Vec<DirectSparseDecisionRecord>,
+    tokens: usize,
+) -> Vec<DirectSparseDecisionRecord> {
+    let Ok(tokens) = i64::try_from(tokens) else {
+        return Vec::new();
+    };
+    records
+        .into_iter()
+        .filter(|record| record.ubatch_tokens == tokens)
         .collect()
 }
 
@@ -711,6 +737,7 @@ struct MicrobenchCase {
     flags: MicrobenchFlags,
     n_gpu_layers: i32,
     native_log_path: Option<PathBuf>,
+    direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
     timings: Vec<IterationTiming>,
@@ -724,6 +751,7 @@ impl MicrobenchCase {
             flags: self.flags,
             n_gpu_layers: self.n_gpu_layers,
             native_log_path: self.native_log_path.clone(),
+            direct_sparse_decision_records: self.direct_sparse_decision_records.clone(),
             op_timing_records: self.op_timing_records.clone(),
             group_timing_records: self.group_timing_records.clone(),
             timings: self.timings.clone(),
@@ -766,6 +794,8 @@ struct MicrobenchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     op_timing_records: Vec<TimingRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_timing_records: Vec<TimingGroupRecord>,
@@ -802,6 +832,8 @@ struct MicrobenchCaseSummary {
     n_gpu_layers: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     op_timing_records: Vec<TimingRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
