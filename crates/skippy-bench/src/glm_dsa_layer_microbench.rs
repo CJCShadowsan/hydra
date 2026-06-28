@@ -87,6 +87,30 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             case.as_case_summary()
         }
     };
+    let optimized_dispatch_probe =
+        if comparison.is_none() && flags.op_timing && flags.metal_dispatch_log {
+            let probe_flags = MicrobenchFlags {
+                op_timing: false,
+                metal_dispatch_log: true,
+                ..flags
+            };
+            Some(
+                run_microbench_case(
+                    "optimized_dispatch_probe",
+                    &selected.absolute_paths,
+                    &runtime_config,
+                    &args,
+                    probe_flags,
+                    &input.frame,
+                    &token_ids,
+                    &positions,
+                    false,
+                )?
+                .as_case_summary(),
+            )
+        } else {
+            None
+        };
 
     let direct_sparse_decision_summary =
         summarize_direct_sparse_decisions(&case.direct_sparse_decision_records);
@@ -94,6 +118,12 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let metal_dispatch_summary = case.metal_dispatch_summary.clone();
     let op_timing_summary = case.op_timing_summary.clone();
     let routed_moe_timing_summary = case.routed_moe_timing_summary.clone();
+    let profile_integrity = ProfileIntegrityReport::new(
+        flags,
+        &metal_dispatch_summary,
+        &timing_summary,
+        optimized_dispatch_probe.as_ref(),
+    );
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -122,11 +152,13 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         metal_dispatch_summary,
         op_timing_summary,
         routed_moe_timing_summary,
+        profile_integrity,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
         group_timing_records: case.group_timing_records,
         hot_tensor_records: case.hot_tensor_records,
+        optimized_dispatch_probe,
         comparison,
         timings: case.timings,
     };
@@ -1348,6 +1380,7 @@ struct MicrobenchReport {
     op_timing_summary: GlmDsaOpTimingSummary,
     #[serde(skip_serializing_if = "RoutedMoeTimingSummary::is_empty")]
     routed_moe_timing_summary: RoutedMoeTimingSummary,
+    profile_integrity: ProfileIntegrityReport,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1358,6 +1391,8 @@ struct MicrobenchReport {
     group_timing_records: Vec<TimingGroupRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hot_tensor_records: Vec<HotTensorRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optimized_dispatch_probe: Option<MicrobenchCaseSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<MicrobenchComparisonReport>,
     timings: Vec<IterationTiming>,
@@ -1407,6 +1442,57 @@ impl MicrobenchFlags {
 
     fn capture_native_logs(self) -> bool {
         self.op_timing || self.metal_dispatch_log
+    }
+}
+
+#[derive(Serialize)]
+struct ProfileIntegrityReport {
+    op_timing_enabled: bool,
+    metal_dispatch_log_enabled: bool,
+    route_fusion_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optimized_probe_route_fusion_active: Option<bool>,
+    diagnostic_timing_may_disable_route_fusion: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_mean_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optimized_probe_mean_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic_slowdown_vs_optimized_probe: Option<f64>,
+}
+
+impl ProfileIntegrityReport {
+    fn new(
+        flags: MicrobenchFlags,
+        dispatch: &GlmDsaDispatchSummary,
+        timing: &TimingDistributionSummary,
+        optimized_probe: Option<&MicrobenchCaseSummary>,
+    ) -> Self {
+        let route_fusion_active = dispatch.topk_moe_route_fused_records > 0;
+        let optimized_probe_route_fusion_active = optimized_probe
+            .map(|probe| probe.metal_dispatch_summary.topk_moe_route_fused_records > 0);
+        let diagnostic_timing_may_disable_route_fusion =
+            flags.op_timing && matches!(optimized_probe_route_fusion_active, Some(true));
+        let diagnostic_mean_ms = timing.mean_ms;
+        let optimized_probe_mean_ms =
+            optimized_probe.and_then(|probe| probe.timing_summary.mean_ms);
+        let diagnostic_slowdown_vs_optimized_probe =
+            match (diagnostic_mean_ms, optimized_probe_mean_ms) {
+                (Some(diagnostic), Some(optimized)) if optimized > f64::EPSILON => {
+                    Some(diagnostic / optimized)
+                }
+                _ => None,
+            };
+        Self {
+            op_timing_enabled: flags.op_timing,
+            metal_dispatch_log_enabled: flags.metal_dispatch_log,
+            route_fusion_active,
+            optimized_probe_route_fusion_active,
+            diagnostic_timing_may_disable_route_fusion,
+            diagnostic_mean_ms,
+            optimized_probe_mean_ms,
+            diagnostic_slowdown_vs_optimized_probe,
+        }
     }
 }
 
