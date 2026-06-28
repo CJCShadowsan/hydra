@@ -72,6 +72,8 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         }
     };
 
+    let direct_sparse_decision_summary =
+        summarize_direct_sparse_decisions(&case.direct_sparse_decision_records);
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -94,6 +96,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             .collect(),
         input_payload_bytes: input.payload.len(),
         native_log_path: case.native_log_path,
+        direct_sparse_decision_summary,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         op_timing_records: case.op_timing_records,
         group_timing_records: case.group_timing_records,
@@ -526,6 +529,32 @@ fn retain_case_decision_records(
         .collect()
 }
 
+fn summarize_direct_sparse_decisions(
+    records: &[DirectSparseDecisionRecord],
+) -> DirectSparseDecisionSummary {
+    let mut summary = DirectSparseDecisionSummary {
+        records: records.len(),
+        ..DirectSparseDecisionSummary::default()
+    };
+    for record in records {
+        if record.use_direct {
+            summary.use_direct += 1;
+        } else {
+            summary.fallback += 1;
+        }
+        if record.decode_shape {
+            summary.decode_shape += 1;
+        }
+        if record.prefill_shape {
+            summary.prefill_shape += 1;
+        }
+        if record.token_shape_allowed {
+            summary.token_shape_allowed += 1;
+        }
+    }
+    summary
+}
+
 fn compare_case_outputs(
     baseline_outputs: &[ActivationFrame],
     candidate_outputs: &[ActivationFrame],
@@ -751,6 +780,9 @@ impl MicrobenchCase {
             flags: self.flags,
             n_gpu_layers: self.n_gpu_layers,
             native_log_path: self.native_log_path.clone(),
+            direct_sparse_decision_summary: summarize_direct_sparse_decisions(
+                &self.direct_sparse_decision_records,
+            ),
             direct_sparse_decision_records: self.direct_sparse_decision_records.clone(),
             op_timing_records: self.op_timing_records.clone(),
             group_timing_records: self.group_timing_records.clone(),
@@ -793,6 +825,8 @@ struct MicrobenchReport {
     input_payload_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "DirectSparseDecisionSummary::is_empty")]
+    direct_sparse_decision_summary: DirectSparseDecisionSummary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -832,6 +866,8 @@ struct MicrobenchCaseSummary {
     n_gpu_layers: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "DirectSparseDecisionSummary::is_empty")]
+    direct_sparse_decision_summary: DirectSparseDecisionSummary,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -839,6 +875,22 @@ struct MicrobenchCaseSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     group_timing_records: Vec<TimingGroupRecord>,
     timings: Vec<IterationTiming>,
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+struct DirectSparseDecisionSummary {
+    records: usize,
+    use_direct: usize,
+    fallback: usize,
+    decode_shape: usize,
+    prefill_shape: usize,
+    token_shape_allowed: usize,
+}
+
+impl DirectSparseDecisionSummary {
+    fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
 }
 
 #[derive(Serialize)]
