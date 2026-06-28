@@ -241,6 +241,16 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub metal_topk_moe_route_fusion: bool,
     #[arg(
         long,
+        help = "Set LLAMA_GLM_DSA_INDEXSHARE_FREQ for this microbench run so every Nth GLM-DSA layer recomputes top-k and intervening layers reuse it."
+    )]
+    pub indexshare_freq: Option<u32>,
+    #[arg(
+        long,
+        help = "Set LLAMA_GLM_DSA_INDEXSHARE_PATTERN for this microbench run. Use F/S characters for Full/reused-Shared GLM-DSA layers."
+    )]
+    pub indexshare_pattern: Option<String>,
+    #[arg(
+        long,
         default_value_t = false,
         help = "Fail unless the optimized dispatch profile has at least one GLM-DSA route-fusion encode candidate, no skipped encode candidates, and at least one fused route dispatch."
     )]
@@ -892,6 +902,10 @@ mod tests {
             "31",
             "--tokens",
             "128",
+            "--indexshare-freq",
+            "4",
+            "--indexshare-pattern",
+            "FSSS",
             "--require-optimized-route-fusion",
             "--compare-dense-fallback",
         ])
@@ -905,6 +919,8 @@ mod tests {
         assert_eq!(args.layer_start, 30);
         assert_eq!(args.layer_end, 31);
         assert_eq!(args.tokens, 128);
+        assert_eq!(args.indexshare_freq, Some(4));
+        assert_eq!(args.indexshare_pattern.as_deref(), Some("FSSS"));
         assert!(args.require_optimized_route_fusion);
         assert!(args.compare_dense_fallback);
         assert!(!args.compare_cpu_direct_sparse);

@@ -49,6 +49,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let token_ids = vec![1_i32; args.tokens];
     let positions = positions(args.tokens)?;
     let flags = MicrobenchFlags::from_args(&args);
+    let indexshare_policy = IndexSharePolicy::from_args_and_env(&args);
     let input = prepare_input_activation(&args, &token_ids, &positions, flags)?;
     let comparison = if args.compare_dense_fallback {
         Some(run_dense_fallback_comparison(
@@ -145,6 +146,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         n_batch: runtime_config.n_batch,
         n_ubatch: runtime_config.n_ubatch,
         flags: case.flags,
+        indexshare_policy,
         input_source: input.report,
         selected_parts: selected
             .selected_parts
@@ -297,7 +299,7 @@ fn run_microbench_case(
     positions: &[i32],
     collect_outputs: bool,
 ) -> Result<MicrobenchCase> {
-    configure_env_flags(flags);
+    configure_env_flags(args, flags);
     let native_logs = NativeLogCapture::start(flags.capture_native_logs())?;
     let model = StageModel::open_from_parts(selected_paths, runtime_config)
         .with_context(|| format!("open GLM-DSA layer microbench model for {label}"))?;
@@ -379,7 +381,7 @@ fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
     Ok(())
 }
 
-fn configure_env_flags(flags: MicrobenchFlags) {
+fn configure_env_flags(args: &GlmDsaLayerMicrobenchArgs, flags: MicrobenchFlags) {
     set_env_flag(
         "SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN",
         flags.direct_sparse_attn,
@@ -409,12 +411,33 @@ fn configure_env_flags(flags: MicrobenchFlags) {
         "SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION",
         flags.metal_topk_moe_route_fusion,
     );
+    set_optional_env(
+        "LLAMA_GLM_DSA_INDEXSHARE_FREQ",
+        IndexSharePolicy::from_args_and_env(args)
+            .freq
+            .map(|freq| freq.to_string()),
+    );
+    set_optional_env(
+        "LLAMA_GLM_DSA_INDEXSHARE_PATTERN",
+        IndexSharePolicy::from_args_and_env(args).pattern,
+    );
 }
 
 fn set_env_flag(name: &str, enabled: bool) {
     // This command is single-threaded and sets native runtime flags before opening llama.cpp.
     unsafe {
         std::env::set_var(name, if enabled { "1" } else { "0" });
+    }
+}
+
+fn set_optional_env(name: &str, value: Option<String>) {
+    // This command is single-threaded and sets native runtime flags before opening llama.cpp.
+    unsafe {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
     }
 }
 
@@ -585,7 +608,7 @@ fn generate_real_top_k_frame(
         direct_sparse_prefill: false,
         ..flags
     };
-    configure_env_flags(source_flags);
+    configure_env_flags(args, source_flags);
     let source_model = StageModel::open_from_parts(&source_selected.absolute_paths, &source_config)
         .with_context(|| {
             format!("open GLM-DSA real top-k source model {source_layer_start}..{source_layer_end}")
@@ -1526,6 +1549,8 @@ struct MicrobenchReport {
     n_batch: Option<u32>,
     n_ubatch: Option<u32>,
     flags: MicrobenchFlags,
+    #[serde(skip_serializing_if = "IndexSharePolicy::is_disabled")]
+    indexshare_policy: IndexSharePolicy,
     input_source: InputSourceReport,
     selected_parts: Vec<PackagePartSummary>,
     input_payload_bytes: usize,
@@ -1626,6 +1651,38 @@ enum InputSourceReport {
         cache_hit: bool,
         selected_parts: Vec<PackagePartSummary>,
     },
+}
+
+#[derive(Clone, Serialize)]
+struct IndexSharePolicy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freq: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pattern: Option<String>,
+}
+
+impl IndexSharePolicy {
+    fn from_args_and_env(args: &GlmDsaLayerMicrobenchArgs) -> Self {
+        let freq = args
+            .indexshare_freq
+            .or_else(|| parse_env_u32("LLAMA_GLM_DSA_INDEXSHARE_FREQ"));
+        let pattern = args.indexshare_pattern.clone().or_else(|| {
+            std::env::var("LLAMA_GLM_DSA_INDEXSHARE_PATTERN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+        Self { freq, pattern }
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.freq.is_none() && self.pattern.is_none()
+    }
+}
+
+fn parse_env_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
 #[derive(Clone, Copy, Serialize)]

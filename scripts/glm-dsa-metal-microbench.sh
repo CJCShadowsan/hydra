@@ -19,6 +19,8 @@ SPARSE_ATTN_THREADS="${SPARSE_ATTN_THREADS:-256}"
 SPARSE_ATTN_CACHE_TOPK="${SPARSE_ATTN_CACHE_TOPK:-off}"
 SPARSE_ATTN_DECODE_GROUP_HEADS="${SPARSE_ATTN_DECODE_GROUP_HEADS:-1}"
 MUL_MM_ID_MIN_TOKENS="${MUL_MM_ID_MIN_TOKENS:-32}"
+INDEXSHARE_FREQ="${INDEXSHARE_FREQ:-}"
+INDEXSHARE_PATTERN="${INDEXSHARE_PATTERN:-}"
 SYNTHETIC_TOP_K_SIDEBAND="${SYNTHETIC_TOP_K_SIDEBAND:-off}"
 SYNTHETIC_TOP_K_WIDTH="${SYNTHETIC_TOP_K_WIDTH:-256}"
 REAL_TOP_K_SOURCE_LAYER_START="${REAL_TOP_K_SOURCE_LAYER_START:-}"
@@ -70,6 +72,9 @@ Options:
   --mul-mm-id-min-tokens LIST
                            Comma-separated Metal mul_mat_id token thresholds
                            for trying the matrix-matrix ID kernel. Default: 32.
+  --indexshare-freq N      Run with LLAMA_GLM_DSA_INDEXSHARE_FREQ=N.
+  --indexshare-pattern PAT Run with LLAMA_GLM_DSA_INDEXSHARE_PATTERN=PAT. Use
+                           F/S characters for Full/reused-Shared layers.
   --synthetic-top-k-sideband MODE
                            Append synthetic GLM-DSA top-k sideband to input
                            activations: off or on. Default: off.
@@ -105,8 +110,9 @@ Environment overrides mirror option names:
   STAGE_MODEL, MODEL_ID, OUTPUT_DIR, LAYER_START, LAYER_END, CTX_SIZE,
   ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS, INDEXER_MODE,
   SPARSE_ATTN_THREADS, SPARSE_ATTN_CACHE_TOPK, SPARSE_ATTN_DECODE_GROUP_HEADS,
-  MUL_MM_ID_MIN_TOKENS, SYNTHETIC_TOP_K_SIDEBAND, SYNTHETIC_TOP_K_WIDTH,
-  REAL_TOP_K_SOURCE_LAYER_START, REAL_TOP_K_CHAIN_SOURCES,
+  MUL_MM_ID_MIN_TOKENS, INDEXSHARE_FREQ, INDEXSHARE_PATTERN,
+  SYNTHETIC_TOP_K_SIDEBAND, SYNTHETIC_TOP_K_WIDTH, REAL_TOP_K_SOURCE_LAYER_START,
+  REAL_TOP_K_CHAIN_SOURCES,
   REAL_TOP_K_MAX_SOURCE_BYTES, REAL_TOP_K_CACHE_DIR, WARM_REAL_TOP_K_CACHE.
 EOF
 }
@@ -179,6 +185,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mul-mm-id-min-tokens)
       MUL_MM_ID_MIN_TOKENS="$2"
+      shift 2
+      ;;
+    --indexshare-freq)
+      INDEXSHARE_FREQ="$2"
+      shift 2
+      ;;
+    --indexshare-pattern)
+      INDEXSHARE_PATTERN="$2"
       shift 2
       ;;
     --synthetic-top-k-sideband)
@@ -326,6 +340,23 @@ validate_mul_mm_id_min_tokens() {
   done < <(split_csv "$MUL_MM_ID_MIN_TOKENS")
 }
 
+validate_indexshare() {
+  if [[ -n "$INDEXSHARE_FREQ" ]]; then
+    case "$INDEXSHARE_FREQ" in
+      *[!0-9]*)
+        echo "invalid --indexshare-freq: $INDEXSHARE_FREQ (expected positive integer)" >&2
+        exit 2
+        ;;
+      *)
+        if [[ "$INDEXSHARE_FREQ" -lt 1 ]]; then
+          echo "invalid --indexshare-freq: $INDEXSHARE_FREQ (expected positive integer)" >&2
+          exit 2
+        fi
+        ;;
+    esac
+  fi
+}
+
 validate_synthetic_top_k_sideband() {
   case "$SYNTHETIC_TOP_K_SIDEBAND" in
     off|on)
@@ -456,6 +487,12 @@ run_case() {
       bench_args+=("$arg")
     fi
   done
+  if [[ -n "$INDEXSHARE_FREQ" ]]; then
+    bench_args+=(--indexshare-freq "$INDEXSHARE_FREQ")
+  fi
+  if [[ -n "$INDEXSHARE_PATTERN" ]]; then
+    bench_args+=(--indexshare-pattern "$INDEXSHARE_PATTERN")
+  fi
   local -a cmd=(
     env
     "${env_args[@]}"
@@ -525,6 +562,12 @@ run_cache_warm_case() {
     --op-timing false
     --parallel-lightning-indexer false
   )
+  if [[ -n "$INDEXSHARE_FREQ" ]]; then
+    cmd+=(--indexshare-freq "$INDEXSHARE_FREQ")
+  fi
+  if [[ -n "$INDEXSHARE_PATTERN" ]]; then
+    cmd+=(--indexshare-pattern "$INDEXSHARE_PATTERN")
+  fi
 
   printf '+'
   printf ' %q' "${cmd[@]}"
@@ -954,6 +997,7 @@ validate_sparse_attn_threads
 validate_sparse_attn_cache_topk
 validate_sparse_attn_decode_group_heads
 validate_mul_mm_id_min_tokens
+validate_indexshare
 validate_synthetic_top_k_sideband
 validate_real_top_k_source_layer_start
 validate_real_top_k_chain_sources
