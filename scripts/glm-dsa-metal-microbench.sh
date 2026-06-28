@@ -14,6 +14,7 @@ ITERATIONS="${ITERATIONS:-1}"
 WARMUP="${WARMUP:-0}"
 TOKENS="${TOKENS:-}"
 LAYERS="${LAYERS:-}"
+INDEXER_MODE="${INDEXER_MODE:-parallel}"
 FORCE_REBUILD=1
 BUILD_ONLY=0
 DRY_RUN=0
@@ -43,6 +44,9 @@ Options:
   --warmup N               Warmup iterations per case. Default: 0.
   --tokens LIST            Comma-separated token sweep, e.g. 1,8,16,32,33,64.
   --layers LIST            Comma-separated single-layer starts, e.g. 30,45,60.
+  --indexer-mode MODE      Lightning indexer mode: serial, parallel, or both.
+                           Default: parallel, matching skippy-bench's current
+                           glm-dsa-layer-microbench default.
   --no-force-rebuild       Skip forced static-metal rebuild/relink.
   --build-only             Rebuild/relink only; do not run cases.
   --dry-run                Print commands without executing.
@@ -50,7 +54,7 @@ Options:
 
 Environment overrides mirror option names:
   STAGE_MODEL, MODEL_ID, OUTPUT_DIR, LAYER_START, LAYER_END, CTX_SIZE,
-  ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS.
+  ACTIVATION_WIDTH, ITERATIONS, WARMUP, TOKENS, LAYERS, INDEXER_MODE.
 EOF
 }
 
@@ -104,6 +108,10 @@ while [[ $# -gt 0 ]]; do
       LAYERS="$2"
       shift 2
       ;;
+    --indexer-mode)
+      INDEXER_MODE="$2"
+      shift 2
+      ;;
     --no-force-rebuild)
       FORCE_REBUILD=0
       shift
@@ -151,6 +159,17 @@ split_csv() {
     [[ -n "$item" ]] || continue
     printf '%s\n' "$item"
   done
+}
+
+validate_indexer_mode() {
+  case "$INDEXER_MODE" in
+    serial|parallel|both)
+      ;;
+    *)
+      echo "invalid --indexer-mode: $INDEXER_MODE (expected serial, parallel, or both)" >&2
+      exit 2
+      ;;
+  esac
 }
 
 prepare_static_metal_bench() {
@@ -227,6 +246,7 @@ def case_sort_key(path):
 
 cases = sorted(base.glob("*.json"), key=case_sort_key)
 paired = {}
+mode_cases = {}
 
 def sample_stats(values):
     values = [value for value in values if value is not None]
@@ -297,6 +317,11 @@ def format_shape_counts(counts):
         return "none"
     return "; ".join(f"{shape} count={count}" for shape, count in sorted(counts.items()))
 
+def case_mode_from_name(name):
+    if "-serial-" in name:
+        return "serial"
+    return "parallel"
+
 print(f"output_dir={base}")
 for path in cases:
     name = path.stem
@@ -321,10 +346,11 @@ for path in cases:
         "routed_moe": median_field(op_timing_records, "routed_moe_us"),
         "shared_expert": median_field(op_timing_records, "shared_expert_us"),
     }
-    pair = re.match(r"(default|optin)-l(\d+)-t(\d+)$", name)
+    pair = re.match(r"(default|optin)(?:-(serial|parallel))?-l(\d+)-t(\d+)$", name)
     if pair:
-        variant, layer, tokens = pair.groups()
-        paired.setdefault((int(layer), int(tokens)), {})[variant] = {
+        variant, mode, layer, tokens = pair.groups()
+        mode = mode or case_mode_from_name(name)
+        case_summary = {
             "elapsed_ms": elapsed_stats,
             "total_us": native_stats,
             "op_stats": op_stats,
@@ -333,6 +359,8 @@ for path in cases:
             "dsa_sparse_attn_nodes": timing.get("dsa_sparse_attn_nodes"),
             "sparse_mask_nodes": timing.get("sparse_mask_nodes"),
         }
+        paired.setdefault((mode, int(layer), int(tokens)), {})[variant] = case_summary
+        mode_cases[(variant, int(layer), int(tokens), mode)] = case_summary
     print(f"  parity={parity['passed']} hidden_mismatches={parity['hidden_mismatches']} sideband_mismatches={parity['sideband_mismatched_bytes']}")
     print(f"  dsa_sparse_attn_nodes={timing.get('dsa_sparse_attn_nodes')} sparse_mask_nodes={timing.get('sparse_mask_nodes')}")
     print(
@@ -382,8 +410,8 @@ for path in cases:
 if paired:
     print()
     print("pairwise_optin_vs_default")
-    print("layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
-    for (layer, tokens), variants in sorted(paired.items()):
+    print("mode layer tokens samples default_ms_median optin_ms_median elapsed_ratio default_native_us_median optin_native_us_median native_ratio indexer_topk_ratio sparse_mask_ratio dsa_sparse_attn_ratio routed_moe_ratio shared_expert_ratio optin_direct optin_fallback")
+    for (mode, layer, tokens), variants in sorted(paired.items()):
         default = variants.get("default")
         optin = variants.get("optin")
         if not default or not optin:
@@ -401,7 +429,7 @@ if paired:
             optin_op = optin["op_stats"][op_name]
             op_ratios[op_name] = optin_op / default_op if default_op not in (None, 0) and optin_op is not None else None
         print(
-            f"{layer} {tokens} "
+            f"{mode} {layer} {tokens} "
             f"{samples} "
             f"{format_float(default_elapsed)} {format_float(optin_elapsed)} {format_float(elapsed_ratio)} "
             f"{format_float(default_native)} {format_float(optin_native)} {format_float(native_ratio)} "
@@ -412,6 +440,34 @@ if paired:
             f"{format_float(op_ratios['shared_expert'])} "
             f"{optin['use_direct']} {optin['fallback']}"
         )
+
+if mode_cases:
+    print()
+    print("parallel_vs_serial")
+    print("variant layer tokens samples serial_ms_median parallel_ms_median elapsed_ratio serial_native_us_median parallel_native_us_median native_ratio indexer_topk_ratio")
+    keys = sorted({(variant, layer, tokens) for (variant, layer, tokens, _mode) in mode_cases})
+    for variant, layer, tokens in keys:
+        serial = mode_cases.get((variant, layer, tokens, "serial"))
+        parallel = mode_cases.get((variant, layer, tokens, "parallel"))
+        if not serial or not parallel:
+            continue
+        serial_elapsed = serial["elapsed_ms"]["median"]
+        parallel_elapsed = parallel["elapsed_ms"]["median"]
+        serial_native = serial["total_us"]["median"]
+        parallel_native = parallel["total_us"]["median"]
+        serial_indexer = serial["op_stats"]["indexer_topk"]
+        parallel_indexer = parallel["op_stats"]["indexer_topk"]
+        samples = min(serial["elapsed_ms"]["count"], parallel["elapsed_ms"]["count"])
+        elapsed_ratio = parallel_elapsed / serial_elapsed if serial_elapsed not in (None, 0) and parallel_elapsed is not None else None
+        native_ratio = parallel_native / serial_native if serial_native not in (None, 0) and parallel_native is not None else None
+        indexer_ratio = parallel_indexer / serial_indexer if serial_indexer not in (None, 0) and parallel_indexer is not None else None
+        print(
+            f"{variant} {layer} {tokens} "
+            f"{samples} "
+            f"{format_float(serial_elapsed)} {format_float(parallel_elapsed)} {format_float(elapsed_ratio)} "
+            f"{format_float(serial_native)} {format_float(parallel_native)} {format_float(native_ratio)} "
+            f"{format_float(indexer_ratio)}"
+        )
 PY
   printf 'summary=%s\n' "$summary"
   if [[ "$DRY_RUN" == "0" ]]; then
@@ -421,6 +477,7 @@ PY
 
 cd "$ROOT"
 require_path "$STAGE_MODEL"
+validate_indexer_mode
 mkdir -p "$OUTPUT_DIR"
 
 prepare_static_metal_bench
@@ -429,10 +486,13 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
 fi
 
 run_default_cases() {
-  run_case default-1 "$LAYER_START" "$LAYER_END" 1
-  run_case default-33 "$LAYER_START" "$LAYER_END" 33
-  run_case optin-prefill-32 "$LAYER_START" "$LAYER_END" 32 --direct-sparse-prefill true
-  run_case optin-prefill-33 "$LAYER_START" "$LAYER_END" 33 --direct-sparse-prefill true
+  local mode
+  for mode in $(indexer_modes); do
+    run_case "$(case_name "default-1" "$mode")" "$LAYER_START" "$LAYER_END" 1 $(indexer_args "$mode")
+    run_case "$(case_name "default-33" "$mode")" "$LAYER_START" "$LAYER_END" 33 $(indexer_args "$mode")
+    run_case "$(case_name "optin-prefill-32" "$mode")" "$LAYER_START" "$LAYER_END" 32 --direct-sparse-prefill true $(indexer_args "$mode")
+    run_case "$(case_name "optin-prefill-33" "$mode")" "$LAYER_START" "$LAYER_END" 33 --direct-sparse-prefill true $(indexer_args "$mode")
+  done
 }
 
 run_sweep_cases() {
@@ -445,10 +505,53 @@ run_sweep_cases() {
   while IFS= read -r layer_start; do
     local layer_end=$((layer_start + 1))
     while IFS= read -r tokens; do
-      run_case "default-l${layer_start}-t${tokens}" "$layer_start" "$layer_end" "$tokens"
-      run_case "optin-l${layer_start}-t${tokens}" "$layer_start" "$layer_end" "$tokens" --direct-sparse-prefill true
+      local mode
+      for mode in $(indexer_modes); do
+        run_case "$(case_name "default-l${layer_start}-t${tokens}" "$mode")" "$layer_start" "$layer_end" "$tokens" $(indexer_args "$mode")
+        run_case "$(case_name "optin-l${layer_start}-t${tokens}" "$mode")" "$layer_start" "$layer_end" "$tokens" --direct-sparse-prefill true $(indexer_args "$mode")
+      done
     done < <(split_csv "$TOKENS")
   done < <(split_csv "$layers")
+}
+
+indexer_modes() {
+  case "$INDEXER_MODE" in
+    both)
+      printf 'serial\nparallel\n'
+      ;;
+    *)
+      printf '%s\n' "$INDEXER_MODE"
+      ;;
+  esac
+}
+
+case_name() {
+  local base_name="$1"
+  local mode="$2"
+  if [[ "$INDEXER_MODE" == "parallel" && "$mode" == "parallel" ]]; then
+    printf '%s\n' "$base_name"
+  else
+    case "$base_name" in
+      default-l*|optin-l*)
+        printf '%s-%s-l%s\n' "${base_name%%-l*}" "$mode" "${base_name#*-l}"
+        ;;
+      *)
+        printf '%s-%s\n' "$base_name" "$mode"
+        ;;
+    esac
+  fi
+}
+
+indexer_args() {
+  local mode="$1"
+  case "$mode" in
+    serial)
+      printf '%s\n%s\n' --parallel-lightning-indexer false
+      ;;
+    parallel)
+      printf '%s\n%s\n' --parallel-lightning-indexer true
+      ;;
+  esac
 }
 
 if [[ -n "$TOKENS" ]]; then
