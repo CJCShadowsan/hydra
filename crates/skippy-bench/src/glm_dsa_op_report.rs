@@ -611,7 +611,8 @@ fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
         v_type: parse_optional_string_field(&fields, "v_type"),
         mask_type: parse_optional_string_field(&fields, "mask_type"),
         top_k_type: parse_optional_string_field(&fields, "top_k_type"),
-        src_type: parse_optional_string_field(&fields, "src_type"),
+        src_type: parse_optional_string_field(&fields, "src_type")
+            .or_else(|| parse_optional_string_field(&fields, "src0_type")),
         dst_type: parse_optional_string_field(&fields, "dst_type"),
         q_width: parse_optional_field(&fields, "q_width")?,
         v_width: parse_optional_field(&fields, "v_width")?,
@@ -1069,6 +1070,7 @@ mod tests {
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
     const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 grid_x=32 grid_y=4 grid_z=1 threads_x=256";
+    const METAL_MUL_MAT_ID_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=mul_mat_id kernel=mul_mv_id tensor=ffn_moe_down-45 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 ne00=5120 ne01=6144 experts=256 used_experts=8 tokens=1 min_tokens=128 nr0=2 nr1=1 nsg=1 grid_x=1536 grid_y=1 grid_z=8 threads_x=32 threads_y=2";
 
     #[test]
     fn parses_timing_record_with_prefix() {
@@ -1173,6 +1175,21 @@ mod tests {
         assert_eq!(record.grid_y, 4);
         assert_eq!(record.threads_x, 256);
         assert_eq!(record.threads_y, None);
+    }
+
+    #[test]
+    fn parses_mul_mat_id_src0_type_as_source_type() {
+        let records = parse_metal_dispatch_records(METAL_MUL_MAT_ID_DISPATCH_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.op, "mul_mat_id");
+        assert_eq!(record.kernel.as_deref(), Some("mul_mv_id"));
+        assert_eq!(record.tensor, "ffn_moe_down-45");
+        assert_eq!(record.src_type.as_deref(), Some("q3_K"));
+        assert_eq!(record.dst_type.as_deref(), Some("f32"));
+        assert_eq!(record.grid_x, 1536);
+        assert_eq!(record.grid_z, 8);
+        assert_eq!(record.threads_y, Some(2));
     }
 
     #[test]
