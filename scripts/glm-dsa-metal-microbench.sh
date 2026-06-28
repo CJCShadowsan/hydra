@@ -620,7 +620,11 @@ def route_fusion_reason_counts(records):
         op = record.get("op", "unknown")
         if not op.startswith("topk_moe_route_"):
             continue
-        reason = record.get("reason") or record.get("kernel") or "unknown"
+        reason = record.get("reason") or record.get("kernel")
+        if reason is None and op == "topk_moe_route_fused":
+            reason = "fused"
+        if reason is None:
+            reason = "unknown"
         key = f"{op}/{reason}"
         counts[key] = counts.get(key, 0) + 1
     return counts
