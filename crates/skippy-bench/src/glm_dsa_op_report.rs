@@ -7,7 +7,8 @@ use crate::cli::{GlmDsaOpCompareArgs, GlmDsaOpReportArgs};
 
 const OP_TIMING_PREFIX: &str = "skippy: glm_dsa_op_timing ";
 const GROUP_TIMING_PREFIX: &str = "skippy: glm_dsa_group_timing ";
-const SIDEBAND_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
+const SIDEBAND_FORWARD_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
+const SIDEBAND_RECEIVE_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_receive ";
 const DIRECT_SPARSE_DECISION_PREFIX: &str = "skippy: glm_dsa_direct_sparse_decision ";
 const METAL_DISPATCH_PREFIX: &str = "skippy: glm_dsa_metal_dispatch ";
 const HOT_TENSOR_PREFIX: &str = "skippy: glm_dsa_hot_tensor ";
@@ -194,6 +195,8 @@ pub(crate) struct MetalDispatchRecord {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct SidebandSummary {
     records: usize,
+    forward_records: usize,
+    receive_records: usize,
     tokens: u64,
     hidden_bytes: u64,
     sideband_bytes: u64,
@@ -210,6 +213,7 @@ struct SidebandSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SidebandRecord {
+    direction: SidebandDirection,
     stage: String,
     kind: String,
     pos_start: u64,
@@ -217,6 +221,12 @@ struct SidebandRecord {
     hidden_bytes: u64,
     sideband_bytes: u64,
     sideband_i32: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebandDirection {
+    Forward,
+    Receive,
 }
 
 pub fn glm_dsa_op_report(args: GlmDsaOpReportArgs) -> Result<()> {
@@ -745,20 +755,33 @@ fn parse_optional_bucket(
 
 fn parse_sideband_records(text: &str) -> Result<Vec<SidebandRecord>> {
     text.lines()
-        .filter_map(|line| {
-            line.find(SIDEBAND_PREFIX)
-                .map(|index| &line[index + SIDEBAND_PREFIX.len()..])
-        })
-        .map(parse_sideband_record)
+        .filter_map(sideband_line)
+        .map(|(direction, line)| parse_sideband_record(direction, line))
         .collect()
 }
 
-fn parse_sideband_record(line: &str) -> Result<SidebandRecord> {
+fn sideband_line(line: &str) -> Option<(SidebandDirection, &str)> {
+    if let Some(index) = line.find(SIDEBAND_FORWARD_PREFIX) {
+        return Some((
+            SidebandDirection::Forward,
+            &line[index + SIDEBAND_FORWARD_PREFIX.len()..],
+        ));
+    }
+    line.find(SIDEBAND_RECEIVE_PREFIX).map(|index| {
+        (
+            SidebandDirection::Receive,
+            &line[index + SIDEBAND_RECEIVE_PREFIX.len()..],
+        )
+    })
+}
+
+fn parse_sideband_record(direction: SidebandDirection, line: &str) -> Result<SidebandRecord> {
     let fields = line
         .split_whitespace()
         .filter_map(|field| field.split_once('='))
         .collect::<BTreeMap<_, _>>();
     Ok(SidebandRecord {
+        direction,
         stage: parse_string_field(&fields, "stage")?,
         kind: parse_string_field(&fields, "kind")?,
         pos_start: parse_field(&fields, "pos_start")?,
@@ -983,6 +1006,10 @@ fn summarize_sideband_records(
             .entry(phase)
             .or_default();
         summary.records += 1;
+        match record.direction {
+            SidebandDirection::Forward => summary.forward_records += 1,
+            SidebandDirection::Receive => summary.receive_records += 1,
+        }
         summary.tokens += record.tokens;
         summary.hidden_bytes += record.hidden_bytes;
         summary.sideband_bytes += record.sideband_bytes;
@@ -1056,7 +1083,7 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComparisonKey, OpBucket, Phase, PhaseSummary, compare_phase,
+        ComparisonKey, OpBucket, Phase, PhaseSummary, SidebandDirection, compare_phase,
         parse_direct_sparse_decision_records, parse_metal_dispatch_records, parse_sideband_record,
         parse_sideband_records, parse_timing_group_records, parse_timing_record,
         parse_timing_records, summarize_comparison_rows, summarize_log,
@@ -1069,6 +1096,7 @@ mod tests {
     const GROUP_LINE_LAYER_0: &str = "skippy: glm_dsa_group_timing stage=1 tokens=128 group=layer_0 total_us=600000 indexer_topk_nodes=100 indexer_topk_us=50000 indexer_nodes=80 indexer_us=30000 top_k_nodes=20 top_k_us=20000 sparse_mask_nodes=40 sparse_mask_us=1000 sparse_mask_fill_nodes=0 sparse_mask_fill_us=0 sparse_mask_topk_nodes=40 sparse_mask_topk_us=1000 sparse_mask_add_nodes=0 sparse_mask_add_us=0 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 mla_attention_nodes=1 mla_attention_us=9000 routed_moe_nodes=0 routed_moe_us=0 shared_expert_nodes=0 shared_expert_us=0";
     const GROUP_LINE_LAYER_1: &str = "skippy: glm_dsa_group_timing stage=1 tokens=128 group=layer_1 total_us=875800 indexer_topk_nodes=175 indexer_topk_us=79065 indexer_nodes=155 indexer_us=50000 top_k_nodes=20 top_k_us=29065 sparse_mask_nodes=195 sparse_mask_us=113543 sparse_mask_fill_nodes=47 sparse_mask_fill_us=1000 sparse_mask_topk_nodes=47 sparse_mask_topk_us=2000 sparse_mask_add_nodes=47 sparse_mask_add_us=3000 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 mla_attention_nodes=46 mla_attention_us=26234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
+    const SIDEBAND_RECEIVE_LINE: &str = "skippy: glm_dsa_top_k_sideband_receive stage=stage-1 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
     const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 grid_x=32 grid_y=4 grid_z=1 threads_x=256";
@@ -1303,6 +1331,7 @@ mod tests {
     fn parses_sideband_record_with_prefix() {
         let records = parse_sideband_records(SIDEBAND_LINE).unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].direction, SidebandDirection::Forward);
         assert_eq!(records[0].stage, "stage-0");
         assert_eq!(records[0].kind, "DecodeEmbd");
         assert_eq!(records[0].pos_start, 718);
@@ -1311,10 +1340,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_sideband_receive_record_with_prefix() {
+        let records = parse_sideband_records(SIDEBAND_RECEIVE_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].direction, SidebandDirection::Receive);
+        assert_eq!(records[0].stage, "stage-1");
+        assert_eq!(records[0].kind, "DecodeEmbd");
+        assert_eq!(records[0].pos_start, 718);
+        assert_eq!(records[0].sideband_bytes, 3072);
+        assert_eq!(records[0].sideband_i32, 768);
+    }
+
+    #[test]
     fn rejects_malformed_sideband_record() {
-        let error = parse_sideband_record("stage=stage-0 kind=DecodeEmbd pos_start=0")
-            .unwrap_err()
-            .to_string();
+        let error = parse_sideband_record(
+            SidebandDirection::Forward,
+            "stage=stage-0 kind=DecodeEmbd pos_start=0",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("missing tokens"));
     }
 
@@ -1326,6 +1370,8 @@ mod tests {
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
         assert_eq!(decode.records, 1);
+        assert_eq!(decode.forward_records, 1);
+        assert_eq!(decode.receive_records, 0);
         assert_eq!(decode.tokens, 1);
         assert_eq!(decode.hidden_bytes, 24576);
         assert_eq!(decode.sideband_bytes, 3072);
@@ -1340,6 +1386,32 @@ mod tests {
         );
         assert_eq!(decode.sideband_padding_ratio, Some(49.0 / 768.0));
         assert_eq!(decode.sideband_to_hidden_ratio, Some(0.125));
+    }
+
+    #[test]
+    fn summarizes_receive_sideband_records() {
+        let timing = parse_timing_records(LINE).unwrap();
+        let text = format!("{SIDEBAND_LINE}\n{SIDEBAND_RECEIVE_LINE}");
+        let sideband = parse_sideband_records(&text).unwrap();
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband);
+        let forward = summary
+            .sideband_records
+            .get("stage-0")
+            .unwrap()
+            .get(&Phase::Decode)
+            .unwrap();
+        let receive = summary
+            .sideband_records
+            .get("stage-1")
+            .unwrap()
+            .get(&Phase::Decode)
+            .unwrap();
+        assert_eq!(forward.forward_records, 1);
+        assert_eq!(forward.receive_records, 0);
+        assert_eq!(receive.forward_records, 0);
+        assert_eq!(receive.receive_records, 1);
+        assert_eq!(receive.sideband_bytes, 3072);
+        assert_eq!(receive.sideband_i32, 768);
     }
 
     #[test]

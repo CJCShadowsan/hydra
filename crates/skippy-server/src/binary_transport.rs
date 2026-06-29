@@ -4213,6 +4213,18 @@ fn input_activation_frame(
         if message.raw_bytes.len() & 3 != 0 {
             bail!("GLM-DSA top-k sideband payload is not i32-aligned");
         }
+        eprintln!(
+            "skippy: glm_dsa_top_k_sideband_receive stage={} request={} session={} kind={:?} pos_start={} tokens={} hidden_bytes={} sideband_bytes={} sideband_i32={}",
+            config.stage_id,
+            message.request_id,
+            message.session_id,
+            message.kind,
+            message.pos_start,
+            message.token_count,
+            payload.len(),
+            message.raw_bytes.len(),
+            message.raw_bytes.len() / std::mem::size_of::<i32>(),
+        );
         payload.extend_from_slice(&message.raw_bytes);
     }
     let (layer_start, layer_end) = upstream_layer_range(config, topology, message);

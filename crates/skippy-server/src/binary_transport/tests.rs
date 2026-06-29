@@ -1,8 +1,9 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    initial_message_closes_without_downstream, is_decode_frame_batch_candidate,
-    is_unsupported_trim_memory_error, native_mtp_enabled_from, prepare_binary_stage_connection,
-    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
+    initial_message_closes_without_downstream, input_activation_frame,
+    is_decode_frame_batch_candidate, is_unsupported_trim_memory_error, native_mtp_enabled_from,
+    prepare_binary_stage_connection, restore_prefill_decode_as_decode_message,
+    token_sideband_or_fill,
 };
 use std::{
     io,
@@ -15,8 +16,8 @@ use std::{
 use crate::kv_integration::KvStageIntegration;
 use crate::runtime_state::RuntimeState;
 use skippy_protocol::binary::{
-    StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType,
-    WireMessageKind,
+    ACTIVATION_FLAG_GLM_DSA_TOP_K, StageReplyStats, StageSamplingConfig, StageStateHeader,
+    StageWireMessage, WireActivationDType, WireMessageKind, state_flags,
 };
 use skippy_protocol::{
     LoadMode, PeerConfig, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
@@ -176,6 +177,48 @@ fn restore_prefill_decode_as_decode_preserves_chat_metadata() {
     assert_eq!(decode.chat_sampling_metadata.as_deref(), Some(metadata));
     assert!(decode.activation.is_empty());
     assert!(decode.positions.is_empty());
+}
+
+#[test]
+fn input_activation_frame_reattaches_glm_dsa_top_k_sideband() {
+    let config = prefix_cache_test_config();
+    let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+    state.flags |= state_flags::GLM_DSA_TOP_K_SIDEBAND;
+    state.source_stage_index = 0;
+    let mut raw_bytes = Vec::new();
+    for value in [3_i32, 1, 2, 0] {
+        raw_bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let hidden = vec![0_u8; 16];
+    let mut message = StageWireMessage {
+        kind: WireMessageKind::DecodeEmbd,
+        pos_start: 3,
+        token_count: 1,
+        state,
+        request_id: 11,
+        session_id: 13,
+        sampling: None,
+        chat_sampling_metadata: None,
+        tokens: vec![104],
+        positions: vec![3],
+        activation: hidden.clone(),
+        raw_bytes: raw_bytes.clone(),
+    };
+
+    let frame = input_activation_frame(&config, None, &mut message, 4)
+        .unwrap()
+        .unwrap();
+
+    let mut expected_payload = hidden;
+    expected_payload.extend_from_slice(&raw_bytes);
+    assert_eq!(frame.payload, expected_payload);
+    assert_eq!(
+        frame.desc.flags & ACTIVATION_FLAG_GLM_DSA_TOP_K,
+        ACTIVATION_FLAG_GLM_DSA_TOP_K
+    );
+    assert_eq!(frame.desc.payload_bytes, expected_payload.len() as u64);
+    assert_eq!(frame.desc.token_count, 1);
+    assert_eq!(frame.desc.layer_end, config.layer_start as i32);
 }
 
 #[test]
