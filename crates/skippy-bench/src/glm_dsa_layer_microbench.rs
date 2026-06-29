@@ -108,6 +108,16 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             &positions,
             flags,
         )?)
+    } else if args.compare_metal_sparse_attn_threads_baseline.is_some() {
+        Some(run_metal_sparse_attn_threads_comparison(
+            &args,
+            &selected.absolute_paths,
+            &runtime_config,
+            input_frame,
+            &token_ids,
+            &positions,
+            flags,
+        )?)
     } else {
         None
     };
@@ -396,6 +406,60 @@ fn run_cpu_direct_sparse_comparison(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_metal_sparse_attn_threads_comparison(
+    args: &GlmDsaLayerMicrobenchArgs,
+    selected_paths: &[PathBuf],
+    runtime_config: &RuntimeConfig,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    candidate_flags: MicrobenchFlags,
+) -> Result<MicrobenchComparisonReport> {
+    let baseline_threads = args
+        .compare_metal_sparse_attn_threads_baseline
+        .expect("validated metal sparse-attn thread baseline");
+    let baseline_flags = MicrobenchFlags {
+        direct_sparse_attn: true,
+        direct_sparse_prefill: true,
+        sparse_attn_threads: Some(baseline_threads),
+        ..candidate_flags
+    };
+    let candidate_flags = MicrobenchFlags {
+        direct_sparse_attn: true,
+        direct_sparse_prefill: true,
+        ..candidate_flags
+    };
+    let baseline = run_microbench_case(
+        "metal_sparse_attn_threads_baseline",
+        selected_paths,
+        runtime_config,
+        args,
+        baseline_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+    )?;
+    let candidate = run_microbench_case(
+        "candidate",
+        selected_paths,
+        runtime_config,
+        args,
+        candidate_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+    )?;
+    let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
+    Ok(MicrobenchComparisonReport {
+        baseline: baseline.as_case_summary(),
+        candidate: candidate.as_case_summary(),
+        parity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_microbench_case(
     label: &'static str,
     selected_paths: &[PathBuf],
@@ -480,8 +544,25 @@ fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
     if args.position_start < 0 {
         bail!("position_start must be greater than or equal to zero");
     }
-    if args.compare_dense_fallback && args.compare_cpu_direct_sparse {
-        bail!("compare_dense_fallback and compare_cpu_direct_sparse are mutually exclusive");
+    let comparison_count = usize::from(args.compare_dense_fallback)
+        + usize::from(args.compare_cpu_direct_sparse)
+        + usize::from(args.compare_metal_sparse_attn_threads_baseline.is_some());
+    if comparison_count > 1 {
+        bail!(
+            "compare_dense_fallback, compare_cpu_direct_sparse, and compare_metal_sparse_attn_threads_baseline are mutually exclusive"
+        );
+    }
+    validate_sparse_attn_threads("sparse_attn_threads", args.sparse_attn_threads)?;
+    validate_sparse_attn_threads(
+        "compare_metal_sparse_attn_threads_baseline",
+        args.compare_metal_sparse_attn_threads_baseline,
+    )?;
+    if args.compare_metal_sparse_attn_threads_baseline.is_some()
+        && args.sparse_attn_threads.is_none()
+    {
+        bail!(
+            "compare_metal_sparse_attn_threads_baseline requires sparse_attn_threads for the candidate run"
+        );
     }
     if real_top_k_source_layer_start(args)?.is_some()
         && synthetic_top_k_sideband_config()?.is_some()
@@ -524,6 +605,10 @@ fn configure_env_flags(args: &GlmDsaLayerMicrobenchArgs, flags: MicrobenchFlags)
         flags.metal_topk_moe_route_fusion,
     );
     set_optional_env(
+        "SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS",
+        flags.sparse_attn_threads.map(|threads| threads.to_string()),
+    );
+    set_optional_env(
         "LLAMA_GLM_DSA_INDEXSHARE_FREQ",
         IndexSharePolicy::from_args_and_env(args)
             .freq
@@ -555,6 +640,16 @@ fn set_optional_env(name: &str, value: Option<String>) {
         } else {
             std::env::remove_var(name);
         }
+    }
+}
+
+fn validate_sparse_attn_threads(label: &str, threads: Option<u32>) -> Result<()> {
+    let Some(threads) = threads else {
+        return Ok(());
+    };
+    match threads {
+        32 | 64 | 128 | 256 => Ok(()),
+        _ => bail!("{label} must be one of 32, 64, 128, or 256"),
     }
 }
 
@@ -3237,6 +3332,7 @@ struct MicrobenchFlags {
     op_timing: bool,
     metal_dispatch_log: bool,
     metal_topk_moe_route_fusion: bool,
+    sparse_attn_threads: Option<u32>,
 }
 
 impl MicrobenchFlags {
@@ -3249,6 +3345,7 @@ impl MicrobenchFlags {
             op_timing: args.op_timing,
             metal_dispatch_log: args.metal_dispatch_log,
             metal_topk_moe_route_fusion: args.metal_topk_moe_route_fusion,
+            sparse_attn_threads: args.sparse_attn_threads,
         }
     }
 
@@ -3642,6 +3739,7 @@ mod tests {
             op_timing: true,
             metal_dispatch_log: true,
             metal_topk_moe_route_fusion: false,
+            sparse_attn_threads: None,
         };
 
         assert!(should_run_optimized_dispatch_probe(flags));
@@ -4112,6 +4210,7 @@ mod tests {
             op_timing: true,
             metal_dispatch_log: false,
             metal_topk_moe_route_fusion: false,
+            sparse_attn_threads: None,
             indexshare_freq: None,
             indexshare_pattern: None,
             dense_sparse_mask_max_bytes: None,
@@ -4121,10 +4220,39 @@ mod tests {
             require_real_top_k_shared_consumer_proof: false,
             compare_dense_fallback: false,
             compare_cpu_direct_sparse: false,
+            compare_metal_sparse_attn_threads_baseline: None,
             parity_atol: 1.0e-3,
             parity_rtol: 1.0e-3,
             output: None,
         }
+    }
+
+    #[test]
+    fn validate_args_requires_candidate_threads_for_metal_thread_comparison() {
+        let mut args = test_args();
+        args.compare_metal_sparse_attn_threads_baseline = Some(32);
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains(
+                "compare_metal_sparse_attn_threads_baseline requires sparse_attn_threads"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_unsupported_sparse_attn_thread_width() {
+        let mut args = test_args();
+        args.sparse_attn_threads = Some(96);
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("sparse_attn_threads must be one of 32, 64, 128, or 256"),
+            "{error}"
+        );
     }
 
     fn shared_consumer_execution_contract_for_test() -> ExecutionContractReport {
@@ -4211,6 +4339,7 @@ mod tests {
                 op_timing: false,
                 metal_dispatch_log: true,
                 metal_topk_moe_route_fusion: false,
+                sparse_attn_threads: None,
             },
             n_gpu_layers: -1,
             native_log_path: None,

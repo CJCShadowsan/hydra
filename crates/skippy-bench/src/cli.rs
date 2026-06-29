@@ -247,6 +247,11 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub metal_topk_moe_route_fusion: bool,
     #[arg(
         long,
+        help = "Set SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS for the candidate run. Use with --compare-metal-sparse-attn-threads-baseline to compare Metal sparse-attention thread counts."
+    )]
+    pub sparse_attn_threads: Option<u32>,
+    #[arg(
+        long,
         help = "Set LLAMA_GLM_DSA_INDEXSHARE_FREQ for this microbench run so every Nth GLM-DSA layer recomputes top-k and intervening layers reuse it."
     )]
     pub indexshare_freq: Option<u32>,
@@ -296,6 +301,11 @@ pub struct GlmDsaLayerMicrobenchArgs {
         help = "Run a CPU direct-sparse baseline and compare it with the requested backend settings."
     )]
     pub compare_cpu_direct_sparse: bool,
+    #[arg(
+        long,
+        help = "Run a same-backend Metal direct-sparse baseline with this SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS value and compare it with the candidate run."
+    )]
+    pub compare_metal_sparse_attn_threads_baseline: Option<u32>,
     #[arg(long, default_value_t = 1.0e-3)]
     pub parity_atol: f32,
     #[arg(long, default_value_t = 1.0e-3)]
@@ -969,6 +979,8 @@ mod tests {
         assert!(args.require_optimized_route_fusion);
         assert!(args.compare_dense_fallback);
         assert!(!args.compare_cpu_direct_sparse);
+        assert_eq!(args.sparse_attn_threads, None);
+        assert_eq!(args.compare_metal_sparse_attn_threads_baseline, None);
     }
 
     #[test]
@@ -988,5 +1000,30 @@ mod tests {
 
         assert!(args.compare_cpu_direct_sparse);
         assert!(!args.compare_dense_fallback);
+        assert_eq!(args.compare_metal_sparse_attn_threads_baseline, None);
+    }
+
+    #[test]
+    fn parses_glm_dsa_layer_microbench_metal_thread_comparison() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "glm-dsa-layer-microbench",
+            "--stage-model",
+            "/tmp/glm52-layers",
+            "--sparse-attn-threads",
+            "256",
+            "--compare-metal-sparse-attn-threads-baseline",
+            "32",
+        ])
+        .unwrap();
+
+        let CommandKind::GlmDsaLayerMicrobench(args) = cli.command else {
+            panic!("expected glm-dsa-layer-microbench subcommand");
+        };
+
+        assert_eq!(args.sparse_attn_threads, Some(256));
+        assert_eq!(args.compare_metal_sparse_attn_threads_baseline, Some(32));
+        assert!(!args.compare_dense_fallback);
+        assert!(!args.compare_cpu_direct_sparse);
     }
 }
