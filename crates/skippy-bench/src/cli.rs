@@ -281,6 +281,12 @@ pub struct GlmDsaLayerMicrobenchArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Fail unless the run proves a real GLM-DSA top-k sideband was carried through Skippy stage wire and consumed by a Shared consumer layer."
+    )]
+    pub require_real_top_k_shared_consumer_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Run a dense-mask fallback baseline and compare it with the requested direct sparse settings."
     )]
     pub compare_dense_fallback: bool,

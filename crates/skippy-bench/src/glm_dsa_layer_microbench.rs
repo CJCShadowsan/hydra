@@ -188,6 +188,15 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     } else {
         None
     };
+    let real_top_k_shared_consumer_guard =
+        args.require_real_top_k_shared_consumer_proof.then(|| {
+            build_real_top_k_shared_consumer_guard(
+                &execution_contract,
+                stage_wire_roundtrip
+                    .as_ref()
+                    .map(|roundtrip| &roundtrip.report),
+            )
+        });
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -225,6 +234,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         route_fusion_guard,
         direct_sparse_prefill_guard,
         partial_top_k_guard,
+        real_top_k_shared_consumer_guard,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
@@ -273,6 +283,17 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             guard.checked_case,
             guard.partial_dsa_sparse_attn_dispatches,
             guard.output_frames_with_expected_sideband,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.real_top_k_shared_consumer_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA real top-k Shared-consumer proof failed: proof_kind={:?} sideband_source={:?} stage_wire_roundtrip_passed={:?} failures={}",
+            guard.proof_kind,
+            guard.sideband_source_kind,
+            guard.stage_wire_roundtrip_passed,
             guard.failure_summary,
         );
     }
@@ -395,6 +416,7 @@ fn run_microbench_case(
     let total_runs = args.warmup + args.iterations;
     for run_index in 0..total_runs {
         let mut session = model.create_session().context("create stage session")?;
+        seed_session_position(&mut session, args.position_start)?;
         let started = Instant::now();
         let output = session
             .prefill_chunk_frame_with_positions(token_ids, positions, Some(input), 0)
@@ -720,6 +742,7 @@ fn generate_real_top_k_frame(
     let mut source_session = source_model
         .create_session()
         .context("create GLM-DSA real top-k source session")?;
+    seed_session_position(&mut source_session, args.position_start)?;
     let frame = source_session
         .prefill_chunk_frame_with_positions(token_ids, positions, Some(&source_input), 0)
         .with_context(|| {
@@ -748,6 +771,19 @@ fn generate_real_top_k_frame(
             cache_hit: false,
         },
     })
+}
+
+fn seed_session_position(
+    session: &mut skippy_runtime::StageSession,
+    position_start: i32,
+) -> Result<()> {
+    let token_count = u64::try_from(position_start).context("position_start is negative")?;
+    if token_count > 0 {
+        session
+            .set_position(token_count)
+            .context("seed stage session position")?;
+    }
+    Ok(())
 }
 
 fn real_top_k_source_input(
@@ -905,7 +941,8 @@ fn maybe_stage_wire_roundtrip(
     token_ids: &[i32],
     positions: &[i32],
 ) -> Result<Option<StageWireRoundTrip>> {
-    if !env_flag_enabled(ENV_STAGE_WIRE_ROUNDTRIP) {
+    if !env_flag_enabled(ENV_STAGE_WIRE_ROUNDTRIP) && !args.require_real_top_k_shared_consumer_proof
+    {
         return Ok(None);
     }
     stage_wire_roundtrip(args, frame, token_ids, positions).map(Some)
@@ -1292,9 +1329,11 @@ fn sideband_contract_report(
         consumer_layer_start,
         position_start: args.position_start,
         position_end: position_end(args.position_start, args.tokens)?,
+        token_count: args.tokens,
         hidden_bytes,
         sideband_bytes: sideband.len(),
         sideband_i32_count: values.len(),
+        sideband_i32_per_token: sideband_i32_per_token(values.len(), args.tokens),
         checksum: fnv1a64(sideband),
         min_index: values.iter().copied().min(),
         max_index: values.iter().copied().max(),
@@ -1675,7 +1714,7 @@ fn sideband_source_report(input: &InputSourceReport) -> SidebandSourceReport {
             kind: SidebandSourceKind::RealTopK,
             source_layer_start: Some(*layer_start),
             source_layer_end: Some(*layer_end),
-            top_k_width: Some(sideband.sideband_i32_count),
+            top_k_width: sideband.sideband_i32_per_token,
         },
     }
 }
@@ -1765,6 +1804,13 @@ fn synthetic_top_k_sideband_bytes(tokens: usize, width: usize) -> Result<usize> 
         .checked_mul(width)
         .and_then(|values| values.checked_mul(std::mem::size_of::<i32>()))
         .context("synthetic GLM-DSA top-k sideband size overflow")
+}
+
+fn sideband_i32_per_token(sideband_i32_count: usize, token_count: usize) -> Option<usize> {
+    if token_count == 0 || !sideband_i32_count.is_multiple_of(token_count) {
+        return None;
+    }
+    Some(sideband_i32_count / token_count)
 }
 
 fn append_synthetic_top_k_sideband(
@@ -2579,6 +2625,8 @@ struct MicrobenchReport {
     direct_sparse_prefill_guard: Option<DirectSparsePrefillGuardReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     partial_top_k_guard: Option<PartialTopKGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    real_top_k_shared_consumer_guard: Option<RealTopKSharedConsumerGuardReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2642,6 +2690,24 @@ struct PartialTopKGuardReport {
 }
 
 #[derive(Serialize)]
+struct RealTopKSharedConsumerGuardReport {
+    passed: bool,
+    proof_kind: ExecutionProofKind,
+    policy_role: IndexShareRole,
+    effective_role: IndexShareRole,
+    sideband_source_kind: SidebandSourceKind,
+    sideband_required: bool,
+    sideband_present: bool,
+    sideband_contract_satisfied: bool,
+    native_consumer_execution_proven: bool,
+    stage_wire_roundtrip_present: bool,
+    stage_wire_roundtrip_passed: Option<bool>,
+    stage_wire_sideband_bytes_match: Option<bool>,
+    stage_wire_sideband_checksum_match: Option<bool>,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
 struct ActivationContractReport {
     dtype: String,
     layout: String,
@@ -2669,9 +2735,12 @@ struct SidebandContractReport {
     consumer_layer_start: u32,
     position_start: i32,
     position_end: i32,
+    token_count: usize,
     hidden_bytes: usize,
     sideband_bytes: usize,
     sideband_i32_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sideband_i32_per_token: Option<usize>,
     checksum: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     min_index: Option<i32>,
@@ -3025,6 +3094,72 @@ fn output_sideband_i32_per_token(
     sideband_i32
         .is_multiple_of(token_count)
         .then_some(sideband_i32 / token_count)
+}
+
+fn build_real_top_k_shared_consumer_guard(
+    execution: &ExecutionContractReport,
+    stage_wire_roundtrip: Option<&StageWireRoundTripReport>,
+) -> RealTopKSharedConsumerGuardReport {
+    let stage_wire_roundtrip_passed = stage_wire_roundtrip.map(|report| report.passed);
+    let stage_wire_sideband_bytes_match =
+        stage_wire_roundtrip.map(|report| report.sideband_bytes_match);
+    let stage_wire_sideband_checksum_match =
+        stage_wire_roundtrip.map(|report| report.sideband_checksum_match);
+    let mut failures = Vec::new();
+    if execution.proof_kind != ExecutionProofKind::SharedConsumerWithRealTopK {
+        failures.push("not_shared_consumer_with_real_top_k");
+    }
+    if execution.policy_layer_role.role != IndexShareRole::SharedConsumer {
+        failures.push("policy_not_shared_consumer");
+    }
+    if execution.effective_layer_role.role != IndexShareRole::SharedConsumer {
+        failures.push("effective_role_not_shared_consumer");
+    }
+    if execution.sideband_source.kind != SidebandSourceKind::RealTopK {
+        failures.push("sideband_source_not_real_top_k");
+    }
+    if !execution.sideband_required {
+        failures.push("sideband_not_required");
+    }
+    if !execution.sideband_present {
+        failures.push("sideband_missing");
+    }
+    if !execution.sideband_contract_satisfied {
+        failures.push("sideband_contract_unsatisfied");
+    }
+    if !execution.native_consumer_execution_proven {
+        failures.push("native_consumer_execution_not_proven");
+    }
+    if !matches!(stage_wire_roundtrip_passed, Some(true)) {
+        failures.push("stage_wire_roundtrip_missing_or_failed");
+    }
+    if !matches!(stage_wire_sideband_bytes_match, Some(true)) {
+        failures.push("stage_wire_sideband_bytes_mismatch");
+    }
+    if !matches!(stage_wire_sideband_checksum_match, Some(true)) {
+        failures.push("stage_wire_sideband_checksum_mismatch");
+    }
+    let passed = failures.is_empty();
+    RealTopKSharedConsumerGuardReport {
+        passed,
+        proof_kind: execution.proof_kind,
+        policy_role: execution.policy_layer_role.role,
+        effective_role: execution.effective_layer_role.role,
+        sideband_source_kind: execution.sideband_source.kind,
+        sideband_required: execution.sideband_required,
+        sideband_present: execution.sideband_present,
+        sideband_contract_satisfied: execution.sideband_contract_satisfied,
+        native_consumer_execution_proven: execution.native_consumer_execution_proven,
+        stage_wire_roundtrip_present: stage_wire_roundtrip.is_some(),
+        stage_wire_roundtrip_passed,
+        stage_wire_sideband_bytes_match,
+        stage_wire_sideband_checksum_match,
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
 }
 
 fn summarize_route_fusion_reasons(dispatch: &GlmDsaDispatchSummary) -> String {
@@ -3578,9 +3713,11 @@ mod tests {
         assert_eq!(report.sideband.consumer_layer_start, 30);
         assert_eq!(report.sideband.position_start, 255);
         assert_eq!(report.sideband.position_end, 255);
+        assert_eq!(report.sideband.token_count, 1);
         assert_eq!(report.sideband.hidden_bytes, 16);
         assert_eq!(report.sideband.sideband_bytes, 16);
         assert_eq!(report.sideband.sideband_i32_count, 4);
+        assert_eq!(report.sideband.sideband_i32_per_token, Some(4));
         assert_eq!(report.sideband.min_index, Some(0));
         assert_eq!(report.sideband.max_index, Some(3));
         assert_eq!(report.sideband.unique_index_count, 4);
@@ -3711,6 +3848,43 @@ mod tests {
         assert!(report.sideband_present);
         assert!(report.sideband_contract_satisfied);
         assert!(report.native_consumer_execution_proven);
+    }
+
+    #[test]
+    fn real_top_k_shared_consumer_guard_accepts_stage_wire_proof() {
+        let execution = shared_consumer_execution_contract_for_test();
+        let stage_wire = stage_wire_roundtrip_report_for_test(true);
+
+        let guard = build_real_top_k_shared_consumer_guard(&execution, Some(&stage_wire));
+
+        assert!(guard.passed);
+        assert_eq!(
+            guard.proof_kind,
+            ExecutionProofKind::SharedConsumerWithRealTopK
+        );
+        assert_eq!(guard.policy_role, IndexShareRole::SharedConsumer);
+        assert_eq!(guard.effective_role, IndexShareRole::SharedConsumer);
+        assert_eq!(guard.sideband_source_kind, SidebandSourceKind::RealTopK);
+        assert_eq!(guard.stage_wire_roundtrip_passed, Some(true));
+        assert_eq!(guard.stage_wire_sideband_bytes_match, Some(true));
+        assert_eq!(guard.stage_wire_sideband_checksum_match, Some(true));
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn real_top_k_shared_consumer_guard_requires_stage_wire_proof() {
+        let execution = shared_consumer_execution_contract_for_test();
+
+        let guard = build_real_top_k_shared_consumer_guard(&execution, None);
+
+        assert!(!guard.passed);
+        assert!(guard.native_consumer_execution_proven);
+        assert!(!guard.stage_wire_roundtrip_present);
+        assert!(
+            guard
+                .failure_summary
+                .contains("stage_wire_roundtrip_missing_or_failed")
+        );
     }
 
     #[test]
@@ -3944,11 +4118,71 @@ mod tests {
             require_optimized_route_fusion: false,
             require_direct_sparse_prefill_proof: false,
             require_partial_top_k_proof: false,
+            require_real_top_k_shared_consumer_proof: false,
             compare_dense_fallback: false,
             compare_cpu_direct_sparse: false,
             parity_atol: 1.0e-3,
             parity_rtol: 1.0e-3,
             output: None,
+        }
+    }
+
+    fn shared_consumer_execution_contract_for_test() -> ExecutionContractReport {
+        let mut args = test_args();
+        args.layer_start = 30;
+        args.layer_end = 31;
+        args.position_start = 255;
+        let frame = synthetic_activation_frame_for_layer(
+            &args,
+            args.layer_start,
+            Some(SyntheticTopKSideband { width: 4 }),
+        )
+        .unwrap();
+        let input_contract = activation_contract_report(&args, &frame).unwrap();
+        let sideband = sideband_contract_report(&args, &frame, Some(26), 30, 30).unwrap();
+        let input = InputSourceReport::RealTopK {
+            layer_start: 26,
+            layer_end: 30,
+            output_flags: frame.desc.flags,
+            output_payload_bytes: frame.payload.len(),
+            sideband: Box::new(sideband),
+            cache_path: None,
+            cache_hit: false,
+            selected_parts: Vec::new(),
+            source_start_artifact_role: Some(artifact_role_for_test(26, Some(true))),
+        };
+        let policy = IndexSharePolicy {
+            freq: Some(4),
+            pattern: None,
+        };
+        let artifact_role = artifact_role_for_test(args.layer_start, Some(true));
+        execution_contract_report(&args, &input, &input_contract, &policy, artifact_role)
+    }
+
+    fn stage_wire_roundtrip_report_for_test(passed: bool) -> StageWireRoundTripReport {
+        StageWireRoundTripReport {
+            kind: "DecodeEmbd".to_string(),
+            wire_dtype: "F32".to_string(),
+            state_flags: 1,
+            activation_flag_bits: ACTIVATION_FLAG_GLM_DSA_TOP_K,
+            token_count: 1,
+            position_start: 0,
+            token_sideband_count: 1,
+            position_sideband_count: 1,
+            hidden_activation_bytes: 16,
+            raw_activation_wire_bytes: 16,
+            top_k_sideband_bytes: 16,
+            top_k_sideband_i32_count: 4,
+            estimated_wire_bytes: 32,
+            encoded_wire_bytes: 32,
+            decoded_payload_bytes: 32,
+            decoded_payload_checksum: "payload".to_string(),
+            decoded_sideband_checksum: "sideband".to_string(),
+            payload_bytes_match: passed,
+            flags_match: passed,
+            sideband_bytes_match: passed,
+            sideband_checksum_match: passed,
+            passed,
         }
     }
 
