@@ -122,6 +122,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let metal_dispatch_summary = case.metal_dispatch_summary.clone();
     let op_timing_summary = case.op_timing_summary.clone();
     let routed_moe_timing_summary = case.routed_moe_timing_summary.clone();
+    let input_contract = activation_contract_report(&args, &input.frame)?;
     let profile_integrity = ProfileIntegrityReport::new(
         flags,
         &metal_dispatch_summary,
@@ -155,6 +156,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             .map(package_part_summary)
             .collect(),
         input_payload_bytes: input.frame.payload.len(),
+        input_contract,
         native_log_path: case.native_log_path,
         direct_sparse_decision_summary,
         timing_summary,
@@ -368,6 +370,9 @@ fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
     }
     if args.activation_width == 0 {
         bail!("activation_width must be greater than zero");
+    }
+    if args.position_start < 0 {
+        bail!("position_start must be greater than or equal to zero");
     }
     if args.compare_dense_fallback && args.compare_cpu_direct_sparse {
         bail!("compare_dense_fallback and compare_cpu_direct_sparse are mutually exclusive");
@@ -763,7 +768,13 @@ fn real_top_k_prepared_input(
         layer_end: source_layer_end,
         output_flags: frame.desc.flags,
         output_payload_bytes: frame.payload.len(),
-        sideband_bytes: real_top_k_sideband_bytes(args, &frame)?,
+        sideband: Box::new(sideband_contract_report(
+            args,
+            &frame,
+            Some(source_layer_start),
+            source_layer_end,
+            args.layer_start,
+        )?),
         cache_path,
         cache_hit,
         selected_parts,
@@ -969,18 +980,116 @@ fn validate_real_top_k_frame_for_range(
     Ok(())
 }
 
-fn real_top_k_sideband_bytes(
+fn activation_contract_report(
     args: &GlmDsaLayerMicrobenchArgs,
     frame: &ActivationFrame,
-) -> Result<usize> {
+) -> Result<ActivationContractReport> {
+    Ok(ActivationContractReport {
+        dtype: format!("{:?}", frame.desc.dtype),
+        layout: format!("{:?}", frame.desc.layout),
+        producer_stage_index: frame.desc.producer_stage_index,
+        layer_start: frame.desc.layer_start,
+        layer_end: frame.desc.layer_end,
+        consumer_layer_start: args.layer_start,
+        consumer_layer_end: args.layer_end,
+        token_count: frame.desc.token_count,
+        sequence_count: frame.desc.sequence_count,
+        position_start: args.position_start,
+        position_end: position_end(args.position_start, args.tokens)?,
+        payload_bytes: frame.payload.len(),
+        descriptor_payload_bytes: frame.desc.payload_bytes,
+        flags: frame.desc.flags,
+        sideband: sideband_contract_report(
+            args,
+            frame,
+            u32::try_from(frame.desc.layer_start).ok(),
+            u32::try_from(frame.desc.layer_end).unwrap_or(args.layer_start),
+            args.layer_start,
+        )?,
+    })
+}
+
+fn position_end(position_start: i32, tokens: usize) -> Result<i32> {
+    let last_offset = tokens
+        .checked_sub(1)
+        .context("tokens must be greater than zero")?;
+    let last_offset = i32::try_from(last_offset).context("position offset exceeds i32")?;
+    position_start
+        .checked_add(last_offset)
+        .context("position exceeds i32")
+}
+
+fn sideband_contract_report(
+    args: &GlmDsaLayerMicrobenchArgs,
+    frame: &ActivationFrame,
+    source_layer_start: Option<u32>,
+    source_layer_end: u32,
+    consumer_layer_start: u32,
+) -> Result<SidebandContractReport> {
     let hidden_bytes = hidden_payload_bytes(args)?;
     if frame.payload.len() < hidden_bytes {
         bail!(
-            "real top-k source payload has {} bytes, expected at least {hidden_bytes}",
+            "activation payload has {} bytes, expected at least {hidden_bytes}",
             frame.payload.len()
         );
     }
-    Ok(frame.payload.len() - hidden_bytes)
+    let sideband = &frame.payload[hidden_bytes..];
+    let values = decode_i32_sideband(sideband)?;
+    Ok(SidebandContractReport {
+        present: (frame.desc.flags & ACTIVATION_FLAG_GLM_DSA_TOP_K) != 0,
+        source_layer_start,
+        source_layer_end,
+        consumer_layer_start,
+        position_start: args.position_start,
+        position_end: position_end(args.position_start, args.tokens)?,
+        hidden_bytes,
+        sideband_bytes: sideband.len(),
+        sideband_i32_count: values.len(),
+        checksum: fnv1a64(sideband),
+        min_index: values.iter().copied().min(),
+        max_index: values.iter().copied().max(),
+        unique_index_count: unique_i32_count(&values),
+        sorted_ascending: values.windows(2).all(|pair| pair[0] <= pair[1]),
+        negative_index_count: values.iter().filter(|value| **value < 0).count(),
+        first_indices: values.iter().take(16).copied().collect(),
+        last_indices: last_i32_values(&values, 16),
+    })
+}
+
+fn decode_i32_sideband(sideband: &[u8]) -> Result<Vec<i32>> {
+    if !sideband.len().is_multiple_of(std::mem::size_of::<i32>()) {
+        bail!("GLM-DSA sideband payload is not i32-aligned");
+    }
+    sideband
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|chunk| {
+            let bytes = chunk
+                .try_into()
+                .context("read GLM-DSA sideband i32 value")?;
+            Ok(i32::from_ne_bytes(bytes))
+        })
+        .collect()
+}
+
+fn unique_i32_count(values: &[i32]) -> usize {
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    values.dedup();
+    values.len()
+}
+
+fn last_i32_values(values: &[i32], count: usize) -> Vec<i32> {
+    let start = values.len().saturating_sub(count);
+    values[start..].to_vec()
+}
+
+fn fnv1a64(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn synthetic_activation_frame_for_layer(
@@ -1562,6 +1671,7 @@ struct MicrobenchReport {
     input_source: InputSourceReport,
     selected_parts: Vec<PackagePartSummary>,
     input_payload_bytes: usize,
+    input_contract: ActivationContractReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "DirectSparseDecisionSummary::is_empty")]
@@ -1603,6 +1713,49 @@ struct RouteFusionGuardReport {
     encode_skipped_candidate_records: usize,
     fused_dispatch_records: usize,
     reason_summary: String,
+}
+
+#[derive(Serialize)]
+struct ActivationContractReport {
+    dtype: String,
+    layout: String,
+    producer_stage_index: i32,
+    layer_start: i32,
+    layer_end: i32,
+    consumer_layer_start: u32,
+    consumer_layer_end: u32,
+    token_count: u32,
+    sequence_count: u32,
+    position_start: i32,
+    position_end: i32,
+    payload_bytes: usize,
+    descriptor_payload_bytes: u64,
+    flags: u64,
+    sideband: SidebandContractReport,
+}
+
+#[derive(Clone, Serialize)]
+struct SidebandContractReport {
+    present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_layer_start: Option<u32>,
+    source_layer_end: u32,
+    consumer_layer_start: u32,
+    position_start: i32,
+    position_end: i32,
+    hidden_bytes: usize,
+    sideband_bytes: usize,
+    sideband_i32_count: usize,
+    checksum: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_index: Option<i32>,
+    unique_index_count: usize,
+    sorted_ascending: bool,
+    negative_index_count: usize,
+    first_indices: Vec<i32>,
+    last_indices: Vec<i32>,
 }
 
 fn build_route_fusion_guard(
@@ -1653,7 +1806,7 @@ enum InputSourceReport {
         layer_end: u32,
         output_flags: u64,
         output_payload_bytes: usize,
-        sideband_bytes: usize,
+        sideband: Box<SidebandContractReport>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_path: Option<PathBuf>,
         cache_hit: bool,
@@ -2007,6 +2160,45 @@ mod tests {
         guard_real_top_k_source_size_with_limit(&parts, 100).unwrap();
     }
 
+    #[test]
+    fn sideband_contract_reports_index_stats() {
+        let mut args = test_args();
+        args.tokens = 1;
+        args.position_start = 255;
+        let frame = synthetic_activation_frame_for_layer(
+            &args,
+            args.layer_start,
+            Some(SyntheticTopKSideband { width: 4 }),
+        )
+        .unwrap();
+
+        let report = activation_contract_report(&args, &frame).expect("activation contract report");
+
+        assert!(report.sideband.present);
+        assert_eq!(report.sideband.source_layer_start, Some(29));
+        assert_eq!(report.sideband.source_layer_end, 30);
+        assert_eq!(report.sideband.consumer_layer_start, 30);
+        assert_eq!(report.sideband.position_start, 255);
+        assert_eq!(report.sideband.position_end, 255);
+        assert_eq!(report.sideband.hidden_bytes, 16);
+        assert_eq!(report.sideband.sideband_bytes, 16);
+        assert_eq!(report.sideband.sideband_i32_count, 4);
+        assert_eq!(report.sideband.min_index, Some(0));
+        assert_eq!(report.sideband.max_index, Some(3));
+        assert_eq!(report.sideband.unique_index_count, 4);
+        assert!(report.sideband.sorted_ascending);
+        assert_eq!(report.sideband.negative_index_count, 0);
+        assert_eq!(report.sideband.first_indices, vec![0, 1, 2, 3]);
+        assert_eq!(report.sideband.last_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn positions_reject_overflow() {
+        let error = positions(i32::MAX, 2).unwrap_err().to_string();
+
+        assert!(error.contains("position exceeds i32"));
+    }
+
     fn test_package_part(artifact_bytes: u64) -> PackagePart {
         PackagePart {
             role: "layer".to_string(),
@@ -2014,6 +2206,41 @@ mod tests {
             path: PathBuf::from("layers/layer-000.gguf"),
             sha256: "test".to_string(),
             artifact_bytes,
+        }
+    }
+
+    fn test_args() -> GlmDsaLayerMicrobenchArgs {
+        GlmDsaLayerMicrobenchArgs {
+            stage_model: PathBuf::from("/tmp/glm52-layers"),
+            model_id: "meshllm/GLM-5.2-Q2_K-MTP-Q8-layers".to_string(),
+            layer_start: 30,
+            layer_end: 31,
+            ctx_size: 4096,
+            activation_width: 4,
+            tokens: 1,
+            position_start: 0,
+            iterations: 1,
+            warmup: 0,
+            n_gpu_layers: -1,
+            n_batch: None,
+            n_ubatch: None,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            direct_sparse_attn: true,
+            direct_sparse_prefill: false,
+            fused_sparse_mask: true,
+            parallel_lightning_indexer: true,
+            op_timing: true,
+            metal_dispatch_log: false,
+            metal_topk_moe_route_fusion: false,
+            indexshare_freq: None,
+            indexshare_pattern: None,
+            require_optimized_route_fusion: false,
+            compare_dense_fallback: false,
+            compare_cpu_direct_sparse: false,
+            parity_atol: 1.0e-3,
+            parity_rtol: 1.0e-3,
+            output: None,
         }
     }
 
