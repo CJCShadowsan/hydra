@@ -710,6 +710,12 @@ pub struct LocalSplitBinaryArgs {
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
+    #[arg(
+        long,
+        default_value = "runtime-slice",
+        help = "Stage load mode for --model-path. Use layer-package when --model-path points at a Skippy layer package directory."
+    )]
+    pub stage_load_mode: String,
     #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
     pub model_id: String,
     #[arg(long, default_value_t = 15)]
@@ -936,6 +942,32 @@ mod tests {
         };
 
         assert_eq!(args.split_layer, Some(24));
+    }
+
+    #[test]
+    fn parses_local_split_binary_layer_package_mode() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "local-split-binary",
+            "--model-path",
+            "/tmp/glm52-layers",
+            "--stage-load-mode",
+            "layer-package",
+            "--split-layer",
+            "31",
+            "--layer-end",
+            "32",
+        ])
+        .unwrap();
+
+        let CommandKind::LocalSplitBinary(args) = cli.command else {
+            panic!("expected local-split-binary subcommand");
+        };
+
+        assert_eq!(args.model_path, PathBuf::from("/tmp/glm52-layers"));
+        assert_eq!(args.stage_load_mode, "layer-package");
+        assert_eq!(args.split_layer, 31);
+        assert_eq!(args.layer_end, 32);
     }
 
     #[test]

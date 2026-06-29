@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use model_artifact::ModelIdentity;
 use serde_json::json;
+use skippy_protocol::LoadMode as ProtocolLoadMode;
 use skippy_protocol::binary::{
     StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
     activation_state_flags_from_frame_flags, activation_wire_bytes_with_state_flags, recv_reply,
@@ -79,6 +80,7 @@ pub fn local_split_binary(args: LocalSplitBinaryArgs) -> Result<()> {
     let result = run_binary_split(BinarySplitConfig {
         stage_server_bin: args.stage_server_bin,
         model_path: args.model_path,
+        stage_load_mode: args.stage_load_mode,
         model_id: args.model_id,
         split_layer: args.split_layer,
         layer_end: args.layer_end,
@@ -128,6 +130,7 @@ pub fn local_split_compare(args: LocalSplitCompareArgs) -> Result<()> {
     let split = run_binary_split(BinarySplitConfig {
         stage_server_bin: args.stage_server_bin,
         model_path: args.model_path,
+        stage_load_mode: "runtime-slice".to_string(),
         model_id: args.model_id,
         split_layer: args.split_layer,
         layer_end: args.layer_end,
@@ -277,6 +280,7 @@ fn run_full_model_decode(
 struct BinarySplitConfig {
     stage_server_bin: std::path::PathBuf,
     model_path: std::path::PathBuf,
+    stage_load_mode: String,
     model_id: String,
     split_layer: u32,
     layer_end: u32,
@@ -293,13 +297,16 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     if args.split_layer == 0 || args.split_layer >= args.layer_end {
         bail!("split_layer must be greater than zero and less than layer_end");
     }
-    validate_local_topology_plan(
-        &args.model_path,
-        args.layer_end,
-        &[args.split_layer],
-        2,
-        &args.activation_wire_dtype,
-    )?;
+    let stage_load_mode = parse_stage_load_mode(&args.stage_load_mode)?;
+    if stage_load_mode.protocol == ProtocolLoadMode::RuntimeSlice {
+        validate_local_topology_plan(
+            &args.model_path,
+            args.layer_end,
+            &[args.split_layer],
+            2,
+            &args.activation_wire_dtype,
+        )?;
+    }
     let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
     let model_identity = model_identity_for_path(&args.model_id, Some(&args.model_path))?;
     let stage0_config = RuntimeConfig {
@@ -317,11 +324,11 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,
         flash_attn_type: skippy_runtime::FlashAttentionType::Auto,
-        load_mode: RuntimeLoadMode::RuntimeSlice,
+        load_mode: stage_load_mode.runtime,
         projector_path: None,
-        use_mmap: true,
-        use_mmap_prefetch: true,
-        use_mmap_buffer: true,
+        use_mmap: stage_load_mode.use_mmap,
+        use_mmap_prefetch: stage_load_mode.use_mmap,
+        use_mmap_buffer: stage_load_mode.use_mmap,
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
@@ -358,7 +365,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         "ctx_size": args.ctx_size,
         "n_gpu_layers": args.n_gpu_layers,
         "filter_tensors_on_load": true,
-        "load_mode": "runtime-slice",
+        "load_mode": stage_load_mode.protocol_str,
         "bind_addr": args.stage1_bind_addr,
         "upstream": {
             "stage_id": "stage-0",
@@ -370,6 +377,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     let topology = local_split_topology(
         "local-split-binary",
         &model_identity.model_id,
+        stage_load_mode.protocol_str,
         &[
             LocalSplitTopologyStage {
                 stage_id: "stage-0",
@@ -593,6 +601,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     let topology = local_split_topology(
         "local-split-chain-binary",
         &model_identity.model_id,
+        "runtime-slice",
         &[
             LocalSplitTopologyStage {
                 stage_id: "stage-0",
@@ -724,6 +733,7 @@ struct LocalSplitTopologyStage<'a> {
 fn local_split_topology(
     topology_id: &str,
     model_id: &str,
+    load_mode: &str,
     stages: &[LocalSplitTopologyStage<'_>],
 ) -> serde_json::Value {
     json!({
@@ -737,10 +747,43 @@ fn local_split_topology(
                 "endpoint": stage.endpoint,
                 "layer_start": stage.layer_start,
                 "layer_end": stage.layer_end,
-                "load_mode": "runtime-slice",
+                "load_mode": load_mode,
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+struct ParsedStageLoadMode {
+    runtime: RuntimeLoadMode,
+    protocol: ProtocolLoadMode,
+    protocol_str: &'static str,
+    use_mmap: bool,
+}
+
+fn parse_stage_load_mode(load_mode: &str) -> Result<ParsedStageLoadMode> {
+    match load_mode {
+        "artifact-slice" => Ok(ParsedStageLoadMode {
+            runtime: RuntimeLoadMode::ArtifactSlice,
+            protocol: ProtocolLoadMode::ArtifactSlice,
+            protocol_str: "artifact-slice",
+            use_mmap: true,
+        }),
+        "layer-package" => Ok(ParsedStageLoadMode {
+            runtime: RuntimeLoadMode::LayerPackage,
+            protocol: ProtocolLoadMode::LayerPackage,
+            protocol_str: "layer-package",
+            use_mmap: false,
+        }),
+        "runtime-slice" => Ok(ParsedStageLoadMode {
+            runtime: RuntimeLoadMode::RuntimeSlice,
+            protocol: ProtocolLoadMode::RuntimeSlice,
+            protocol_str: "runtime-slice",
+            use_mmap: true,
+        }),
+        other => bail!(
+            "unsupported --stage-load-mode {other}; expected runtime-slice, artifact-slice, or layer-package"
+        ),
+    }
 }
 
 fn send_generation_config(
@@ -1074,6 +1117,46 @@ mod tests {
     use super::*;
     use skippy_protocol::binary::ACTIVATION_FLAG_GLM_DSA_TOP_K;
     use skippy_runtime::ActivationDesc;
+
+    #[test]
+    fn parses_layer_package_stage_load_mode() {
+        let parsed = parse_stage_load_mode("layer-package").unwrap();
+
+        assert!(matches!(parsed.runtime, RuntimeLoadMode::LayerPackage));
+        assert_eq!(parsed.protocol, ProtocolLoadMode::LayerPackage);
+        assert_eq!(parsed.protocol_str, "layer-package");
+        assert!(!parsed.use_mmap);
+    }
+
+    #[test]
+    fn local_split_topology_uses_selected_load_mode() {
+        let topology = local_split_topology(
+            "test-topology",
+            "meshllm/GLM-5.2-Q2_K-MTP-Q8-layers",
+            "layer-package",
+            &[
+                LocalSplitTopologyStage {
+                    stage_id: "stage-0",
+                    stage_index: 0,
+                    endpoint: "driver".to_string(),
+                    layer_start: 0,
+                    layer_end: 31,
+                },
+                LocalSplitTopologyStage {
+                    stage_id: "stage-1",
+                    stage_index: 1,
+                    endpoint: "tcp://127.0.0.1:18181".to_string(),
+                    layer_start: 31,
+                    layer_end: 32,
+                },
+            ],
+        );
+
+        let stages = topology["stages"].as_array().expect("topology stages");
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0]["load_mode"], "layer-package");
+        assert_eq!(stages[1]["load_mode"], "layer-package");
+    }
 
     #[test]
     fn boundary_width_uses_payload_width_without_glm_sideband() {
