@@ -1150,6 +1150,7 @@ fn handle_binary_connection(
         let mut decode_batch_size = 1usize;
         let mut decode_batch_wait_ms = 0.0;
         let input_activation_bytes = message.activation.len();
+        let input_glm_dsa_top_k_sideband = glm_dsa_top_k_sideband_stats(&message);
         let mut proactive_eviction = None;
         let (predicted_token, predicted_tokens, output, compute_ms) = if restored_prefill {
             let now = now_unix_nanos() as u64;
@@ -1810,6 +1811,7 @@ fn handle_binary_connection(
             upstream_reply_ms,
             message_elapsed_ms,
             input_activation_bytes,
+            input_glm_dsa_top_k_sideband,
             output_activation_bytes: output.payload.len(),
             input_activation_decode_ms,
             forward_activation_encode_ms,
@@ -1947,6 +1949,11 @@ fn handle_binary_connection(
                 "skippy.input_activation_bytes".to_string(),
                 json!(input_activation_bytes),
             );
+            insert_glm_dsa_top_k_sideband_attrs(
+                &mut timing_attrs,
+                "llama_stage.input_glm_dsa_top_k_sideband",
+                input_glm_dsa_top_k_sideband,
+            );
             timing_attrs.insert(
                 "skippy.output_activation_bytes".to_string(),
                 json!(output.payload.len()),
@@ -1985,6 +1992,31 @@ fn insert_optional_unix_nanos(attrs: &mut BTreeMap<String, Value>, key: &str, va
     if let Some(value) = value {
         attrs.insert(key.to_string(), json!(value));
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GlmDsaTopKSidebandStats {
+    bytes: usize,
+    count: usize,
+}
+
+fn glm_dsa_top_k_sideband_stats(message: &StageWireMessage) -> GlmDsaTopKSidebandStats {
+    if (message.state.flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) == 0 {
+        return GlmDsaTopKSidebandStats::default();
+    }
+    GlmDsaTopKSidebandStats {
+        bytes: message.raw_bytes.len(),
+        count: message.raw_bytes.len() / std::mem::size_of::<i32>(),
+    }
+}
+
+fn insert_glm_dsa_top_k_sideband_attrs(
+    attrs: &mut BTreeMap<String, Value>,
+    prefix: &str,
+    stats: GlmDsaTopKSidebandStats,
+) {
+    attrs.insert(format!("{prefix}_bytes"), json!(stats.bytes));
+    attrs.insert(format!("{prefix}_count"), json!(stats.count));
 }
 
 fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -> Vec<i32> {
@@ -3487,6 +3519,10 @@ struct BinaryRequestSummary {
     output_activation_bytes: usize,
     max_input_activation_bytes: usize,
     max_output_activation_bytes: usize,
+    input_glm_dsa_top_k_sideband_bytes: usize,
+    input_glm_dsa_top_k_sideband_count: usize,
+    max_input_glm_dsa_top_k_sideband_bytes: usize,
+    max_input_glm_dsa_top_k_sideband_count: usize,
     kv_tokens_after_max: i64,
     kv_token_layer_cells_max: i64,
     prefill_credit_limit: usize,
@@ -3527,6 +3563,7 @@ struct BinaryMessageObservation<'a> {
     forward_activation_encode_ms: f64,
     runtime_lock_hold_ms: f64,
     input_activation_bytes: usize,
+    input_glm_dsa_top_k_sideband: GlmDsaTopKSidebandStats,
     output_activation_bytes: usize,
     prefill_credit_limit: usize,
     pending_prefill_replies_before: usize,
@@ -3664,12 +3701,24 @@ impl BinaryRequestSummary {
         self.runtime_lock_hold_ms += observation.runtime_lock_hold_ms;
         self.input_activation_bytes += observation.input_activation_bytes;
         self.output_activation_bytes += observation.output_activation_bytes;
+        self.input_glm_dsa_top_k_sideband_bytes = self
+            .input_glm_dsa_top_k_sideband_bytes
+            .saturating_add(observation.input_glm_dsa_top_k_sideband.bytes);
+        self.input_glm_dsa_top_k_sideband_count = self
+            .input_glm_dsa_top_k_sideband_count
+            .saturating_add(observation.input_glm_dsa_top_k_sideband.count);
         self.max_input_activation_bytes = self
             .max_input_activation_bytes
             .max(observation.input_activation_bytes);
         self.max_output_activation_bytes = self
             .max_output_activation_bytes
             .max(observation.output_activation_bytes);
+        self.max_input_glm_dsa_top_k_sideband_bytes = self
+            .max_input_glm_dsa_top_k_sideband_bytes
+            .max(observation.input_glm_dsa_top_k_sideband.bytes);
+        self.max_input_glm_dsa_top_k_sideband_count = self
+            .max_input_glm_dsa_top_k_sideband_count
+            .max(observation.input_glm_dsa_top_k_sideband.count);
 
         let layer_count = i64::from(
             observation
@@ -3795,6 +3844,22 @@ impl BinaryRequestSummary {
         attrs.insert(
             "skippy.max_output_activation_bytes".to_string(),
             json!(self.max_output_activation_bytes),
+        );
+        attrs.insert(
+            "skippy.input_glm_dsa_top_k_sideband_bytes".to_string(),
+            json!(self.input_glm_dsa_top_k_sideband_bytes),
+        );
+        attrs.insert(
+            "skippy.input_glm_dsa_top_k_sideband_count".to_string(),
+            json!(self.input_glm_dsa_top_k_sideband_count),
+        );
+        attrs.insert(
+            "skippy.max_input_glm_dsa_top_k_sideband_bytes".to_string(),
+            json!(self.max_input_glm_dsa_top_k_sideband_bytes),
+        );
+        attrs.insert(
+            "skippy.max_input_glm_dsa_top_k_sideband_count".to_string(),
+            json!(self.max_input_glm_dsa_top_k_sideband_count),
         );
         attrs.insert(
             "skippy.kv_tokens_after".to_string(),

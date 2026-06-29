@@ -102,6 +102,17 @@ bucket. It does not export prompt text, completion text, schemas, tool
 arguments, raw tool names, reserved sentinel names, request paths, endpoints, or
 hostnames.
 
+Skippy staged-runtime telemetry follows the same metrics-only boundary. Stage
+spans may include activation and GLM-DSA top-k sideband byte/count fields such
+as `skippy.input_glm_dsa_top_k_sideband_bytes`,
+`skippy.input_glm_dsa_top_k_sideband_count`,
+`skippy.max_input_glm_dsa_top_k_sideband_bytes`,
+`skippy.max_input_glm_dsa_top_k_sideband_count`,
+`llama_stage.input_glm_dsa_top_k_sideband_bytes`, and
+`llama_stage.input_glm_dsa_top_k_sideband_count`. These are bounded numeric
+shape counters only; raw activation payloads, token IDs, top-k index values, and
+prompt/completion text are not exported.
+
 Guardrail v1 is validated emulation, not hard constrained decoding. Streaming is
 pass-through, no tool execution happens inside the guardrail layer, and real
 tools plus strict structured output stays unsupported in v1. See

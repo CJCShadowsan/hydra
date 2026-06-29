@@ -142,6 +142,25 @@ fn request_summary_tracks_auto_align_totals() {
 }
 
 #[test]
+fn request_summary_tracks_input_glm_dsa_top_k_sideband() {
+    let config = prefix_cache_test_config();
+    let mut summary = super::BinaryRequestSummary::default();
+    let mut message = test_message(WireMessageKind::DecodeEmbd, 1);
+    message.state.flags |= state_flags::GLM_DSA_TOP_K_SIDEBAND;
+    message.raw_bytes = vec![0; 16];
+
+    let mut observation = summary_observation(&config, &message, 7.0);
+    observation.input_glm_dsa_top_k_sideband =
+        super::glm_dsa_top_k_sideband_stats(observation.message);
+    summary.observe(observation);
+
+    assert_eq!(summary.input_glm_dsa_top_k_sideband_bytes, 16);
+    assert_eq!(summary.input_glm_dsa_top_k_sideband_count, 4);
+    assert_eq!(summary.max_input_glm_dsa_top_k_sideband_bytes, 16);
+    assert_eq!(summary.max_input_glm_dsa_top_k_sideband_count, 4);
+}
+
+#[test]
 fn restore_prefill_decode_as_decode_preserves_chat_metadata() {
     let metadata = r#"{"grammar":"chat"}"#;
     let sampling = StageSamplingConfig {
@@ -433,6 +452,7 @@ fn summary_observation<'a>(
         forward_activation_encode_ms: 0.0,
         runtime_lock_hold_ms: 2.5,
         input_activation_bytes: 0,
+        input_glm_dsa_top_k_sideband: super::GlmDsaTopKSidebandStats::default(),
         output_activation_bytes: 0,
         prefill_credit_limit: 0,
         pending_prefill_replies_before: 0,
