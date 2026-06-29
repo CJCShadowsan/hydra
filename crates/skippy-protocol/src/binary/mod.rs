@@ -17,12 +17,12 @@ pub use types::{
     ACTIVATION_FLAG_FINAL_NORMED, ACTIVATION_FLAG_GEMMA3N_ALTUP, ACTIVATION_FLAG_GLM_DSA_TOP_K,
     ACTIVATION_FLAG_RWKV7_V_FIRST, LLAMA_TOKEN_NULL, MAX_STAGE_ACTIVATION_BYTES,
     MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES, MAX_STAGE_DECODED_ACTIVATION_BYTES,
-    MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS, MAX_STAGE_SIDEBAND_VALUES,
-    MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC, STAGE_LOGIT_BIAS_WIRE_BYTES,
-    STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES, STAGE_STATE_VERSION,
-    STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias, StageReply, StageReplySpdTap, StageReplyStats,
-    StageRequestEpoch, StageSamplingConfig, StageStateHeader, StageWireMessage,
-    WireActivationDType, WireMessageKind, WireReplyKind, WireStagePhase,
+    MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS, MAX_STAGE_RAW_SIDEBAND_BYTES,
+    MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC,
+    STAGE_LOGIT_BIAS_WIRE_BYTES, STAGE_SAMPLING_CONFIG_BASE_BYTES, STAGE_STATE_HEADER_BYTES,
+    STAGE_STATE_VERSION, STAGE_WIRE_FIXED_HEADER_BYTES, StageLogitBias, StageReply,
+    StageReplySpdTap, StageReplyStats, StageRequestEpoch, StageSamplingConfig, StageStateHeader,
+    StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind, WireStagePhase,
     activation_frame_flags_from_state_flags, activation_state_flags_from_frame_flags, state_flags,
 };
 
@@ -852,6 +852,52 @@ mod tests {
         assert_eq!(
             decoded.activation_f32_payload(2).unwrap(),
             message.activation
+        );
+    }
+
+    #[test]
+    fn raw_sideband_can_exceed_token_sideband_value_limit() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+        state.source_stage_index = 0;
+        state.flags |= state_flags::GLM_DSA_TOP_K_SIDEBAND;
+        let raw_i32_count = MAX_STAGE_SIDEBAND_VALUES + 1;
+        let message = StageWireMessage {
+            kind: WireMessageKind::DecodeEmbd,
+            pos_start: 0,
+            token_count: 1,
+            state,
+            request_id: 7,
+            session_id: 9,
+            sampling: None,
+            chat_sampling_metadata: None,
+            tokens: vec![42],
+            positions: Vec::new(),
+            activation: 1.0_f32.to_le_bytes().to_vec(),
+            raw_bytes: vec![0_u8; raw_i32_count * std::mem::size_of::<i32>()],
+        };
+        let mut bytes = Vec::new();
+        write_stage_message(&mut bytes, &message, WireActivationDType::F32).unwrap();
+        let decoded = read_stage_message(Cursor::new(bytes), 1).unwrap();
+
+        assert_eq!(decoded.raw_bytes.len(), message.raw_bytes.len());
+    }
+
+    #[test]
+    fn glm_dsa_top_k_sideband_reader_rejects_raw_byte_count_over_limit() {
+        let mut state =
+            StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+        state.source_stage_index = 0;
+        state.flags |= state_flags::GLM_DSA_TOP_K_SIDEBAND;
+        let mut bytes = stage_frame_prefix(WireMessageKind::DecodeEmbd, 0, 0, 0, state);
+        push_i32(
+            &mut bytes,
+            i32::try_from(MAX_STAGE_RAW_SIDEBAND_BYTES / std::mem::size_of::<i32>() + 1).unwrap(),
+        );
+
+        assert_invalid_data(
+            read_stage_message(Cursor::new(bytes), 2),
+            "raw stage sideband count exceeds maximum",
         );
     }
 

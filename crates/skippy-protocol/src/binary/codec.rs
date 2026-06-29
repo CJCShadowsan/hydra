@@ -3,9 +3,10 @@ use std::io::{self, Read, Write};
 use super::{
     MAX_STAGE_ACTIVATION_BYTES, MAX_STAGE_CHAT_SAMPLING_METADATA_BYTES,
     MAX_STAGE_DECODED_ACTIVATION_BYTES, MAX_STAGE_LOGIT_BIAS, MAX_STAGE_PREDICTED_TOKENS,
-    MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES, READY_MAGIC, STAGE_STATE_VERSION,
-    StageLogitBias, StageReply, StageReplySpdTap, StageReplyStats, StageSamplingConfig,
-    StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+    MAX_STAGE_RAW_SIDEBAND_BYTES, MAX_STAGE_SIDEBAND_VALUES, MAX_STAGE_STATE_IMPORT_BYTES,
+    READY_MAGIC, STAGE_STATE_VERSION, StageLogitBias, StageReply, StageReplySpdTap,
+    StageReplyStats, StageSamplingConfig, StageStateHeader, StageWireMessage, WireActivationDType,
+    WireMessageKind, WireReplyKind,
     activation::{
         activation_decoded_f32_bytes_with_state_flags, activation_wire_bytes_with_state_flags,
     },
@@ -243,8 +244,8 @@ pub fn write_stage_message(
         if message.raw_bytes.len() & 3 != 0 {
             return Err(invalid_input("GLM-DSA top-k sideband is not i32-aligned"));
         }
-        if message.raw_bytes.len() > MAX_STAGE_SIDEBAND_VALUES * std::mem::size_of::<i32>() {
-            return Err(invalid_input("GLM-DSA top-k sideband is too large"));
+        if message.raw_bytes.len() > MAX_STAGE_RAW_SIDEBAND_BYTES {
+            return Err(invalid_input("raw stage sideband is too large"));
         }
         write_i32(
             &mut writer,
@@ -379,11 +380,12 @@ pub fn read_stage_message(mut reader: impl Read, n_embd: i32) -> io::Result<Stag
         reader.read_exact(&mut activation)?;
     }
     let raw_bytes = if (state.flags & super::state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0 {
+        let top_k_count_i32 = read_i32(&mut reader)?;
         let top_k_count = checked_i32_len(
-            read_i32(&mut reader)?,
-            MAX_STAGE_SIDEBAND_VALUES,
+            top_k_count_i32,
+            MAX_STAGE_RAW_SIDEBAND_BYTES / std::mem::size_of::<i32>(),
             "negative GLM-DSA top-k sideband count",
-            "GLM-DSA top-k sideband count exceeds maximum",
+            "raw stage sideband count exceeds maximum",
         )?;
         let raw_byte_count = top_k_count
             .checked_mul(std::mem::size_of::<i32>())
