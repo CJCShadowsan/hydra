@@ -1,12 +1,18 @@
 use std::{
     fs::{self, File},
-    io::{BufReader, Read},
+    io::{BufReader, Cursor, Read},
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use skippy_protocol::binary::{
+    StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind,
+    activation_frame_flags_from_state_flags, activation_state_flags_from_frame_flags,
+    encode_f32_activation_payload_with_state_flags, read_stage_message, state_flags,
+    write_stage_message,
+};
 use skippy_runtime::package::{PackagePart, PackageStageRequest, select_layer_package_parts};
 use skippy_runtime::{
     ActivationDesc, ActivationFrame, FlashAttentionType, RuntimeActivationDType,
@@ -37,6 +43,7 @@ const ENV_REAL_TOP_K_CACHE_DIR: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CACHE_DI
 const ENV_REAL_TOP_K_REQUIRE_CACHE: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQUIRE_CACHE";
 const ENV_REAL_TOP_K_CHAIN_SOURCES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES";
 const ENV_REAL_TOP_K_MAX_SOURCE_BYTES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES";
+const ENV_STAGE_WIRE_ROUNDTRIP: &str = "SKIPPY_BENCH_GLM_DSA_STAGE_WIRE_ROUNDTRIP";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
 const DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES: u64 = 110 * 1024 * 1024 * 1024;
 const GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -73,12 +80,18 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     )
     .context("derive GLM-DSA artifact layer role")?;
     let input = prepare_input_activation(&args, &token_ids, &positions, flags)?;
+    let stage_wire_roundtrip =
+        maybe_stage_wire_roundtrip(&args, &input.frame, &token_ids, &positions)
+            .context("round-trip GLM-DSA activation through Skippy stage wire")?;
+    let input_frame = stage_wire_roundtrip
+        .as_ref()
+        .map_or(&input.frame, |roundtrip| &roundtrip.frame);
     let comparison = if args.compare_dense_fallback {
         Some(run_dense_fallback_comparison(
             &args,
             &selected.absolute_paths,
             &runtime_config,
-            &input.frame,
+            input_frame,
             &token_ids,
             &positions,
             flags,
@@ -88,7 +101,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             &args,
             &selected.absolute_paths,
             &runtime_config,
-            &input.frame,
+            input_frame,
             &token_ids,
             &positions,
             flags,
@@ -105,7 +118,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
                 &runtime_config,
                 &args,
                 flags,
-                &input.frame,
+                input_frame,
                 &token_ids,
                 &positions,
                 false,
@@ -144,7 +157,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let metal_dispatch_summary = case.metal_dispatch_summary.clone();
     let op_timing_summary = case.op_timing_summary.clone();
     let routed_moe_timing_summary = case.routed_moe_timing_summary.clone();
-    let input_contract = activation_contract_report(&args, &input.frame)?;
+    let input_contract = activation_contract_report(&args, input_frame)?;
     let execution_contract = execution_contract_report(
         &args,
         &input.report,
@@ -184,8 +197,9 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             .iter()
             .map(package_part_summary)
             .collect(),
-        input_payload_bytes: input.frame.payload.len(),
+        input_payload_bytes: input_frame.payload.len(),
         input_contract,
+        stage_wire_roundtrip: stage_wire_roundtrip.map(|roundtrip| roundtrip.report),
         execution_contract,
         native_log_path: case.native_log_path,
         direct_sparse_decision_summary,
@@ -838,6 +852,139 @@ fn real_top_k_prepared_input(
         source_start_artifact_role: generated.source_start_artifact_role,
     };
     Ok(PreparedInputActivation { frame, report })
+}
+
+fn maybe_stage_wire_roundtrip(
+    args: &GlmDsaLayerMicrobenchArgs,
+    frame: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+) -> Result<Option<StageWireRoundTrip>> {
+    if !env_flag_enabled(ENV_STAGE_WIRE_ROUNDTRIP) {
+        return Ok(None);
+    }
+    stage_wire_roundtrip(args, frame, token_ids, positions).map(Some)
+}
+
+fn stage_wire_roundtrip(
+    args: &GlmDsaLayerMicrobenchArgs,
+    frame: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+) -> Result<StageWireRoundTrip> {
+    let hidden_bytes = hidden_payload_bytes(args)?;
+    if frame.payload.len() < hidden_bytes {
+        bail!(
+            "activation payload has {} bytes, expected at least {hidden_bytes}",
+            frame.payload.len()
+        );
+    }
+    let token_count = i32::try_from(args.tokens).context("tokens exceeds i32")?;
+    let activation_width =
+        i32::try_from(args.activation_width).context("activation_width exceeds i32")?;
+    let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, WireActivationDType::F32);
+    state.prompt_token_count = args.position_start.max(0);
+    state.decode_step = args.tokens.saturating_sub(1).try_into().unwrap_or(i32::MAX);
+    state.current_token = token_ids.last().copied().unwrap_or_default();
+    state.source_stage_index = frame.desc.producer_stage_index.max(0);
+    state.flags |= activation_state_flags_from_frame_flags(frame.desc.flags);
+    let activation = encode_f32_activation_payload_with_state_flags(
+        WireActivationDType::F32,
+        token_count,
+        activation_width,
+        &frame.payload[..hidden_bytes],
+        state.flags & !state_flags::GLM_DSA_TOP_K_SIDEBAND,
+    )
+    .context("encode activation payload for stage wire")?;
+    let raw_bytes = if (state.flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0 {
+        frame.payload[hidden_bytes..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let message = StageWireMessage {
+        kind: WireMessageKind::DecodeEmbd,
+        pos_start: args.position_start,
+        token_count,
+        state,
+        request_id: 1,
+        session_id: 1,
+        sampling: None,
+        chat_sampling_metadata: None,
+        tokens: token_ids.to_vec(),
+        positions: positions.to_vec(),
+        activation,
+        raw_bytes,
+    };
+    let estimated_wire_bytes = message.estimated_wire_bytes();
+    let mut encoded = Vec::with_capacity(estimated_wire_bytes);
+    write_stage_message(&mut encoded, &message, WireActivationDType::F32)
+        .context("encode Skippy stage wire message")?;
+    let mut decoded = read_stage_message(Cursor::new(&encoded), activation_width)
+        .context("decode Skippy stage wire message")?;
+    let mut payload = decoded
+        .take_activation_f32_payload(activation_width)
+        .context("decode stage wire activation payload")?;
+    let decoded_sideband_bytes = if (decoded.state.flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0
+    {
+        if !decoded
+            .raw_bytes
+            .len()
+            .is_multiple_of(std::mem::size_of::<i32>())
+        {
+            bail!("decoded GLM-DSA top-k sideband payload is not i32-aligned");
+        }
+        payload.extend_from_slice(&decoded.raw_bytes);
+        decoded.raw_bytes.len()
+    } else {
+        0
+    };
+    let mut desc = frame.desc;
+    desc.producer_stage_index = decoded.state.source_stage_index;
+    desc.token_count = decoded
+        .token_count
+        .try_into()
+        .context("decoded token_count is negative")?;
+    desc.sequence_count = if decoded.token_count > 0 { 1 } else { 0 };
+    desc.payload_bytes = payload.len() as u64;
+    desc.flags = activation_frame_flags_from_state_flags(decoded.state.flags);
+    let decoded_frame = ActivationFrame { desc, payload };
+    let payload_bytes_match = decoded_frame.payload == frame.payload;
+    let flags_match = decoded_frame.desc.flags == frame.desc.flags;
+    let sideband_bytes_match = decoded_sideband_bytes == message.raw_bytes.len();
+    let sideband_checksum_match = fnv1a64(&decoded.raw_bytes) == fnv1a64(&message.raw_bytes);
+    let passed =
+        payload_bytes_match && flags_match && sideband_bytes_match && sideband_checksum_match;
+    if !passed {
+        bail!("Skippy stage wire round-trip did not preserve GLM-DSA activation payload");
+    }
+    let report = StageWireRoundTripReport {
+        kind: format!("{:?}", message.kind),
+        wire_dtype: format!("{:?}", WireActivationDType::F32),
+        state_flags: decoded.state.flags,
+        activation_flag_bits: decoded_frame.desc.flags,
+        token_count: decoded.token_count,
+        position_start: decoded.pos_start,
+        token_sideband_count: decoded.tokens.len(),
+        position_sideband_count: decoded.positions.len(),
+        hidden_activation_bytes: hidden_bytes,
+        raw_activation_wire_bytes: message.activation.len(),
+        top_k_sideband_bytes: message.raw_bytes.len(),
+        top_k_sideband_i32_count: message.raw_bytes.len() / std::mem::size_of::<i32>(),
+        estimated_wire_bytes,
+        encoded_wire_bytes: encoded.len(),
+        decoded_payload_bytes: decoded_frame.payload.len(),
+        decoded_payload_checksum: fnv1a64(&decoded_frame.payload),
+        decoded_sideband_checksum: fnv1a64(&decoded.raw_bytes),
+        payload_bytes_match,
+        flags_match,
+        sideband_bytes_match,
+        sideband_checksum_match,
+        passed,
+    };
+    Ok(StageWireRoundTrip {
+        frame: decoded_frame,
+        report,
+    })
 }
 
 fn real_top_k_cache_path(
@@ -1613,6 +1760,11 @@ struct GeneratedTopKReport {
     cache_hit: bool,
 }
 
+struct StageWireRoundTrip {
+    frame: ActivationFrame,
+    report: StageWireRoundTripReport,
+}
+
 fn positions(position_start: i32, tokens: usize) -> Result<Vec<i32>> {
     (0..tokens)
         .map(|offset| {
@@ -2073,6 +2225,8 @@ struct MicrobenchReport {
     selected_parts: Vec<PackagePartSummary>,
     input_payload_bytes: usize,
     input_contract: ActivationContractReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_wire_roundtrip: Option<StageWireRoundTripReport>,
     execution_contract: ExecutionContractReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
@@ -2158,6 +2312,32 @@ struct SidebandContractReport {
     negative_index_count: usize,
     first_indices: Vec<i32>,
     last_indices: Vec<i32>,
+}
+
+#[derive(Serialize)]
+struct StageWireRoundTripReport {
+    kind: String,
+    wire_dtype: String,
+    state_flags: i32,
+    activation_flag_bits: u64,
+    token_count: i32,
+    position_start: i32,
+    token_sideband_count: usize,
+    position_sideband_count: usize,
+    hidden_activation_bytes: usize,
+    raw_activation_wire_bytes: usize,
+    top_k_sideband_bytes: usize,
+    top_k_sideband_i32_count: usize,
+    estimated_wire_bytes: usize,
+    encoded_wire_bytes: usize,
+    decoded_payload_bytes: usize,
+    decoded_payload_checksum: String,
+    decoded_sideband_checksum: String,
+    payload_bytes_match: bool,
+    flags_match: bool,
+    sideband_bytes_match: bool,
+    sideband_checksum_match: bool,
+    passed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -2697,6 +2877,35 @@ mod tests {
         assert_eq!(report.sideband.negative_index_count, 0);
         assert_eq!(report.sideband.first_indices, vec![0, 1, 2, 3]);
         assert_eq!(report.sideband.last_indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn stage_wire_roundtrip_preserves_glm_dsa_top_k_sideband() {
+        let mut args = test_args();
+        args.tokens = 1;
+        args.position_start = 255;
+        args.activation_width = 4;
+        let frame = synthetic_activation_frame_for_layer(
+            &args,
+            args.layer_start,
+            Some(SyntheticTopKSideband { width: 4 }),
+        )
+        .unwrap();
+        let token_ids = vec![42];
+        let positions = positions(args.position_start, args.tokens).unwrap();
+
+        let roundtrip = stage_wire_roundtrip(&args, &frame, &token_ids, &positions).unwrap();
+
+        assert_eq!(roundtrip.frame.payload, frame.payload);
+        assert_eq!(roundtrip.frame.desc.flags, frame.desc.flags);
+        assert!(roundtrip.report.passed);
+        assert_eq!(roundtrip.report.hidden_activation_bytes, 16);
+        assert_eq!(roundtrip.report.top_k_sideband_bytes, 16);
+        assert_eq!(roundtrip.report.top_k_sideband_i32_count, 4);
+        assert_eq!(
+            roundtrip.report.state_flags & state_flags::GLM_DSA_TOP_K_SIDEBAND,
+            state_flags::GLM_DSA_TOP_K_SIDEBAND
+        );
     }
 
     #[test]
