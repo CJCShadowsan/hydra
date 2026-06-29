@@ -595,9 +595,7 @@ fn real_top_k_activation_frame(
         generated.frame,
         source_layer_start,
         source_layer_end,
-        generated.selected_parts,
-        generated.cache_path,
-        generated.cache_hit,
+        generated.report,
     )
 }
 
@@ -618,9 +616,12 @@ fn generate_real_top_k_frame(
         validate_real_top_k_frame_for_range(args, &frame, source_layer_start, source_layer_end)?;
         return Ok(GeneratedTopKFrame {
             frame,
-            selected_parts: Vec::new(),
-            cache_path,
-            cache_hit: true,
+            report: GeneratedTopKReport {
+                selected_parts: Vec::new(),
+                source_start_artifact_role: None,
+                cache_path,
+                cache_hit: true,
+            },
         });
     }
     if env_flag_enabled(ENV_REAL_TOP_K_REQUIRE_CACHE) {
@@ -638,13 +639,14 @@ fn generate_real_top_k_frame(
         .context("select GLM-DSA real top-k source layer package parts")?;
     guard_real_top_k_source_size(&source_selected.selected_parts)
         .context("check GLM-DSA real top-k source span size")?;
-    guard_real_top_k_source_start(
-        &source_input,
+    let source_start_artifact_role = artifact_layer_role_report(
         &source_selected.selected_parts,
         &source_selected.absolute_paths,
         source_layer_start,
     )
-    .context("check GLM-DSA real top-k source start")?;
+    .context("derive GLM-DSA real top-k source artifact role")?;
+    guard_real_top_k_source_start(&source_input, &source_start_artifact_role)
+        .context("check GLM-DSA real top-k source start")?;
     let source_config = runtime_config_for_range(args, source_layer_start, source_layer_end)?;
     let source_flags = MicrobenchFlags {
         direct_sparse_attn: false,
@@ -676,13 +678,16 @@ fn generate_real_top_k_frame(
     }
     Ok(GeneratedTopKFrame {
         frame,
-        selected_parts: source_selected
-            .selected_parts
-            .iter()
-            .map(package_part_summary)
-            .collect(),
-        cache_path,
-        cache_hit: false,
+        report: GeneratedTopKReport {
+            selected_parts: source_selected
+                .selected_parts
+                .iter()
+                .map(package_part_summary)
+                .collect(),
+            source_start_artifact_role: Some(source_start_artifact_role),
+            cache_path,
+            cache_hit: false,
+        },
     })
 }
 
@@ -754,18 +759,15 @@ fn guard_real_top_k_source_size(selected_parts: &[PackagePart]) -> Result<()> {
 
 fn guard_real_top_k_source_start(
     source_input: &ActivationFrame,
-    selected_parts: &[PackagePart],
-    absolute_paths: &[PathBuf],
-    source_layer_start: u32,
+    artifact_role: &ArtifactLayerRoleReport,
 ) -> Result<()> {
     if (source_input.desc.flags & ACTIVATION_FLAG_GLM_DSA_TOP_K) != 0 {
         return Ok(());
     }
-    let artifact_role =
-        artifact_layer_role_report(selected_parts, absolute_paths, source_layer_start)?;
     if artifact_role.can_produce_top_k == Some(true) {
         return Ok(());
     }
+    let source_layer_start = artifact_role.layer_index;
     bail!(
         "real top-k source layer {source_layer_start} has no input top-k sideband and cannot produce top-k from artifact role {:?}; choose a producer layer or set {ENV_REAL_TOP_K_CHAIN_SOURCES}",
         artifact_role.role
@@ -816,9 +818,7 @@ fn real_top_k_prepared_input(
     frame: ActivationFrame,
     source_layer_start: u32,
     source_layer_end: u32,
-    selected_parts: Vec<PackagePartSummary>,
-    cache_path: Option<PathBuf>,
-    cache_hit: bool,
+    generated: GeneratedTopKReport,
 ) -> Result<PreparedInputActivation> {
     let report = InputSourceReport::RealTopK {
         layer_start: source_layer_start,
@@ -832,9 +832,10 @@ fn real_top_k_prepared_input(
             source_layer_end,
             args.layer_start,
         )?),
-        cache_path,
-        cache_hit,
-        selected_parts,
+        cache_path: generated.cache_path,
+        cache_hit: generated.cache_hit,
+        selected_parts: generated.selected_parts,
+        source_start_artifact_role: generated.source_start_artifact_role,
     };
     Ok(PreparedInputActivation { frame, report })
 }
@@ -1602,7 +1603,12 @@ struct PreparedInputActivation {
 
 struct GeneratedTopKFrame {
     frame: ActivationFrame,
+    report: GeneratedTopKReport,
+}
+
+struct GeneratedTopKReport {
     selected_parts: Vec<PackagePartSummary>,
+    source_start_artifact_role: Option<ArtifactLayerRoleReport>,
     cache_path: Option<PathBuf>,
     cache_hit: bool,
 }
@@ -2310,6 +2316,8 @@ enum InputSourceReport {
         cache_path: Option<PathBuf>,
         cache_hit: bool,
         selected_parts: Vec<PackagePartSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_start_artifact_role: Option<ArtifactLayerRoleReport>,
     },
 }
 
@@ -2755,6 +2763,7 @@ mod tests {
             cache_path: None,
             cache_hit: false,
             selected_parts: Vec::new(),
+            source_start_artifact_role: Some(artifact_role_for_test(26, Some(true))),
         };
         let policy = IndexSharePolicy {
             freq: Some(4),
@@ -2878,33 +2887,24 @@ mod tests {
 
     #[test]
     fn real_top_k_source_start_rejects_non_indexer_without_sideband_input() {
-        let path = temp_test_file("glm-dsa-source-no-indexer.gguf");
-        fs::write(&path, b"blk.28.attn_q.weight").unwrap();
-        let part = test_layer_package_part(28, 32);
         let source_input = activation_frame_for_test(28, 0);
+        let artifact_role = artifact_role_for_test(28, Some(false));
 
-        let error =
-            guard_real_top_k_source_start(&source_input, &[part], std::slice::from_ref(&path), 28)
-                .unwrap_err()
-                .to_string();
+        let error = guard_real_top_k_source_start(&source_input, &artifact_role)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("real top-k source layer 28"));
         assert!(error.contains("cannot produce top-k"));
         assert!(error.contains("SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES"));
-        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn real_top_k_source_start_allows_non_indexer_with_sideband_input() {
-        let path = temp_test_file("glm-dsa-source-chained-sideband.gguf");
-        fs::write(&path, b"blk.28.attn_q.weight").unwrap();
-        let part = test_layer_package_part(28, 32);
         let source_input = activation_frame_for_test(28, ACTIVATION_FLAG_GLM_DSA_TOP_K);
+        let artifact_role = artifact_role_for_test(28, Some(false));
 
-        guard_real_top_k_source_start(&source_input, &[part], std::slice::from_ref(&path), 28)
-            .unwrap();
-
-        let _ = fs::remove_file(path);
+        guard_real_top_k_source_start(&source_input, &artifact_role).unwrap();
     }
 
     fn artifact_role_for_test(
