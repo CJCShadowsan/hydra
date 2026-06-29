@@ -2,7 +2,7 @@
 
 mod cache;
 mod flavor;
-mod host;
+pub mod host;
 mod load_plan;
 mod manifest;
 mod resolver;

@@ -29,6 +29,19 @@ sha256_file() {
     fi
 }
 
+python_bin() {
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+            "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "Python 3.9 or newer is required to verify native runtimes" >&2
+    exit 1
+}
+
 verify_sidecar_checksum() {
     local archive="$1"
     local sidecar="$archive.sha256"
@@ -83,7 +96,7 @@ verify_artifact_dir() {
         echo "missing manifest: $manifest" >&2
         exit 1
     fi
-    python3 - "$artifact_dir" "$manifest" <<'PY'
+    "$(python_bin)" - "$artifact_dir" "$manifest" <<'PY'
 import hashlib
 import json
 import os
@@ -152,7 +165,7 @@ verify_macos_runtime_paths() {
         echo "otool is required to verify macOS native runtime dylibs" >&2
         exit 1
     fi
-    python3 - "$artifact_dir" "$manifest" <<'PY'
+    "$(python_bin)" - "$artifact_dir" "$manifest" <<'PY'
 import json
 import os
 import subprocess
@@ -194,7 +207,7 @@ PY
 verify_linux_runtime_paths() {
     local artifact_dir="$1"
     local manifest="$2"
-    if ! python3 - "$manifest" <<'PY'
+    if ! "$(python_bin)" - "$manifest" <<'PY'
 import json
 import sys
 
@@ -209,7 +222,7 @@ PY
         echo "readelf is required to verify Linux native runtime shared libraries" >&2
         exit 1
     fi
-    python3 - "$artifact_dir" "$manifest" <<'PY'
+    "$(python_bin)" - "$artifact_dir" "$manifest" <<'PY'
 import json
 import os
 import platform
