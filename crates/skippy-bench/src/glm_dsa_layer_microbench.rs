@@ -179,6 +179,15 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let direct_sparse_prefill_guard = args
         .require_direct_sparse_prefill_proof
         .then(|| build_direct_sparse_prefill_guard(&case));
+    let partial_top_k_guard = if args.require_partial_top_k_proof {
+        Some(build_partial_top_k_guard(
+            &case,
+            hidden_payload_bytes(&args)?,
+            args.tokens,
+        ))
+    } else {
+        None
+    };
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -215,6 +224,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         profile_integrity,
         route_fusion_guard,
         direct_sparse_prefill_guard,
+        partial_top_k_guard,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
@@ -252,6 +262,17 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             guard.sparse_mask_nodes,
             guard.dsa_sparse_attn_nodes,
             guard.capped_large_prefill_dispatches,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.partial_top_k_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA partial top-k proof failed for {}: partial_dispatches={} output_frames_with_expected_sideband={} failures={}",
+            guard.checked_case,
+            guard.partial_dsa_sparse_attn_dispatches,
+            guard.output_frames_with_expected_sideband,
             guard.failure_summary,
         );
     }
@@ -2556,6 +2577,8 @@ struct MicrobenchReport {
     route_fusion_guard: Option<RouteFusionGuardReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     direct_sparse_prefill_guard: Option<DirectSparsePrefillGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial_top_k_guard: Option<PartialTopKGuardReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2598,6 +2621,23 @@ struct DirectSparsePrefillGuardReport {
     dsa_sparse_attn_dispatches: usize,
     capped_large_prefill_dispatches: usize,
     expected_large_prefill_threads_x: u64,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
+struct PartialTopKGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    dsa_sparse_attn_dispatches: usize,
+    partial_dsa_sparse_attn_dispatches: usize,
+    max_kv: Option<u64>,
+    min_partial_top_k: Option<u64>,
+    max_partial_top_k: Option<u64>,
+    output_frames: usize,
+    output_frames_with_sideband: usize,
+    output_frames_with_expected_sideband: usize,
+    expected_sideband_i32_per_token: Option<usize>,
+    max_observed_sideband_i32_per_token: Option<usize>,
     failure_summary: String,
 }
 
@@ -2872,6 +2912,119 @@ fn build_direct_sparse_prefill_guard(
             failures.join(",")
         },
     }
+}
+
+fn build_partial_top_k_guard(
+    candidate: &MicrobenchCaseSummary,
+    hidden_payload_bytes: usize,
+    token_count: usize,
+) -> PartialTopKGuardReport {
+    let dsa_dispatches: Vec<_> = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| record.op == "dsa_sparse_attn")
+        .collect();
+    let partial_dispatches: Vec<_> = dsa_dispatches
+        .iter()
+        .copied()
+        .filter(|record| dispatch_has_partial_top_k(record))
+        .collect();
+    let max_kv = dsa_dispatches.iter().filter_map(|record| record.kv).max();
+    let min_partial_top_k = partial_dispatches
+        .iter()
+        .filter_map(|record| record.top_k)
+        .min();
+    let max_partial_top_k = partial_dispatches
+        .iter()
+        .filter_map(|record| record.top_k)
+        .max();
+    let expected_sideband_i32_per_token =
+        common_partial_top_k_width(&partial_dispatches).and_then(|width| width.try_into().ok());
+    let observed_sideband_widths: Vec<_> = candidate
+        .timings
+        .iter()
+        .filter_map(|timing| {
+            output_sideband_i32_per_token(
+                timing.output_payload_bytes,
+                hidden_payload_bytes,
+                token_count,
+            )
+        })
+        .collect();
+    let output_frames_with_sideband = observed_sideband_widths
+        .iter()
+        .filter(|width| **width > 0)
+        .count();
+    let output_frames_with_expected_sideband =
+        expected_sideband_i32_per_token.map_or(0, |expected| {
+            observed_sideband_widths
+                .iter()
+                .filter(|width| **width == expected)
+                .count()
+        });
+    let max_observed_sideband_i32_per_token = observed_sideband_widths.iter().copied().max();
+
+    let mut failures = Vec::new();
+    if partial_dispatches.is_empty() {
+        failures.push("missing_partial_top_k_dispatch");
+    }
+    if expected_sideband_i32_per_token.is_none() {
+        failures.push("ambiguous_partial_top_k_width");
+    }
+    if output_frames_with_expected_sideband == 0 {
+        failures.push("missing_expected_output_sideband_width");
+    }
+    let passed = failures.is_empty();
+    PartialTopKGuardReport {
+        checked_case: candidate.label,
+        passed,
+        dsa_sparse_attn_dispatches: dsa_dispatches.len(),
+        partial_dsa_sparse_attn_dispatches: partial_dispatches.len(),
+        max_kv,
+        min_partial_top_k,
+        max_partial_top_k,
+        output_frames: candidate.timings.len(),
+        output_frames_with_sideband,
+        output_frames_with_expected_sideband,
+        expected_sideband_i32_per_token,
+        max_observed_sideband_i32_per_token,
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
+}
+
+fn dispatch_has_partial_top_k(record: &MetalDispatchRecord) -> bool {
+    matches!(
+        (record.kv, record.top_k),
+        (Some(kv), Some(top_k)) if top_k > 0 && kv > top_k
+    )
+}
+
+fn common_partial_top_k_width(records: &[&MetalDispatchRecord]) -> Option<u64> {
+    let mut widths = records.iter().filter_map(|record| record.top_k);
+    let first = widths.next()?;
+    widths.all(|width| width == first).then_some(first)
+}
+
+fn output_sideband_i32_per_token(
+    output_payload_bytes: usize,
+    hidden_payload_bytes: usize,
+    token_count: usize,
+) -> Option<usize> {
+    if token_count == 0 || output_payload_bytes < hidden_payload_bytes {
+        return None;
+    }
+    let sideband_bytes = output_payload_bytes - hidden_payload_bytes;
+    if !sideband_bytes.is_multiple_of(std::mem::size_of::<i32>()) {
+        return None;
+    }
+    let sideband_i32 = sideband_bytes / std::mem::size_of::<i32>();
+    sideband_i32
+        .is_multiple_of(token_count)
+        .then_some(sideband_i32 / token_count)
 }
 
 fn summarize_route_fusion_reasons(dispatch: &GlmDsaDispatchSummary) -> String {
@@ -3235,6 +3388,59 @@ mod tests {
             guard
                 .failure_summary
                 .contains("missing_capped_large_prefill_dispatch")
+        );
+    }
+
+    #[test]
+    fn partial_top_k_guard_accepts_kv_larger_than_sideband_width() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate
+            .metal_dispatch_records
+            .push(dsa_sparse_attn_dispatch_with_kv(2304, 2304, 2048, 32));
+        candidate.timings.push(IterationTiming {
+            iteration: 0,
+            elapsed_ms: 1.0,
+            output_payload_bytes: 16 + 2 * 2048 * std::mem::size_of::<i32>(),
+            output_flags: ACTIVATION_FLAG_GLM_DSA_TOP_K,
+        });
+
+        let guard = build_partial_top_k_guard(&candidate, 16, 2);
+
+        assert!(guard.passed);
+        assert_eq!(guard.partial_dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.max_kv, Some(2304));
+        assert_eq!(guard.expected_sideband_i32_per_token, Some(2048));
+        assert_eq!(guard.output_frames_with_expected_sideband, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn partial_top_k_guard_rejects_degenerate_or_missing_sideband() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate
+            .metal_dispatch_records
+            .push(dsa_sparse_attn_dispatch_with_kv(2048, 2048, 2048, 32));
+        candidate.timings.push(IterationTiming {
+            iteration: 0,
+            elapsed_ms: 1.0,
+            output_payload_bytes: 16,
+            output_flags: 0,
+        });
+
+        let guard = build_partial_top_k_guard(&candidate, 16, 2);
+
+        assert!(!guard.passed);
+        assert_eq!(guard.partial_dsa_sparse_attn_dispatches, 0);
+        assert_eq!(guard.output_frames_with_expected_sideband, 0);
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_partial_top_k_dispatch")
+        );
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_expected_output_sideband_width")
         );
     }
 
@@ -3737,6 +3943,7 @@ mod tests {
             dense_sparse_mask_max_bytes: None,
             require_optimized_route_fusion: false,
             require_direct_sparse_prefill_proof: false,
+            require_partial_top_k_proof: false,
             compare_dense_fallback: false,
             compare_cpu_direct_sparse: false,
             parity_atol: 1.0e-3,
@@ -3829,6 +4036,15 @@ mod tests {
     }
 
     fn dsa_sparse_attn_dispatch(batch: u64, top_k: u64, threads_x: u64) -> MetalDispatchRecord {
+        dsa_sparse_attn_dispatch_with_kv(batch, 256, top_k, threads_x)
+    }
+
+    fn dsa_sparse_attn_dispatch_with_kv(
+        batch: u64,
+        kv: u64,
+        top_k: u64,
+        threads_x: u64,
+    ) -> MetalDispatchRecord {
         MetalDispatchRecord {
             op: "dsa_sparse_attn".to_string(),
             kernel: Some("default".to_string()),
@@ -3847,7 +4063,7 @@ mod tests {
             batch: Some(batch),
             heads: Some(64),
             stream: Some(1),
-            kv: Some(256),
+            kv: Some(kv),
             top_k: Some(top_k),
             top_stream: Some(1),
             grid_x: 64,

@@ -275,6 +275,12 @@ pub struct GlmDsaLayerMicrobenchArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Fail unless the run proves GLM-DSA direct sparse attention executed a partial top-k shape where visible KV is larger than the top-k sideband width."
+    )]
+    pub require_partial_top_k_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Run a dense-mask fallback baseline and compare it with the requested direct sparse settings."
     )]
     pub compare_dense_fallback: bool,
