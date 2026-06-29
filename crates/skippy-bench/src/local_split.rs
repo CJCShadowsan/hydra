@@ -7,10 +7,14 @@ use anyhow::{Context, Result, bail};
 use model_artifact::ModelIdentity;
 use serde_json::json;
 use skippy_protocol::binary::{
-    StageStateHeader, StageWireMessage, WireMessageKind, WireReplyKind, recv_reply,
-    write_stage_message,
+    StageStateHeader, StageWireMessage, WireActivationDType, WireMessageKind, WireReplyKind,
+    activation_state_flags_from_frame_flags, activation_wire_bytes_with_state_flags, recv_reply,
+    state_flags, write_stage_message,
 };
-use skippy_runtime::{RuntimeConfig, RuntimeLoadMode, StageModel};
+use skippy_runtime::{
+    ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout, RuntimeConfig,
+    RuntimeLoadMode, StageModel,
+};
 use skippy_topology::{
     BoundaryDecision, NodeSpec, PlannerPolicy, TopologyPlanRequest, WireValidation,
     dense_attention_layers, infer_family_capability, plan_contiguous_with_splits,
@@ -40,6 +44,9 @@ struct BinarySplitResult {
     boundary_token_count: u32,
     boundary_payload_bytes: u64,
     boundary_wire_payload_bytes: usize,
+    boundary_wire_sideband_bytes: usize,
+    boundary_wire_sideband_i32_count: usize,
+    boundary_wire_message_bytes: usize,
 }
 
 struct BinaryChainResult {
@@ -49,6 +56,9 @@ struct BinaryChainResult {
     activation_width: i32,
     wire_dtype: String,
     stage0_wire_payload_bytes: usize,
+    stage0_wire_sideband_bytes: usize,
+    stage0_wire_sideband_i32_count: usize,
+    stage0_wire_message_bytes: usize,
     stage0_payload_bytes: u64,
     split_layer_1: u32,
     split_layer_2: u32,
@@ -97,6 +107,9 @@ pub fn local_split_binary(args: LocalSplitBinaryArgs) -> Result<()> {
                 "token_count": result.boundary_token_count,
                 "payload_bytes": result.boundary_payload_bytes,
                 "wire_payload_bytes": result.boundary_wire_payload_bytes,
+                "wire_sideband_bytes": result.boundary_wire_sideband_bytes,
+                "wire_sideband_i32_count": result.boundary_wire_sideband_i32_count,
+                "wire_message_bytes": result.boundary_wire_message_bytes,
             }
         }))?
     );
@@ -148,6 +161,9 @@ pub fn local_split_compare(args: LocalSplitCompareArgs) -> Result<()> {
                 "token_count": split.boundary_token_count,
                 "payload_bytes": split.boundary_payload_bytes,
                 "wire_payload_bytes": split.boundary_wire_payload_bytes,
+                "wire_sideband_bytes": split.boundary_wire_sideband_bytes,
+                "wire_sideband_i32_count": split.boundary_wire_sideband_i32_count,
+                "wire_message_bytes": split.boundary_wire_message_bytes,
             }
         }
     });
@@ -182,6 +198,9 @@ pub fn local_split_chain_binary(args: LocalSplitChainBinaryArgs) -> Result<()> {
                     "layer_end": result.split_layer_1,
                     "payload_bytes": result.stage0_payload_bytes,
                     "wire_payload_bytes": result.stage0_wire_payload_bytes,
+                    "wire_sideband_bytes": result.stage0_wire_sideband_bytes,
+                    "wire_sideband_i32_count": result.stage0_wire_sideband_i32_count,
+                    "wire_message_bytes": result.stage0_wire_message_bytes,
                 },
                 {
                     "stage_index": 1,
@@ -322,7 +341,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     if boundary.payload.is_empty() {
         bail!("stage 0 produced an empty activation frame");
     }
-    let activation_width = activation_width(&boundary)?;
+    let activation_width = boundary_activation_width(&boundary, &[0])?;
 
     let run_id = generate_run_id();
     let config_path = temp_config_path_for(&run_id, "stage-1");
@@ -409,16 +428,12 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     state.decode_step = 0;
     state.current_token = token_id;
     state.source_stage_index = 0;
-    state.flags |=
-        skippy_protocol::binary::activation_state_flags_from_frame_flags(boundary.desc.flags);
-    let activation = skippy_protocol::binary::encode_f32_activation_payload_with_state_flags(
-        wire_dtype,
-        1,
-        activation_width,
-        &boundary.payload,
-        state.flags,
-    )
-    .context("failed to encode boundary activation for wire")?;
+    state.flags |= activation_state_flags_from_frame_flags(boundary.desc.flags);
+    let wire_payload =
+        encode_boundary_wire_payload(&boundary, wire_dtype, 1, activation_width, state.flags)
+            .context("failed to encode boundary activation for wire")?;
+    let boundary_wire_sideband_bytes = wire_payload.glm_dsa_top_k_sideband_bytes;
+    let boundary_wire_sideband_i32_count = wire_payload.glm_dsa_top_k_sideband_i32_count;
     let message = StageWireMessage {
         kind: WireMessageKind::DecodeEmbd,
         pos_start: 0,
@@ -430,9 +445,10 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         chat_sampling_metadata: None,
         tokens: vec![token_id],
         positions: vec![0],
-        activation,
-        raw_bytes: Vec::new(),
+        activation: wire_payload.activation,
+        raw_bytes: wire_payload.raw_bytes,
     };
+    let boundary_wire_message_bytes = message.estimated_wire_bytes();
     write_stage_message(&mut stream, &message, wire_dtype).context("send binary decode")?;
     let reply = recv_reply(&mut stream).context("receive binary split prediction reply")?;
     ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
@@ -451,6 +467,9 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         boundary_token_count: boundary.desc.token_count,
         boundary_payload_bytes: boundary.desc.payload_bytes,
         boundary_wire_payload_bytes: message.activation.len(),
+        boundary_wire_sideband_bytes,
+        boundary_wire_sideband_i32_count,
+        boundary_wire_message_bytes,
     })
 }
 
@@ -509,7 +528,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     if boundary.payload.is_empty() {
         bail!("stage 0 produced an empty activation frame");
     }
-    let activation_width = activation_width(&boundary)?;
+    let activation_width = boundary_activation_width(&boundary, &[0])?;
 
     let run_id = generate_run_id();
     let stage1_config_path = temp_config_path_for(&run_id, "stage-1");
@@ -650,16 +669,12 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     state.decode_step = 0;
     state.current_token = token_id;
     state.source_stage_index = 0;
-    state.flags |=
-        skippy_protocol::binary::activation_state_flags_from_frame_flags(boundary.desc.flags);
-    let activation = skippy_protocol::binary::encode_f32_activation_payload_with_state_flags(
-        wire_dtype,
-        1,
-        activation_width,
-        &boundary.payload,
-        state.flags,
-    )
-    .context("failed to encode boundary activation for wire")?;
+    state.flags |= activation_state_flags_from_frame_flags(boundary.desc.flags);
+    let wire_payload =
+        encode_boundary_wire_payload(&boundary, wire_dtype, 1, activation_width, state.flags)
+            .context("failed to encode boundary activation for wire")?;
+    let stage0_wire_sideband_bytes = wire_payload.glm_dsa_top_k_sideband_bytes;
+    let stage0_wire_sideband_i32_count = wire_payload.glm_dsa_top_k_sideband_i32_count;
     let message = StageWireMessage {
         kind: WireMessageKind::DecodeEmbd,
         pos_start: 0,
@@ -671,9 +686,10 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         chat_sampling_metadata: None,
         tokens: vec![token_id],
         positions: vec![0],
-        activation,
-        raw_bytes: Vec::new(),
+        activation: wire_payload.activation,
+        raw_bytes: wire_payload.raw_bytes,
     };
+    let stage0_wire_message_bytes = message.estimated_wire_bytes();
     write_stage_message(&mut stream, &message, wire_dtype).context("send binary chain decode")?;
     let reply = recv_reply(&mut stream).context("receive binary chain prediction reply")?;
     ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
@@ -687,6 +703,9 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         activation_width,
         wire_dtype: args.activation_wire_dtype,
         stage0_wire_payload_bytes: message.activation.len(),
+        stage0_wire_sideband_bytes,
+        stage0_wire_sideband_i32_count,
+        stage0_wire_message_bytes,
         stage0_payload_bytes: boundary.desc.payload_bytes,
         split_layer_1: args.split_layer_1,
         split_layer_2: args.split_layer_2,
@@ -745,6 +764,122 @@ fn send_generation_config(
         bail!("expected configure-generation ACK, got {:?}", reply.kind);
     }
     Ok(())
+}
+
+struct BoundaryWirePayload {
+    activation: Vec<u8>,
+    raw_bytes: Vec<u8>,
+    glm_dsa_top_k_sideband_bytes: usize,
+    glm_dsa_top_k_sideband_i32_count: usize,
+}
+
+fn boundary_activation_width(frame: &ActivationFrame, positions: &[i32]) -> Result<i32> {
+    let state_flags = activation_state_flags_from_frame_flags(frame.desc.flags);
+    if (state_flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) == 0 {
+        return activation_width(frame);
+    }
+    if frame.desc.dtype != RuntimeActivationDType::F32
+        || frame.desc.layout != RuntimeActivationLayout::TokenMajor
+    {
+        bail!(
+            "GLM-DSA sideband boundary width inference requires F32 token-major activations, got {:?}/{:?}",
+            frame.desc.dtype,
+            frame.desc.layout
+        );
+    }
+    let sideband_i32 = glm_dsa_decode_sideband_i32_count(positions)?;
+    let sideband_bytes = sideband_i32
+        .checked_mul(std::mem::size_of::<i32>())
+        .context("GLM-DSA sideband byte count overflow")?;
+    let hidden_bytes = frame
+        .payload
+        .len()
+        .checked_sub(sideband_bytes)
+        .context("GLM-DSA sideband estimate exceeds activation payload")?;
+    activation_width_from_hidden_bytes(hidden_bytes, frame.desc.token_count)
+}
+
+fn encode_boundary_wire_payload(
+    frame: &ActivationFrame,
+    wire_dtype: WireActivationDType,
+    token_count: i32,
+    activation_width: i32,
+    state_flags: i32,
+) -> Result<BoundaryWirePayload> {
+    let hidden_bytes = activation_wire_bytes_with_state_flags(
+        WireActivationDType::F32,
+        token_count,
+        activation_width,
+        state_flags & !state_flags::GLM_DSA_TOP_K_SIDEBAND,
+    )
+    .context("calculate hidden activation payload bytes")?;
+    if frame.payload.len() < hidden_bytes {
+        bail!(
+            "boundary activation payload has {} bytes, expected at least {hidden_bytes}",
+            frame.payload.len()
+        );
+    }
+    let has_glm_dsa_sideband = (state_flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) != 0;
+    if !has_glm_dsa_sideband && frame.payload.len() != hidden_bytes {
+        bail!(
+            "boundary activation payload has {} bytes, expected {hidden_bytes}",
+            frame.payload.len()
+        );
+    }
+    let sideband_bytes = if has_glm_dsa_sideband {
+        frame.payload.len() - hidden_bytes
+    } else {
+        0
+    };
+    if !sideband_bytes.is_multiple_of(std::mem::size_of::<i32>()) {
+        bail!("GLM-DSA top-k sideband payload is not i32-aligned");
+    }
+    let activation = skippy_protocol::binary::encode_f32_activation_payload_with_state_flags(
+        wire_dtype,
+        token_count,
+        activation_width,
+        &frame.payload[..hidden_bytes],
+        state_flags & !state_flags::GLM_DSA_TOP_K_SIDEBAND,
+    )
+    .context("encode hidden activation payload")?;
+    Ok(BoundaryWirePayload {
+        activation,
+        raw_bytes: frame.payload[hidden_bytes..].to_vec(),
+        glm_dsa_top_k_sideband_bytes: sideband_bytes,
+        glm_dsa_top_k_sideband_i32_count: sideband_bytes / std::mem::size_of::<i32>(),
+    })
+}
+
+fn activation_width_from_hidden_bytes(hidden_bytes: usize, token_count: u32) -> Result<i32> {
+    if token_count == 0 {
+        bail!("activation frame token_count is zero");
+    }
+    let token_count = usize::try_from(token_count).context("token_count exceeds usize")?;
+    if !hidden_bytes.is_multiple_of(token_count) {
+        bail!(
+            "hidden activation bytes {hidden_bytes} are not divisible by token_count {token_count}"
+        );
+    }
+    let hidden_bytes_per_token = hidden_bytes / token_count;
+    if !hidden_bytes_per_token.is_multiple_of(std::mem::size_of::<f32>()) {
+        bail!("hidden activation bytes are not F32 aligned");
+    }
+    i32::try_from(hidden_bytes_per_token / std::mem::size_of::<f32>())
+        .context("activation width exceeds i32")
+}
+
+fn glm_dsa_decode_sideband_i32_count(positions: &[i32]) -> Result<usize> {
+    positions.iter().try_fold(0_usize, |sum, position| {
+        let visible = if *position < 0 {
+            0
+        } else {
+            usize::try_from(*position)
+                .context("position exceeds usize")?
+                .saturating_add(1)
+        };
+        sum.checked_add(visible)
+            .context("GLM-DSA sideband i32 count overflow")
+    })
 }
 
 fn validate_local_topology_plan(
@@ -932,4 +1067,73 @@ pub fn local_split_inprocess(args: LocalSplitInprocessArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skippy_protocol::binary::ACTIVATION_FLAG_GLM_DSA_TOP_K;
+    use skippy_runtime::ActivationDesc;
+
+    #[test]
+    fn boundary_width_uses_payload_width_without_glm_sideband() {
+        let frame = activation_frame(vec![0_u8; 16], 0, 1);
+
+        let width = boundary_activation_width(&frame, &[0]).unwrap();
+
+        assert_eq!(width, 4);
+    }
+
+    #[test]
+    fn boundary_width_subtracts_glm_dsa_visible_sideband() {
+        let frame = activation_frame(vec![0_u8; 32], ACTIVATION_FLAG_GLM_DSA_TOP_K, 1);
+
+        let width = boundary_activation_width(&frame, &[3]).unwrap();
+
+        assert_eq!(width, 4);
+    }
+
+    #[test]
+    fn boundary_wire_payload_splits_glm_dsa_sideband() {
+        let mut payload = vec![0_u8; 16];
+        for value in [0_i32, 1, 2, 3] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        let frame = activation_frame(payload, ACTIVATION_FLAG_GLM_DSA_TOP_K, 1);
+        let state_flags = activation_state_flags_from_frame_flags(frame.desc.flags);
+
+        let wire =
+            encode_boundary_wire_payload(&frame, WireActivationDType::F32, 1, 4, state_flags)
+                .unwrap();
+
+        assert_eq!(wire.activation.len(), 16);
+        assert_eq!(wire.raw_bytes.len(), 16);
+        assert_eq!(wire.glm_dsa_top_k_sideband_bytes, 16);
+        assert_eq!(wire.glm_dsa_top_k_sideband_i32_count, 4);
+    }
+
+    #[test]
+    fn glm_dsa_decode_sideband_count_follows_visible_positions() {
+        let count = glm_dsa_decode_sideband_i32_count(&[0, 3, 7]).unwrap();
+
+        assert_eq!(count, 13);
+    }
+
+    fn activation_frame(payload: Vec<u8>, flags: u64, token_count: u32) -> ActivationFrame {
+        ActivationFrame {
+            desc: ActivationDesc {
+                version: 1,
+                dtype: RuntimeActivationDType::F32,
+                layout: RuntimeActivationLayout::TokenMajor,
+                producer_stage_index: 0,
+                layer_start: 0,
+                layer_end: 1,
+                token_count,
+                sequence_count: 1,
+                payload_bytes: payload.len() as u64,
+                flags,
+            },
+            payload,
+        }
+    }
 }
