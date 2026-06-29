@@ -35,8 +35,9 @@ use skippy_protocol::{
     },
 };
 use skippy_runtime::{
-    ActivationDesc, ActivationFrame, LogitBias, MAX_LOGIT_BIAS, NativeMtpDraft,
-    RuntimeActivationDType, RuntimeActivationLayout, SamplingConfig,
+    ActivationDesc, ActivationFrame, LogitBias, MAX_LOGIT_BIAS, NativeLogEvent, NativeMtpDraft,
+    RuntimeActivationDType, RuntimeActivationLayout, SamplingConfig, register_filtered_native_logs,
+    set_filtered_native_logs_enabled, unregister_filtered_native_logs,
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -297,6 +298,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         telemetry_level,
     );
     telemetry.emit("stage.binary_server_start", lifecycle_attrs(&config));
+    let _native_log_forwarder = NativeLogTelemetryForwarder::start(&telemetry);
     let warm_downstream = Arc::new(Mutex::new(None));
     let warm_preconnect = warm_downstream_preconnect_enabled();
     if warm_preconnect {
@@ -2051,6 +2053,84 @@ fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -
 fn native_mtp_enabled() -> bool {
     native_mtp_enabled_from(env::var(NATIVE_MTP_ENABLED_ENV).ok().as_deref())
 }
+
+struct NativeLogTelemetryForwarder {
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl NativeLogTelemetryForwarder {
+    fn start(telemetry: &Telemetry) -> Option<Self> {
+        if !telemetry.is_debug_enabled() {
+            return None;
+        }
+        let mut rx = register_filtered_native_logs();
+        set_filtered_native_logs_enabled(true);
+        let telemetry = telemetry.clone();
+        let handle = thread::spawn(move || {
+            while let Some(event) = rx.blocking_recv() {
+                emit_glm_dsa_direct_sparse_decision_event(&telemetry, event);
+            }
+        });
+        Some(Self {
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for NativeLogTelemetryForwarder {
+    fn drop(&mut self) {
+        set_filtered_native_logs_enabled(false);
+        unregister_filtered_native_logs();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn emit_glm_dsa_direct_sparse_decision_event(telemetry: &Telemetry, event: NativeLogEvent) {
+    let Some(attrs) = glm_dsa_direct_sparse_decision_attrs(event) else {
+        return;
+    };
+    telemetry.emit_debug("stage.glm_dsa_direct_sparse_decision", attrs);
+}
+
+fn glm_dsa_direct_sparse_decision_attrs(event: NativeLogEvent) -> Option<BTreeMap<String, Value>> {
+    if event.category != "glm_dsa_direct_sparse_decision" {
+        return None;
+    }
+    let mut attrs = BTreeMap::new();
+    attrs.insert(
+        "llama_stage.native_log.category".to_string(),
+        json!(event.category),
+    );
+    for (key, value) in event.params {
+        if GLM_DSA_DIRECT_SPARSE_DECISION_PARAM_ALLOWLIST.contains(&key.as_str()) {
+            attrs.insert(format!("llama_stage.glm_dsa_direct_sparse.{key}"), value);
+        }
+    }
+    Some(attrs)
+}
+
+const GLM_DSA_DIRECT_SPARSE_DECISION_PARAM_ALLOWLIST: &[&str] = &[
+    "layer",
+    "ubatch_tokens",
+    "sparse_batch",
+    "sparse_streams",
+    "prefill_cap",
+    "dense_mask_bytes",
+    "dense_mask_limit",
+    "direct_enabled",
+    "prefill_enabled",
+    "decode_shape",
+    "prefill_shape",
+    "large_prefill_shape",
+    "token_shape_allowed",
+    "kq_b_ok",
+    "sinks_ok",
+    "alibi_ok",
+    "soft_cap_ok",
+    "use_direct",
+];
 
 fn binary_auto_align_session_enabled() -> bool {
     truthy_env(env::var(AUTO_ALIGN_SESSION_ENV).ok().as_deref())

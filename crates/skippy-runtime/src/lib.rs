@@ -513,6 +513,14 @@ fn should_suppress_native_log_line(line: &str) -> bool {
 }
 
 fn summarize_native_log_line(line: &str) -> Option<NativeLogEvent> {
+    if let Some(params) = glm_dsa_direct_sparse_decision_params(line) {
+        return Some(NativeLogEvent {
+            message: line.to_string(),
+            category: "glm_dsa_direct_sparse_decision",
+            params,
+        });
+    }
+
     if let Some((category, params)) = cpu_offload_diagnostic_params(line) {
         return Some(NativeLogEvent {
             message: line.to_string(),
@@ -594,6 +602,18 @@ fn summarize_native_log_line(line: &str) -> Option<NativeLogEvent> {
     }
 
     None
+}
+
+fn glm_dsa_direct_sparse_decision_params(line: &str) -> Option<Vec<(String, Value)>> {
+    let rest = line.strip_prefix("skippy: glm_dsa_direct_sparse_decision ")?;
+    let mut params = Vec::new();
+    for part in rest.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        params.push((key.to_string(), json_value_from_text(value)));
+    }
+    Some(params)
 }
 
 fn cpu_offload_diagnostic_params(line: &str) -> Option<(&'static str, Vec<(String, Value)>)> {
@@ -4666,6 +4686,38 @@ mod tests {
                 category: "memory",
                 params: Vec::new(),
             }]
+        );
+    }
+
+    #[test]
+    fn aggregator_tags_glm_dsa_direct_sparse_decision() {
+        let mut aggregator = NativeLogAggregator::default();
+        let events = aggregator.process_line(
+            "skippy: glm_dsa_direct_sparse_decision layer=31 ubatch_tokens=2304 sparse_batch=2304 sparse_streams=1 prefill_cap=256 dense_mask_bytes=301989888 dense_mask_limit=1 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1",
+        );
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.category, "glm_dsa_direct_sparse_decision");
+        assert!(event.params.iter().any(|(key, value)| {
+            key == "dense_mask_bytes" && value == &Value::from(301_989_888_u64)
+        }));
+        assert!(
+            event
+                .params
+                .iter()
+                .any(|(key, value)| { key == "dense_mask_limit" && value == &Value::from(1_u64) })
+        );
+        assert!(
+            event.params.iter().any(|(key, value)| {
+                key == "large_prefill_shape" && value == &Value::from(1_u64)
+            })
+        );
+        assert!(
+            event
+                .params
+                .iter()
+                .any(|(key, value)| key == "use_direct" && value == &Value::from(1_u64))
         );
     }
 

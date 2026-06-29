@@ -116,6 +116,13 @@ include the matching per-message i32-per-token and remainder counters. These are
 bounded numeric shape counters only; raw activation payloads, token IDs, top-k
 index values, and prompt/completion text are not exported.
 
+When debug telemetry is enabled, Skippy may also export
+`stage.glm_dsa_direct_sparse_decision` events derived from llama.cpp native GLM
+DSA decision logs. Only fixed numeric/bool decision fields are exported under
+`llama_stage.glm_dsa_direct_sparse.*`, such as layer, token shape,
+dense-mask byte estimate/limit, and `use_direct`. The raw native log line is
+not exported.
+
 Guardrail v1 is validated emulation, not hard constrained decoding. Streaming is
 pass-through, no tool execution happens inside the guardrail layer, and real
 tools plus strict structured output stays unsupported in v1. See

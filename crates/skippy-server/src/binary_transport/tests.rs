@@ -1,9 +1,10 @@
 use super::{
     binary_full_prefill_record_identities, decode_record_tokens_sideband,
-    forwarded_stage_message_timed, initial_message_closes_without_downstream,
-    input_activation_frame, is_decode_frame_batch_candidate, is_unsupported_trim_memory_error,
-    native_mtp_enabled_from, prepare_binary_stage_connection,
-    restore_prefill_decode_as_decode_message, token_sideband_or_fill,
+    forwarded_stage_message_timed, glm_dsa_direct_sparse_decision_attrs,
+    initial_message_closes_without_downstream, input_activation_frame,
+    is_decode_frame_batch_candidate, is_unsupported_trim_memory_error, native_mtp_enabled_from,
+    prepare_binary_stage_connection, restore_prefill_decode_as_decode_message,
+    token_sideband_or_fill,
 };
 use std::{
     io,
@@ -24,7 +25,8 @@ use skippy_protocol::{
     LoadMode, PeerConfig, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
 };
 use skippy_runtime::{
-    ActivationDesc, ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout,
+    ActivationDesc, ActivationFrame, NativeLogEvent, RuntimeActivationDType,
+    RuntimeActivationLayout,
 };
 
 type BinaryEvictionFn = fn(
@@ -160,6 +162,41 @@ fn request_summary_tracks_input_glm_dsa_top_k_sideband() {
     assert_eq!(summary.max_input_glm_dsa_top_k_sideband_count, 4);
     assert_eq!(summary.max_input_glm_dsa_top_k_sideband_i32_per_token, 4);
     assert_eq!(summary.input_glm_dsa_top_k_sideband_remainder_count, 0);
+}
+
+#[test]
+fn glm_dsa_direct_sparse_decision_attrs_are_bounded() {
+    let attrs = glm_dsa_direct_sparse_decision_attrs(NativeLogEvent {
+        message: "raw native log should not be exported".to_string(),
+        category: "glm_dsa_direct_sparse_decision",
+        params: vec![
+            ("layer".to_string(), serde_json::json!(31)),
+            (
+                "dense_mask_bytes".to_string(),
+                serde_json::json!(301_989_888_u64),
+            ),
+            ("dense_mask_limit".to_string(), serde_json::json!(1)),
+            ("large_prefill_shape".to_string(), serde_json::json!(1)),
+            ("use_direct".to_string(), serde_json::json!(1)),
+            ("unexpected".to_string(), serde_json::json!("drop-me")),
+        ],
+    })
+    .unwrap();
+
+    assert_eq!(
+        attrs.get("llama_stage.native_log.category"),
+        Some(&serde_json::json!("glm_dsa_direct_sparse_decision"))
+    );
+    assert_eq!(
+        attrs.get("llama_stage.glm_dsa_direct_sparse.dense_mask_bytes"),
+        Some(&serde_json::json!(301_989_888_u64))
+    );
+    assert_eq!(
+        attrs.get("llama_stage.glm_dsa_direct_sparse.use_direct"),
+        Some(&serde_json::json!(1))
+    );
+    assert!(!attrs.contains_key("llama_stage.native_log.message"));
+    assert!(!attrs.contains_key("llama_stage.glm_dsa_direct_sparse.unexpected"));
 }
 
 #[test]
