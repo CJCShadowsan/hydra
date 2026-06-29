@@ -487,6 +487,7 @@ fn run_distributed_collect(args: RunArgs) -> Result<DistributedRunOutcome> {
         "glm_dsa_metal_dispatch_log": args.glm_dsa_metal_dispatch_log,
         "glm_dsa_indexshare_freq": args.glm_dsa_indexshare_freq,
         "glm_dsa_indexshare_pattern": args.glm_dsa_indexshare_pattern,
+        "glm_dsa_dense_sparse_mask_max_bytes": args.glm_dsa_dense_sparse_mask_max_bytes,
         "stages": stage_reports,
         "execute_remote": args.execute_remote,
         "keep_remote": args.keep_remote,
@@ -779,6 +780,7 @@ fn run_args_for_existing_driver(
         glm_dsa_metal_dispatch_log: false,
         glm_dsa_indexshare_freq: None,
         glm_dsa_indexshare_pattern: None,
+        glm_dsa_dense_sparse_mask_max_bytes: None,
     })
 }
 
@@ -1794,6 +1796,12 @@ fn stage_server_env_exports(args: &RunArgs) -> String {
     }
     if let Some(pattern) = args.glm_dsa_indexshare_pattern.as_ref() {
         env.push(("LLAMA_GLM_DSA_INDEXSHARE_PATTERN", pattern.clone()));
+    }
+    if let Some(max_bytes) = args.glm_dsa_dense_sparse_mask_max_bytes {
+        env.push((
+            "SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES",
+            max_bytes.to_string(),
+        ));
     }
     if env_flag_enabled("LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER") {
         env.push(("LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER", "1".to_string()));
@@ -3454,6 +3462,7 @@ mod tests {
             glm_dsa_metal_dispatch_log: false,
             glm_dsa_indexshare_freq: None,
             glm_dsa_indexshare_pattern: None,
+            glm_dsa_dense_sparse_mask_max_bytes: None,
         };
 
         assert_eq!(
@@ -4075,6 +4084,7 @@ mod tests {
             glm_dsa_metal_dispatch_log: false,
             glm_dsa_indexshare_freq: None,
             glm_dsa_indexshare_pattern: None,
+            glm_dsa_dense_sparse_mask_max_bytes: None,
         };
         let plan = DeploymentPlan {
             run_id: "run-1".to_string(),
@@ -4141,6 +4151,7 @@ mod tests {
         assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL"));
         assert!(!command.contains("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION"));
         assert!(!command.contains("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH"));
+        assert!(!command.contains("SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES"));
 
         args.glm_dsa_op_timing = true;
         args.glm_dsa_direct_sparse_attn = true;
@@ -4149,6 +4160,7 @@ mod tests {
         args.glm_dsa_metal_dispatch_log = true;
         args.glm_dsa_indexshare_freq = Some(4);
         args.glm_dsa_indexshare_pattern = Some("FSSS".to_string());
+        args.glm_dsa_dense_sparse_mask_max_bytes = Some(1_048_576);
         let command = remote_start_command(
             &args,
             &plan,
@@ -4162,6 +4174,8 @@ mod tests {
         assert!(command.contains("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH"));
         assert!(command.contains("LLAMA_GLM_DSA_INDEXSHARE_FREQ"));
         assert!(command.contains("LLAMA_GLM_DSA_INDEXSHARE_PATTERN"));
+        assert!(command.contains("SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES"));
+        assert!(command.contains("1048576"));
     }
 
     #[test]
@@ -4366,6 +4380,7 @@ mod tests {
             glm_dsa_metal_dispatch_log: false,
             glm_dsa_indexshare_freq: None,
             glm_dsa_indexshare_pattern: None,
+            glm_dsa_dense_sparse_mask_max_bytes: None,
         }
     }
 

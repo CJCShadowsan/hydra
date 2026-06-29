@@ -471,6 +471,11 @@ fn configure_env_flags(args: &GlmDsaLayerMicrobenchArgs, flags: MicrobenchFlags)
         "LLAMA_GLM_DSA_INDEXSHARE_PATTERN",
         IndexSharePolicy::from_args_and_env(args).pattern,
     );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES",
+        args.dense_sparse_mask_max_bytes
+            .map(|max_bytes| max_bytes.to_string()),
+    );
 }
 
 fn set_env_flag(name: &str, enabled: bool) {
@@ -3229,6 +3234,7 @@ mod tests {
             metal_topk_moe_route_fusion: false,
             indexshare_freq: None,
             indexshare_pattern: None,
+            dense_sparse_mask_max_bytes: None,
             require_optimized_route_fusion: false,
             compare_dense_fallback: false,
             compare_cpu_direct_sparse: false,

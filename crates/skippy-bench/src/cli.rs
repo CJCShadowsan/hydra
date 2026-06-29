@@ -257,6 +257,11 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub indexshare_pattern: Option<String>,
     #[arg(
         long,
+        help = "Set SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES for this microbench run. When direct sparse prefill is enabled, larger dense sparse-mask fallbacks are routed to direct sparse attention."
+    )]
+    pub dense_sparse_mask_max_bytes: Option<u64>,
+    #[arg(
+        long,
         default_value_t = false,
         help = "Fail unless the optimized dispatch profile has at least one GLM-DSA route-fusion encode candidate, no skipped encode candidates, and at least one fused route dispatch."
     )]
@@ -602,6 +607,11 @@ pub struct RunArgs {
         help = "Set LLAMA_GLM_DSA_INDEXSHARE_PATTERN in every launched stage. Use F/S characters for Full/reused-Shared GLM-DSA layers."
     )]
     pub glm_dsa_indexshare_pattern: Option<String>,
+    #[arg(
+        long,
+        help = "Set SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES in every launched stage. When GLM-DSA direct sparse prefill is enabled, larger dense sparse-mask fallbacks are routed to direct sparse attention."
+    )]
+    pub glm_dsa_dense_sparse_mask_max_bytes: Option<u64>,
 }
 
 #[derive(Parser)]
@@ -919,6 +929,8 @@ mod tests {
             "4",
             "--indexshare-pattern",
             "FSSS",
+            "--dense-sparse-mask-max-bytes",
+            "1048576",
             "--require-optimized-route-fusion",
             "--compare-dense-fallback",
         ])
@@ -935,6 +947,7 @@ mod tests {
         assert_eq!(args.position_start, 255);
         assert_eq!(args.indexshare_freq, Some(4));
         assert_eq!(args.indexshare_pattern.as_deref(), Some("FSSS"));
+        assert_eq!(args.dense_sparse_mask_max_bytes, Some(1_048_576));
         assert!(args.require_optimized_route_fusion);
         assert!(args.compare_dense_fallback);
         assert!(!args.compare_cpu_direct_sparse);

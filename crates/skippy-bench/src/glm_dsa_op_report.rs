@@ -151,10 +151,13 @@ pub(crate) struct DirectSparseDecisionRecord {
     pub(crate) sparse_batch: i64,
     pub(crate) sparse_streams: i64,
     pub(crate) prefill_cap: i64,
+    pub(crate) dense_mask_bytes: Option<u64>,
+    pub(crate) dense_mask_limit: Option<u64>,
     pub(crate) direct_enabled: bool,
     pub(crate) prefill_enabled: bool,
     pub(crate) decode_shape: bool,
     pub(crate) prefill_shape: bool,
+    pub(crate) large_prefill_shape: Option<bool>,
     pub(crate) token_shape_allowed: bool,
     pub(crate) kq_b_ok: bool,
     pub(crate) sinks_ok: bool,
@@ -594,10 +597,13 @@ fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisio
         sparse_batch: parse_field(&fields, "sparse_batch")?,
         sparse_streams: parse_field(&fields, "sparse_streams")?,
         prefill_cap: parse_field(&fields, "prefill_cap")?,
+        dense_mask_bytes: parse_optional_field(&fields, "dense_mask_bytes")?,
+        dense_mask_limit: parse_optional_field(&fields, "dense_mask_limit")?,
         direct_enabled: parse_bool_int_field(&fields, "direct_enabled")?,
         prefill_enabled: parse_bool_int_field(&fields, "prefill_enabled")?,
         decode_shape: parse_bool_int_field(&fields, "decode_shape")?,
         prefill_shape: parse_bool_int_field(&fields, "prefill_shape")?,
+        large_prefill_shape: parse_optional_bool_int_field(&fields, "large_prefill_shape")?,
         token_shape_allowed: parse_bool_int_field(&fields, "token_shape_allowed")?,
         kq_b_ok: parse_bool_int_field(&fields, "kq_b_ok")?,
         sinks_ok: parse_bool_int_field(&fields, "sinks_ok")?,
@@ -1098,7 +1104,8 @@ mod tests {
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const SIDEBAND_RECEIVE_LINE: &str = "skippy: glm_dsa_top_k_sideband_receive stage=stage-1 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
-    const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
+    const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 dense_mask_bytes=270336 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
+    const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 grid_x=32 grid_y=4 grid_z=1 threads_x=256";
     const METAL_MUL_MAT_ID_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=mul_mat_id kernel=mul_mv_id tensor=ffn_moe_down-45 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 ne00=5120 ne01=6144 experts=256 used_experts=8 tokens=1 min_tokens=128 nr0=2 nr1=1 nsg=1 grid_x=1536 grid_y=1 grid_z=8 threads_x=32 threads_y=2";
     const METAL_ROUTE_ENCODE_CANDIDATE_LINE: &str = "skippy: glm_dsa_metal_dispatch op=topk_moe_route_encode tensor=blk.45.ffn_moe_probs candidate=UNARY/blk.45.ffn_moe_probs,RESHAPE/view reason=fused filtered_nodes=65 graph_nodes=71 graph_idx=30 grid_x=1 grid_y=1 grid_z=1 threads_x=1";
@@ -1178,16 +1185,36 @@ mod tests {
         assert_eq!(record.ubatch_tokens, 33);
         assert_eq!(record.sparse_batch, 33);
         assert_eq!(record.prefill_cap, 32);
+        assert_eq!(record.dense_mask_bytes, Some(270_336));
+        assert_eq!(record.dense_mask_limit, Some(536_870_912));
         assert!(record.direct_enabled);
         assert!(record.prefill_enabled);
         assert!(!record.decode_shape);
         assert!(!record.prefill_shape);
+        assert_eq!(record.large_prefill_shape, Some(false));
         assert!(!record.token_shape_allowed);
         assert!(record.kq_b_ok);
         assert!(record.sinks_ok);
         assert!(record.alibi_ok);
         assert!(record.soft_cap_ok);
         assert!(!record.use_direct);
+    }
+
+    #[test]
+    fn parses_large_prefill_direct_sparse_decision_records() {
+        let records =
+            parse_direct_sparse_decision_records(LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE)
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.ubatch_tokens, 4096);
+        assert_eq!(record.sparse_batch, 4096);
+        assert_eq!(record.dense_mask_bytes, Some(2_147_483_648));
+        assert_eq!(record.dense_mask_limit, Some(536_870_912));
+        assert!(!record.prefill_shape);
+        assert_eq!(record.large_prefill_shape, Some(true));
+        assert!(record.token_shape_allowed);
+        assert!(record.use_direct);
     }
 
     #[test]
