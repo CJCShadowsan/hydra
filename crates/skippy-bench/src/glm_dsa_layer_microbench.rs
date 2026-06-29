@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +39,7 @@ const ENV_REAL_TOP_K_CHAIN_SOURCES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAI
 const ENV_REAL_TOP_K_MAX_SOURCE_BYTES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
 const DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES: u64 = 110 * 1024 * 1024 * 1024;
+const GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
 const INPUT_FRAME_CACHE_MAGIC: &[u8; 16] = b"SKPGLMDSAFRM1\0\0\0";
 
 pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
@@ -50,6 +52,12 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let positions = positions(args.position_start, args.tokens)?;
     let flags = MicrobenchFlags::from_args(&args);
     let indexshare_policy = IndexSharePolicy::from_args_and_env(&args);
+    let artifact_layer_role = artifact_layer_role_report(
+        &selected.selected_parts,
+        &selected.absolute_paths,
+        args.layer_start,
+    )
+    .context("derive GLM-DSA artifact layer role")?;
     let input = prepare_input_activation(&args, &token_ids, &positions, flags)?;
     let comparison = if args.compare_dense_fallback {
         Some(run_dense_fallback_comparison(
@@ -123,8 +131,13 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let op_timing_summary = case.op_timing_summary.clone();
     let routed_moe_timing_summary = case.routed_moe_timing_summary.clone();
     let input_contract = activation_contract_report(&args, &input.frame)?;
-    let execution_contract =
-        execution_contract_report(&args, &input.report, &input_contract, &indexshare_policy);
+    let execution_contract = execution_contract_report(
+        &args,
+        &input.report,
+        &input_contract,
+        &indexshare_policy,
+        artifact_layer_role,
+    );
     let profile_integrity = ProfileIntegrityReport::new(
         flags,
         &metal_dispatch_summary,
@@ -1095,24 +1108,100 @@ fn fnv1a64(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+fn artifact_layer_role_report(
+    selected_parts: &[PackagePart],
+    absolute_paths: &[PathBuf],
+    layer_index: u32,
+) -> Result<ArtifactLayerRoleReport> {
+    let indexer_tensor_prefix = format!("blk.{layer_index}.indexer.");
+    let Some((part, path)) = selected_parts
+        .iter()
+        .zip(absolute_paths.iter())
+        .find(|(part, _)| part.role == "layer" && part.layer_index == Some(layer_index))
+    else {
+        return Ok(ArtifactLayerRoleReport {
+            layer_index,
+            role: None,
+            basis: ArtifactLayerRoleBasis::NoMatchingLayerPart,
+            part_path: None,
+            indexer_tensor_prefix,
+            can_produce_top_k: None,
+        });
+    };
+    let can_produce_top_k = file_contains_bytes(path, indexer_tensor_prefix.as_bytes())
+        .with_context(|| format!("scan {} for GLM-DSA indexer tensor names", path.display()))?;
+    Ok(ArtifactLayerRoleReport {
+        layer_index,
+        role: Some(if can_produce_top_k {
+            IndexShareRole::FullProducer
+        } else {
+            IndexShareRole::SharedConsumer
+        }),
+        basis: ArtifactLayerRoleBasis::TensorNameScan,
+        part_path: Some(part.path.clone()),
+        indexer_tensor_prefix,
+        can_produce_top_k: Some(can_produce_top_k),
+    })
+}
+
+fn file_contains_bytes(path: &Path, needle: &[u8]) -> Result<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::with_capacity(GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES, file);
+    let mut chunk = vec![0_u8; GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES];
+    let mut carry = Vec::new();
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let mut search = Vec::with_capacity(carry.len() + read);
+        search.extend_from_slice(&carry);
+        search.extend_from_slice(&chunk[..read]);
+        if contains_subslice(&search, needle) {
+            return Ok(true);
+        }
+        let keep = needle.len().saturating_sub(1).min(search.len());
+        carry.clear();
+        carry.extend_from_slice(&search[search.len() - keep..]);
+    }
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|candidate| candidate == needle)
+}
+
 fn execution_contract_report(
     args: &GlmDsaLayerMicrobenchArgs,
     input: &InputSourceReport,
     activation: &ActivationContractReport,
     policy: &IndexSharePolicy,
+    artifact_layer_role: ArtifactLayerRoleReport,
 ) -> ExecutionContractReport {
-    let target_layer_role = indexshare_layer_role(args.layer_start, policy);
+    let policy_layer_role = indexshare_layer_role(args.layer_start, policy);
+    let effective_layer_role = effective_layer_role(&policy_layer_role, &artifact_layer_role);
+    let policy_artifact_compatible =
+        policy_artifact_compatible(&policy_layer_role, &artifact_layer_role);
     let sideband_source = sideband_source_report(input);
-    let sideband_required = matches!(target_layer_role.role, IndexShareRole::SharedConsumer);
+    let sideband_required = matches!(effective_layer_role.role, IndexShareRole::SharedConsumer);
     let sideband_present = activation.sideband.sideband_bytes > 0 && activation.sideband.present;
     let proof_kind = proof_kind(
-        target_layer_role.role,
+        effective_layer_role.role,
         sideband_source.kind,
         sideband_present,
     );
     ExecutionContractReport {
         proof_kind,
-        target_layer_role,
+        policy_layer_role,
+        artifact_layer_role,
+        effective_layer_role,
+        policy_artifact_compatible,
         sideband_source,
         sideband_required,
         sideband_present,
@@ -1122,6 +1211,33 @@ fn execution_contract_report(
             (ExecutionProofKind::SharedConsumerWithRealTopK, true)
         ),
     }
+}
+
+fn effective_layer_role(
+    policy_role: &IndexShareLayerRole,
+    artifact_role: &ArtifactLayerRoleReport,
+) -> EffectiveLayerRoleReport {
+    if artifact_role.can_produce_top_k == Some(false)
+        && matches!(policy_role.role, IndexShareRole::FullProducer)
+    {
+        return EffectiveLayerRoleReport {
+            role: IndexShareRole::SharedConsumer,
+            basis: EffectiveLayerRoleBasis::ArtifactNoIndexer,
+        };
+    }
+    EffectiveLayerRoleReport {
+        role: policy_role.role,
+        basis: EffectiveLayerRoleBasis::Policy,
+    }
+}
+
+fn policy_artifact_compatible(
+    policy_role: &IndexShareLayerRole,
+    artifact_role: &ArtifactLayerRoleReport,
+) -> Option<bool> {
+    artifact_role
+        .can_produce_top_k
+        .map(|can_produce| can_produce || !matches!(policy_role.role, IndexShareRole::FullProducer))
 }
 
 fn proof_kind(
@@ -1901,7 +2017,11 @@ enum ExecutionProofKind {
 #[derive(Serialize)]
 struct ExecutionContractReport {
     proof_kind: ExecutionProofKind,
-    target_layer_role: IndexShareLayerRole,
+    policy_layer_role: IndexShareLayerRole,
+    artifact_layer_role: ArtifactLayerRoleReport,
+    effective_layer_role: EffectiveLayerRoleReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_artifact_compatible: Option<bool>,
     sideband_source: SidebandSourceReport,
     sideband_required: bool,
     sideband_present: bool,
@@ -1931,6 +2051,39 @@ struct IndexShareLayerRole {
     freq: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pattern: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct ArtifactLayerRoleReport {
+    layer_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<IndexShareRole>,
+    basis: ArtifactLayerRoleBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part_path: Option<PathBuf>,
+    indexer_tensor_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    can_produce_top_k: Option<bool>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactLayerRoleBasis {
+    TensorNameScan,
+    NoMatchingLayerPart,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct EffectiveLayerRoleReport {
+    role: IndexShareRole,
+    basis: EffectiveLayerRoleBasis,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EffectiveLayerRoleBasis {
+    Policy,
+    ArtifactNoIndexer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -2455,31 +2608,153 @@ mod tests {
             freq: Some(4),
             pattern: None,
         };
+        let artifact_role = artifact_role_for_test(args.layer_start, Some(true));
 
-        let report = execution_contract_report(&args, &input, &input_contract, &policy);
+        let report =
+            execution_contract_report(&args, &input, &input_contract, &policy, artifact_role);
 
         assert_eq!(
             report.proof_kind,
             ExecutionProofKind::SharedConsumerWithRealTopK
         );
         assert_eq!(
-            report.target_layer_role.role,
+            report.policy_layer_role.role,
             IndexShareRole::SharedConsumer
         );
+        assert_eq!(
+            report.effective_layer_role.role,
+            IndexShareRole::SharedConsumer
+        );
+        assert_eq!(report.policy_artifact_compatible, Some(true));
         assert!(report.sideband_required);
         assert!(report.sideband_present);
         assert!(report.sideband_contract_satisfied);
         assert!(report.native_consumer_execution_proven);
     }
 
+    #[test]
+    fn artifact_role_detects_indexer_tensor_name() {
+        let path = temp_test_file("glm-dsa-indexer-present.gguf");
+        fs::write(&path, b"before blk.28.indexer.weight after").unwrap();
+        let part = test_layer_package_part(28, 32);
+
+        let role = artifact_layer_role_report(&[part], std::slice::from_ref(&path), 28).unwrap();
+
+        assert_eq!(role.role, Some(IndexShareRole::FullProducer));
+        assert_eq!(role.can_produce_top_k, Some(true));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_role_detects_missing_indexer_tensor_name() {
+        let path = temp_test_file("glm-dsa-indexer-missing.gguf");
+        fs::write(&path, b"before blk.28.attn_q.weight after").unwrap();
+        let part = test_layer_package_part(28, 32);
+
+        let role = artifact_layer_role_report(&[part], std::slice::from_ref(&path), 28).unwrap();
+
+        assert_eq!(role.role, Some(IndexShareRole::SharedConsumer));
+        assert_eq!(role.can_produce_top_k, Some(false));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn artifact_scan_detects_needle_across_chunk_boundary() {
+        let path = temp_test_file("glm-dsa-indexer-boundary.gguf");
+        let needle = b"blk.28.indexer.weight";
+        let mut bytes = vec![b'a'; GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES - 3];
+        bytes.extend_from_slice(needle);
+        fs::write(&path, bytes).unwrap();
+
+        assert!(file_contains_bytes(&path, needle).unwrap());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn execution_contract_downgrades_policy_full_when_artifact_lacks_indexer() {
+        let mut args = test_args();
+        args.layer_start = 28;
+        args.layer_end = 29;
+        let frame = synthetic_activation_frame_for_layer(&args, args.layer_start, None).unwrap();
+        let input_contract = activation_contract_report(&args, &frame).unwrap();
+        let input = InputSourceReport::Synthetic {
+            top_k_sideband: None,
+        };
+        let policy = IndexSharePolicy {
+            freq: Some(4),
+            pattern: None,
+        };
+        let artifact_role = artifact_role_for_test(args.layer_start, Some(false));
+
+        let report =
+            execution_contract_report(&args, &input, &input_contract, &policy, artifact_role);
+
+        assert_eq!(report.policy_layer_role.role, IndexShareRole::FullProducer);
+        assert_eq!(
+            report.effective_layer_role.role,
+            IndexShareRole::SharedConsumer
+        );
+        assert!(matches!(
+            report.effective_layer_role.basis,
+            EffectiveLayerRoleBasis::ArtifactNoIndexer
+        ));
+        assert_eq!(report.policy_artifact_compatible, Some(false));
+        assert_eq!(
+            report.proof_kind,
+            ExecutionProofKind::SharedConsumerMissingSideband
+        );
+        assert!(report.sideband_required);
+        assert!(!report.sideband_contract_satisfied);
+        assert!(!report.native_consumer_execution_proven);
+    }
+
+    fn artifact_role_for_test(
+        layer_index: u32,
+        can_produce_top_k: Option<bool>,
+    ) -> ArtifactLayerRoleReport {
+        ArtifactLayerRoleReport {
+            layer_index,
+            role: can_produce_top_k.map(|can_produce| {
+                if can_produce {
+                    IndexShareRole::FullProducer
+                } else {
+                    IndexShareRole::SharedConsumer
+                }
+            }),
+            basis: can_produce_top_k.map_or(ArtifactLayerRoleBasis::NoMatchingLayerPart, |_| {
+                ArtifactLayerRoleBasis::TensorNameScan
+            }),
+            part_path: can_produce_top_k
+                .map(|_| PathBuf::from(format!("layers/layer-{layer_index:03}.gguf"))),
+            indexer_tensor_prefix: format!("blk.{layer_index}.indexer."),
+            can_produce_top_k,
+        }
+    }
+
     fn test_package_part(artifact_bytes: u64) -> PackagePart {
+        test_layer_package_part(0, artifact_bytes)
+    }
+
+    fn test_layer_package_part(layer_index: u32, artifact_bytes: u64) -> PackagePart {
         PackagePart {
             role: "layer".to_string(),
-            layer_index: Some(0),
-            path: PathBuf::from("layers/layer-000.gguf"),
+            layer_index: Some(layer_index),
+            path: PathBuf::from(format!("layers/layer-{layer_index:03}.gguf")),
             sha256: "test".to_string(),
             artifact_bytes,
         }
+    }
+
+    fn temp_test_file(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "skippy-bench-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     fn test_args() -> GlmDsaLayerMicrobenchArgs {
