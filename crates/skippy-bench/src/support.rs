@@ -1,7 +1,7 @@
 use std::{
     net::{SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +26,10 @@ impl ChildGuard {
 
     pub fn keep_alive(self) {
         std::mem::forget(self);
+    }
+
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        self.child.try_wait().context("poll child process")
     }
 }
 
@@ -53,6 +57,34 @@ pub fn connect_ready(addr: SocketAddr, timeout_secs: u64) -> Result<TcpStream> {
     let attempts = timeout_secs.saturating_mul(2).max(1);
     let mut last_error = None;
     for _ in 0..attempts {
+        match TcpStream::connect(addr) {
+            Ok(mut stream) => {
+                stream.set_nodelay(true).ok();
+                match recv_ready(&mut stream) {
+                    Ok(()) => return Ok(stream),
+                    Err(error) => {
+                        last_error = Some(anyhow!(error).context("ready handshake failed"))
+                    }
+                }
+            }
+            Err(error) => last_error = Some(anyhow!(error).context("connect failed")),
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("timed out")))
+}
+
+pub fn connect_ready_while_child_running(
+    addr: SocketAddr,
+    timeout_secs: u64,
+    child: &mut ChildGuard,
+) -> Result<TcpStream> {
+    let attempts = timeout_secs.saturating_mul(2).max(1);
+    let mut last_error = None;
+    for _ in 0..attempts {
+        if let Some(status) = child.try_wait()? {
+            bail!("child process exited before readiness: {status}");
+        }
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
                 stream.set_nodelay(true).ok();

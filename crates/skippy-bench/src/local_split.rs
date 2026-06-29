@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::TcpStream,
     process::{Command, Stdio},
 };
 
@@ -15,6 +16,7 @@ use skippy_protocol::binary::{
 use skippy_runtime::{
     ActivationFrame, RuntimeActivationDType, RuntimeActivationLayout, RuntimeConfig,
     RuntimeLoadMode, StageModel,
+    package::{PackageStageRequest, inspect_layer_package, select_layer_package_parts},
 };
 use skippy_topology::{
     BoundaryDecision, NodeSpec, PlannerPolicy, TopologyPlanRequest, WireValidation,
@@ -28,8 +30,8 @@ use crate::{
     },
     model_identity::model_identity_for_path,
     support::{
-        ChildGuard, activation_width, connect_ready, generate_run_id, parse_wire_dtype,
-        temp_config_path_for,
+        ChildGuard, activation_width, connect_ready, connect_ready_while_child_running,
+        generate_run_id, parse_wire_dtype, temp_config_path_for,
     },
 };
 
@@ -309,6 +311,14 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     }
     let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
     let model_identity = model_identity_for_path(&args.model_id, Some(&args.model_path))?;
+    let package_activation_width =
+        package_activation_width_for_binary_split(&args.model_path, &stage_load_mode)
+            .context("read layer package activation width")?;
+    let prestarted_stage1 = package_activation_width
+        .map(|activation_width| {
+            start_stage1_binary(&args, &model_identity, &stage_load_mode, activation_width)
+        })
+        .transpose()?;
     let stage0_config = RuntimeConfig {
         stage_index: 0,
         layer_start: 0,
@@ -333,8 +343,15 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         include_output: false,
         filter_tensors_on_load: true,
     };
-    let stage0 =
-        StageModel::open(&args.model_path, &stage0_config).context("failed to open stage 0")?;
+    let stage0 = open_stage_model_for_binary_split(
+        &args.model_path,
+        &args.model_id,
+        "local-split-binary",
+        "stage-0",
+        &stage_load_mode,
+        &stage0_config,
+    )
+    .context("failed to open stage 0")?;
     let tokens = stage0
         .tokenize(&args.prompt, true)
         .context("failed to tokenize prompt")?;
@@ -348,85 +365,29 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
     if boundary.payload.is_empty() {
         bail!("stage 0 produced an empty activation frame");
     }
-    let activation_width = boundary_activation_width(&boundary, &[0])?;
-
-    let run_id = generate_run_id();
-    let config_path = temp_config_path_for(&run_id, "stage-1");
-    let topology_path = temp_config_path_for(&run_id, "topology");
-    let config = json!({
-        "run_id": run_id,
-        "topology_id": "local-split-binary",
-        "model_id": model_identity.model_id,
-        "model_path": args.model_path,
-        "stage_id": "stage-1",
-        "stage_index": 1,
-        "layer_start": args.split_layer,
-        "layer_end": args.layer_end,
-        "ctx_size": args.ctx_size,
-        "n_gpu_layers": args.n_gpu_layers,
-        "filter_tensors_on_load": true,
-        "load_mode": stage_load_mode.protocol_str,
-        "bind_addr": args.stage1_bind_addr,
-        "upstream": {
-            "stage_id": "stage-0",
-            "stage_index": 0,
-            "endpoint": "driver"
-        },
-        "downstream": null
-    });
-    let topology = local_split_topology(
-        "local-split-binary",
-        &model_identity.model_id,
-        stage_load_mode.protocol_str,
-        &[
-            LocalSplitTopologyStage {
-                stage_id: "stage-0",
-                stage_index: 0,
-                endpoint: "driver".to_string(),
-                layer_start: 0,
-                layer_end: args.split_layer,
-            },
-            LocalSplitTopologyStage {
-                stage_id: "stage-1",
-                stage_index: 1,
-                endpoint: format!("tcp://{}", args.stage1_bind_addr),
-                layer_start: args.split_layer,
-                layer_end: args.layer_end,
-            },
-        ],
-    );
-    fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    fs::write(&topology_path, serde_json::to_vec_pretty(&topology)?)
-        .with_context(|| format!("failed to write {}", topology_path.display()))?;
-
-    let mut stage_command = Command::new(&args.stage_server_bin);
-    stage_command.args([
-        "serve-binary",
-        "--config",
-        config_path
-            .to_str()
-            .context("stage config path is not valid UTF-8")?,
-        "--topology",
-        topology_path
-            .to_str()
-            .context("stage topology path is not valid UTF-8")?,
-        "--activation-width",
-        &activation_width.to_string(),
-        "--activation-wire-dtype",
-        &args.activation_wire_dtype,
-    ]);
-    if args.child_logs {
-        stage_command
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-    } else {
-        stage_command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-    let _stage1 = ChildGuard::spawn(stage_command)?;
-
-    let mut stream = connect_ready(args.stage1_bind_addr, args.startup_timeout_secs)
-        .context("stage 1 binary server did not become ready")?;
+    let boundary_activation_width = boundary_activation_width(&boundary, &[0])?;
+    let StartedBinaryStage {
+        _child: _stage1,
+        mut stream,
+        activation_width,
+    } = match prestarted_stage1 {
+        Some(stage1) => {
+            if stage1.activation_width != boundary_activation_width {
+                bail!(
+                    "package activation_width {} did not match stage 0 boundary activation_width {}",
+                    stage1.activation_width,
+                    boundary_activation_width
+                );
+            }
+            stage1
+        }
+        None => start_stage1_binary(
+            &args,
+            &model_identity,
+            &stage_load_mode,
+            boundary_activation_width,
+        )?,
+    };
     let request_id = 1;
     let session_id = 1;
     send_generation_config(&mut stream, wire_dtype, request_id, session_id, 1)
@@ -784,6 +745,164 @@ fn parse_stage_load_mode(load_mode: &str) -> Result<ParsedStageLoadMode> {
             "unsupported --stage-load-mode {other}; expected runtime-slice, artifact-slice, or layer-package"
         ),
     }
+}
+
+struct StartedBinaryStage {
+    _child: ChildGuard,
+    stream: TcpStream,
+    activation_width: i32,
+}
+
+fn package_activation_width_for_binary_split(
+    model_path: &std::path::Path,
+    stage_load_mode: &ParsedStageLoadMode,
+) -> Result<Option<i32>> {
+    if stage_load_mode.protocol != ProtocolLoadMode::LayerPackage {
+        return Ok(None);
+    }
+    let info = inspect_layer_package(&model_path.display().to_string())?;
+    let width = info.activation_width.with_context(|| {
+        format!(
+            "layer package {} does not declare activation_width",
+            model_path.display()
+        )
+    })?;
+    let width = i32::try_from(width).context("layer package activation_width exceeds i32")?;
+    Ok(Some(width))
+}
+
+fn start_stage1_binary(
+    args: &BinarySplitConfig,
+    model_identity: &ModelIdentity,
+    stage_load_mode: &ParsedStageLoadMode,
+    activation_width: i32,
+) -> Result<StartedBinaryStage> {
+    let run_id = generate_run_id();
+    let config_path = temp_config_path_for(&run_id, "stage-1");
+    let topology_path = temp_config_path_for(&run_id, "topology");
+    let config = json!({
+        "run_id": run_id,
+        "topology_id": "local-split-binary",
+        "model_id": model_identity.model_id,
+        "model_path": args.model_path,
+        "stage_id": "stage-1",
+        "stage_index": 1,
+        "layer_start": args.split_layer,
+        "layer_end": args.layer_end,
+        "ctx_size": args.ctx_size,
+        "n_gpu_layers": args.n_gpu_layers,
+        "filter_tensors_on_load": true,
+        "load_mode": stage_load_mode.protocol_str,
+        "bind_addr": args.stage1_bind_addr,
+        "upstream": {
+            "stage_id": "stage-0",
+            "stage_index": 0,
+            "endpoint": "driver"
+        },
+        "downstream": null
+    });
+    let topology = local_split_topology(
+        "local-split-binary",
+        &model_identity.model_id,
+        stage_load_mode.protocol_str,
+        &[
+            LocalSplitTopologyStage {
+                stage_id: "stage-0",
+                stage_index: 0,
+                endpoint: "driver".to_string(),
+                layer_start: 0,
+                layer_end: args.split_layer,
+            },
+            LocalSplitTopologyStage {
+                stage_id: "stage-1",
+                stage_index: 1,
+                endpoint: format!("tcp://{}", args.stage1_bind_addr),
+                layer_start: args.split_layer,
+                layer_end: args.layer_end,
+            },
+        ],
+    );
+    fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    fs::write(&topology_path, serde_json::to_vec_pretty(&topology)?)
+        .with_context(|| format!("failed to write {}", topology_path.display()))?;
+
+    let mut stage_command = Command::new(&args.stage_server_bin);
+    stage_command.args([
+        "serve-binary",
+        "--config",
+        config_path
+            .to_str()
+            .context("stage config path is not valid UTF-8")?,
+        "--topology",
+        topology_path
+            .to_str()
+            .context("stage topology path is not valid UTF-8")?,
+        "--activation-width",
+        &activation_width.to_string(),
+        "--activation-wire-dtype",
+        &args.activation_wire_dtype,
+    ]);
+    if args.child_logs {
+        stage_command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        stage_command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut child = ChildGuard::spawn(stage_command)?;
+    let stream = connect_ready_while_child_running(
+        args.stage1_bind_addr,
+        args.startup_timeout_secs,
+        &mut child,
+    )
+    .context("stage 1 binary server did not become ready")?;
+    Ok(StartedBinaryStage {
+        _child: child,
+        stream,
+        activation_width,
+    })
+}
+
+fn open_stage_model_for_binary_split(
+    model_path: &std::path::Path,
+    model_id: &str,
+    topology_id: &str,
+    stage_id: &str,
+    stage_load_mode: &ParsedStageLoadMode,
+    config: &RuntimeConfig,
+) -> Result<StageModel> {
+    if stage_load_mode.protocol != ProtocolLoadMode::LayerPackage {
+        return StageModel::open(model_path, config)
+            .with_context(|| format!("open stage model {}", model_path.display()));
+    }
+
+    let selected = select_layer_package_parts(&PackageStageRequest {
+        model_id: model_id.to_string(),
+        topology_id: topology_id.to_string(),
+        package_ref: model_path.display().to_string(),
+        stage_id: stage_id.to_string(),
+        layer_start: config.layer_start,
+        layer_end: config.layer_end,
+        include_embeddings: config.include_embeddings,
+        include_output: config.include_output,
+    })
+    .with_context(|| {
+        format!(
+            "select layer package parts for {stage_id} layers {}..{}",
+            config.layer_start, config.layer_end
+        )
+    })?;
+
+    StageModel::open_from_parts(&selected.absolute_paths, config).with_context(|| {
+        let paths = selected
+            .absolute_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("open layer package stage {stage_id} from parts [{paths}]")
+    })
 }
 
 fn send_generation_config(
