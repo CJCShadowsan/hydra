@@ -47,6 +47,8 @@ const ENV_STAGE_WIRE_ROUNDTRIP: &str = "SKIPPY_BENCH_GLM_DSA_STAGE_WIRE_ROUNDTRI
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
 const DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES: u64 = 110 * 1024 * 1024 * 1024;
 const GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
+const SIDEBAND_DIFF_SAMPLE_LIMIT: usize = 8;
+const SIDEBAND_TOKEN_DIFF_SAMPLE_LIMIT: usize = 16;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_TYPE_UINT8: u32 = 0;
 const GGUF_TYPE_INT8: u32 = 1;
@@ -2042,7 +2044,8 @@ fn compare_activation_frames(
     let sideband = compare_sideband_payloads(
         &baseline.payload[hidden_bytes..],
         &candidate.payload[hidden_bytes..],
-    );
+        sideband_token_count(baseline, candidate),
+    )?;
     let output_flags_match = baseline.desc.flags == candidate.desc.flags;
     let payload_len_match = baseline.payload.len() == candidate.payload.len();
     let passed = output_flags_match
@@ -2066,7 +2069,14 @@ fn compare_activation_frames(
         sideband_bytes: sideband.compared_bytes,
         sideband_mismatched_bytes: sideband.mismatched_bytes,
         first_sideband_mismatch: sideband.first_mismatch,
+        sideband_i32_diff: sideband.i32_diff,
     })
+}
+
+fn sideband_token_count(baseline: &ActivationFrame, candidate: &ActivationFrame) -> Option<usize> {
+    let baseline_tokens = usize::try_from(baseline.desc.token_count).ok()?;
+    let candidate_tokens = usize::try_from(candidate.desc.token_count).ok()?;
+    (baseline_tokens == candidate_tokens && baseline_tokens > 0).then_some(baseline_tokens)
 }
 
 fn ensure_hidden_payload(label: &str, frame: &ActivationFrame, hidden_bytes: usize) -> Result<()> {
@@ -2148,7 +2158,11 @@ fn values_close(baseline: f32, candidate: f32, atol: f32, rtol: f32) -> bool {
     (baseline - candidate).abs() <= tolerance
 }
 
-fn compare_sideband_payloads(baseline: &[u8], candidate: &[u8]) -> SidebandComparison {
+fn compare_sideband_payloads(
+    baseline: &[u8],
+    candidate: &[u8],
+    token_count: Option<usize>,
+) -> Result<SidebandComparison> {
     let compared_bytes = baseline.len().min(candidate.len());
     let mut mismatched_bytes = baseline.len().abs_diff(candidate.len());
     let mut first_mismatch = None;
@@ -2163,11 +2177,201 @@ fn compare_sideband_payloads(baseline: &[u8], candidate: &[u8]) -> SidebandCompa
     if first_mismatch.is_none() && baseline.len() != candidate.len() {
         first_mismatch = Some(compared_bytes);
     }
-    SidebandComparison {
+    let i32_diff = compare_sideband_i32_payloads(baseline, candidate, token_count)?;
+    Ok(SidebandComparison {
         compared_bytes,
         mismatched_bytes,
         first_mismatch,
+        i32_diff,
+    })
+}
+
+fn compare_sideband_i32_payloads(
+    baseline: &[u8],
+    candidate: &[u8],
+    token_count: Option<usize>,
+) -> Result<Option<SidebandI32Diff>> {
+    if baseline.is_empty() && candidate.is_empty() {
+        return Ok(None);
     }
+    let i32_aligned = baseline.len().is_multiple_of(std::mem::size_of::<i32>())
+        && candidate.len().is_multiple_of(std::mem::size_of::<i32>());
+    if !i32_aligned {
+        return Ok(Some(SidebandI32Diff::unaligned(
+            baseline.len(),
+            candidate.len(),
+        )));
+    }
+    let baseline_values = decode_i32_sideband(baseline)?;
+    let candidate_values = decode_i32_sideband(candidate)?;
+    let compared_i32 = baseline_values.len().min(candidate_values.len());
+    let mut mismatched_i32 = baseline_values.len().abs_diff(candidate_values.len());
+    let mut first_mismatches = Vec::new();
+    for (index, (baseline, candidate)) in baseline_values
+        .iter()
+        .zip(candidate_values.iter())
+        .enumerate()
+    {
+        if baseline != candidate {
+            mismatched_i32 += 1;
+            if first_mismatches.len() < SIDEBAND_DIFF_SAMPLE_LIMIT {
+                first_mismatches.push(SidebandI32Mismatch {
+                    index,
+                    token_index: token_index_for_sideband(index, compared_i32, token_count),
+                    offset_in_token: offset_in_token_for_sideband(index, compared_i32, token_count),
+                    baseline: *baseline,
+                    candidate: *candidate,
+                });
+            }
+        }
+    }
+    let token_summary = token_count.and_then(|tokens| {
+        sideband_token_diff_summary(&baseline_values, &candidate_values, tokens)
+    });
+    Ok(Some(SidebandI32Diff {
+        i32_aligned,
+        baseline_i32_count: baseline_values.len(),
+        candidate_i32_count: candidate_values.len(),
+        compared_i32,
+        mismatched_i32,
+        first_mismatches,
+        token_summary,
+    }))
+}
+
+fn token_index_for_sideband(
+    index: usize,
+    compared_i32: usize,
+    token_count: Option<usize>,
+) -> Option<usize> {
+    sideband_width(compared_i32, token_count).map(|width| index / width)
+}
+
+fn offset_in_token_for_sideband(
+    index: usize,
+    compared_i32: usize,
+    token_count: Option<usize>,
+) -> Option<usize> {
+    sideband_width(compared_i32, token_count).map(|width| index % width)
+}
+
+fn sideband_width(compared_i32: usize, token_count: Option<usize>) -> Option<usize> {
+    let tokens = token_count?;
+    (tokens > 0 && compared_i32.is_multiple_of(tokens)).then_some(compared_i32 / tokens)
+}
+
+fn sideband_token_diff_summary(
+    baseline: &[i32],
+    candidate: &[i32],
+    token_count: usize,
+) -> Option<SidebandTokenDiffSummary> {
+    if token_count == 0
+        || baseline.len() != candidate.len()
+        || !baseline.len().is_multiple_of(token_count)
+    {
+        return None;
+    }
+    let width = baseline.len() / token_count;
+    let mut exact_order_matching_tokens = 0usize;
+    let mut set_equivalent_tokens = 0usize;
+    let mut set_mismatched_tokens = 0usize;
+    let mut first_set_mismatch = None;
+    for token_index in 0..token_count {
+        let start = token_index * width;
+        let end = start + width;
+        let baseline_token = &baseline[start..end];
+        let candidate_token = &candidate[start..end];
+        if baseline_token == candidate_token {
+            exact_order_matching_tokens += 1;
+            set_equivalent_tokens += 1;
+            continue;
+        }
+        let set_diff = sideband_token_set_diff(baseline_token, candidate_token);
+        if set_diff.set_equivalent {
+            set_equivalent_tokens += 1;
+        } else {
+            set_mismatched_tokens += 1;
+            first_set_mismatch.get_or_insert(SidebandTokenSetMismatch {
+                token_index,
+                baseline_only: set_diff.baseline_only,
+                candidate_only: set_diff.candidate_only,
+            });
+        }
+    }
+    Some(SidebandTokenDiffSummary {
+        token_count,
+        width,
+        exact_order_matching_tokens,
+        set_equivalent_tokens,
+        set_mismatched_tokens,
+        first_set_mismatch,
+    })
+}
+
+fn sideband_token_set_diff(baseline: &[i32], candidate: &[i32]) -> SidebandTokenSetDiff {
+    let mut baseline_sorted = baseline.to_vec();
+    let mut candidate_sorted = candidate.to_vec();
+    baseline_sorted.sort_unstable();
+    candidate_sorted.sort_unstable();
+    let set_equivalent = baseline_sorted == candidate_sorted;
+    if set_equivalent {
+        return SidebandTokenSetDiff {
+            set_equivalent,
+            baseline_only: Vec::new(),
+            candidate_only: Vec::new(),
+        };
+    }
+    let (baseline_only, candidate_only) = sorted_multiset_diff(
+        &baseline_sorted,
+        &candidate_sorted,
+        SIDEBAND_TOKEN_DIFF_SAMPLE_LIMIT,
+    );
+    SidebandTokenSetDiff {
+        set_equivalent,
+        baseline_only,
+        candidate_only,
+    }
+}
+
+fn sorted_multiset_diff(baseline: &[i32], candidate: &[i32], limit: usize) -> (Vec<i32>, Vec<i32>) {
+    let mut baseline_only = Vec::new();
+    let mut candidate_only = Vec::new();
+    let mut baseline_index = 0usize;
+    let mut candidate_index = 0usize;
+    while baseline_index < baseline.len() || candidate_index < candidate.len() {
+        match (baseline.get(baseline_index), candidate.get(candidate_index)) {
+            (Some(baseline_value), Some(candidate_value)) if baseline_value == candidate_value => {
+                baseline_index += 1;
+                candidate_index += 1;
+            }
+            (Some(baseline_value), Some(candidate_value)) if baseline_value < candidate_value => {
+                if baseline_only.len() < limit {
+                    baseline_only.push(*baseline_value);
+                }
+                baseline_index += 1;
+            }
+            (Some(_), Some(candidate_value)) => {
+                if candidate_only.len() < limit {
+                    candidate_only.push(*candidate_value);
+                }
+                candidate_index += 1;
+            }
+            (Some(baseline_value), None) => {
+                if baseline_only.len() < limit {
+                    baseline_only.push(*baseline_value);
+                }
+                baseline_index += 1;
+            }
+            (None, Some(candidate_value)) => {
+                if candidate_only.len() < limit {
+                    candidate_only.push(*candidate_value);
+                }
+                candidate_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    (baseline_only, candidate_only)
 }
 
 struct MicrobenchCase {
@@ -2222,6 +2426,68 @@ struct SidebandComparison {
     compared_bytes: usize,
     mismatched_bytes: usize,
     first_mismatch: Option<usize>,
+    i32_diff: Option<SidebandI32Diff>,
+}
+
+#[derive(Serialize)]
+struct SidebandI32Diff {
+    i32_aligned: bool,
+    baseline_i32_count: usize,
+    candidate_i32_count: usize,
+    compared_i32: usize,
+    mismatched_i32: usize,
+    first_mismatches: Vec<SidebandI32Mismatch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_summary: Option<SidebandTokenDiffSummary>,
+}
+
+impl SidebandI32Diff {
+    fn unaligned(baseline_bytes: usize, candidate_bytes: usize) -> Self {
+        Self {
+            i32_aligned: false,
+            baseline_i32_count: baseline_bytes / std::mem::size_of::<i32>(),
+            candidate_i32_count: candidate_bytes / std::mem::size_of::<i32>(),
+            compared_i32: baseline_bytes.min(candidate_bytes) / std::mem::size_of::<i32>(),
+            mismatched_i32: baseline_bytes.abs_diff(candidate_bytes) / std::mem::size_of::<i32>(),
+            first_mismatches: Vec::new(),
+            token_summary: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SidebandI32Mismatch {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset_in_token: Option<usize>,
+    baseline: i32,
+    candidate: i32,
+}
+
+#[derive(Serialize)]
+struct SidebandTokenDiffSummary {
+    token_count: usize,
+    width: usize,
+    exact_order_matching_tokens: usize,
+    set_equivalent_tokens: usize,
+    set_mismatched_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_set_mismatch: Option<SidebandTokenSetMismatch>,
+}
+
+#[derive(Serialize)]
+struct SidebandTokenSetMismatch {
+    token_index: usize,
+    baseline_only: Vec<i32>,
+    candidate_only: Vec<i32>,
+}
+
+struct SidebandTokenSetDiff {
+    set_equivalent: bool,
+    baseline_only: Vec<i32>,
+    candidate_only: Vec<i32>,
 }
 
 #[derive(Serialize)]
@@ -2846,6 +3112,8 @@ struct FrameParity {
     sideband_mismatched_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_sideband_mismatch: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sideband_i32_diff: Option<SidebandI32Diff>,
 }
 
 #[derive(Serialize)]
@@ -2943,6 +3211,39 @@ mod tests {
                 .failure_summary
                 .contains("missing_capped_large_prefill_dispatch")
         );
+    }
+
+    #[test]
+    fn sideband_i32_diff_reports_order_and_set_mismatches() {
+        let baseline = i32_sideband_bytes(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let candidate = i32_sideband_bytes(&[0, 2, 1, 3, 4, 5, 8, 7]);
+
+        let comparison = compare_sideband_payloads(&baseline, &candidate, Some(2)).unwrap();
+
+        let diff = comparison.i32_diff.expect("decoded i32 diff");
+        assert!(diff.i32_aligned);
+        assert_eq!(diff.baseline_i32_count, 8);
+        assert_eq!(diff.candidate_i32_count, 8);
+        assert_eq!(diff.mismatched_i32, 3);
+        assert_eq!(diff.first_mismatches[0].index, 1);
+        assert_eq!(diff.first_mismatches[0].token_index, Some(0));
+        assert_eq!(diff.first_mismatches[0].offset_in_token, Some(1));
+        assert_eq!(diff.first_mismatches[0].baseline, 1);
+        assert_eq!(diff.first_mismatches[0].candidate, 2);
+
+        let token_summary = diff.token_summary.expect("token summary");
+        assert_eq!(token_summary.token_count, 2);
+        assert_eq!(token_summary.width, 4);
+        assert_eq!(token_summary.exact_order_matching_tokens, 0);
+        assert_eq!(token_summary.set_equivalent_tokens, 1);
+        assert_eq!(token_summary.set_mismatched_tokens, 1);
+
+        let first_set_mismatch = token_summary
+            .first_set_mismatch
+            .expect("first set mismatch");
+        assert_eq!(first_set_mismatch.token_index, 1);
+        assert_eq!(first_set_mismatch.baseline_only, vec![6]);
+        assert_eq!(first_set_mismatch.candidate_only, vec![8]);
     }
 
     #[test]
@@ -3510,5 +3811,12 @@ mod tests {
             threads_x,
             threads_y: Some(1),
         }
+    }
+
+    fn i32_sideband_bytes(values: &[i32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
     }
 }
