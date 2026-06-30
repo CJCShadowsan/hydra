@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,6 +106,8 @@ GGUF_MTP_NAMES = [
     "nextn.hnorm.weight",
     "nextn.shared_head_norm.weight",
 ]
+
+LAYER_RE = re.compile(r"^blk\.(\d+)\.")
 
 
 @dataclass
@@ -216,6 +219,13 @@ def gguf_paths(root: Path) -> list[Path]:
     if not paths:
         fail(f"no GGUF files found under {root}")
     return paths
+
+
+def tensor_layer(name: str) -> int | None:
+    match = LAYER_RE.match(name)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def read_safetensors_header(path: Path) -> dict[str, object]:
@@ -427,6 +437,67 @@ def verify_gguf_inventory(
     }
 
 
+def stale_shard_report(root: Path, expected_target_layers: int, expected_nextn_layers: int) -> dict[str, object]:
+    paths = gguf_paths(root)
+    stale_files: list[dict[str, object]] = []
+    stale_layers: set[int] = set()
+    merged = Inventory()
+
+    for path in paths:
+        inventory = parse_gguf_header(path)
+        merged.files += 1
+        merged.tensors.update(inventory.tensors)
+        for key, value in inventory.metadata.items():
+            merged.metadata.setdefault(key, value)
+
+        unsplit_kv_b = sorted(name for name in inventory.tensors if name.endswith(".attn_kv_b.weight"))
+        if not unsplit_kv_b:
+            continue
+
+        layers = sorted({layer for name in unsplit_kv_b if (layer := tensor_layer(name)) is not None})
+        stale_layers.update(layers)
+        stale_files.append(
+            {
+                "file": str(path),
+                "unsplit_kv_b_count": len(unsplit_kv_b),
+                "layers": layers,
+                "examples": unsplit_kv_b[:5],
+            }
+        )
+
+    expected_block_count = expected_target_layers + expected_nextn_layers
+    mtp_layer = expected_target_layers
+    required_mtp_split = [
+        gguf_name(mtp_layer, "attn_k_b.weight"),
+        gguf_name(mtp_layer, "attn_v_b.weight"),
+    ]
+    missing_mtp_split = [name for name in required_mtp_split if name not in merged.tensors]
+    missing_metadata = [
+        key
+        for key in [
+            "general.architecture",
+            "glm-dsa.block_count",
+            "glm-dsa.nextn_predict_layers",
+            "glm-dsa.attention.indexer.types",
+        ]
+        if key not in merged.metadata
+    ]
+
+    return {
+        "gguf_files": len(paths),
+        "gguf_tensors": len(merged.tensors),
+        "metadata_missing": missing_metadata,
+        "block_count": merged.metadata.get("glm-dsa.block_count"),
+        "expected_block_count": expected_block_count,
+        "stale_file_count": len(stale_files),
+        "stale_layer_count": len(stale_layers),
+        "stale_layers": sorted(stale_layers),
+        "stale_files": stale_files,
+        "missing_mtp_split_tensors": missing_mtp_split,
+        "contains_mtp_unsplit_kv_b": gguf_name(mtp_layer, "attn_kv_b.weight") in merged.tensors,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True, help="GLM-5.2 SafeTensors checkpoint directory")
@@ -437,6 +508,11 @@ def parse_args() -> argparse.Namespace:
         "--partial-gguf",
         action="store_true",
         help="Validate GGUF metadata and present tensor names without requiring every block tensor.",
+    )
+    parser.add_argument(
+        "--stale-shard-report",
+        action="store_true",
+        help="Print a non-failing read-only report of GGUF shards that still contain stale unsplit GLM-DSA tensors.",
     )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
@@ -451,7 +527,15 @@ def main() -> None:
             args.expected_nextn_layers,
         )
     }
-    if args.gguf:
+    if args.stale_shard_report:
+        if not args.gguf:
+            fail("--stale-shard-report requires --gguf")
+        summary["stale_shard_report"] = stale_shard_report(
+            args.gguf,
+            args.expected_target_layers,
+            args.expected_nextn_layers,
+        )
+    elif args.gguf:
         summary["gguf"] = verify_gguf_inventory(
             args.gguf,
             args.expected_target_layers,
