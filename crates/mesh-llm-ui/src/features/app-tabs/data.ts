@@ -959,28 +959,6 @@ export const CONFIGURATION_DEFAULTS = {
       }
     },
     {
-      id: 'llamacpp-flavor',
-      categoryId: 'runtime',
-      tomlSection: 'defaults.hardware',
-      tomlKey: 'model_runtime',
-      icon: 'binary',
-      label: 'Model Runtime',
-      description: 'Select the default runtime target for new placements.',
-      inheritedLabel: 'Override when a model needs a specialized runner',
-      control: {
-        kind: 'choice',
-        name: 'model_runtime',
-        value: 'cuda',
-        options: [
-          { value: 'cuda', label: 'cuda' },
-          { value: 'rocm', label: 'rocm' },
-          { value: 'metal', label: 'metal' },
-          { value: 'vulkan', label: 'vulkan' },
-          { value: 'cpu', label: 'cpu' }
-        ]
-      }
-    },
-    {
       id: 'hardware-device',
       categoryId: 'runtime',
       tomlSection: 'defaults.hardware',
@@ -1032,7 +1010,7 @@ export const CONFIGURATION_DEFAULTS = {
       inheritedLabel: 'Applied when a placement does not override context size',
       tomlSection: MODEL_FIT_TOML_SECTION,
       mutability: 'restart-required',
-      control: { kind: 'range', name: 'ctx_size', value: '512', min: 512, max: 131072, step: 512, unit: 'tokens' }
+      control: { kind: 'range', name: 'ctx_size', value: '2048', min: 2048, max: 262144, step: 512, unit: 'tokens' }
     },
     {
       id: 'batch',

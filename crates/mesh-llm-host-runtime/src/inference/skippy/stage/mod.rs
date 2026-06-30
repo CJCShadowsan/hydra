@@ -398,6 +398,7 @@ impl StageControlState {
             async_prefill_forward: true,
             downstream_wire_condition: WireCondition::new(0.0, None)?,
             downstream_connect_timeout_secs: 30,
+            native_mtp_enabled: effective_load.native_mtp_enabled,
             openai: None,
         });
         tracing::info!(
@@ -766,6 +767,7 @@ fn stage_config(
         use_mmap_buffer: true,
         selected_device: load.selected_device.clone(),
         kv_cache: None,
+        native_mtp_enabled: load.native_mtp_enabled,
         load_mode: load.load_mode.clone(),
         bind_addr: load.bind_addr.clone(),
         upstream: load.upstream.as_ref().map(peer_config),

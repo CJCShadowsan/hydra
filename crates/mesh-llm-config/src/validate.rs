@@ -11,6 +11,7 @@ use crate::plugin_validation::{
 use crate::*;
 use anyhow::Result;
 use semver::{BuildMetadata, Version};
+use url::Url;
 
 fn parsed_config_path(raw_path: &str) -> Option<ConfigPath> {
     ConfigPath::parse_rendered(raw_path).ok()
@@ -34,6 +35,33 @@ pub(crate) fn validation_diagnostic(
     diagnostic
 }
 
+fn validate_duplicate_model_entries(
+    models: &[ModelConfigEntry],
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    for i in 0..models.len() {
+        for j in (i + 1)..models.len() {
+            if models[i].model == models[j].model
+                && models[i].derived_profile() == models[j].derived_profile()
+            {
+                let profile_i = models[i].derived_profile();
+                let profile_clause = if profile_i.is_empty() {
+                    " and default profile".to_string()
+                } else {
+                    format!(" and profile=\"{profile_i}\"")
+                };
+                diagnostics.push(validation_diagnostic(
+                    "models",
+                    format!(
+                        "duplicate model entry: models[{i}] and models[{j}] both have model=\"{}\"{profile_clause}",
+                        models[i].model,
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic> {
     let mut diagnostics = Vec::new();
 
@@ -55,6 +83,27 @@ pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic>
         ));
     }
     if let Some(advertise_addr) = config.owner_control.advertise_addr {
+        match config.owner_control.bind {
+            Some(bind) if bind.port() == 0 => {
+                diagnostics.push(validation_diagnostic(
+                    "owner_control.bind",
+                    "owner_control.bind must use a concrete port when owner_control.advertise_addr is set",
+                ));
+            }
+            Some(bind) if bind.port() != advertise_addr.port() => {
+                diagnostics.push(validation_diagnostic(
+                    "owner_control.advertise_addr",
+                    "owner_control.advertise_addr must use the same port as owner_control.bind",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                diagnostics.push(validation_diagnostic(
+                    "owner_control.advertise_addr",
+                    "owner_control.advertise_addr requires owner_control.bind so the advertised port is actually listening",
+                ));
+            }
+        }
         if advertise_addr.port() == 0 {
             diagnostics.push(validation_diagnostic(
                 "owner_control.advertise_addr",
@@ -80,6 +129,9 @@ pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic>
         diagnostics.push(diagnostic);
     }
     if let Err(diagnostic) = validate_telemetry_config(&config.telemetry) {
+        diagnostics.push(diagnostic);
+    }
+    if let Err(diagnostic) = validate_runtime_config(&config.runtime) {
         diagnostics.push(diagnostic);
     }
     if let Err(diagnostic) = validate_plugin_entries(&config.plugins) {
@@ -112,7 +164,40 @@ pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic>
         }
     }
 
+    validate_duplicate_model_entries(&config.models, &mut diagnostics);
+
     diagnostics
+}
+
+fn validate_runtime_config(config: &RuntimeConfig) -> DiagnosticResult {
+    let mesh_version = config.native_runtime.mesh_version.as_deref();
+    let skippy_abi = config.native_runtime.skippy_abi.as_deref();
+    let selection = config.native_runtime.selection.as_deref();
+    if mesh_version.is_none() && (skippy_abi.is_some() || selection.is_some()) {
+        return Err(validation_diagnostic(
+            "runtime.native_runtime",
+            "runtime.native_runtime override must set mesh_version when skippy_abi or selection is set",
+        ));
+    }
+    if matches!(mesh_version, Some(value) if value.trim().is_empty()) {
+        return Err(validation_diagnostic(
+            "runtime.native_runtime.mesh_version",
+            "runtime.native_runtime.mesh_version must not be empty",
+        ));
+    }
+    if matches!(skippy_abi, Some(value) if value.trim().is_empty()) {
+        return Err(validation_diagnostic(
+            "runtime.native_runtime.skippy_abi",
+            "runtime.native_runtime.skippy_abi must not be empty",
+        ));
+    }
+    if matches!(selection, Some(value) if value.trim().is_empty()) {
+        return Err(validation_diagnostic(
+            "runtime.native_runtime.selection",
+            "runtime.native_runtime.selection must not be empty",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_config_diagnostics_with_plugin_schemas<F>(
@@ -197,6 +282,14 @@ fn validate_model_defaults(
     }
     if let Some(hardware) = &defaults.hardware {
         validate_hardware(hardware, &format!("{base_path}.hardware"), gpu_assignment)?;
+        validate_gpu_assignment_constraints(
+            Some(hardware),
+            None,
+            None,
+            &format!("{base_path}.hardware.device"),
+            gpu_assignment,
+            false,
+        )?;
     }
     if let Some(throughput) = &defaults.throughput {
         validate_throughput(throughput, &format!("{base_path}.throughput"))?;
@@ -293,6 +386,7 @@ fn validate_model_entry(
             .flatten(),
         &format!("{base_path}.hardware.device"),
         gpu_assignment,
+        true,
     )?;
     Ok(())
 }
@@ -303,14 +397,20 @@ fn validate_gpu_assignment_constraints(
     legacy_gpu_id: Option<&str>,
     device_path: &str,
     gpu_assignment: GpuAssignment,
+    require_pinned_device: bool,
 ) -> DiagnosticResult {
-    if matches!(gpu_assignment, GpuAssignment::Auto) && legacy_gpu_id.is_some() {
-        return Err(validation_diagnostic(
-            device_path,
-            format!("{device_path} must not be set when gpu.assignment = \"auto\""),
-        ));
+    if matches!(gpu_assignment, GpuAssignment::Auto) {
+        let explicit_device = hardware
+            .and_then(|config| config.device.as_deref())
+            .is_some_and(|device| !device.trim().is_empty());
+        if explicit_device || legacy_gpu_id.is_some() {
+            return Err(validation_diagnostic(
+                device_path,
+                format!("{device_path} must not be set when gpu.assignment = \"auto\""),
+            ));
+        }
     }
-    if matches!(gpu_assignment, GpuAssignment::Pinned) {
+    if require_pinned_device && matches!(gpu_assignment, GpuAssignment::Pinned) {
         match hardware
             .and_then(|config| config.device.as_deref())
             .or(inherited_device)
@@ -330,9 +430,14 @@ fn validate_gpu_assignment_constraints(
 }
 
 fn validate_model_fit(config: &ModelFitConfig, base_path: &str) -> DiagnosticResult {
-    validate_optional_positive_u32(config.ctx_size, &format!("{base_path}.ctx_size"))?;
-    validate_optional_positive_u32(config.batch, &format!("{base_path}.batch"))?;
-    validate_optional_positive_u32(config.ubatch, &format!("{base_path}.ubatch"))?;
+    validate_optional_u32_range(
+        config.ctx_size,
+        &format!("{base_path}.ctx_size"),
+        1,
+        1_000_000,
+    )?;
+    validate_optional_u32_range(config.batch, &format!("{base_path}.batch"), 1, 10_000_000)?;
+    validate_optional_u32_range(config.ubatch, &format!("{base_path}.ubatch"), 1, 10_000_000)?;
     if let (Some(batch), Some(ubatch)) = (config.batch, config.ubatch)
         && ubatch > batch
     {
@@ -341,11 +446,11 @@ fn validate_model_fit(config: &ModelFitConfig, base_path: &str) -> DiagnosticRes
             format!("{base_path}.ubatch must be less than or equal to {base_path}.batch"),
         ));
     }
-    validate_optional_non_empty(
+    validate_optional_kv_cache_type(
         config.cache_type_k.as_deref(),
         &format!("{base_path}.cache_type_k"),
     )?;
-    validate_optional_non_empty(
+    validate_optional_kv_cache_type(
         config.cache_type_v.as_deref(),
         &format!("{base_path}.cache_type_v"),
     )?;
@@ -390,19 +495,29 @@ fn validate_model_fit(config: &ModelFitConfig, base_path: &str) -> DiagnosticRes
             format!("{base_path}.keep_tokens must be less than or equal to {base_path}.ctx_size"),
         ));
     }
-    validate_optional_positive_u32(
+    validate_optional_u32_range(
+        config.keep_tokens,
+        &format!("{base_path}.keep_tokens"),
+        1,
+        1_000_000,
+    )?;
+    validate_optional_u32_range(
         config.checkpoint_interval,
         &format!("{base_path}.checkpoint_interval"),
+        1,
+        10_000_000,
     )?;
-    validate_optional_positive_u32(
+    validate_optional_u32_range(
         config.checkpoint_count,
         &format!("{base_path}.checkpoint_count"),
+        1,
+        10_000_000,
     )?;
-    validate_optional_non_empty(
+    validate_optional_path(
         config.lookup_cache_static.as_deref(),
         &format!("{base_path}.lookup_cache_static"),
     )?;
-    validate_optional_non_empty(
+    validate_optional_path(
         config.lookup_cache_dynamic.as_deref(),
         &format!("{base_path}.lookup_cache_dynamic"),
     )?;
@@ -414,15 +529,29 @@ fn validate_prefix_cache(config: &PrefixCacheConfig, base_path: &str) -> Diagnos
         return Ok(());
     }
     if config.enabled == Some(true) {
-        validate_optional_positive_u32(config.max_entries, &format!("{base_path}.max_entries"))?;
-        validate_optional_positive_u32(config.min_tokens, &format!("{base_path}.min_tokens"))?;
-        validate_optional_positive_u32(
+        validate_optional_u32_range(
+            config.max_entries,
+            &format!("{base_path}.max_entries"),
+            1,
+            10_000_000,
+        )?;
+        validate_optional_u32_range(
+            config.min_tokens,
+            &format!("{base_path}.min_tokens"),
+            1,
+            10_000_000,
+        )?;
+        validate_optional_u32_range(
             config.shared_stride_tokens,
             &format!("{base_path}.shared_stride_tokens"),
+            1,
+            10_000_000,
         )?;
-        validate_optional_positive_u32(
+        validate_optional_u32_range(
             config.shared_record_limit,
             &format!("{base_path}.shared_record_limit"),
+            1,
+            10_000_000,
         )?;
     }
     validate_optional_enum(
@@ -545,11 +674,11 @@ fn validate_hardware(
         &format!("{base_path}.hf_repo"),
         &format!("{base_path}.hf_file"),
     )?;
-    validate_optional_non_empty(
+    validate_optional_path(
         config.model_path.as_deref(),
         &format!("{base_path}.model_path"),
     )?;
-    validate_optional_non_empty(config.mmproj.as_deref(), &format!("{base_path}.mmproj"))?;
+    validate_optional_path(config.mmproj.as_deref(), &format!("{base_path}.mmproj"))?;
     validate_bool_or_auto(
         config.mmproj_offload.as_ref(),
         &format!("{base_path}.mmproj_offload"),
@@ -601,7 +730,7 @@ fn validate_throughput(config: &ThroughputConfig, base_path: &str) -> Diagnostic
             }
         }
     }
-    validate_optional_non_empty(config.numa.as_deref(), &format!("{base_path}.numa"))?;
+
     if let Some(slot_prompt_similarity) = config.slot_prompt_similarity
         && slot_prompt_similarity < 0.0
     {
@@ -625,26 +754,14 @@ fn validate_throughput(config: &ThroughputConfig, base_path: &str) -> Diagnostic
 }
 
 fn validate_skippy(config: &SkippyConfig, base_path: &str) -> DiagnosticResult {
-    validate_optional_non_empty(
+    validate_optional_path(
         config.stage_model_path.as_deref(),
         &format!("{base_path}.stage_model_path"),
-    )?;
-    validate_optional_non_empty(
-        config.stage_role.as_deref(),
-        &format!("{base_path}.stage_role"),
-    )?;
-    validate_optional_non_empty(
-        config.stage_topology.as_deref(),
-        &format!("{base_path}.stage_topology"),
     )?;
     validate_optional_enum(
         config.activation_wire_dtype.as_deref(),
         &["auto", "f16", "f32", "q8"],
         &format!("{base_path}.activation_wire_dtype"),
-    )?;
-    validate_optional_non_empty(
-        config.binary_stage_transport.as_deref(),
-        &format!("{base_path}.binary_stage_transport"),
     )?;
     if config.openai_frontend_mode.is_some() {
         return Err(validation_diagnostic(
@@ -694,9 +811,18 @@ fn validate_skippy(config: &SkippyConfig, base_path: &str) -> DiagnosticResult {
 
 fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> DiagnosticResult {
     validate_optional_enum(
+        config.strategy.as_deref(),
+        &["auto", "disabled", "native-mtp-n1"],
+        &format!("{base_path}.strategy"),
+    )?;
+    validate_optional_enum(
         config.mode.as_deref(),
         &["auto", "disabled", "draft", "ngram"],
         &format!("{base_path}.mode"),
+    )?;
+    validate_optional_path(
+        config.draft_model_path.as_deref(),
+        &format!("{base_path}.draft_model_path"),
     )?;
     validate_hf_pair(
         config.draft_hf_repo.as_deref(),
@@ -720,9 +846,17 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
         ],
         &format!("{base_path}.pairing_fault"),
     )?;
-    validate_optional_positive_u32(
+    validate_optional_u32_range(
+        config.draft_min_tokens,
+        &format!("{base_path}.draft_min_tokens"),
+        1,
+        10_000_000,
+    )?;
+    validate_optional_u32_range(
         config.draft_max_tokens,
         &format!("{base_path}.draft_max_tokens"),
+        1,
+        10_000_000,
     )?;
     if let (Some(min), Some(max)) = (config.draft_min_tokens, config.draft_max_tokens)
         && min > max
@@ -750,21 +884,27 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
             format!("{base_path}.draft_gpu_layers must be at least -1"),
         ));
     }
-    validate_optional_non_empty(
-        config.draft_device.as_deref(),
-        &format!("{base_path}.draft_device"),
-    )?;
     validate_optional_positive_usize(config.draft_threads, &format!("{base_path}.draft_threads"))?;
-    validate_optional_non_empty(
+    validate_optional_kv_cache_type(
         config.draft_cache_type_k.as_deref(),
         &format!("{base_path}.draft_cache_type_k"),
     )?;
-    validate_optional_non_empty(
+    validate_optional_kv_cache_type(
         config.draft_cache_type_v.as_deref(),
         &format!("{base_path}.draft_cache_type_v"),
     )?;
-    validate_optional_positive_u32(config.ngram_min, &format!("{base_path}.ngram_min"))?;
-    validate_optional_positive_u32(config.ngram_max, &format!("{base_path}.ngram_max"))?;
+    validate_optional_u32_range(
+        config.ngram_min,
+        &format!("{base_path}.ngram_min"),
+        1,
+        10_000_000,
+    )?;
+    validate_optional_u32_range(
+        config.ngram_max,
+        &format!("{base_path}.ngram_max"),
+        1,
+        10_000_000,
+    )?;
     if let (Some(min), Some(max)) = (config.ngram_min, config.ngram_max)
         && max < min
     {
@@ -793,7 +933,12 @@ fn validate_speculative(config: &SpeculativeConfig, base_path: &str) -> Diagnost
 }
 
 fn validate_request_defaults(config: &RequestDefaultsConfig, base_path: &str) -> DiagnosticResult {
-    validate_optional_positive_u32(config.max_tokens, &format!("{base_path}.max_tokens"))?;
+    validate_optional_u32_range(
+        config.max_tokens,
+        &format!("{base_path}.max_tokens"),
+        1,
+        10_000_000,
+    )?;
     if let Some(stop) = &config.stop {
         match stop {
             StringOrStringList::String(value) => {
@@ -872,10 +1017,6 @@ fn validate_request_defaults(config: &RequestDefaultsConfig, base_path: &str) ->
     if let Some(samplers) = &config.samplers {
         validate_string_list(samplers, &format!("{base_path}.samplers"))?;
     }
-    validate_optional_non_empty(
-        config.sampler_sequence.as_deref(),
-        &format!("{base_path}.sampler_sequence"),
-    )?;
     if config.backend_sampling.is_some() {
         return Err(validation_diagnostic(
             &format!("{base_path}.backend_sampling"),
@@ -907,17 +1048,9 @@ fn validate_request_defaults(config: &RequestDefaultsConfig, base_path: &str) ->
             )?,
         }
     }
-    validate_optional_non_empty(
-        config.chat_template.as_deref(),
-        &format!("{base_path}.chat_template"),
-    )?;
-    validate_optional_non_empty(
+    validate_optional_path(
         config.chat_template_file.as_deref(),
         &format!("{base_path}.chat_template_file"),
-    )?;
-    validate_optional_non_empty(
-        config.system_prompt.as_deref(),
-        &format!("{base_path}.system_prompt"),
     )?;
     if config.grammar.is_some() {
         return Err(validation_diagnostic(
@@ -975,14 +1108,26 @@ fn validate_multimodal_pair(
 }
 
 fn validate_multimodal(config: &MultimodalConfig, base_path: &str) -> DiagnosticResult {
-    validate_optional_non_empty(config.mmproj.as_deref(), &format!("{base_path}.mmproj"))?;
-    validate_optional_non_empty(
+    validate_optional_path(config.mmproj.as_deref(), &format!("{base_path}.mmproj"))?;
+    validate_optional_http_url(
         config.mmproj_url.as_deref(),
         &format!("{base_path}.mmproj_url"),
     )?;
     validate_bool_or_auto(
         config.mmproj_offload.as_ref(),
         &format!("{base_path}.mmproj_offload"),
+    )?;
+    validate_optional_u32_range(
+        config.image_min_tokens,
+        &format!("{base_path}.image_min_tokens"),
+        1,
+        10_000_000,
+    )?;
+    validate_optional_u32_range(
+        config.image_max_tokens,
+        &format!("{base_path}.image_max_tokens"),
+        1,
+        10_000_000,
     )?;
     if let (Some(min), Some(max)) = (config.image_min_tokens, config.image_max_tokens)
         && min > max
@@ -1071,19 +1216,22 @@ fn validate_advanced(config: &AdvancedConfig, base_path: &str) -> DiagnosticResu
                 format!("{base_path}.server.api_prefix is documented-rejected and must not be set"),
             ));
         }
-        validate_optional_non_empty(
-            server.alias.as_deref(),
-            &format!("{base_path}.server.alias"),
-        )?;
     }
     Ok(())
 }
 
-fn validate_optional_positive_u32(value: Option<u32>, path: &str) -> DiagnosticResult {
-    if value == Some(0) {
+fn validate_optional_u32_range(
+    value: Option<u32>,
+    path: &str,
+    min: u32,
+    max: u32,
+) -> DiagnosticResult {
+    if let Some(value) = value
+        && (value < min || value > max)
+    {
         return Err(validation_diagnostic(
             path,
-            format!("{path} must be at least 1 when set"),
+            format!("{path} must be between {min} and {max}, got {value}"),
         ));
     }
     Ok(())
@@ -1109,13 +1257,6 @@ fn validate_optional_positive_usize(value: Option<usize>, path: &str) -> Diagnos
     Ok(())
 }
 
-fn validate_optional_non_empty(value: Option<&str>, path: &str) -> DiagnosticResult {
-    if let Some(value) = value {
-        validate_non_empty(value, path)?;
-    }
-    Ok(())
-}
-
 fn validate_non_empty(value: &str, path: &str) -> DiagnosticResult {
     if value.trim().is_empty() {
         return Err(validation_diagnostic(
@@ -1131,6 +1272,16 @@ fn validate_optional_enum(value: Option<&str>, allowed: &[&str], path: &str) -> 
         validate_allowed(value, allowed, path)?;
     }
     Ok(())
+}
+
+fn validate_optional_kv_cache_type(value: Option<&str>, path: &str) -> DiagnosticResult {
+    validate_optional_enum(
+        value,
+        &[
+            "auto", "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+        ],
+        path,
+    )
 }
 
 fn validate_allowed(value: &str, allowed: &[&str], path: &str) -> DiagnosticResult {
@@ -1150,6 +1301,27 @@ fn validate_allowed(value: &str, allowed: &[&str], path: &str) -> DiagnosticResu
 fn validate_bool_or_auto(value: Option<&BoolOrAuto>, path: &str) -> DiagnosticResult {
     if let Some(BoolOrAuto::String(value)) = value {
         validate_allowed(value, &["auto"], path)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_http_url(value: Option<&str>, path: &str) -> DiagnosticResult {
+    if let Some(value) = value {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            let url = Url::parse(trimmed).map_err(|_| {
+                validation_diagnostic(
+                    path,
+                    format!("{path} must be a valid URL (http:// or https://)"),
+                )
+            })?;
+            if url.scheme() != "http" && url.scheme() != "https" {
+                return Err(validation_diagnostic(
+                    path,
+                    format!("{path} must use http:// or https:// scheme"),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1196,14 +1368,14 @@ fn validate_hf_pair(
     repo_path: &str,
     file_path: &str,
 ) -> DiagnosticResult {
-    validate_optional_non_empty(repo, repo_path)?;
-    validate_optional_non_empty(file, file_path)?;
-    match (repo, file) {
-        (Some(_), None) => Err(validation_diagnostic(
+    let repo_present = repo.is_some_and(|v| !v.trim().is_empty());
+    let file_present = file.is_some_and(|v| !v.trim().is_empty());
+    match (repo_present, file_present) {
+        (true, false) => Err(validation_diagnostic(
             file_path,
             format!("{file_path} must be set when {repo_path} is set"),
         )),
-        (None, Some(_)) => Err(validation_diagnostic(
+        (false, true) => Err(validation_diagnostic(
             repo_path,
             format!("{repo_path} must be set when {file_path} is set"),
         )),
@@ -1214,6 +1386,34 @@ fn validate_hf_pair(
 fn validate_string_list(values: &[String], path: &str) -> DiagnosticResult {
     for value in values {
         validate_non_empty(value, path)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_path(value: Option<&str>, path: &str) -> DiagnosticResult {
+    if let Some(value) = value {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            validate_path_chars(trimmed, path)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_path_chars(value: &str, path: &str) -> DiagnosticResult {
+    if value.contains('\0') {
+        return Err(validation_diagnostic(
+            path,
+            format!("{path} must not contain NUL bytes"),
+        ));
+    }
+    for ch in value.chars() {
+        if ch.is_control() {
+            return Err(validation_diagnostic(
+                path,
+                format!("{path} must not contain control characters"),
+            ));
+        }
     }
     Ok(())
 }
@@ -1312,30 +1512,26 @@ fn version_precedence_cmp(left: &Version, right: &Version) -> std::cmp::Ordering
 }
 
 fn validate_telemetry_config(config: &TelemetryConfig) -> DiagnosticResult {
-    if let Some(service_name) = &config.service_name
-        && service_name.trim().is_empty()
-    {
-        return Err(validation_diagnostic(
-            "telemetry.service_name",
-            "telemetry.service_name must not be empty when set",
-        ));
+    if let Some(service_name) = &config.service_name {
+        let trimmed = service_name.trim();
+        if !trimmed.is_empty() {
+            // Validate service name: alphanumeric, dash, underscore only
+            if !trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(validation_diagnostic(
+                    "telemetry.service_name",
+                    "telemetry.service_name must contain only alphanumeric characters, dashes, and underscores",
+                ));
+            }
+        }
     }
-    if let Some(endpoint) = &config.endpoint
-        && endpoint.trim().is_empty()
-    {
-        return Err(validation_diagnostic(
-            "telemetry.endpoint",
-            "telemetry.endpoint must not be empty when set",
-        ));
-    }
-    if let Some(endpoint) = &config.metrics.endpoint
-        && endpoint.trim().is_empty()
-    {
-        return Err(validation_diagnostic(
-            "telemetry.metrics.endpoint",
-            "telemetry.metrics.endpoint must not be empty when set",
-        ));
-    }
+    validate_optional_http_url(config.endpoint.as_deref(), "telemetry.endpoint")?;
+    validate_optional_http_url(
+        config.metrics.endpoint.as_deref(),
+        "telemetry.metrics.endpoint",
+    )?;
     for key in config.headers.keys() {
         if key.trim().is_empty() {
             return Err(validation_diagnostic(
@@ -1466,6 +1662,65 @@ mod schema_tests {
     }
 
     #[test]
+    fn owner_control_advertise_addr_requires_matching_bind_port() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[owner_control]
+advertise_addr = "127.0.0.1:17001"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(
+            legacy_validation_error_text(&diagnostics).contains(
+                "owner_control.advertise_addr requires owner_control.bind so the advertised port is actually listening"
+            )
+        );
+
+        let config: MeshConfig = toml::from_str(
+            r#"
+[owner_control]
+bind = "127.0.0.1:17002"
+advertise_addr = "127.0.0.1:17001"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(
+            legacy_validation_error_text(&diagnostics).contains(
+                "owner_control.advertise_addr must use the same port as owner_control.bind"
+            )
+        );
+
+        let config: MeshConfig = toml::from_str(
+            r#"
+[owner_control]
+bind = "127.0.0.1:0"
+advertise_addr = "127.0.0.1:17001"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(legacy_validation_error_text(&diagnostics).contains(
+            "owner_control.bind must use a concrete port when owner_control.advertise_addr is set"
+        ));
+
+        let config: MeshConfig = toml::from_str(
+            r#"
+[owner_control]
+bind = "127.0.0.1:17001"
+advertise_addr = "127.0.0.1:17001"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        validate_config(&config).expect("matching bind and advertise ports should validate");
+    }
+
+    #[test]
     fn structured_diagnostics_report_canonical_path_for_alias_backed_invalid_input() {
         let config: MeshConfig = toml::from_str(
             r#"
@@ -1511,6 +1766,29 @@ gpu_id = "metal:0"
     }
 
     #[test]
+    fn speculative_strategy_rejects_unknown_values() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+[defaults.speculative]
+strategy = "mystery-oracle"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].path.as_ref().map(ConfigPath::render),
+            Some("defaults.speculative.strategy".to_string())
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("defaults.speculative.strategy must be one of")
+        );
+    }
+
+    #[test]
     fn legacy_validation_errors_derive_compatible_string_messages() {
         let config: MeshConfig = toml::from_str(
             r#"
@@ -1538,6 +1816,91 @@ connect_timeout_secs = 0
         assert_eq!(
             err.to_string(),
             "plugin[0].startup.connect_timeout_secs must be at least 1 when set"
+        );
+    }
+
+    #[test]
+    fn duplicate_model_with_same_profile_is_rejected() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+defaults.runtime = "metal"
+
+[[models]]
+model = "Qwen/Qwen3-8B-GGUF:Q4_K_M"
+profile = "gaming"
+
+[[models]]
+model = "Qwen/Qwen3-8B-GGUF:Q4_K_M"
+profile = "gaming"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            text.contains("duplicate model entry"),
+            "expected duplicate model error, got: {text}"
+        );
+        assert!(
+            text.contains("models[0]"),
+            "expected reference to models[0], got: {text}"
+        );
+        assert!(
+            text.contains("models[1]"),
+            "expected reference to models[1], got: {text}"
+        );
+    }
+
+    #[test]
+    fn duplicate_model_without_profile_is_rejected() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+defaults.runtime = "metal"
+
+[[models]]
+model = "my-model"
+
+[[models]]
+model = "my-model"
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            text.contains("duplicate model entry"),
+            "expected duplicate model error, got: {text}"
+        );
+        assert!(
+            text.contains("and default profile"),
+            "expected 'and default profile' in error, got: {text}"
+        );
+    }
+
+    #[test]
+    fn same_model_with_different_profiles_is_allowed() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+defaults.runtime = "metal"
+
+[[models]]
+model = "Qwen/Qwen3-8B-GGUF:Q4_K_M"
+ctx_size = 4096
+
+[[models]]
+model = "Qwen/Qwen3-8B-GGUF:Q4_K_M"
+ctx_size = 8192
+"#,
+        )
+        .expect("config should parse before validation");
+
+        let diagnostics = validate_config_diagnostics(&config);
+        let text = legacy_validation_error_text(&diagnostics);
+        assert!(
+            !text.contains("duplicate model entry"),
+            "expected no duplicate error for different derived profiles, got: {text}"
         );
     }
 }

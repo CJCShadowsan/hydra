@@ -326,6 +326,20 @@ installs the recommended compatible native runtime from the release manifest,
 an explicit manifest, or bundle directories. Explicit backend policy or runtime ID
 arguments are overrides for advanced users, CI, and prepared images.
 
+Advanced users can pin runtime resolution in `~/.mesh-llm/config.toml`:
+
+```toml
+[runtime.native_runtime]
+mesh_version = "0.68.0"
+selection = "exact:meshllm-native-runtime-linux-x86_64-cuda12"
+```
+
+`skippy_abi` may also be supplied for strict ABI selection; when omitted,
+install resolves the ABI from the selected release manifest. The configured
+`mesh_version` is honored by startup, `runtime install`, `runtime list
+--available`, `runtime prune`, and `mesh-llm doctor`, so autoupdate pruning does
+not remove a manually pinned runtime version.
+
 Selected-runtime diagnostics belong in `mesh-llm doctor`, not in a separate
 `mesh-llm runtime doctor` command. Doctor output should include the active
 MeshLLM version, selected native runtime ID, backend lane, runtime path,
@@ -364,6 +378,30 @@ Recommended SDK feature shape:
 console assets. Client-only applications should not pull native-runtime
 install/update APIs. Native runtime source builds are not SDK features; native
 runtimes are release artifacts resolved at install/update time.
+
+## Development Loop Boundary
+
+Native runtime artifacts are a distribution boundary, not the normal way to
+iterate on the Skippy ABI. When changing `third_party/llama.cpp/patches`,
+`skippy-ffi`, hidden-state/tensor surfaces, activation-frame execution, or other
+native ABI behavior, build the branch-local native code and Rust together with
+the standard `just build` path. That path prepares the patched llama.cpp
+checkout, builds the static ABI libraries, builds the UI, and links the local
+debug `mesh-llm` binary against those libraries.
+
+Use dynamic native runtimes when validating release, SDK, installer,
+autoupdate, or packaged-app behavior. A dynamic build must load a runtime
+artifact whose `skippy_abi` matches the Rust loader; downloaded release
+artifacts will not contain new branch-local ABI symbols until that runtime has
+also been packaged from the same branch.
+
+For release-mode performance or behavior testing of a new native ABI before a
+matching native runtime package exists, build the release binary with embedded
+branch-local native libraries instead of the default dynamic release path:
+
+```bash
+MESH_LLM_DYNAMIC_NATIVE_RUNTIME=0 just release-build
+```
 
 ## Generated Runtime Crates
 
