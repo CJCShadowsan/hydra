@@ -173,12 +173,15 @@ syntax_checks() {
     "$ROOT/scripts/glm-dsa-indexshare-local-smoke.sh" \
     "$ROOT/scripts/glm-dsa-bf16-rebuild-window.sh" \
     "$ROOT/scripts/glm-dsa-bf16-rebuild-window-test.sh" \
+    "$ROOT/scripts/glm-dsa-bf16-repair-stale-shards.sh" \
+    "$ROOT/scripts/glm-dsa-bf16-repair-stale-shards-test.sh" \
     "$ROOT/scripts/glm-dsa-phase-a-local-gate.sh"
 }
 
 run_rebuild_helper_fixture() {
   phase "BF16 rebuild helper fixture"
   bash "$ROOT/scripts/glm-dsa-bf16-rebuild-window-test.sh"
+  bash "$ROOT/scripts/glm-dsa-bf16-repair-stale-shards-test.sh"
 }
 
 build_local_tools() {
