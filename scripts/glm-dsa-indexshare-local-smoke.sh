@@ -225,7 +225,7 @@ python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
   "$MODEL" \
   "$stale_unsplit_model" \
   --rename-tensor blk.0.attn_v_b.weight=blk.0.attn_kv_b.weight \
-  --set-tensor-shape blk.0.attn_kv_b.weight=2,4
+  --set-tensor-shape blk.0.attn_kv_b.weight=2,5
 
 good_status="$(run_llama good "$MODEL")"
 if [[ "$good_status" != "0" ]]; then
