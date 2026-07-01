@@ -598,7 +598,7 @@ fn effective_relay_urls(policy: RelayPolicy, relay_urls: &[String]) -> Vec<Strin
     match policy {
         RelayPolicy::Disabled | RelayPolicy::ExplicitlyDisabled => Vec::new(),
         RelayPolicy::DefaultPublic if relay_urls.is_empty() => vec![
-            "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
+            "https://usw1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
             "https://aps1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
         ],
         RelayPolicy::DefaultPublic => relay_urls.to_vec(),
