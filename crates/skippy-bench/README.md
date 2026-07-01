@@ -60,6 +60,12 @@ skippy-bench eval sync --pack core
 skippy-bench eval run speed-bench --base-url http://127.0.0.1:9337/v1 --model org/repo:Q4_K_M --metrics-http http://127.0.0.1:18080 --metrics-run-id run-local-qwen
 ```
 
+Benchmark-managed Skippy server runs require a release `skippy-server` binary.
+Run `just release-build` before `run`, `focused-runtime`, `local-single`, or
+local split binary benchmarks. These commands default to
+`target/release/skippy-server` and reject `target/debug/skippy-server` because
+debug builds distort throughput and timeout behavior.
+
 The old standalone `kv-stage-integration` and `kv-hit-regression` commands are
 intentionally absent. Mesh does not carry the legacy standalone cache sidecar
 path; exact cache work should be reintroduced through the embedded runtime and
@@ -108,7 +114,7 @@ The current core pack is:
 | `speed-bench` | llama.cpp `tools/server/bench/speed-bench` | Native SPEED-Bench qualitative run across all categories, no sample limit, `--osl 1024` |
 | `terminal-bench` | Terminal-Bench CLI (`tb`) | `terminal-bench-core==0.1.1`, Terminus agent, no task-id filter |
 | `swe-bench-pro` | Scale SWE-Bench Pro OS repo | Upstream SWE-agent patch generation, patch gathering, and `swe_bench_pro_eval.py` |
-| `mcp-atlas` | Scale MCP-Atlas repo | Native MCP-Atlas completion script and scoring script through auto-started MCP services |
+| `mcp-atlas` | Scale MCP-Atlas repo | Native MCP-Atlas completion script with upstream `--no-filter`, plus scoring through auto-started MCP services |
 
 ```bash
 skippy-bench eval list
@@ -126,6 +132,12 @@ skippy-bench eval run terminal-bench \
 where supported. It is not a SkippyBench dataset limit and does not cap full
 canonical runs. Use `--harness-timeout-secs` only when an operator wants a hard
 wall-clock cap around the native harness process for debugging or CI guardrails.
+`--endpoint-concurrency` declares the target OpenAI endpoint's generation
+concurrency and defaults to `1`. SkippyBench keeps each external harness's LLM
+request concurrency equal to that value. If an adapter-specific request
+concurrency override such as `SWE_BENCH_PRO_NUM_WORKERS` or
+`MCP_ATLAS_COMPLETION_CONCURRENCY` is set to a different value, `eval run`
+fails before launching the native harness.
 
 `sync` clones or installs the external harnesses into
 `~/.cache/mesh-llm/skippy-bench/harnesses/` by default. Use `--cache-root` to
@@ -141,15 +153,45 @@ Docker's daemon is reachable and can start a tiny container, not just that the
 MCP-Atlas starts its Docker agent environment and Python completion service
 when ports `1984` and `3000` are not already reachable, waits for readiness,
 and cleans up only the services that the run started. The adapter runs the
-upstream completion and scoring scripts without Skippy-specific task limits or
-`tool_choice` overrides. By default, the MCP-Atlas scorer uses the same local
+upstream completion script with `--no-filter` so all Hugging Face dataset rows
+are attempted, and without Skippy-specific task limits or `tool_choice`
+overrides. By default, the MCP-Atlas scorer uses the same local
 OpenAI-compatible endpoint/model as the completion run; set `EVAL_LLM_MODEL`,
-`EVAL_LLM_BASE_URL`, and `EVAL_LLM_API_KEY` to use a separate judge model.
-SWE-Bench Pro defaults to the official Docker image namespace (`jefzda`) and
-Modal-backed evaluation. Override `SWE_BENCH_PRO_DOCKERHUB_USERNAME`,
-`SWE_BENCH_PRO_DEPLOYMENT_TYPE`, `SWE_BENCH_PRO_NUM_WORKERS`,
-`SWE_BENCH_PRO_EVAL_WORKERS`, or set `SWE_BENCH_PRO_USE_LOCAL_DOCKER=1` when
-running the full harness in a different environment.
+`EVAL_LLM_BASE_URL`, and `EVAL_LLM_API_KEY` to use a separate judge model. For
+small local Skippy validation models, keep the completion endpoint in normal
+compatibility mode and point the scorer override at a strict structured-output
+endpoint, for example a second `skippy-server serve-openai
+--openai-guardrails enforce` process. The adapter still uses the native scorer
+and does not rewrite score data. For operator resumes, set
+`MCP_ATLAS_COMPLETION_OUTPUT_NAME` to an existing upstream
+`completion_results/*.csv` basename so the native completion script can reuse
+its own resume behavior, and set `MCP_ATLAS_SCORE_CONCURRENCY` to the upstream
+scorer's `--concurrency` value.
+SWE-Bench Pro defaults to the official Docker image namespace (`jefzda`) with
+local Docker deployment and local Docker evaluation so the core pack can run
+without Modal credentials. The adapter first runs upstream
+`helper_code/generate_sweagent_instances.py` for the full dataset, then feeds
+SWE-agent a native `expert_file` instance file so local Docker can set the
+official image platform, clear image entrypoints, and use SWE-agent's
+standalone Python/SWE-Rex Docker runtime. Local Docker runs install SWE-agent
+into a dedicated venv and default `SWE_BENCH_PRO_SWEREX_SPEC` to
+`swe-rex[modal]==1.4.0`, which preserves SWE-ReX's native Docker runtime while
+using the upstream `python:3.11.9-slim-bookworm` builder fix. Modal runs keep
+the Scale SWE-Rex patch flow. Some SWE-Pro base images carry a pip index config
+for an unavailable localhost mirror, so the local Docker adapter defaults
+`SWE_BENCH_PRO_SWEREX_PIP_INDEX_URL` to `https://pypi.org/simple` for the
+derived-image SWE-ReX install step. Override
+`SWE_BENCH_PRO_DOCKERHUB_USERNAME`,
+`SWE_BENCH_PRO_DOCKER_PLATFORM`, `SWE_BENCH_PRO_DEPLOYMENT_TYPE`,
+`SWE_BENCH_PRO_NUM_WORKERS`, `SWE_BENCH_PRO_EVAL_WORKERS`, or
+`SWE_BENCH_PRO_PARSE_FUNCTION`. Use `SWE_BENCH_PRO_PYTHON` to choose the
+SWE-agent venv interpreter and `SWE_BENCH_PRO_SWEREX_SPEC` to override the
+SWE-ReX package spec. Use `SWE_BENCH_PRO_SWEREX_PIP_INDEX_URL` to choose the
+package index used inside SWE-ReX derived Docker images. Set
+`SWE_BENCH_PRO_PARSE_FUNCTION=thought_action` for local OpenAI-compatible
+models that do not emit OpenAI tool calls; this is the upstream SWE-agent
+local-model path. Set `SWE_BENCH_PRO_USE_LOCAL_DOCKER=0` when running the full
+harness in a different environment such as Modal.
 
 Every `eval run` writes `run.json` under the run directory with command status,
 raw artifact paths, wall-clock duration, and normalized metrics where the

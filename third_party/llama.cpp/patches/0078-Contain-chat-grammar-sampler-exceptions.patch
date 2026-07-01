@@ -1,7 +1,7 @@
 From 9f97a0a7cc646fe31d14ff9891bce45144d78dfb Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Sat, 9 May 2026 13:23:46 +1000
-Subject: [PATCH 78/82] Contain chat grammar sampler exceptions
+Subject: [PATCH 78/82] Contain chat grammar sampler failures
 
 ---
  src/skippy.cpp | 42 ++++++++++++++++++++++++++++++++++++++----
@@ -32,7 +32,14 @@ index 27dc78b07..2aa45bb9f 100644
  static enum skippy_status skippy_success(skippy_error ** out_error) {
      if (out_error != nullptr) {
          *out_error = nullptr;
-@@ -1317,8 +1331,16 @@ static bool skippy_init_chat_grammar_sampler(
+@@ -1311,13 +1325,21 @@ static bool skippy_init_chat_grammar_sampler(
+             llama_sampler_init_grammar(vocab, grammar.c_str(), "root");
+     if (session->grammar_sampler == nullptr) {
+-        skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "failed to initialize chat grammar sampler");
+-        return false;
++        fprintf(stderr, "skippy: disabling chat grammar after initialization failed\n");
++        return true;
+     }
  
      if (!grammar_lazy) {
          const std::string generation_prompt = metadata.value("generation_prompt", std::string());
@@ -83,4 +90,3 @@ index 27dc78b07..2aa45bb9f 100644
      if (cur.selected < 0 || static_cast<size_t>(cur.selected) >= cur.size) {
 -- 
 2.54.0 (Apple Git-156)
-

@@ -61,7 +61,7 @@ use crate::{
         forwarded_stage_message, forwarded_stage_message_timed, run_binary_stage_message,
         stage_output_activation_capacity, write_stage_message_conditioned,
     },
-    cli::ServeOpenAiArgs,
+    cli::{OpenAiGuardrailsCliMode, ServeOpenAiArgs},
     config::{load_json, validate_config},
     kv_integration::{KvStageIntegration, proactive_eviction_attrs, proactive_eviction_error_kind},
     runtime_state::{RuntimeSessionStats, RuntimeState, load_runtime},
@@ -193,7 +193,7 @@ pub async fn serve_openai(args: ServeOpenAiArgs) -> Result<()> {
         hook_policy: None,
         kv,
     });
-    let backend = OpenAiGuardrailsConfig::compatibility_for_skippy()
+    let backend = OpenAiGuardrailsConfig::for_standalone_mode(args.openai_guardrails)
         .wrap_backend_with_context_limit(backend, Some(ctx_size));
     let app: Router = instrumented_openai_router(backend, telemetry.clone());
 
@@ -277,6 +277,23 @@ impl OpenAiGuardrailsConfig {
             }
             .into(),
             compaction: None,
+        }
+    }
+
+    pub fn for_standalone_mode(mode: OpenAiGuardrailsCliMode) -> Self {
+        match mode {
+            OpenAiGuardrailsCliMode::Disabled => Self::disabled_for_skippy(),
+            OpenAiGuardrailsCliMode::Metrics => Self::compatibility_for_skippy(),
+            OpenAiGuardrailsCliMode::Enforce => Self {
+                target: OpenAiGuardrailsTarget::Skippy,
+                policy: GuardrailPolicy {
+                    mode: GuardrailMode::Enforce,
+                    apply_to_all_models: true,
+                    ..GuardrailPolicy::default()
+                }
+                .into(),
+                compaction: None,
+            },
         }
     }
 

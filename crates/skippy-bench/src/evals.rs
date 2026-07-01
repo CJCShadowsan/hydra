@@ -87,6 +87,7 @@ struct RunReport {
     eval_id: &'static str,
     model: String,
     base_url: String,
+    endpoint_concurrency: usize,
     run_dir: String,
     dry_run: bool,
     command: String,
@@ -295,6 +296,9 @@ fn doctor_evals(args: EvalDoctorArgs) -> Result<()> {
 }
 
 fn run_eval(args: EvalRunArgs) -> Result<()> {
+    if args.endpoint_concurrency == 0 {
+        bail!("--endpoint-concurrency must be greater than zero");
+    }
     let root = absolute_path(cache_root(args.cache_root.clone())?)?;
     let definition = definition(args.eval);
     let run_dir = absolute_path(output_dir(args.output_dir.clone(), args.eval)?)?;
@@ -333,6 +337,7 @@ fn run_eval(args: EvalRunArgs) -> Result<()> {
         eval_id: definition.id.as_str(),
         model: args.model.clone(),
         base_url: args.base_url.clone(),
+        endpoint_concurrency: args.endpoint_concurrency,
         run_dir: run_dir.display().to_string(),
         dry_run: args.dry_run,
         command: display,
@@ -554,7 +559,7 @@ fn definition(id: EvalId) -> EvalDefinition {
             sync_notes: &["Clones repo and pulls the prebuilt MCP-Atlas Docker image."],
             run_notes: &[
                 "Starts the MCP environment and completion service when they are not already running.",
-                "Runs the MCP-Atlas completion and scoring scripts without --num-tasks or tool_choice overrides.",
+                "Runs the MCP-Atlas completion and scoring scripts with --no-filter and without --num-tasks or tool_choice overrides.",
             ],
         },
     }
@@ -1105,6 +1110,30 @@ fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
+fn env_concurrency_matching_endpoint(
+    var_name: &str,
+    endpoint_concurrency: usize,
+) -> Result<String> {
+    match env::var(var_name) {
+        Ok(value) => {
+            let parsed = value.parse::<usize>().with_context(|| {
+                format!("{var_name} must be a positive integer matching --endpoint-concurrency")
+            })?;
+            if parsed == 0 {
+                bail!("{var_name} must be greater than zero");
+            }
+            if parsed != endpoint_concurrency {
+                bail!(
+                    "{var_name} ({parsed}) must equal --endpoint-concurrency ({endpoint_concurrency}) so native harness request concurrency matches the Skippy endpoint generation concurrency"
+                );
+            }
+            Ok(value)
+        }
+        Err(env::VarError::NotPresent) => Ok(endpoint_concurrency.to_string()),
+        Err(error) => Err(error).with_context(|| format!("read {var_name}")),
+    }
+}
+
 fn run_command(
     definition: EvalDefinition,
     args: &EvalRunArgs,
@@ -1147,7 +1176,7 @@ fn speed_bench_command(
             "--osl".to_string(),
             "1024".to_string(),
             "--concurrency".to_string(),
-            "1".to_string(),
+            args.endpoint_concurrency.to_string(),
             "--timeout".to_string(),
             args.timeout_secs.to_string(),
             "--output".to_string(),
@@ -1177,7 +1206,7 @@ fn terminal_bench_command(args: &EvalRunArgs, run_dir: &Path) -> CommandSpec {
             "--model".to_string(),
             model,
             "--n-concurrent".to_string(),
-            "1".to_string(),
+            args.endpoint_concurrency.to_string(),
             "--output-path".to_string(),
             terminal_bench_output_path(run_dir).display().to_string(),
             "--global-agent-timeout-sec".to_string(),
@@ -1194,14 +1223,14 @@ fn terminal_bench_command(args: &EvalRunArgs, run_dir: &Path) -> CommandSpec {
 fn swe_bench_pro_command(args: &EvalRunArgs, root: &Path, run_dir: &Path) -> Result<CommandSpec> {
     let harness = harness_dir(root, definition(EvalId::SweBenchPro));
     let script = run_dir.join("raw/swe-bench-pro-run.sh");
-    write_swe_bench_pro_run_script(&script, args, &harness, run_dir)?;
+    write_swe_bench_pro_run_script(&script, args, root, &harness, run_dir)?;
     Ok(CommandSpec::new("zsh").args([script.display().to_string()]))
 }
 
 fn mcp_atlas_command(args: &EvalRunArgs, root: &Path, run_dir: &Path) -> Result<CommandSpec> {
     let harness = harness_dir(root, definition(EvalId::McpAtlas));
     let script = run_dir.join("raw/mcp-atlas-run.sh");
-    write_mcp_atlas_run_script(&script, args, &harness, run_dir)?;
+    write_mcp_atlas_run_script(&script, args, root, &harness, run_dir)?;
     Ok(CommandSpec::new("zsh").args([script.display().to_string()]))
 }
 
@@ -1248,14 +1277,19 @@ fn eval_run_id(eval: EvalId) -> String {
 fn write_mcp_atlas_run_script(
     path: &Path,
     args: &EvalRunArgs,
+    cache_root: &Path,
     harness: &Path,
     run_dir: &Path,
 ) -> Result<()> {
     let raw_dir = run_dir.join("raw");
     let completion_dir = harness.join("services/mcp_eval");
-    let output_name = format!("skippybench-{}-completion-results.csv", unix_millis()?);
+    let default_output_name = format!("skippybench-{}-completion-results.csv", unix_millis()?);
     let model_label = model_label(&args.model);
     let score_dir = mcp_atlas_score_dir(run_dir);
+    let completion_concurrency = env_concurrency_matching_endpoint(
+        "MCP_ATLAS_COMPLETION_CONCURRENCY",
+        args.endpoint_concurrency,
+    )?;
     let script = format!(
         r#"#!/usr/bin/env zsh
 set -euo pipefail
@@ -1268,12 +1302,28 @@ API_KEY={api_key}
 MODEL={model}
 EVAL_MODEL=${{EVAL_LLM_MODEL:-$MODEL}}
 OUTPUT={output}
-OUTPUT_NAME={output_name}
+OUTPUT_NAME=${{MCP_ATLAS_COMPLETION_OUTPUT_NAME:-{output_name}}}
 MODEL_LABEL={model_label}
 SCORE_DIR={score_dir}
+COMPLETION_CONCURRENCY={completion_concurrency}
+SCORE_CONCURRENCY=${{MCP_ATLAS_SCORE_CONCURRENCY:-5}}
+HF_HOME_DIR={hf_home}
+HF_DATASETS_CACHE_DIR={hf_datasets_cache}
+UV_CACHE_DIR_LOCAL={uv_cache_dir}
+XDG_CACHE_HOME_DIR={xdg_cache_home}
 agent_started=0
 completion_started=0
 completion_pid=""
+
+mkdir -p \
+  "$HF_HOME_DIR" \
+  "$HF_DATASETS_CACHE_DIR" \
+  "$UV_CACHE_DIR_LOCAL" \
+  "$XDG_CACHE_HOME_DIR"
+export HF_HOME="$HF_HOME_DIR"
+export HF_DATASETS_CACHE="$HF_DATASETS_CACHE_DIR"
+export UV_CACHE_DIR="$UV_CACHE_DIR_LOCAL"
+export XDG_CACHE_HOME="$XDG_CACHE_HOME_DIR"
 
 port_ready() {{
   python3 - "$1" <<'PY'
@@ -1364,7 +1414,8 @@ uv run python mcp_completion_script.py \
     --model "$MODEL" \
     --input_huggingface ScaleAI/MCP-Atlas \
     --output "$OUTPUT_NAME" \
-    --concurrency 5
+    --no-filter \
+    --concurrency "$COMPLETION_CONCURRENCY"
 cp "completion_results/$OUTPUT_NAME" "$OUTPUT"
 EVAL_LLM_BASE_URL="${{EVAL_LLM_BASE_URL:-$BASE_URL}}" \
   EVAL_LLM_API_KEY="${{EVAL_LLM_API_KEY:-$API_KEY}}" \
@@ -1372,7 +1423,8 @@ uv run python mcp_evals_scores.py \
     --input-file "completion_results/$OUTPUT_NAME" \
     --model-label "$MODEL_LABEL" \
     --evaluator-model "$EVAL_MODEL" \
-    --output-dir "$SCORE_DIR"
+    --output-dir "$SCORE_DIR" \
+    --concurrency "$SCORE_CONCURRENCY"
 "#,
         harness = shell_quote(&harness.display().to_string()),
         completion_dir = shell_quote(&completion_dir.display().to_string()),
@@ -1381,9 +1433,14 @@ uv run python mcp_evals_scores.py \
         api_key = shell_quote(&args.api_key),
         model = shell_quote(&litellm_model_name(&args.model)),
         output = shell_quote(&mcp_atlas_output_path(run_dir).display().to_string()),
-        output_name = shell_quote(&output_name),
+        output_name = shell_quote(&default_output_name),
         model_label = shell_quote(&model_label),
         score_dir = shell_quote(&score_dir.display().to_string()),
+        completion_concurrency = shell_quote(&completion_concurrency),
+        hf_home = shell_quote(&cache_root.join("hf").display().to_string()),
+        hf_datasets_cache = shell_quote(&cache_root.join("hf-datasets").display().to_string()),
+        uv_cache_dir = shell_quote(&cache_root.join("uv").display().to_string()),
+        xdg_cache_home = shell_quote(&cache_root.join("xdg").display().to_string()),
     );
     fs::write(path, script).with_context(|| format!("write {}", path.display()))
 }
@@ -1391,23 +1448,33 @@ uv run python mcp_evals_scores.py \
 fn write_swe_bench_pro_run_script(
     path: &Path,
     args: &EvalRunArgs,
+    cache_root: &Path,
     harness: &Path,
     run_dir: &Path,
 ) -> Result<()> {
     let raw_dir = run_dir.join("raw/swe-bench-pro");
     let instances = raw_dir.join("instances.yaml");
+    let expert_instances = raw_dir.join("instances-expert.yaml");
     let sweagent_output = raw_dir.join("sweagent-results");
     let patches = raw_dir.join("patches.json");
     let eval_dir = raw_dir.join("eval");
     let dockerhub_username =
         env::var("SWE_BENCH_PRO_DOCKERHUB_USERNAME").unwrap_or_else(|_| "jefzda".to_string());
     let deployment_type =
-        env::var("SWE_BENCH_PRO_DEPLOYMENT_TYPE").unwrap_or_else(|_| "modal".to_string());
-    let num_workers = env::var("SWE_BENCH_PRO_NUM_WORKERS").unwrap_or_else(|_| "30".to_string());
+        env::var("SWE_BENCH_PRO_DEPLOYMENT_TYPE").unwrap_or_else(|_| "docker".to_string());
+    let num_workers =
+        env_concurrency_matching_endpoint("SWE_BENCH_PRO_NUM_WORKERS", args.endpoint_concurrency)?;
     let eval_workers = env::var("SWE_BENCH_PRO_EVAL_WORKERS").unwrap_or_else(|_| "100".to_string());
+    let docker_platform =
+        env::var("SWE_BENCH_PRO_DOCKER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string());
+    let parse_function = env::var("SWE_BENCH_PRO_PARSE_FUNCTION").ok();
+    let sweagent_python = env::var("SWE_BENCH_PRO_PYTHON").unwrap_or_else(|_| "3.12".to_string());
+    let swerex_spec = env::var("SWE_BENCH_PRO_SWEREX_SPEC").ok();
+    let swerex_pip_index_url = env::var("SWE_BENCH_PRO_SWEREX_PIP_INDEX_URL")
+        .unwrap_or_else(|_| "https://pypi.org/simple".to_string());
     let use_local_eval = env::var("SWE_BENCH_PRO_USE_LOCAL_DOCKER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .unwrap_or(true);
     let local_eval_flag = if use_local_eval {
         "--use_local_docker"
     } else {
@@ -1421,6 +1488,7 @@ set -euo pipefail
 HARNESS={harness}
 RAW_DIR={raw_dir}
 INSTANCES={instances}
+EXPERT_INSTANCES={expert_instances}
 SWEAGENT_OUTPUT={sweagent_output}
 PATCHES={patches}
 EVAL_DIR={eval_dir}
@@ -1432,8 +1500,58 @@ DEPLOYMENT_TYPE={deployment_type}
 NUM_WORKERS={num_workers}
 EVAL_WORKERS={eval_workers}
 LOCAL_EVAL_FLAG={local_eval_flag}
+DOCKER_PLATFORM={docker_platform}
+PARSE_FUNCTION={parse_function}
+SWEAGENT_PYTHON={sweagent_python}
+SWEREX_SPEC={swerex_spec}
+SWEREX_PIP_INDEX_URL={swerex_pip_index_url}
+HF_HOME_DIR={hf_home}
+HF_DATASETS_CACHE_DIR={hf_datasets_cache}
+UV_CACHE_DIR_LOCAL={uv_cache_dir}
+XDG_CACHE_HOME_DIR={xdg_cache_home}
 
-mkdir -p "$RAW_DIR" "$SWEAGENT_OUTPUT" "$EVAL_DIR"
+mkdir -p \
+  "$RAW_DIR" \
+  "$SWEAGENT_OUTPUT" \
+  "$EVAL_DIR" \
+  "$HF_HOME_DIR" \
+  "$HF_DATASETS_CACHE_DIR" \
+  "$UV_CACHE_DIR_LOCAL" \
+  "$XDG_CACHE_HOME_DIR"
+export HF_HOME="$HF_HOME_DIR"
+export HF_DATASETS_CACHE="$HF_DATASETS_CACHE_DIR"
+export UV_CACHE_DIR="$UV_CACHE_DIR_LOCAL"
+export XDG_CACHE_HOME="$XDG_CACHE_HOME_DIR"
+deployment_timeout_args=()
+if [[ "$DEPLOYMENT_TYPE" == "modal" ]]; then
+  deployment_timeout_args=(
+    --instances.deployment.startup_timeout 1800
+    --instances.deployment.runtime_timeout 3600
+  )
+fi
+deployment_platform_args=()
+if [[ "$DEPLOYMENT_TYPE" == "docker" && -n "$DOCKER_PLATFORM" ]]; then
+  deployment_platform_args=(
+    --instances.deployment.platform "$DOCKER_PLATFORM"
+  )
+fi
+deployment_type_args=(
+  --instances.deployment.type "$DEPLOYMENT_TYPE"
+)
+expert_instance_args=(
+  --instances.type file
+  --instances.path "$INSTANCES"
+)
+parse_function_args=()
+if [[ -n "$PARSE_FUNCTION" ]]; then
+  parse_function_args=(
+    --agent.tools.parse_function.type "$PARSE_FUNCTION"
+  )
+fi
+if [[ -z "$SWEREX_SPEC" && "$DEPLOYMENT_TYPE" == "docker" ]]; then
+  SWEREX_SPEC="swe-rex[modal]==1.4.0"
+fi
+
 cd "$HARNESS"
 
 uv run \
@@ -1445,22 +1563,115 @@ uv run \
 
 (
   cd SWE-agent
+  uv venv --clear --python "$SWEAGENT_PYTHON" .venv
+  uv pip install --python .venv/bin/python -e .
+  if [[ -n "$SWEREX_SPEC" ]]; then
+    uv pip install --python .venv/bin/python --upgrade "$SWEREX_SPEC"
+  fi
+  if [[ "$DEPLOYMENT_TYPE" == "docker" && -n "$SWEREX_PIP_INDEX_URL" ]]; then
+    .venv/bin/python - "$SWEREX_PIP_INDEX_URL" <<'PY'
+import sys
+from pathlib import Path
+
+import swerex.deployment.docker as docker
+
+path = Path(docker.__file__)
+text = path.read_text()
+old = 'f"RUN /root/python3.11/bin/pip3 install --no-cache-dir {{PACKAGE_NAME}}\\n\\n"'
+new = (
+    f'f"RUN /root/python3.11/bin/pip3 install --index-url {{sys.argv[1]}} '
+    '--no-cache-dir {{PACKAGE_NAME}}\\n\\n"'
+)
+if old in text:
+    path.write_text(text.replace(old, new))
+elif new not in text:
+    raise RuntimeError(f"could not patch SWE-ReX Docker pip index in {{path}}")
+PY
+  fi
+  if [[ "$DEPLOYMENT_TYPE" == "modal" ]]; then
+    .venv/bin/python swerex_patches/patch.py --yes
+  fi
+)
+
+if [[ "$DEPLOYMENT_TYPE" == "docker" ]]; then
+  (
+    cd SWE-agent
+    .venv/bin/python - "$INSTANCES" "$EXPERT_INSTANCES" "$DOCKER_PLATFORM" <<'PY'
+import sys
+
+import yaml
+from sweagent.agent.problem_statement import TextProblemStatement
+from sweagent.environment.repo import PreExistingRepoConfig
+from sweagent.environment.swe_env import EnvironmentConfig
+from sweagent.run.batch_instances import BatchInstance
+from swerex.deployment.config import DockerDeploymentConfig
+
+source, target, platform = sys.argv[1:4]
+with open(source) as handle:
+    simple_instances = yaml.safe_load(handle)
+
+docker_args = [
+    "--entrypoint",
+    "",
+]
+instances = []
+for item in simple_instances:
+    deployment = DockerDeploymentConfig(
+        image=item["image_name"],
+        docker_args=docker_args,
+        platform=platform or None,
+        python_standalone_dir="/root",
+        startup_timeout=1800,
+    )
+    instance = BatchInstance(
+        env=EnvironmentConfig(
+            deployment=deployment,
+            repo=PreExistingRepoConfig(
+                repo_name=item.get("repo_name") or "app",
+                base_commit=item.get("base_commit") or "HEAD",
+            ),
+        ),
+        problem_statement=TextProblemStatement(
+            text=item["problem_statement"],
+            id=item["instance_id"],
+            extra_fields=item.get("extra_fields") or {{}},
+        ),
+    )
+    instances.append(instance.model_dump(mode="json", exclude_none=True))
+
+with open(target, "w") as handle:
+    yaml.safe_dump(instances, handle, sort_keys=False)
+PY
+  )
+  expert_instance_args=(
+    --instances.type expert_file
+    --instances.path "$EXPERT_INSTANCES"
+  )
+  deployment_type_args=()
+  deployment_platform_args=()
+fi
+
+(
+  cd SWE-agent
   OPENAI_BASE_URL="$BASE_URL" \
   OPENAI_API_KEY="$API_KEY" \
-  uv run --with-editable . sweagent run-batch \
+  .venv/bin/sweagent run-batch \
     --config config/tool_use.yaml \
     --output_dir "$SWEAGENT_OUTPUT" \
     --num_workers "$NUM_WORKERS" \
     --random_delay_multiplier 1 \
-    --instances.type file \
-    --instances.path "$INSTANCES" \
+    "${{expert_instance_args[@]}}" \
     --instances.shuffle=False \
-    --instances.deployment.type "$DEPLOYMENT_TYPE" \
-    --instances.deployment.startup_timeout 1800 \
-    --instances.deployment.runtime_timeout 3600 \
+    "${{deployment_type_args[@]}}" \
+    "${{deployment_timeout_args[@]}}" \
+    "${{deployment_platform_args[@]}}" \
+    "${{parse_function_args[@]}}" \
     --agent.model.name "$MODEL" \
     --agent.model.api_base "$BASE_URL" \
-    --agent.model.api_key "$API_KEY"
+    --agent.model.api_key "$API_KEY" \
+    --agent.model.max_input_tokens 0 \
+    --agent.model.per_instance_cost_limit 0 \
+    --agent.model.total_cost_limit 0
 )
 
 uv run \
@@ -1486,6 +1697,7 @@ uv run \
         harness = shell_quote(&harness.display().to_string()),
         raw_dir = shell_quote(&raw_dir.display().to_string()),
         instances = shell_quote(&instances.display().to_string()),
+        expert_instances = shell_quote(&expert_instances.display().to_string()),
         sweagent_output = shell_quote(&sweagent_output.display().to_string()),
         patches = shell_quote(&patches.display().to_string()),
         eval_dir = shell_quote(&eval_dir.display().to_string()),
@@ -1496,7 +1708,16 @@ uv run \
         deployment_type = shell_quote(&deployment_type),
         num_workers = shell_quote(&num_workers),
         eval_workers = shell_quote(&eval_workers),
+        docker_platform = shell_quote(&docker_platform),
+        parse_function = shell_quote(parse_function.as_deref().unwrap_or("")),
+        sweagent_python = shell_quote(&sweagent_python),
+        swerex_spec = shell_quote(swerex_spec.as_deref().unwrap_or("")),
+        swerex_pip_index_url = shell_quote(&swerex_pip_index_url),
         local_eval_flag = shell_quote(local_eval_flag),
+        hf_home = shell_quote(&cache_root.join("hf").display().to_string()),
+        hf_datasets_cache = shell_quote(&cache_root.join("hf-datasets").display().to_string()),
+        uv_cache_dir = shell_quote(&cache_root.join("uv").display().to_string()),
+        xdg_cache_home = shell_quote(&cache_root.join("xdg").display().to_string()),
     );
     fs::write(path, script).with_context(|| format!("write {}", path.display()))
 }
@@ -1667,6 +1888,7 @@ mod tests {
             output_dir: None,
             timeout_secs: 30,
             harness_timeout_secs: None,
+            endpoint_concurrency: 1,
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,
@@ -1695,6 +1917,7 @@ mod tests {
             output_dir: None,
             timeout_secs: 30,
             harness_timeout_secs: None,
+            endpoint_concurrency: 1,
             run_id: None,
             metrics_http: "http://127.0.0.1:18080".to_string(),
             metrics_run_id: None,

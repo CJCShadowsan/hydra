@@ -773,6 +773,29 @@ async fn guarded_structured_output_is_not_rejected_by_runtime_feature_guard() {
     );
 }
 
+#[test]
+fn standalone_guardrail_modes_have_expected_policies() {
+    let metrics =
+        OpenAiGuardrailsConfig::for_standalone_mode(crate::cli::OpenAiGuardrailsCliMode::Metrics)
+            .status();
+    assert_eq!(metrics.mode, "metrics");
+    assert_eq!(metrics.retry_exhaustion, "pass_last_text");
+    assert_eq!(metrics.small_model_policy, "all");
+
+    let enforce =
+        OpenAiGuardrailsConfig::for_standalone_mode(crate::cli::OpenAiGuardrailsCliMode::Enforce)
+            .status();
+    assert_eq!(enforce.mode, "enforce");
+    assert_eq!(enforce.retry_exhaustion, "error");
+    assert_eq!(enforce.small_model_policy, "all");
+
+    let disabled =
+        OpenAiGuardrailsConfig::for_standalone_mode(crate::cli::OpenAiGuardrailsCliMode::Disabled)
+            .status();
+    assert_eq!(disabled.mode, "disabled");
+    assert_eq!(disabled.small_model_policy, "small_models_only");
+}
+
 #[tokio::test]
 async fn compaction_wraps_skippy_backend_even_when_guardrails_are_disabled() {
     let backend = Arc::new(StructuredGuardrailRecordingBackend::default());

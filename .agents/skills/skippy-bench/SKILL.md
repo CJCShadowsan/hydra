@@ -15,6 +15,13 @@ as `chat-corpus` and `eval run` require `--metrics-http` to point at an
 already-running metrics-server and should use `--metrics-run-id` matching the
 target endpoint's Skippy run id.
 
+Benchmark-managed Skippy server runs must use a release `skippy-server` build.
+Run `just release-build` before `run`, `focused-runtime`, `local-single`, or
+local split binary benchmarks, and use `target/release/skippy-server` (the
+SkippyBench default). Do not use `target/debug/skippy-server` for performance or
+full-corpus validation; SkippyBench rejects that path because debug builds can
+create false timeout and throughput failures.
+
 ## Current Repo Shape
 
 Standalone `skippy-bench` may not be present in this mesh checkout yet. Confirm
@@ -50,6 +57,7 @@ skippy-bench eval doctor
 skippy-bench eval run speed-bench \
   --base-url http://127.0.0.1:9337/v1 \
   --model org/repo:Q4_K_M \
+  --endpoint-concurrency 1 \
   --metrics-http http://127.0.0.1:18080 \
   --metrics-run-id run-local-qwen
 ```
@@ -58,6 +66,13 @@ skippy-bench eval run speed-bench \
 where supported. It is not a full-run dataset limit. Use
 `--harness-timeout-secs` only when you need a hard wall-clock cap for an
 operator/debug run; omit it for canonical full-dataset validation.
+`--endpoint-concurrency` must match the target endpoint's
+`serve-openai --generation-concurrency` value. SkippyBench keeps native harness
+request concurrency equal to that value; adapter-specific request concurrency
+overrides such as `SWE_BENCH_PRO_NUM_WORKERS` and
+`MCP_ATLAS_COMPLETION_CONCURRENCY` must match it or `eval run` fails before
+starting the upstream harness. Do not run multiple LLM workers against a
+single-lane Skippy endpoint when validating full corpora.
 
 Core eval ids:
 
@@ -70,8 +85,9 @@ Core eval ids:
   benchmark.
 - `mcp-atlas` — Scale MCP-Atlas native harness. `eval run` starts the
   MCP agent environment and completion service when their localhost ports are
-  not already live, then runs the upstream completion and scoring paths without
-  Skippy-specific task limits or `tool_choice` overrides.
+  not already live, then runs the upstream completion script with `--no-filter`
+  so all Hugging Face dataset rows are attempted, plus the upstream scoring
+  path, without Skippy-specific task limits or `tool_choice` overrides.
 
 Use-case routing:
 
@@ -103,9 +119,33 @@ unless the user explicitly asks for a noncanonical experiment.
 For MCP-Atlas scoring, the wrapper defaults `EVAL_LLM_MODEL`,
 `EVAL_LLM_BASE_URL`, and `EVAL_LLM_API_KEY` to the same local endpoint/model
 used for completion, while preserving caller-provided `EVAL_LLM_*` overrides
-for judge-model runs. For SWE-Bench Pro, the wrapper defaults to the official
-Docker image namespace and Modal-backed evaluation; local Docker is an explicit
-environment override.
+for judge-model runs. When validating with a very small local Skippy model, run
+completion against the normal compatibility endpoint and point `EVAL_LLM_*` at
+a separate strict structured-output scorer endpoint, for example a second
+`skippy-server serve-openai --openai-guardrails enforce` process; do not patch
+or post-process the MCP scorer. For resumed operator runs, set
+`MCP_ATLAS_COMPLETION_OUTPUT_NAME` to an existing upstream
+`completion_results/*.csv` basename so the native completion script can reuse
+its own processed-row skip behavior, and use `MCP_ATLAS_SCORE_CONCURRENCY` for
+the scorer's native `--concurrency` setting.
+
+For SWE-Bench Pro, the wrapper defaults to the official Docker image namespace
+with local Docker deployment and local Docker evaluation so the core pack can
+run without Modal credentials. It still runs upstream
+`helper_code/generate_sweagent_instances.py` for the full dataset, then supplies
+SWE-agent with a native `expert_file` instance file for local Docker platform,
+entrypoint settings and SWE-agent's standalone Python/SWE-Rex Docker runtime.
+Local Docker runs install SWE-agent into a dedicated venv and default
+`SWE_BENCH_PRO_SWEREX_SPEC` to `swe-rex[modal]==1.4.0`, which keeps the native
+SWE-ReX Docker runtime but includes the upstream
+`python:3.11.9-slim-bookworm` builder fix. Modal remains an explicit
+environment override and uses the Scale SWE-ReX patch flow. Some official
+SWE-Pro base images point pip at an unavailable localhost package mirror; local
+Docker runs default `SWE_BENCH_PRO_SWEREX_PIP_INDEX_URL` to
+`https://pypi.org/simple` for the derived-image SWE-ReX install. Use
+`SWE_BENCH_PRO_PARSE_FUNCTION=thought_action` for local OpenAI-compatible models
+that do not emit OpenAI tool calls; this is the upstream SWE-agent local-model
+path, not a Skippy dataset or harness rewrite.
 
 For TTFT/FTTT, use metrics-server correlation rather than harness-only timing.
 `skippy-bench eval run` and `skippy-bench chat-corpus` create/finalize a

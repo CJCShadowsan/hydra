@@ -130,6 +130,12 @@ pub struct EvalRunArgs {
     pub timeout_secs: u64,
     #[arg(long)]
     pub harness_timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Expected OpenAI endpoint generation concurrency; native harness request concurrency is kept equal to this value."
+    )]
+    pub endpoint_concurrency: usize,
     #[arg(long)]
     pub run_id: Option<String>,
     #[arg(long, default_value = "http://127.0.0.1:18080")]
@@ -251,7 +257,7 @@ pub struct ChatCorpusArgs {
 pub struct RunArgs {
     #[arg(long, default_value = "target/debug/metrics-server")]
     pub metrics_server_bin: PathBuf,
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(
         long,
@@ -384,7 +390,7 @@ pub struct RunArgs {
 pub struct LocalSingleArgs {
     #[arg(long, default_value = "target/debug/metrics-server")]
     pub metrics_server_bin: PathBuf,
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -444,7 +450,7 @@ pub struct LocalSplitInprocessArgs {
 
 #[derive(Parser)]
 pub struct LocalSplitBinaryArgs {
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -472,7 +478,7 @@ pub struct LocalSplitBinaryArgs {
 
 #[derive(Parser)]
 pub struct LocalSplitCompareArgs {
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -502,7 +508,7 @@ pub struct LocalSplitCompareArgs {
 
 #[derive(Parser)]
 pub struct LocalSplitChainBinaryArgs {
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
