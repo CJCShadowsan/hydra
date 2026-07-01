@@ -15,7 +15,7 @@ BF16_TARGET="${BF16_TARGET:-}"
 SKIPPY_QUANTIZE_BIN="${SKIPPY_QUANTIZE_BIN:-$ROOT/target/debug/skippy-quantize}"
 SKIPPY_BENCH_BIN="${SKIPPY_BENCH_BIN:-$ROOT/target/debug/skippy-bench}"
 
-LLAMA_BENCH_BUILD_DIR="${LLAMA_BENCH_BUILD_DIR:-$ROOT/.deps/llama-build/build-glm52-deps-metal}"
+LLAMA_BENCH_BUILD_DIR="${LLAMA_BENCH_BUILD_DIR:-${LLAMA_STAGE_BUILD_DIR:-$ROOT/.deps/llama-build/build-stage-abi-static-metal}}"
 BACKEND_OPS_BUILD_DIR="${BACKEND_OPS_BUILD_DIR:-$ROOT/.deps/llama-build/build-metal-tests}"
 
 usage() {
@@ -208,6 +208,7 @@ run_contract_smoke() {
   require_executable "$SKIPPY_BENCH_BIN"
   require_executable "$LLAMA_BENCH_BUILD_DIR/bin/llama-bench"
   REBUILD_FIXTURE=1 \
+    LLAMA_BENCH_BIN="$LLAMA_BENCH_BUILD_DIR/bin/llama-bench" \
     SKIPPY_QUANTIZE_BIN="$SKIPPY_QUANTIZE_BIN" \
     SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
     "$ROOT/scripts/glm-dsa-indexshare-local-smoke.sh"
