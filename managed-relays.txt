@@ -1,0 +1,7 @@
+# Default public iroh relays for mesh-llm.
+#
+# One iroh relay URL per line. Keep the absolute-DNS trailing dot before the
+# slash; released clients fetch this file at startup when no --relay URLs are
+# explicitly configured.
+https://usw1-1.relay.michaelneale.mesh-llm.iroh.link./
+https://aps1-2.relay.michaelneale.mesh-llm.iroh.link./

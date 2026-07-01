@@ -24,6 +24,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+#[cfg(not(test))]
+use tokio::sync::OnceCell;
 use tokio::sync::{Mutex, watch};
 
 use self::requirements::{
@@ -51,6 +53,20 @@ const PRETTY_LOCAL_REQUEST_WINDOW_SECS: u64 = 24 * 60 * 60;
 const EPHEMERAL_QUIC_PORT: u16 = 0;
 const SIGNED_BOOTSTRAP_TOKEN_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 const RECENT_MESH_REJECTION_LIMIT: usize = 16;
+#[cfg(not(test))]
+const DEFAULT_PUBLIC_RELAY_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/managed-relays.txt";
+#[cfg(not(test))]
+const DEFAULT_PUBLIC_RELAY_MANIFEST_ENV: &str = "MESH_LLM_DEFAULT_RELAY_MANIFEST_URL";
+#[cfg(not(test))]
+const DEFAULT_PUBLIC_RELAY_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const BAKED_DEFAULT_PUBLIC_RELAY_URLS: &[&str] = &[
+    "https://usw1-1.relay.michaelneale.mesh-llm.iroh.link./",
+    "https://aps1-2.relay.michaelneale.mesh-llm.iroh.link./",
+];
+
+#[cfg(not(test))]
+static DEFAULT_PUBLIC_RELAY_URLS: OnceCell<Vec<String>> = OnceCell::const_new();
 
 fn emit_mesh_info(message: String) {
     let _ = mesh_llm_events::emit_event(OutputEvent::Info {
@@ -597,17 +613,171 @@ fn filter_endpoint_addr_for_bind_ip(
 fn effective_relay_urls(policy: RelayPolicy, relay_urls: &[String]) -> Vec<String> {
     match policy {
         RelayPolicy::Disabled | RelayPolicy::ExplicitlyDisabled => Vec::new(),
-        RelayPolicy::DefaultPublic if relay_urls.is_empty() => vec![
-            "https://usw1-2.relay.michaelneale.mesh-llm.iroh.link./".into(),
-            "https://aps1-1.relay.michaelneale.mesh-llm.iroh.link./".into(),
-        ],
+        RelayPolicy::DefaultPublic if relay_urls.is_empty() => baked_default_public_relay_urls(),
         RelayPolicy::DefaultPublic => relay_urls.to_vec(),
+    }
+}
+
+async fn resolved_relay_urls(policy: RelayPolicy, relay_urls: &[String]) -> Vec<String> {
+    match policy {
+        RelayPolicy::DefaultPublic if relay_urls.is_empty() => {
+            cached_default_public_relay_urls().await
+        }
+        _ => effective_relay_urls(policy, relay_urls),
+    }
+}
+
+fn baked_default_public_relay_urls() -> Vec<String> {
+    BAKED_DEFAULT_PUBLIC_RELAY_URLS
+        .iter()
+        .map(|url| (*url).to_string())
+        .collect()
+}
+
+#[cfg(test)]
+async fn cached_default_public_relay_urls() -> Vec<String> {
+    baked_default_public_relay_urls()
+}
+
+#[cfg(not(test))]
+async fn cached_default_public_relay_urls() -> Vec<String> {
+    DEFAULT_PUBLIC_RELAY_URLS
+        .get_or_init(load_default_public_relay_urls)
+        .await
+        .clone()
+}
+
+#[cfg(not(test))]
+async fn load_default_public_relay_urls() -> Vec<String> {
+    match fetch_default_public_relay_urls().await {
+        Some(urls) => urls,
+        None => baked_default_public_relay_urls(),
+    }
+}
+
+#[cfg(not(test))]
+async fn fetch_default_public_relay_urls() -> Option<Vec<String>> {
+    let manifest_url = default_public_relay_manifest_url()?;
+    let body = fetch_default_public_relay_manifest(&manifest_url).await?;
+    let urls = parse_default_public_relay_manifest(&body);
+    non_empty_default_public_relay_urls(urls, &manifest_url)
+}
+
+#[cfg(not(test))]
+async fn fetch_default_public_relay_manifest(manifest_url: &str) -> Option<String> {
+    let client = default_public_relay_http_client()?;
+    let response = send_default_public_relay_manifest_request(&client, manifest_url).await?;
+    read_default_public_relay_manifest_response(response, manifest_url).await
+}
+
+#[cfg(not(test))]
+fn default_public_relay_http_client() -> Option<reqwest::Client> {
+    match reqwest::Client::builder()
+        .timeout(DEFAULT_PUBLIC_RELAY_FETCH_TIMEOUT)
+        .connect_timeout(DEFAULT_PUBLIC_RELAY_FETCH_TIMEOUT)
+        .user_agent(concat!("mesh-llm/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(err) => {
+            tracing::warn!("Failed to build default relay manifest HTTP client: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn send_default_public_relay_manifest_request(
+    client: &reqwest::Client,
+    manifest_url: &str,
+) -> Option<reqwest::Response> {
+    let response = match client.get(manifest_url).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!("Failed to fetch default relay manifest {manifest_url}: {err}");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            "Default relay manifest {manifest_url} returned HTTP {}",
+            response.status()
+        );
+        return None;
+    }
+    Some(response)
+}
+
+#[cfg(not(test))]
+async fn read_default_public_relay_manifest_response(
+    response: reqwest::Response,
+    manifest_url: &str,
+) -> Option<String> {
+    match response.text().await {
+        Ok(body) => Some(body),
+        Err(err) => {
+            tracing::warn!("Failed to read default relay manifest {manifest_url}: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn non_empty_default_public_relay_urls(
+    urls: Vec<String>,
+    manifest_url: &str,
+) -> Option<Vec<String>> {
+    if urls.is_empty() {
+        tracing::warn!("Default relay manifest {manifest_url} had no valid relay URLs");
+        None
+    } else {
+        tracing::info!(
+            "Loaded {} default relay URL(s) from {manifest_url}",
+            urls.len()
+        );
+        Some(urls)
+    }
+}
+
+#[cfg(not(test))]
+fn default_public_relay_manifest_url() -> Option<String> {
+    match std::env::var(DEFAULT_PUBLIC_RELAY_MANIFEST_ENV) {
+        Ok(value) if manifest_fetch_disabled(&value) => None,
+        Ok(value) => Some(value),
+        Err(_) => Some(DEFAULT_PUBLIC_RELAY_MANIFEST_URL.to_string()),
+    }
+}
+
+#[cfg(not(test))]
+fn manifest_fetch_disabled(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("disabled")
+}
+
+fn parse_default_public_relay_manifest(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(parse_default_public_relay_manifest_line)
+        .collect()
+}
+
+fn parse_default_public_relay_manifest_line(line: &str) -> Option<String> {
+    let url = line.split_once('#').map_or(line, |(url, _comment)| url);
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    match url.parse::<iroh::RelayUrl>() {
+        Ok(parsed) => Some(parsed.to_string()),
+        Err(err) => {
+            tracing::warn!("Ignoring invalid default relay URL {url:?}: {err}");
+            None
+        }
     }
 }
 
 #[cfg(test)]
 mod relay_policy_tests {
-    use super::{RelayPolicy, effective_relay_urls};
+    use super::{RelayPolicy, effective_relay_urls, parse_default_public_relay_manifest};
 
     #[test]
     fn default_policy_uses_managed_relays_when_no_urls_are_given() {
@@ -636,6 +806,26 @@ mod relay_policy_tests {
         assert!(!RelayPolicy::ExplicitlyDisabled.uses_relay());
         assert!(!RelayPolicy::Disabled.uses_raw_stun());
         assert!(RelayPolicy::ExplicitlyDisabled.uses_raw_stun());
+    }
+
+    #[test]
+    fn relay_manifest_parser_accepts_one_iroh_url_per_line() {
+        let urls = parse_default_public_relay_manifest(
+            r#"
+            # default public relays
+            https://usw1-1.relay.michaelneale.mesh-llm.iroh.link./
+            not a url
+            https://aps1-2.relay.michaelneale.mesh-llm.iroh.link./ # ap-southeast
+            "#,
+        );
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://usw1-1.relay.michaelneale.mesh-llm.iroh.link./",
+                "https://aps1-2.relay.michaelneale.mesh-llm.iroh.link./",
+            ]
+        );
     }
 }
 
@@ -2092,8 +2282,8 @@ fn startup_transport_config() -> iroh::endpoint::QuicTransportConfig {
         .build()
 }
 
-fn relay_mode_for_startup(relay: RelayConfig<'_>) -> iroh::endpoint::RelayMode {
-    let urls = effective_relay_urls(relay.policy, relay.urls);
+async fn relay_mode_for_startup(relay: RelayConfig<'_>) -> iroh::endpoint::RelayMode {
+    let urls = resolved_relay_urls(relay.policy, relay.urls).await;
     if relay.policy.uses_relay() {
         tracing::info!("Relay: {:?}", urls);
         iroh::endpoint::RelayMode::Custom(relay_map_from_urls(&urls, relay.auths))
@@ -2113,6 +2303,7 @@ async fn bind_mesh_endpoint(
     relay: RelayConfig<'_>,
     quic_bind: QuicBindSelection,
 ) -> Result<Endpoint> {
+    let relay_mode = relay_mode_for_startup(relay).await;
     let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key)
         .alpns(vec![
@@ -2120,7 +2311,7 @@ async fn bind_mesh_endpoint(
             skippy_protocol::STAGE_ALPN_V2.to_vec(),
         ])
         .transport_config(startup_transport_config())
-        .relay_mode(relay_mode_for_startup(relay));
+        .relay_mode(relay_mode);
 
     if let Some(addr) = quic_bind_addr(quic_bind) {
         tracing::info!("Binding QUIC to {addr}");
@@ -2265,12 +2456,12 @@ fn init_owner_runtime(
     })
 }
 
-fn configure_control_relay(
+async fn configure_control_relay(
     mut builder: iroh::endpoint::Builder,
     relay: Option<RelayConfig<'_>>,
 ) -> iroh::endpoint::Builder {
     if let Some(relay) = relay.filter(|relay| relay.policy.uses_relay()) {
-        let urls = effective_relay_urls(relay.policy, relay.urls);
+        let urls = resolved_relay_urls(relay.policy, relay.urls).await;
         tracing::info!("Owner-control relay: {:?}", urls);
         builder = builder.relay_mode(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
             &urls,
@@ -4046,7 +4237,7 @@ impl Node {
             .secret_key(secret_key)
             .alpns(vec![ALPN_CONTROL_V1.to_vec()])
             .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?;
-        builder = configure_control_relay(builder, relay);
+        builder = configure_control_relay(builder, relay).await;
         let endpoint = builder.bind().await?;
         if relay.is_some_and(|relay| relay.policy.uses_relay()) {
             wait_for_endpoint_online(
