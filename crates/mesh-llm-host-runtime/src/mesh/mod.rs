@@ -55,7 +55,7 @@ const SIGNED_BOOTSTRAP_TOKEN_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 const RECENT_MESH_REJECTION_LIMIT: usize = 16;
 #[cfg(not(test))]
 const DEFAULT_PUBLIC_RELAY_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/main/managed-relays.txt";
+    "https://raw.githubusercontent.com/Mesh-LLM/relay-config/main/managed-relays.txt";
 #[cfg(not(test))]
 const DEFAULT_PUBLIC_RELAY_MANIFEST_ENV: &str = "MESH_LLM_DEFAULT_RELAY_MANIFEST_URL";
 #[cfg(not(test))]
