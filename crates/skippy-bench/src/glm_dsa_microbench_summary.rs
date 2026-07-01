@@ -244,7 +244,7 @@ pub(crate) fn summarize_metal_dispatch(records: &[MetalDispatchRecord]) -> GlmDs
             }
             "get_rows" => {
                 summary.get_rows_records += 1;
-                if record.kernel.as_deref() == Some("typed") {
+                if matches!(record.kernel.as_deref(), Some("typed" | "typed_vec4")) {
                     summary.get_rows_typed_records += 1;
                 }
                 if record.kernel.as_deref() == Some("promote") {
@@ -846,6 +846,12 @@ mod tests {
             glm_flash,
             regular_flash,
             dispatch("get_rows", Some("typed"), "blk.30.attn_k_top_k_rows", None),
+            dispatch(
+                "get_rows",
+                Some("typed_vec4"),
+                "blk.30.attn_v_top_k_rows",
+                None,
+            ),
             dispatch("get_rows", Some("promote"), "blk.30.mask_top_k_rows", None),
             dispatch(
                 "dsa_compact_get_rows_fused",
@@ -862,8 +868,8 @@ mod tests {
         assert_eq!(summary.flash_attn_ext_vec_records, 1);
         assert_eq!(summary.flash_attn_ext_tile_records, 1);
         assert_eq!(summary.flash_attn_ext_glm_dsa_shape_records, 1);
-        assert_eq!(summary.get_rows_records, 2);
-        assert_eq!(summary.get_rows_typed_records, 1);
+        assert_eq!(summary.get_rows_records, 3);
+        assert_eq!(summary.get_rows_typed_records, 2);
         assert_eq!(summary.get_rows_promote_records, 1);
         assert_eq!(summary.dsa_compact_get_rows_fused_records, 1);
         assert_eq!(summary.dsa_sparse_attn_records, 1);

@@ -5771,7 +5771,7 @@ fn build_compact_flash_guard(candidate: &MicrobenchCaseSummary) -> CompactFlashG
     let compact_get_rows_records = compact_get_rows_records(&candidate.metal_dispatch_records);
     let compact_get_rows_typed_records = compact_get_rows_records
         .iter()
-        .filter(|record| record.kernel.as_deref() == Some("typed"))
+        .filter(|record| matches!(record.kernel.as_deref(), Some("typed" | "typed_vec4")))
         .count();
     let compact_get_rows_promote_records = compact_get_rows_records
         .iter()
@@ -7483,6 +7483,32 @@ mod tests {
         assert!(guard.passed);
         assert_eq!(guard.compact_get_rows_typed_records, 0);
         assert_eq!(guard.dsa_compact_get_rows_fused_records, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn compact_flash_guard_accepts_vec4_typed_compact_get_rows_path() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.flags.compact_flash_attn = true;
+        candidate.metal_dispatch_summary.flash_attn_ext_records = 1;
+        candidate.metal_dispatch_summary.flash_attn_ext_vec_records = 1;
+        candidate
+            .metal_dispatch_summary
+            .flash_attn_ext_glm_dsa_shape_records = 1;
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch(
+                "dsa_compact_k_topk_rows-30",
+                "typed_vec4",
+            ));
+        candidate
+            .compact_flash_execution_mask_records
+            .push(compact_flash_mask_record(true));
+
+        let guard = build_compact_flash_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.compact_get_rows_typed_records, 1);
         assert_eq!(guard.failure_summary, "none");
     }
 
