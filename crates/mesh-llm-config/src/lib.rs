@@ -5,11 +5,20 @@ mod plugin_validation;
 mod store;
 mod validate;
 
+#[cfg(test)]
+mod validate_schema_contract;
+
 pub use authoring::{
     ConfigEditor, ConfigSchemaBuilder, ConfigSettingSchemaBuilder, LocalServingNodeConfig,
     ModelConfigEditor, ModelDefaultsEditor, PluginConfigEditor, built_in_config_schema,
 };
 pub use model::*;
+pub use plugin_validation::control_behavior::{
+    PluginConditionOperator, PluginConditionValue, PluginConditionalDisable, PluginConflictRule,
+    PluginControlAvailability, PluginControlAvailabilitySource, PluginControlBehavior,
+    PluginControlCondition, PluginDisabledWritePolicy, PluginNumericControl, PluginOptionsSource,
+    PluginTextFormat,
+};
 pub use plugin_validation::{
     PluginConfigSchema, PluginObjectPropertySchema, PluginSchemaAvailability,
     PluginSettingConstraint, PluginSettingSchema, PluginValueKind, PluginValueSchema,
@@ -99,6 +108,55 @@ connect_timeout_secs = 0
     }
 
     #[test]
+    fn native_runtime_override_accepts_mesh_version_with_optional_abi_and_selection() {
+        let config = parse_config_toml(
+            r#"
+[runtime.native_runtime]
+mesh_version = "0.68.0"
+skippy_abi = "0.1.25"
+selection = "exact:meshllm-native-runtime-linux-x86_64-cuda12"
+"#,
+        )
+        .expect("native runtime selector should parse");
+
+        assert_eq!(
+            config.runtime.native_runtime.mesh_version.as_deref(),
+            Some("0.68.0")
+        );
+        assert_eq!(
+            config.runtime.native_runtime.skippy_abi.as_deref(),
+            Some("0.1.25")
+        );
+        assert_eq!(
+            config.runtime.native_runtime.selection.as_deref(),
+            Some("exact:meshllm-native-runtime-linux-x86_64-cuda12")
+        );
+
+        parse_config_toml(
+            r#"
+[runtime.native_runtime]
+mesh_version = "0.68.0"
+"#,
+        )
+        .expect("mesh-version-only native runtime selector should parse");
+
+        let err = parse_config_toml(
+            r#"
+[runtime.native_runtime]
+selection = "cuda12"
+"#,
+        )
+        .expect_err("partial native runtime selector should fail validation");
+
+        assert!(
+            err.to_string().contains(
+                "runtime.native_runtime override must set mesh_version when skippy_abi or selection is set"
+            ),
+            "unexpected validation error: {err}"
+        );
+    }
+
+    #[test]
     fn config_store_add_model_preserves_existing_fields() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("config.toml");
@@ -164,11 +222,20 @@ ctx_size = 4096
                     context_size: Some(8192),
                     parallel: Some(2),
                     owner_control_bind: Some("127.0.0.1:0".parse().unwrap()),
-                    gpu_assignment: Some(GpuAssignment::Auto),
+                    gpu_assignment: Some(GpuAssignment::Pinned),
                     ..LocalServingNodeConfig::default()
                 })?;
+                let derived_profile = {
+                    let entry = config
+                        .config()
+                        .models
+                        .iter()
+                        .find(|m| m.model == "Qwen/Qwen3-8B-GGUF:Q4_K_M")
+                        .expect("model entry exists after configure_local_serving_node");
+                    entry.derived_profile()
+                };
                 config
-                    .upsert_model("Qwen/Qwen3-8B-GGUF:Q4_K_M")?
+                    .upsert_model("Qwen/Qwen3-8B-GGUF:Q4_K_M", derived_profile)?
                     .max_tokens(1024)
                     .temperature(0.2);
                 Ok(())
@@ -268,6 +335,8 @@ model_runtime = "Metal"
 version = 1
 
 [runtime]
+debug = true
+listen_all = true
 reconcile_model_targets = true
 reconcile_model_target_demand_upgrades = true
 model_target_demand_upgrade_min_requests = 4
@@ -276,6 +345,8 @@ model_target_demand_upgrade_max_age_secs = 900
         )
         .unwrap();
 
+        assert!(config.runtime.debug);
+        assert!(config.runtime.listen_all);
         assert!(config.runtime.reconcile_model_targets);
         assert!(config.runtime.reconcile_model_target_demand_upgrades);
         assert_eq!(config.runtime.model_target_demand_upgrade_min_requests, 4);
@@ -289,7 +360,7 @@ model_target_demand_upgrade_max_age_secs = 900
 version = 1
 
 [gpu]
-assignment = "auto"
+assignment = "pinned"
 
 [[models]]
 model = "Qwen3-8B-Q4_K_M"
@@ -353,6 +424,8 @@ gpu_id = "pci:0000:65:00.0"
             "version",
             "gpu.assignment",
             "owner_control.bind",
+            "runtime.debug",
+            "runtime.listen_all",
             "telemetry.prompt_shape_metrics",
             "defaults.model_fit.ctx_size",
             "defaults.hardware.rpc_backend",
@@ -576,6 +649,7 @@ gpu_id = "pci:0000:65:00.0"
             "ConfigEditor::model_refs",
             "ConfigEditor::upsert_plugin",
             "ModelConfigEditor::model_ref",
+            "ModelConfigEditor::derived_profile",
             "PluginConfigEditor::name",
         ]);
         let actual = authoring_public_methods();
@@ -607,6 +681,7 @@ gpu_id = "pci:0000:65:00.0"
             ("OwnerControlConfig", 1),
             ("GpuConfig", 1),
             ("RuntimeConfig", 1),
+            ("NativeRuntimeConfig", 1),
             ("MeshRequirementsConfig", 1),
             ("ModelConfigEntry", 1),
             ("ModelFitConfig", 2),
@@ -628,6 +703,7 @@ gpu_id = "pci:0000:65:00.0"
             "MeshRequirementsConfig",
             "OwnerControlConfig",
             "RuntimeConfig",
+            "NativeRuntimeConfig",
             "TelemetryConfig",
             "TelemetryMetricsConfig",
             "ModelConfigDefaults",
@@ -651,24 +727,25 @@ gpu_id = "pci:0000:65:00.0"
             "models",
             "plugins",
             "settings",
+            "strategy",
         ];
 
-        occurrences
-            .iter()
-            .map(|(name, multiplier)| {
-                let leafs = extract_struct_fields(source, name)
-                    .into_iter()
-                    .filter(|(field, ty)| {
-                        !ignored.contains(&field.as_str())
-                            && !is_legacy_flat_model_field(name, field)
-                            && !nested
-                                .iter()
-                                .any(|nested_ty| contains_nested_type(ty, nested_ty))
-                    })
-                    .count();
-                leafs * multiplier
-            })
-            .sum()
+        let mut total = 0usize;
+        for (name, multiplier) in occurrences.iter() {
+            let leafs = extract_struct_fields(source, name)
+                .into_iter()
+                .filter(|(field, ty)| {
+                    !ignored.contains(&field.as_str())
+                        && !is_legacy_flat_model_field(name, field)
+                        && !nested
+                            .iter()
+                            .any(|nested_ty| contains_nested_type(ty, nested_ty))
+                })
+                .count();
+            let contribution = leafs * multiplier;
+            total += contribution;
+        }
+        total
     }
 
     fn extract_struct_fields(source: &str, struct_name: &str) -> Vec<(String, String)> {

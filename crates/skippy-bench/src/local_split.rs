@@ -21,7 +21,6 @@ use crate::{
         LocalSplitBinaryArgs, LocalSplitChainBinaryArgs, LocalSplitCompareArgs,
         LocalSplitInprocessArgs,
     },
-    direct_return::BenchDirectReturnServer,
     model_identity::model_identity_for_path,
     support::{
         ChildGuard, activation_width, connect_ready, ensure_release_skippy_server_bin,
@@ -54,6 +53,16 @@ struct BinaryChainResult {
     split_layer_1: u32,
     split_layer_2: u32,
     layer_end: u32,
+}
+
+fn ensure_reply_kind(
+    reply: &skippy_protocol::binary::StageReply,
+    expected: WireReplyKind,
+) -> Result<()> {
+    if reply.kind != expected {
+        bail!("expected {expected:?} reply, got {:?}", reply.kind);
+    }
+    Ok(())
 }
 
 pub fn local_split_binary(args: LocalSplitBinaryArgs) -> Result<()> {
@@ -309,7 +318,6 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         bail!("stage 0 produced an empty activation frame");
     }
     let activation_width = activation_width(&boundary)?;
-    let direct_returns = BenchDirectReturnServer::start("127.0.0.1:0")?;
 
     let run_id = generate_run_id();
     let config_path = temp_config_path_for(&run_id, "stage-1");
@@ -342,7 +350,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
             LocalSplitTopologyStage {
                 stage_id: "stage-0",
                 stage_index: 0,
-                endpoint: format!("tcp://{}", direct_returns.endpoint()),
+                endpoint: "driver".to_string(),
                 layer_start: 0,
                 layer_end: args.split_layer,
             },
@@ -389,7 +397,6 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         .context("stage 1 binary server did not become ready")?;
     let request_id = 1;
     let session_id = 1;
-    let direct_return = direct_returns.register(request_id, session_id)?;
     send_generation_config(&mut stream, wire_dtype, request_id, session_id, 1)
         .context("send binary split generation config")?;
     let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, wire_dtype);
@@ -422,9 +429,8 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         raw_bytes: Vec::new(),
     };
     write_stage_message(&mut stream, &message, wire_dtype).context("send binary decode")?;
-    let reply = direct_return
-        .recv_expected(WireReplyKind::PredictedToken)
-        .context("receive direct binary reply")?;
+    let reply = recv_reply(&mut stream).context("receive binary split prediction reply")?;
+    ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
     write_stage_message(&mut stream, &StageWireMessage::stop(wire_dtype), wire_dtype)
         .context("send binary stop")?;
 
@@ -497,7 +503,6 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         bail!("stage 0 produced an empty activation frame");
     }
     let activation_width = activation_width(&boundary)?;
-    let direct_returns = BenchDirectReturnServer::start("127.0.0.1:0")?;
 
     let run_id = generate_run_id();
     let stage1_config_path = temp_config_path_for(&run_id, "stage-1");
@@ -566,7 +571,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
             LocalSplitTopologyStage {
                 stage_id: "stage-0",
                 stage_index: 0,
-                endpoint: format!("tcp://{}", direct_returns.endpoint()),
+                endpoint: "driver".to_string(),
                 layer_start: 0,
                 layer_end: args.split_layer_1,
             },
@@ -631,7 +636,6 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         .context("stage 1 binary server did not become ready")?;
     let request_id = 2;
     let session_id = 2;
-    let direct_return = direct_returns.register(request_id, session_id)?;
     send_generation_config(&mut stream, wire_dtype, request_id, session_id, 1)
         .context("send binary chain generation config")?;
     let mut state = StageStateHeader::new(WireMessageKind::DecodeEmbd, wire_dtype);
@@ -664,9 +668,8 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         raw_bytes: Vec::new(),
     };
     write_stage_message(&mut stream, &message, wire_dtype).context("send binary chain decode")?;
-    let reply = direct_return
-        .recv_expected(WireReplyKind::PredictedToken)
-        .context("receive direct binary chain reply")?;
+    let reply = recv_reply(&mut stream).context("receive binary chain prediction reply")?;
+    ensure_reply_kind(&reply, WireReplyKind::PredictedToken)?;
     write_stage_message(&mut stream, &StageWireMessage::stop(wire_dtype), wire_dtype)
         .context("send binary chain stop")?;
 

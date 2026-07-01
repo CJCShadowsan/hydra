@@ -47,9 +47,13 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
             mesh_llm_commands::gpus::dispatch_gpu_command(*json, command.as_ref())?;
             Ok(())
         }
-        Command::Runtime { command } => dispatch_runtime_command(command.as_ref()).await,
+        Command::Runtime { command } => {
+            dispatch_runtime_command(command.as_ref(), cli.config.as_deref()).await
+        }
         Command::Config { command } => dispatch_config_command(cli, command),
-        Command::Doctor { command, json } => dispatch_doctor_command(command.as_ref(), *json).await,
+        Command::Doctor { command, json } => {
+            dispatch_doctor_command(command.as_ref(), cli.config.as_deref(), *json).await
+        }
         Command::Load { name, port } => run_load(name, *port).await,
         Command::Unload { name, port } => run_drop(name, *port).await,
         Command::Status { port } => run_status(*port).await,
@@ -147,12 +151,21 @@ async fn dispatch_model_prepare(cmd: &Command) -> Result<()> {
 }
 
 async fn run_plugin_command(command: &mesh_llm_cli::PluginCommand, cli: &Cli) -> Result<()> {
-    let rows = if matches!(command, mesh_llm_cli::PluginCommand::List) {
-        Some(resolved_plugin_list_rows(cli)?)
-    } else {
-        None
-    };
-    mesh_llm_commands::plugin::run_plugin_command(command, rows.as_ref()).await?;
+    match command {
+        mesh_llm_cli::PluginCommand::List => {
+            let rows = resolved_plugin_list_rows(cli)?;
+            mesh_llm_commands::plugin::run_plugin_command(command, Some(&rows)).await?;
+        }
+        mesh_llm_cli::PluginCommand::Info { .. } => {
+            if !mesh_llm_commands::plugin::run_plugin_command(command, None).await? {
+                let rows = resolved_plugin_list_rows(cli)?;
+                mesh_llm_commands::plugin::run_plugin_command(command, Some(&rows)).await?;
+            }
+        }
+        _ => {
+            mesh_llm_commands::plugin::run_plugin_command(command, None).await?;
+        }
+    }
     Ok(())
 }
 

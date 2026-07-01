@@ -179,7 +179,6 @@ hook currently bound by this crate.
 | --- | --- |
 | `skippy_abi_version` | Returns the compiled stage ABI version. The C header exports it; this Rust crate mirrors the version through constants. |
 | `skippy_abi_features` | Returns the compiled feature bitmask. Rust binds this function in `skippy-ffi`; higher-level consumers can use it for feature probing or gating. |
-| `skippy_status_string` | Converts a status enum to a static C string. |
 | `skippy_error_free` | Frees an allocated `skippy_error`. |
 
 ### Model and session lifecycle
@@ -209,12 +208,9 @@ hook currently bound by this crate.
 | Function | Purpose |
 | --- | --- |
 | `skippy_prefill_chunk` | Prefills a token chunk using raw activation buffers for staged input/output. |
-| `skippy_decode_step` | Decodes one token using raw activation buffers and optionally returns a predicted token. |
 | `skippy_verify_tokens` | Runs batched token verification and returns the model-selected tokens. |
 | `skippy_decode_step_sampled` | Decodes one token with `SamplingConfig`, including penalties and logit bias. |
 | `skippy_prefill_chunk_frame` | Prefills a token chunk using `ActivationDesc` plus payload buffers. |
-| `skippy_decode_step_frame` | Decodes one token using activation-frame descriptors and payloads. |
-| `skippy_verify_tokens_frame` | Runs batched verification with activation-frame descriptors and payloads. |
 | `skippy_decode_step_frame_sampled` | Decodes one token with activation-frame I/O and `SamplingConfig`. |
 
 ### Token and chat helpers

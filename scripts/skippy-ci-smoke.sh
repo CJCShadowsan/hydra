@@ -473,14 +473,12 @@ assert_json "$REPORT_DIR/recurrent-kv-recurrent.json" \
   '.matches == true and .cache_hit_matches == true and .suffix_prefill_matches == null and .state_payload_kind == "kv-recurrent" and .cache_hit_repeats == 2 and .state_bytes > 0 and .payload_digest.recurrent_bytes > 0 and .payload_digest.kv_bytes > 0'
 
 PROMPT_PORT="$(pick_port)"
-PROMPT_RETURN_PORT="$(pick_port)"
 PROMPT_CONFIG="$WORK_DIR/prompt-stage.json"
 PROMPT_LOG="$WORK_DIR/prompt-stage.log"
 PROMPT_IN="$WORK_DIR/prompt-input.txt"
 PROMPT_OUT="$WORK_DIR/prompt-output.log"
 PROMPT_BIND="127.0.0.1:${PROMPT_PORT}"
-PROMPT_RETURN_BIND="127.0.0.1:${PROMPT_RETURN_PORT}"
-write_stage_config "$PROMPT_CONFIG" "$DENSE_MODEL_ID" "$DENSE_MODEL_PATH" "$DENSE_LAYER_END" "$PROMPT_CTX_SIZE" "$PROMPT_BIND" "resident-kv" "$PROMPT_N_BATCH" "$PROMPT_N_UBATCH" "tcp://${PROMPT_RETURN_BIND}"
+write_stage_config "$PROMPT_CONFIG" "$DENSE_MODEL_ID" "$DENSE_MODEL_PATH" "$DENSE_LAYER_END" "$PROMPT_CTX_SIZE" "$PROMPT_BIND" "resident-kv" "$PROMPT_N_BATCH" "$PROMPT_N_UBATCH" "driver"
 make_long_prompt_file "$PROMPT_IN"
 
 OPENAI_PORT="$(pick_port)"
@@ -680,7 +678,6 @@ LLAMA_STAGE_BUILD_DIR="$LLAMA_BUILD_DIR" \
     --tokenizer-layer-start 0 \
     --tokenizer-layer-end "$DENSE_LAYER_END" \
     --first-stage-addr "$PROMPT_BIND" \
-    --direct-return-bind-addr "$PROMPT_RETURN_BIND" \
     --ctx-size "$PROMPT_CTX_SIZE" \
     --activation-width 2048 \
     --activation-wire-dtype f16 \

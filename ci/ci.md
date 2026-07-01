@@ -118,6 +118,7 @@ subgraph PRCI["pr_builds.yml · PR Builds"]
         WebsiteDeploy["website-pages.yml\nActions Pages deploy\nPublic Website environment"]
         DockerPublish["docker.yml\ntag / dispatch publish"]
         Release["release.yml\nrelease artifacts + publish gates"]
+        FlyConsole["fly-deploy-console.yml\nmanual Fly console deploy"]
     end
 
     style Quality fill:#1a3a5c,stroke:#4a90d9,color:#e8f4fd
@@ -192,6 +193,11 @@ subgraph PRCI["pr_builds.yml · PR Builds"]
   request CI; non-PR workflows (`ci.yml`, `website-pages.yml`, `docker.yml`,
   `release.yml`) own main, dispatch, tag, website deployment, and release-grade
   publishing behavior.
+- `fly-deploy-console.yml` is a manual (`workflow_dispatch`) deploy of the
+  `mesh-llm-console` Fly app. It builds the image on Fly's remote builders from
+  `fly/Dockerfile` and authenticates with the app-scoped `FLY_API_TOKEN` repo
+  secret. It carries no pull request trigger and does not run release or smoke
+  jobs.
 
 ## Public website deployment
 
@@ -224,6 +230,11 @@ subgraph PRCI["pr_builds.yml · PR Builds"]
   runs.
 - Linux CPU artifacts feed inference, two-node, native SDK, and Kotlin SDK
   smokes. macOS CPU artifacts feed Swift SDK smokes.
+- Linux native-runtime packaging uses `patchelf` to make packaged shared
+  libraries relocatable with `$ORIGIN`, then verifies them without
+  `LD_LIBRARY_PATH`. Release native-runtime jobs and Linux SDK smoke jobs need
+  `patchelf` because SDK smoke prepares native runtime packages through
+  `scripts/ci-prepare-native-runtime.sh`.
 - Artifact-consuming smokes are additionally gated on the matching CPU producer
   being eligible, so backend-only or cleanup-only PRs skip those jobs natively
   instead of attempting to download an artifact that was never uploaded.
