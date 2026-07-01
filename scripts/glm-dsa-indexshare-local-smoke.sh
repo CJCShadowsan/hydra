@@ -23,7 +23,7 @@ The smoke proves:
   - native logs contain Full producer -> Shared consumer IndexShare flow
   - missing IndexShare metadata fails llama.cpp load
   - Shared layers with indexer tensors fail llama.cpp load
-  - contradictory IndexShare role/frequency metadata fails llama.cpp load
+  - explicit IndexShare role metadata overrides frequency metadata
   - MTP/NextN layers without complete indexer tensors fail llama.cpp load
   - missing split KV-B tensors fail llama.cpp load
   - stale unsplit attn_kv_b tensors fail llama.cpp load
@@ -309,13 +309,14 @@ assert_log_contains \
   "GLM_DSA attention.indexer.key_length must be greater than rope.dimension_count"
 
 frequency_conflict_status="$(run_llama frequency_conflict "$frequency_conflict_model")"
-if [[ "$frequency_conflict_status" == "0" ]]; then
-  echo "frequency-conflict fixture unexpectedly loaded" >&2
+if [[ "$frequency_conflict_status" != "0" ]]; then
+  echo "frequency-conflict fixture unexpectedly failed; explicit indexer.types should win" >&2
+  echo "stderr: $WORK_DIR/frequency_conflict.stderr" >&2
   exit 1
 fi
 assert_log_contains \
   "$WORK_DIR/frequency_conflict.stderr" \
-  "GLM_DSA attention.indexer.types conflicts with top_k_frequency at layer 1"
+  "GLM_DSA attention.indexer.types differs from top_k_frequency"
 
 missing_mtp_indexer_status="$(run_llama missing_mtp_indexer "$missing_mtp_indexer_model")"
 if [[ "$missing_mtp_indexer_status" == "0" ]]; then

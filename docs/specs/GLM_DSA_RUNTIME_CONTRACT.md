@@ -148,13 +148,16 @@ selects a documented dense fallback.
 
 Role precedence is:
 
-1. Explicit debug override via `LLAMA_GLM_DSA_INDEXSHARE_PATTERN`.
-2. `glm-dsa.attention.indexer.types`.
-3. `glm-dsa.attention.indexer.top_k_frequency` plus
+1. `glm-dsa.attention.indexer.types`.
+2. `glm-dsa.attention.indexer.top_k_frequency` plus
    `glm-dsa.attention.indexer.skip_top_k_offset`.
-4. Complete indexer tensor presence.
+3. Legacy/debug fallback via `LLAMA_GLM_DSA_INDEXSHARE_PATTERN` or
+   `LLAMA_GLM_DSA_INDEXSHARE_FREQ` only when metadata is unavailable.
+4. Complete indexer tensor presence as the last fallback.
 
-The production path should rely on metadata, not environment overrides.
+The production path relies on checkpoint/GGUF metadata, not environment
+overrides. When explicit `indexer.types` and frequency metadata both exist,
+`indexer.types` is authoritative.
 
 ## Top-K Sideband Contract
 
