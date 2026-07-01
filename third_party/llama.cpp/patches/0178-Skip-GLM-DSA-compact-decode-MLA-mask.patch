@@ -1,0 +1,216 @@
+From 050fff60b1cdc841400e38f4c6ba63b7fcb0fe77 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 07:14:27 +1000
+Subject: [PATCH] Skip GLM DSA compact decode MLA mask
+
+---
+ src/llama-graph.cpp | 123 +++++++++++++++++++++++++++++++++++++++-----
+ src/llama-graph.h   |   3 ++
+ 2 files changed, 112 insertions(+), 14 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b54537efc..7f4ec39f0 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -85,6 +85,18 @@ static int64_t skippy_glm_dsa_dense_sparse_mask_max_bytes() {
+     return parsed <= 0 ? INT64_MAX : parsed;
+ }
+ 
++static ggml_type llama_glm_dsa_mla_kq_mask_type(const llama_cparams & cparams) {
++    return cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
++}
++
++static int64_t llama_glm_dsa_kq_mask_nbytes(
++        ggml_type type,
++        int64_t   n_kv,
++        int64_t   n_batch,
++        int64_t   n_stream) {
++    return (int64_t) ggml_row_size(type, n_kv) * n_batch * n_stream;
++}
++
+ static bool skippy_glm_dsa_direct_sparse_decision_log_enabled() {
+     return skippy_env_enabled("SKIPPY_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS");
+ }
+@@ -260,6 +272,51 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     return policy;
+ }
+ 
++static bool llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
++        const llama_hparams & hparams,
++        const llama_cparams & cparams,
++        const llama_ubatch  & ubatch,
++        const llama_kv_cache_context * mctx_mla,
++        bool eligible) {
++    if (!eligible || mctx_mla == nullptr) {
++        return false;
++    }
++
++    const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
++    if (n_stream <= 0 || ubatch.n_tokens % n_stream != 0) {
++        return false;
++    }
++
++    const int64_t n_batch  = ubatch.n_tokens / n_stream;
++    const int64_t n_kv     = mctx_mla->get_n_kv();
++    const int64_t top_k    = std::min<int64_t>(n_kv, hparams.indexer_top_k);
++    const int64_t nbytes   = llama_glm_dsa_kq_mask_nbytes(
++            llama_glm_dsa_mla_kq_mask_type(cparams),
++            n_kv,
++            n_batch,
++            n_stream);
++
++    const llama_glm_dsa_sparse_attn_policy policy = llama_glm_dsa_choose_sparse_attn_policy(
++            n_batch,
++            n_stream,
++            top_k,
++            ubatch.n_tokens,
++            skippy_glm_dsa_direct_sparse_prefill_max_tokens(),
++            nbytes,
++            skippy_glm_dsa_dense_sparse_mask_max_bytes(),
++            skippy_glm_dsa_direct_sparse_attn_enabled(),
++            skippy_glm_dsa_direct_sparse_prefill_enabled(),
++            skippy_glm_dsa_unproven_large_direct_sparse_prefill_enabled(),
++            cparams.flash_attn,
++            skippy_glm_dsa_compact_flash_attn_disabled(),
++            true,
++            true,
++            hparams.f_max_alibi_bias == 0.0f,
++            !hparams.attn_soft_cap);
++
++    return policy.use_compact_flash_attn();
++}
++
+ static void skippy_glm_dsa_log_direct_sparse_decision(
+         int     layer,
+         int64_t ubatch_tokens,
+@@ -1041,6 +1098,14 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
+     this->mctx = mctx;
+ 
+     bool res = true;
++    const bool skip_mla_mask = llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
++            hparams,
++            params.cparams,
++            params.ubatch,
++            mctx->get_mla(),
++            glm_dsa_compact_decode_mask_eligible);
++
++    res &= compact_decode_mla_mask_omitted == skip_mla_mask;
+ 
+     if (self_k_idxs_mla && self_k_idxs_mla->buffer) {
+         res &= self_k_idxs_mla->ne[0] == params.ubatch.n_tokens;
+@@ -3161,26 +3226,38 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+     }
+ 
+-    const auto & kq_mask = inp->get_kq_mask_mla();
+-
+-    // reshape KQ mask into tensor with rows of size 1:
+-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
+-    ggml_tensor * kq_mask_rows = ggml_view_4d(
+-            ctx0, kq_mask,
+-            1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
+-            kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+-
+     ggml_tensor * top_k_3d = llama_glm_dsa_top_k_for_sparse_attn(ctx0, top_k);
+ 
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
++    ggml_tensor * kq_mask = inp->get_kq_mask_mla();
++    ggml_tensor * kq_mask_rows = nullptr;
++    const auto ensure_kq_mask_rows = [&]() -> ggml_tensor * {
++        if (kq_mask == nullptr) {
++            throw std::runtime_error("GLM_DSA compact decode omitted the MLA KQ mask but selected a mask-dependent attention route");
++        }
++        if (kq_mask_rows == nullptr) {
++            // reshape KQ mask into tensor with rows of size 1:
++            // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
++            kq_mask_rows = ggml_view_4d(
++                    ctx0, kq_mask,
++                    1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
++                    kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
++        }
++        return kq_mask_rows;
++    };
++
+     const int64_t n_direct_sparse_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+     const int64_t n_direct_sparse_batch = top_k_3d->ne[1];
+-    const int64_t n_sparse_kv = kq_mask_rows->ne[1];
++    const int64_t n_sparse_kv = mctx_cur->get_n_kv();
+     const int64_t n_sparse_top_k = top_k_3d->ne[0];
+-    const int64_t dense_sparse_mask_bytes = (int64_t) ggml_nbytes(kq_mask_rows);
++    const int64_t dense_sparse_mask_bytes = llama_glm_dsa_kq_mask_nbytes(
++            llama_glm_dsa_mla_kq_mask_type(cparams),
++            n_sparse_kv,
++            n_direct_sparse_batch,
++            n_direct_sparse_stream);
+     const int64_t direct_sparse_prefill_max_tokens = skippy_glm_dsa_direct_sparse_prefill_max_tokens();
+     const int64_t dense_sparse_mask_limit = skippy_glm_dsa_dense_sparse_mask_max_bytes();
+     const bool direct_sparse_enabled = skippy_glm_dsa_direct_sparse_attn_enabled();
+@@ -3264,7 +3341,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     }
+ 
+     if (sparse_policy.use_direct_sparse_attn()) {
+-        ggml_tensor * cur = build_attn_mha_dsa_sparse(q, k, v, kq_mask_rows, top_k_3d, v_mla, kq_scale, il);
++        ggml_tensor * cur = build_attn_mha_dsa_sparse(q, k, v, ensure_kq_mask_rows(), top_k_3d, v_mla, kq_scale, il);
+         cb(cur, "kqv_out", il);
+ 
+         if (wo) {
+@@ -3278,6 +3355,8 @@ ggml_tensor * llm_graph_context::build_attn(
+         return cur;
+     }
+ 
++    ensure_kq_mask_rows();
++
+     ggml_tensor * kq_mask_top_k = nullptr;
+     if (skippy_glm_dsa_fused_sparse_mask_enabled()) {
+         kq_mask_top_k = ggml_dsa_sparse_mask(ctx0, kq_mask_rows, top_k_3d);
+@@ -3467,12 +3546,28 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_context *>(mctx);
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
++    inp->glm_dsa_compact_decode_mask_eligible = arch == LLM_ARCH_GLM_DSA;
++    inp->compact_decode_mla_mask_omitted = llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
++            hparams,
++            cparams,
++            ubatch,
++            mctx_cur->get_mla(),
++            inp->glm_dsa_compact_decode_mask_eligible);
+ 
+     {
+         inp->self_k_idxs_mla = mctx_cur->get_mla()->build_input_k_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
+-        inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
++        if (!inp->compact_decode_mla_mask_omitted) {
++            inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
++            inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
++        } else if (skippy_glm_dsa_compact_flash_policy_log_enabled()) {
++            LLAMA_LOG_INFO(
++                    "skippy: glm_dsa_compact_flash_mask layer=-1 omitted_mla_kq_mask=1 visible_kv=%u ubatch_tokens=%u streams=%u max_top_k=%u\n",
++                    mctx_cur->get_mla()->get_n_kv(),
++                    ubatch.n_tokens,
++                    cparams.kv_unified ? 1 : ubatch.n_seqs_unq,
++                    std::min<uint32_t>(mctx_cur->get_mla()->get_n_kv(), hparams.indexer_top_k));
++        }
+     }
+ 
+     {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e9280a066..4c8bab6f1 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -515,6 +515,9 @@ public:
+ 
+     ggml_tensor * self_k_rot_lid = nullptr;
+ 
++    bool glm_dsa_compact_decode_mask_eligible = false;
++    bool compact_decode_mla_mask_omitted = false;
++
+     const llama_hparams hparams;
+     const llama_cparams cparams;
+ 
+-- 
+2.53.0
+
