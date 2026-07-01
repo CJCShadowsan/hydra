@@ -3,7 +3,8 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::sleep;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -17,6 +18,7 @@ use sha2::{Digest, Sha256};
 use skippy_ffi::TensorRole;
 use skippy_runtime::{ModelInfo, TensorInfo, write_gguf_from_parts};
 
+mod glm_dsa_contract;
 mod preflight;
 mod progress;
 
@@ -71,6 +73,8 @@ enum Command {
         #[arg(long)]
         after_artifact_command: Option<PathBuf>,
         #[arg(long)]
+        resume_existing_artifacts: bool,
+        #[arg(long)]
         model_id: Option<String>,
         #[arg(long)]
         source_repo: Option<String>,
@@ -93,6 +97,14 @@ enum Command {
         stages: Option<usize>,
         #[arg(long)]
         verify_sha256: bool,
+    },
+    GlmDsaContract {
+        path: PathBuf,
+    },
+    RepairGlmDsaIndexshareMetadata {
+        package: PathBuf,
+        #[arg(long)]
+        in_place: bool,
     },
 }
 
@@ -405,6 +417,7 @@ fn main() -> Result<()> {
             out_dir,
             projectors,
             after_artifact_command,
+            resume_existing_artifacts,
             model_id,
             source_repo,
             source_revision,
@@ -416,6 +429,7 @@ fn main() -> Result<()> {
             ArtifactHook {
                 command: after_artifact_command,
             },
+            resume_existing_artifacts,
             ExplicitSourceIdentity {
                 model_id,
                 source_repo,
@@ -430,6 +444,10 @@ fn main() -> Result<()> {
             stages,
             verify_sha256,
         } => run_preflight(package, stages, verify_sha256),
+        Command::GlmDsaContract { path } => run_glm_dsa_contract(path),
+        Command::RepairGlmDsaIndexshareMetadata { package, in_place } => {
+            repair_glm_dsa_indexshare_metadata(package, in_place)
+        }
     }
 }
 
@@ -517,6 +535,7 @@ fn write_package(
     out_dir: PathBuf,
     projectors: Vec<PathBuf>,
     artifact_hook: ArtifactHook,
+    resume_existing_artifacts: bool,
     explicit: ExplicitSourceIdentity,
 ) -> Result<()> {
     let input = resolve_package_input(model, explicit)?;
@@ -552,6 +571,7 @@ fn write_package(
         },
         &out_dir,
         &artifact_hook,
+        resume_existing_artifacts,
     )?;
     progress.finish_step(&artifact_progress_detail(&metadata))?;
     progress.start_step("shared/embeddings.gguf")?;
@@ -568,6 +588,7 @@ fn write_package(
         },
         &out_dir,
         &artifact_hook,
+        resume_existing_artifacts,
     )?;
     progress.finish_step(&artifact_progress_detail(&embeddings))?;
     progress.start_step("shared/output.gguf")?;
@@ -584,6 +605,7 @@ fn write_package(
         },
         &out_dir,
         &artifact_hook,
+        resume_existing_artifacts,
     )?;
     progress.finish_step(&artifact_progress_detail(&output))?;
 
@@ -604,6 +626,7 @@ fn write_package(
             },
             &out_dir,
             &artifact_hook,
+            resume_existing_artifacts,
         )?;
         progress.finish_step(&artifact_progress_detail(&artifact))?;
         layers.push(PackageLayer {
@@ -1050,6 +1073,234 @@ fn run_preflight(package: PathBuf, stages: Option<usize>, verify_sha256: bool) -
     Ok(())
 }
 
+fn run_glm_dsa_contract(path: PathBuf) -> Result<()> {
+    let report = glm_dsa_contract::validate_path(&path)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !report.valid {
+        bail!("GLM-DSA contract validation failed");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct GlmDsaIndexshareRepairOutput {
+    repaired: bool,
+    package: String,
+    metadata_path: String,
+    role_count: usize,
+    full_layer_count: usize,
+    shared_layer_count: usize,
+    metadata_sha256: String,
+    metadata_artifact_bytes: u64,
+    validation: glm_dsa_contract::GlmDsaContractReport,
+}
+
+fn repair_glm_dsa_indexshare_metadata(package: PathBuf, in_place: bool) -> Result<()> {
+    ensure!(
+        in_place,
+        "repair-glm-dsa-indexshare-metadata requires --in-place"
+    );
+    ensure!(
+        package.is_dir(),
+        "package must be a directory: {}",
+        package.display()
+    );
+
+    let manifest_path = package.join("model-package.json");
+    let mut manifest: PackageManifest = serde_json::from_str(
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", manifest_path.display()))?;
+
+    let initial = glm_dsa_contract::validate_path(&package)?;
+    if initial.valid {
+        let metadata_path = package.join(&manifest.shared.metadata.path);
+        let output = GlmDsaIndexshareRepairOutput {
+            repaired: false,
+            package: package.display().to_string(),
+            metadata_path: metadata_path.display().to_string(),
+            role_count: initial.full_layers.len() + initial.shared_layers.len(),
+            full_layer_count: initial.full_layers.len(),
+            shared_layer_count: initial.shared_layers.len(),
+            metadata_sha256: manifest.shared.metadata.sha256.clone(),
+            metadata_artifact_bytes: manifest.shared.metadata.artifact_bytes,
+            validation: initial,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    let role_error = "missing IndexShare role metadata; expected indexer.types or top_k_frequency/skip_top_k_offset";
+    ensure!(
+        initial.tensor_errors.is_empty(),
+        "cannot repair GLM-DSA IndexShare metadata while tensor errors are present: {:?}",
+        initial.tensor_errors
+    );
+    ensure!(
+        initial
+            .metadata_errors
+            .iter()
+            .all(|error| error == role_error),
+        "cannot safely repair GLM-DSA package with non-role metadata errors: {:?}",
+        initial.metadata_errors
+    );
+    ensure!(
+        initial.role_source.as_deref() == Some("tensor_presence"),
+        "cannot infer roles from unexpected role source {:?}",
+        initial.role_source
+    );
+
+    let roles = indexshare_roles_from_report(&initial)?;
+    let metadata_path = package.join(&manifest.shared.metadata.path);
+    append_string_array_kv_to_zero_tensor_gguf(
+        &metadata_path,
+        "glm-dsa.attention.indexer.types",
+        &roles,
+    )?;
+
+    let metadata = fs::metadata(&metadata_path)
+        .with_context(|| format!("read repaired metadata {}", metadata_path.display()))?;
+    manifest.shared.metadata.artifact_bytes = metadata.len();
+    manifest.shared.metadata.sha256 = file_sha256(&metadata_path)?;
+    write_json_file(&manifest_path, &manifest)?;
+
+    let validation = glm_dsa_contract::validate_path(&package)?;
+    ensure!(
+        validation.valid,
+        "repaired GLM-DSA package still fails contract validation"
+    );
+
+    let output = GlmDsaIndexshareRepairOutput {
+        repaired: true,
+        package: package.display().to_string(),
+        metadata_path: metadata_path.display().to_string(),
+        role_count: roles.len(),
+        full_layer_count: validation.full_layers.len(),
+        shared_layer_count: validation.shared_layers.len(),
+        metadata_sha256: manifest.shared.metadata.sha256,
+        metadata_artifact_bytes: manifest.shared.metadata.artifact_bytes,
+        validation,
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn indexshare_roles_from_report(
+    report: &glm_dsa_contract::GlmDsaContractReport,
+) -> Result<Vec<String>> {
+    let effective_layers = report
+        .effective_decoder_layers
+        .context("GLM-DSA report missing effective decoder layer count")?;
+    let full = report.full_layers.iter().copied().collect::<BTreeSet<_>>();
+    let shared = report
+        .shared_layers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut roles = Vec::with_capacity(effective_layers as usize);
+    for layer in 0..effective_layers {
+        if full.contains(&layer) {
+            roles.push("full".to_string());
+        } else if shared.contains(&layer) {
+            roles.push("shared".to_string());
+        } else {
+            bail!("GLM-DSA report does not classify layer {layer}");
+        }
+    }
+    Ok(roles)
+}
+
+fn append_string_array_kv_to_zero_tensor_gguf(
+    path: &Path,
+    key: &str,
+    values: &[String],
+) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut cursor = std::io::Cursor::new(bytes.as_slice());
+    let mut magic = [0_u8; 4];
+    cursor
+        .read_exact(&mut magic)
+        .with_context(|| format!("read GGUF magic from {}", path.display()))?;
+    ensure!(&magic == b"GGUF", "not a GGUF file: {}", path.display());
+    let version = read_gguf_u32(&mut cursor)?;
+    ensure!(
+        version >= 2,
+        "unsupported GGUF version {version} in {}",
+        path.display()
+    );
+    let tensor_count = read_gguf_header_count(&mut cursor, MAX_GGUF_TENSOR_COUNT, "tensor")?;
+    let kv_count = read_gguf_header_count(&mut cursor, MAX_GGUF_HEADER_KV_COUNT, "metadata")?;
+    ensure!(
+        tensor_count == 0,
+        "metadata repair only supports zero-tensor GGUF files; {} has {tensor_count} tensors",
+        path.display()
+    );
+
+    let metadata_start =
+        usize::try_from(cursor.position()).context("metadata start exceeds usize")?;
+    for _ in 0..kv_count {
+        let existing_key = read_gguf_string(&mut cursor)?;
+        ensure!(
+            existing_key != key,
+            "{} already contains metadata key {key}",
+            path.display()
+        );
+        let value_type = GgufValueType::from_u32(read_gguf_u32(&mut cursor)?)?;
+        skip_gguf_value(&mut cursor, value_type)?;
+    }
+    let metadata_end = usize::try_from(cursor.position()).context("metadata end exceeds usize")?;
+
+    let tmp_path = path.with_file_name(format!(
+        ".{}.repair-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("metadata.gguf"),
+        std::process::id()
+    ));
+    {
+        let mut output =
+            File::create(&tmp_path).with_context(|| format!("create {}", tmp_path.display()))?;
+        output.write_all(b"GGUF")?;
+        write_gguf_u32(&mut output, version)?;
+        write_gguf_u64(&mut output, tensor_count)?;
+        write_gguf_u64(&mut output, kv_count + 1)?;
+        output.write_all(&bytes[metadata_start..metadata_end])?;
+        write_gguf_string_array_kv(&mut output, key, values)?;
+        output.write_all(&bytes[metadata_end..])?;
+    }
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("replace {} with {}", path.display(), tmp_path.display()))?;
+    Ok(())
+}
+
+fn write_gguf_string_array_kv(writer: &mut impl Write, key: &str, values: &[String]) -> Result<()> {
+    write_gguf_string(writer, key)?;
+    write_gguf_u32(writer, 9)?;
+    write_gguf_u32(writer, 8)?;
+    write_gguf_u64(writer, values.len() as u64)?;
+    for value in values {
+        write_gguf_string(writer, value)?;
+    }
+    Ok(())
+}
+
+fn write_gguf_string(writer: &mut impl Write, value: &str) -> Result<()> {
+    write_gguf_u64(writer, value.len() as u64)?;
+    writer.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+fn write_gguf_u32(writer: &mut impl Write, value: u32) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_gguf_u64(writer: &mut impl Write, value: u64) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
 fn validate_package_artifact(
     package: &Path,
     artifact: &PackageArtifact,
@@ -1178,6 +1429,7 @@ fn write_package_artifact(
     spec: PackageArtifactSpec,
     out_dir: &Path,
     artifact_hook: &ArtifactHook,
+    resume_existing_artifacts: bool,
 ) -> Result<PackageArtifact> {
     let stage = stage_plan_from_tensors(
         spec.stage_index as usize,
@@ -1188,22 +1440,30 @@ fn write_package_artifact(
         tensors,
     );
     let path = out_dir.join(&spec.relative_path);
+    if resume_existing_artifacts && path.is_file() {
+        return read_package_artifact(&path, &spec.relative_path);
+    }
     write_stage_artifact(source, &stage, &path)?;
     let relative_path = spec.relative_path.display().to_string();
     run_artifact_hook(artifact_hook, &path, &relative_path)?;
-    let artifact_info = ModelInfo::open(&path)
+    read_package_artifact(&path, &spec.relative_path)
+}
+
+fn read_package_artifact(path: &Path, relative_path: &Path) -> Result<PackageArtifact> {
+    let relative_path = relative_path.display().to_string();
+    let artifact_info = ModelInfo::open(path)
         .with_context(|| format!("open package artifact {}", path.display()))?;
     let artifact_tensors = artifact_info
         .tensors()
         .with_context(|| format!("read package artifact tensors {}", path.display()))?;
-    let metadata = fs::metadata(&path)
-        .with_context(|| format!("read artifact metadata {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("read artifact metadata {}", path.display()))?;
     let artifact = PackageArtifact {
         path: relative_path,
         tensor_count: artifact_tensors.len(),
         tensor_bytes: artifact_tensors.iter().map(|tensor| tensor.byte_size).sum(),
         artifact_bytes: metadata.len(),
-        sha256: file_sha256(&path)?,
+        sha256: file_sha256(path)?,
     };
     Ok(artifact)
 }
@@ -1437,10 +1697,14 @@ fn write_sharded_stage_artifact(source: &ModelSource, stage: &StagePlan, out: &P
         .and_then(|value| value.to_str())
         .unwrap_or("stage");
     let pid = std::process::id();
-    let scratch = parent.join(format!(".{stem}.shard-parts-{pid}"));
+    let scratch_parent = std::env::var_os("SKIPPY_MODEL_PACKAGE_SHARD_SCRATCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| parent.to_path_buf());
+    fs::create_dir_all(&scratch_parent)
+        .with_context(|| format!("create shard scratch root {}", scratch_parent.display()))?;
+    let scratch = scratch_parent.join(format!(".{stem}.shard-parts-{pid}"));
     if scratch.exists() {
-        fs::remove_dir_all(&scratch)
-            .with_context(|| format!("remove stale shard scratch {}", scratch.display()))?;
+        remove_shard_scratch_dir(&scratch, "remove stale shard scratch")?;
     }
     fs::create_dir_all(&scratch)
         .with_context(|| format!("create shard scratch {}", scratch.display()))?;
@@ -1461,9 +1725,34 @@ fn write_sharded_stage_artifact(source: &ModelSource, stage: &StagePlan, out: &P
             .with_context(|| format!("merge split-GGUF shard slices into {}", out.display()))
     })();
 
-    let cleanup = fs::remove_dir_all(&scratch)
-        .with_context(|| format!("remove shard scratch {}", scratch.display()));
-    result.and(cleanup)
+    let cleanup = remove_shard_scratch_dir(&scratch, "remove shard scratch");
+    result?;
+    cleanup
+}
+
+fn remove_shard_scratch_dir(path: &Path, label: &str) -> Result<()> {
+    const ATTEMPTS: u32 = 8;
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut last_error = None;
+    for attempt in 0..ATTEMPTS {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < ATTEMPTS {
+                    sleep(Duration::from_millis(50 * u64::from(attempt + 1)));
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("scratch directory still exists")))
+        .with_context(|| format!("{label} {}", path.display()))
 }
 
 const MAX_GGUF_STRING_BYTES: u64 = 1_000_000;

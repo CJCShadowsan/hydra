@@ -1,7 +1,9 @@
 use std::{
-    fs::{self, File},
-    io::{BufReader, Cursor, Read},
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io::{BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
+    process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,8 +18,8 @@ use skippy_protocol::binary::{
 use skippy_runtime::package::{PackagePart, PackageStageRequest, select_layer_package_parts};
 use skippy_runtime::{
     ActivationDesc, ActivationFrame, FlashAttentionType, RuntimeActivationDType,
-    RuntimeActivationLayout, RuntimeConfig, RuntimeLoadMode, StageModel, parse_cache_type,
-    redirect_native_logs_to_file, restore_native_logs,
+    RuntimeActivationLayout, RuntimeConfig, RuntimeKvPageDesc, RuntimeLoadMode, StageModel,
+    parse_cache_type, redirect_native_logs_to_file, restore_native_logs,
 };
 
 use crate::{
@@ -28,9 +30,12 @@ use crate::{
         summarize_metal_dispatch, summarize_routed_moe_timing,
     },
     glm_dsa_op_report::{
-        DirectSparseDecisionRecord, HotTensorRecord, MetalDispatchRecord, TimingGroupRecord,
-        TimingRecord, parse_direct_sparse_decision_records, parse_hot_tensor_records,
-        parse_metal_dispatch_records, parse_timing_group_records, parse_timing_records,
+        CompactFlashPolicyRecord, ComputeBufferRecord, DirectSparseDecisionRecord, HotTensorRecord,
+        IndexShareTraceSummary, MetalDispatchRecord, TimingGroupRecord, TimingRecord,
+        parse_compact_flash_policy_records, parse_compute_buffer_records,
+        parse_direct_sparse_decision_records, parse_hot_tensor_records,
+        parse_indexshare_trace_records, parse_metal_dispatch_records, parse_timing_group_records,
+        parse_timing_records, summarize_indexshare_trace_records,
     },
 };
 
@@ -44,6 +49,7 @@ const ENV_REAL_TOP_K_REQUIRE_CACHE: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_REQU
 const ENV_REAL_TOP_K_CHAIN_SOURCES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES";
 const ENV_REAL_TOP_K_MAX_SOURCE_BYTES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES";
 const ENV_STAGE_WIRE_ROUNDTRIP: &str = "SKIPPY_BENCH_GLM_DSA_STAGE_WIRE_ROUNDTRIP";
+const ENV_ALLOW_COMPACT_FLASH_AUTO: &str = "SKIPPY_GLM_DSA_BENCH_ALLOW_COMPACT_FLASH_AUTO";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
 const DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES: u64 = 110 * 1024 * 1024 * 1024;
 const GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -64,9 +70,14 @@ const GGUF_TYPE_UINT64: u32 = 10;
 const GGUF_TYPE_INT64: u32 = 11;
 const GGUF_TYPE_FLOAT64: u32 = 12;
 const INPUT_FRAME_CACHE_MAGIC: &[u8; 16] = b"SKPGLMDSAFRM1\0\0\0";
+const GGML_TYPE_F32_ID: u32 = 0;
+const GGML_TYPE_F16_ID: u32 = 1;
+const GLM_DSA_F16_K_ROW_BYTES: u32 = 1152;
 
 pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     validate_args(&args)?;
+    let _single_run_guard = GlmDsaSingleRunGuard::acquire(&args)?;
+    let mut deferred_model_drops = Vec::new();
 
     let selected = select_layer_package_parts(&package_request(&args))
         .context("select GLM-DSA layer package parts")?;
@@ -81,14 +92,31 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         args.layer_start,
     )
     .context("derive GLM-DSA artifact layer role")?;
-    let input = prepare_input_activation(&args, &token_ids, &positions, flags)?;
+    let input = prepare_input_activation(
+        &args,
+        &token_ids,
+        &positions,
+        flags,
+        &mut deferred_model_drops,
+    )?;
     let stage_wire_roundtrip =
         maybe_stage_wire_roundtrip(&args, &input.frame, &token_ids, &positions)
             .context("round-trip GLM-DSA activation through Skippy stage wire")?;
     let input_frame = stage_wire_roundtrip
         .as_ref()
         .map_or(&input.frame, |roundtrip| &roundtrip.frame);
-    let comparison = if args.compare_dense_fallback {
+    let comparison = if args.compare_native_indexshare_producer_consumer {
+        Some(run_native_indexshare_producer_consumer_comparison(
+            &args,
+            &selected.absolute_paths,
+            &runtime_config,
+            input_frame,
+            &token_ids,
+            &positions,
+            flags,
+            &mut deferred_model_drops,
+        )?)
+    } else if args.compare_dense_fallback {
         Some(run_dense_fallback_comparison(
             &args,
             &selected.absolute_paths,
@@ -97,6 +125,18 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             &token_ids,
             &positions,
             flags,
+            &mut deferred_model_drops,
+        )?)
+    } else if args.compare_dense_flash_prefill {
+        Some(run_dense_flash_prefill_comparison(
+            &args,
+            &selected.absolute_paths,
+            &runtime_config,
+            input_frame,
+            &token_ids,
+            &positions,
+            flags,
+            &mut deferred_model_drops,
         )?)
     } else if args.compare_cpu_direct_sparse {
         Some(run_cpu_direct_sparse_comparison(
@@ -107,6 +147,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             &token_ids,
             &positions,
             flags,
+            &mut deferred_model_drops,
         )?)
     } else if args.compare_metal_sparse_attn_threads_baseline.is_some() {
         Some(run_metal_sparse_attn_threads_comparison(
@@ -117,58 +158,93 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             &token_ids,
             &positions,
             flags,
+            &mut deferred_model_drops,
+        )?)
+    } else if args.compare_moe_down_weighted_fusion
+        || args.compare_moe_down_weighted_parallel
+        || args.compare_moe_down_unweighted_slots
+    {
+        Some(run_moe_down_weighted_fusion_comparison(
+            &args,
+            &selected.absolute_paths,
+            &runtime_config,
+            input_frame,
+            &token_ids,
+            &positions,
+            flags,
+            &mut deferred_model_drops,
         )?)
     } else {
         None
     };
     let case = match comparison.as_ref() {
-        Some(comparison) => comparison.candidate.clone(),
+        Some(comparison) => comparison.candidate.as_case_summary(),
         None => {
             let case = run_microbench_case(
                 "candidate",
                 &selected.absolute_paths,
                 &runtime_config,
                 &args,
+                args.layer_start,
+                args.layer_end,
                 flags,
                 input_frame,
                 &token_ids,
                 &positions,
                 false,
+                &mut deferred_model_drops,
             )?;
             case.as_case_summary()
         }
     };
-    let optimized_dispatch_probe = if should_run_optimized_dispatch_probe(flags) {
-        let probe_flags = MicrobenchFlags {
-            op_timing: false,
-            metal_dispatch_log: true,
-            metal_topk_moe_route_fusion: true,
-            ..flags
-        };
-        Some(
-            run_microbench_case(
+    let effective_flags = case.flags;
+    let optimized_dispatch_probe_case =
+        if should_run_optimized_dispatch_probe(effective_flags, args.require_moe_motif_proof) {
+            let probe_flags = MicrobenchFlags {
+                op_timing: false,
+                metal_dispatch_log: true,
+                metal_topk_moe_route_fusion: effective_flags.metal_topk_moe_route_fusion,
+                ..effective_flags
+            };
+            Some(run_microbench_case(
                 "optimized_dispatch_probe",
                 &selected.absolute_paths,
                 &runtime_config,
                 &args,
+                args.layer_start,
+                args.layer_end,
                 probe_flags,
                 &input.frame,
                 &token_ids,
                 &positions,
-                false,
-            )?
-            .as_case_summary(),
-        )
-    } else {
-        None
-    };
+                true,
+                &mut deferred_model_drops,
+            )?)
+        } else {
+            None
+        };
+    let optimized_dispatch_probe = optimized_dispatch_probe_case
+        .as_ref()
+        .map(MicrobenchCase::as_case_summary);
+    let optimized_dispatch_probe_parity =
+        match (comparison.as_ref(), optimized_dispatch_probe_case.as_ref()) {
+            (Some(comparison), Some(probe)) => Some(compare_case_outputs(
+                &comparison.baseline.outputs,
+                &probe.outputs,
+                &args,
+            )?),
+            _ => None,
+        };
 
-    let direct_sparse_decision_summary =
-        summarize_direct_sparse_decisions(&case.direct_sparse_decision_records);
+    let compact_flash_policy_summary = summarize_compact_flash_policy(&case);
+    let direct_sparse_decision_summary = summarize_direct_sparse_decisions(&case);
     let timing_summary = case.timing_summary.clone();
+    let timing_breakdown = case.timing_breakdown.clone();
     let metal_dispatch_summary = case.metal_dispatch_summary.clone();
+    let direct_sparse_spill_summary = summarize_direct_sparse_spill(&case.metal_dispatch_records);
     let op_timing_summary = case.op_timing_summary.clone();
     let routed_moe_timing_summary = case.routed_moe_timing_summary.clone();
+    let indexshare_timing_summary = summarize_indexshare_timing(&case.group_timing_records);
     let input_contract = activation_contract_report(&args, input_frame)?;
     let execution_contract = execution_contract_report(
         &args,
@@ -178,10 +254,15 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         artifact_layer_role,
     );
     let profile_integrity = ProfileIntegrityReport::new(
-        flags,
+        effective_flags,
         &metal_dispatch_summary,
         &timing_summary,
         optimized_dispatch_probe.as_ref(),
+    );
+    let representative_profile = RepresentativeProfileReport::new(
+        &case,
+        optimized_dispatch_probe.as_ref(),
+        &profile_integrity,
     );
     let route_fusion_guard = args
         .require_optimized_route_fusion
@@ -189,15 +270,37 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let direct_sparse_prefill_guard = args
         .require_direct_sparse_prefill_proof
         .then(|| build_direct_sparse_prefill_guard(&case));
+    let direct_sparse_decode_guard = args
+        .require_direct_sparse_decode_proof
+        .then(|| build_direct_sparse_decode_guard(&case));
     let partial_top_k_guard = if args.require_partial_top_k_proof {
         Some(build_partial_top_k_guard(
             &case,
+            optimized_dispatch_probe.as_ref(),
             hidden_payload_bytes(&args)?,
             args.tokens,
         ))
     } else {
         None
     };
+    let compact_flash_guard = args
+        .require_compact_flash_proof
+        .then(|| build_compact_flash_guard(&case));
+    let moe_weighted_sum_guard = args
+        .require_moe_weighted_sum_proof
+        .then(|| build_moe_weighted_sum_guard(&case));
+    let moe_motif_guard = args
+        .require_moe_motif_proof
+        .then(|| build_moe_motif_guard(&case, optimized_dispatch_probe.as_ref()));
+    let native_indexshare_guard =
+        args.require_native_indexshare_proof
+            .then(|| match comparison.as_ref() {
+                Some(comparison) if args.compare_native_indexshare_producer_consumer => {
+                    build_native_indexshare_guard(&comparison.baseline.as_case_summary())
+                }
+                _ => build_native_indexshare_guard(&case),
+            });
+    let comparison_report = comparison.as_ref().map(MicrobenchComparison::as_report);
     let real_top_k_shared_consumer_guard =
         args.require_real_top_k_shared_consumer_proof.then(|| {
             build_real_top_k_shared_consumer_guard(
@@ -207,6 +310,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
                     .map(|roundtrip| &roundtrip.report),
             )
         });
+    let report_kv_warmup_chunk_tokens = kv_warmup_chunk_tokens(&args);
     let report = MicrobenchReport {
         command: "glm-dsa-layer-microbench",
         model_id: args.model_id,
@@ -217,6 +321,11 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         activation_width: args.activation_width,
         tokens: args.tokens,
         position_start: args.position_start,
+        kv_warmup_tokens: args.kv_warmup_tokens,
+        kv_warmup_chunk_tokens: report_kv_warmup_chunk_tokens,
+        synthetic_kv_warmup: args.synthetic_kv_warmup,
+        reuse_kv_warmup_checkpoint: args.reuse_kv_warmup_checkpoint,
+        reuse_kv_warmup_stream: args.reuse_kv_warmup_stream,
         warmup: args.warmup,
         iterations: args.iterations,
         n_gpu_layers: args.n_gpu_layers,
@@ -235,29 +344,52 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         stage_wire_roundtrip: stage_wire_roundtrip.map(|roundtrip| roundtrip.report),
         execution_contract,
         native_log_path: case.native_log_path,
+        compact_flash_policy_summary,
         direct_sparse_decision_summary,
         timing_summary,
+        timing_breakdown,
         metal_dispatch_summary,
+        direct_sparse_spill_summary,
         op_timing_summary,
         routed_moe_timing_summary,
+        indexshare_timing_summary,
+        indexshare_trace_summary: case.indexshare_trace_summary.clone(),
+        representative_profile,
         profile_integrity,
         route_fusion_guard,
         direct_sparse_prefill_guard,
+        direct_sparse_decode_guard,
         partial_top_k_guard,
+        compact_flash_guard,
+        moe_weighted_sum_guard,
+        moe_motif_guard,
+        native_indexshare_guard,
         real_top_k_shared_consumer_guard,
+        compact_flash_policy_records: case.compact_flash_policy_records,
+        compact_flash_execution_policy_records: case.compact_flash_execution_policy_records,
+        compact_flash_non_measured_policy_records: case.compact_flash_non_measured_policy_records,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
+        direct_sparse_execution_decision_records: case.direct_sparse_execution_decision_records,
+        direct_sparse_non_measured_decision_records: case
+            .direct_sparse_non_measured_decision_records,
         metal_dispatch_records: case.metal_dispatch_records,
         op_timing_records: case.op_timing_records,
         group_timing_records: case.group_timing_records,
         hot_tensor_records: case.hot_tensor_records,
+        compute_buffer_records: case.compute_buffer_records,
         optimized_dispatch_probe,
-        comparison,
+        optimized_dispatch_probe_parity,
+        comparison: comparison_report,
         timings: case.timings,
     };
     let parity_passed = report
         .comparison
         .as_ref()
-        .is_none_or(|comparison| comparison.parity.passed);
+        .is_none_or(|comparison| comparison.parity.passed)
+        && report
+            .optimized_dispatch_probe_parity
+            .as_ref()
+            .is_none_or(|parity| parity.passed);
 
     write_report(args.output.as_deref(), &report)?;
     if let Some(guard) = &report.route_fusion_guard
@@ -276,12 +408,31 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         && !guard.passed
     {
         bail!(
-            "GLM-DSA direct sparse prefill proof failed for {}: large_prefill_direct={} sparse_mask_nodes={} dsa_nodes={} capped_dispatches={} failures={}",
+            "GLM-DSA direct sparse prefill proof failed for {}: prefill_direct={} large_prefill_direct={} sparse_mask_nodes={} dense_mask_dispatches={} dsa_nodes={} dsa_dispatches={} accepted_dispatches={} failures={}",
             guard.checked_case,
+            guard.prefill_direct_decisions,
             guard.large_prefill_direct_decisions,
             guard.sparse_mask_nodes,
+            guard.dense_sparse_mask_dispatches,
             guard.dsa_sparse_attn_nodes,
-            guard.capped_large_prefill_dispatches,
+            guard.dsa_sparse_attn_dispatches,
+            guard.accepted_prefill_dispatches,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.direct_sparse_decode_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA direct sparse decode proof failed for {}: decode_direct={} fallback={} sparse_mask_nodes={} dense_mask_dispatches={} dsa_nodes={} dsa_dispatches={} accepted_dispatches={} failures={}",
+            guard.checked_case,
+            guard.decode_direct_decisions,
+            guard.fallback_records,
+            guard.sparse_mask_nodes,
+            guard.dense_sparse_mask_dispatches,
+            guard.dsa_sparse_attn_nodes,
+            guard.dsa_sparse_attn_dispatches,
+            guard.accepted_decode_dispatches,
             guard.failure_summary,
         );
     }
@@ -293,6 +444,59 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             guard.checked_case,
             guard.partial_dsa_sparse_attn_dispatches,
             guard.output_frames_with_expected_sideband,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.compact_flash_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA compact flash proof failed for {}: flash_glm_shape={} typed_get_rows={} compact_get_rows_fused={} promoted_get_rows={} dsa_sparse_attn={} failures={}",
+            guard.checked_case,
+            guard.flash_attn_ext_glm_dsa_shape_records,
+            guard.get_rows_typed_records,
+            guard.dsa_compact_get_rows_fused_records,
+            guard.get_rows_promote_records,
+            guard.dsa_sparse_attn_records,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.moe_weighted_sum_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA MoE weighted-sum proof failed for {}: weighted_sum={} f32x4={} failures={}",
+            guard.checked_case,
+            guard.moe_weighted_sum_records,
+            guard.moe_weighted_sum_f32x4_records,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.moe_motif_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA MoE motif proof failed for {}: candidates={} natural={} backend={} subgraph={} max_nodes={} failures={}",
+            guard.checked_case,
+            guard.motif_candidate_records,
+            guard.natural_order_records,
+            guard.backend_candidate_records,
+            guard.subgraph_fusable_records,
+            guard.max_motif_nodes,
+            guard.failure_summary,
+        );
+    }
+    if let Some(guard) = &report.native_indexshare_guard
+        && !guard.passed
+    {
+        bail!(
+            "GLM-DSA native IndexShare proof failed for {}: full_exec={} shared_exec={} top_k={} consume={} shared_missing_top_k={} failures={}",
+            guard.checked_case,
+            guard.full_exec_records,
+            guard.shared_exec_records,
+            guard.top_k_records,
+            guard.consume_records,
+            guard.shared_exec_missing_input_top_k,
             guard.failure_summary,
         );
     }
@@ -322,38 +526,112 @@ fn run_dense_fallback_comparison(
     token_ids: &[i32],
     positions: &[i32],
     candidate_flags: MicrobenchFlags,
-) -> Result<MicrobenchComparisonReport> {
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchComparison> {
     let baseline_flags = MicrobenchFlags {
         direct_sparse_attn: false,
+        compact_flash_attn: false,
         direct_sparse_prefill: false,
+        enable_unproven_large_direct_sparse_prefill: false,
+        direct_sparse_prefill_max_tokens: None,
         ..candidate_flags
     };
-    let baseline = run_microbench_case(
+    let baseline = run_microbench_case_with_warmup(
         "dense_fallback",
         selected_paths,
         runtime_config,
         args,
+        args.layer_start,
+        args.layer_end,
         baseline_flags,
         input,
         token_ids,
         positions,
         true,
+        None,
+        false,
+        deferred_model_drops,
     )?;
     let candidate = run_microbench_case(
         "candidate",
         selected_paths,
         runtime_config,
         args,
+        args.layer_start,
+        args.layer_end,
         candidate_flags,
         input,
         token_ids,
         positions,
         true,
+        deferred_model_drops,
     )?;
     let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
-    Ok(MicrobenchComparisonReport {
-        baseline: baseline.as_case_summary(),
-        candidate: candidate.as_case_summary(),
+    Ok(MicrobenchComparison {
+        baseline,
+        candidate,
+        parity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_dense_flash_prefill_comparison(
+    args: &GlmDsaLayerMicrobenchArgs,
+    selected_paths: &[PathBuf],
+    runtime_config: &RuntimeConfig,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    candidate_flags: MicrobenchFlags,
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchComparison> {
+    let baseline_flags = MicrobenchFlags {
+        direct_sparse_attn: true,
+        compact_flash_attn: false,
+        direct_sparse_prefill: false,
+        enable_unproven_large_direct_sparse_prefill: false,
+        direct_sparse_prefill_max_tokens: None,
+        dense_sparse_mask_max_bytes: None,
+        direct_sparse_prefill_min_kv_topk_ratio: None,
+        ..candidate_flags
+    };
+    let candidate_flags = MicrobenchFlags {
+        direct_sparse_attn: true,
+        direct_sparse_prefill: true,
+        ..candidate_flags
+    };
+    let baseline = run_microbench_case(
+        "dense_flash_prefill",
+        selected_paths,
+        runtime_config,
+        args,
+        args.layer_start,
+        args.layer_end,
+        baseline_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+        deferred_model_drops,
+    )?;
+    let candidate = run_microbench_case(
+        "direct_sparse_prefill",
+        selected_paths,
+        runtime_config,
+        args,
+        args.layer_start,
+        args.layer_end,
+        candidate_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+        deferred_model_drops,
+    )?;
+    let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
+    Ok(MicrobenchComparison {
+        baseline,
+        candidate,
         parity,
     })
 }
@@ -367,7 +645,8 @@ fn run_cpu_direct_sparse_comparison(
     token_ids: &[i32],
     positions: &[i32],
     candidate_flags: MicrobenchFlags,
-) -> Result<MicrobenchComparisonReport> {
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchComparison> {
     let mut baseline_config = runtime_config.clone();
     baseline_config.n_gpu_layers = 0;
     let baseline_flags = MicrobenchFlags {
@@ -380,27 +659,33 @@ fn run_cpu_direct_sparse_comparison(
         selected_paths,
         &baseline_config,
         args,
+        args.layer_start,
+        args.layer_end,
         baseline_flags,
         input,
         token_ids,
         positions,
         true,
+        deferred_model_drops,
     )?;
     let candidate = run_microbench_case(
         "candidate",
         selected_paths,
         runtime_config,
         args,
+        args.layer_start,
+        args.layer_end,
         candidate_flags,
         input,
         token_ids,
         positions,
         true,
+        deferred_model_drops,
     )?;
     let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
-    Ok(MicrobenchComparisonReport {
-        baseline: baseline.as_case_summary(),
-        candidate: candidate.as_case_summary(),
+    Ok(MicrobenchComparison {
+        baseline,
+        candidate,
         parity,
     })
 }
@@ -414,7 +699,8 @@ fn run_metal_sparse_attn_threads_comparison(
     token_ids: &[i32],
     positions: &[i32],
     candidate_flags: MicrobenchFlags,
-) -> Result<MicrobenchComparisonReport> {
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchComparison> {
     let baseline_threads = args
         .compare_metal_sparse_attn_threads_baseline
         .expect("validated metal sparse-attn thread baseline");
@@ -434,29 +720,212 @@ fn run_metal_sparse_attn_threads_comparison(
         selected_paths,
         runtime_config,
         args,
+        args.layer_start,
+        args.layer_end,
         baseline_flags,
         input,
         token_ids,
         positions,
         true,
+        deferred_model_drops,
     )?;
     let candidate = run_microbench_case(
         "candidate",
         selected_paths,
         runtime_config,
         args,
+        args.layer_start,
+        args.layer_end,
         candidate_flags,
         input,
         token_ids,
         positions,
         true,
+        deferred_model_drops,
     )?;
     let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
-    Ok(MicrobenchComparisonReport {
-        baseline: baseline.as_case_summary(),
-        candidate: candidate.as_case_summary(),
+    Ok(MicrobenchComparison {
+        baseline,
+        candidate,
         parity,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_moe_down_weighted_fusion_comparison(
+    args: &GlmDsaLayerMicrobenchArgs,
+    selected_paths: &[PathBuf],
+    runtime_config: &RuntimeConfig,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    candidate_flags: MicrobenchFlags,
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchComparison> {
+    let baseline_flags = MicrobenchFlags {
+        moe_motif_coencode: true,
+        moe_down_weighted_fusion: false,
+        moe_down_weighted_parallel: false,
+        moe_down_unweighted_slots: false,
+        ..candidate_flags
+    };
+    let candidate_flags = MicrobenchFlags {
+        moe_motif_coencode: true,
+        moe_down_weighted_fusion: args.compare_moe_down_weighted_fusion,
+        moe_down_weighted_parallel: args.compare_moe_down_weighted_parallel,
+        moe_down_unweighted_slots: args.compare_moe_down_unweighted_slots,
+        ..candidate_flags
+    };
+    let baseline_label = if args.compare_moe_down_unweighted_slots {
+        "moe_down_unweighted_slots_off"
+    } else if args.compare_moe_down_weighted_parallel {
+        "moe_down_weighted_parallel_off"
+    } else {
+        "moe_down_weighted_fusion_off"
+    };
+    let candidate_label = if args.compare_moe_down_unweighted_slots {
+        "moe_down_unweighted_slots_on"
+    } else if args.compare_moe_down_weighted_parallel {
+        "moe_down_weighted_parallel_on"
+    } else {
+        "moe_down_weighted_fusion_on"
+    };
+    let baseline = run_microbench_case(
+        baseline_label,
+        selected_paths,
+        runtime_config,
+        args,
+        args.layer_start,
+        args.layer_end,
+        baseline_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+        deferred_model_drops,
+    )?;
+    let candidate = run_microbench_case(
+        candidate_label,
+        selected_paths,
+        runtime_config,
+        args,
+        args.layer_start,
+        args.layer_end,
+        candidate_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+        deferred_model_drops,
+    )?;
+    let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
+    Ok(MicrobenchComparison {
+        baseline,
+        candidate,
+        parity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_indexshare_producer_consumer_comparison(
+    args: &GlmDsaLayerMicrobenchArgs,
+    selected_paths: &[PathBuf],
+    runtime_config: &RuntimeConfig,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    flags: MicrobenchFlags,
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchComparison> {
+    let target_layer_start = args
+        .layer_start
+        .checked_add(1)
+        .context("native IndexShare target layer overflow")?;
+    if target_layer_start >= args.layer_end {
+        bail!(
+            "--compare-native-indexshare-producer-consumer requires at least two layers; got {}..{}",
+            args.layer_start,
+            args.layer_end
+        );
+    }
+
+    let trace_flags = MicrobenchFlags {
+        native_indexshare_exec_log: true,
+        ..flags
+    };
+    let baseline = run_microbench_case(
+        "native_indexshare_full_span",
+        selected_paths,
+        runtime_config,
+        args,
+        args.layer_start,
+        args.layer_end,
+        trace_flags,
+        input,
+        token_ids,
+        positions,
+        true,
+        deferred_model_drops,
+    )?;
+
+    let generated = generate_real_top_k_frame(
+        args,
+        token_ids,
+        positions,
+        trace_flags,
+        args.layer_start,
+        target_layer_start,
+        deferred_model_drops,
+    )
+    .context("generate native IndexShare producer frame")?;
+    let target_request = package_request_for_range(args, target_layer_start, args.layer_end);
+    let target_selected = select_layer_package_parts(&target_request)
+        .context("select GLM-DSA native IndexShare target layer package parts")?;
+    let target_config = runtime_config_for_range(args, target_layer_start, args.layer_end)
+        .context("build native IndexShare target runtime config")?;
+    let warmup_source = NativeIndexShareWarmupSource {
+        selected_paths: select_layer_package_parts(&package_request_for_range(
+            args,
+            args.layer_start,
+            target_layer_start,
+        ))
+        .context("select GLM-DSA native IndexShare warmup source parts")?
+        .absolute_paths,
+        runtime_config: runtime_config_for_range(args, args.layer_start, target_layer_start)
+            .context("build native IndexShare warmup source runtime config")?,
+        layer_start: args.layer_start,
+        layer_end: target_layer_start,
+    };
+    let candidate = run_microbench_case_with_warmup(
+        "native_indexshare_source_target",
+        &target_selected.absolute_paths,
+        &target_config,
+        args,
+        target_layer_start,
+        args.layer_end,
+        trace_flags,
+        &generated.frame,
+        token_ids,
+        positions,
+        true,
+        Some(&warmup_source),
+        allow_compact_flash_auto(args),
+        deferred_model_drops,
+    )?;
+
+    let parity = compare_case_outputs(&baseline.outputs, &candidate.outputs, args)?;
+    Ok(MicrobenchComparison {
+        baseline,
+        candidate,
+        parity,
+    })
+}
+
+struct NativeIndexShareWarmupSource {
+    selected_paths: Vec<PathBuf>,
+    runtime_config: RuntimeConfig,
+    layer_start: u32,
+    layer_end: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -465,62 +934,622 @@ fn run_microbench_case(
     selected_paths: &[PathBuf],
     runtime_config: &RuntimeConfig,
     args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    layer_end: u32,
     flags: MicrobenchFlags,
     input: &ActivationFrame,
     token_ids: &[i32],
     positions: &[i32],
     collect_outputs: bool,
+    deferred_model_drops: &mut Vec<StageModel>,
 ) -> Result<MicrobenchCase> {
-    configure_env_flags(args, flags);
-    let native_logs = NativeLogCapture::start(flags.capture_native_logs())?;
-    let model = StageModel::open_from_parts(selected_paths, runtime_config)
-        .with_context(|| format!("open GLM-DSA layer microbench model for {label}"))?;
+    run_microbench_case_with_warmup(
+        label,
+        selected_paths,
+        runtime_config,
+        args,
+        layer_start,
+        layer_end,
+        flags,
+        input,
+        token_ids,
+        positions,
+        collect_outputs,
+        None,
+        allow_compact_flash_auto(args),
+        deferred_model_drops,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_microbench_case_with_warmup(
+    label: &'static str,
+    selected_paths: &[PathBuf],
+    runtime_config: &RuntimeConfig,
+    args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    layer_end: u32,
+    flags: MicrobenchFlags,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    collect_outputs: bool,
+    warmup_source: Option<&NativeIndexShareWarmupSource>,
+    allow_compact_flash_auto: bool,
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<MicrobenchCase> {
+    configure_env_flags(args, flags, allow_compact_flash_auto);
+    let mut native_logs = Some(NativeLogCapture::start(flags.capture_native_logs())?);
+    let model = match StageModel::open_from_parts(selected_paths, runtime_config) {
+        Ok(model) => model,
+        Err(error) => {
+            let native_context = native_logs
+                .take()
+                .expect("native log capture is initialized")
+                .finish_after_open_error();
+            return Err(error).with_context(|| {
+                format!("open GLM-DSA layer microbench model for {label}{native_context}")
+            });
+        }
+    };
+    let (timings, outputs) = if should_reuse_kv_warmup_stream(args) {
+        run_microbench_iterations_with_streaming_kv(
+            &model,
+            args,
+            layer_start,
+            layer_end,
+            warmup_source,
+            flags,
+            input,
+            token_ids,
+            deferred_model_drops,
+            collect_outputs,
+        )?
+    } else if should_reuse_kv_warmup_checkpoint(args) {
+        run_microbench_iterations_with_reused_kv(
+            &model,
+            args,
+            layer_start,
+            layer_end,
+            warmup_source,
+            flags,
+            input,
+            token_ids,
+            positions,
+            deferred_model_drops,
+            collect_outputs,
+        )?
+    } else {
+        run_microbench_iterations_with_fresh_sessions(
+            &model,
+            args,
+            layer_start,
+            layer_end,
+            warmup_source,
+            flags,
+            input,
+            token_ids,
+            positions,
+            deferred_model_drops,
+            collect_outputs,
+        )?
+    };
+    let native_timings = native_logs
+        .take()
+        .expect("native log capture is initialized")
+        .finish()?;
+    deferred_model_drops.push(model);
+    let compact_flash_policy_records = retain_case_compact_policy_records(
+        native_timings.compact_flash_policy_records,
+        args.tokens,
+    );
+    let (compact_flash_non_measured_policy_records, compact_flash_execution_policy_records) =
+        split_execution_compact_policy_records(compact_flash_policy_records.clone(), timings.len());
+    let direct_sparse_decision_records =
+        retain_case_decision_records(native_timings.direct_sparse_decision_records, args.tokens);
+    let (direct_sparse_non_measured_decision_records, direct_sparse_execution_decision_records) =
+        split_execution_decision_records(direct_sparse_decision_records.clone(), timings.len());
+    Ok(MicrobenchCase {
+        label,
+        flags,
+        n_gpu_layers: runtime_config.n_gpu_layers,
+        measured_tokens: args.tokens,
+        native_log_path: native_timings.log_path,
+        compact_flash_policy_records,
+        compact_flash_execution_policy_records,
+        compact_flash_non_measured_policy_records,
+        direct_sparse_decision_records,
+        direct_sparse_execution_decision_records,
+        direct_sparse_non_measured_decision_records,
+        metal_dispatch_records: native_timings.metal_dispatch_records,
+        op_timing_records: retain_measured_timing_records(
+            native_timings.op_timing_records,
+            args.tokens,
+            args.warmup,
+        ),
+        group_timing_records: retain_measured_group_timing_records(
+            native_timings.group_timing_records,
+            args.tokens,
+            args.warmup,
+        ),
+        indexshare_trace_summary: native_timings.indexshare_trace_summary,
+        hot_tensor_records: retain_measured_hot_tensor_records(
+            native_timings.hot_tensor_records,
+            args.tokens,
+            args.warmup,
+        ),
+        compute_buffer_records: native_timings.compute_buffer_records,
+        timings,
+        outputs,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn run_microbench_iterations_with_fresh_sessions(
+    model: &StageModel,
+    args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    layer_end: u32,
+    warmup_source: Option<&NativeIndexShareWarmupSource>,
+    flags: MicrobenchFlags,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    deferred_model_drops: &mut Vec<StageModel>,
+    collect_outputs: bool,
+) -> Result<(Vec<IterationTiming>, Vec<ActivationFrame>)> {
     let mut timings = Vec::with_capacity(args.iterations);
     let mut outputs = Vec::with_capacity(if collect_outputs { args.iterations } else { 0 });
     let total_runs = args.warmup + args.iterations;
     for run_index in 0..total_runs {
         let mut session = model.create_session().context("create stage session")?;
-        seed_session_position(&mut session, args.position_start)?;
-        let started = Instant::now();
-        let output = session
-            .prefill_chunk_frame_with_positions(token_ids, positions, Some(input), 0)
-            .with_context(|| format!("run microbench iteration {run_index}"))?;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        if run_index >= args.warmup {
-            timings.push(IterationTiming {
-                iteration: run_index - args.warmup,
-                elapsed_ms,
-                output_payload_bytes: output.payload.len(),
-                output_flags: output.desc.flags,
-            });
-            if collect_outputs {
-                outputs.push(output);
-            }
+        warm_session_kv_prefix_for_case(
+            &mut session,
+            args,
+            flags,
+            layer_start,
+            layer_end,
+            warmup_source,
+            deferred_model_drops,
+        )
+        .with_context(|| format!("warm GLM-DSA KV prefix for iteration {run_index}"))?;
+        run_timed_iteration(
+            &mut session,
+            args,
+            input,
+            token_ids,
+            positions,
+            collect_outputs,
+            run_index,
+            args.position_start,
+            &mut timings,
+            &mut outputs,
+        )?;
+    }
+    Ok((timings, outputs))
+}
+
+#[allow(clippy::type_complexity)]
+fn run_microbench_iterations_with_streaming_kv(
+    model: &StageModel,
+    args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    layer_end: u32,
+    warmup_source: Option<&NativeIndexShareWarmupSource>,
+    flags: MicrobenchFlags,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    deferred_model_drops: &mut Vec<StageModel>,
+    collect_outputs: bool,
+) -> Result<(Vec<IterationTiming>, Vec<ActivationFrame>)> {
+    let mut session = model.create_session().context("create stage session")?;
+    warm_session_kv_prefix_for_case(
+        &mut session,
+        args,
+        flags,
+        layer_start,
+        layer_end,
+        warmup_source,
+        deferred_model_drops,
+    )
+    .context("warm GLM-DSA KV prefix for streaming decode")?;
+    let mut timings = Vec::with_capacity(args.iterations);
+    let mut outputs = Vec::with_capacity(if collect_outputs { args.iterations } else { 0 });
+    let total_runs = args.warmup + args.iterations;
+    for run_index in 0..total_runs {
+        let run_position_start = streamed_iteration_position_start(args, run_index)?;
+        let run_positions = positions(run_position_start, args.tokens)?;
+        run_timed_iteration(
+            &mut session,
+            args,
+            input,
+            token_ids,
+            &run_positions,
+            collect_outputs,
+            run_index,
+            run_position_start,
+            &mut timings,
+            &mut outputs,
+        )?;
+    }
+    Ok((timings, outputs))
+}
+
+#[allow(clippy::type_complexity)]
+fn run_microbench_iterations_with_reused_kv(
+    model: &StageModel,
+    args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    layer_end: u32,
+    warmup_source: Option<&NativeIndexShareWarmupSource>,
+    flags: MicrobenchFlags,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    deferred_model_drops: &mut Vec<StageModel>,
+    collect_outputs: bool,
+) -> Result<(Vec<IterationTiming>, Vec<ActivationFrame>)> {
+    let mut session = model.create_session().context("create stage session")?;
+    warm_session_kv_prefix_for_case(
+        &mut session,
+        args,
+        flags,
+        layer_start,
+        layer_end,
+        warmup_source,
+        deferred_model_drops,
+    )
+    .context("warm GLM-DSA KV prefix for reusable checkpoint")?;
+    let mut checkpoint = session
+        .checkpoint()
+        .context("checkpoint warmed GLM-DSA KV prefix")?;
+    let mut timings = Vec::with_capacity(args.iterations);
+    let mut outputs = Vec::with_capacity(if collect_outputs { args.iterations } else { 0 });
+    let total_runs = args.warmup + args.iterations;
+    for run_index in 0..total_runs {
+        run_timed_iteration(
+            &mut session,
+            args,
+            input,
+            token_ids,
+            positions,
+            collect_outputs,
+            run_index,
+            args.position_start,
+            &mut timings,
+            &mut outputs,
+        )?;
+        session.restore_checkpoint(&checkpoint).with_context(|| {
+            format!("restore GLM-DSA KV checkpoint after iteration {run_index}")
+        })?;
+        if run_index + 1 < total_runs {
+            checkpoint = session.checkpoint().with_context(|| {
+                format!("refresh GLM-DSA KV checkpoint after iteration {run_index}")
+            })?;
         }
     }
-    let native_timings = native_logs.finish()?;
-    Ok(MicrobenchCase {
-        label,
-        flags,
-        n_gpu_layers: runtime_config.n_gpu_layers,
-        native_log_path: native_timings.log_path,
-        direct_sparse_decision_records: retain_case_decision_records(
-            native_timings.direct_sparse_decision_records,
-            args.tokens,
-        ),
-        metal_dispatch_records: native_timings.metal_dispatch_records,
-        op_timing_records: skip_warmup_records(native_timings.op_timing_records, args.warmup),
-        group_timing_records: skip_warmup_group_records(
-            native_timings.group_timing_records,
-            args.warmup,
-        ),
-        hot_tensor_records: skip_warmup_hot_tensor_records(
-            native_timings.hot_tensor_records,
-            args.warmup,
-        ),
-        timings,
-        outputs,
+    Ok((timings, outputs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_timed_iteration(
+    session: &mut skippy_runtime::StageSession,
+    args: &GlmDsaLayerMicrobenchArgs,
+    input: &ActivationFrame,
+    token_ids: &[i32],
+    positions: &[i32],
+    collect_outputs: bool,
+    run_index: usize,
+    position_start: i32,
+    timings: &mut Vec<IterationTiming>,
+    outputs: &mut Vec<ActivationFrame>,
+) -> Result<()> {
+    let started = Instant::now();
+    let output = session
+        .prefill_chunk_frame_with_positions(token_ids, positions, Some(input), 0)
+        .with_context(|| format!("run microbench iteration {run_index}"))?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if run_index >= args.warmup {
+        timings.push(IterationTiming {
+            iteration: run_index - args.warmup,
+            position_start,
+            elapsed_ms,
+            output_payload_bytes: output.payload.len(),
+            output_flags: output.desc.flags,
+        });
+        if collect_outputs {
+            outputs.push(output);
+        }
+    }
+    Ok(())
+}
+
+fn should_reuse_kv_warmup_checkpoint(args: &GlmDsaLayerMicrobenchArgs) -> bool {
+    args.reuse_kv_warmup_checkpoint && args.kv_warmup_tokens > 0
+}
+
+fn should_reuse_kv_warmup_stream(args: &GlmDsaLayerMicrobenchArgs) -> bool {
+    args.reuse_kv_warmup_stream
+}
+
+fn streamed_iteration_position_start(
+    args: &GlmDsaLayerMicrobenchArgs,
+    run_index: usize,
+) -> Result<i32> {
+    let token_offset = run_index
+        .checked_mul(args.tokens)
+        .context("streaming decode position offset overflow")?;
+    let token_offset =
+        i32::try_from(token_offset).context("streaming decode position offset exceeds i32")?;
+    args.position_start
+        .checked_add(token_offset)
+        .context("streaming decode position exceeds i32")
+}
+
+fn warm_session_kv_prefix_for_range(
+    session: &mut skippy_runtime::StageSession,
+    args: &GlmDsaLayerMicrobenchArgs,
+    flags: MicrobenchFlags,
+    layer_start: u32,
+    layer_end: u32,
+) -> Result<()> {
+    if args.kv_warmup_tokens == 0 {
+        return seed_session_position(session, args.position_start);
+    }
+    if args.synthetic_kv_warmup {
+        return import_synthetic_kv_prefix_for_range(session, args, layer_start, layer_end);
+    }
+    let _diagnostic_guard = NativeDiagnosticFlagGuard::muted(flags);
+    let chunk_tokens = kv_warmup_chunk_tokens(args)
+        .min(args.kv_warmup_tokens)
+        .max(1);
+    let mut token_start = 0usize;
+    while token_start < args.kv_warmup_tokens {
+        let token_count = (args.kv_warmup_tokens - token_start).min(chunk_tokens);
+        let token_ids = vec![1_i32; token_count];
+        let position_start =
+            i32::try_from(token_start).context("KV warmup token position exceeds i32")?;
+        let positions = positions(position_start, token_count)?;
+        let input =
+            synthetic_activation_frame_for_layer_tokens(args, layer_start, token_count, None)?;
+        session
+            .prefill_chunk_frame_with_positions(&token_ids, &positions, Some(&input), 0)
+            .with_context(|| {
+                format!(
+                    "run GLM-DSA KV warmup layer range {layer_start}..{layer_end} chunk {}..{}",
+                    token_start,
+                    token_start + token_count
+                )
+            })?;
+        token_start += token_count;
+    }
+    Ok(())
+}
+
+fn warm_session_kv_prefix_for_case(
+    session: &mut skippy_runtime::StageSession,
+    args: &GlmDsaLayerMicrobenchArgs,
+    flags: MicrobenchFlags,
+    layer_start: u32,
+    layer_end: u32,
+    warmup_source: Option<&NativeIndexShareWarmupSource>,
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<()> {
+    if let Some(source) = warmup_source {
+        return warm_session_kv_prefix_from_top_k_source(
+            session,
+            args,
+            flags,
+            layer_start,
+            layer_end,
+            source,
+            deferred_model_drops,
+        );
+    }
+    warm_session_kv_prefix_for_range(session, args, flags, layer_start, layer_end)
+}
+
+fn warm_session_kv_prefix_from_top_k_source(
+    target_session: &mut skippy_runtime::StageSession,
+    args: &GlmDsaLayerMicrobenchArgs,
+    flags: MicrobenchFlags,
+    target_layer_start: u32,
+    target_layer_end: u32,
+    source: &NativeIndexShareWarmupSource,
+    deferred_model_drops: &mut Vec<StageModel>,
+) -> Result<()> {
+    if source.layer_end != target_layer_start {
+        bail!(
+            "native IndexShare warmup source {}..{} must end at target layer_start {}",
+            source.layer_start,
+            source.layer_end,
+            target_layer_start
+        );
+    }
+    if args.kv_warmup_tokens == 0 {
+        return seed_session_position(target_session, args.position_start);
+    }
+
+    let _diagnostic_guard = NativeDiagnosticFlagGuard::muted(flags);
+    let source_model = StageModel::open_from_parts(&source.selected_paths, &source.runtime_config)
+        .with_context(|| {
+            format!(
+                "open GLM-DSA native IndexShare warmup source {}..{}",
+                source.layer_start, source.layer_end
+            )
+        })?;
+    let mut source_session = source_model
+        .create_session()
+        .context("create GLM-DSA native IndexShare warmup source session")?;
+
+    let chunk_tokens = kv_warmup_chunk_tokens(args)
+        .min(args.kv_warmup_tokens)
+        .max(1);
+    let mut token_start = 0usize;
+    while token_start < args.kv_warmup_tokens {
+        let token_count = (args.kv_warmup_tokens - token_start).min(chunk_tokens);
+        warm_top_k_target_chunk(
+            &mut source_session,
+            target_session,
+            args,
+            source.layer_start,
+            target_layer_start,
+            target_layer_end,
+            token_start,
+            token_count,
+        )?;
+        token_start += token_count;
+    }
+    drop(source_session);
+    deferred_model_drops.push(source_model);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warm_top_k_target_chunk(
+    source_session: &mut skippy_runtime::StageSession,
+    target_session: &mut skippy_runtime::StageSession,
+    args: &GlmDsaLayerMicrobenchArgs,
+    source_layer_start: u32,
+    target_layer_start: u32,
+    target_layer_end: u32,
+    token_start: usize,
+    token_count: usize,
+) -> Result<()> {
+    let token_ids = vec![1_i32; token_count];
+    let position_start =
+        i32::try_from(token_start).context("KV warmup token position exceeds i32")?;
+    let positions = positions(position_start, token_count)?;
+    let source_input =
+        synthetic_activation_frame_for_layer_tokens(args, source_layer_start, token_count, None)?;
+    let top_k_frame = source_session
+        .prefill_chunk_frame_with_positions(&token_ids, &positions, Some(&source_input), 0)
+        .with_context(|| {
+            format!(
+                "run GLM-DSA native IndexShare warmup source layer {source_layer_start} chunk {}..{}",
+                token_start,
+                token_start + token_count
+            )
+        })?;
+    target_session
+        .prefill_chunk_frame_with_positions(&token_ids, &positions, Some(&top_k_frame), 0)
+        .with_context(|| {
+            format!(
+                "run GLM-DSA native IndexShare warmup target range {target_layer_start}..{target_layer_end} chunk {}..{}",
+                token_start,
+                token_start + token_count
+            )
+        })?;
+    Ok(())
+}
+
+fn import_synthetic_kv_prefix_for_range(
+    session: &mut skippy_runtime::StageSession,
+    args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    layer_end: u32,
+) -> Result<()> {
+    let layer_count = layer_end
+        .checked_sub(layer_start)
+        .context("invalid GLM-DSA layer range")?;
+    let chunk_tokens = kv_warmup_chunk_tokens(args)
+        .min(args.kv_warmup_tokens)
+        .max(1);
+    let mut token_start = 0usize;
+    while token_start < args.kv_warmup_tokens {
+        let token_count = (args.kv_warmup_tokens - token_start).min(chunk_tokens);
+        let desc = synthetic_kv_page_desc(
+            layer_start,
+            layer_end,
+            layer_count,
+            token_start,
+            token_count,
+        )?;
+        let payload = vec![
+            0_u8;
+            usize::try_from(desc.payload_bytes)
+                .context("synthetic KV page exceeds usize")?
+        ];
+        session.import_kv_page(&desc, &payload).with_context(|| {
+            format!(
+                "import synthetic GLM-DSA KV page {}..{}",
+                token_start,
+                token_start + token_count
+            )
+        })?;
+        token_start += token_count;
+    }
+    let token_count = u64::try_from(args.kv_warmup_tokens)
+        .context("synthetic KV warmup token count exceeds u64")?;
+    session
+        .set_position(token_count)
+        .context("set session position after synthetic KV import")?;
+    Ok(())
+}
+
+fn synthetic_kv_page_desc(
+    layer_start: u32,
+    layer_end: u32,
+    layer_count: u32,
+    token_start: usize,
+    token_count: usize,
+) -> Result<RuntimeKvPageDesc> {
+    let token_start = u64::try_from(token_start).context("synthetic KV token_start exceeds u64")?;
+    let token_count = u64::try_from(token_count).context("synthetic KV token_count exceeds u64")?;
+    let per_layer_bytes = token_count
+        .checked_mul(u64::from(GLM_DSA_F16_K_ROW_BYTES))
+        .context("synthetic KV page byte count overflow")?;
+    let payload_bytes = per_layer_bytes
+        .checked_mul(u64::from(layer_count))
+        .context("synthetic KV page payload byte count overflow")?;
+    Ok(RuntimeKvPageDesc {
+        version: 1,
+        layer_start: i32::try_from(layer_start).context("layer_start exceeds i32")?,
+        layer_end: i32::try_from(layer_end).context("layer_end exceeds i32")?,
+        token_start,
+        token_count,
+        layer_count,
+        k_type: GGML_TYPE_F16_ID,
+        v_type: GGML_TYPE_F32_ID,
+        k_row_bytes: GLM_DSA_F16_K_ROW_BYTES,
+        v_row_bytes: 0,
+        v_element_bytes: 0,
+        payload_bytes,
+        flags: 0,
     })
+}
+
+struct NativeDiagnosticFlagGuard {
+    flags: MicrobenchFlags,
+}
+
+impl NativeDiagnosticFlagGuard {
+    fn muted(flags: MicrobenchFlags) -> Self {
+        set_native_diagnostic_flags(flags, false);
+        Self { flags }
+    }
+}
+
+impl Drop for NativeDiagnosticFlagGuard {
+    fn drop(&mut self) {
+        set_native_diagnostic_flags(self.flags, true);
+    }
+}
+
+fn set_native_diagnostic_flags(flags: MicrobenchFlags, enabled: bool) {
+    set_env_flag("SKIPPY_GLM_DSA_OP_TIMING", enabled && flags.op_timing);
+    set_env_flag(
+        "LLAMA_GLM_DSA_INDEXSHARE_EXEC_LOG",
+        enabled && flags.native_indexshare_exec_log,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS",
+        enabled && flags.op_timing,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_LOG_METAL_DISPATCH",
+        enabled && flags.metal_dispatch_log,
+    );
 }
 
 fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
@@ -544,15 +1573,92 @@ fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
     if args.position_start < 0 {
         bail!("position_start must be greater than or equal to zero");
     }
-    let comparison_count = usize::from(args.compare_dense_fallback)
-        + usize::from(args.compare_cpu_direct_sparse)
-        + usize::from(args.compare_metal_sparse_attn_threads_baseline.is_some());
-    if comparison_count > 1 {
+    if args.ctx_size == 0 {
+        bail!("ctx_size must be greater than zero");
+    }
+    let max_position_end = max_requested_position_end(args)?;
+    if max_position_end >= i64::from(args.ctx_size) {
         bail!(
-            "compare_dense_fallback, compare_cpu_direct_sparse, and compare_metal_sparse_attn_threads_baseline are mutually exclusive"
+            "requested position_end {max_position_end} must be less than ctx_size {}; valid positions are 0..{}",
+            args.ctx_size,
+            args.ctx_size - 1
         );
     }
+    if args.kv_warmup_tokens > 0 {
+        let position_start =
+            usize::try_from(args.position_start).context("position_start is negative")?;
+        if args.kv_warmup_tokens != position_start {
+            bail!(
+                "kv_warmup_tokens must equal position_start so the synthetic KV prefix covers exactly 0..position_start"
+            );
+        }
+    }
+    if args.kv_warmup_chunk_tokens == Some(0) {
+        bail!("kv_warmup_chunk_tokens must be greater than zero when set");
+    }
+    if args.synthetic_kv_warmup {
+        if args.kv_warmup_tokens == 0 {
+            bail!("synthetic_kv_warmup requires kv_warmup_tokens");
+        }
+        if !args.cache_type_k.eq_ignore_ascii_case("f16")
+            || !args.cache_type_v.eq_ignore_ascii_case("f16")
+        {
+            bail!("synthetic_kv_warmup currently requires f16 cache_type_k and cache_type_v");
+        }
+    }
+    if let Some(n_batch) = args.n_batch {
+        let warmup_chunk = kv_warmup_chunk_tokens(args);
+        if warmup_chunk > n_batch as usize {
+            bail!("kv_warmup_chunk_tokens ({warmup_chunk}) must fit within n_batch ({n_batch})");
+        }
+    }
+    if top_k_sideband_warmup_exports_chunk(args)?
+        && let Some(n_ubatch) = args.n_ubatch
+    {
+        let warmup_chunk = kv_warmup_chunk_tokens(args);
+        if warmup_chunk > n_ubatch as usize {
+            bail!(
+                "kv_warmup_chunk_tokens ({warmup_chunk}) must fit within n_ubatch ({n_ubatch}) when KV warmup exports GLM-DSA top-k sideband"
+            );
+        }
+    }
+    if args.reuse_kv_warmup_checkpoint && args.reuse_kv_warmup_stream {
+        bail!("reuse_kv_warmup_checkpoint and reuse_kv_warmup_stream are mutually exclusive");
+    }
+    if args.reuse_kv_warmup_stream && real_top_k_source_layer_start(args)?.is_some() {
+        bail!(
+            "reuse_kv_warmup_stream cannot be combined with real top-k source input because the cached sideband is position-specific"
+        );
+    }
+    if args.metal_topk_moe_route_fusion_native_default && !args.metal_topk_moe_route_fusion {
+        bail!(
+            "metal_topk_moe_route_fusion_native_default cannot be combined with metal_topk_moe_route_fusion=false"
+        );
+    }
+    let comparison_count = usize::from(args.compare_dense_fallback)
+        + usize::from(args.compare_dense_flash_prefill)
+        + usize::from(args.compare_cpu_direct_sparse)
+        + usize::from(args.compare_metal_sparse_attn_threads_baseline.is_some())
+        + usize::from(args.compare_moe_down_weighted_fusion)
+        + usize::from(args.compare_moe_down_weighted_parallel)
+        + usize::from(args.compare_moe_down_unweighted_slots)
+        + usize::from(args.compare_native_indexshare_producer_consumer);
+    if comparison_count > 1 {
+        bail!(
+            "compare_dense_fallback, compare_dense_flash_prefill, compare_cpu_direct_sparse, compare_metal_sparse_attn_threads_baseline, compare_moe_down_weighted_fusion, compare_moe_down_weighted_parallel, compare_moe_down_unweighted_slots, and compare_native_indexshare_producer_consumer are mutually exclusive"
+        );
+    }
+    if args.compare_native_indexshare_producer_consumer
+        && args.layer_start.saturating_add(1) >= args.layer_end
+    {
+        bail!("compare_native_indexshare_producer_consumer requires at least two layers");
+    }
     validate_sparse_attn_threads("sparse_attn_threads", args.sparse_attn_threads)?;
+    validate_sparse_attn_group_heads("sparse_attn_group_heads", args.sparse_attn_group_heads)?;
+    validate_lightning_indexer_threads(
+        "lightning_indexer_threads",
+        args.lightning_indexer_threads,
+    )?;
     validate_sparse_attn_threads(
         "compare_metal_sparse_attn_threads_baseline",
         args.compare_metal_sparse_attn_threads_baseline,
@@ -574,14 +1680,211 @@ fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
     Ok(())
 }
 
-fn configure_env_flags(args: &GlmDsaLayerMicrobenchArgs, flags: MicrobenchFlags) {
+fn top_k_sideband_warmup_exports_chunk(args: &GlmDsaLayerMicrobenchArgs) -> Result<bool> {
+    if args.kv_warmup_tokens == 0 || args.synthetic_kv_warmup {
+        return Ok(false);
+    }
+
+    Ok(args.compare_native_indexshare_producer_consumer
+        || real_top_k_source_layer_start(args)?.is_some())
+}
+
+fn max_requested_position_end(args: &GlmDsaLayerMicrobenchArgs) -> Result<i64> {
+    let run_index = if args.reuse_kv_warmup_stream {
+        args.warmup
+            .checked_add(args.iterations)
+            .and_then(|total| total.checked_sub(1))
+            .context("streaming decode run count overflow")?
+    } else {
+        0
+    };
+    let run_token_offset = run_index
+        .checked_mul(args.tokens)
+        .context("streaming decode position offset overflow")?;
+    let run_token_offset =
+        i64::try_from(run_token_offset).context("streaming decode position offset exceeds i64")?;
+    let token_offset = args
+        .tokens
+        .checked_sub(1)
+        .context("tokens must be greater than zero")?;
+    let token_offset = i64::try_from(token_offset).context("position offset exceeds i64")?;
+    i64::from(args.position_start)
+        .checked_add(run_token_offset)
+        .and_then(|position| position.checked_add(token_offset))
+        .context("position exceeds i64")
+}
+
+struct GlmDsaSingleRunGuard {
+    lock_path: Option<PathBuf>,
+}
+
+impl GlmDsaSingleRunGuard {
+    fn acquire(args: &GlmDsaLayerMicrobenchArgs) -> Result<Self> {
+        if args.allow_concurrent {
+            return Ok(Self { lock_path: None });
+        }
+
+        let current_pid = std::process::id();
+        let active = active_glm_microbench_processes(current_pid)?;
+        if !active.is_empty() {
+            let summary = active
+                .iter()
+                .map(|process| format!("pid={} {}", process.pid, process.command))
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!(
+                "another glm-dsa-layer-microbench process is already running: {summary}. \
+                 Stop it first or pass --allow-concurrent if this overlap is intentional"
+            );
+        }
+
+        acquire_glm_microbench_lock(current_pid)
+    }
+}
+
+impl Drop for GlmDsaSingleRunGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.lock_path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveGlmMicrobenchProcess {
+    pid: u32,
+    command: String,
+}
+
+fn active_glm_microbench_processes(current_pid: u32) -> Result<Vec<ActiveGlmMicrobenchProcess>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,args="])
+        .output()
+        .context("scan process table for active GLM-DSA microbench runs")?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|line| parse_active_glm_microbench_process(line, current_pid))
+        .collect())
+}
+
+fn parse_active_glm_microbench_process(
+    line: &str,
+    current_pid: u32,
+) -> Option<ActiveGlmMicrobenchProcess> {
+    let line = line.trim();
+    let (pid, command) = line.split_once(char::is_whitespace)?;
+    let pid = pid.parse::<u32>().ok()?;
+    if pid == current_pid || !is_glm_microbench_command(command.trim()) {
+        return None;
+    }
+    Some(ActiveGlmMicrobenchProcess {
+        pid,
+        command: command.trim().to_string(),
+    })
+}
+
+fn is_glm_microbench_command(command: &str) -> bool {
+    let Some(executable) = command.split_whitespace().next() else {
+        return false;
+    };
+    let Some(name) = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    (name == "skippy-bench" || name.starts_with("skippy_bench-"))
+        && command.contains("glm-dsa-layer-microbench")
+}
+
+fn acquire_glm_microbench_lock(current_pid: u32) -> Result<GlmDsaSingleRunGuard> {
+    let lock_path = std::env::temp_dir().join("skippy-bench-glm-dsa-layer-microbench.lock");
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "{current_pid}").context("write GLM-DSA microbench lock pid")?;
+                return Ok(GlmDsaSingleRunGuard {
+                    lock_path: Some(lock_path),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let lock_pid = read_lock_pid(&lock_path);
+                if lock_pid.is_some_and(process_is_live) {
+                    bail!(
+                        "another glm-dsa-layer-microbench process owns {} with pid {}. \
+                         Stop it first or pass --allow-concurrent if this overlap is intentional",
+                        lock_path.display(),
+                        lock_pid.unwrap()
+                    );
+                }
+                fs::remove_file(&lock_path)
+                    .with_context(|| format!("remove stale lock {}", lock_path.display()))?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create GLM-DSA microbench lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+    bail!(
+        "failed to acquire GLM-DSA microbench lock at {} after removing stale state",
+        lock_path.display()
+    )
+}
+
+fn read_lock_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn process_is_live(pid: u32) -> bool {
+    let pid = pid.to_string();
+    Command::new("ps")
+        .args(["-p", &pid])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn configure_env_flags(
+    args: &GlmDsaLayerMicrobenchArgs,
+    flags: MicrobenchFlags,
+    allow_compact_flash_auto: bool,
+) {
     set_env_flag(
         "SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN",
         flags.direct_sparse_attn,
     );
     set_env_flag(
+        "SKIPPY_GLM_DSA_ENABLE_COMPACT_FLASH_ATTN",
+        flags.compact_flash_attn,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_DISABLE_COMPACT_FLASH_ATTN",
+        !flags.compact_flash_attn && !allow_compact_flash_auto,
+    );
+    set_env_flag(
         "SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL",
         flags.direct_sparse_prefill,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL",
+        flags.enable_unproven_large_direct_sparse_prefill,
+    );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS",
+        flags
+            .direct_sparse_prefill_max_tokens
+            .map(|max_tokens| max_tokens.to_string()),
     );
     set_env_flag(
         "SKIPPY_GLM_DSA_ENABLE_FUSED_SPARSE_MASK",
@@ -593,20 +1896,54 @@ fn configure_env_flags(args: &GlmDsaLayerMicrobenchArgs, flags: MicrobenchFlags)
     );
     set_env_flag("SKIPPY_GLM_DSA_OP_TIMING", flags.op_timing);
     set_env_flag(
+        "LLAMA_GLM_DSA_INDEXSHARE_EXEC_LOG",
+        flags.native_indexshare_exec_log,
+    );
+    set_env_flag(
         "SKIPPY_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS",
-        flags.op_timing,
+        flags.op_timing
+            || flags.metal_dispatch_log
+            || args.require_direct_sparse_prefill_proof
+            || args.require_partial_top_k_proof,
     );
     set_env_flag(
         "SKIPPY_GLM_DSA_LOG_METAL_DISPATCH",
         flags.metal_dispatch_log,
     );
+    configure_metal_topk_moe_route_fusion_env(flags);
     set_env_flag(
-        "SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION",
-        flags.metal_topk_moe_route_fusion,
+        "SKIPPY_GLM_DSA_MOE_MOTIF_COENCODE",
+        flags.moe_motif_coencode,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_MOE_DOWN_WEIGHTED_FUSION",
+        flags.moe_down_weighted_fusion,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_EXPERIMENTAL_Q3_DOWN_WEIGHTED_FUSION",
+        flags.moe_down_weighted_fusion,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_EXPERIMENTAL_Q3_DOWN_WEIGHTED_PARALLEL",
+        flags.moe_down_weighted_parallel,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_EXPERIMENTAL_Q3_DOWN_UNWEIGHTED_SLOTS",
+        flags.moe_down_unweighted_slots,
     );
     set_optional_env(
         "SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS",
         flags.sparse_attn_threads.map(|threads| threads.to_string()),
+    );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_SPARSE_ATTN_DECODE_GROUP_HEADS",
+        flags.sparse_attn_group_heads.map(|heads| heads.to_string()),
+    );
+    set_optional_env(
+        "LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER_THREADS",
+        flags
+            .lightning_indexer_threads
+            .map(|threads| threads.to_string()),
     );
     set_optional_env(
         "LLAMA_GLM_DSA_INDEXSHARE_FREQ",
@@ -620,15 +1957,56 @@ fn configure_env_flags(args: &GlmDsaLayerMicrobenchArgs, flags: MicrobenchFlags)
     );
     set_optional_env(
         "SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES",
-        args.dense_sparse_mask_max_bytes
+        flags
+            .dense_sparse_mask_max_bytes
             .map(|max_bytes| max_bytes.to_string()),
     );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MIN_KV_TOPK_RATIO",
+        flags
+            .direct_sparse_prefill_min_kv_topk_ratio
+            .map(|ratio| ratio.to_string()),
+    );
+}
+
+fn configure_metal_topk_moe_route_fusion_env(flags: MicrobenchFlags) {
+    match metal_topk_moe_route_fusion_env_plan(flags) {
+        RouteFusionEnvPlan::NativeDefault => {
+            clear_env("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION");
+            clear_env("LLAMA_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION");
+            clear_env("LLAMA_GLM_DSA_DISABLE_METAL_TOPK_MOE_FUSION");
+        }
+        RouteFusionEnvPlan::LegacyOverride(enabled) => {
+            set_env_flag("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION", enabled);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteFusionEnvPlan {
+    NativeDefault,
+    LegacyOverride(bool),
+}
+
+fn metal_topk_moe_route_fusion_env_plan(flags: MicrobenchFlags) -> RouteFusionEnvPlan {
+    if flags.metal_topk_moe_route_fusion_native_default {
+        RouteFusionEnvPlan::NativeDefault
+    } else {
+        RouteFusionEnvPlan::LegacyOverride(flags.metal_topk_moe_route_fusion)
+    }
 }
 
 fn set_env_flag(name: &str, enabled: bool) {
     // This command is single-threaded and sets native runtime flags before opening llama.cpp.
     unsafe {
         std::env::set_var(name, if enabled { "1" } else { "0" });
+    }
+}
+
+fn clear_env(name: &str) {
+    // This command is single-threaded and sets native runtime flags before opening llama.cpp.
+    unsafe {
+        std::env::remove_var(name);
     }
 }
 
@@ -650,6 +2028,26 @@ fn validate_sparse_attn_threads(label: &str, threads: Option<u32>) -> Result<()>
     match threads {
         32 | 64 | 128 | 256 => Ok(()),
         _ => bail!("{label} must be one of 32, 64, 128, or 256"),
+    }
+}
+
+fn validate_sparse_attn_group_heads(label: &str, heads: Option<u32>) -> Result<()> {
+    let Some(heads) = heads else {
+        return Ok(());
+    };
+    match heads {
+        2 | 4 => Ok(()),
+        _ => bail!("{label} must be one of 2 or 4"),
+    }
+}
+
+fn validate_lightning_indexer_threads(label: &str, threads: Option<u32>) -> Result<()> {
+    let Some(threads) = threads else {
+        return Ok(());
+    };
+    match threads {
+        32 | 64 | 128 | 256 | 512 | 1024 => Ok(()),
+        _ => bail!("{label} must be one of 32, 64, 128, 256, 512, or 1024"),
     }
 }
 
@@ -689,8 +2087,14 @@ fn runtime_config_for_range(
         layer_end,
         ctx_size: args.ctx_size,
         lane_count: 1,
-        n_batch: Some(args.n_batch.unwrap_or_else(|| bounded_u32(args.tokens))),
-        n_ubatch: Some(args.n_ubatch.unwrap_or_else(|| bounded_u32(args.tokens))),
+        n_batch: Some(
+            args.n_batch
+                .unwrap_or_else(|| bounded_u32(runtime_batch_tokens(args))),
+        ),
+        n_ubatch: Some(
+            args.n_ubatch
+                .unwrap_or_else(|| bounded_u32(runtime_batch_tokens(args))),
+        ),
         n_threads: None,
         n_threads_batch: None,
         n_gpu_layers: args.n_gpu_layers,
@@ -713,14 +2117,38 @@ fn bounded_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX).max(1)
 }
 
+fn runtime_batch_tokens(args: &GlmDsaLayerMicrobenchArgs) -> usize {
+    args.tokens.max(kv_warmup_chunk_tokens(args)).max(1)
+}
+
+fn kv_warmup_chunk_tokens(args: &GlmDsaLayerMicrobenchArgs) -> usize {
+    args.kv_warmup_chunk_tokens
+        .or_else(|| args.n_ubatch.map(|value| value as usize))
+        .or_else(|| args.n_batch.map(|value| value as usize))
+        .unwrap_or_else(|| conservative_kv_warmup_chunk_tokens(args))
+        .max(1)
+}
+
+fn conservative_kv_warmup_chunk_tokens(args: &GlmDsaLayerMicrobenchArgs) -> usize {
+    args.tokens.max(args.kv_warmup_tokens.min(128)).max(1)
+}
+
 fn prepare_input_activation(
     args: &GlmDsaLayerMicrobenchArgs,
     token_ids: &[i32],
     positions: &[i32],
     flags: MicrobenchFlags,
+    deferred_model_drops: &mut Vec<StageModel>,
 ) -> Result<PreparedInputActivation> {
     if let Some(source_layer_start) = real_top_k_source_layer_start(args)? {
-        return real_top_k_activation_frame(args, token_ids, positions, flags, source_layer_start);
+        return real_top_k_activation_frame(
+            args,
+            token_ids,
+            positions,
+            flags,
+            source_layer_start,
+            deferred_model_drops,
+        );
     }
     let top_k_sideband = synthetic_top_k_sideband_config()?;
     let frame = synthetic_activation_frame_for_layer(args, args.layer_start, top_k_sideband)?;
@@ -734,17 +2162,23 @@ fn real_top_k_source_layer_start(args: &GlmDsaLayerMicrobenchArgs) -> Result<Opt
     let Ok(value) = std::env::var(ENV_REAL_TOP_K_SOURCE_LAYER_START) else {
         return Ok(None);
     };
+    parse_real_top_k_source_layer_start(&value, args.layer_start)
+}
+
+fn parse_real_top_k_source_layer_start(
+    value: &str,
+    target_layer_start: u32,
+) -> Result<Option<u32>> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
         return Ok(None);
     }
     let layer_start = trimmed
         .parse::<u32>()
         .with_context(|| format!("parse {ENV_REAL_TOP_K_SOURCE_LAYER_START}"))?;
-    if layer_start >= args.layer_start {
+    if layer_start >= target_layer_start {
         bail!(
-            "{ENV_REAL_TOP_K_SOURCE_LAYER_START} must be less than target layer_start {}",
-            args.layer_start
+            "{ENV_REAL_TOP_K_SOURCE_LAYER_START} must be less than target layer_start {target_layer_start}",
         );
     }
     Ok(Some(layer_start))
@@ -756,6 +2190,7 @@ fn real_top_k_activation_frame(
     positions: &[i32],
     flags: MicrobenchFlags,
     source_layer_start: u32,
+    deferred_model_drops: &mut Vec<StageModel>,
 ) -> Result<PreparedInputActivation> {
     let source_layer_end = args.layer_start;
     let generated = generate_real_top_k_frame(
@@ -765,6 +2200,7 @@ fn real_top_k_activation_frame(
         flags,
         source_layer_start,
         source_layer_end,
+        deferred_model_drops,
     )?;
     real_top_k_prepared_input(
         args,
@@ -782,6 +2218,7 @@ fn generate_real_top_k_frame(
     flags: MicrobenchFlags,
     source_layer_start: u32,
     source_layer_end: u32,
+    deferred_model_drops: &mut Vec<StageModel>,
 ) -> Result<GeneratedTopKFrame> {
     let cache_path = real_top_k_cache_path(args, flags, source_layer_start, source_layer_end)?;
     if let Some(path) = cache_path.as_ref()
@@ -808,8 +2245,14 @@ fn generate_real_top_k_frame(
         bail!("real top-k input cache is required but missing: {cache}");
     }
 
-    let source_input =
-        real_top_k_source_input(args, token_ids, positions, flags, source_layer_start)?;
+    let source_input = real_top_k_source_input(
+        args,
+        token_ids,
+        positions,
+        flags,
+        source_layer_start,
+        deferred_model_drops,
+    )?;
     let source_request = package_request_for_range(args, source_layer_start, source_layer_end);
     let source_selected = select_layer_package_parts(&source_request)
         .context("select GLM-DSA real top-k source layer package parts")?;
@@ -827,9 +2270,11 @@ fn generate_real_top_k_frame(
     let source_flags = MicrobenchFlags {
         direct_sparse_attn: false,
         direct_sparse_prefill: false,
+        enable_unproven_large_direct_sparse_prefill: false,
+        direct_sparse_prefill_max_tokens: None,
         ..flags
     };
-    configure_env_flags(args, source_flags);
+    configure_env_flags(args, source_flags, allow_compact_flash_auto(args));
     let source_model = StageModel::open_from_parts(&source_selected.absolute_paths, &source_config)
         .with_context(|| {
             format!("open GLM-DSA real top-k source model {source_layer_start}..{source_layer_end}")
@@ -837,13 +2282,21 @@ fn generate_real_top_k_frame(
     let mut source_session = source_model
         .create_session()
         .context("create GLM-DSA real top-k source session")?;
-    seed_session_position(&mut source_session, args.position_start)?;
+    warm_session_kv_prefix_for_range(
+        &mut source_session,
+        args,
+        source_flags,
+        source_layer_start,
+        source_layer_end,
+    )?;
     let frame = source_session
         .prefill_chunk_frame_with_positions(token_ids, positions, Some(&source_input), 0)
         .with_context(|| {
             format!("run GLM-DSA real top-k source {source_layer_start}..{source_layer_end}")
         })?;
     validate_real_top_k_frame_for_range(args, &frame, source_layer_start, source_layer_end)?;
+    drop(source_session);
+    deferred_model_drops.push(source_model);
     if let Some(path) = cache_path.as_ref() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -887,6 +2340,7 @@ fn real_top_k_source_input(
     positions: &[i32],
     flags: MicrobenchFlags,
     source_layer_start: u32,
+    deferred_model_drops: &mut Vec<StageModel>,
 ) -> Result<ActivationFrame> {
     let Some(chain_source_start) = chained_real_top_k_source_for(source_layer_start)? else {
         return synthetic_activation_frame_for_layer(args, source_layer_start, None);
@@ -903,6 +2357,7 @@ fn real_top_k_source_input(
         flags,
         chain_source_start,
         source_layer_start,
+        deferred_model_drops,
     )
     .map(|generated| generated.frame)
 }
@@ -1129,6 +2584,12 @@ fn stage_wire_roundtrip(
     let flags_match = decoded_frame.desc.flags == frame.desc.flags;
     let sideband_bytes_match = decoded_sideband_bytes == message.raw_bytes.len();
     let sideband_checksum_match = fnv1a64(&decoded.raw_bytes) == fnv1a64(&message.raw_bytes);
+    let top_k_sideband_stats = summarize_top_k_sideband(
+        &message.raw_bytes,
+        positions,
+        args.position_start,
+        args.tokens,
+    );
     let passed =
         payload_bytes_match && flags_match && sideband_bytes_match && sideband_checksum_match;
     if !passed {
@@ -1147,6 +2608,7 @@ fn stage_wire_roundtrip(
         raw_activation_wire_bytes: message.activation.len(),
         top_k_sideband_bytes: message.raw_bytes.len(),
         top_k_sideband_i32_count: message.raw_bytes.len() / std::mem::size_of::<i32>(),
+        top_k_sideband_stats,
         estimated_wire_bytes,
         encoded_wire_bytes: encoded.len(),
         decoded_payload_bytes: decoded_frame.payload.len(),
@@ -1164,6 +2626,110 @@ fn stage_wire_roundtrip(
     })
 }
 
+fn summarize_top_k_sideband(
+    raw_bytes: &[u8],
+    positions: &[i32],
+    position_start: i32,
+    token_count: usize,
+) -> TopKSidebandStats {
+    let i32_aligned = raw_bytes.len().is_multiple_of(std::mem::size_of::<i32>());
+    if !i32_aligned || raw_bytes.is_empty() || token_count == 0 {
+        return TopKSidebandStats {
+            i32_aligned,
+            token_count,
+            ..TopKSidebandStats::default()
+        };
+    }
+
+    let values: Vec<i32> = raw_bytes
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("chunk size is checked")))
+        .collect();
+    let total_i32 = values.len();
+    let width_per_token = total_i32
+        .is_multiple_of(token_count)
+        .then_some(total_i32 / token_count);
+    let Some(width) = width_per_token else {
+        return TopKSidebandStats {
+            i32_aligned,
+            token_count,
+            total_i32,
+            width_per_token,
+            ..TopKSidebandStats::default()
+        };
+    };
+
+    let mut stats = TopKSidebandStats {
+        i32_aligned,
+        token_count,
+        total_i32,
+        width_per_token,
+        ..TopKSidebandStats::default()
+    };
+    let fallback_kv_len = position_start
+        .max(0)
+        .saturating_add(i32::try_from(token_count).unwrap_or(i32::MAX));
+    let kv_len = positions
+        .iter()
+        .copied()
+        .max()
+        .map_or(fallback_kv_len, |position| {
+            position.saturating_add(1).max(fallback_kv_len)
+        })
+        .max(0);
+
+    for token_index in 0..token_count {
+        let token_start = token_index * width;
+        let token_end = token_start + width;
+        let current_position = positions
+            .get(token_index)
+            .copied()
+            .unwrap_or(position_start.saturating_add(token_index as i32))
+            .max(0);
+        let mut seen = HashSet::with_capacity(width.min(2048));
+        let mut active_top_end = 0usize;
+
+        for (offset, &value) in values[token_start..token_end].iter().enumerate() {
+            if value < 0 {
+                stats.negative_index_count += 1;
+                continue;
+            }
+            if value >= kv_len {
+                stats.out_of_range_index_count += 1;
+                continue;
+            }
+
+            stats.valid_index_count += 1;
+            if value <= current_position {
+                stats.causal_visible_count += 1;
+                active_top_end = offset + 1;
+            } else {
+                stats.future_index_count += 1;
+            }
+            if !seen.insert(value) {
+                stats.duplicate_index_count += 1;
+            }
+        }
+
+        stats.active_top_end_sum += active_top_end;
+        stats.max_active_top_end = stats.max_active_top_end.max(active_top_end);
+        stats.inactive_tail_count += width.saturating_sub(active_top_end);
+    }
+
+    stats.avg_active_top_end = nonzero_ratio(stats.active_top_end_sum, token_count);
+    stats.active_prefix_ratio = nonzero_ratio(stats.active_top_end_sum, total_i32);
+    stats.causal_visible_ratio = nonzero_ratio(stats.causal_visible_count, total_i32);
+    stats.masked_future_in_active_prefix_count = stats
+        .active_top_end_sum
+        .saturating_sub(stats.causal_visible_count);
+
+    stats
+}
+
+fn nonzero_ratio(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator > 0).then_some(numerator as f64 / denominator as f64)
+}
+
 fn real_top_k_cache_path(
     args: &GlmDsaLayerMicrobenchArgs,
     flags: MicrobenchFlags,
@@ -1177,14 +2743,19 @@ fn real_top_k_cache_path(
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
         return Ok(None);
     }
-    let n_batch = args.n_batch.unwrap_or_else(|| bounded_u32(args.tokens));
-    let n_ubatch = args.n_ubatch.unwrap_or_else(|| bounded_u32(args.tokens));
+    let n_batch = args
+        .n_batch
+        .unwrap_or_else(|| bounded_u32(runtime_batch_tokens(args)));
+    let n_ubatch = args
+        .n_ubatch
+        .unwrap_or_else(|| bounded_u32(runtime_batch_tokens(args)));
     let file_name = format!(
-        "real-topk-src{}-dst{}-tok{}-pos{}-ctx{}-act{}-ngpu{}-nb{}-nub{}-pi{}.skippy-frame",
+        "real-topk-src{}-dst{}-tok{}-pos{}-kv{}-ctx{}-act{}-ngpu{}-nb{}-nub{}-pi{}.skippy-frame",
         source_layer_start,
         source_layer_end,
         args.tokens,
         args.position_start,
+        args.kv_warmup_tokens,
         args.ctx_size,
         args.activation_width,
         args.n_gpu_layers,
@@ -1819,9 +3390,17 @@ fn synthetic_activation_frame_for_layer(
     layer_start: u32,
     top_k_sideband: Option<SyntheticTopKSideband>,
 ) -> Result<ActivationFrame> {
+    synthetic_activation_frame_for_layer_tokens(args, layer_start, args.tokens, top_k_sideband)
+}
+
+fn synthetic_activation_frame_for_layer_tokens(
+    args: &GlmDsaLayerMicrobenchArgs,
+    layer_start: u32,
+    tokens: usize,
+    top_k_sideband: Option<SyntheticTopKSideband>,
+) -> Result<ActivationFrame> {
     let width = usize::try_from(args.activation_width).context("activation_width exceeds usize")?;
-    let value_count = args
-        .tokens
+    let value_count = tokens
         .checked_mul(width)
         .context("synthetic activation value count overflow")?;
     let payload_bytes = value_count
@@ -1829,18 +3408,18 @@ fn synthetic_activation_frame_for_layer(
         .context("synthetic activation payload size overflow")?;
     let sideband_bytes = top_k_sideband
         .as_ref()
-        .map(|sideband| synthetic_top_k_sideband_bytes(args.tokens, sideband.width))
+        .map(|sideband| synthetic_top_k_sideband_bytes(tokens, sideband.width))
         .transpose()?
         .unwrap_or(0);
     let mut payload = Vec::with_capacity(payload_bytes);
-    for token in 0..args.tokens {
+    for token in 0..tokens {
         for dim in 0..width {
             let value = synthetic_activation_value(token, dim);
             payload.extend_from_slice(&value.to_ne_bytes());
         }
     }
     if let Some(sideband) = top_k_sideband {
-        append_synthetic_top_k_sideband(&mut payload, args.tokens, sideband.width)?;
+        append_synthetic_top_k_sideband(&mut payload, tokens, sideband.width)?;
     }
     let flags = if sideband_bytes > 0 {
         ACTIVATION_FLAG_GLM_DSA_TOP_K
@@ -1856,7 +3435,7 @@ fn synthetic_activation_frame_for_layer(
             layer_start: i32::try_from(layer_start.saturating_sub(1))
                 .context("input layer_start exceeds i32")?,
             layer_end: i32::try_from(layer_start).context("input layer_start exceeds i32")?,
-            token_count: u32::try_from(args.tokens).context("tokens exceeds u32")?,
+            token_count: u32::try_from(tokens).context("tokens exceeds u32")?,
             sequence_count: 1,
             payload_bytes: u64::try_from(payload.len()).context("payload length exceeds u64")?,
             flags,
@@ -1892,6 +3471,10 @@ fn env_flag_enabled(name: &str) -> bool {
         let value = value.trim();
         !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
     })
+}
+
+fn allow_compact_flash_auto(args: &GlmDsaLayerMicrobenchArgs) -> bool {
+    args.allow_compact_flash_auto || env_flag_enabled(ENV_ALLOW_COMPACT_FLASH_AUTO)
 }
 
 fn synthetic_top_k_sideband_bytes(tokens: usize, width: usize) -> Result<usize> {
@@ -2012,6 +3595,8 @@ impl NativeLogCapture {
             .with_context(|| format!("read native timing log {}", path.display()))?;
         Ok(NativeTimingCapture {
             log_path: Some(path),
+            compact_flash_policy_records: parse_compact_flash_policy_records(&text)
+                .context("parse native compact flash policy records")?,
             direct_sparse_decision_records: parse_direct_sparse_decision_records(&text)
                 .context("parse native direct sparse decisions")?,
             metal_dispatch_records: parse_metal_dispatch_records(&text)
@@ -2019,9 +3604,30 @@ impl NativeLogCapture {
             op_timing_records: parse_timing_records(&text).context("parse native op timings")?,
             group_timing_records: parse_timing_group_records(&text)
                 .context("parse native group timings")?,
+            indexshare_trace_summary: summarize_indexshare_trace_records(
+                &parse_indexshare_trace_records(&text).context("parse native IndexShare trace")?,
+            ),
             hot_tensor_records: parse_hot_tensor_records(&text)
                 .context("parse native hot tensor timings")?,
+            compute_buffer_records: parse_compute_buffer_records(&text)
+                .context("parse native compute buffer records")?,
         })
+    }
+
+    fn finish_after_open_error(mut self) -> String {
+        let Some(path) = self.path.clone() else {
+            return String::new();
+        };
+        restore_native_logs();
+        self.active = false;
+        match fs::read_to_string(&path) {
+            Ok(text) => format!(
+                "; native log: {}; tail:\n{}",
+                path.display(),
+                tail_lines(&text, 80)
+            ),
+            Err(error) => format!("; native log: {}; read failed: {error}", path.display()),
+        }
     }
 }
 
@@ -2037,11 +3643,20 @@ impl Drop for NativeLogCapture {
 #[derive(Default)]
 struct NativeTimingCapture {
     log_path: Option<PathBuf>,
+    compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
+    indexshare_trace_summary: IndexShareTraceSummary,
     hot_tensor_records: Vec<HotTensorRecord>,
+    compute_buffer_records: Vec<ComputeBufferRecord>,
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn native_log_capture_path() -> Result<PathBuf> {
@@ -2055,37 +3670,73 @@ fn native_log_capture_path() -> Result<PathBuf> {
     )))
 }
 
-fn skip_warmup_records(records: Vec<TimingRecord>, warmup: usize) -> Vec<TimingRecord> {
-    records.into_iter().skip(warmup).collect()
+fn retain_measured_timing_records(
+    records: Vec<TimingRecord>,
+    measured_tokens: usize,
+    warmup: usize,
+) -> Vec<TimingRecord> {
+    let measured_tokens = measured_tokens as u64;
+    records
+        .into_iter()
+        .filter(|record| record.tokens == measured_tokens)
+        .skip(warmup)
+        .collect()
 }
 
-fn skip_warmup_group_records(
+fn retain_measured_group_timing_records(
     records: Vec<TimingGroupRecord>,
+    measured_tokens: usize,
     warmup: usize,
 ) -> Vec<TimingGroupRecord> {
+    let measured_tokens = measured_tokens as u64;
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|record| record.timing.tokens == measured_tokens)
+        .collect();
+    let record_index_map =
+        measured_record_index_map(records.iter().map(|record| record.record_index), warmup);
     records
         .into_iter()
         .filter_map(|mut record| {
-            if record.record_index < warmup {
-                return None;
-            }
-            record.record_index -= warmup;
+            record.record_index = *record_index_map.get(&record.record_index)?;
             Some(record)
         })
         .collect()
 }
 
-fn skip_warmup_hot_tensor_records(
+fn retain_measured_hot_tensor_records(
     records: Vec<HotTensorRecord>,
+    measured_tokens: usize,
     warmup: usize,
 ) -> Vec<HotTensorRecord> {
+    let measured_tokens = measured_tokens as u64;
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|record| record.tokens == measured_tokens)
+        .collect();
+    let record_index_map =
+        measured_record_index_map(records.iter().map(|record| record.record_index), warmup);
     records
         .into_iter()
-        .filter(|record| record.record_index >= warmup)
-        .map(|mut record| {
-            record.record_index -= warmup;
-            record
+        .filter_map(|mut record| {
+            record.record_index = *record_index_map.get(&record.record_index)?;
+            Some(record)
         })
+        .collect()
+}
+
+fn measured_record_index_map(
+    indices: impl Iterator<Item = usize>,
+    warmup: usize,
+) -> HashMap<usize, usize> {
+    let mut unique_indices: Vec<_> = indices.collect();
+    unique_indices.sort_unstable();
+    unique_indices.dedup();
+    unique_indices
+        .into_iter()
+        .skip(warmup)
+        .enumerate()
+        .map(|(new_index, old_index)| (old_index, new_index))
         .collect()
 }
 
@@ -2102,18 +3753,98 @@ fn retain_case_decision_records(
         .collect()
 }
 
-fn summarize_direct_sparse_decisions(
-    records: &[DirectSparseDecisionRecord],
-) -> DirectSparseDecisionSummary {
+fn retain_case_compact_policy_records(
+    records: Vec<CompactFlashPolicyRecord>,
+    tokens: usize,
+) -> Vec<CompactFlashPolicyRecord> {
+    let Ok(tokens) = i64::try_from(tokens) else {
+        return Vec::new();
+    };
+    records
+        .into_iter()
+        .filter(|record| record.ubatch_tokens == tokens)
+        .collect()
+}
+
+fn split_execution_decision_records(
+    records: Vec<DirectSparseDecisionRecord>,
+    measured_iterations: usize,
+) -> (
+    Vec<DirectSparseDecisionRecord>,
+    Vec<DirectSparseDecisionRecord>,
+) {
+    if records.is_empty() || measured_iterations == 0 {
+        return (records, Vec::new());
+    }
+    let execution_count = records.len().min(measured_iterations);
+    let split_at = records.len() - execution_count;
+    let non_measured = records[..split_at].to_vec();
+    let execution = records[split_at..].to_vec();
+    (non_measured, execution)
+}
+
+fn split_execution_compact_policy_records(
+    records: Vec<CompactFlashPolicyRecord>,
+    measured_iterations: usize,
+) -> (Vec<CompactFlashPolicyRecord>, Vec<CompactFlashPolicyRecord>) {
+    if records.is_empty() || measured_iterations == 0 {
+        return (records, Vec::new());
+    }
+    let execution_count = records.len().min(measured_iterations);
+    let split_at = records.len() - execution_count;
+    let non_measured = records[..split_at].to_vec();
+    let execution = records[split_at..].to_vec();
+    (non_measured, execution)
+}
+
+fn summarize_direct_sparse_decisions(case: &MicrobenchCaseSummary) -> DirectSparseDecisionSummary {
     let mut summary = DirectSparseDecisionSummary {
-        records: records.len(),
+        records: case.direct_sparse_decision_records.len(),
+        execution_records: case.direct_sparse_execution_decision_records.len(),
+        non_measured_records: case.direct_sparse_non_measured_decision_records.len(),
         ..DirectSparseDecisionSummary::default()
     };
+    summarize_direct_sparse_decision_slice(
+        &case.direct_sparse_decision_records,
+        &mut summary,
+        false,
+    );
+    summarize_direct_sparse_decision_slice(
+        &case.direct_sparse_execution_decision_records,
+        &mut summary,
+        true,
+    );
+    summary
+}
+
+fn summarize_direct_sparse_decision_slice(
+    records: &[DirectSparseDecisionRecord],
+    summary: &mut DirectSparseDecisionSummary,
+    execution: bool,
+) {
     for record in records {
-        if record.use_direct {
+        if execution {
+            if record.use_direct {
+                summary.execution_use_direct += 1;
+            } else {
+                summary.execution_fallback += 1;
+            }
+        } else if record.use_direct {
             summary.use_direct += 1;
         } else {
             summary.fallback += 1;
+        }
+        if execution {
+            *summary
+                .execution_selector_reasons
+                .entry(
+                    record
+                        .selector_reason
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                )
+                .or_default() += 1;
+            continue;
         }
         if record.decode_shape {
             summary.decode_shape += 1;
@@ -2125,7 +3856,72 @@ fn summarize_direct_sparse_decisions(
             summary.token_shape_allowed += 1;
         }
     }
+}
+
+fn summarize_compact_flash_policy(case: &MicrobenchCaseSummary) -> CompactFlashPolicySummary {
+    let mut summary = CompactFlashPolicySummary {
+        records: case.compact_flash_policy_records.len(),
+        execution_records: case.compact_flash_execution_policy_records.len(),
+        non_measured_records: case.compact_flash_non_measured_policy_records.len(),
+        ..CompactFlashPolicySummary::default()
+    };
+    summarize_compact_flash_policy_slice(&case.compact_flash_policy_records, &mut summary, false);
+    summarize_compact_flash_policy_slice(
+        &case.compact_flash_execution_policy_records,
+        &mut summary,
+        true,
+    );
     summary
+}
+
+fn summarize_compact_flash_policy_slice(
+    records: &[CompactFlashPolicyRecord],
+    summary: &mut CompactFlashPolicySummary,
+    execution: bool,
+) {
+    for record in records {
+        if execution {
+            if record.use_compact {
+                summary.execution_use_compact += 1;
+            } else {
+                summary.execution_fallback += 1;
+            }
+        } else if record.use_compact {
+            summary.use_compact += 1;
+        } else {
+            summary.fallback += 1;
+        }
+        if record.forced {
+            summary.forced += 1;
+        }
+        if record.disabled {
+            summary.disabled += 1;
+        }
+        if record.ratio_ok {
+            summary.ratio_ok += 1;
+        }
+        if record.enabled {
+            summary.enabled += 1;
+        }
+        if record.flash_attn {
+            summary.flash_attn += 1;
+        }
+        if record.decode_shape {
+            summary.decode_shape += 1;
+        }
+        if record.no_mask == Some(true) {
+            summary.no_mask += 1;
+        }
+        if let Some(phase) = &record.phase {
+            *summary.phases.entry(phase.clone()).or_default() += 1;
+        }
+        if execution && let Some(reason) = &record.selector_reason {
+            *summary
+                .execution_selector_reasons
+                .entry(reason.clone())
+                .or_default() += 1;
+        }
+    }
 }
 
 fn compare_case_outputs(
@@ -2561,39 +4357,69 @@ struct MicrobenchCase {
     label: &'static str,
     flags: MicrobenchFlags,
     n_gpu_layers: i32,
+    measured_tokens: usize,
     native_log_path: Option<PathBuf>,
+    compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
+    compact_flash_execution_policy_records: Vec<CompactFlashPolicyRecord>,
+    compact_flash_non_measured_policy_records: Vec<CompactFlashPolicyRecord>,
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    direct_sparse_execution_decision_records: Vec<DirectSparseDecisionRecord>,
+    direct_sparse_non_measured_decision_records: Vec<DirectSparseDecisionRecord>,
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
+    indexshare_trace_summary: IndexShareTraceSummary,
     hot_tensor_records: Vec<HotTensorRecord>,
+    compute_buffer_records: Vec<ComputeBufferRecord>,
     timings: Vec<IterationTiming>,
     outputs: Vec<ActivationFrame>,
 }
 
 impl MicrobenchCase {
     fn as_case_summary(&self) -> MicrobenchCaseSummary {
-        MicrobenchCaseSummary {
+        let mut summary = MicrobenchCaseSummary {
             label: self.label,
             flags: self.flags,
             n_gpu_layers: self.n_gpu_layers,
             native_log_path: self.native_log_path.clone(),
-            direct_sparse_decision_summary: summarize_direct_sparse_decisions(
-                &self.direct_sparse_decision_records,
-            ),
+            compact_flash_policy_summary: CompactFlashPolicySummary::default(),
+            compact_flash_policy_records: self.compact_flash_policy_records.clone(),
+            compact_flash_execution_policy_records: self
+                .compact_flash_execution_policy_records
+                .clone(),
+            compact_flash_non_measured_policy_records: self
+                .compact_flash_non_measured_policy_records
+                .clone(),
+            direct_sparse_decision_summary: DirectSparseDecisionSummary::default(),
             timing_summary: summarize_elapsed_ms(
                 self.timings.iter().map(|timing| timing.elapsed_ms),
             ),
+            timing_breakdown: summarize_timing_breakdown(&self.timings, self.measured_tokens),
             metal_dispatch_summary: summarize_metal_dispatch(&self.metal_dispatch_records),
+            direct_sparse_spill_summary: summarize_direct_sparse_spill(
+                &self.metal_dispatch_records,
+            ),
             op_timing_summary: summarize_glm_dsa_op_timing(&self.op_timing_records),
             routed_moe_timing_summary: summarize_routed_moe_timing(&self.op_timing_records),
+            indexshare_timing_summary: summarize_indexshare_timing(&self.group_timing_records),
+            indexshare_trace_summary: self.indexshare_trace_summary.clone(),
             direct_sparse_decision_records: self.direct_sparse_decision_records.clone(),
+            direct_sparse_execution_decision_records: self
+                .direct_sparse_execution_decision_records
+                .clone(),
+            direct_sparse_non_measured_decision_records: self
+                .direct_sparse_non_measured_decision_records
+                .clone(),
             metal_dispatch_records: self.metal_dispatch_records.clone(),
             op_timing_records: self.op_timing_records.clone(),
             group_timing_records: self.group_timing_records.clone(),
             hot_tensor_records: self.hot_tensor_records.clone(),
+            compute_buffer_records: self.compute_buffer_records.clone(),
             timings: self.timings.clone(),
-        }
+        };
+        summary.compact_flash_policy_summary = summarize_compact_flash_policy(&summary);
+        summary.direct_sparse_decision_summary = summarize_direct_sparse_decisions(&summary);
+        summary
     }
 }
 
@@ -2614,7 +4440,7 @@ struct SidebandComparison {
     i32_diff: Option<SidebandI32Diff>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SidebandI32Diff {
     i32_aligned: bool,
     baseline_i32_count: usize,
@@ -2640,7 +4466,7 @@ impl SidebandI32Diff {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SidebandI32Mismatch {
     index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2651,7 +4477,7 @@ struct SidebandI32Mismatch {
     candidate: i32,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SidebandTokenDiffSummary {
     token_count: usize,
     width: usize,
@@ -2662,7 +4488,7 @@ struct SidebandTokenDiffSummary {
     first_set_mismatch: Option<SidebandTokenSetMismatch>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct SidebandTokenSetMismatch {
     token_index: usize,
     baseline_only: Vec<i32>,
@@ -2686,6 +4512,11 @@ struct MicrobenchReport {
     activation_width: u32,
     tokens: usize,
     position_start: i32,
+    kv_warmup_tokens: usize,
+    kv_warmup_chunk_tokens: usize,
+    synthetic_kv_warmup: bool,
+    reuse_kv_warmup_checkpoint: bool,
+    reuse_kv_warmup_stream: bool,
     warmup: usize,
     iterations: usize,
     n_gpu_layers: i32,
@@ -2703,27 +4534,58 @@ struct MicrobenchReport {
     execution_contract: ExecutionContractReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "CompactFlashPolicySummary::is_empty")]
+    compact_flash_policy_summary: CompactFlashPolicySummary,
     #[serde(skip_serializing_if = "DirectSparseDecisionSummary::is_empty")]
     direct_sparse_decision_summary: DirectSparseDecisionSummary,
     #[serde(skip_serializing_if = "TimingDistributionSummary::is_empty")]
     timing_summary: TimingDistributionSummary,
+    #[serde(skip_serializing_if = "TimingBreakdownSummary::is_empty")]
+    timing_breakdown: TimingBreakdownSummary,
     #[serde(skip_serializing_if = "GlmDsaDispatchSummary::is_empty")]
     metal_dispatch_summary: GlmDsaDispatchSummary,
+    #[serde(skip_serializing_if = "DirectSparseSpillSummary::is_empty")]
+    direct_sparse_spill_summary: DirectSparseSpillSummary,
     #[serde(skip_serializing_if = "GlmDsaOpTimingSummary::is_empty")]
     op_timing_summary: GlmDsaOpTimingSummary,
     #[serde(skip_serializing_if = "RoutedMoeTimingSummary::is_empty")]
     routed_moe_timing_summary: RoutedMoeTimingSummary,
+    #[serde(skip_serializing_if = "IndexShareTimingSummary::is_empty")]
+    indexshare_timing_summary: IndexShareTimingSummary,
+    #[serde(skip_serializing_if = "IndexShareTraceSummary::is_empty")]
+    indexshare_trace_summary: IndexShareTraceSummary,
+    representative_profile: RepresentativeProfileReport,
     profile_integrity: ProfileIntegrityReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     route_fusion_guard: Option<RouteFusionGuardReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     direct_sparse_prefill_guard: Option<DirectSparsePrefillGuardReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    direct_sparse_decode_guard: Option<DirectSparseDecodeGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     partial_top_k_guard: Option<PartialTopKGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_flash_guard: Option<CompactFlashGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moe_weighted_sum_guard: Option<MoeWeightedSumGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moe_motif_guard: Option<MoeMotifGuardReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_indexshare_guard: Option<NativeIndexShareGuardReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     real_top_k_shared_consumer_guard: Option<RealTopKSharedConsumerGuardReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_execution_policy_records: Vec<CompactFlashPolicyRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_non_measured_policy_records: Vec<CompactFlashPolicyRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    direct_sparse_execution_decision_records: Vec<DirectSparseDecisionRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    direct_sparse_non_measured_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2732,11 +4594,59 @@ struct MicrobenchReport {
     group_timing_records: Vec<TimingGroupRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hot_tensor_records: Vec<HotTensorRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compute_buffer_records: Vec<ComputeBufferRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     optimized_dispatch_probe: Option<MicrobenchCaseSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    optimized_dispatch_probe_parity: Option<ParityComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<MicrobenchComparisonReport>,
     timings: Vec<IterationTiming>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct TimingBreakdownSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    measured_phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "TimingDistributionSummary::is_empty")]
+    decode: TimingDistributionSummary,
+    #[serde(skip_serializing_if = "TimingDistributionSummary::is_empty")]
+    prefill: TimingDistributionSummary,
+}
+
+impl TimingBreakdownSummary {
+    fn is_empty(summary: &Self) -> bool {
+        TimingDistributionSummary::is_empty(&summary.decode)
+            && TimingDistributionSummary::is_empty(&summary.prefill)
+    }
+}
+
+fn summarize_timing_breakdown(
+    timings: &[IterationTiming],
+    tokens: usize,
+) -> TimingBreakdownSummary {
+    let measured = summarize_elapsed_ms(timings.iter().map(|timing| timing.elapsed_ms));
+    if TimingDistributionSummary::is_empty(&measured) {
+        return TimingBreakdownSummary::default();
+    }
+    match measured_timing_phase(tokens) {
+        "decode" => TimingBreakdownSummary {
+            measured_phase: Some("decode"),
+            decode: measured,
+            prefill: TimingDistributionSummary::default(),
+        },
+        "prefill" => TimingBreakdownSummary {
+            measured_phase: Some("prefill"),
+            decode: TimingDistributionSummary::default(),
+            prefill: measured,
+        },
+        _ => unreachable!("measured timing phase is exhaustive"),
+    }
+}
+
+fn measured_timing_phase(tokens: usize) -> &'static str {
+    if tokens == 1 { "decode" } else { "prefill" }
 }
 
 #[derive(Serialize)]
@@ -2757,13 +4667,36 @@ struct DirectSparsePrefillGuardReport {
     direct_decision_records: usize,
     direct_use_records: usize,
     fallback_records: usize,
+    prefill_decisions: usize,
+    prefill_direct_decisions: usize,
     large_prefill_decisions: usize,
     large_prefill_direct_decisions: usize,
     sparse_mask_nodes: u64,
+    dense_sparse_mask_dispatches: usize,
     dsa_sparse_attn_nodes: u64,
     dsa_sparse_attn_dispatches: usize,
-    capped_large_prefill_dispatches: usize,
-    expected_large_prefill_threads_x: u64,
+    accepted_prefill_dispatches: usize,
+    cached_topk_non_prefill_dispatches: usize,
+    accepted_large_prefill_dispatches: usize,
+    default_prefill_threads_x: u64,
+    max_cached_topk_prefill_threads_x: u64,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
+struct DirectSparseDecodeGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    direct_decision_records: usize,
+    direct_use_records: usize,
+    fallback_records: usize,
+    decode_decisions: usize,
+    decode_direct_decisions: usize,
+    sparse_mask_nodes: u64,
+    dense_sparse_mask_dispatches: usize,
+    dsa_sparse_attn_nodes: u64,
+    dsa_sparse_attn_dispatches: usize,
+    accepted_decode_dispatches: usize,
     failure_summary: String,
 }
 
@@ -2781,6 +4714,78 @@ struct PartialTopKGuardReport {
     output_frames_with_expected_sideband: usize,
     expected_sideband_i32_per_token: Option<usize>,
     max_observed_sideband_i32_per_token: Option<usize>,
+    native_shared_consume_records: usize,
+    native_shared_consume_width_matches: usize,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
+struct CompactFlashGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    flash_attn_ext_records: usize,
+    flash_attn_ext_vec_records: usize,
+    flash_attn_ext_tile_records: usize,
+    flash_attn_ext_glm_dsa_shape_records: usize,
+    get_rows_records: usize,
+    get_rows_typed_records: usize,
+    get_rows_promote_records: usize,
+    compact_get_rows_records: usize,
+    compact_get_rows_typed_records: usize,
+    compact_get_rows_promote_records: usize,
+    dsa_compact_get_rows_fused_records: usize,
+    dsa_sparse_attn_records: usize,
+    sparse_mask_nodes: u64,
+    policy_phase: Option<String>,
+    policy_selector_reason: Option<String>,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
+struct MoeWeightedSumGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    moe_weighted_sum_records: usize,
+    moe_weighted_sum_f32x4_records: usize,
+    moe_weighted_sum_already_weighted_records: usize,
+    mul_mv_id_weighted_sum_fused_records: usize,
+    mul_mv_id_weighted_sum_fused_q3_k_records: usize,
+    mul_mv_id_weighted_slots_records: usize,
+    mul_mv_id_weighted_slots_q3_k_records: usize,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
+struct MoeMotifGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    motif_candidate_records: usize,
+    natural_order_records: usize,
+    backend_candidate_records: usize,
+    subgraph_fusable_records: usize,
+    coencoded_records: usize,
+    max_motif_nodes: u64,
+    failure_summary: String,
+}
+
+#[derive(Serialize)]
+struct NativeIndexShareGuardReport {
+    checked_case: &'static str,
+    passed: bool,
+    records: usize,
+    exec_records: usize,
+    full_exec_records: usize,
+    shared_exec_records: usize,
+    shared_exec_with_input_top_k: usize,
+    shared_exec_missing_input_top_k: usize,
+    top_k_records: usize,
+    top_k_from_indexer: usize,
+    top_k_from_full_visible: usize,
+    consume_records: usize,
+    min_consume_width: Option<i64>,
+    max_consume_width: Option<i64>,
+    full_layers: Vec<i32>,
+    shared_layers: Vec<i32>,
     failure_summary: String,
 }
 
@@ -2848,6 +4853,31 @@ struct SidebandContractReport {
     last_indices: Vec<i32>,
 }
 
+#[derive(Default, Serialize)]
+struct TopKSidebandStats {
+    i32_aligned: bool,
+    token_count: usize,
+    total_i32: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width_per_token: Option<usize>,
+    valid_index_count: usize,
+    negative_index_count: usize,
+    out_of_range_index_count: usize,
+    causal_visible_count: usize,
+    future_index_count: usize,
+    duplicate_index_count: usize,
+    active_top_end_sum: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avg_active_top_end: Option<f64>,
+    max_active_top_end: usize,
+    inactive_tail_count: usize,
+    masked_future_in_active_prefix_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active_prefix_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    causal_visible_ratio: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct StageWireRoundTripReport {
     kind: String,
@@ -2862,6 +4892,7 @@ struct StageWireRoundTripReport {
     raw_activation_wire_bytes: usize,
     top_k_sideband_bytes: usize,
     top_k_sideband_i32_count: usize,
+    top_k_sideband_stats: TopKSidebandStats,
     estimated_wire_bytes: usize,
     encoded_wire_bytes: usize,
     decoded_payload_bytes: usize,
@@ -3004,7 +5035,8 @@ fn build_route_fusion_guard(
 fn build_direct_sparse_prefill_guard(
     candidate: &MicrobenchCaseSummary,
 ) -> DirectSparsePrefillGuardReport {
-    const EXPECTED_LARGE_PREFILL_THREADS_X: u64 = 32;
+    const DEFAULT_PREFILL_THREADS_X: u64 = 32;
+    const MAX_CACHED_TOPK_PREFILL_THREADS_X: u64 = 256;
 
     let direct_decision_records = candidate.direct_sparse_decision_records.len();
     let direct_use_records = candidate
@@ -3013,6 +5045,16 @@ fn build_direct_sparse_prefill_guard(
         .filter(|record| record.use_direct)
         .count();
     let fallback_records = direct_decision_records.saturating_sub(direct_use_records);
+    let prefill_decisions = candidate
+        .direct_sparse_decision_records
+        .iter()
+        .filter(|record| direct_sparse_decision_is_prefill(record))
+        .count();
+    let prefill_direct_decisions = candidate
+        .direct_sparse_decision_records
+        .iter()
+        .filter(|record| direct_sparse_decision_is_prefill(record) && record.use_direct)
+        .count();
     let large_prefill_decisions = candidate
         .direct_sparse_decision_records
         .iter()
@@ -3025,24 +5067,43 @@ fn build_direct_sparse_prefill_guard(
         .count();
     let sparse_mask_nodes = candidate.op_timing_summary.sparse_mask.nodes;
     let dsa_sparse_attn_nodes = candidate.op_timing_summary.dsa_sparse_attn.nodes;
+    let dense_sparse_mask_dispatches = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| record.op == "dsa_sparse_mask")
+        .count();
     let dsa_sparse_attn_dispatches = candidate
         .metal_dispatch_records
         .iter()
         .filter(|record| record.op == "dsa_sparse_attn")
         .count();
-    let capped_large_prefill_dispatches = candidate
+    let accepted_prefill_dispatches = candidate
         .metal_dispatch_records
         .iter()
         .filter(|record| {
             record.op == "dsa_sparse_attn"
                 && record.batch.is_some_and(|batch| batch > 1)
                 && record.top_k.is_some_and(|top_k| top_k >= 64)
-                && record.threads_x == EXPECTED_LARGE_PREFILL_THREADS_X
+                && prefill_dispatch_threads_accepted(record.kernel.as_deref(), record.threads_x)
         })
         .count();
+    let cached_topk_non_prefill_dispatches = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| {
+            record.op == "dsa_sparse_attn"
+                && dsa_sparse_attn_kernel_is_cached_topk(record.kernel.as_deref())
+                && !record.batch.is_some_and(|batch| batch > 1)
+        })
+        .count();
+    let accepted_large_prefill_dispatches = if large_prefill_direct_decisions > 0 {
+        accepted_prefill_dispatches
+    } else {
+        0
+    };
     let mut failures = Vec::new();
-    if large_prefill_direct_decisions == 0 {
-        failures.push("no_large_prefill_direct_decision");
+    if prefill_direct_decisions == 0 {
+        failures.push("no_prefill_direct_decision");
     }
     if fallback_records > 0 {
         failures.push("fallback_decision_present");
@@ -3050,11 +5111,17 @@ fn build_direct_sparse_prefill_guard(
     if sparse_mask_nodes > 0 {
         failures.push("sparse_mask_nodes_present");
     }
-    if dsa_sparse_attn_nodes == 0 {
-        failures.push("missing_dsa_sparse_attn_timing");
+    if dense_sparse_mask_dispatches > 0 {
+        failures.push("dense_sparse_mask_dispatch_present");
     }
-    if capped_large_prefill_dispatches == 0 {
-        failures.push("missing_capped_large_prefill_dispatch");
+    if dsa_sparse_attn_nodes == 0 && dsa_sparse_attn_dispatches == 0 {
+        failures.push("missing_dsa_sparse_attn_evidence");
+    }
+    if accepted_prefill_dispatches == 0 {
+        failures.push("missing_accepted_prefill_dispatch");
+    }
+    if cached_topk_non_prefill_dispatches > 0 {
+        failures.push("cached_topk_non_prefill_dispatch_present");
     }
     let passed = failures.is_empty();
     DirectSparsePrefillGuardReport {
@@ -3063,13 +5130,19 @@ fn build_direct_sparse_prefill_guard(
         direct_decision_records,
         direct_use_records,
         fallback_records,
+        prefill_decisions,
+        prefill_direct_decisions,
         large_prefill_decisions,
         large_prefill_direct_decisions,
         sparse_mask_nodes,
+        dense_sparse_mask_dispatches,
         dsa_sparse_attn_nodes,
         dsa_sparse_attn_dispatches,
-        capped_large_prefill_dispatches,
-        expected_large_prefill_threads_x: EXPECTED_LARGE_PREFILL_THREADS_X,
+        accepted_prefill_dispatches,
+        cached_topk_non_prefill_dispatches,
+        accepted_large_prefill_dispatches,
+        default_prefill_threads_x: DEFAULT_PREFILL_THREADS_X,
+        max_cached_topk_prefill_threads_x: MAX_CACHED_TOPK_PREFILL_THREADS_X,
         failure_summary: if failures.is_empty() {
             "none".to_string()
         } else {
@@ -3078,12 +5151,123 @@ fn build_direct_sparse_prefill_guard(
     }
 }
 
+fn build_direct_sparse_decode_guard(
+    candidate: &MicrobenchCaseSummary,
+) -> DirectSparseDecodeGuardReport {
+    let direct_decision_records = candidate.direct_sparse_decision_records.len();
+    let direct_use_records = candidate
+        .direct_sparse_decision_records
+        .iter()
+        .filter(|record| record.use_direct)
+        .count();
+    let fallback_records = direct_decision_records.saturating_sub(direct_use_records);
+    let decode_decisions = candidate
+        .direct_sparse_decision_records
+        .iter()
+        .filter(|record| record.decode_shape)
+        .count();
+    let decode_direct_decisions = candidate
+        .direct_sparse_decision_records
+        .iter()
+        .filter(|record| record.decode_shape && record.use_direct)
+        .count();
+    let sparse_mask_nodes = candidate.op_timing_summary.sparse_mask.nodes;
+    let dsa_sparse_attn_nodes = candidate.op_timing_summary.dsa_sparse_attn.nodes;
+    let dense_sparse_mask_dispatches = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| record.op == "dsa_sparse_mask")
+        .count();
+    let dsa_sparse_attn_dispatches = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| record.op == "dsa_sparse_attn")
+        .count();
+    let accepted_decode_dispatches = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| {
+            record.op == "dsa_sparse_attn"
+                && record.batch == Some(1)
+                && record.top_k.is_some_and(|top_k| top_k > 0)
+        })
+        .count();
+
+    let mut failures = Vec::new();
+    if decode_direct_decisions == 0 {
+        failures.push("no_decode_direct_decision");
+    }
+    if fallback_records > 0 {
+        failures.push("fallback_decision_present");
+    }
+    if sparse_mask_nodes > 0 {
+        failures.push("sparse_mask_nodes_present");
+    }
+    if dense_sparse_mask_dispatches > 0 {
+        failures.push("dense_sparse_mask_dispatch_present");
+    }
+    if dsa_sparse_attn_nodes == 0 && dsa_sparse_attn_dispatches == 0 {
+        failures.push("missing_dsa_sparse_attn_evidence");
+    }
+    if accepted_decode_dispatches == 0 {
+        failures.push("missing_accepted_decode_dispatch");
+    }
+
+    DirectSparseDecodeGuardReport {
+        checked_case: candidate.label,
+        passed: failures.is_empty(),
+        direct_decision_records,
+        direct_use_records,
+        fallback_records,
+        decode_decisions,
+        decode_direct_decisions,
+        sparse_mask_nodes,
+        dense_sparse_mask_dispatches,
+        dsa_sparse_attn_nodes,
+        dsa_sparse_attn_dispatches,
+        accepted_decode_dispatches,
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
+}
+
+fn direct_sparse_decision_is_prefill(record: &DirectSparseDecisionRecord) -> bool {
+    record.prefill_shape || record.large_prefill_shape == Some(true)
+}
+
+fn prefill_dispatch_threads_accepted(kernel: Option<&str>, threads_x: u64) -> bool {
+    const DEFAULT_PREFILL_THREADS_X: u64 = 32;
+    const MAX_CACHED_TOPK_PREFILL_THREADS_X: u64 = 256;
+
+    match kernel {
+        Some("decode_vec" | "decode_vec_direct") => threads_x <= MAX_CACHED_TOPK_PREFILL_THREADS_X,
+        _ if dsa_sparse_attn_kernel_is_cached_topk(kernel) => {
+            threads_x <= MAX_CACHED_TOPK_PREFILL_THREADS_X
+        }
+        _ => threads_x == DEFAULT_PREFILL_THREADS_X,
+    }
+}
+
+fn dsa_sparse_attn_kernel_is_cached_topk(kernel: Option<&str>) -> bool {
+    matches!(kernel, Some("cached_topk" | "cached_topk_v4"))
+}
+
 fn build_partial_top_k_guard(
     candidate: &MicrobenchCaseSummary,
+    optimized_dispatch_probe: Option<&MicrobenchCaseSummary>,
     hidden_payload_bytes: usize,
     token_count: usize,
 ) -> PartialTopKGuardReport {
+    let dispatch_case = optimized_dispatch_probe.unwrap_or(candidate);
     let dsa_dispatches: Vec<_> = candidate
+        .metal_dispatch_records
+        .iter()
+        .filter(|record| record.op == "dsa_sparse_attn")
+        .collect();
+    let dispatch_case_dsa_dispatches: Vec<_> = dispatch_case
         .metal_dispatch_records
         .iter()
         .filter(|record| record.op == "dsa_sparse_attn")
@@ -3093,17 +5277,31 @@ fn build_partial_top_k_guard(
         .copied()
         .filter(|record| dispatch_has_partial_top_k(record))
         .collect();
-    let max_kv = dsa_dispatches.iter().filter_map(|record| record.kv).max();
-    let min_partial_top_k = partial_dispatches
+    let dispatch_case_partial_dispatches: Vec<_> = dispatch_case_dsa_dispatches
+        .iter()
+        .copied()
+        .filter(|record| dispatch_has_partial_top_k(record))
+        .collect();
+    let proof_partial_dispatches = if dispatch_case_partial_dispatches.is_empty() {
+        &partial_dispatches
+    } else {
+        &dispatch_case_partial_dispatches
+    };
+    let max_kv = dispatch_case_dsa_dispatches
+        .iter()
+        .filter_map(|record| record.kv)
+        .max()
+        .or_else(|| dsa_dispatches.iter().filter_map(|record| record.kv).max());
+    let min_partial_top_k = proof_partial_dispatches
         .iter()
         .filter_map(|record| record.top_k)
         .min();
-    let max_partial_top_k = partial_dispatches
+    let max_partial_top_k = proof_partial_dispatches
         .iter()
         .filter_map(|record| record.top_k)
         .max();
-    let expected_sideband_i32_per_token =
-        common_partial_top_k_width(&partial_dispatches).and_then(|width| width.try_into().ok());
+    let expected_sideband_i32_per_token = common_partial_top_k_width(proof_partial_dispatches)
+        .and_then(|width| width.try_into().ok());
     let observed_sideband_widths: Vec<_> = candidate
         .timings
         .iter()
@@ -3127,23 +5325,37 @@ fn build_partial_top_k_guard(
                 .count()
         });
     let max_observed_sideband_i32_per_token = observed_sideband_widths.iter().copied().max();
+    let native_shared_consume_width_matches =
+        expected_sideband_i32_per_token.map_or(0, |expected| {
+            let trace = &candidate.indexshare_trace_summary;
+            let expected = expected as i64;
+            let width_matches = trace.min_consume_width == Some(expected)
+                && trace.max_consume_width == Some(expected);
+            if width_matches && trace.shared_exec_missing_input_top_k == 0 {
+                trace.consume_records
+            } else {
+                0
+            }
+        });
+    let local_top_k_contract_satisfied =
+        output_frames_with_expected_sideband > 0 || native_shared_consume_width_matches > 0;
 
     let mut failures = Vec::new();
-    if partial_dispatches.is_empty() {
+    if proof_partial_dispatches.is_empty() {
         failures.push("missing_partial_top_k_dispatch");
     }
     if expected_sideband_i32_per_token.is_none() {
         failures.push("ambiguous_partial_top_k_width");
     }
-    if output_frames_with_expected_sideband == 0 {
-        failures.push("missing_expected_output_sideband_width");
+    if !local_top_k_contract_satisfied {
+        failures.push("missing_expected_top_k_width_proof");
     }
     let passed = failures.is_empty();
     PartialTopKGuardReport {
-        checked_case: candidate.label,
+        checked_case: dispatch_case.label,
         passed,
-        dsa_sparse_attn_dispatches: dsa_dispatches.len(),
-        partial_dsa_sparse_attn_dispatches: partial_dispatches.len(),
+        dsa_sparse_attn_dispatches: dispatch_case_dsa_dispatches.len(),
+        partial_dsa_sparse_attn_dispatches: proof_partial_dispatches.len(),
         max_kv,
         min_partial_top_k,
         max_partial_top_k,
@@ -3152,6 +5364,8 @@ fn build_partial_top_k_guard(
         output_frames_with_expected_sideband,
         expected_sideband_i32_per_token,
         max_observed_sideband_i32_per_token,
+        native_shared_consume_records: candidate.indexshare_trace_summary.consume_records,
+        native_shared_consume_width_matches,
         failure_summary: if failures.is_empty() {
             "none".to_string()
         } else {
@@ -3173,6 +5387,199 @@ fn common_partial_top_k_width(records: &[&MetalDispatchRecord]) -> Option<u64> {
     widths.all(|width| width == first).then_some(first)
 }
 
+fn build_compact_flash_guard(candidate: &MicrobenchCaseSummary) -> CompactFlashGuardReport {
+    let dispatch = &candidate.metal_dispatch_summary;
+    let compact_get_rows_records = compact_get_rows_records(&candidate.metal_dispatch_records);
+    let compact_get_rows_typed_records = compact_get_rows_records
+        .iter()
+        .filter(|record| record.kernel.as_deref() == Some("typed"))
+        .count();
+    let compact_get_rows_promote_records = compact_get_rows_records
+        .iter()
+        .filter(|record| record.kernel.as_deref() == Some("promote"))
+        .count();
+    let execution_policy = candidate
+        .compact_flash_execution_policy_records
+        .last()
+        .or_else(|| candidate.compact_flash_policy_records.last());
+    let mut failures = Vec::new();
+    if dispatch.flash_attn_ext_glm_dsa_shape_records == 0 {
+        failures.push("missing_glm_shape_flash_attn_ext");
+    }
+    if dispatch.flash_attn_ext_vec_records == 0 {
+        failures.push("missing_vec_flash_attn_ext");
+    }
+    if compact_get_rows_typed_records == 0 && dispatch.dsa_compact_get_rows_fused_records == 0 {
+        failures.push("missing_compact_get_rows");
+    }
+    if compact_get_rows_promote_records > 0 {
+        failures.push("promoted_get_rows_present");
+    }
+    if dispatch.dsa_sparse_attn_records > 0 {
+        failures.push("dsa_sparse_attn_dispatch_present");
+    }
+    if candidate.op_timing_summary.sparse_mask.nodes > 0 {
+        failures.push("sparse_mask_nodes_present");
+    }
+    let passed = failures.is_empty();
+    CompactFlashGuardReport {
+        checked_case: candidate.label,
+        passed,
+        flash_attn_ext_records: dispatch.flash_attn_ext_records,
+        flash_attn_ext_vec_records: dispatch.flash_attn_ext_vec_records,
+        flash_attn_ext_tile_records: dispatch.flash_attn_ext_tile_records,
+        flash_attn_ext_glm_dsa_shape_records: dispatch.flash_attn_ext_glm_dsa_shape_records,
+        get_rows_records: dispatch.get_rows_records,
+        get_rows_typed_records: dispatch.get_rows_typed_records,
+        get_rows_promote_records: dispatch.get_rows_promote_records,
+        compact_get_rows_records: compact_get_rows_records.len(),
+        compact_get_rows_typed_records,
+        compact_get_rows_promote_records,
+        dsa_compact_get_rows_fused_records: dispatch.dsa_compact_get_rows_fused_records,
+        dsa_sparse_attn_records: dispatch.dsa_sparse_attn_records,
+        sparse_mask_nodes: candidate.op_timing_summary.sparse_mask.nodes,
+        policy_phase: execution_policy.and_then(|record| record.phase.clone()),
+        policy_selector_reason: execution_policy.and_then(|record| record.selector_reason.clone()),
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
+}
+
+fn compact_get_rows_records(records: &[MetalDispatchRecord]) -> Vec<&MetalDispatchRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            record.op == "get_rows"
+                && (record.tensor.starts_with("dsa_compact_k_topk_rows")
+                    || record.tensor.starts_with("dsa_compact_v_topk_rows")
+                    || record.tensor.starts_with("dsa_compact_mask_topk_rows"))
+        })
+        .collect()
+}
+
+fn build_moe_weighted_sum_guard(candidate: &MicrobenchCaseSummary) -> MoeWeightedSumGuardReport {
+    let dispatch = &candidate.metal_dispatch_summary;
+    let mut failures = Vec::new();
+    let standalone_weighted_sum_ok = dispatch.moe_weighted_sum_records > 0
+        && dispatch.moe_weighted_sum_f32x4_records == dispatch.moe_weighted_sum_records;
+    let fused_weighted_sum_ok = dispatch.mul_mv_id_weighted_sum_fused_records > 0
+        && dispatch.mul_mv_id_weighted_sum_fused_q3_k_records
+            == dispatch.mul_mv_id_weighted_sum_fused_records;
+    let parallel_weighted_slots_ok = dispatch.mul_mv_id_weighted_slots_records > 0
+        && dispatch.mul_mv_id_weighted_slots_q3_k_records
+            == dispatch.mul_mv_id_weighted_slots_records
+        && dispatch.moe_weighted_sum_already_weighted_records > 0;
+
+    if !standalone_weighted_sum_ok && !fused_weighted_sum_ok && !parallel_weighted_slots_ok {
+        if dispatch.moe_weighted_sum_records == 0 {
+            failures.push("missing_moe_weighted_sum");
+        }
+        if dispatch.moe_weighted_sum_f32x4_records == 0
+            && dispatch.moe_weighted_sum_already_weighted_records == 0
+        {
+            failures.push("missing_moe_weighted_sum_f32x4");
+        }
+        if dispatch.moe_weighted_sum_records > 0
+            && dispatch.moe_weighted_sum_f32x4_records != dispatch.moe_weighted_sum_records
+            && dispatch.moe_weighted_sum_already_weighted_records
+                != dispatch.moe_weighted_sum_records
+        {
+            failures.push("non_f32x4_moe_weighted_sum_present");
+        }
+        if dispatch.mul_mv_id_weighted_sum_fused_records == 0 {
+            failures.push("missing_mul_mv_id_weighted_sum_fused");
+        }
+        if dispatch.mul_mv_id_weighted_sum_fused_records > 0
+            && dispatch.mul_mv_id_weighted_sum_fused_q3_k_records
+                != dispatch.mul_mv_id_weighted_sum_fused_records
+        {
+            failures.push("non_q3_k_mul_mv_id_weighted_sum_fused_present");
+        }
+        if dispatch.mul_mv_id_weighted_slots_records == 0 {
+            failures.push("missing_mul_mv_id_weighted_slots");
+        }
+        if dispatch.mul_mv_id_weighted_slots_records > 0
+            && dispatch.mul_mv_id_weighted_slots_q3_k_records
+                != dispatch.mul_mv_id_weighted_slots_records
+        {
+            failures.push("non_q3_k_mul_mv_id_weighted_slots_present");
+        }
+        if dispatch.mul_mv_id_weighted_slots_records > 0
+            && dispatch.moe_weighted_sum_already_weighted_records == 0
+        {
+            failures.push("missing_already_weighted_moe_weighted_sum");
+        }
+    }
+    let passed = failures.is_empty();
+    MoeWeightedSumGuardReport {
+        checked_case: candidate.label,
+        passed,
+        moe_weighted_sum_records: dispatch.moe_weighted_sum_records,
+        moe_weighted_sum_f32x4_records: dispatch.moe_weighted_sum_f32x4_records,
+        moe_weighted_sum_already_weighted_records: dispatch
+            .moe_weighted_sum_already_weighted_records,
+        mul_mv_id_weighted_sum_fused_records: dispatch.mul_mv_id_weighted_sum_fused_records,
+        mul_mv_id_weighted_sum_fused_q3_k_records: dispatch
+            .mul_mv_id_weighted_sum_fused_q3_k_records,
+        mul_mv_id_weighted_slots_records: dispatch.mul_mv_id_weighted_slots_records,
+        mul_mv_id_weighted_slots_q3_k_records: dispatch.mul_mv_id_weighted_slots_q3_k_records,
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
+}
+
+fn build_moe_motif_guard(
+    candidate: &MicrobenchCaseSummary,
+    optimized_probe: Option<&MicrobenchCaseSummary>,
+) -> MoeMotifGuardReport {
+    let checked = optimized_probe.unwrap_or(candidate);
+    let dispatch = &checked.metal_dispatch_summary;
+    let mut failures = Vec::new();
+    if dispatch.glm_dsa_moe_motif_candidate_records == 0 {
+        failures.push("missing_moe_motif_candidate");
+    }
+    if dispatch.glm_dsa_moe_motif_natural_order_records
+        != dispatch.glm_dsa_moe_motif_candidate_records
+    {
+        failures.push("non_natural_order_motif_present");
+    }
+    if dispatch.glm_dsa_moe_motif_backend_candidate_records
+        != dispatch.glm_dsa_moe_motif_candidate_records
+    {
+        failures.push("non_backend_candidate_motif_present");
+    }
+    if dispatch.glm_dsa_moe_motif_subgraph_fusable_records
+        != dispatch.glm_dsa_moe_motif_candidate_records
+    {
+        failures.push("non_subgraph_fusable_motif_present");
+    }
+    if dispatch.glm_dsa_moe_motif_max_nodes < 4 {
+        failures.push("motif_too_small");
+    }
+    let passed = failures.is_empty();
+    MoeMotifGuardReport {
+        checked_case: checked.label,
+        passed,
+        motif_candidate_records: dispatch.glm_dsa_moe_motif_candidate_records,
+        natural_order_records: dispatch.glm_dsa_moe_motif_natural_order_records,
+        backend_candidate_records: dispatch.glm_dsa_moe_motif_backend_candidate_records,
+        subgraph_fusable_records: dispatch.glm_dsa_moe_motif_subgraph_fusable_records,
+        coencoded_records: dispatch.glm_dsa_moe_motif_coencoded_records,
+        max_motif_nodes: dispatch.glm_dsa_moe_motif_max_nodes,
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
+}
+
 fn output_sideband_i32_per_token(
     output_payload_bytes: usize,
     hidden_payload_bytes: usize,
@@ -3191,6 +5598,56 @@ fn output_sideband_i32_per_token(
         .then_some(sideband_i32 / token_count)
 }
 
+fn build_native_indexshare_guard(case: &MicrobenchCaseSummary) -> NativeIndexShareGuardReport {
+    let trace = &case.indexshare_trace_summary;
+    let mut failures = Vec::new();
+    if trace.records == 0 {
+        failures.push("missing_indexshare_trace_records");
+    }
+    if trace.full_exec_records == 0 {
+        failures.push("missing_full_exec");
+    }
+    if trace.shared_exec_records == 0 {
+        failures.push("missing_shared_exec");
+    }
+    if trace.top_k_records == 0 {
+        failures.push("missing_top_k_production");
+    }
+    if trace.consume_records == 0 {
+        failures.push("missing_shared_consume");
+    }
+    if trace.shared_exec_missing_input_top_k > 0 {
+        failures.push("shared_exec_missing_input_top_k");
+    }
+    if trace.shared_exec_with_input_top_k < trace.shared_exec_records {
+        failures.push("not_all_shared_execs_have_input_top_k");
+    }
+    let passed = failures.is_empty();
+    NativeIndexShareGuardReport {
+        checked_case: case.label,
+        passed,
+        records: trace.records,
+        exec_records: trace.exec_records,
+        full_exec_records: trace.full_exec_records,
+        shared_exec_records: trace.shared_exec_records,
+        shared_exec_with_input_top_k: trace.shared_exec_with_input_top_k,
+        shared_exec_missing_input_top_k: trace.shared_exec_missing_input_top_k,
+        top_k_records: trace.top_k_records,
+        top_k_from_indexer: trace.top_k_from_indexer,
+        top_k_from_full_visible: trace.top_k_from_full_visible,
+        consume_records: trace.consume_records,
+        min_consume_width: trace.min_consume_width,
+        max_consume_width: trace.max_consume_width,
+        full_layers: trace.full_layers.clone(),
+        shared_layers: trace.shared_layers.clone(),
+        failure_summary: if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join(",")
+        },
+    }
+}
+
 fn build_real_top_k_shared_consumer_guard(
     execution: &ExecutionContractReport,
     stage_wire_roundtrip: Option<&StageWireRoundTripReport>,
@@ -3203,9 +5660,6 @@ fn build_real_top_k_shared_consumer_guard(
     let mut failures = Vec::new();
     if execution.proof_kind != ExecutionProofKind::SharedConsumerWithRealTopK {
         failures.push("not_shared_consumer_with_real_top_k");
-    }
-    if execution.policy_layer_role.role != IndexShareRole::SharedConsumer {
-        failures.push("policy_not_shared_consumer");
     }
     if execution.effective_layer_role.role != IndexShareRole::SharedConsumer {
         failures.push("effective_role_not_shared_consumer");
@@ -3326,36 +5780,75 @@ fn parse_env_u32(name: &str) -> Option<u32> {
 #[derive(Clone, Copy, Serialize)]
 struct MicrobenchFlags {
     direct_sparse_attn: bool,
+    compact_flash_attn: bool,
+    allow_compact_flash_auto: bool,
     direct_sparse_prefill: bool,
+    enable_unproven_large_direct_sparse_prefill: bool,
+    direct_sparse_prefill_max_tokens: Option<u32>,
     fused_sparse_mask: bool,
     parallel_lightning_indexer: bool,
     op_timing: bool,
+    native_indexshare_exec_log: bool,
     metal_dispatch_log: bool,
     metal_topk_moe_route_fusion: bool,
+    metal_topk_moe_route_fusion_native_default: bool,
+    moe_motif_coencode: bool,
+    moe_down_weighted_fusion: bool,
+    moe_down_weighted_parallel: bool,
+    moe_down_unweighted_slots: bool,
     sparse_attn_threads: Option<u32>,
+    sparse_attn_group_heads: Option<u32>,
+    lightning_indexer_threads: Option<u32>,
+    dense_sparse_mask_max_bytes: Option<u64>,
+    direct_sparse_prefill_min_kv_topk_ratio: Option<u32>,
 }
 
 impl MicrobenchFlags {
     fn from_args(args: &GlmDsaLayerMicrobenchArgs) -> Self {
         Self {
             direct_sparse_attn: args.direct_sparse_attn,
+            compact_flash_attn: args.compact_flash_attn,
+            allow_compact_flash_auto: args.allow_compact_flash_auto,
             direct_sparse_prefill: args.direct_sparse_prefill,
+            enable_unproven_large_direct_sparse_prefill: args
+                .enable_unproven_large_direct_sparse_prefill,
+            direct_sparse_prefill_max_tokens: args.direct_sparse_prefill_max_tokens,
             fused_sparse_mask: args.fused_sparse_mask,
             parallel_lightning_indexer: args.parallel_lightning_indexer,
             op_timing: args.op_timing,
+            native_indexshare_exec_log: args.require_native_indexshare_proof,
             metal_dispatch_log: args.metal_dispatch_log,
             metal_topk_moe_route_fusion: args.metal_topk_moe_route_fusion,
+            metal_topk_moe_route_fusion_native_default: args
+                .metal_topk_moe_route_fusion_native_default,
+            moe_motif_coencode: args.moe_motif_coencode,
+            moe_down_weighted_fusion: args.moe_down_weighted_fusion,
+            moe_down_weighted_parallel: args.moe_down_weighted_parallel,
+            moe_down_unweighted_slots: args.moe_down_unweighted_slots,
             sparse_attn_threads: args.sparse_attn_threads,
+            sparse_attn_group_heads: args.sparse_attn_group_heads,
+            lightning_indexer_threads: args.lightning_indexer_threads,
+            dense_sparse_mask_max_bytes: args.dense_sparse_mask_max_bytes,
+            direct_sparse_prefill_min_kv_topk_ratio: args.direct_sparse_prefill_min_kv_topk_ratio,
         }
     }
 
     fn capture_native_logs(self) -> bool {
-        self.op_timing || self.metal_dispatch_log
+        self.op_timing || self.native_indexshare_exec_log || self.metal_dispatch_log
     }
 }
 
-fn should_run_optimized_dispatch_probe(flags: MicrobenchFlags) -> bool {
-    flags.op_timing && flags.metal_dispatch_log
+fn should_run_optimized_dispatch_probe(
+    flags: MicrobenchFlags,
+    require_moe_motif_proof: bool,
+) -> bool {
+    require_moe_motif_proof
+        || (flags.op_timing && flags.metal_dispatch_log)
+        || (flags.metal_topk_moe_route_fusion && !flags.metal_dispatch_log)
+        || ((flags.moe_down_weighted_fusion
+            || flags.moe_down_weighted_parallel
+            || flags.moe_down_unweighted_slots)
+            && !flags.metal_dispatch_log)
 }
 
 #[derive(Serialize)]
@@ -3434,6 +5927,52 @@ impl ProfileIntegrityReport {
     }
 }
 
+#[derive(Serialize)]
+struct RepresentativeProfileReport {
+    checked_case: &'static str,
+    source: &'static str,
+    diagnostic_timing_discarded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<&'static str>,
+    #[serde(skip_serializing_if = "TimingDistributionSummary::is_empty")]
+    timing_summary: TimingDistributionSummary,
+    #[serde(skip_serializing_if = "TimingBreakdownSummary::is_empty")]
+    timing_breakdown: TimingBreakdownSummary,
+    #[serde(skip_serializing_if = "GlmDsaDispatchSummary::is_empty")]
+    metal_dispatch_summary: GlmDsaDispatchSummary,
+}
+
+impl RepresentativeProfileReport {
+    fn new(
+        candidate: &MicrobenchCaseSummary,
+        optimized_probe: Option<&MicrobenchCaseSummary>,
+        integrity: &ProfileIntegrityReport,
+    ) -> Self {
+        let use_optimized_probe =
+            integrity.diagnostic_timing_may_disable_route_fusion && optimized_probe.is_some();
+        let checked = if use_optimized_probe {
+            optimized_probe.expect("optimized probe is present")
+        } else {
+            candidate
+        };
+        Self {
+            checked_case: checked.label,
+            source: if use_optimized_probe {
+                "optimized_dispatch_probe"
+            } else {
+                "candidate"
+            },
+            diagnostic_timing_discarded: use_optimized_probe,
+            warning: use_optimized_probe.then_some(
+                "op timing observes intermediate tensors and may disable graph fusion; representative profile uses the optimized probe",
+            ),
+            timing_summary: checked.timing_summary.clone(),
+            timing_breakdown: checked.timing_breakdown.clone(),
+            metal_dispatch_summary: checked.metal_dispatch_summary.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct MicrobenchCaseSummary {
     label: &'static str,
@@ -3441,18 +5980,38 @@ struct MicrobenchCaseSummary {
     n_gpu_layers: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_log_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "CompactFlashPolicySummary::is_empty")]
+    compact_flash_policy_summary: CompactFlashPolicySummary,
     #[serde(skip_serializing_if = "DirectSparseDecisionSummary::is_empty")]
     direct_sparse_decision_summary: DirectSparseDecisionSummary,
     #[serde(skip_serializing_if = "TimingDistributionSummary::is_empty")]
     timing_summary: TimingDistributionSummary,
+    #[serde(skip_serializing_if = "TimingBreakdownSummary::is_empty")]
+    timing_breakdown: TimingBreakdownSummary,
     #[serde(skip_serializing_if = "GlmDsaDispatchSummary::is_empty")]
     metal_dispatch_summary: GlmDsaDispatchSummary,
+    #[serde(skip_serializing_if = "DirectSparseSpillSummary::is_empty")]
+    direct_sparse_spill_summary: DirectSparseSpillSummary,
     #[serde(skip_serializing_if = "GlmDsaOpTimingSummary::is_empty")]
     op_timing_summary: GlmDsaOpTimingSummary,
     #[serde(skip_serializing_if = "RoutedMoeTimingSummary::is_empty")]
     routed_moe_timing_summary: RoutedMoeTimingSummary,
+    #[serde(skip_serializing_if = "IndexShareTimingSummary::is_empty")]
+    indexshare_timing_summary: IndexShareTimingSummary,
+    #[serde(skip_serializing_if = "IndexShareTraceSummary::is_empty")]
+    indexshare_trace_summary: IndexShareTraceSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_execution_policy_records: Vec<CompactFlashPolicyRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_non_measured_policy_records: Vec<CompactFlashPolicyRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    direct_sparse_execution_decision_records: Vec<DirectSparseDecisionRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    direct_sparse_non_measured_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -3461,22 +6020,235 @@ struct MicrobenchCaseSummary {
     group_timing_records: Vec<TimingGroupRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hot_tensor_records: Vec<HotTensorRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compute_buffer_records: Vec<ComputeBufferRecord>,
     timings: Vec<IterationTiming>,
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
+struct DirectSparseSpillSummary {
+    records: usize,
+    decode_vec_records: usize,
+    decode_vec_direct_records: usize,
+    decode_vec_reduce_records: usize,
+    rows: u64,
+    partial_bytes: u64,
+    softmax_bytes: u64,
+    tmp_bytes: u64,
+    max_tmp_bytes: u64,
+    partial_mib: Option<f64>,
+    softmax_mib: Option<f64>,
+    tmp_mib: Option<f64>,
+}
+
+impl DirectSparseSpillSummary {
+    fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
+}
+
+fn summarize_direct_sparse_spill(records: &[MetalDispatchRecord]) -> DirectSparseSpillSummary {
+    let mut summary = DirectSparseSpillSummary::default();
+    summary.decode_vec_records = records
+        .iter()
+        .filter(|record| {
+            record.op == "dsa_sparse_attn" && record.kernel.as_deref() == Some("decode_vec")
+        })
+        .count();
+    summary.decode_vec_direct_records = records
+        .iter()
+        .filter(|record| {
+            record.op == "dsa_sparse_attn" && record.kernel.as_deref() == Some("decode_vec_direct")
+        })
+        .count();
+    summary.records += summary.decode_vec_direct_records;
+    for record in records.iter().filter(|record| {
+        record.op == "dsa_sparse_attn" && record.kernel.as_deref() == Some("decode_vec_direct")
+    }) {
+        summary.rows += record.rows.unwrap_or(0);
+    }
+
+    for record in records.iter().filter(|record| {
+        record.op == "dsa_sparse_attn" && record.kernel.as_deref() == Some("decode_vec_reduce")
+    }) {
+        summary.records += 1;
+        summary.decode_vec_reduce_records += 1;
+        summary.rows += record.rows.unwrap_or(0);
+        summary.partial_bytes += record.partial_bytes.unwrap_or(0);
+        summary.softmax_bytes += record.softmax_bytes.unwrap_or(0);
+        let tmp_bytes = record.tmp_bytes.unwrap_or(0);
+        summary.tmp_bytes += tmp_bytes;
+        summary.max_tmp_bytes = summary.max_tmp_bytes.max(tmp_bytes);
+    }
+
+    summary.partial_mib = bytes_to_mib(summary.partial_bytes);
+    summary.softmax_mib = bytes_to_mib(summary.softmax_bytes);
+    summary.tmp_mib = bytes_to_mib(summary.tmp_bytes);
+    summary
+}
+
+fn bytes_to_mib(bytes: u64) -> Option<f64> {
+    if bytes == 0 {
+        None
+    } else {
+        Some(bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[derive(Clone, Default, Serialize)]
 struct DirectSparseDecisionSummary {
     records: usize,
+    execution_records: usize,
+    non_measured_records: usize,
     use_direct: usize,
     fallback: usize,
+    execution_use_direct: usize,
+    execution_fallback: usize,
     decode_shape: usize,
     prefill_shape: usize,
     token_shape_allowed: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    execution_selector_reasons: BTreeMap<String, usize>,
 }
 
 impl DirectSparseDecisionSummary {
     fn is_empty(summary: &Self) -> bool {
         summary.records == 0
+    }
+}
+
+#[derive(Clone, Default, Serialize)]
+struct CompactFlashPolicySummary {
+    records: usize,
+    execution_records: usize,
+    non_measured_records: usize,
+    use_compact: usize,
+    fallback: usize,
+    execution_use_compact: usize,
+    execution_fallback: usize,
+    forced: usize,
+    disabled: usize,
+    ratio_ok: usize,
+    enabled: usize,
+    flash_attn: usize,
+    decode_shape: usize,
+    no_mask: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    phases: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    execution_selector_reasons: BTreeMap<String, usize>,
+}
+
+impl CompactFlashPolicySummary {
+    fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
+}
+
+#[derive(Clone, Default, Serialize)]
+struct IndexShareTimingSummary {
+    records: usize,
+    layer_groups: usize,
+    producer_groups: usize,
+    consumer_groups: usize,
+    indexer_topk_nodes: u64,
+    indexer_topk_us: u64,
+    indexer_nodes: u64,
+    indexer_us: u64,
+    top_k_nodes: u64,
+    top_k_us: u64,
+    producer_total_us: u64,
+    consumer_total_us: u64,
+    indexer_share_of_indexer_topk: Option<f64>,
+    top_k_share_of_indexer_topk: Option<f64>,
+    producer_group_names: Vec<String>,
+    consumer_group_names: Vec<String>,
+}
+
+impl IndexShareTimingSummary {
+    fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
+}
+
+#[derive(Default)]
+struct IndexShareGroupTiming {
+    records: usize,
+    total_us: u64,
+    indexer_topk_nodes: u64,
+    indexer_topk_us: u64,
+    indexer_nodes: u64,
+    indexer_us: u64,
+    top_k_nodes: u64,
+    top_k_us: u64,
+}
+
+fn summarize_indexshare_timing(records: &[TimingGroupRecord]) -> IndexShareTimingSummary {
+    let mut groups: HashMap<String, IndexShareGroupTiming> = HashMap::new();
+    for record in records {
+        if !record.group.starts_with("layer_") {
+            continue;
+        }
+        let group = groups.entry(record.group.clone()).or_default();
+        group.records += 1;
+        group.total_us += record.timing.total_us;
+        group.indexer_topk_nodes += record.timing.indexer_topk_nodes;
+        group.indexer_topk_us += record.timing.indexer_topk_us;
+        group.indexer_nodes += record.timing.indexer_nodes.unwrap_or(0);
+        group.indexer_us += record.timing.indexer_us.unwrap_or(0);
+        group.top_k_nodes += record.timing.top_k_nodes.unwrap_or(0);
+        group.top_k_us += record.timing.top_k_us.unwrap_or(0);
+    }
+
+    let mut summary = IndexShareTimingSummary::default();
+    summary.records = groups.values().map(|group| group.records).sum();
+    summary.layer_groups = groups.len();
+    summary.indexer_topk_nodes = groups.values().map(|group| group.indexer_topk_nodes).sum();
+    summary.indexer_topk_us = groups.values().map(|group| group.indexer_topk_us).sum();
+    summary.indexer_nodes = groups.values().map(|group| group.indexer_nodes).sum();
+    summary.indexer_us = groups.values().map(|group| group.indexer_us).sum();
+    summary.top_k_nodes = groups.values().map(|group| group.top_k_nodes).sum();
+    summary.top_k_us = groups.values().map(|group| group.top_k_us).sum();
+    summary.indexer_share_of_indexer_topk = ratio_u64(summary.indexer_us, summary.indexer_topk_us);
+    summary.top_k_share_of_indexer_topk = ratio_u64(summary.top_k_us, summary.indexer_topk_us);
+
+    let mut group_names: Vec<_> = groups.into_iter().collect();
+    group_names.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, group) in group_names {
+        if group.indexer_topk_nodes > 0 {
+            summary.producer_groups += 1;
+            summary.producer_total_us += group.total_us;
+            summary.producer_group_names.push(name);
+        } else {
+            summary.consumer_groups += 1;
+            summary.consumer_total_us += group.total_us;
+            summary.consumer_group_names.push(name);
+        }
+    }
+    summary
+}
+
+fn ratio_u64(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        None
+    } else {
+        Some(numerator as f64 / denominator as f64)
+    }
+}
+
+struct MicrobenchComparison {
+    baseline: MicrobenchCase,
+    candidate: MicrobenchCase,
+    parity: ParityComparison,
+}
+
+impl MicrobenchComparison {
+    fn as_report(&self) -> MicrobenchComparisonReport {
+        MicrobenchComparisonReport {
+            baseline: self.baseline.as_case_summary(),
+            candidate: self.candidate.as_case_summary(),
+            parity: self.parity.clone(),
+        }
     }
 }
 
@@ -3487,7 +6259,7 @@ struct MicrobenchComparisonReport {
     parity: ParityComparison,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ParityComparison {
     passed: bool,
     iterations: usize,
@@ -3500,7 +6272,7 @@ struct ParityComparison {
     frames: Vec<FrameParity>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct FrameParity {
     iteration: usize,
     passed: bool,
@@ -3526,7 +6298,7 @@ struct FrameParity {
     sideband_i32_diff: Option<SidebandI32Diff>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct HiddenMismatch {
     index: usize,
     baseline: f32,
@@ -3546,6 +6318,7 @@ struct PackagePartSummary {
 #[derive(Clone, Serialize)]
 struct IterationTiming {
     iteration: usize,
+    position_start: i32,
     elapsed_ms: f64,
     output_payload_bytes: usize,
     output_flags: u64,
@@ -3594,11 +6367,207 @@ mod tests {
         let guard = build_direct_sparse_prefill_guard(&candidate);
 
         assert!(guard.passed);
+        assert_eq!(guard.prefill_direct_decisions, 1);
         assert_eq!(guard.large_prefill_direct_decisions, 1);
         assert_eq!(guard.sparse_mask_nodes, 0);
+        assert_eq!(guard.dense_sparse_mask_dispatches, 0);
         assert_eq!(guard.dsa_sparse_attn_nodes, 1);
-        assert_eq!(guard.capped_large_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 1);
         assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_accepts_small_prefill_direct_path() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(false, true)],
+            0,
+            1,
+            &[dsa_sparse_attn_dispatch(32, 256, 32)],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.prefill_decisions, 1);
+        assert_eq!(guard.prefill_direct_decisions, 1);
+        assert_eq!(guard.large_prefill_direct_decisions, 0);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 0);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_accepts_dispatch_evidence_without_op_timing() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[dsa_sparse_attn_dispatch(64, 256, 32)],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.dsa_sparse_attn_nodes, 0);
+        assert_eq!(guard.dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_accepts_cached_topk_prefill_dispatch() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[cached_topk_dsa_sparse_attn_dispatch(2304, 2048, 256)],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_accepts_cached_topk_v4_prefill_dispatch() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[cached_topk_v4_dsa_sparse_attn_dispatch(2304, 2048, 256)],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_rejects_cached_topk_non_prefill_dispatch() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[
+                cached_topk_dsa_sparse_attn_dispatch(64, 2048, 32),
+                cached_topk_dsa_sparse_attn_dispatch(1, 2048, 32),
+            ],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(!guard.passed);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.cached_topk_non_prefill_dispatches, 1);
+        assert!(
+            guard
+                .failure_summary
+                .contains("cached_topk_non_prefill_dispatch_present")
+        );
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_accepts_decode_vec_prefill_dispatch() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[decode_vec_dsa_sparse_attn_dispatch(1024, 1024, 256)],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_prefill_guard_accepts_decode_vec_direct_prefill_dispatch() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[decode_vec_direct_dsa_sparse_attn_dispatch(4096, 2048, 256)],
+        );
+
+        let guard = build_direct_sparse_prefill_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 1);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_spill_summary_captures_decode_vec_reduce_tmp_bytes() {
+        let mut reduce = decode_vec_dsa_sparse_attn_dispatch(4096, 2048, 32);
+        reduce.kernel = Some("decode_vec_reduce".to_string());
+        reduce.rows = Some(262_144);
+        reduce.partial_bytes = Some(536_870_912);
+        reduce.softmax_bytes = Some(4_194_304);
+        reduce.tmp_bytes = Some(541_065_216);
+
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[decode_vec_dsa_sparse_attn_dispatch(4096, 2048, 256), reduce],
+        );
+
+        let summary = candidate.direct_sparse_spill_summary;
+
+        assert_eq!(summary.decode_vec_records, 1);
+        assert_eq!(summary.decode_vec_reduce_records, 1);
+        assert_eq!(summary.rows, 262_144);
+        assert_eq!(summary.partial_bytes, 536_870_912);
+        assert_eq!(summary.softmax_bytes, 4_194_304);
+        assert_eq!(summary.tmp_bytes, 541_065_216);
+        assert_eq!(summary.partial_mib, Some(512.0));
+        assert_eq!(summary.softmax_mib, Some(4.0));
+        assert_eq!(summary.tmp_mib, Some(516.0));
+    }
+
+    #[test]
+    fn direct_sparse_spill_summary_captures_decode_vec_direct_zero_spill() {
+        let mut direct = decode_vec_dsa_sparse_attn_dispatch(4096, 2048, 256);
+        direct.kernel = Some("decode_vec_direct".to_string());
+        direct.rows = Some(262_144);
+        direct.partial_bytes = Some(0);
+        direct.softmax_bytes = Some(0);
+        direct.tmp_bytes = Some(0);
+
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decision(true, true)],
+            0,
+            0,
+            &[direct],
+        );
+
+        let summary = candidate.direct_sparse_spill_summary;
+
+        assert_eq!(summary.records, 1);
+        assert_eq!(summary.decode_vec_records, 0);
+        assert_eq!(summary.decode_vec_direct_records, 1);
+        assert_eq!(summary.decode_vec_reduce_records, 0);
+        assert_eq!(summary.rows, 262_144);
+        assert_eq!(summary.partial_bytes, 0);
+        assert_eq!(summary.softmax_bytes, 0);
+        assert_eq!(summary.tmp_bytes, 0);
+        assert_eq!(summary.tmp_mib, None);
     }
 
     #[test]
@@ -3607,19 +6576,87 @@ mod tests {
             &[direct_sparse_decision(true, true)],
             1,
             1,
-            &[dsa_sparse_attn_dispatch(64, 256, 64)],
+            &[
+                dsa_sparse_attn_dispatch(64, 256, 64),
+                dsa_sparse_mask_dispatch(),
+            ],
         );
 
         let guard = build_direct_sparse_prefill_guard(&candidate);
 
         assert!(!guard.passed);
         assert_eq!(guard.sparse_mask_nodes, 1);
-        assert_eq!(guard.capped_large_prefill_dispatches, 0);
+        assert_eq!(guard.dense_sparse_mask_dispatches, 1);
+        assert_eq!(guard.accepted_prefill_dispatches, 0);
+        assert_eq!(guard.accepted_large_prefill_dispatches, 0);
         assert!(guard.failure_summary.contains("sparse_mask_nodes_present"));
         assert!(
             guard
                 .failure_summary
-                .contains("missing_capped_large_prefill_dispatch")
+                .contains("dense_sparse_mask_dispatch_present")
+        );
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_accepted_prefill_dispatch")
+        );
+    }
+
+    #[test]
+    fn direct_sparse_decode_guard_accepts_direct_decode_path() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decode_decision(true)],
+            0,
+            3,
+            &[dsa_sparse_attn_dispatch(1, 256, 256)],
+        );
+
+        let guard = build_direct_sparse_decode_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.decode_decisions, 1);
+        assert_eq!(guard.decode_direct_decisions, 1);
+        assert_eq!(guard.sparse_mask_nodes, 0);
+        assert_eq!(guard.dense_sparse_mask_dispatches, 0);
+        assert_eq!(guard.dsa_sparse_attn_nodes, 3);
+        assert_eq!(guard.accepted_decode_dispatches, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn direct_sparse_decode_guard_rejects_dense_mask_fallback() {
+        let candidate = direct_sparse_prefill_case_summary(
+            &[direct_sparse_decode_decision(false)],
+            1,
+            0,
+            &[dsa_sparse_mask_dispatch()],
+        );
+
+        let guard = build_direct_sparse_decode_guard(&candidate);
+
+        assert!(!guard.passed);
+        assert_eq!(guard.decode_decisions, 1);
+        assert_eq!(guard.decode_direct_decisions, 0);
+        assert_eq!(guard.sparse_mask_nodes, 1);
+        assert_eq!(guard.dense_sparse_mask_dispatches, 1);
+        assert_eq!(guard.accepted_decode_dispatches, 0);
+        assert!(guard.failure_summary.contains("no_decode_direct_decision"));
+        assert!(guard.failure_summary.contains("fallback_decision_present"));
+        assert!(guard.failure_summary.contains("sparse_mask_nodes_present"));
+        assert!(
+            guard
+                .failure_summary
+                .contains("dense_sparse_mask_dispatch_present")
+        );
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_dsa_sparse_attn_evidence")
+        );
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_accepted_decode_dispatch")
         );
     }
 
@@ -3631,18 +6668,109 @@ mod tests {
             .push(dsa_sparse_attn_dispatch_with_kv(2304, 2304, 2048, 32));
         candidate.timings.push(IterationTiming {
             iteration: 0,
+            position_start: 0,
             elapsed_ms: 1.0,
             output_payload_bytes: 16 + 2 * 2048 * std::mem::size_of::<i32>(),
             output_flags: ACTIVATION_FLAG_GLM_DSA_TOP_K,
         });
 
-        let guard = build_partial_top_k_guard(&candidate, 16, 2);
+        let guard = build_partial_top_k_guard(&candidate, None, 16, 2);
 
         assert!(guard.passed);
         assert_eq!(guard.partial_dsa_sparse_attn_dispatches, 1);
         assert_eq!(guard.max_kv, Some(2304));
         assert_eq!(guard.expected_sideband_i32_per_token, Some(2048));
         assert_eq!(guard.output_frames_with_expected_sideband, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn timing_breakdown_marks_single_token_runs_as_decode() {
+        let timings = vec![iteration_timing(0, 1.0), iteration_timing(1, 2.0)];
+
+        let breakdown = summarize_timing_breakdown(&timings, 1);
+
+        assert_eq!(breakdown.measured_phase, Some("decode"));
+        assert_eq!(breakdown.decode.samples, 2);
+        assert_eq!(breakdown.decode.mean_ms, Some(1.5));
+        assert_eq!(breakdown.prefill.samples, 0);
+    }
+
+    #[test]
+    fn timing_breakdown_marks_multi_token_runs_as_prefill() {
+        let timings = vec![iteration_timing(0, 4.0), iteration_timing(1, 8.0)];
+
+        let breakdown = summarize_timing_breakdown(&timings, 2304);
+
+        assert_eq!(breakdown.measured_phase, Some("prefill"));
+        assert_eq!(breakdown.decode.samples, 0);
+        assert_eq!(breakdown.prefill.samples, 2);
+        assert_eq!(breakdown.prefill.mean_ms, Some(6.0));
+    }
+
+    #[test]
+    fn partial_top_k_guard_accepts_optimized_dispatch_probe() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.timings.push(IterationTiming {
+            iteration: 0,
+            position_start: 0,
+            elapsed_ms: 1.0,
+            output_payload_bytes: 16 + 2 * 2048 * std::mem::size_of::<i32>(),
+            output_flags: ACTIVATION_FLAG_GLM_DSA_TOP_K,
+        });
+        let mut optimized_probe = case_summary("optimized_dispatch_probe", 0, 0, 0);
+        optimized_probe
+            .metal_dispatch_records
+            .push(dsa_sparse_attn_dispatch_with_kv(2304, 2304, 2048, 32));
+
+        let guard = build_partial_top_k_guard(&candidate, Some(&optimized_probe), 16, 2);
+
+        assert!(guard.passed);
+        assert_eq!(guard.checked_case, "optimized_dispatch_probe");
+        assert_eq!(guard.dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.partial_dsa_sparse_attn_dispatches, 1);
+        assert_eq!(guard.max_kv, Some(2304));
+        assert_eq!(guard.expected_sideband_i32_per_token, Some(2048));
+        assert_eq!(guard.output_frames_with_expected_sideband, 1);
+    }
+
+    #[test]
+    fn partial_top_k_guard_accepts_native_shared_consume_width() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.indexshare_trace_summary = IndexShareTraceSummary {
+            records: 4,
+            exec_records: 2,
+            full_exec_records: 0,
+            shared_exec_records: 2,
+            shared_exec_with_input_top_k: 2,
+            shared_exec_missing_input_top_k: 0,
+            top_k_records: 0,
+            top_k_from_indexer: 0,
+            top_k_from_full_visible: 0,
+            consume_records: 2,
+            min_consume_width: Some(2048),
+            max_consume_width: Some(2048),
+            full_layers: vec![],
+            shared_layers: vec![31],
+        };
+        candidate.timings.push(IterationTiming {
+            iteration: 0,
+            position_start: 0,
+            elapsed_ms: 1.0,
+            output_payload_bytes: 16,
+            output_flags: 0,
+        });
+        let mut optimized_probe = case_summary("optimized_dispatch_probe", 0, 0, 0);
+        optimized_probe
+            .metal_dispatch_records
+            .push(dsa_sparse_attn_dispatch_with_kv(1, 4352, 2048, 32));
+
+        let guard = build_partial_top_k_guard(&candidate, Some(&optimized_probe), 16, 1);
+
+        assert!(guard.passed);
+        assert_eq!(guard.output_frames_with_expected_sideband, 0);
+        assert_eq!(guard.native_shared_consume_records, 2);
+        assert_eq!(guard.native_shared_consume_width_matches, 2);
         assert_eq!(guard.failure_summary, "none");
     }
 
@@ -3654,12 +6782,13 @@ mod tests {
             .push(dsa_sparse_attn_dispatch_with_kv(2048, 2048, 2048, 32));
         candidate.timings.push(IterationTiming {
             iteration: 0,
+            position_start: 0,
             elapsed_ms: 1.0,
             output_payload_bytes: 16,
             output_flags: 0,
         });
 
-        let guard = build_partial_top_k_guard(&candidate, 16, 2);
+        let guard = build_partial_top_k_guard(&candidate, None, 16, 2);
 
         assert!(!guard.passed);
         assert_eq!(guard.partial_dsa_sparse_attn_dispatches, 0);
@@ -3672,7 +6801,334 @@ mod tests {
         assert!(
             guard
                 .failure_summary
-                .contains("missing_expected_output_sideband_width")
+                .contains("missing_expected_top_k_width_proof")
+        );
+    }
+
+    #[test]
+    fn compact_flash_guard_accepts_typed_glm_flash_path() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.metal_dispatch_summary.flash_attn_ext_records = 3;
+        candidate.metal_dispatch_summary.flash_attn_ext_vec_records = 3;
+        candidate
+            .metal_dispatch_summary
+            .flash_attn_ext_glm_dsa_shape_records = 3;
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch(
+                "dsa_compact_k_topk_rows-30",
+                "typed",
+            ));
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch(
+                "dsa_compact_v_topk_rows-30",
+                "typed",
+            ));
+
+        let guard = build_compact_flash_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.flash_attn_ext_glm_dsa_shape_records, 3);
+        assert_eq!(guard.compact_get_rows_typed_records, 2);
+        assert_eq!(guard.compact_get_rows_promote_records, 0);
+        assert_eq!(guard.dsa_sparse_attn_records, 0);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn compact_flash_guard_accepts_native_policy_without_cli_flag() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.flags.compact_flash_attn = false;
+        candidate.metal_dispatch_summary.flash_attn_ext_records = 1;
+        candidate.metal_dispatch_summary.flash_attn_ext_vec_records = 1;
+        candidate
+            .metal_dispatch_summary
+            .flash_attn_ext_glm_dsa_shape_records = 1;
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch(
+                "dsa_compact_k_topk_rows-30",
+                "typed",
+            ));
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch(
+                "dsa_compact_v_topk_rows-30",
+                "typed",
+            ));
+        candidate
+            .compact_flash_execution_policy_records
+            .push(compact_flash_policy_record(
+                "decode",
+                "decode_compact",
+                true,
+            ));
+
+        let guard = build_compact_flash_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.failure_summary, "none");
+        assert_eq!(guard.policy_phase.as_deref(), Some("decode"));
+        assert_eq!(
+            guard.policy_selector_reason.as_deref(),
+            Some("decode_compact")
+        );
+    }
+
+    #[test]
+    fn compact_flash_guard_accepts_fused_compact_get_rows_path() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.flags.compact_flash_attn = true;
+        candidate.metal_dispatch_summary.flash_attn_ext_records = 1;
+        candidate.metal_dispatch_summary.flash_attn_ext_vec_records = 1;
+        candidate
+            .metal_dispatch_summary
+            .flash_attn_ext_glm_dsa_shape_records = 1;
+        candidate
+            .metal_dispatch_summary
+            .dsa_compact_get_rows_fused_records = 1;
+
+        let guard = build_compact_flash_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.compact_get_rows_typed_records, 0);
+        assert_eq!(guard.dsa_compact_get_rows_fused_records, 1);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn compact_flash_guard_rejects_fallback_or_promoted_path() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.flags.compact_flash_attn = true;
+        candidate.metal_dispatch_summary.flash_attn_ext_records = 1;
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch(
+                "dsa_compact_k_topk_rows-30",
+                "promote",
+            ));
+        candidate.metal_dispatch_summary.dsa_sparse_attn_records = 1;
+        candidate.op_timing_summary.sparse_mask.nodes = 1;
+
+        let guard = build_compact_flash_guard(&candidate);
+
+        assert!(!guard.passed);
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_glm_shape_flash_attn_ext")
+        );
+        assert!(guard.failure_summary.contains("missing_vec_flash_attn_ext"));
+        assert!(guard.failure_summary.contains("missing_compact_get_rows"));
+        assert!(guard.failure_summary.contains("promoted_get_rows_present"));
+        assert!(
+            guard
+                .failure_summary
+                .contains("dsa_sparse_attn_dispatch_present")
+        );
+        assert!(guard.failure_summary.contains("sparse_mask_nodes_present"));
+    }
+
+    #[test]
+    fn compact_flash_guard_rejects_unrelated_get_rows_records() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.metal_dispatch_summary.flash_attn_ext_records = 1;
+        candidate.metal_dispatch_summary.flash_attn_ext_vec_records = 1;
+        candidate
+            .metal_dispatch_summary
+            .flash_attn_ext_glm_dsa_shape_records = 1;
+        candidate
+            .metal_dispatch_records
+            .push(compact_get_rows_dispatch("ffn_moe_weights-30", "typed"));
+
+        let guard = build_compact_flash_guard(&candidate);
+
+        assert!(!guard.passed);
+        assert_eq!(guard.compact_get_rows_records, 0);
+        assert!(guard.failure_summary.contains("missing_compact_get_rows"));
+    }
+
+    #[test]
+    fn moe_weighted_sum_guard_accepts_f32x4_dispatches() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.metal_dispatch_summary.moe_weighted_sum_records = 4;
+        candidate
+            .metal_dispatch_summary
+            .moe_weighted_sum_f32x4_records = 4;
+
+        let guard = build_moe_weighted_sum_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.moe_weighted_sum_records, 4);
+        assert_eq!(guard.moe_weighted_sum_f32x4_records, 4);
+        assert_eq!(guard.mul_mv_id_weighted_sum_fused_records, 0);
+        assert_eq!(guard.mul_mv_id_weighted_sum_fused_q3_k_records, 0);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn moe_weighted_sum_guard_accepts_q3_k_fused_dispatches() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate
+            .metal_dispatch_summary
+            .mul_mv_id_weighted_sum_fused_records = 4;
+        candidate
+            .metal_dispatch_summary
+            .mul_mv_id_weighted_sum_fused_q3_k_records = 4;
+
+        let guard = build_moe_weighted_sum_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.moe_weighted_sum_records, 0);
+        assert_eq!(guard.moe_weighted_sum_f32x4_records, 0);
+        assert_eq!(guard.mul_mv_id_weighted_sum_fused_records, 4);
+        assert_eq!(guard.mul_mv_id_weighted_sum_fused_q3_k_records, 4);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn moe_weighted_sum_guard_accepts_q3_k_weighted_slots_dispatches() {
+        let mut candidate = case_summary("candidate", 0, 0, 0);
+        candidate.metal_dispatch_summary.moe_weighted_sum_records = 4;
+        candidate
+            .metal_dispatch_summary
+            .moe_weighted_sum_already_weighted_records = 4;
+        candidate
+            .metal_dispatch_summary
+            .mul_mv_id_weighted_slots_records = 4;
+        candidate
+            .metal_dispatch_summary
+            .mul_mv_id_weighted_slots_q3_k_records = 4;
+
+        let guard = build_moe_weighted_sum_guard(&candidate);
+
+        assert!(guard.passed);
+        assert_eq!(guard.moe_weighted_sum_records, 4);
+        assert_eq!(guard.moe_weighted_sum_already_weighted_records, 4);
+        assert_eq!(guard.mul_mv_id_weighted_slots_records, 4);
+        assert_eq!(guard.mul_mv_id_weighted_slots_q3_k_records, 4);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn moe_weighted_sum_guard_rejects_missing_or_non_f32x4_dispatches() {
+        let missing = case_summary("candidate", 0, 0, 0);
+
+        let guard = build_moe_weighted_sum_guard(&missing);
+
+        assert!(!guard.passed);
+        assert!(guard.failure_summary.contains("missing_moe_weighted_sum"));
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_moe_weighted_sum_f32x4")
+        );
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_mul_mv_id_weighted_sum_fused")
+        );
+
+        let mut scalar = case_summary("candidate", 0, 0, 0);
+        scalar.metal_dispatch_summary.moe_weighted_sum_records = 4;
+        scalar.metal_dispatch_summary.moe_weighted_sum_f32x4_records = 3;
+
+        let guard = build_moe_weighted_sum_guard(&scalar);
+
+        assert!(!guard.passed);
+        assert!(
+            guard
+                .failure_summary
+                .contains("non_f32x4_moe_weighted_sum_present")
+        );
+
+        let mut partial_fused = case_summary("candidate", 0, 0, 0);
+        partial_fused
+            .metal_dispatch_summary
+            .mul_mv_id_weighted_sum_fused_records = 4;
+        partial_fused
+            .metal_dispatch_summary
+            .mul_mv_id_weighted_sum_fused_q3_k_records = 3;
+
+        let guard = build_moe_weighted_sum_guard(&partial_fused);
+
+        assert!(!guard.passed);
+        assert!(
+            guard
+                .failure_summary
+                .contains("non_q3_k_mul_mv_id_weighted_sum_fused_present")
+        );
+    }
+
+    #[test]
+    fn moe_motif_guard_accepts_optimized_backend_candidates() {
+        let candidate = case_summary("candidate", 0, 0, 0);
+        let mut optimized_probe = case_summary("optimized_dispatch_probe", 0, 0, 0);
+        optimized_probe
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_candidate_records = 4;
+        optimized_probe
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_natural_order_records = 4;
+        optimized_probe
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_backend_candidate_records = 4;
+        optimized_probe
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_subgraph_fusable_records = 4;
+        optimized_probe
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_max_nodes = 4;
+
+        let guard = build_moe_motif_guard(&candidate, Some(&optimized_probe));
+
+        assert!(guard.passed);
+        assert_eq!(guard.checked_case, "optimized_dispatch_probe");
+        assert_eq!(guard.motif_candidate_records, 4);
+        assert_eq!(guard.natural_order_records, 4);
+        assert_eq!(guard.backend_candidate_records, 4);
+        assert_eq!(guard.subgraph_fusable_records, 4);
+        assert_eq!(guard.max_motif_nodes, 4);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn moe_motif_guard_rejects_missing_or_partial_candidates() {
+        let missing = case_summary("candidate", 0, 0, 0);
+
+        let guard = build_moe_motif_guard(&missing, None);
+
+        assert!(!guard.passed);
+        assert!(
+            guard
+                .failure_summary
+                .contains("missing_moe_motif_candidate")
+        );
+        assert!(guard.failure_summary.contains("motif_too_small"));
+
+        let mut partial = case_summary("candidate", 0, 0, 0);
+        partial
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_candidate_records = 2;
+        partial
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_natural_order_records = 2;
+        partial
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_backend_candidate_records = 1;
+        partial
+            .metal_dispatch_summary
+            .glm_dsa_moe_motif_subgraph_fusable_records = 2;
+        partial.metal_dispatch_summary.glm_dsa_moe_motif_max_nodes = 4;
+
+        let guard = build_moe_motif_guard(&partial, None);
+
+        assert!(!guard.passed);
+        assert!(
+            guard
+                .failure_summary
+                .contains("non_backend_candidate_motif_present")
         );
     }
 
@@ -3733,16 +7189,183 @@ mod tests {
     fn optimized_dispatch_probe_runs_for_diagnostic_reports() {
         let flags = MicrobenchFlags {
             direct_sparse_attn: true,
+            compact_flash_attn: false,
+            allow_compact_flash_auto: false,
             direct_sparse_prefill: false,
+            enable_unproven_large_direct_sparse_prefill: false,
+            direct_sparse_prefill_max_tokens: None,
             fused_sparse_mask: true,
             parallel_lightning_indexer: true,
             op_timing: true,
+            native_indexshare_exec_log: false,
             metal_dispatch_log: true,
             metal_topk_moe_route_fusion: false,
+            metal_topk_moe_route_fusion_native_default: false,
+            moe_motif_coencode: false,
+            moe_down_weighted_fusion: false,
+            moe_down_weighted_parallel: false,
+            moe_down_unweighted_slots: false,
             sparse_attn_threads: None,
+            sparse_attn_group_heads: None,
+            lightning_indexer_threads: None,
+            dense_sparse_mask_max_bytes: None,
+            direct_sparse_prefill_min_kv_topk_ratio: None,
         };
 
-        assert!(should_run_optimized_dispatch_probe(flags));
+        assert!(should_run_optimized_dispatch_probe(flags, false));
+    }
+
+    #[test]
+    fn optimized_dispatch_probe_runs_for_clean_route_fusion_reports() {
+        let flags = MicrobenchFlags {
+            direct_sparse_attn: true,
+            compact_flash_attn: false,
+            allow_compact_flash_auto: false,
+            direct_sparse_prefill: false,
+            enable_unproven_large_direct_sparse_prefill: false,
+            direct_sparse_prefill_max_tokens: None,
+            fused_sparse_mask: true,
+            parallel_lightning_indexer: true,
+            op_timing: false,
+            native_indexshare_exec_log: false,
+            metal_dispatch_log: false,
+            metal_topk_moe_route_fusion: true,
+            metal_topk_moe_route_fusion_native_default: false,
+            moe_motif_coencode: false,
+            moe_down_weighted_fusion: false,
+            moe_down_weighted_parallel: false,
+            moe_down_unweighted_slots: false,
+            sparse_attn_threads: None,
+            sparse_attn_group_heads: None,
+            lightning_indexer_threads: None,
+            dense_sparse_mask_max_bytes: None,
+            direct_sparse_prefill_min_kv_topk_ratio: None,
+        };
+
+        assert!(should_run_optimized_dispatch_probe(flags, false));
+    }
+
+    #[test]
+    fn optimized_dispatch_probe_skips_clean_non_fusion_reports() {
+        let flags = MicrobenchFlags {
+            direct_sparse_attn: true,
+            compact_flash_attn: false,
+            allow_compact_flash_auto: false,
+            direct_sparse_prefill: false,
+            enable_unproven_large_direct_sparse_prefill: false,
+            direct_sparse_prefill_max_tokens: None,
+            fused_sparse_mask: true,
+            parallel_lightning_indexer: true,
+            op_timing: false,
+            native_indexshare_exec_log: false,
+            metal_dispatch_log: false,
+            metal_topk_moe_route_fusion: false,
+            metal_topk_moe_route_fusion_native_default: false,
+            moe_motif_coencode: false,
+            moe_down_weighted_fusion: false,
+            moe_down_weighted_parallel: false,
+            moe_down_unweighted_slots: false,
+            sparse_attn_threads: None,
+            sparse_attn_group_heads: None,
+            lightning_indexer_threads: None,
+            dense_sparse_mask_max_bytes: None,
+            direct_sparse_prefill_min_kv_topk_ratio: None,
+        };
+
+        assert!(!should_run_optimized_dispatch_probe(flags, false));
+        assert!(should_run_optimized_dispatch_probe(flags, true));
+    }
+
+    #[test]
+    fn optimized_dispatch_probe_runs_for_clean_moe_down_weighted_reports() {
+        let mut flags = test_microbench_flags();
+        flags.op_timing = false;
+        flags.metal_dispatch_log = false;
+        flags.metal_topk_moe_route_fusion = false;
+        flags.moe_down_weighted_fusion = true;
+
+        assert!(should_run_optimized_dispatch_probe(flags, false));
+    }
+
+    #[test]
+    fn route_fusion_env_plan_uses_legacy_override_by_default() {
+        let mut flags = test_microbench_flags();
+        flags.metal_topk_moe_route_fusion = true;
+        flags.metal_topk_moe_route_fusion_native_default = false;
+        assert_eq!(
+            metal_topk_moe_route_fusion_env_plan(flags),
+            RouteFusionEnvPlan::LegacyOverride(true)
+        );
+
+        flags.metal_topk_moe_route_fusion = false;
+        assert_eq!(
+            metal_topk_moe_route_fusion_env_plan(flags),
+            RouteFusionEnvPlan::LegacyOverride(false)
+        );
+    }
+
+    #[test]
+    fn route_fusion_env_plan_can_prove_native_default() {
+        let mut flags = test_microbench_flags();
+        flags.metal_topk_moe_route_fusion = true;
+        flags.metal_topk_moe_route_fusion_native_default = true;
+        assert_eq!(
+            metal_topk_moe_route_fusion_env_plan(flags),
+            RouteFusionEnvPlan::NativeDefault
+        );
+    }
+
+    #[test]
+    fn representative_profile_uses_optimized_probe_when_op_timing_perturbs_fusion() {
+        let mut candidate = case_summary("candidate", 4, 4, 0);
+        candidate.timing_summary = single_sample_timing(153.0);
+        let mut optimized_probe = case_summary("optimized_dispatch_probe", 4, 0, 4);
+        optimized_probe.timing_summary = single_sample_timing(1.5);
+        let mut flags = candidate.flags;
+        flags.op_timing = true;
+        flags.metal_dispatch_log = true;
+
+        let integrity = ProfileIntegrityReport::new(
+            flags,
+            &candidate.metal_dispatch_summary,
+            &candidate.timing_summary,
+            Some(&optimized_probe),
+        );
+        let profile =
+            RepresentativeProfileReport::new(&candidate, Some(&optimized_probe), &integrity);
+
+        assert_eq!(profile.checked_case, "optimized_dispatch_probe");
+        assert_eq!(profile.source, "optimized_dispatch_probe");
+        assert!(profile.diagnostic_timing_discarded);
+        assert_eq!(profile.timing_summary.mean_ms, Some(1.5));
+        assert_eq!(
+            profile.metal_dispatch_summary.topk_moe_route_fused_records,
+            4
+        );
+    }
+
+    #[test]
+    fn representative_profile_uses_candidate_when_diagnostic_is_representative() {
+        let mut candidate = case_summary("candidate", 4, 0, 4);
+        candidate.timing_summary = single_sample_timing(1.5);
+        let flags = candidate.flags;
+
+        let integrity = ProfileIntegrityReport::new(
+            flags,
+            &candidate.metal_dispatch_summary,
+            &candidate.timing_summary,
+            None,
+        );
+        let profile = RepresentativeProfileReport::new(&candidate, None, &integrity);
+
+        assert_eq!(profile.checked_case, "candidate");
+        assert_eq!(profile.source, "candidate");
+        assert!(!profile.diagnostic_timing_discarded);
+        assert_eq!(profile.timing_summary.mean_ms, Some(1.5));
+        assert_eq!(
+            profile.metal_dispatch_summary.topk_moe_route_fused_records,
+            4
+        );
     }
 
     #[test]
@@ -3859,6 +7482,45 @@ mod tests {
         let error = positions(i32::MAX, 2).unwrap_err().to_string();
 
         assert!(error.contains("position exceeds i32"));
+    }
+
+    #[test]
+    fn validate_args_accepts_last_context_position() {
+        let mut args = test_args();
+        args.ctx_size = 4096;
+        args.position_start = 4095;
+        args.tokens = 1;
+
+        validate_args(&args).unwrap();
+        assert_eq!(max_requested_position_end(&args).unwrap(), 4095);
+    }
+
+    #[test]
+    fn validate_args_rejects_one_past_context_position() {
+        let mut args = test_args();
+        args.ctx_size = 4096;
+        args.position_start = 4096;
+        args.tokens = 1;
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(error.contains("requested position_end 4096 must be less than ctx_size 4096"));
+        assert!(error.contains("valid positions are 0..4095"));
+    }
+
+    #[test]
+    fn validate_args_checks_streamed_final_position() {
+        let mut args = test_args();
+        args.ctx_size = 10;
+        args.position_start = 6;
+        args.tokens = 2;
+        args.warmup = 1;
+        args.iterations = 2;
+        args.reuse_kv_warmup_stream = true;
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(error.contains("requested position_end 11 must be less than ctx_size 10"));
     }
 
     #[test]
@@ -3983,6 +7645,64 @@ mod tests {
                 .failure_summary
                 .contains("stage_wire_roundtrip_missing_or_failed")
         );
+    }
+
+    #[test]
+    fn native_indexshare_guard_accepts_full_producer_shared_consumer_trace() {
+        let case = microbench_case_with_indexshare_trace(IndexShareTraceSummary {
+            records: 4,
+            exec_records: 2,
+            full_exec_records: 1,
+            shared_exec_records: 1,
+            shared_exec_with_input_top_k: 1,
+            shared_exec_missing_input_top_k: 0,
+            top_k_records: 1,
+            top_k_from_indexer: 1,
+            top_k_from_full_visible: 0,
+            consume_records: 1,
+            min_consume_width: Some(2048),
+            max_consume_width: Some(2048),
+            full_layers: vec![30],
+            shared_layers: vec![31],
+        });
+
+        let guard = build_native_indexshare_guard(&case);
+
+        assert!(guard.passed);
+        assert_eq!(guard.checked_case, "candidate");
+        assert_eq!(guard.full_layers, vec![30]);
+        assert_eq!(guard.shared_layers, vec![31]);
+        assert_eq!(guard.failure_summary, "none");
+    }
+
+    #[test]
+    fn native_indexshare_guard_rejects_shared_exec_without_top_k() {
+        let case = microbench_case_with_indexshare_trace(IndexShareTraceSummary {
+            records: 2,
+            exec_records: 2,
+            full_exec_records: 1,
+            shared_exec_records: 1,
+            shared_exec_with_input_top_k: 0,
+            shared_exec_missing_input_top_k: 1,
+            top_k_records: 1,
+            top_k_from_indexer: 1,
+            top_k_from_full_visible: 0,
+            consume_records: 0,
+            min_consume_width: None,
+            max_consume_width: None,
+            full_layers: vec![30],
+            shared_layers: vec![31],
+        });
+
+        let guard = build_native_indexshare_guard(&case);
+
+        assert!(!guard.passed);
+        assert!(
+            guard
+                .failure_summary
+                .contains("shared_exec_missing_input_top_k")
+        );
+        assert!(guard.failure_summary.contains("missing_shared_consume"));
     }
 
     #[test]
@@ -4165,6 +7885,77 @@ mod tests {
         }
     }
 
+    fn timing_record(tokens: u64, total_us: u64) -> TimingRecord {
+        TimingRecord {
+            stage: 0,
+            tokens,
+            total_us,
+            indexer_topk_nodes: 0,
+            indexer_topk_us: 0,
+            indexer_nodes: Some(0),
+            indexer_us: Some(0),
+            top_k_nodes: Some(0),
+            top_k_us: Some(0),
+            sparse_mask_nodes: 0,
+            sparse_mask_us: 0,
+            sparse_mask_fill_nodes: Some(0),
+            sparse_mask_fill_us: Some(0),
+            sparse_mask_topk_nodes: Some(0),
+            sparse_mask_topk_us: Some(0),
+            sparse_mask_add_nodes: Some(0),
+            sparse_mask_add_us: Some(0),
+            dsa_sparse_attn_nodes: Some(0),
+            dsa_sparse_attn_us: Some(0),
+            mla_attention_nodes: 0,
+            mla_attention_us: 0,
+            routed_moe_nodes: 0,
+            routed_moe_us: 0,
+            routed_moe_route_nodes: Some(0),
+            routed_moe_route_us: Some(0),
+            routed_moe_gate_up_nodes: Some(0),
+            routed_moe_gate_up_us: Some(0),
+            routed_moe_gate_nodes: Some(0),
+            routed_moe_gate_us: Some(0),
+            routed_moe_up_nodes: Some(0),
+            routed_moe_up_us: Some(0),
+            routed_moe_act_nodes: Some(0),
+            routed_moe_act_us: Some(0),
+            routed_moe_down_nodes: Some(0),
+            routed_moe_down_us: Some(0),
+            routed_moe_weighted_nodes: Some(0),
+            routed_moe_weighted_us: Some(0),
+            routed_moe_aggregate_nodes: Some(0),
+            routed_moe_aggregate_us: Some(0),
+            shared_expert_nodes: 0,
+            shared_expert_us: 0,
+        }
+    }
+
+    fn timing_group_record(record_index: usize, tokens: u64, total_us: u64) -> TimingGroupRecord {
+        TimingGroupRecord {
+            record_index,
+            group: "layer_30".to_string(),
+            timing: timing_record(tokens, total_us),
+        }
+    }
+
+    fn hot_tensor_record(record_index: usize, tokens: u64, name: &str) -> HotTensorRecord {
+        HotTensorRecord {
+            record_index,
+            stage: 0,
+            tokens,
+            rank: 1,
+            op: "MUL_MAT".to_string(),
+            kind: "test".to_string(),
+            elapsed_us: 1,
+            name: name.to_string(),
+            ne0: 1,
+            ne1: 1,
+            ne2: 1,
+            ne3: 1,
+        }
+    }
+
     fn minimal_gguf_with_tensor_names(names: &[&str]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(GGUF_MAGIC);
@@ -4196,6 +7987,11 @@ mod tests {
             activation_width: 4,
             tokens: 1,
             position_start: 0,
+            kv_warmup_tokens: 0,
+            kv_warmup_chunk_tokens: None,
+            synthetic_kv_warmup: false,
+            reuse_kv_warmup_checkpoint: false,
+            reuse_kv_warmup_stream: false,
             iterations: 1,
             warmup: 0,
             n_gpu_layers: -1,
@@ -4204,27 +8000,357 @@ mod tests {
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             direct_sparse_attn: true,
+            compact_flash_attn: false,
+            allow_compact_flash_auto: false,
             direct_sparse_prefill: false,
+            enable_unproven_large_direct_sparse_prefill: false,
+            direct_sparse_prefill_max_tokens: None,
             fused_sparse_mask: true,
             parallel_lightning_indexer: true,
             op_timing: true,
             metal_dispatch_log: false,
-            metal_topk_moe_route_fusion: false,
+            metal_topk_moe_route_fusion: true,
+            metal_topk_moe_route_fusion_native_default: false,
+            moe_motif_coencode: false,
+            moe_down_weighted_fusion: false,
+            moe_down_weighted_parallel: false,
+            moe_down_unweighted_slots: false,
             sparse_attn_threads: None,
+            sparse_attn_group_heads: None,
+            lightning_indexer_threads: None,
             indexshare_freq: None,
             indexshare_pattern: None,
             dense_sparse_mask_max_bytes: None,
+            direct_sparse_prefill_min_kv_topk_ratio: None,
             require_optimized_route_fusion: false,
             require_direct_sparse_prefill_proof: false,
+            require_direct_sparse_decode_proof: false,
             require_partial_top_k_proof: false,
+            require_compact_flash_proof: false,
+            require_moe_weighted_sum_proof: false,
+            require_moe_motif_proof: false,
+            require_native_indexshare_proof: false,
             require_real_top_k_shared_consumer_proof: false,
             compare_dense_fallback: false,
+            compare_dense_flash_prefill: false,
             compare_cpu_direct_sparse: false,
             compare_metal_sparse_attn_threads_baseline: None,
+            compare_moe_down_weighted_fusion: false,
+            compare_moe_down_weighted_parallel: false,
+            compare_moe_down_unweighted_slots: false,
+            compare_native_indexshare_producer_consumer: false,
             parity_atol: 1.0e-3,
             parity_rtol: 1.0e-3,
+            allow_concurrent: false,
             output: None,
         }
+    }
+
+    #[test]
+    fn glm_microbench_process_parser_matches_other_bench_process() {
+        let process = parse_active_glm_microbench_process(
+            "12345 ./target/release/skippy-bench glm-dsa-layer-microbench --stage-model /tmp/pkg",
+            999,
+        )
+        .expect("expected active bench process");
+
+        assert_eq!(process.pid, 12345);
+        assert!(
+            process
+                .command
+                .contains("glm-dsa-layer-microbench --stage-model")
+        );
+    }
+
+    #[test]
+    fn glm_microbench_process_parser_ignores_current_process() {
+        let process = parse_active_glm_microbench_process(
+            "12345 ./target/release/skippy-bench glm-dsa-layer-microbench --stage-model /tmp/pkg",
+            12345,
+        );
+
+        assert_eq!(process, None);
+    }
+
+    #[test]
+    fn glm_microbench_process_parser_ignores_shell_wrappers() {
+        let process = parse_active_glm_microbench_process(
+            "12345 /bin/zsh -c target/release/skippy-bench glm-dsa-layer-microbench --stage-model /tmp/pkg",
+            999,
+        );
+
+        assert_eq!(process, None);
+    }
+
+    #[test]
+    fn reuse_kv_warmup_checkpoint_requires_warmup_tokens() {
+        let mut args = test_args();
+        args.reuse_kv_warmup_checkpoint = true;
+        args.kv_warmup_tokens = 0;
+
+        assert!(!should_reuse_kv_warmup_checkpoint(&args));
+
+        args.kv_warmup_tokens = 128;
+
+        assert!(should_reuse_kv_warmup_checkpoint(&args));
+    }
+
+    #[test]
+    fn real_top_k_source_layer_zero_is_valid_before_shared_consumer() {
+        assert_eq!(
+            parse_real_top_k_source_layer_start("0", 1).unwrap(),
+            Some(0)
+        );
+        assert_eq!(parse_real_top_k_source_layer_start("off", 1).unwrap(), None);
+        assert!(parse_real_top_k_source_layer_start("1", 1).is_err());
+    }
+
+    #[test]
+    fn reuse_kv_warmup_stream_is_independent_of_checkpoint_mode() {
+        let mut args = test_args();
+        args.reuse_kv_warmup_stream = true;
+        args.kv_warmup_tokens = 0;
+
+        assert!(should_reuse_kv_warmup_stream(&args));
+        assert!(!should_reuse_kv_warmup_checkpoint(&args));
+    }
+
+    #[test]
+    fn streamed_iteration_positions_advance_by_token_count() {
+        let mut args = test_args();
+        args.position_start = 16_384;
+        args.tokens = 2;
+
+        assert_eq!(streamed_iteration_position_start(&args, 0).unwrap(), 16_384);
+        assert_eq!(streamed_iteration_position_start(&args, 1).unwrap(), 16_386);
+        assert_eq!(streamed_iteration_position_start(&args, 7).unwrap(), 16_398);
+    }
+
+    #[test]
+    fn kv_warmup_chunk_uses_explicit_override_first() {
+        let mut args = test_args();
+        args.kv_warmup_tokens = 65_536;
+        args.n_batch = Some(256);
+        args.n_ubatch = Some(512);
+        args.kv_warmup_chunk_tokens = Some(1024);
+
+        assert_eq!(kv_warmup_chunk_tokens(&args), 1024);
+    }
+
+    #[test]
+    fn kv_warmup_chunk_uses_runtime_batch_when_no_override() {
+        let mut args = test_args();
+        args.kv_warmup_tokens = 65_536;
+        args.n_batch = Some(256);
+        args.n_ubatch = Some(512);
+
+        assert_eq!(kv_warmup_chunk_tokens(&args), 512);
+
+        args.n_ubatch = None;
+
+        assert_eq!(kv_warmup_chunk_tokens(&args), 256);
+
+        args.n_batch = None;
+
+        assert_eq!(kv_warmup_chunk_tokens(&args), 128);
+    }
+
+    #[test]
+    fn synthetic_kv_page_desc_uses_glm_dsa_f16_layout() {
+        let args = test_args();
+
+        let desc = synthetic_kv_page_desc(args.layer_start, args.layer_end, 1, 1024, 256).unwrap();
+
+        assert_eq!(desc.version, 1);
+        assert_eq!(desc.layer_start, 30);
+        assert_eq!(desc.layer_end, 31);
+        assert_eq!(desc.token_start, 1024);
+        assert_eq!(desc.token_count, 256);
+        assert_eq!(desc.layer_count, 1);
+        assert_eq!(desc.k_type, GGML_TYPE_F16_ID);
+        assert_eq!(desc.v_type, GGML_TYPE_F32_ID);
+        assert_eq!(desc.k_row_bytes, GLM_DSA_F16_K_ROW_BYTES);
+        assert_eq!(desc.v_row_bytes, 0);
+        assert_eq!(desc.v_element_bytes, 0);
+        assert_eq!(desc.flags, 0);
+        assert_eq!(desc.payload_bytes, 256 * u64::from(GLM_DSA_F16_K_ROW_BYTES));
+    }
+
+    #[test]
+    fn validate_args_rejects_zero_kv_warmup_chunk_override() {
+        let mut args = test_args();
+        args.kv_warmup_chunk_tokens = Some(0);
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("kv_warmup_chunk_tokens must be greater than zero"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_synthetic_kv_without_warmup_tokens() {
+        let mut args = test_args();
+        args.synthetic_kv_warmup = true;
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("synthetic_kv_warmup requires kv_warmup_tokens"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_top_k_warmup_chunk_larger_than_microbatch() {
+        let mut args = test_args();
+        args.compare_native_indexshare_producer_consumer = true;
+        args.layer_start = 6;
+        args.layer_end = 10;
+        args.position_start = 256;
+        args.kv_warmup_tokens = 256;
+        args.kv_warmup_chunk_tokens = Some(64);
+        args.n_batch = Some(64);
+        args.n_ubatch = Some(4);
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains(
+                "must fit within n_ubatch (4) when KV warmup exports GLM-DSA top-k sideband"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_args_allows_synthetic_kv_warmup_chunk_larger_than_microbatch() {
+        let mut args = test_args();
+        args.position_start = 256;
+        args.kv_warmup_tokens = 256;
+        args.kv_warmup_chunk_tokens = Some(64);
+        args.n_batch = Some(64);
+        args.n_ubatch = Some(4);
+        args.synthetic_kv_warmup = true;
+
+        validate_args(&args).unwrap();
+    }
+
+    #[test]
+    fn validate_args_rejects_both_kv_reuse_modes() {
+        let mut args = test_args();
+        args.reuse_kv_warmup_checkpoint = true;
+        args.reuse_kv_warmup_stream = true;
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("reuse_kv_warmup_checkpoint and reuse_kv_warmup_stream"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_args_requires_two_layers_for_native_indexshare_comparison() {
+        let mut args = test_args();
+        args.layer_start = 30;
+        args.layer_end = 31;
+        args.compare_native_indexshare_producer_consumer = true;
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains(
+                "compare_native_indexshare_producer_consumer requires at least two layers"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn measured_timing_filters_drop_prefix_records_and_decode_warmup() {
+        let records = vec![
+            timing_record(128, 1000),
+            timing_record(1, 10),
+            timing_record(1, 20),
+            timing_record(128, 2000),
+            timing_record(1, 40),
+        ];
+        let measured = retain_measured_timing_records(records, 1, 1);
+
+        assert_eq!(measured.len(), 2);
+        assert_eq!(measured[0].total_us, 20);
+        assert_eq!(measured[1].total_us, 40);
+
+        let groups = vec![
+            timing_group_record(0, 128, 1000),
+            timing_group_record(1, 1, 10),
+            timing_group_record(2, 1, 20),
+            timing_group_record(3, 128, 2000),
+            timing_group_record(4, 1, 40),
+        ];
+        let measured_groups = retain_measured_group_timing_records(groups, 1, 1);
+
+        assert_eq!(measured_groups.len(), 2);
+        assert_eq!(measured_groups[0].record_index, 0);
+        assert_eq!(measured_groups[0].timing.total_us, 20);
+        assert_eq!(measured_groups[1].record_index, 1);
+        assert_eq!(measured_groups[1].timing.total_us, 40);
+
+        let hot_tensors = vec![
+            hot_tensor_record(0, 128, "prefix"),
+            hot_tensor_record(1, 1, "decode-warmup"),
+            hot_tensor_record(2, 1, "decode-0"),
+            hot_tensor_record(4, 1, "decode-1"),
+        ];
+        let measured_hot_tensors = retain_measured_hot_tensor_records(hot_tensors, 1, 1);
+
+        assert_eq!(measured_hot_tensors.len(), 2);
+        assert_eq!(measured_hot_tensors[0].record_index, 0);
+        assert_eq!(measured_hot_tensors[0].name, "decode-0");
+        assert_eq!(measured_hot_tensors[1].record_index, 1);
+        assert_eq!(measured_hot_tensors[1].name, "decode-1");
+    }
+
+    #[test]
+    fn indexshare_timing_summary_classifies_producers_and_consumers() {
+        let mut producer = timing_group_record(0, 1, 20_000);
+        producer.group = "layer_30".to_string();
+        producer.timing.indexer_topk_nodes = 25;
+        producer.timing.indexer_topk_us = 8_000;
+        producer.timing.indexer_nodes = Some(10);
+        producer.timing.indexer_us = Some(5_000);
+        producer.timing.top_k_nodes = Some(15);
+        producer.timing.top_k_us = Some(3_000);
+        let mut consumer_a = timing_group_record(0, 1, 11_000);
+        consumer_a.group = "layer_31".to_string();
+        let mut consumer_b = timing_group_record(0, 1, 12_000);
+        consumer_b.group = "layer_32".to_string();
+        let mut consumer_c = timing_group_record(0, 1, 13_000);
+        consumer_c.group = "layer_33".to_string();
+
+        let summary = summarize_indexshare_timing(&[consumer_c, producer, consumer_a, consumer_b]);
+
+        assert_eq!(summary.records, 4);
+        assert_eq!(summary.layer_groups, 4);
+        assert_eq!(summary.producer_groups, 1);
+        assert_eq!(summary.consumer_groups, 3);
+        assert_eq!(summary.indexer_topk_nodes, 25);
+        assert_eq!(summary.indexer_topk_us, 8_000);
+        assert_eq!(summary.indexer_nodes, 10);
+        assert_eq!(summary.indexer_us, 5_000);
+        assert_eq!(summary.top_k_nodes, 15);
+        assert_eq!(summary.top_k_us, 3_000);
+        assert_eq!(summary.indexer_share_of_indexer_topk, Some(0.625));
+        assert_eq!(summary.top_k_share_of_indexer_topk, Some(0.375));
+        assert_eq!(summary.producer_total_us, 20_000);
+        assert_eq!(summary.consumer_total_us, 36_000);
+        assert_eq!(summary.producer_group_names, ["layer_30"]);
+        assert_eq!(
+            summary.consumer_group_names,
+            ["layer_31", "layer_32", "layer_33"]
+        );
     }
 
     #[test]
@@ -4251,6 +8377,21 @@ mod tests {
 
         assert!(
             error.contains("sparse_attn_threads must be one of 32, 64, 128, or 256"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_args_rejects_unsupported_lightning_indexer_thread_width() {
+        let mut args = test_args();
+        args.lightning_indexer_threads = Some(96);
+
+        let error = validate_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains(
+                "lightning_indexer_threads must be one of 32, 64, 128, 256, 512, or 1024"
+            ),
             "{error}"
         );
     }
@@ -4301,6 +8442,25 @@ mod tests {
             raw_activation_wire_bytes: 16,
             top_k_sideband_bytes: 16,
             top_k_sideband_i32_count: 4,
+            top_k_sideband_stats: TopKSidebandStats {
+                i32_aligned: true,
+                token_count: 1,
+                total_i32: 4,
+                width_per_token: Some(4),
+                valid_index_count: 4,
+                negative_index_count: 0,
+                out_of_range_index_count: 0,
+                causal_visible_count: 4,
+                future_index_count: 0,
+                duplicate_index_count: 0,
+                active_top_end_sum: 4,
+                avg_active_top_end: Some(4.0),
+                max_active_top_end: 4,
+                inactive_tail_count: 0,
+                masked_future_in_active_prefix_count: 0,
+                active_prefix_ratio: Some(1.0),
+                causal_visible_ratio: Some(1.0),
+            },
             estimated_wire_bytes: 32,
             encoded_wire_bytes: 32,
             decoded_payload_bytes: 32,
@@ -4333,27 +8493,129 @@ mod tests {
             label,
             flags: MicrobenchFlags {
                 direct_sparse_attn: true,
+                compact_flash_attn: false,
+                allow_compact_flash_auto: false,
                 direct_sparse_prefill: true,
+                enable_unproven_large_direct_sparse_prefill: false,
+                direct_sparse_prefill_max_tokens: None,
                 fused_sparse_mask: true,
                 parallel_lightning_indexer: false,
                 op_timing: false,
+                native_indexshare_exec_log: false,
                 metal_dispatch_log: true,
                 metal_topk_moe_route_fusion: false,
+                metal_topk_moe_route_fusion_native_default: false,
+                moe_motif_coencode: false,
+                moe_down_weighted_fusion: false,
+                moe_down_weighted_parallel: false,
+                moe_down_unweighted_slots: false,
                 sparse_attn_threads: None,
+                sparse_attn_group_heads: None,
+                lightning_indexer_threads: None,
+                dense_sparse_mask_max_bytes: None,
+                direct_sparse_prefill_min_kv_topk_ratio: None,
             },
             n_gpu_layers: -1,
             native_log_path: None,
+            compact_flash_policy_summary: CompactFlashPolicySummary::default(),
+            compact_flash_policy_records: Vec::new(),
+            compact_flash_execution_policy_records: Vec::new(),
+            compact_flash_non_measured_policy_records: Vec::new(),
             direct_sparse_decision_summary: DirectSparseDecisionSummary::default(),
             timing_summary: TimingDistributionSummary::default(),
+            timing_breakdown: TimingBreakdownSummary::default(),
             metal_dispatch_summary: dispatch,
+            direct_sparse_spill_summary: DirectSparseSpillSummary::default(),
             op_timing_summary: GlmDsaOpTimingSummary::default(),
             routed_moe_timing_summary: RoutedMoeTimingSummary::default(),
+            indexshare_timing_summary: IndexShareTimingSummary::default(),
+            indexshare_trace_summary: IndexShareTraceSummary::default(),
             direct_sparse_decision_records: Vec::new(),
+            direct_sparse_execution_decision_records: Vec::new(),
+            direct_sparse_non_measured_decision_records: Vec::new(),
             metal_dispatch_records: Vec::new(),
             op_timing_records: Vec::new(),
             group_timing_records: Vec::new(),
             hot_tensor_records: Vec::new(),
+            compute_buffer_records: Vec::new(),
             timings: Vec::new(),
+        }
+    }
+
+    fn microbench_case_with_indexshare_trace(
+        indexshare_trace_summary: IndexShareTraceSummary,
+    ) -> MicrobenchCaseSummary {
+        MicrobenchCase {
+            label: "candidate",
+            flags: MicrobenchFlags {
+                direct_sparse_attn: true,
+                compact_flash_attn: false,
+                allow_compact_flash_auto: false,
+                direct_sparse_prefill: false,
+                enable_unproven_large_direct_sparse_prefill: false,
+                direct_sparse_prefill_max_tokens: None,
+                fused_sparse_mask: true,
+                parallel_lightning_indexer: false,
+                op_timing: true,
+                native_indexshare_exec_log: true,
+                metal_dispatch_log: false,
+                metal_topk_moe_route_fusion: true,
+                metal_topk_moe_route_fusion_native_default: false,
+                moe_motif_coencode: false,
+                moe_down_weighted_fusion: false,
+                moe_down_weighted_parallel: false,
+                moe_down_unweighted_slots: false,
+                sparse_attn_threads: None,
+                sparse_attn_group_heads: None,
+                lightning_indexer_threads: None,
+                dense_sparse_mask_max_bytes: None,
+                direct_sparse_prefill_min_kv_topk_ratio: None,
+            },
+            n_gpu_layers: -1,
+            measured_tokens: 1,
+            native_log_path: None,
+            compact_flash_policy_records: Vec::new(),
+            compact_flash_execution_policy_records: Vec::new(),
+            compact_flash_non_measured_policy_records: Vec::new(),
+            direct_sparse_decision_records: Vec::new(),
+            direct_sparse_execution_decision_records: Vec::new(),
+            direct_sparse_non_measured_decision_records: Vec::new(),
+            metal_dispatch_records: Vec::new(),
+            op_timing_records: Vec::new(),
+            group_timing_records: Vec::new(),
+            indexshare_trace_summary,
+            hot_tensor_records: Vec::new(),
+            compute_buffer_records: Vec::new(),
+            timings: Vec::new(),
+            outputs: Vec::new(),
+        }
+        .as_case_summary()
+    }
+
+    fn single_sample_timing(mean_ms: f64) -> TimingDistributionSummary {
+        TimingDistributionSummary {
+            samples: 1,
+            mean_ms: Some(mean_ms),
+            min_ms: Some(mean_ms),
+            p50_ms: Some(mean_ms),
+            p90_ms: Some(mean_ms),
+            p95_ms: Some(mean_ms),
+            p99_ms: Some(mean_ms),
+            max_ms: Some(mean_ms),
+            stdev_ms: Some(0.0),
+            coefficient_of_variation: Some(0.0),
+            slow_outlier_count: 0,
+            slow_outlier_threshold_ms: Some(mean_ms * 1.25),
+        }
+    }
+
+    fn iteration_timing(iteration: usize, elapsed_ms: f64) -> IterationTiming {
+        IterationTiming {
+            iteration,
+            position_start: 0,
+            elapsed_ms,
+            output_payload_bytes: 16,
+            output_flags: 0,
         }
     }
 
@@ -4365,10 +8627,14 @@ mod tests {
     ) -> MicrobenchCaseSummary {
         let mut case = case_summary("candidate", 0, 0, 0);
         case.direct_sparse_decision_records = decisions.to_vec();
+        case.direct_sparse_execution_decision_records = decisions.to_vec();
+        case.direct_sparse_decision_summary = summarize_direct_sparse_decisions(&case);
         case.op_timing_summary.records = 1;
         case.op_timing_summary.sparse_mask.nodes = sparse_mask_nodes;
         case.op_timing_summary.dsa_sparse_attn.nodes = dsa_sparse_attn_nodes;
         case.metal_dispatch_records = dispatches.to_vec();
+        case.direct_sparse_spill_summary =
+            summarize_direct_sparse_spill(&case.metal_dispatch_records);
         case
     }
 
@@ -4382,13 +8648,58 @@ mod tests {
             sparse_batch: 64,
             sparse_streams: 1,
             prefill_cap: 32,
+            sparse_kv: Some(2048),
+            sparse_top_k: Some(64),
+            min_kv_topk_ratio: Some(32),
+            kv_topk_ratio: Some(32),
             dense_mask_bytes: Some(524288),
             dense_mask_limit: Some(1),
+            selector_reason: Some(if use_direct {
+                if large_prefill_shape {
+                    "kv_topk_ratio".to_string()
+                } else {
+                    "small_prefill".to_string()
+                }
+            } else {
+                "fallback".to_string()
+            }),
             direct_enabled: true,
             prefill_enabled: true,
             decode_shape: false,
-            prefill_shape: false,
+            prefill_shape: !large_prefill_shape,
             large_prefill_shape: Some(large_prefill_shape),
+            token_shape_allowed: true,
+            kq_b_ok: true,
+            sinks_ok: true,
+            alibi_ok: true,
+            soft_cap_ok: true,
+            use_direct,
+        }
+    }
+
+    fn direct_sparse_decode_decision(use_direct: bool) -> DirectSparseDecisionRecord {
+        DirectSparseDecisionRecord {
+            layer: 30,
+            ubatch_tokens: 1,
+            sparse_batch: 1,
+            sparse_streams: 1,
+            prefill_cap: 32,
+            sparse_kv: Some(2048),
+            sparse_top_k: Some(256),
+            min_kv_topk_ratio: Some(32),
+            kv_topk_ratio: Some(8),
+            dense_mask_bytes: Some(8192),
+            dense_mask_limit: Some(536_870_912),
+            selector_reason: Some(if use_direct {
+                "decode".to_string()
+            } else {
+                "fallback".to_string()
+            }),
+            direct_enabled: true,
+            prefill_enabled: false,
+            decode_shape: true,
+            prefill_shape: false,
+            large_prefill_shape: Some(false),
             token_shape_allowed: true,
             kq_b_ok: true,
             sinks_ok: true,
@@ -4402,6 +8713,91 @@ mod tests {
         dsa_sparse_attn_dispatch_with_kv(batch, 256, top_k, threads_x)
     }
 
+    fn cached_topk_dsa_sparse_attn_dispatch(
+        batch: u64,
+        top_k: u64,
+        threads_x: u64,
+    ) -> MetalDispatchRecord {
+        let mut record = dsa_sparse_attn_dispatch_with_kv(batch, batch, top_k, threads_x);
+        record.kernel = Some("cached_topk".to_string());
+        record
+    }
+
+    fn cached_topk_v4_dsa_sparse_attn_dispatch(
+        batch: u64,
+        top_k: u64,
+        threads_x: u64,
+    ) -> MetalDispatchRecord {
+        let mut record = dsa_sparse_attn_dispatch_with_kv(batch, batch, top_k, threads_x);
+        record.kernel = Some("cached_topk_v4".to_string());
+        record
+    }
+
+    fn decode_vec_dsa_sparse_attn_dispatch(
+        batch: u64,
+        top_k: u64,
+        threads_x: u64,
+    ) -> MetalDispatchRecord {
+        let mut record = dsa_sparse_attn_dispatch_with_kv(batch, batch * 97, top_k, threads_x);
+        record.kernel = Some("decode_vec".to_string());
+        record
+    }
+
+    fn decode_vec_direct_dsa_sparse_attn_dispatch(
+        batch: u64,
+        top_k: u64,
+        threads_x: u64,
+    ) -> MetalDispatchRecord {
+        let mut record = dsa_sparse_attn_dispatch_with_kv(batch, batch * 97, top_k, threads_x);
+        record.kernel = Some("decode_vec_direct".to_string());
+        record
+    }
+
+    fn dsa_sparse_mask_dispatch() -> MetalDispatchRecord {
+        let mut record = dsa_sparse_attn_dispatch_with_kv(64, 256, 256, 32);
+        record.op = "dsa_sparse_mask".to_string();
+        record.kernel = Some("set".to_string());
+        record.tensor = "dsa_sparse_mask-30".to_string();
+        record
+    }
+
+    fn compact_get_rows_dispatch(tensor: &str, kernel: &str) -> MetalDispatchRecord {
+        let mut record = dsa_sparse_attn_dispatch_with_kv(1, 2048, 2048, 576);
+        record.op = "get_rows".to_string();
+        record.kernel = Some(kernel.to_string());
+        record.tensor = tensor.to_string();
+        record
+    }
+
+    fn compact_flash_policy_record(
+        phase: &str,
+        selector_reason: &str,
+        use_compact: bool,
+    ) -> CompactFlashPolicyRecord {
+        CompactFlashPolicyRecord {
+            layer: 30,
+            ubatch_tokens: 1,
+            visible_kv: 4096,
+            top_k: 2048,
+            kv_topk_ratio: 2,
+            min_kv_topk_ratio: 2,
+            forced: false,
+            disabled: false,
+            ratio_ok: true,
+            enabled: true,
+            flash_attn: true,
+            phase: Some(phase.to_string()),
+            decode_shape: phase == "decode",
+            kq_b_ok: true,
+            sinks_ok: true,
+            alibi_ok: true,
+            soft_cap_ok: true,
+            no_mask: Some(use_compact),
+            use_compact,
+            selector_reason: Some(selector_reason.to_string()),
+        }
+    }
+
     fn dsa_sparse_attn_dispatch_with_kv(
         batch: u64,
         kv: u64,
@@ -4412,7 +8808,25 @@ mod tests {
             op: "dsa_sparse_attn".to_string(),
             kernel: Some("default".to_string()),
             tensor: "dsa_sparse_attn-30".to_string(),
+            next: None,
+            next_op: None,
+            shared_gate: None,
+            shared_up: None,
+            weighted_sum: None,
+            weighted_sum_op: None,
             reason: None,
+            shared_branch: None,
+            weighted_sum_uses_down: None,
+            natural_order: None,
+            backend_candidate: None,
+            pair_fusable: None,
+            subgraph_fusable: None,
+            motif_nodes: None,
+            fusion_outputs: None,
+            filtered_gap: None,
+            graph_gap: None,
+            weighted_sum_gap: None,
+            weighted_sum_graph_gap: None,
             parallel: None,
             q_type: Some("f32".to_string()),
             k_type: Some("f16".to_string()),
@@ -4429,11 +8843,55 @@ mod tests {
             kv: Some(kv),
             top_k: Some(top_k),
             top_stream: Some(1),
+            selected_keys: None,
+            q_read_bytes: None,
+            k_read_bytes: None,
+            v_read_bytes: None,
+            mask_read_bytes: None,
+            top_k_read_bytes: None,
+            scratch_per_tg_bytes: None,
+            score_fma: None,
+            value_fma: None,
+            reduction_strategy: None,
+            rows: None,
+            partial_bytes: None,
+            softmax_bytes: None,
+            tmp_bytes: None,
+            nwg: None,
+            tmp_f16: None,
+            dst_partial: None,
             grid_x: 64,
             grid_y: batch,
             grid_z: 1,
             threads_x,
             threads_y: Some(1),
+        }
+    }
+
+    fn test_microbench_flags() -> MicrobenchFlags {
+        MicrobenchFlags {
+            direct_sparse_attn: true,
+            compact_flash_attn: false,
+            allow_compact_flash_auto: false,
+            direct_sparse_prefill: true,
+            enable_unproven_large_direct_sparse_prefill: false,
+            direct_sparse_prefill_max_tokens: None,
+            fused_sparse_mask: true,
+            parallel_lightning_indexer: false,
+            op_timing: false,
+            native_indexshare_exec_log: false,
+            metal_dispatch_log: true,
+            metal_topk_moe_route_fusion: true,
+            metal_topk_moe_route_fusion_native_default: false,
+            moe_motif_coencode: false,
+            moe_down_weighted_fusion: false,
+            moe_down_weighted_parallel: false,
+            moe_down_unweighted_slots: false,
+            sparse_attn_threads: None,
+            sparse_attn_group_heads: None,
+            lightning_indexer_threads: None,
+            dense_sparse_mask_max_bytes: None,
+            direct_sparse_prefill_min_kv_topk_ratio: None,
         }
     }
 

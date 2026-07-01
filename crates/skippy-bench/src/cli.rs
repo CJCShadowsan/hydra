@@ -36,6 +36,8 @@ pub enum CommandKind {
     GlmDsaOpReport(GlmDsaOpReportArgs),
     #[command(name = "glm-dsa-op-compare")]
     GlmDsaOpCompare(GlmDsaOpCompareArgs),
+    #[command(name = "glm-dsa-aggregate-reports")]
+    GlmDsaAggregateReports(GlmDsaAggregateReportsArgs),
     Run(RunArgs),
 }
 
@@ -178,6 +180,44 @@ pub struct GlmDsaOpReportArgs {
         help = "Only include the first N timing records from each log. Use this for one request when a REPL log contains follow-up prompts."
     )]
     pub first_records: Option<usize>,
+    #[arg(
+        long,
+        help = "Fail unless IndexShare trace proves Full producer top-k generation and Shared consumer reuse."
+    )]
+    pub require_indexshare_producer_consumer: bool,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum GlmDsaAggregateReportCase {
+    TopLevel,
+    Baseline,
+    Candidate,
+}
+
+impl GlmDsaAggregateReportCase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TopLevel => "top-level",
+            Self::Baseline => "baseline",
+            Self::Candidate => "candidate",
+        }
+    }
+}
+
+#[derive(Parser)]
+pub struct GlmDsaAggregateReportsArgs {
+    #[arg(long, required = true)]
+    pub report: Vec<PathBuf>,
+    #[arg(long, value_enum, default_value = "top-level")]
+    pub case: GlmDsaAggregateReportCase,
+    #[arg(
+        long,
+        default_value_t = 0.10,
+        help = "Fraction of run means to trim from each tail when computing trimmed_mean_ms."
+    )]
+    pub trim_fraction: f64,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -207,6 +247,35 @@ pub struct GlmDsaLayerMicrobenchArgs {
         help = "Starting token position for GLM-DSA layer microbench inputs."
     )]
     pub position_start: i32,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Populate the target stage KV cache with this many synthetic prefix tokens before each timed run. The prefix must end exactly at position_start."
+    )]
+    pub kv_warmup_tokens: usize,
+    #[arg(
+        long,
+        help = "Override the synthetic KV warmup chunk size. Defaults to explicit n_ubatch/n_batch when set, otherwise the conservative 128-token warmup chunk."
+    )]
+    pub kv_warmup_chunk_tokens: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Populate the target KV cache by importing synthetic zero KV pages instead of running warmup prefill. GLM-DSA microbench only."
+    )]
+    pub synthetic_kv_warmup: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Warm the synthetic KV prefix once, checkpoint it, and restore that checkpoint before each measured GLM-DSA decode sample."
+    )]
+    pub reuse_kv_warmup_checkpoint: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Warm the synthetic KV prefix once, then measure consecutive decode samples on the same session without restoring the KV position."
+    )]
+    pub reuse_kv_warmup_stream: bool,
     #[arg(long, default_value_t = 3)]
     pub iterations: usize,
     #[arg(long, default_value_t = 1)]
@@ -223,11 +292,37 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub cache_type_v: String,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub direct_sparse_attn: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Enable the experimental GLM-DSA compact top-k K/V + flash-attention path for the candidate run."
+    )]
+    pub compact_flash_attn: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Allow llama.cpp's native GLM-DSA compact flash-attention policy to select the compact path without forcing it on."
+    )]
+    pub allow_compact_flash_auto: bool,
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub direct_sparse_prefill: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Set SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL for candidate runs that intentionally test the large-prefill memory-guard path."
+    )]
+    pub enable_unproven_large_direct_sparse_prefill: bool,
+    #[arg(
+        long,
+        help = "Set SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS for this microbench run. Larger prefill batches require the explicit unproven-large opt-in."
+    )]
+    pub direct_sparse_prefill_max_tokens: Option<u32>,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub fused_sparse_mask: bool,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub parallel_lightning_indexer: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub op_timing: bool,
@@ -240,16 +335,60 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub metal_dispatch_log: bool,
     #[arg(
         long,
-        default_value_t = false,
+        default_value_t = true,
         action = ArgAction::Set,
-        help = "Enable the native Metal GLM-DSA top-k MoE route-fusion prototype."
+        help = "Enable the native Metal GLM-DSA top-k MoE route fusion."
     )]
     pub metal_topk_moe_route_fusion: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Do not inject route-fusion env overrides; clear route-fusion env knobs so the run proves llama.cpp's native Metal GLM-DSA default."
+    )]
+    pub metal_topk_moe_route_fusion_native_default: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Enable the experimental native Metal GLM-DSA MoE motif co-encode path."
+    )]
+    pub moe_motif_coencode: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Enable the experimental native Metal GLM-DSA routed down + weighted-sum fusion."
+    )]
+    pub moe_down_weighted_fusion: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Enable the experimental native Metal GLM-DSA routed down path that computes weighted expert slots in parallel before reduction."
+    )]
+    pub moe_down_weighted_parallel: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Enable the diagnostic native Metal GLM-DSA routed down path that writes unweighted expert slots before the normal weighted-sum reduction."
+    )]
+    pub moe_down_unweighted_slots: bool,
     #[arg(
         long,
         help = "Set SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS for the candidate run. Use with --compare-metal-sparse-attn-threads-baseline to compare Metal sparse-attention thread counts."
     )]
     pub sparse_attn_threads: Option<u32>,
+    #[arg(
+        long,
+        help = "Set SKIPPY_GLM_DSA_SPARSE_ATTN_DECODE_GROUP_HEADS for the candidate run. Valid values are 2 or 4."
+    )]
+    pub sparse_attn_group_heads: Option<u32>,
+    #[arg(
+        long,
+        help = "Set LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER_THREADS for the candidate run. Valid values are 32, 64, 128, 256, 512, or 1024."
+    )]
+    pub lightning_indexer_threads: Option<u32>,
     #[arg(
         long,
         help = "Set LLAMA_GLM_DSA_INDEXSHARE_FREQ for this microbench run so every Nth GLM-DSA layer recomputes top-k and intervening layers reuse it."
@@ -262,9 +401,14 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub indexshare_pattern: Option<String>,
     #[arg(
         long,
-        help = "Set SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES for this microbench run. When direct sparse prefill is enabled, larger dense sparse-mask fallbacks are routed to direct sparse attention."
+        help = "Set SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES for this microbench run. Used for direct-sparse decision telemetry and memory guard experiments."
     )]
     pub dense_sparse_mask_max_bytes: Option<u64>,
+    #[arg(
+        long,
+        help = "Set SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MIN_KV_TOPK_RATIO for this microbench run. Lower this only when intentionally forcing direct sparse prefill proof runs."
+    )]
+    pub direct_sparse_prefill_min_kv_topk_ratio: Option<u32>,
     #[arg(
         long,
         default_value_t = false,
@@ -280,9 +424,39 @@ pub struct GlmDsaLayerMicrobenchArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Fail unless the run proves decode-shaped GLM-DSA direct sparse attention avoided sparse-mask timing nodes and dispatched native sparse attention."
+    )]
+    pub require_direct_sparse_decode_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Fail unless the run proves GLM-DSA direct sparse attention executed a partial top-k shape where visible KV is larger than the top-k sideband width."
     )]
     pub require_partial_top_k_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fail unless the candidate proves the compact GLM-DSA flash-attention path: GLM-shaped flash attention, typed get-rows, no promoted get-rows, and no old dsa_sparse_attn dispatch."
+    )]
+    pub require_compact_flash_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fail unless the candidate proves GLM-DSA MoE aggregation used the Metal moe_weighted_sum f32x4 path."
+    )]
+    pub require_moe_weighted_sum_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fail unless the optimized dispatch profile proves natural-order GLM-DSA MoE motifs are backend candidates for native Metal fusion."
+    )]
+    pub require_moe_motif_proof: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Fail unless native llama.cpp logs prove a GLM-DSA Full layer produced top-k and a Shared layer consumed it in the same local stage."
+    )]
+    pub require_native_indexshare_proof: bool,
     #[arg(
         long,
         default_value_t = false,
@@ -298,6 +472,12 @@ pub struct GlmDsaLayerMicrobenchArgs {
     #[arg(
         long,
         default_value_t = false,
+        help = "Run native dense-mask flash prefill as the baseline and forced direct-sparse prefill as the candidate."
+    )]
+    pub compare_dense_flash_prefill: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Run a CPU direct-sparse baseline and compare it with the requested backend settings."
     )]
     pub compare_cpu_direct_sparse: bool,
@@ -306,10 +486,40 @@ pub struct GlmDsaLayerMicrobenchArgs {
         help = "Run a same-backend Metal direct-sparse baseline with this SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS value and compare it with the candidate run."
     )]
     pub compare_metal_sparse_attn_threads_baseline: Option<u32>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run the same GLM-DSA Metal case with routed down + weighted-sum fusion disabled as the baseline and enabled as the candidate."
+    )]
+    pub compare_moe_down_weighted_fusion: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run the same GLM-DSA Metal case with routed down + weighted slots disabled as the baseline and the expert-parallel weighted-slots path enabled as the candidate."
+    )]
+    pub compare_moe_down_weighted_parallel: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run the same GLM-DSA Metal case with routed down + weighted slots disabled as the baseline and the diagnostic unweighted-slots path enabled as the candidate."
+    )]
+    pub compare_moe_down_unweighted_slots: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Compare native in-graph GLM-DSA Full->Shared execution with a local producer stage feeding the Shared consumer stage."
+    )]
+    pub compare_native_indexshare_producer_consumer: bool,
     #[arg(long, default_value_t = 1.0e-3)]
     pub parity_atol: f32,
     #[arg(long, default_value_t = 1.0e-3)]
     pub parity_rtol: f32,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow another glm-dsa-layer-microbench process to run concurrently. Disabled by default because overlapping Metal runs contaminate timing evidence."
+    )]
+    pub allow_concurrent: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -985,14 +1195,28 @@ mod tests {
             "128",
             "--position-start",
             "255",
+            "--kv-warmup-tokens",
+            "255",
+            "--kv-warmup-chunk-tokens",
+            "64",
+            "--synthetic-kv-warmup",
+            "--reuse-kv-warmup-checkpoint",
             "--indexshare-freq",
             "4",
             "--indexshare-pattern",
             "FSSS",
             "--dense-sparse-mask-max-bytes",
             "1048576",
+            "--enable-unproven-large-direct-sparse-prefill",
+            "--direct-sparse-prefill-max-tokens",
+            "12",
+            "--allow-compact-flash-auto",
             "--require-optimized-route-fusion",
-            "--compare-dense-fallback",
+            "--require-moe-weighted-sum-proof",
+            "--require-moe-motif-proof",
+            "--require-native-indexshare-proof",
+            "--require-direct-sparse-decode-proof",
+            "--compare-native-indexshare-producer-consumer",
         ])
         .unwrap();
 
@@ -1005,13 +1229,66 @@ mod tests {
         assert_eq!(args.layer_end, 31);
         assert_eq!(args.tokens, 128);
         assert_eq!(args.position_start, 255);
+        assert_eq!(args.kv_warmup_tokens, 255);
+        assert_eq!(args.kv_warmup_chunk_tokens, Some(64));
+        assert!(args.synthetic_kv_warmup);
+        assert!(args.reuse_kv_warmup_checkpoint);
         assert_eq!(args.indexshare_freq, Some(4));
         assert_eq!(args.indexshare_pattern.as_deref(), Some("FSSS"));
         assert_eq!(args.dense_sparse_mask_max_bytes, Some(1_048_576));
+        assert!(args.enable_unproven_large_direct_sparse_prefill);
+        assert_eq!(args.direct_sparse_prefill_max_tokens, Some(12));
+        assert!(args.allow_compact_flash_auto);
         assert!(args.require_optimized_route_fusion);
-        assert!(args.compare_dense_fallback);
+        assert!(args.require_moe_weighted_sum_proof);
+        assert!(args.require_moe_motif_proof);
+        assert!(args.require_native_indexshare_proof);
+        assert!(args.require_direct_sparse_decode_proof);
+        assert!(args.compare_native_indexshare_producer_consumer);
+        assert!(!args.compare_dense_fallback);
+        assert!(!args.compare_dense_flash_prefill);
         assert!(!args.compare_cpu_direct_sparse);
         assert_eq!(args.sparse_attn_threads, None);
+        assert_eq!(args.compare_metal_sparse_attn_threads_baseline, None);
+        assert!(!args.allow_concurrent);
+    }
+
+    #[test]
+    fn parses_glm_dsa_layer_microbench_concurrency_override() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "glm-dsa-layer-microbench",
+            "--stage-model",
+            "/tmp/glm52-layers",
+            "--allow-concurrent",
+        ])
+        .unwrap();
+
+        let CommandKind::GlmDsaLayerMicrobench(args) = cli.command else {
+            panic!("expected glm-dsa-layer-microbench subcommand");
+        };
+
+        assert!(args.allow_concurrent);
+    }
+
+    #[test]
+    fn parses_glm_dsa_layer_microbench_dense_flash_prefill_comparison() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "glm-dsa-layer-microbench",
+            "--stage-model",
+            "/tmp/glm52-layers",
+            "--compare-dense-flash-prefill",
+        ])
+        .unwrap();
+
+        let CommandKind::GlmDsaLayerMicrobench(args) = cli.command else {
+            panic!("expected glm-dsa-layer-microbench subcommand");
+        };
+
+        assert!(args.compare_dense_flash_prefill);
+        assert!(!args.compare_dense_fallback);
+        assert!(!args.compare_cpu_direct_sparse);
         assert_eq!(args.compare_metal_sparse_attn_threads_baseline, None);
     }
 
@@ -1057,5 +1334,42 @@ mod tests {
         assert_eq!(args.compare_metal_sparse_attn_threads_baseline, Some(32));
         assert!(!args.compare_dense_fallback);
         assert!(!args.compare_cpu_direct_sparse);
+    }
+
+    #[test]
+    fn parses_glm_dsa_aggregate_reports_command() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "glm-dsa-aggregate-reports",
+            "--report",
+            "/tmp/direct-a.json",
+            "--report",
+            "/tmp/direct-b.json",
+            "--case",
+            "candidate",
+            "--trim-fraction",
+            "0.2",
+            "--output",
+            "/tmp/aggregate.json",
+        ])
+        .unwrap();
+
+        let CommandKind::GlmDsaAggregateReports(args) = cli.command else {
+            panic!("expected glm-dsa-aggregate-reports subcommand");
+        };
+
+        assert_eq!(
+            args.report,
+            vec![
+                PathBuf::from("/tmp/direct-a.json"),
+                PathBuf::from("/tmp/direct-b.json"),
+            ]
+        );
+        assert!(matches!(
+            args.case,
+            super::GlmDsaAggregateReportCase::Candidate
+        ));
+        assert_eq!(args.trim_fraction, 0.2);
+        assert_eq!(args.output, Some(PathBuf::from("/tmp/aggregate.json")));
     }
 }

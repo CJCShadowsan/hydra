@@ -10,8 +10,11 @@ const GROUP_TIMING_PREFIX: &str = "skippy: glm_dsa_group_timing ";
 const SIDEBAND_FORWARD_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
 const SIDEBAND_RECEIVE_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_receive ";
 const DIRECT_SPARSE_DECISION_PREFIX: &str = "skippy: glm_dsa_direct_sparse_decision ";
+const COMPACT_FLASH_POLICY_PREFIX: &str = "skippy: glm_dsa_compact_flash_policy ";
 const METAL_DISPATCH_PREFIX: &str = "skippy: glm_dsa_metal_dispatch ";
 const HOT_TENSOR_PREFIX: &str = "skippy: glm_dsa_hot_tensor ";
+const COMPUTE_BUFFER_PREFIX: &str = "~llama_context:";
+const INDEXSHARE_TRACE_MARKER: &str = "GLM_DSA IndexShare ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +64,7 @@ struct LogSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hottest_group_records: Vec<HotGroupSummary>,
     sideband_records: BTreeMap<String, BTreeMap<Phase, SidebandSummary>>,
+    indexshare_trace: IndexShareTraceSummary,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -144,6 +148,14 @@ pub(crate) struct HotTensorRecord {
     pub(crate) ne3: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ComputeBufferRecord {
+    pub(crate) device: String,
+    pub(crate) size_mib: f64,
+    pub(crate) expected_mib: f64,
+    pub(crate) matches_expectation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DirectSparseDecisionRecord {
     pub(crate) layer: i32,
@@ -151,8 +163,13 @@ pub(crate) struct DirectSparseDecisionRecord {
     pub(crate) sparse_batch: i64,
     pub(crate) sparse_streams: i64,
     pub(crate) prefill_cap: i64,
+    pub(crate) sparse_kv: Option<i64>,
+    pub(crate) sparse_top_k: Option<i64>,
+    pub(crate) min_kv_topk_ratio: Option<i64>,
+    pub(crate) kv_topk_ratio: Option<i64>,
     pub(crate) dense_mask_bytes: Option<u64>,
     pub(crate) dense_mask_limit: Option<u64>,
+    pub(crate) selector_reason: Option<String>,
     pub(crate) direct_enabled: bool,
     pub(crate) prefill_enabled: bool,
     pub(crate) decode_shape: bool,
@@ -167,11 +184,56 @@ pub(crate) struct DirectSparseDecisionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CompactFlashPolicyRecord {
+    pub(crate) layer: i32,
+    pub(crate) ubatch_tokens: i64,
+    pub(crate) visible_kv: i64,
+    pub(crate) top_k: i64,
+    pub(crate) kv_topk_ratio: i64,
+    pub(crate) min_kv_topk_ratio: i64,
+    pub(crate) forced: bool,
+    pub(crate) disabled: bool,
+    pub(crate) ratio_ok: bool,
+    pub(crate) enabled: bool,
+    pub(crate) flash_attn: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
+    pub(crate) decode_shape: bool,
+    pub(crate) kq_b_ok: bool,
+    pub(crate) sinks_ok: bool,
+    pub(crate) alibi_ok: bool,
+    pub(crate) soft_cap_ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) no_mask: Option<bool>,
+    pub(crate) use_compact: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) selector_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct MetalDispatchRecord {
     pub(crate) op: String,
     pub(crate) kernel: Option<String>,
     pub(crate) tensor: String,
+    pub(crate) next: Option<String>,
+    pub(crate) next_op: Option<String>,
+    pub(crate) shared_gate: Option<String>,
+    pub(crate) shared_up: Option<String>,
+    pub(crate) weighted_sum: Option<String>,
+    pub(crate) weighted_sum_op: Option<String>,
     pub(crate) reason: Option<String>,
+    pub(crate) shared_branch: Option<bool>,
+    pub(crate) weighted_sum_uses_down: Option<bool>,
+    pub(crate) natural_order: Option<bool>,
+    pub(crate) backend_candidate: Option<bool>,
+    pub(crate) pair_fusable: Option<bool>,
+    pub(crate) subgraph_fusable: Option<bool>,
+    pub(crate) motif_nodes: Option<u64>,
+    pub(crate) fusion_outputs: Option<u64>,
+    pub(crate) filtered_gap: Option<u64>,
+    pub(crate) graph_gap: Option<i64>,
+    pub(crate) weighted_sum_gap: Option<i64>,
+    pub(crate) weighted_sum_graph_gap: Option<i64>,
     pub(crate) parallel: Option<bool>,
     pub(crate) q_type: Option<String>,
     pub(crate) k_type: Option<String>,
@@ -188,6 +250,23 @@ pub(crate) struct MetalDispatchRecord {
     pub(crate) kv: Option<u64>,
     pub(crate) top_k: Option<u64>,
     pub(crate) top_stream: Option<u64>,
+    pub(crate) selected_keys: Option<u64>,
+    pub(crate) q_read_bytes: Option<u64>,
+    pub(crate) k_read_bytes: Option<u64>,
+    pub(crate) v_read_bytes: Option<u64>,
+    pub(crate) mask_read_bytes: Option<u64>,
+    pub(crate) top_k_read_bytes: Option<u64>,
+    pub(crate) scratch_per_tg_bytes: Option<u64>,
+    pub(crate) score_fma: Option<u64>,
+    pub(crate) value_fma: Option<u64>,
+    pub(crate) reduction_strategy: Option<String>,
+    pub(crate) rows: Option<u64>,
+    pub(crate) partial_bytes: Option<u64>,
+    pub(crate) softmax_bytes: Option<u64>,
+    pub(crate) tmp_bytes: Option<u64>,
+    pub(crate) nwg: Option<u64>,
+    pub(crate) tmp_f16: Option<bool>,
+    pub(crate) dst_partial: Option<bool>,
     pub(crate) grid_x: u64,
     pub(crate) grid_y: u64,
     pub(crate) grid_z: u64,
@@ -232,6 +311,55 @@ enum SidebandDirection {
     Receive,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct IndexShareTraceSummary {
+    pub(crate) records: usize,
+    pub(crate) exec_records: usize,
+    pub(crate) full_exec_records: usize,
+    pub(crate) shared_exec_records: usize,
+    pub(crate) shared_exec_with_input_top_k: usize,
+    pub(crate) shared_exec_missing_input_top_k: usize,
+    pub(crate) top_k_records: usize,
+    pub(crate) top_k_from_indexer: usize,
+    pub(crate) top_k_from_full_visible: usize,
+    pub(crate) consume_records: usize,
+    pub(crate) min_consume_width: Option<i64>,
+    pub(crate) max_consume_width: Option<i64>,
+    pub(crate) full_layers: Vec<i32>,
+    pub(crate) shared_layers: Vec<i32>,
+}
+
+impl IndexShareTraceSummary {
+    pub(crate) fn is_empty(summary: &Self) -> bool {
+        summary.records == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IndexShareTraceEvent {
+    Exec,
+    TopK,
+    Consume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct IndexShareTraceRecord {
+    pub(crate) event: IndexShareTraceEvent,
+    pub(crate) layer: i32,
+    pub(crate) role: Option<String>,
+    pub(crate) input_top_k: Option<bool>,
+    pub(crate) stage_filtered: Option<bool>,
+    pub(crate) layer_start: Option<i32>,
+    pub(crate) layer_end: Option<i32>,
+    pub(crate) source: Option<String>,
+    pub(crate) width: Option<i64>,
+    pub(crate) batch: Option<i64>,
+    pub(crate) stream: Option<i64>,
+    pub(crate) visible_kv: Option<i64>,
+    pub(crate) score_width: Option<i64>,
+}
+
 pub fn glm_dsa_op_report(args: GlmDsaOpReportArgs) -> Result<()> {
     let output = args.output.clone();
     let report = build_report(&args)?;
@@ -260,8 +388,13 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let records = parse_timing_records(&text)
             .with_context(|| format!("parse GLM-DSA op timing records in {}", path.display()))?;
-        if records.is_empty() {
-            bail!("{} contains no GLM-DSA op timing records", path.display());
+        let indexshare_records = parse_indexshare_trace_records(&text)
+            .with_context(|| format!("parse GLM-DSA IndexShare trace in {}", path.display()))?;
+        if records.is_empty() && indexshare_records.is_empty() {
+            bail!(
+                "{} contains no GLM-DSA op timing or IndexShare trace records",
+                path.display()
+            );
         }
         let sideband_records = parse_sideband_records(&text).with_context(|| {
             format!("parse GLM-DSA top-k sideband records in {}", path.display())
@@ -283,12 +416,17 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
             Some(limit) => sideband_records.into_iter().take(limit).collect::<Vec<_>>(),
             None => sideband_records,
         };
-        logs.push(summarize_log(
+        let summary = summarize_log(
             path.clone(),
             &records,
             &group_records,
             &sideband_records,
-        ));
+            &indexshare_records,
+        );
+        if args.require_indexshare_producer_consumer {
+            require_indexshare_producer_consumer_trace(path, &summary)?;
+        }
+        logs.push(summary);
     }
     Ok(GlmDsaOpReport { logs })
 }
@@ -506,6 +644,45 @@ fn delta(candidate: u64, baseline: u64) -> i128 {
     i128::from(candidate) - i128::from(baseline)
 }
 
+fn require_indexshare_producer_consumer_trace(path: &PathBuf, summary: &LogSummary) -> Result<()> {
+    let trace = &summary.indexshare_trace;
+    let mut missing = Vec::new();
+    if trace.records == 0 {
+        missing.push("indexshare_trace_records");
+    }
+    if trace.full_exec_records == 0 {
+        missing.push("full_exec");
+    }
+    if trace.top_k_from_indexer == 0 {
+        missing.push("top_k_from_indexer");
+    }
+    if trace.shared_exec_records == 0 {
+        missing.push("shared_exec");
+    }
+    if trace.shared_exec_with_input_top_k != trace.shared_exec_records {
+        missing.push("shared_exec_with_input_top_k");
+    }
+    if trace.shared_exec_missing_input_top_k != 0 {
+        missing.push("no_shared_exec_missing_input_top_k");
+    }
+    if trace.consume_records == 0 {
+        missing.push("consume");
+    }
+    if !matches!(trace.min_consume_width, Some(width) if width > 0) {
+        missing.push("positive_consume_width");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} does not prove native GLM-DSA IndexShare producer/consumer flow; missing {}; trace={:?}",
+        path.display(),
+        missing.join(","),
+        trace
+    )
+}
+
 pub(crate) fn parse_timing_records(text: &str) -> Result<Vec<TimingRecord>> {
     text.lines()
         .filter_map(|line| {
@@ -576,6 +753,18 @@ pub(crate) fn parse_direct_sparse_decision_records(
         .collect()
 }
 
+pub(crate) fn parse_compact_flash_policy_records(
+    text: &str,
+) -> Result<Vec<CompactFlashPolicyRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(COMPACT_FLASH_POLICY_PREFIX)
+                .map(|index| &line[index + COMPACT_FLASH_POLICY_PREFIX.len()..])
+        })
+        .map(parse_compact_flash_policy_record)
+        .collect()
+}
+
 pub(crate) fn parse_metal_dispatch_records(text: &str) -> Result<Vec<MetalDispatchRecord>> {
     text.lines()
         .filter_map(|line| {
@@ -584,6 +773,91 @@ pub(crate) fn parse_metal_dispatch_records(text: &str) -> Result<Vec<MetalDispat
         })
         .map(parse_metal_dispatch_record)
         .collect()
+}
+
+pub(crate) fn parse_compute_buffer_records(text: &str) -> Result<Vec<ComputeBufferRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(COMPUTE_BUFFER_PREFIX)
+                .map(|index| &line[index + COMPUTE_BUFFER_PREFIX.len()..])
+        })
+        .filter(|line| line.contains("compute buffer size"))
+        .map(parse_compute_buffer_record)
+        .collect()
+}
+
+pub(crate) fn parse_indexshare_trace_records(text: &str) -> Result<Vec<IndexShareTraceRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(INDEXSHARE_TRACE_MARKER)
+                .map(|index| &line[index + INDEXSHARE_TRACE_MARKER.len()..])
+        })
+        .filter(|line| {
+            line.starts_with("exec ") || line.starts_with("top_k ") || line.starts_with("consume ")
+        })
+        .map(parse_indexshare_trace_record)
+        .collect()
+}
+
+fn parse_indexshare_trace_record(line: &str) -> Result<IndexShareTraceRecord> {
+    let mut parts = line.split_whitespace();
+    let event = match parts.next().context("missing IndexShare trace event")? {
+        "exec" => IndexShareTraceEvent::Exec,
+        "top_k" => IndexShareTraceEvent::TopK,
+        "consume" => IndexShareTraceEvent::Consume,
+        value => bail!("unknown IndexShare trace event {value}"),
+    };
+    let fields = parts
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(IndexShareTraceRecord {
+        event,
+        layer: parse_field(&fields, "layer")?,
+        role: parse_optional_string_field(&fields, "role"),
+        input_top_k: parse_optional_bool_int_field(&fields, "input_top_k")?,
+        stage_filtered: parse_optional_bool_int_field(&fields, "stage_filtered")?,
+        layer_start: parse_optional_field(&fields, "layer_start")?,
+        layer_end: parse_optional_field(&fields, "layer_end")?,
+        source: parse_optional_string_field(&fields, "source"),
+        width: parse_optional_field(&fields, "width")?,
+        batch: parse_optional_field(&fields, "batch")?,
+        stream: parse_optional_field(&fields, "stream")?,
+        visible_kv: parse_optional_field(&fields, "visible_kv")?,
+        score_width: parse_optional_field(&fields, "score_width")?,
+    })
+}
+
+fn parse_compute_buffer_record(line: &str) -> Result<ComputeBufferRecord> {
+    let line = line.trim();
+    let (device, rest) = line
+        .split_once(" compute buffer size ")
+        .context("compute buffer record missing device or size marker")?;
+    let rest = rest
+        .strip_prefix("is ")
+        .or_else(|| rest.strip_prefix("of "))
+        .context("compute buffer record missing size verb")?;
+    let (size_text, rest) = rest
+        .split_once(" MiB, ")
+        .context("compute buffer record missing MiB size")?;
+    let (_, expected) = rest
+        .split_once("expectation of ")
+        .context("compute buffer record missing expected size")?;
+    Ok(ComputeBufferRecord {
+        device: device.to_string(),
+        size_mib: parse_first_f64(size_text)
+            .map_err(|error| anyhow::anyhow!("invalid compute buffer size: {error}"))?,
+        expected_mib: parse_first_f64(expected)
+            .map_err(|error| anyhow::anyhow!("invalid expected compute buffer size: {error}"))?,
+        matches_expectation: rest.contains("matches expectation"),
+    })
+}
+
+fn parse_first_f64(text: &str) -> Result<f64> {
+    let token = text
+        .split_whitespace()
+        .next()
+        .context("missing float token")?;
+    token.parse().context("parse float token")
 }
 
 fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisionRecord> {
@@ -597,8 +871,15 @@ fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisio
         sparse_batch: parse_field(&fields, "sparse_batch")?,
         sparse_streams: parse_field(&fields, "sparse_streams")?,
         prefill_cap: parse_field(&fields, "prefill_cap")?,
+        sparse_kv: parse_optional_field(&fields, "sparse_kv")?,
+        sparse_top_k: parse_optional_field(&fields, "sparse_top_k")?,
+        min_kv_topk_ratio: parse_optional_field(&fields, "min_kv_topk_ratio")?,
+        kv_topk_ratio: parse_optional_field(&fields, "kv_topk_ratio")?,
         dense_mask_bytes: parse_optional_field(&fields, "dense_mask_bytes")?,
         dense_mask_limit: parse_optional_field(&fields, "dense_mask_limit")?,
+        selector_reason: fields
+            .get("selector_reason")
+            .map(|value| (*value).to_string()),
         direct_enabled: parse_bool_int_field(&fields, "direct_enabled")?,
         prefill_enabled: parse_bool_int_field(&fields, "prefill_enabled")?,
         decode_shape: parse_bool_int_field(&fields, "decode_shape")?,
@@ -613,6 +894,37 @@ fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisio
     })
 }
 
+fn parse_compact_flash_policy_record(line: &str) -> Result<CompactFlashPolicyRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(CompactFlashPolicyRecord {
+        layer: parse_field(&fields, "layer")?,
+        ubatch_tokens: parse_field(&fields, "ubatch_tokens")?,
+        visible_kv: parse_field(&fields, "visible_kv")?,
+        top_k: parse_field(&fields, "top_k")?,
+        kv_topk_ratio: parse_field(&fields, "kv_topk_ratio")?,
+        min_kv_topk_ratio: parse_field(&fields, "min_kv_topk_ratio")?,
+        forced: parse_bool_int_field(&fields, "forced")?,
+        disabled: parse_bool_int_field(&fields, "disabled")?,
+        ratio_ok: parse_bool_int_field(&fields, "ratio_ok")?,
+        enabled: parse_bool_int_field(&fields, "enabled")?,
+        flash_attn: parse_bool_int_field(&fields, "flash_attn")?,
+        phase: fields.get("phase").map(|value| (*value).to_string()),
+        decode_shape: parse_bool_int_field(&fields, "decode_shape")?,
+        kq_b_ok: parse_bool_int_field(&fields, "kq_b_ok")?,
+        sinks_ok: parse_bool_int_field(&fields, "sinks_ok")?,
+        alibi_ok: parse_bool_int_field(&fields, "alibi_ok")?,
+        soft_cap_ok: parse_bool_int_field(&fields, "soft_cap_ok")?,
+        no_mask: parse_optional_bool_int_field(&fields, "no_mask")?,
+        use_compact: parse_bool_int_field(&fields, "use_compact")?,
+        selector_reason: fields
+            .get("selector_reason")
+            .map(|value| (*value).to_string()),
+    })
+}
+
 fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
     let fields = line
         .split_whitespace()
@@ -622,7 +934,25 @@ fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
         op: parse_string_field(&fields, "op")?,
         kernel: parse_optional_string_field(&fields, "kernel"),
         tensor: parse_string_field(&fields, "tensor")?,
+        next: parse_optional_string_field(&fields, "next"),
+        next_op: parse_optional_string_field(&fields, "next_op"),
+        shared_gate: parse_optional_string_field(&fields, "shared_gate"),
+        shared_up: parse_optional_string_field(&fields, "shared_up"),
+        weighted_sum: parse_optional_string_field(&fields, "weighted_sum"),
+        weighted_sum_op: parse_optional_string_field(&fields, "weighted_sum_op"),
         reason: parse_optional_string_field(&fields, "reason"),
+        shared_branch: parse_optional_bool_int_field(&fields, "shared_branch")?,
+        weighted_sum_uses_down: parse_optional_bool_int_field(&fields, "weighted_sum_uses_down")?,
+        natural_order: parse_optional_bool_int_field(&fields, "natural_order")?,
+        backend_candidate: parse_optional_bool_int_field(&fields, "backend_candidate")?,
+        pair_fusable: parse_optional_bool_int_field(&fields, "pair_fusable")?,
+        subgraph_fusable: parse_optional_bool_int_field(&fields, "subgraph_fusable")?,
+        motif_nodes: parse_optional_field(&fields, "motif_nodes")?,
+        fusion_outputs: parse_optional_field(&fields, "fusion_outputs")?,
+        filtered_gap: parse_optional_field(&fields, "filtered_gap")?,
+        graph_gap: parse_optional_field(&fields, "graph_gap")?,
+        weighted_sum_gap: parse_optional_field(&fields, "weighted_sum_gap")?,
+        weighted_sum_graph_gap: parse_optional_field(&fields, "weighted_sum_graph_gap")?,
         parallel: parse_optional_bool_int_field(&fields, "parallel")?,
         q_type: parse_optional_string_field(&fields, "q_type"),
         k_type: parse_optional_string_field(&fields, "k_type"),
@@ -640,6 +970,23 @@ fn parse_metal_dispatch_record(line: &str) -> Result<MetalDispatchRecord> {
         kv: parse_optional_field(&fields, "kv")?,
         top_k: parse_optional_field(&fields, "top_k")?,
         top_stream: parse_optional_field(&fields, "top_stream")?,
+        selected_keys: parse_optional_field(&fields, "selected_keys")?,
+        q_read_bytes: parse_optional_field(&fields, "q_read_bytes")?,
+        k_read_bytes: parse_optional_field(&fields, "k_read_bytes")?,
+        v_read_bytes: parse_optional_field(&fields, "v_read_bytes")?,
+        mask_read_bytes: parse_optional_field(&fields, "mask_read_bytes")?,
+        top_k_read_bytes: parse_optional_field(&fields, "top_k_read_bytes")?,
+        scratch_per_tg_bytes: parse_optional_field(&fields, "scratch_per_tg_bytes")?,
+        score_fma: parse_optional_field(&fields, "score_fma")?,
+        value_fma: parse_optional_field(&fields, "value_fma")?,
+        reduction_strategy: parse_optional_string_field(&fields, "reduction_strategy"),
+        rows: parse_optional_field(&fields, "rows")?,
+        partial_bytes: parse_optional_field(&fields, "partial_bytes")?,
+        softmax_bytes: parse_optional_field(&fields, "softmax_bytes")?,
+        tmp_bytes: parse_optional_field(&fields, "tmp_bytes")?,
+        nwg: parse_optional_field(&fields, "nwg")?,
+        tmp_f16: parse_optional_bool_int_field(&fields, "tmp_f16")?,
+        dst_partial: parse_optional_bool_int_field(&fields, "dst_partial")?,
         grid_x: parse_field(&fields, "grid_x")?,
         grid_y: parse_field(&fields, "grid_y")?,
         grid_z: parse_field(&fields, "grid_z")?,
@@ -853,6 +1200,7 @@ fn summarize_log(
     records: &[TimingRecord],
     group_records: &[TimingGroupRecord],
     sideband_records: &[SidebandRecord],
+    indexshare_records: &[IndexShareTraceRecord],
 ) -> LogSummary {
     let mut stage_records: BTreeMap<i32, BTreeMap<Phase, PhaseSummary>> = BTreeMap::new();
     for record in records {
@@ -886,6 +1234,7 @@ fn summarize_log(
     let hottest_group_records = summarize_hottest_groups(&grouped_records);
 
     let sideband_records = summarize_sideband_records(sideband_records);
+    let indexshare_trace = summarize_indexshare_trace_records(indexshare_records);
     LogSummary {
         path,
         records: records.len(),
@@ -893,6 +1242,70 @@ fn summarize_log(
         group_records: grouped_records,
         hottest_group_records,
         sideband_records,
+        indexshare_trace,
+    }
+}
+
+pub(crate) fn summarize_indexshare_trace_records(
+    records: &[IndexShareTraceRecord],
+) -> IndexShareTraceSummary {
+    let mut summary = IndexShareTraceSummary {
+        records: records.len(),
+        ..IndexShareTraceSummary::default()
+    };
+    for record in records {
+        match record.event {
+            IndexShareTraceEvent::Exec => {
+                summary.exec_records += 1;
+                match record.role.as_deref() {
+                    Some("full") => {
+                        summary.full_exec_records += 1;
+                        push_unique_sorted(&mut summary.full_layers, record.layer);
+                    }
+                    Some("shared") => {
+                        summary.shared_exec_records += 1;
+                        push_unique_sorted(&mut summary.shared_layers, record.layer);
+                        if record.input_top_k == Some(true) {
+                            summary.shared_exec_with_input_top_k += 1;
+                        } else {
+                            summary.shared_exec_missing_input_top_k += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            IndexShareTraceEvent::TopK => {
+                summary.top_k_records += 1;
+                match record.source.as_deref() {
+                    Some("indexer") => summary.top_k_from_indexer += 1,
+                    Some("full_visible") => summary.top_k_from_full_visible += 1,
+                    _ => {}
+                }
+            }
+            IndexShareTraceEvent::Consume => {
+                summary.consume_records += 1;
+                if let Some(width) = record.width {
+                    summary.min_consume_width = Some(
+                        summary
+                            .min_consume_width
+                            .map_or(width, |current| current.min(width)),
+                    );
+                    summary.max_consume_width = Some(
+                        summary
+                            .max_consume_width
+                            .map_or(width, |current| current.max(width)),
+                    );
+                }
+            }
+        }
+    }
+    summary
+}
+
+fn push_unique_sorted(values: &mut Vec<i32>, value: i32) {
+    match values.binary_search(&value) {
+        Ok(_) => {}
+        Err(index) => values.insert(index, value),
     }
 }
 
@@ -1090,9 +1503,11 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 mod tests {
     use super::{
         ComparisonKey, OpBucket, Phase, PhaseSummary, SidebandDirection, compare_phase,
-        parse_direct_sparse_decision_records, parse_metal_dispatch_records, parse_sideband_record,
-        parse_sideband_records, parse_timing_group_records, parse_timing_record,
-        parse_timing_records, summarize_comparison_rows, summarize_log,
+        parse_compact_flash_policy_records, parse_compute_buffer_records,
+        parse_direct_sparse_decision_records, parse_indexshare_trace_records,
+        parse_metal_dispatch_records, parse_sideband_record, parse_sideband_records,
+        parse_timing_group_records, parse_timing_record, parse_timing_records,
+        require_indexshare_producer_consumer_trace, summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -1105,10 +1520,21 @@ mod tests {
     const SIDEBAND_RECEIVE_LINE: &str = "skippy: glm_dsa_top_k_sideband_receive stage=stage-1 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
     const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 dense_mask_bytes=270336 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
+    const DIRECT_SPARSE_DECISION_LINE_WITH_REASON: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1024 sparse_batch=1024 sparse_streams=1 prefill_cap=32 sparse_kv=99328 sparse_top_k=1024 min_kv_topk_ratio=32 kv_topk_ratio=97 dense_mask_bytes=203423744 dense_mask_limit=268435456 selector_reason=kv_topk_ratio direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
-    const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 grid_x=32 grid_y=4 grid_z=1 threads_x=256";
+    const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
+    const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 selected_keys=1048576 q_read_bytes=2415919104 k_read_bytes=1207959552 v_read_bytes=1073741824 mask_read_bytes=4194304 top_k_read_bytes=4194304 scratch_per_tg_bytes=1024 score_fma=603979776 value_fma=536870912 reduction_strategy=threadgroup_direct grid_x=32 grid_y=4 grid_z=8 threads_x=256 nwg=8 tmp_f16=1 dst_partial=1";
+    const METAL_DECODE_VEC_REDUCE_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec_reduce tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=4096 heads=64 stream=1 kv=4096 top_k=2048 top_stream=1 rows=262144 partial_bytes=536870912 softmax_bytes=4194304 tmp_bytes=541065216 grid_x=262144 grid_y=1 grid_z=1 threads_x=32 threads_y=2 nwg=2 tmp_f16=1 dst_partial=1";
     const METAL_MUL_MAT_ID_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=mul_mat_id kernel=mul_mv_id tensor=ffn_moe_down-45 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 ne00=5120 ne01=6144 experts=256 used_experts=8 tokens=1 min_tokens=128 nr0=2 nr1=1 nsg=1 grid_x=1536 grid_y=1 grid_z=8 threads_x=32 threads_y=2";
     const METAL_ROUTE_ENCODE_CANDIDATE_LINE: &str = "skippy: glm_dsa_metal_dispatch op=topk_moe_route_encode tensor=blk.45.ffn_moe_probs candidate=UNARY/blk.45.ffn_moe_probs,RESHAPE/view reason=fused filtered_nodes=65 graph_nodes=71 graph_idx=30 grid_x=1 grid_y=1 grid_z=1 threads_x=1";
+    const METAL_WEIGHTED_DOWN_CANDIDATE_LINE: &str = "skippy: glm_dsa_metal_dispatch op=mul_mat_id_weighted_down_candidate tensor=ffn_moe_down-45 next=ffn_gate-45 next_op=MUL_MAT shared_gate=ffn_gate-45 shared_up=ffn_up-45 weighted_sum=ffn_moe_out-45 weighted_sum_op=MOE_WEIGHTED_SUM reason=full_motif shared_branch=1 weighted_sum_uses_down=1 pair_fusable=0 subgraph_fusable=1 filtered_gap=0 graph_gap=0 weighted_sum_gap=2 weighted_sum_graph_gap=2 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 experts=256 used_experts=8 tokens=1 grid_x=1 grid_y=1 grid_z=1 threads_x=1";
+    const METAL_GLM_DSA_MOE_MOTIF_CANDIDATE_LINE: &str = "skippy: glm_dsa_metal_dispatch op=glm_dsa_moe_motif_candidate tensor=ffn_moe_down-45 shared_gate=ffn_gate-45 shared_up=ffn_up-45 weighted_sum=ffn_moe_out-45 reason=full_motif natural_order=1 backend_candidate=1 subgraph_fusable=1 motif_nodes=4 fusion_outputs=3 weighted_sum_gap=2 weighted_sum_graph_gap=2 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 experts=256 used_experts=8 tokens=1 grid_x=1 grid_y=1 grid_z=1 threads_x=1";
+    const COMPUTE_BUFFER_LINES: &str = "~llama_context:       MTL0 compute buffer size is 2421.0264 MiB, matches expectation of 2421.0264 MiB\n~llama_context:       MTL0 compute buffer size of 667.8496 MiB, does not match expectation of 507.0029 MiB\n~llama_context:        CPU compute buffer size is  24.0059 MiB, matches expectation of  24.0059 MiB\n~llama_context:        CPU compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB, trailing native detail";
+    const INDEXSHARE_CONTRACT_LINE: &str = "llama_glm_dsa_log_indexshare_contract: GLM_DSA IndexShare source=metadata_types full_layers=21 shared_layers=57 indexer_tensor_layers=1 filtered_indexer_groups=0 out_of_stage_indexer_groups=76 stage_filtered=1 layer_start=30 layer_end=32 top_k=2048 top_k_frequency=0 skip_top_k_offset=0";
+    const INDEXSHARE_EXEC_FULL_LINE: &str = "llama_model_glm_dsa::graph::graph: GLM_DSA IndexShare exec layer=30 role=full input_top_k=0 stage_filtered=1 layer_start=30 layer_end=34";
+    const INDEXSHARE_TOP_K_LINE: &str = "llama_model_glm_dsa::graph::graph: GLM_DSA IndexShare top_k layer=30 source=indexer width=1024 score_width=4096";
+    const INDEXSHARE_EXEC_SHARED_LINE: &str = "llama_model_glm_dsa::graph::graph: GLM_DSA IndexShare exec layer=31 role=shared input_top_k=1 stage_filtered=1 layer_start=30 layer_end=34";
+    const INDEXSHARE_CONSUME_LINE: &str = "llama_model_glm_dsa::graph::graph: GLM_DSA IndexShare consume layer=31 source=last_top_k width=1024 batch=1 stream=1";
 
     #[test]
     fn parses_timing_record_with_prefix() {
@@ -1128,7 +1554,7 @@ mod tests {
         assert_eq!(record.top_k_nodes, Some(40));
         assert_eq!(record.top_k_us, Some(49_065));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[]);
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1147,7 +1573,7 @@ mod tests {
         assert_eq!(record.sparse_mask_topk_us, Some(2000));
         assert_eq!(record.sparse_mask_add_us, Some(3000));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[]);
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1166,7 +1592,7 @@ mod tests {
         assert_eq!(record.dsa_sparse_attn_nodes, Some(47));
         assert_eq!(record.dsa_sparse_attn_us, Some(114543));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[]);
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1185,8 +1611,13 @@ mod tests {
         assert_eq!(record.ubatch_tokens, 33);
         assert_eq!(record.sparse_batch, 33);
         assert_eq!(record.prefill_cap, 32);
+        assert_eq!(record.sparse_kv, None);
+        assert_eq!(record.sparse_top_k, None);
+        assert_eq!(record.min_kv_topk_ratio, None);
+        assert_eq!(record.kv_topk_ratio, None);
         assert_eq!(record.dense_mask_bytes, Some(270_336));
         assert_eq!(record.dense_mask_limit, Some(536_870_912));
+        assert_eq!(record.selector_reason, None);
         assert!(record.direct_enabled);
         assert!(record.prefill_enabled);
         assert!(!record.decode_shape);
@@ -1198,6 +1629,50 @@ mod tests {
         assert!(record.alibi_ok);
         assert!(record.soft_cap_ok);
         assert!(!record.use_direct);
+    }
+
+    #[test]
+    fn parses_compact_flash_policy_records() {
+        let records = parse_compact_flash_policy_records(COMPACT_FLASH_POLICY_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.layer, 30);
+        assert_eq!(record.ubatch_tokens, 1);
+        assert_eq!(record.visible_kv, 8192);
+        assert_eq!(record.top_k, 2048);
+        assert_eq!(record.kv_topk_ratio, 4);
+        assert_eq!(record.min_kv_topk_ratio, 2);
+        assert!(!record.forced);
+        assert!(!record.disabled);
+        assert!(record.ratio_ok);
+        assert!(record.enabled);
+        assert!(record.flash_attn);
+        assert_eq!(record.phase.as_deref(), Some("decode"));
+        assert!(record.decode_shape);
+        assert!(record.kq_b_ok);
+        assert!(record.sinks_ok);
+        assert!(record.alibi_ok);
+        assert!(record.soft_cap_ok);
+        assert_eq!(record.no_mask, Some(true));
+        assert!(record.use_compact);
+        assert_eq!(record.selector_reason.as_deref(), Some("decode_compact"));
+    }
+
+    #[test]
+    fn parses_direct_sparse_decision_selector_reason() {
+        let records =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_LINE_WITH_REASON).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.ubatch_tokens, 1024);
+        assert_eq!(record.sparse_kv, Some(99_328));
+        assert_eq!(record.sparse_top_k, Some(1024));
+        assert_eq!(record.min_kv_topk_ratio, Some(32));
+        assert_eq!(record.kv_topk_ratio, Some(97));
+        assert_eq!(record.dense_mask_bytes, Some(203_423_744));
+        assert_eq!(record.dense_mask_limit, Some(268_435_456));
+        assert_eq!(record.selector_reason.as_deref(), Some("kv_topk_ratio"));
+        assert!(record.use_direct);
     }
 
     #[test]
@@ -1223,16 +1698,150 @@ mod tests {
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record.op, "dsa_sparse_attn");
+        assert_eq!(record.kernel.as_deref(), Some("decode_vec"));
         assert_eq!(record.tensor, "blk.30.dsa_sparse_attn");
         assert_eq!(record.q_width, Some(576));
         assert_eq!(record.v_width, Some(512));
         assert_eq!(record.batch, Some(32));
         assert_eq!(record.heads, Some(4));
         assert_eq!(record.top_k, Some(1024));
+        assert_eq!(record.selected_keys, Some(1_048_576));
+        assert_eq!(record.q_read_bytes, Some(2_415_919_104));
+        assert_eq!(record.k_read_bytes, Some(1_207_959_552));
+        assert_eq!(record.v_read_bytes, Some(1_073_741_824));
+        assert_eq!(record.mask_read_bytes, Some(4_194_304));
+        assert_eq!(record.top_k_read_bytes, Some(4_194_304));
+        assert_eq!(record.scratch_per_tg_bytes, Some(1024));
+        assert_eq!(record.score_fma, Some(603_979_776));
+        assert_eq!(record.value_fma, Some(536_870_912));
+        assert_eq!(
+            record.reduction_strategy.as_deref(),
+            Some("threadgroup_direct")
+        );
         assert_eq!(record.grid_x, 32);
         assert_eq!(record.grid_y, 4);
+        assert_eq!(record.grid_z, 8);
+        assert_eq!(record.nwg, Some(8));
+        assert_eq!(record.tmp_f16, Some(true));
+        assert_eq!(record.dst_partial, Some(true));
         assert_eq!(record.threads_x, 256);
         assert_eq!(record.threads_y, None);
+    }
+
+    #[test]
+    fn parses_decode_vec_reduce_dispatch_fields() {
+        let records = parse_metal_dispatch_records(METAL_DECODE_VEC_REDUCE_DISPATCH_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.op, "dsa_sparse_attn");
+        assert_eq!(record.kernel.as_deref(), Some("decode_vec_reduce"));
+        assert_eq!(record.rows, Some(262_144));
+        assert_eq!(record.partial_bytes, Some(536_870_912));
+        assert_eq!(record.softmax_bytes, Some(4_194_304));
+        assert_eq!(record.tmp_bytes, Some(541_065_216));
+        assert_eq!(record.grid_x, 262_144);
+        assert_eq!(record.threads_x, 32);
+        assert_eq!(record.threads_y, Some(2));
+        assert_eq!(record.nwg, Some(2));
+        assert_eq!(record.tmp_f16, Some(true));
+        assert_eq!(record.dst_partial, Some(true));
+    }
+
+    #[test]
+    fn parses_compute_buffer_records() {
+        let records = parse_compute_buffer_records(COMPUTE_BUFFER_LINES).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].device, "MTL0");
+        assert_eq!(records[0].size_mib, 2421.0264);
+        assert_eq!(records[0].expected_mib, 2421.0264);
+        assert!(records[0].matches_expectation);
+        assert_eq!(records[1].device, "MTL0");
+        assert_eq!(records[1].size_mib, 667.8496);
+        assert_eq!(records[1].expected_mib, 507.0029);
+        assert!(!records[1].matches_expectation);
+        assert_eq!(records[2].device, "CPU");
+        assert_eq!(records[2].size_mib, 24.0059);
+        assert!(records[2].matches_expectation);
+        assert_eq!(records[3].device, "CPU");
+        assert_eq!(records[3].size_mib, 0.0);
+        assert_eq!(records[3].expected_mib, 0.0);
+        assert!(records[3].matches_expectation);
+    }
+
+    #[test]
+    fn parses_indexshare_trace_records() {
+        let text = format!(
+            "{INDEXSHARE_CONTRACT_LINE}\n{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}\n{INDEXSHARE_EXEC_SHARED_LINE}\n{INDEXSHARE_CONSUME_LINE}"
+        );
+        let records = parse_indexshare_trace_records(&text).unwrap();
+
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].event, super::IndexShareTraceEvent::Exec);
+        assert_eq!(records[0].layer, 30);
+        assert_eq!(records[0].role.as_deref(), Some("full"));
+        assert_eq!(records[0].input_top_k, Some(false));
+        assert_eq!(records[0].stage_filtered, Some(true));
+        assert_eq!(records[0].layer_start, Some(30));
+        assert_eq!(records[0].layer_end, Some(34));
+        assert_eq!(records[1].event, super::IndexShareTraceEvent::TopK);
+        assert_eq!(records[1].source.as_deref(), Some("indexer"));
+        assert_eq!(records[1].width, Some(1024));
+        assert_eq!(records[1].score_width, Some(4096));
+        assert_eq!(records[3].event, super::IndexShareTraceEvent::Consume);
+        assert_eq!(records[3].source.as_deref(), Some("last_top_k"));
+        assert_eq!(records[3].batch, Some(1));
+        assert_eq!(records[3].stream, Some(1));
+    }
+
+    #[test]
+    fn summarizes_indexshare_trace_records() {
+        let timing = parse_timing_records(LINE).unwrap();
+        let text = format!(
+            "{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}\n{INDEXSHARE_EXEC_SHARED_LINE}\n{INDEXSHARE_CONSUME_LINE}"
+        );
+        let records = parse_indexshare_trace_records(&text).unwrap();
+        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &records);
+
+        assert_eq!(summary.indexshare_trace.records, 4);
+        assert_eq!(summary.indexshare_trace.exec_records, 2);
+        assert_eq!(summary.indexshare_trace.full_exec_records, 1);
+        assert_eq!(summary.indexshare_trace.shared_exec_records, 1);
+        assert_eq!(summary.indexshare_trace.shared_exec_with_input_top_k, 1);
+        assert_eq!(summary.indexshare_trace.shared_exec_missing_input_top_k, 0);
+        assert_eq!(summary.indexshare_trace.top_k_from_indexer, 1);
+        assert_eq!(summary.indexshare_trace.consume_records, 1);
+        assert_eq!(summary.indexshare_trace.min_consume_width, Some(1024));
+        assert_eq!(summary.indexshare_trace.max_consume_width, Some(1024));
+        assert_eq!(summary.indexshare_trace.full_layers, vec![30]);
+        assert_eq!(summary.indexshare_trace.shared_layers, vec![31]);
+    }
+
+    #[test]
+    fn accepts_indexshare_producer_consumer_guard() {
+        let timing = parse_timing_records(LINE).unwrap();
+        let text = format!(
+            "{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}\n{INDEXSHARE_EXEC_SHARED_LINE}\n{INDEXSHARE_CONSUME_LINE}"
+        );
+        let records = parse_indexshare_trace_records(&text).unwrap();
+        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &records);
+
+        require_indexshare_producer_consumer_trace(&"stage1.log".into(), &summary).unwrap();
+    }
+
+    #[test]
+    fn rejects_indexshare_trace_without_shared_consumer() {
+        let timing = parse_timing_records(LINE).unwrap();
+        let text = format!("{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}");
+        let records = parse_indexshare_trace_records(&text).unwrap();
+        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &records);
+
+        let error =
+            require_indexshare_producer_consumer_trace(&"stage1.log".into(), &summary).unwrap_err();
+
+        assert!(
+            error.to_string().contains("shared_exec"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
@@ -1260,6 +1869,52 @@ mod tests {
         assert_eq!(record.reason.as_deref(), Some("fused"));
         assert_eq!(record.grid_x, 1);
         assert_eq!(record.threads_x, 1);
+    }
+
+    #[test]
+    fn parses_weighted_down_candidate_fields() {
+        let records = parse_metal_dispatch_records(METAL_WEIGHTED_DOWN_CANDIDATE_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.op, "mul_mat_id_weighted_down_candidate");
+        assert_eq!(record.tensor, "ffn_moe_down-45");
+        assert_eq!(record.next.as_deref(), Some("ffn_gate-45"));
+        assert_eq!(record.next_op.as_deref(), Some("MUL_MAT"));
+        assert_eq!(record.shared_gate.as_deref(), Some("ffn_gate-45"));
+        assert_eq!(record.shared_up.as_deref(), Some("ffn_up-45"));
+        assert_eq!(record.weighted_sum.as_deref(), Some("ffn_moe_out-45"));
+        assert_eq!(record.weighted_sum_op.as_deref(), Some("MOE_WEIGHTED_SUM"));
+        assert_eq!(record.reason.as_deref(), Some("full_motif"));
+        assert_eq!(record.shared_branch, Some(true));
+        assert_eq!(record.weighted_sum_uses_down, Some(true));
+        assert_eq!(record.pair_fusable, Some(false));
+        assert_eq!(record.subgraph_fusable, Some(true));
+        assert_eq!(record.filtered_gap, Some(0));
+        assert_eq!(record.graph_gap, Some(0));
+        assert_eq!(record.weighted_sum_gap, Some(2));
+        assert_eq!(record.weighted_sum_graph_gap, Some(2));
+        assert_eq!(record.src_type.as_deref(), Some("q3_K"));
+    }
+
+    #[test]
+    fn parses_glm_dsa_moe_motif_candidate_fields() {
+        let records = parse_metal_dispatch_records(METAL_GLM_DSA_MOE_MOTIF_CANDIDATE_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.op, "glm_dsa_moe_motif_candidate");
+        assert_eq!(record.tensor, "ffn_moe_down-45");
+        assert_eq!(record.shared_gate.as_deref(), Some("ffn_gate-45"));
+        assert_eq!(record.shared_up.as_deref(), Some("ffn_up-45"));
+        assert_eq!(record.weighted_sum.as_deref(), Some("ffn_moe_out-45"));
+        assert_eq!(record.reason.as_deref(), Some("full_motif"));
+        assert_eq!(record.natural_order, Some(true));
+        assert_eq!(record.backend_candidate, Some(true));
+        assert_eq!(record.subgraph_fusable, Some(true));
+        assert_eq!(record.motif_nodes, Some(4));
+        assert_eq!(record.fusion_outputs, Some(3));
+        assert_eq!(record.weighted_sum_gap, Some(2));
+        assert_eq!(record.weighted_sum_graph_gap, Some(2));
+        assert_eq!(record.src_type.as_deref(), Some("q3_K"));
     }
 
     #[test]
@@ -1300,7 +1955,7 @@ mod tests {
                 .replace("total_us=1475800", "total_us=200")
         );
         let records = parse_timing_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &records, &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &records, &[], &[], &[]);
         let stages = summary.stage_records.get(&1).unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
@@ -1335,7 +1990,7 @@ mod tests {
             "{LINE}\n{GROUP_LINE_LAYER_0}\n{GROUP_LINE_LAYER_1}"
         ))
         .unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &groups, &[]);
+        let summary = summarize_log("stage1.log".into(), &timing, &groups, &[], &[]);
         let stage = summary.group_records.get(&1).unwrap();
         let layer_0 = stage.get("layer_0").unwrap().get(&Phase::Prefill).unwrap();
         let layer_1 = stage.get("layer_1").unwrap().get(&Phase::Prefill).unwrap();
@@ -1393,7 +2048,7 @@ mod tests {
     fn summarizes_sideband_payload_ratios() {
         let timing = parse_timing_records(LINE).unwrap();
         let sideband = parse_sideband_records(SIDEBAND_LINE).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband);
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[]);
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
         assert_eq!(decode.records, 1);
@@ -1420,7 +2075,7 @@ mod tests {
         let timing = parse_timing_records(LINE).unwrap();
         let text = format!("{SIDEBAND_LINE}\n{SIDEBAND_RECEIVE_LINE}");
         let sideband = parse_sideband_records(&text).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband);
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[]);
         let forward = summary
             .sideband_records
             .get("stage-0")
@@ -1445,7 +2100,7 @@ mod tests {
     fn summarizes_sideband_padding_for_prefill() {
         let timing = parse_timing_records(LINE).unwrap();
         let sideband = parse_sideband_records(PADDED_PREFILL_SIDEBAND_LINE).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband);
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[]);
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         assert_eq!(prefill.tokens, 128);

@@ -24,6 +24,7 @@ The smoke proves:
   - missing IndexShare metadata fails llama.cpp load
   - Shared layers with indexer tensors fail llama.cpp load
   - contradictory IndexShare role/frequency metadata fails llama.cpp load
+  - MTP/NextN layers without complete indexer tensors fail llama.cpp load
   - missing split KV-B tensors fail llama.cpp load
   - stale unsplit attn_kv_b tensors fail llama.cpp load
   - invalid NextN and MoE hparams fail llama.cpp load
@@ -176,6 +177,7 @@ shared_bad_model="$WORK_DIR/shared-with-indexer.gguf"
 odd_rope_model="$WORK_DIR/odd-rope.gguf"
 short_indexer_model="$WORK_DIR/short-indexer-head.gguf"
 frequency_conflict_model="$WORK_DIR/indexshare-frequency-conflict.gguf"
+missing_mtp_indexer_model="$WORK_DIR/missing-mtp-indexer.gguf"
 bad_nextn_model="$WORK_DIR/bad-nextn-count.gguf"
 bad_experts_model="$WORK_DIR/bad-expert-counts.gguf"
 missing_split_model="$WORK_DIR/missing-split-kv-b.gguf"
@@ -206,6 +208,15 @@ python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
   "$MODEL" \
   "$frequency_conflict_model" \
   --set-u32 glm-dsa.attention.indexer.top_k_frequency=1
+
+python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
+  "$MODEL" \
+  "$missing_mtp_indexer_model" \
+  --rename-tensor blk.3.indexer.k_norm.weight=blk.3.indexer.k_norm_missing.weight \
+  --rename-tensor blk.3.indexer.k_norm.bias=blk.3.indexer.k_norm_missing.bias \
+  --rename-tensor blk.3.indexer.proj.weight=blk.3.indexer.proj_missing.weight \
+  --rename-tensor blk.3.indexer.attn_k.weight=blk.3.indexer.attn_k_missing.weight \
+  --rename-tensor blk.3.indexer.attn_q_b.weight=blk.3.indexer.attn_q_b_missing.weight
 
 python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
   "$MODEL" \
@@ -286,6 +297,15 @@ fi
 assert_log_contains \
   "$WORK_DIR/frequency_conflict.stderr" \
   "GLM_DSA attention.indexer.types conflicts with top_k_frequency at layer 1"
+
+missing_mtp_indexer_status="$(run_llama missing_mtp_indexer "$missing_mtp_indexer_model")"
+if [[ "$missing_mtp_indexer_status" == "0" ]]; then
+  echo "missing MTP indexer fixture unexpectedly loaded" >&2
+  exit 1
+fi
+assert_log_contains \
+  "$WORK_DIR/missing_mtp_indexer.stderr" \
+  "GLM_DSA MTP/NextN layer 3 requires complete indexer tensors"
 
 bad_nextn_status="$(run_llama bad_nextn "$bad_nextn_model")"
 if [[ "$bad_nextn_status" == "0" ]]; then

@@ -46,6 +46,7 @@ skippy-model-package write-package org/repo:Q4_K_M --out-dir model-package/
 skippy-model-package write-package org/repo:Q4_K_M --projector mmproj-model-f16.gguf --out-dir model-package/
 skippy-model-package validate model.gguf slices/stage-*.gguf
 skippy-model-package validate-package model.gguf model-package/
+skippy-model-package glm-dsa-contract model-package/
 ```
 
 `write` and `write-stages` call the llama C ABI, which uses llama.cpp GGUF
@@ -91,3 +92,9 @@ than inferred from arbitrary filesystem paths.
 `validate-package` checks the source-model checksum, manifest artifact checksums
 and sizes, declared tensor counts/bytes, layer coverage, duplicate layers, and
 exact owned tensor coverage against the source model.
+
+`glm-dsa-contract` is the local pre-spend gate for GLM-5.2-style artifacts. It
+checks GGUF metadata, tensor completeness, native MTP preservation, and
+Full/Shared IndexShare roles. New GLM-DSA artifacts must expose roles through
+`glm-dsa.attention.indexer.types` or frequency/offset metadata; tensor-presence
+inference is reported as a compatibility fallback and fails the contract gate.

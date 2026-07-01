@@ -13,8 +13,7 @@ from pathlib import Path
 VOCAB_SIZE = 8
 HIDDEN_SIZE = 4
 INTERMEDIATE_SIZE = 8
-TARGET_LAYERS = 3
-MTP_LAYER = 3
+DEFAULT_TARGET_LAYERS = 3
 ATTENTION_HEADS = 1
 QK_NOPE_HEAD_DIM = 3
 QK_ROPE_HEAD_DIM = 2
@@ -137,20 +136,60 @@ def add_mtp(tensors: list[Tensor], layer: int) -> None:
     add_f32(tensors, layer_name(layer, "shared_head.norm.weight"), [HIDDEN_SIZE], 1.0)
 
 
-def build_tensors() -> list[Tensor]:
+def build_tensors(indexer_types: list[str]) -> list[Tensor]:
+    target_layers = len(indexer_types)
+    mtp_layer = target_layers
     tensors: list[Tensor] = []
     add_f32(tensors, "model.embed_tokens.weight", [VOCAB_SIZE, HIDDEN_SIZE])
     add_f32(tensors, "model.norm.weight", [HIDDEN_SIZE], 1.0)
-    for layer in range(TARGET_LAYERS):
+    for layer in range(target_layers):
         add_attention(tensors, layer)
-    add_attention(tensors, MTP_LAYER)
+    add_attention(tensors, mtp_layer)
     add_dense_ffn(tensors, 0)
-    for layer in [1, 2, MTP_LAYER]:
+    for layer in range(1, target_layers):
         add_moe(tensors, layer)
-    for layer in [0, 2, MTP_LAYER]:
-        add_indexer(tensors, layer)
-    add_mtp(tensors, MTP_LAYER)
+    add_moe(tensors, mtp_layer)
+    for layer, role in enumerate(indexer_types):
+        if role == "full":
+            add_indexer(tensors, layer)
+    add_indexer(tensors, mtp_layer)
+    add_mtp(tensors, mtp_layer)
     return tensors
+
+
+def write_config(root: Path, indexer_types: list[str], index_topk_freq: int, index_skip_topk_offset: int) -> None:
+    target_layers = len(indexer_types)
+    config = {
+        "model_type": "glm_moe_dsa",
+        "vocab_size": VOCAB_SIZE,
+        "max_position_embeddings": 128,
+        "hidden_size": HIDDEN_SIZE,
+        "intermediate_size": INTERMEDIATE_SIZE,
+        "num_hidden_layers": target_layers,
+        "num_nextn_predict_layers": 1,
+        "num_attention_heads": ATTENTION_HEADS,
+        "num_key_value_heads": 1,
+        "qk_nope_head_dim": QK_NOPE_HEAD_DIM,
+        "qk_rope_head_dim": QK_ROPE_HEAD_DIM,
+        "v_head_dim": V_HEAD_DIM,
+        "q_lora_rank": Q_LORA_RANK,
+        "kv_lora_rank": KV_LORA_RANK,
+        "index_n_heads": INDEX_HEADS,
+        "index_head_dim": INDEX_HEAD_DIM,
+        "index_topk": 2,
+        "index_topk_freq": index_topk_freq,
+        "index_skip_topk_offset": index_skip_topk_offset,
+        "indexer_types": indexer_types,
+        "n_routed_experts": ROUTED_EXPERTS,
+        "num_experts_per_tok": EXPERTS_PER_TOKEN,
+        "n_shared_experts": SHARED_EXPERTS,
+        "moe_intermediate_size": MOE_INTERMEDIATE_SIZE,
+        "first_k_dense_replace": 1,
+        "routed_scaling_factor": 2.5,
+        "norm_topk_prob": True,
+        "rms_norm_eps": 1e-5,
+    }
+    root.joinpath("config.json").write_text(json.dumps(config, indent=2) + "\n")
 
 
 def write_safetensors(path: Path, tensors: list[Tensor]) -> None:
@@ -169,40 +208,6 @@ def write_safetensors(path: Path, tensors: list[Tensor]) -> None:
 
     header = json.dumps(entries, separators=(",", ":")).encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(header)) + header + payload)
-
-
-def write_config(root: Path) -> None:
-    config = {
-        "model_type": "glm_moe_dsa",
-        "vocab_size": VOCAB_SIZE,
-        "max_position_embeddings": 128,
-        "hidden_size": HIDDEN_SIZE,
-        "intermediate_size": INTERMEDIATE_SIZE,
-        "num_hidden_layers": TARGET_LAYERS,
-        "num_nextn_predict_layers": 1,
-        "num_attention_heads": ATTENTION_HEADS,
-        "num_key_value_heads": 1,
-        "qk_nope_head_dim": QK_NOPE_HEAD_DIM,
-        "qk_rope_head_dim": QK_ROPE_HEAD_DIM,
-        "v_head_dim": V_HEAD_DIM,
-        "q_lora_rank": Q_LORA_RANK,
-        "kv_lora_rank": KV_LORA_RANK,
-        "index_n_heads": INDEX_HEADS,
-        "index_head_dim": INDEX_HEAD_DIM,
-        "index_topk": 2,
-        "index_topk_freq": 2,
-        "index_skip_topk_offset": 1,
-        "indexer_types": ["full", "shared", "full"],
-        "n_routed_experts": ROUTED_EXPERTS,
-        "num_experts_per_tok": EXPERTS_PER_TOKEN,
-        "n_shared_experts": SHARED_EXPERTS,
-        "moe_intermediate_size": MOE_INTERMEDIATE_SIZE,
-        "first_k_dense_replace": 1,
-        "routed_scaling_factor": 2.5,
-        "norm_topk_prob": True,
-        "rms_norm_eps": 1e-5,
-    }
-    root.joinpath("config.json").write_text(json.dumps(config, indent=2) + "\n")
 
 
 def write_tokenizer(root: Path) -> None:
@@ -247,16 +252,32 @@ def write_tokenizer(root: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--indexer-types",
+        default="full,shared,full",
+        help=(
+            "Comma-separated target-layer IndexShare roles. "
+            f"Default has {DEFAULT_TARGET_LAYERS} layers: full,shared,full."
+        ),
+    )
+    parser.add_argument("--index-topk-freq", type=int, default=2)
+    parser.add_argument("--index-skip-topk-offset", type=int, default=1)
     parser.add_argument("output_dir", type=Path)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    indexer_types = [item.strip() for item in args.indexer_types.split(",") if item.strip()]
+    if len(indexer_types) < 1:
+        raise SystemExit("--indexer-types must contain at least one role")
+    invalid_roles = sorted(set(indexer_types) - {"full", "shared"})
+    if invalid_roles:
+        raise SystemExit(f"--indexer-types contains invalid roles: {invalid_roles}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_config(args.output_dir)
+    write_config(args.output_dir, indexer_types, args.index_topk_freq, args.index_skip_topk_offset)
     write_tokenizer(args.output_dir)
-    write_safetensors(args.output_dir / "model.safetensors", build_tensors())
+    write_safetensors(args.output_dir / "model.safetensors", build_tensors(indexer_types))
     print(f"wrote tiny GLM-DSA contract fixture to {args.output_dir}")
 
 

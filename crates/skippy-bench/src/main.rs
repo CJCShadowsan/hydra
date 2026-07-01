@@ -4,6 +4,7 @@ mod distributed;
 mod glm_dsa_layer_microbench;
 mod glm_dsa_microbench_summary;
 mod glm_dsa_op_report;
+mod glm_dsa_report_aggregate;
 mod local_single;
 mod local_split;
 mod model_identity;
@@ -20,6 +21,7 @@ use crate::{
     distributed::{drive_existing, focused_runtime, run_distributed},
     glm_dsa_layer_microbench::glm_dsa_layer_microbench,
     glm_dsa_op_report::{glm_dsa_op_compare, glm_dsa_op_report},
+    glm_dsa_report_aggregate::glm_dsa_aggregate_reports,
     local_single::local_single,
     local_split::{
         local_split_binary, local_split_chain_binary, local_split_compare, local_split_inprocess,
@@ -43,6 +45,7 @@ fn main() -> Result<()> {
         CommandKind::GlmDsaLayerMicrobench(args) => glm_dsa_layer_microbench(args),
         CommandKind::GlmDsaOpReport(args) => glm_dsa_op_report(args),
         CommandKind::GlmDsaOpCompare(args) => glm_dsa_op_compare(args),
+        CommandKind::GlmDsaAggregateReports(args) => glm_dsa_aggregate_reports(args),
         CommandKind::Run(args) => run_distributed(args),
     }
 }

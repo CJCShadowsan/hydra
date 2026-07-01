@@ -64,8 +64,9 @@ Options:
                            Comma-separated Metal dsa_sparse_attn threadgroup
                            widths to sweep. Allowed: 32,64,128,256. Default: 256.
   --sparse-attn-cache-topk MODE
-                           Cache top-k indices in dsa_sparse_attn threadgroup
-                           memory: off, on, or both. Default: off.
+                           Allow the safe cached-top-k dsa_sparse_attn selector:
+                           off disables it, on permits the prefill-only auto
+                           selector, both compares them. Default: off.
   --sparse-attn-decode-group-heads LIST
                            Comma-separated decode head group sizes to sweep.
                            Allowed: 1,2,4. Default: 1.
@@ -539,7 +540,7 @@ run_cache_warm_case() {
   local -a cmd=(
     env
     "SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS=256"
-    "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=0"
+    "SKIPPY_GLM_DSA_DISABLE_SPARSE_ATTN_CACHE_TOPK=1"
     "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=0"
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_SOURCE_LAYER_START=$REAL_TOP_K_SOURCE_LAYER_START"
     "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAIN_SOURCES=$REAL_TOP_K_CHAIN_SOURCES"
@@ -1115,10 +1116,10 @@ case_env() {
   printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS=$threads"
   printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_DECODE_GROUP_HEADS=$decode_group_heads"
   printf '%s\n' "SKIPPY_GLM_DSA_MUL_MM_ID_MIN_TOKENS=$mm_id_min_tokens"
-  if [[ "$cache_topk" == "on" ]]; then
-    printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=1"
+  if [[ "$cache_topk" == "off" ]]; then
+    printf '%s\n' "SKIPPY_GLM_DSA_DISABLE_SPARSE_ATTN_CACHE_TOPK=1"
   else
-    printf '%s\n' "SKIPPY_GLM_DSA_SPARSE_ATTN_CACHE_TOPK=0"
+    printf '%s\n' "SKIPPY_GLM_DSA_DISABLE_SPARSE_ATTN_CACHE_TOPK=0"
   fi
   if [[ "$SYNTHETIC_TOP_K_SIDEBAND" == "on" ]]; then
     printf '%s\n' "SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=1"
