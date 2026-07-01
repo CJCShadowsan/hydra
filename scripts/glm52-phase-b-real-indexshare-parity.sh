@@ -10,13 +10,13 @@ LAYER_START="${LAYER_START:-2}"
 LAYER_END="${LAYER_END:-6}"
 CTX_SIZE="${CTX_SIZE:-128}"
 TOKENS="${TOKENS:-1}"
-POSITION_START="${POSITION_START:-0}"
+POSITION_START="${POSITION_START:-16}"
 ITERATIONS="${ITERATIONS:-1}"
 WARMUP="${WARMUP:-0}"
-N_BATCH="${N_BATCH:-1}"
-N_UBATCH="${N_UBATCH:-1}"
-KV_WARMUP_TOKENS="${KV_WARMUP_TOKENS:-0}"
-KV_WARMUP_CHUNK_TOKENS="${KV_WARMUP_CHUNK_TOKENS:-}"
+N_BATCH="${N_BATCH:-16}"
+N_UBATCH="${N_UBATCH:-16}"
+KV_WARMUP_TOKENS="${KV_WARMUP_TOKENS:-16}"
+KV_WARMUP_CHUNK_TOKENS="${KV_WARMUP_CHUNK_TOKENS:-16}"
 SYNTHETIC_KV_WARMUP="${SYNTHETIC_KV_WARMUP:-0}"
 REUSE_KV_WARMUP_CHECKPOINT="${REUSE_KV_WARMUP_CHECKPOINT:-0}"
 REUSE_KV_WARMUP_STREAM="${REUSE_KV_WARMUP_STREAM:-0}"
@@ -26,6 +26,11 @@ COMPACT_FLASH_NO_MASK="${COMPACT_FLASH_NO_MASK:-0}"
 REQUIRE_COMPACT_FLASH_PROOF="${REQUIRE_COMPACT_FLASH_PROOF:-0}"
 DIRECT_SPARSE_ATTN="${DIRECT_SPARSE_ATTN:-0}"
 DIRECT_SPARSE_PREFILL="${DIRECT_SPARSE_PREFILL:-0}"
+NATIVE_DEFAULT_DIRECT_SPARSE_PREFILL="${NATIVE_DEFAULT_DIRECT_SPARSE_PREFILL:-0}"
+NATIVE_DEFAULT_DIRECT_SPARSE_ATTN="${NATIVE_DEFAULT_DIRECT_SPARSE_ATTN:-0}"
+ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL="${ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL:-0}"
+DIRECT_SPARSE_PREFILL_MAX_TOKENS="${DIRECT_SPARSE_PREFILL_MAX_TOKENS:-}"
+DENSE_SPARSE_MASK_MAX_BYTES="${DENSE_SPARSE_MASK_MAX_BYTES:-}"
 REQUIRE_DIRECT_SPARSE_DECODE_PROOF="${REQUIRE_DIRECT_SPARSE_DECODE_PROOF:-0}"
 REQUIRE_DIRECT_SPARSE_PREFILL_PROOF="${REQUIRE_DIRECT_SPARSE_PREFILL_PROOF:-0}"
 SPARSE_ATTN_THREADS="${SPARSE_ATTN_THREADS:-}"
@@ -52,14 +57,14 @@ Options:
   --layer-end N           Exclusive end layer. Default: 6
   --ctx-size N            Context size. Default: 128
   --tokens N              Tokens. Default: 1
-  --position-start N      Decode position start. Default: 0
+  --position-start N      Decode position start. Default: 16
   --iterations N          Iterations. Default: 1
   --warmup N              Warmup iterations. Default: 0
-  --n-batch N             Batch size. Default: 1
-  --n-ubatch N            Microbatch size. Default: 1
-  --kv-warmup-tokens N    Populate KV prefix before the measured decode. Default: 0
+  --n-batch N             Batch size. Default: 16
+  --n-ubatch N            Microbatch size. Default: 16
+  --kv-warmup-tokens N    Populate KV prefix before the measured decode. Default: 16
   --kv-warmup-chunk-tokens N
-                           KV warmup chunk size.
+                           KV warmup chunk size. Default: 16
   --synthetic-kv-warmup   Import synthetic zero KV pages for warmup.
   --reuse-kv-warmup-checkpoint
                            Reuse a checkpointed KV warmup prefix.
@@ -72,9 +77,21 @@ Options:
   --require-compact-flash-proof
                            Fail unless compact flash eliminated the old sparse path.
   --direct-sparse-attn     Enable llama.cpp direct sparse-attention candidate path.
+  --native-default-direct-sparse-attn
+                           Do not pass --direct-sparse-attn to skippy-bench;
+                           prove llama.cpp's native default selects direct sparse.
   --require-direct-sparse-decode-proof
                            Fail unless decode direct sparse avoids sparse-mask nodes and dispatches DSA sparse attention.
   --direct-sparse-prefill  Enable direct sparse-attention for prefill-shaped candidate runs.
+  --native-default-direct-sparse-prefill
+                           Do not pass the direct sparse prefill env toggle;
+                           prove llama.cpp's native default selects direct sparse prefill.
+  --enable-unproven-large-direct-sparse-prefill
+                           Set the large direct-sparse prefill experiment opt-in.
+  --direct-sparse-prefill-max-tokens N
+                           Set the native short-prefill token cap.
+  --dense-sparse-mask-max-bytes N
+                           Set the dense sparse-mask byte guard threshold.
   --require-direct-sparse-prefill-proof
                            Fail unless direct sparse prefill avoids sparse-mask nodes and dispatches DSA sparse attention.
   --sparse-attn-threads N  Set SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS for candidate runs.
@@ -187,10 +204,35 @@ while [[ $# -gt 0 ]]; do
       DIRECT_SPARSE_ATTN=1
       shift
       ;;
+    --native-default-direct-sparse-attn)
+      NATIVE_DEFAULT_DIRECT_SPARSE_ATTN=1
+      DIRECT_SPARSE_ATTN=1
+      shift
+      ;;
     --direct-sparse-prefill)
       DIRECT_SPARSE_PREFILL=1
       DIRECT_SPARSE_ATTN=1
       shift
+      ;;
+    --native-default-direct-sparse-prefill)
+      NATIVE_DEFAULT_DIRECT_SPARSE_PREFILL=1
+      DIRECT_SPARSE_PREFILL=1
+      DIRECT_SPARSE_ATTN=1
+      shift
+      ;;
+    --enable-unproven-large-direct-sparse-prefill)
+      ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL=1
+      DIRECT_SPARSE_PREFILL=1
+      DIRECT_SPARSE_ATTN=1
+      shift
+      ;;
+    --direct-sparse-prefill-max-tokens)
+      DIRECT_SPARSE_PREFILL_MAX_TOKENS="$2"
+      shift 2
+      ;;
+    --dense-sparse-mask-max-bytes)
+      DENSE_SPARSE_MASK_MAX_BYTES="$2"
+      shift 2
       ;;
     --require-direct-sparse-decode-proof)
       REQUIRE_DIRECT_SPARSE_DECODE_PROOF=1
@@ -281,13 +323,29 @@ BENCH_ARGS=(
   --warmup "$WARMUP"
   --n-batch "$N_BATCH"
   --n-ubatch "$N_UBATCH"
-  --direct-sparse-attn "$([[ "$DIRECT_SPARSE_ATTN" == "1" ]] && echo true || echo false)"
+  --direct-sparse-prefill "$([[ "$DIRECT_SPARSE_PREFILL" == "1" ]] && echo true || echo false)"
   --metal-topk-moe-route-fusion "$([[ "$METAL_TOPK_MOE_ROUTE_FUSION" == "1" ]] && echo true || echo false)"
   --op-timing true
   --compare-native-indexshare-producer-consumer
   --require-native-indexshare-proof
   --output "$REPORT"
 )
+
+if [[ "$NATIVE_DEFAULT_DIRECT_SPARSE_ATTN" != "1" ]]; then
+  BENCH_ARGS+=(--direct-sparse-attn "$([[ "$DIRECT_SPARSE_ATTN" == "1" ]] && echo true || echo false)")
+fi
+if [[ "$NATIVE_DEFAULT_DIRECT_SPARSE_PREFILL" == "1" ]]; then
+  BENCH_ARGS+=(--native-default-direct-sparse-prefill)
+fi
+if [[ "$ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL" == "1" ]]; then
+  BENCH_ARGS+=(--enable-unproven-large-direct-sparse-prefill)
+fi
+if [[ -n "$DIRECT_SPARSE_PREFILL_MAX_TOKENS" ]]; then
+  BENCH_ARGS+=(--direct-sparse-prefill-max-tokens "$DIRECT_SPARSE_PREFILL_MAX_TOKENS")
+fi
+if [[ -n "$DENSE_SPARSE_MASK_MAX_BYTES" ]]; then
+  BENCH_ARGS+=(--dense-sparse-mask-max-bytes "$DENSE_SPARSE_MASK_MAX_BYTES")
+fi
 
 if [[ "$KV_WARMUP_TOKENS" != "0" ]]; then
   BENCH_ARGS+=(--kv-warmup-tokens "$KV_WARMUP_TOKENS")
@@ -306,9 +364,6 @@ if [[ "$REUSE_KV_WARMUP_STREAM" == "1" ]]; then
 fi
 if [[ "$COMPACT_FLASH_ATTN" == "1" ]]; then
   BENCH_ARGS+=(--compact-flash-attn true)
-fi
-if [[ "$DIRECT_SPARSE_PREFILL" == "1" ]]; then
-  BENCH_ARGS+=(--direct-sparse-prefill true)
 fi
 if [[ "$REQUIRE_DIRECT_SPARSE_DECODE_PROOF" == "1" ]]; then
   BENCH_ARGS+=(--require-direct-sparse-decode-proof)
@@ -351,6 +406,7 @@ with open(report_path) as f:
 
 comparison = report.get("comparison") or {}
 parity = comparison.get("parity") or {}
+sensitivity = comparison.get("sideband_sensitivity") or {}
 guard = report.get("native_indexshare_guard") or {}
 baseline = comparison.get("baseline") or {}
 candidate = comparison.get("candidate") or {}
@@ -388,6 +444,10 @@ def candidate_metal_records():
 failures = []
 if not parity.get("passed"):
     failures.append(f"parity failed: {parity}")
+if not sensitivity.get("passed"):
+    failures.append(f"sideband sensitivity proof failed: {sensitivity}")
+if sensitivity.get("poisoned_hidden_mismatches", 0) < 1 and sensitivity.get("poisoned_hidden_max_abs_diff", 0) == 0:
+    failures.append(f"poisoned sideband did not change hidden output: {sensitivity}")
 if parity.get("hidden_mismatches") not in (0, None):
     failures.append(f"hidden mismatches present: {parity}")
 if parity.get("sideband_mismatched_bytes") not in (0, None):
@@ -448,6 +508,8 @@ print(f"report={report_path}")
 print(f"full_layers={guard.get('full_layers')}")
 print(f"shared_layers={guard.get('shared_layers')}")
 print(f"shared_exec_with_input_top_k={guard.get('shared_exec_with_input_top_k')}")
+print(f"sideband_sensitivity={sensitivity.get('passed')}")
+print(f"sideband_poison_changed_i32={((sensitivity.get('poison') or {}).get('changed_i32_count'))}")
 print(f"candidate_indexer_topk_nodes={candidate_ops.get('indexer_topk', {}).get('nodes')}")
 print(f"candidate_sparse_mask_nodes={candidate_ops.get('sparse_mask', {}).get('nodes')}")
 if compact_guard is not None:

@@ -1,0 +1,50 @@
+From 574e1ee7f113740a0577c82bbaf148e085e6df06 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 05:56:11 +1000
+Subject: [PATCH] Cap GLM DSA direct sparse decode top-k
+
+---
+ src/llama-graph.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f8c49e7c7..b54537efc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -150,6 +150,8 @@ struct llama_glm_dsa_sparse_attn_policy {
+     }
+ };
+ 
++static constexpr int64_t LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K = 128;
++
+ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         int64_t sparse_batch,
+         int64_t sparse_streams,
+@@ -200,7 +202,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+ 
+     policy.compact_large_decode_top_k =
+             policy.decode_shape &&
+-            sparse_top_k > 1024;
++            sparse_top_k > LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K;
+     policy.compact_candidate =
+             !compact_flash_disabled &&
+             policy.compact_large_decode_top_k;
+@@ -221,6 +223,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     const bool direct_ready =
+             direct_sparse_enabled &&
+             policy.token_shape_allowed &&
++            !policy.compact_large_decode_top_k &&
+             kq_b_ok &&
+             sinks_ok &&
+             alibi_ok &&
+@@ -236,6 +239,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         policy.direct_selector_reason =
+                 !direct_sparse_enabled ? "direct_sparse_disabled" :
+                 !policy.token_shape_allowed ? "token_shape_not_allowed" :
++                policy.compact_large_decode_top_k ? "direct_sparse_top_k_too_large" :
+                 !kq_b_ok ? "kq_b_present" :
+                 !sinks_ok ? "sinks_present" :
+                 !alibi_ok ? "alibi_present" :
+-- 
+2.53.0
+

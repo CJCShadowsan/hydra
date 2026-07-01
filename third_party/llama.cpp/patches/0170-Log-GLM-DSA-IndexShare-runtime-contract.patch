@@ -1,0 +1,148 @@
+From 274c72fab61f2ae8642693dd8cdca6eb229d6733 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 02:46:17 +1000
+Subject: [PATCH] Log GLM DSA IndexShare runtime contract
+
+---
+ src/models/glm-dsa.cpp | 97 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 97 insertions(+)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 45ac7de49..3243cfb3e 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -45,6 +45,16 @@ static bool llama_glm_dsa_layer_has_indexer(const llama_layer & layer) {
+     return has_all;
+ }
+ 
++static const char * llama_glm_dsa_indexshare_role_source(const llama_hparams & hparams) {
++    if (hparams.indexer_types_present) {
++        return "metadata_types";
++    }
++    if (hparams.indexer_top_k_freq > 0) {
++        return "metadata_frequency";
++    }
++    return "tensor_fallback";
++}
++
+ static int llama_glm_dsa_indexshare_freq() {
+     const char * value = getenv("LLAMA_GLM_DSA_INDEXSHARE_FREQ");
+     if (value == nullptr) {
+@@ -213,6 +223,23 @@ static void llama_glm_dsa_validate_indexshare_layer_contract(int il, const llama
+     }
+ }
+ 
++static void llama_glm_dsa_validate_nextn_indexer_contract(int il, const llama_hparams & hparams, const llama_layer & layer) {
++    if ((uint32_t) il < hparams.n_layer()) {
++        return;
++    }
++
++    const llama_model_loader_stage_filter & stage_filter = llama_model_loader_get_stage_filter();
++    if (stage_filter.enabled && (il < stage_filter.layer_start || il >= stage_filter.layer_end)) {
++        return;
++    }
++
++    if (!llama_glm_dsa_layer_has_indexer(layer)) {
++        std::ostringstream message;
++        message << "GLM_DSA MTP/NextN layer " << il << " requires complete indexer tensors";
++        throw std::runtime_error(message.str());
++    }
++}
++
+ static bool llama_glm_dsa_layer_uses_indexer(int il, const llama_hparams & hparams, const llama_layer & layer) {
+     const bool has_indexer = llama_glm_dsa_layer_has_indexer(layer);
+ 
+@@ -294,6 +321,73 @@ static void llama_glm_dsa_log_indexshare_consume(int il, const ggml_tensor * top
+             (long long) (top_k ? top_k->ne[3] : 0));
+ }
+ 
++static void llama_glm_dsa_log_indexshare_contract(
++        const llama_model & model,
++        const llama_hparams & hparams,
++        bool stage_filtered,
++        int  layer_start,
++        int  layer_end) {
++    if (!llama_glm_dsa_indexshare_exec_log_enabled()) {
++        return;
++    }
++
++    int full_layers = 0;
++    int shared_layers = 0;
++    int selected_indexer_tensor_layers = 0;
++    int total_indexer_tensor_layers = 0;
++    int selected_full_layers = 0;
++    int out_of_stage_full_layers = 0;
++
++    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++        bool metadata_matched = false;
++        bool full_layer = llama_glm_dsa_metadata_layer_is_full(hparams, il, &metadata_matched);
++        if (!metadata_matched) {
++            full_layer = llama_glm_dsa_layer_has_indexer(model.layers[il]);
++        }
++
++        if (full_layer) {
++            ++full_layers;
++        } else {
++            ++shared_layers;
++        }
++
++        const bool has_indexer = llama_glm_dsa_layer_has_indexer(model.layers[il]);
++        if (has_indexer) {
++            ++total_indexer_tensor_layers;
++        }
++
++        const bool selected = !stage_filtered || ((int) il >= layer_start && (int) il < layer_end);
++        if (selected) {
++            if (has_indexer) {
++                ++selected_indexer_tensor_layers;
++            }
++            if (full_layer) {
++                ++selected_full_layers;
++            }
++        } else if (full_layer) {
++            ++out_of_stage_full_layers;
++        }
++    }
++
++    LLAMA_LOG_INFO(
++            "%s: GLM_DSA IndexShare source=%s full_layers=%d shared_layers=%d indexer_tensor_layers=%d target_indexer_tensor_layers=%d filtered_indexer_groups=%d out_of_stage_indexer_groups=%d stage_filtered=%d layer_start=%d layer_end=%d top_k=%u top_k_frequency=%u skip_top_k_offset=%u nextn_layers=%u\n",
++            __func__,
++            llama_glm_dsa_indexshare_role_source(hparams),
++            full_layers,
++            shared_layers,
++            selected_indexer_tensor_layers,
++            total_indexer_tensor_layers,
++            selected_full_layers,
++            out_of_stage_full_layers,
++            stage_filtered ? 1 : 0,
++            layer_start,
++            layer_end,
++            hparams.indexer_top_k,
++            hparams.indexer_top_k_freq,
++            hparams.indexer_skip_top_k_offset,
++            hparams.n_layer_nextn);
++}
++
+ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+@@ -439,6 +533,7 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
+         layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd, hparams.indexer_head_size}, indexer_flags);
+         layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size}, indexer_flags);
+         llama_glm_dsa_validate_indexshare_layer_contract(i, hparams, layer);
++        llama_glm_dsa_validate_nextn_indexer_contract(i, hparams, layer);
+         if (i < (int) hparams.n_layer_dense_lead) {
+             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, flags);
+             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, flags);
+@@ -547,6 +642,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         res->add_input(std::move(inp));
+     }
+ 
++    llama_glm_dsa_log_indexshare_contract(model, hparams, stage_filtered, il_start, il_end);
++
+     for (int il = il_start; il < il_end; ++il) {
+         ggml_tensor * inpSA = inpL;
+ 
+-- 
+2.53.0
+

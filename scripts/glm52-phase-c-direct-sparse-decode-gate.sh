@@ -8,19 +8,22 @@ MODEL_ID="${MODEL_ID:-meshllm/GLM-5.2-Q2_K-MTP-Q8-layers}"
 SKIPPY_BENCH_BIN="${SKIPPY_BENCH_BIN:-$ROOT/target/debug/skippy-bench}"
 OUT_DIR="${OUT_DIR:-/tmp/glm52-phase-c-direct-sparse-decode-gate}"
 QUICK=0
+LONG_KV=0
+LONG_KV_ONLY=0
 
 usage() {
   cat <<'EOF'
 Usage: scripts/glm52-phase-c-direct-sparse-decode-gate.sh [options]
 
-Runs the strict Phase-C decode gate for native GLM-5.2 direct sparse attention.
+Runs the strict Phase-C decode gate for native GLM-5.2 sparse decode policy.
 
 This gate assumes Phase A and Phase B are already closed. It proves decode only:
 
-  - direct sparse decode decisions are selected;
+  - direct sparse decode decisions are selected for the proven small-top-k shape;
+  - compact K/V gather + flash attention is selected for the large-top-k shape;
   - sparse-mask timing nodes are absent in the candidate;
   - dense sparse-mask Metal dispatches are absent in the candidate;
-  - native DSA_SPARSE_ATTN timing and Metal dispatch evidence is present;
+  - native DSA sparse-attention or compact-flash execution evidence is present;
   - parity still holds against the dense/direct producer baseline;
   - Shared consumers still reuse Full top-k sideband without recomputing top-k.
 
@@ -32,6 +35,8 @@ Options:
   --skippy-bench PATH     skippy-bench binary.
   --out-dir PATH          Artifact directory.
   --quick                 Run one reduced middle-span smoke case.
+  --long-kv               Run larger-KV decode cases after the normal sweep.
+  --long-kv-only          Run only the larger-KV decode cases.
   -h, --help              Show this help.
 
 Environment overrides mirror upper-case option names.
@@ -58,6 +63,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --quick)
       QUICK=1
+      shift
+      ;;
+    --long-kv)
+      LONG_KV=1
+      shift
+      ;;
+    --long-kv-only)
+      LONG_KV=1
+      LONG_KV_ONLY=1
       shift
       ;;
     -h|--help)
@@ -89,32 +103,45 @@ mkdir -p "$OUT_DIR"
 
 run_decode_case() {
   local name="$1"
-  shift
+  local proof_mode="$2"
+  shift 2
+  local require_args=()
+  local allow_compact_flash_auto=0
+  if [[ "$proof_mode" == "direct" ]]; then
+    require_args+=(--require-direct-sparse-decode-proof)
+  elif [[ "$proof_mode" == "compact" ]]; then
+    allow_compact_flash_auto=1
+    require_args+=(--allow-compact-flash-auto --require-compact-flash-proof)
+  else
+    echo "unknown proof mode for $name: $proof_mode" >&2
+    exit 2
+  fi
   local case_dir="$OUT_DIR/$name"
   mkdir -p "$case_dir"
   REPORT="$case_dir/report.json" LOG="$case_dir/run.log" \
     DIRECT_SPARSE_ATTN=1 \
+    NATIVE_DEFAULT_DIRECT_SPARSE_ATTN=1 \
     DIRECT_SPARSE_PREFILL=0 \
     COMPACT_FLASH_ATTN=0 \
-    ALLOW_COMPACT_FLASH_AUTO=0 \
+    ALLOW_COMPACT_FLASH_AUTO="$allow_compact_flash_auto" \
     METAL_DISPATCH_LOG=1 \
     METAL_TOPK_MOE_ROUTE_FUSION=0 \
     "$ROOT/scripts/glm52-phase-b-real-indexshare-parity.sh" \
       --stage-model "$STAGE_MODEL" \
       --model-id "$MODEL_ID" \
       --skippy-bench "$SKIPPY_BENCH_BIN" \
-      --direct-sparse-attn \
-      --require-direct-sparse-decode-proof \
+      --native-default-direct-sparse-attn \
       --metal-dispatch-log \
       --no-metal-topk-moe-route-fusion \
       --out-dir "$case_dir" \
+      "${require_args[@]}" \
       "$@" \
       >"$case_dir/stdout.txt" \
       2>"$case_dir/stderr.txt"
 }
 
 if [[ "$QUICK" == "1" ]]; then
-  run_decode_case decode-middle-quick \
+  run_decode_case decode-middle-quick direct \
     --layer-start 30 \
     --layer-end 34 \
     --ctx-size 128 \
@@ -124,37 +151,60 @@ if [[ "$QUICK" == "1" ]]; then
     --kv-warmup-chunk-tokens 16 \
     --n-batch 16 \
     --n-ubatch 16
-else
-  run_decode_case decode-early \
+elif [[ "$LONG_KV_ONLY" != "1" ]]; then
+  run_decode_case decode-early direct \
     --layer-start 6 \
     --layer-end 10 \
     --ctx-size 128 \
     --tokens 1 \
     --position-start 32 \
     --kv-warmup-tokens 32 \
-    --kv-warmup-chunk-tokens 16 \
-    --n-batch 16 \
-    --n-ubatch 16
-  run_decode_case decode-middle \
+    --kv-warmup-chunk-tokens 32 \
+    --n-batch 32 \
+    --n-ubatch 32
+  run_decode_case decode-middle direct \
     --layer-start 30 \
     --layer-end 34 \
     --ctx-size 256 \
     --tokens 1 \
     --position-start 64 \
     --kv-warmup-tokens 64 \
-    --kv-warmup-chunk-tokens 32 \
-    --n-batch 32 \
-    --n-ubatch 32
-  run_decode_case decode-late \
+    --kv-warmup-chunk-tokens 64 \
+    --n-batch 64 \
+    --n-ubatch 64
+  run_decode_case decode-late compact \
     --layer-start 74 \
     --layer-end 78 \
     --ctx-size 512 \
     --tokens 1 \
     --position-start 128 \
     --kv-warmup-tokens 128 \
-    --kv-warmup-chunk-tokens 64 \
-    --n-batch 64 \
-    --n-ubatch 64
+    --kv-warmup-chunk-tokens 128 \
+    --n-batch 128 \
+    --n-ubatch 128
+fi
+
+if [[ "$LONG_KV" == "1" ]]; then
+  run_decode_case decode-middle-kv512 direct \
+    --layer-start 30 \
+    --layer-end 34 \
+    --ctx-size 1024 \
+    --tokens 1 \
+    --position-start 512 \
+    --kv-warmup-tokens 512 \
+    --kv-warmup-chunk-tokens 128 \
+    --n-batch 128 \
+    --n-ubatch 128
+  run_decode_case decode-late-kv1024 compact \
+    --layer-start 74 \
+    --layer-end 78 \
+    --ctx-size 2048 \
+    --tokens 1 \
+    --position-start 1024 \
+    --kv-warmup-tokens 1024 \
+    --kv-warmup-chunk-tokens 128 \
+    --n-batch 128 \
+    --n-ubatch 128
 fi
 
 python3 - "$OUT_DIR" <<'PY'
@@ -180,15 +230,26 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
     candidate = comparison.get("candidate") or {}
     baseline = comparison.get("baseline") or {}
     guard = report.get("direct_sparse_decode_guard") or {}
+    compact_guard = report.get("compact_flash_guard") or {}
     native_guard = report.get("native_indexshare_guard") or {}
     candidate_ops = candidate.get("op_timing_summary") or {}
     baseline_ops = baseline.get("op_timing_summary") or {}
     candidate_dispatch = candidate.get("metal_dispatch_summary") or {}
+    candidate_dispatch_records = candidate.get("metal_dispatch_records") or []
+    dense_sparse_mask_dispatches = guard.get("dense_sparse_mask_dispatches")
+    if dense_sparse_mask_dispatches is None:
+        dense_sparse_mask_dispatches = sum(
+            1
+            for record in candidate_dispatch_records
+            if isinstance(record, dict) and record.get("op") == "dsa_sparse_mask"
+        )
     baseline_timing = (baseline.get("timing_summary") or {}).get("mean_ms")
     candidate_timing = (candidate.get("timing_summary") or {}).get("mean_ms")
+    proof_kind = "compact_flash" if compact_guard else "direct_sparse"
     row = {
         "label": case_dir.name,
         "report": str(report_path),
+        "proof_kind": proof_kind,
         "tokens": report.get("tokens"),
         "position_start": report.get("position_start"),
         "kv_warmup_tokens": report.get("kv_warmup_tokens"),
@@ -198,10 +259,16 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         "native_indexshare_guard_passed": bool(native_guard.get("passed")),
         "direct_sparse_decode_guard_passed": bool(guard.get("passed")),
         "direct_sparse_failure_summary": guard.get("failure_summary"),
+        "compact_flash_guard_passed": bool(compact_guard.get("passed")),
+        "compact_flash_failure_summary": compact_guard.get("failure_summary"),
+        "compact_flash_selector_reason": compact_guard.get("policy_selector_reason"),
         "candidate_sparse_mask_nodes": (candidate_ops.get("sparse_mask") or {}).get("nodes"),
         "candidate_dsa_sparse_attn_nodes": (candidate_ops.get("dsa_sparse_attn") or {}).get("nodes"),
         "candidate_dsa_sparse_attn_dispatches": candidate_dispatch.get("dsa_sparse_attn_records"),
-        "candidate_dense_sparse_mask_dispatches": guard.get("dense_sparse_mask_dispatches"),
+        "candidate_dense_sparse_mask_dispatches": dense_sparse_mask_dispatches,
+        "candidate_flash_attn_ext_records": compact_guard.get("flash_attn_ext_records"),
+        "candidate_compact_get_rows_records": compact_guard.get("compact_get_rows_records"),
+        "candidate_dsa_compact_get_rows_fused_records": compact_guard.get("dsa_compact_get_rows_fused_records"),
         "candidate_indexer_topk_nodes": (candidate_ops.get("indexer_topk") or {}).get("nodes"),
         "candidate_indexer_nodes": (candidate_ops.get("indexer") or {}).get("nodes"),
         "candidate_top_k_nodes": (candidate_ops.get("top_k") or {}).get("nodes"),
@@ -222,16 +289,25 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         failures.append(f"{case_dir.name}: sideband mismatch {row['sideband_mismatched_bytes']}")
     if not row["native_indexshare_guard_passed"]:
         failures.append(f"{case_dir.name}: native IndexShare guard failed")
-    if not row["direct_sparse_decode_guard_passed"]:
+    if proof_kind == "direct_sparse" and not row["direct_sparse_decode_guard_passed"]:
         failures.append(f"{case_dir.name}: direct sparse decode guard failed: {row['direct_sparse_failure_summary']}")
+    if proof_kind == "compact_flash" and not row["compact_flash_guard_passed"]:
+        failures.append(f"{case_dir.name}: compact flash guard failed: {row['compact_flash_failure_summary']}")
     if row["candidate_sparse_mask_nodes"] not in (0, None):
         failures.append(f"{case_dir.name}: sparse-mask nodes still present")
     if row["candidate_dense_sparse_mask_dispatches"] not in (0, None):
         failures.append(f"{case_dir.name}: dense sparse-mask dispatch still present")
-    if not row["candidate_dsa_sparse_attn_nodes"]:
+    if proof_kind == "direct_sparse" and not row["candidate_dsa_sparse_attn_nodes"]:
         failures.append(f"{case_dir.name}: missing DSA sparse attention timing nodes")
-    if not row["candidate_dsa_sparse_attn_dispatches"]:
+    if proof_kind == "direct_sparse" and not row["candidate_dsa_sparse_attn_dispatches"]:
         failures.append(f"{case_dir.name}: missing DSA sparse attention Metal dispatches")
+    if proof_kind == "compact_flash" and not row["candidate_flash_attn_ext_records"]:
+        failures.append(f"{case_dir.name}: missing compact flash attention dispatch evidence")
+    if proof_kind == "compact_flash" and not (
+        row["candidate_compact_get_rows_records"]
+        or row["candidate_dsa_compact_get_rows_fused_records"]
+    ):
+        failures.append(f"{case_dir.name}: missing compact K/V gather evidence")
     if row["candidate_indexer_topk_nodes"] not in (0, None):
         failures.append(f"{case_dir.name}: candidate recomputed indexer_topk")
     if row["candidate_indexer_nodes"] not in (0, None):
@@ -242,7 +318,7 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
 summary = {
     "passed": not failures,
     "phase": "C",
-    "scope": "native GLM-5.2 direct sparse decode only; compact flash, route fusion, prefill, MTP, and split work disabled",
+    "scope": "native GLM-5.2 sparse decode policy; direct sparse for small top-k, compact flash for large top-k; dense sparse masks, route fusion, prefill, MTP, and split work disabled",
     "rows": rows,
     "failures": failures,
 }
@@ -263,8 +339,10 @@ for row in rows:
     ratio_text = f" ratio={ratio:.3f}x" if ratio else ""
     print(
         f"{row['label']}: pos={row['position_start']} kv_warmup={row['kv_warmup_tokens']} "
+        f"proof={row['proof_kind']} "
         f"sparse_mask={row['candidate_sparse_mask_nodes']} "
         f"dsa_nodes={row['candidate_dsa_sparse_attn_nodes']} "
-        f"dsa_dispatches={row['candidate_dsa_sparse_attn_dispatches']}{ratio_text}"
+        f"dsa_dispatches={row['candidate_dsa_sparse_attn_dispatches']} "
+        f"flash_dispatches={row['candidate_flash_attn_ext_records']}{ratio_text}"
     )
 PY

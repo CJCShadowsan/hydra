@@ -169,6 +169,7 @@ pub(crate) struct DirectSparseDecisionRecord {
     pub(crate) kv_topk_ratio: Option<i64>,
     pub(crate) dense_mask_bytes: Option<u64>,
     pub(crate) dense_mask_limit: Option<u64>,
+    pub(crate) phase: Option<String>,
     pub(crate) selector_reason: Option<String>,
     pub(crate) direct_enabled: bool,
     pub(crate) prefill_enabled: bool,
@@ -314,6 +315,13 @@ enum SidebandDirection {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct IndexShareTraceSummary {
     pub(crate) records: usize,
+    pub(crate) contract_records: usize,
+    pub(crate) contract_sources: Vec<String>,
+    pub(crate) contract_full_layers: Option<usize>,
+    pub(crate) contract_shared_layers: Option<usize>,
+    pub(crate) contract_indexer_tensor_layers: Option<usize>,
+    pub(crate) contract_target_indexer_tensor_layers: Option<usize>,
+    pub(crate) contract_nextn_layers: Option<usize>,
     pub(crate) exec_records: usize,
     pub(crate) full_exec_records: usize,
     pub(crate) shared_exec_records: usize,
@@ -360,6 +368,24 @@ pub(crate) struct IndexShareTraceRecord {
     pub(crate) score_width: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct IndexShareContractRecord {
+    pub(crate) source: String,
+    pub(crate) full_layers: usize,
+    pub(crate) shared_layers: usize,
+    pub(crate) indexer_tensor_layers: usize,
+    pub(crate) target_indexer_tensor_layers: Option<usize>,
+    pub(crate) filtered_indexer_groups: Option<usize>,
+    pub(crate) out_of_stage_indexer_groups: Option<usize>,
+    pub(crate) stage_filtered: bool,
+    pub(crate) layer_start: i32,
+    pub(crate) layer_end: i32,
+    pub(crate) top_k: usize,
+    pub(crate) top_k_frequency: Option<usize>,
+    pub(crate) skip_top_k_offset: Option<usize>,
+    pub(crate) nextn_layers: Option<usize>,
+}
+
 pub fn glm_dsa_op_report(args: GlmDsaOpReportArgs) -> Result<()> {
     let output = args.output.clone();
     let report = build_report(&args)?;
@@ -390,7 +416,17 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
             .with_context(|| format!("parse GLM-DSA op timing records in {}", path.display()))?;
         let indexshare_records = parse_indexshare_trace_records(&text)
             .with_context(|| format!("parse GLM-DSA IndexShare trace in {}", path.display()))?;
-        if records.is_empty() && indexshare_records.is_empty() {
+        let indexshare_contract_records =
+            parse_indexshare_contract_records(&text).with_context(|| {
+                format!(
+                    "parse GLM-DSA IndexShare contract records in {}",
+                    path.display()
+                )
+            })?;
+        if records.is_empty()
+            && indexshare_records.is_empty()
+            && indexshare_contract_records.is_empty()
+        {
             bail!(
                 "{} contains no GLM-DSA op timing or IndexShare trace records",
                 path.display()
@@ -422,6 +458,7 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
             &group_records,
             &sideband_records,
             &indexshare_records,
+            &indexshare_contract_records,
         );
         if args.require_indexshare_producer_consumer {
             require_indexshare_producer_consumer_trace(path, &summary)?;
@@ -647,6 +684,18 @@ fn delta(candidate: u64, baseline: u64) -> i128 {
 fn require_indexshare_producer_consumer_trace(path: &PathBuf, summary: &LogSummary) -> Result<()> {
     let trace = &summary.indexshare_trace;
     let mut missing = Vec::new();
+    if trace.contract_records == 0 {
+        missing.push("indexshare_contract");
+    }
+    if trace.contract_sources.is_empty() {
+        missing.push("indexshare_contract_source");
+    }
+    if trace.contract_full_layers.unwrap_or(0) == 0 {
+        missing.push("contract_full_layers");
+    }
+    if trace.contract_shared_layers.unwrap_or(0) == 0 {
+        missing.push("contract_shared_layers");
+    }
     if trace.records == 0 {
         missing.push("indexshare_trace_records");
     }
@@ -799,6 +848,45 @@ pub(crate) fn parse_indexshare_trace_records(text: &str) -> Result<Vec<IndexShar
         .collect()
 }
 
+pub(crate) fn parse_indexshare_contract_records(
+    text: &str,
+) -> Result<Vec<IndexShareContractRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(INDEXSHARE_TRACE_MARKER)
+                .map(|index| &line[index + INDEXSHARE_TRACE_MARKER.len()..])
+        })
+        .filter(|line| line.starts_with("source="))
+        .map(parse_indexshare_contract_record)
+        .collect()
+}
+
+fn parse_indexshare_contract_record(line: &str) -> Result<IndexShareContractRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(IndexShareContractRecord {
+        source: parse_string_field(&fields, "source")?,
+        full_layers: parse_field(&fields, "full_layers")?,
+        shared_layers: parse_field(&fields, "shared_layers")?,
+        indexer_tensor_layers: parse_field(&fields, "indexer_tensor_layers")?,
+        target_indexer_tensor_layers: parse_optional_field(
+            &fields,
+            "target_indexer_tensor_layers",
+        )?,
+        filtered_indexer_groups: parse_optional_field(&fields, "filtered_indexer_groups")?,
+        out_of_stage_indexer_groups: parse_optional_field(&fields, "out_of_stage_indexer_groups")?,
+        stage_filtered: parse_bool_int_field(&fields, "stage_filtered")?,
+        layer_start: parse_field(&fields, "layer_start")?,
+        layer_end: parse_field(&fields, "layer_end")?,
+        top_k: parse_field(&fields, "top_k")?,
+        top_k_frequency: parse_optional_field(&fields, "top_k_frequency")?,
+        skip_top_k_offset: parse_optional_field(&fields, "skip_top_k_offset")?,
+        nextn_layers: parse_optional_field(&fields, "nextn_layers")?,
+    })
+}
+
 fn parse_indexshare_trace_record(line: &str) -> Result<IndexShareTraceRecord> {
     let mut parts = line.split_whitespace();
     let event = match parts.next().context("missing IndexShare trace event")? {
@@ -877,6 +965,7 @@ fn parse_direct_sparse_decision_record(line: &str) -> Result<DirectSparseDecisio
         kv_topk_ratio: parse_optional_field(&fields, "kv_topk_ratio")?,
         dense_mask_bytes: parse_optional_field(&fields, "dense_mask_bytes")?,
         dense_mask_limit: parse_optional_field(&fields, "dense_mask_limit")?,
+        phase: fields.get("phase").map(|value| (*value).to_string()),
         selector_reason: fields
             .get("selector_reason")
             .map(|value| (*value).to_string()),
@@ -1201,6 +1290,7 @@ fn summarize_log(
     group_records: &[TimingGroupRecord],
     sideband_records: &[SidebandRecord],
     indexshare_records: &[IndexShareTraceRecord],
+    indexshare_contract_records: &[IndexShareContractRecord],
 ) -> LogSummary {
     let mut stage_records: BTreeMap<i32, BTreeMap<Phase, PhaseSummary>> = BTreeMap::new();
     for record in records {
@@ -1234,7 +1324,8 @@ fn summarize_log(
     let hottest_group_records = summarize_hottest_groups(&grouped_records);
 
     let sideband_records = summarize_sideband_records(sideband_records);
-    let indexshare_trace = summarize_indexshare_trace_records(indexshare_records);
+    let indexshare_trace =
+        summarize_indexshare_trace_records(indexshare_records, indexshare_contract_records);
     LogSummary {
         path,
         records: records.len(),
@@ -1248,11 +1339,25 @@ fn summarize_log(
 
 pub(crate) fn summarize_indexshare_trace_records(
     records: &[IndexShareTraceRecord],
+    contract_records: &[IndexShareContractRecord],
 ) -> IndexShareTraceSummary {
     let mut summary = IndexShareTraceSummary {
         records: records.len(),
+        contract_records: contract_records.len(),
         ..IndexShareTraceSummary::default()
     };
+    for record in contract_records {
+        push_unique_string(&mut summary.contract_sources, &record.source);
+        summary.contract_full_layers = Some(record.full_layers);
+        summary.contract_shared_layers = Some(record.shared_layers);
+        summary.contract_indexer_tensor_layers = Some(record.indexer_tensor_layers);
+        if let Some(value) = record.target_indexer_tensor_layers {
+            summary.contract_target_indexer_tensor_layers = Some(value);
+        }
+        if let Some(value) = record.nextn_layers {
+            summary.contract_nextn_layers = Some(value);
+        }
+    }
     for record in records {
         match record.event {
             IndexShareTraceEvent::Exec => {
@@ -1306,6 +1411,13 @@ fn push_unique_sorted(values: &mut Vec<i32>, value: i32) {
     match values.binary_search(&value) {
         Ok(_) => {}
         Err(index) => values.insert(index, value),
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: &str) {
+    match values.binary_search_by(|current| current.as_str().cmp(value)) {
+        Ok(_) => {}
+        Err(index) => values.insert(index, value.to_string()),
     }
 }
 
@@ -1504,10 +1616,11 @@ mod tests {
     use super::{
         ComparisonKey, OpBucket, Phase, PhaseSummary, SidebandDirection, compare_phase,
         parse_compact_flash_policy_records, parse_compute_buffer_records,
-        parse_direct_sparse_decision_records, parse_indexshare_trace_records,
-        parse_metal_dispatch_records, parse_sideband_record, parse_sideband_records,
-        parse_timing_group_records, parse_timing_record, parse_timing_records,
-        require_indexshare_producer_consumer_trace, summarize_comparison_rows, summarize_log,
+        parse_direct_sparse_decision_records, parse_indexshare_contract_records,
+        parse_indexshare_trace_records, parse_metal_dispatch_records, parse_sideband_record,
+        parse_sideband_records, parse_timing_group_records, parse_timing_record,
+        parse_timing_records, require_indexshare_producer_consumer_trace,
+        summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -1520,7 +1633,7 @@ mod tests {
     const SIDEBAND_RECEIVE_LINE: &str = "skippy: glm_dsa_top_k_sideband_receive stage=stage-1 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
     const PADDED_PREFILL_SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=PrefillEmbd pos_start=512 tokens=128 hidden_bytes=3145728 sideband_bytes=393216 sideband_i32=98304";
     const DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=33 sparse_batch=33 sparse_streams=1 prefill_cap=32 dense_mask_bytes=270336 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=0 token_shape_allowed=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
-    const DIRECT_SPARSE_DECISION_LINE_WITH_REASON: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1024 sparse_batch=1024 sparse_streams=1 prefill_cap=32 sparse_kv=99328 sparse_top_k=1024 min_kv_topk_ratio=32 kv_topk_ratio=97 dense_mask_bytes=203423744 dense_mask_limit=268435456 selector_reason=kv_topk_ratio direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
+    const DIRECT_SPARSE_DECISION_LINE_WITH_REASON: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1024 sparse_batch=1024 sparse_streams=1 prefill_cap=32 sparse_kv=99328 sparse_top_k=1024 min_kv_topk_ratio=32 kv_topk_ratio=97 dense_mask_bytes=203423744 dense_mask_limit=268435456 phase=prefill selector_reason=dense_mask_guard_large_prefill direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 selected_keys=1048576 q_read_bytes=2415919104 k_read_bytes=1207959552 v_read_bytes=1073741824 mask_read_bytes=4194304 top_k_read_bytes=4194304 scratch_per_tg_bytes=1024 score_fma=603979776 value_fma=536870912 reduction_strategy=threadgroup_direct grid_x=32 grid_y=4 grid_z=8 threads_x=256 nwg=8 tmp_f16=1 dst_partial=1";
@@ -1554,7 +1667,7 @@ mod tests {
         assert_eq!(record.top_k_nodes, Some(40));
         assert_eq!(record.top_k_us, Some(49_065));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1573,7 +1686,7 @@ mod tests {
         assert_eq!(record.sparse_mask_topk_us, Some(2000));
         assert_eq!(record.sparse_mask_add_us, Some(3000));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1592,7 +1705,7 @@ mod tests {
         assert_eq!(record.dsa_sparse_attn_nodes, Some(47));
         assert_eq!(record.dsa_sparse_attn_us, Some(114543));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1617,6 +1730,7 @@ mod tests {
         assert_eq!(record.kv_topk_ratio, None);
         assert_eq!(record.dense_mask_bytes, Some(270_336));
         assert_eq!(record.dense_mask_limit, Some(536_870_912));
+        assert_eq!(record.phase, None);
         assert_eq!(record.selector_reason, None);
         assert!(record.direct_enabled);
         assert!(record.prefill_enabled);
@@ -1671,7 +1785,11 @@ mod tests {
         assert_eq!(record.kv_topk_ratio, Some(97));
         assert_eq!(record.dense_mask_bytes, Some(203_423_744));
         assert_eq!(record.dense_mask_limit, Some(268_435_456));
-        assert_eq!(record.selector_reason.as_deref(), Some("kv_topk_ratio"));
+        assert_eq!(record.phase.as_deref(), Some("prefill"));
+        assert_eq!(
+            record.selector_reason.as_deref(),
+            Some("dense_mask_guard_large_prefill")
+        );
         assert!(record.use_direct);
     }
 
@@ -1774,7 +1892,13 @@ mod tests {
             "{INDEXSHARE_CONTRACT_LINE}\n{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}\n{INDEXSHARE_EXEC_SHARED_LINE}\n{INDEXSHARE_CONSUME_LINE}"
         );
         let records = parse_indexshare_trace_records(&text).unwrap();
+        let contract_records = parse_indexshare_contract_records(&text).unwrap();
 
+        assert_eq!(contract_records.len(), 1);
+        assert_eq!(contract_records[0].source, "metadata_types");
+        assert_eq!(contract_records[0].full_layers, 21);
+        assert_eq!(contract_records[0].shared_layers, 57);
+        assert_eq!(contract_records[0].indexer_tensor_layers, 1);
         assert_eq!(records.len(), 4);
         assert_eq!(records[0].event, super::IndexShareTraceEvent::Exec);
         assert_eq!(records[0].layer, 30);
@@ -1800,8 +1924,23 @@ mod tests {
             "{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}\n{INDEXSHARE_EXEC_SHARED_LINE}\n{INDEXSHARE_CONSUME_LINE}"
         );
         let records = parse_indexshare_trace_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &records);
+        let contract_records = parse_indexshare_contract_records(INDEXSHARE_CONTRACT_LINE).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            &timing,
+            &[],
+            &[],
+            &records,
+            &contract_records,
+        );
 
+        assert_eq!(summary.indexshare_trace.contract_records, 1);
+        assert_eq!(
+            summary.indexshare_trace.contract_sources,
+            vec!["metadata_types".to_string()]
+        );
+        assert_eq!(summary.indexshare_trace.contract_full_layers, Some(21));
+        assert_eq!(summary.indexshare_trace.contract_shared_layers, Some(57));
         assert_eq!(summary.indexshare_trace.records, 4);
         assert_eq!(summary.indexshare_trace.exec_records, 2);
         assert_eq!(summary.indexshare_trace.full_exec_records, 1);
@@ -1823,7 +1962,15 @@ mod tests {
             "{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}\n{INDEXSHARE_EXEC_SHARED_LINE}\n{INDEXSHARE_CONSUME_LINE}"
         );
         let records = parse_indexshare_trace_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &records);
+        let contract_records = parse_indexshare_contract_records(INDEXSHARE_CONTRACT_LINE).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            &timing,
+            &[],
+            &[],
+            &records,
+            &contract_records,
+        );
 
         require_indexshare_producer_consumer_trace(&"stage1.log".into(), &summary).unwrap();
     }
@@ -1833,7 +1980,15 @@ mod tests {
         let timing = parse_timing_records(LINE).unwrap();
         let text = format!("{INDEXSHARE_EXEC_FULL_LINE}\n{INDEXSHARE_TOP_K_LINE}");
         let records = parse_indexshare_trace_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &records);
+        let contract_records = parse_indexshare_contract_records(INDEXSHARE_CONTRACT_LINE).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            &timing,
+            &[],
+            &[],
+            &records,
+            &contract_records,
+        );
 
         let error =
             require_indexshare_producer_consumer_trace(&"stage1.log".into(), &summary).unwrap_err();
@@ -1955,7 +2110,7 @@ mod tests {
                 .replace("total_us=1475800", "total_us=200")
         );
         let records = parse_timing_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &records, &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &records, &[], &[], &[], &[]);
         let stages = summary.stage_records.get(&1).unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
@@ -1990,7 +2145,7 @@ mod tests {
             "{LINE}\n{GROUP_LINE_LAYER_0}\n{GROUP_LINE_LAYER_1}"
         ))
         .unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &groups, &[], &[]);
+        let summary = summarize_log("stage1.log".into(), &timing, &groups, &[], &[], &[]);
         let stage = summary.group_records.get(&1).unwrap();
         let layer_0 = stage.get("layer_0").unwrap().get(&Phase::Prefill).unwrap();
         let layer_1 = stage.get("layer_1").unwrap().get(&Phase::Prefill).unwrap();
@@ -2048,7 +2203,7 @@ mod tests {
     fn summarizes_sideband_payload_ratios() {
         let timing = parse_timing_records(LINE).unwrap();
         let sideband = parse_sideband_records(SIDEBAND_LINE).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[]);
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[], &[]);
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
         assert_eq!(decode.records, 1);
@@ -2075,7 +2230,7 @@ mod tests {
         let timing = parse_timing_records(LINE).unwrap();
         let text = format!("{SIDEBAND_LINE}\n{SIDEBAND_RECEIVE_LINE}");
         let sideband = parse_sideband_records(&text).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[]);
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[], &[]);
         let forward = summary
             .sideband_records
             .get("stage-0")
@@ -2100,7 +2255,7 @@ mod tests {
     fn summarizes_sideband_padding_for_prefill() {
         let timing = parse_timing_records(LINE).unwrap();
         let sideband = parse_sideband_records(PADDED_PREFILL_SIDEBAND_LINE).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[]);
+        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[], &[]);
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         assert_eq!(prefill.tokens, 128);

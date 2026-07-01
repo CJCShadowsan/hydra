@@ -1,0 +1,119 @@
+From e2e4085cc4973eeb7b14efe917723f0df29845da Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 04:57:07 +1000
+Subject: [PATCH] Validate GLM DSA required backend op residency
+
+---
+ src/llama-context.cpp | 84 ++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 63 insertions(+), 21 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index eb5b7cf22..6b4f66641 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -30,6 +30,66 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
+     throw std::runtime_error("Unsupported ctx type");
+ }
+ 
++static const char * llama_glm_dsa_required_backend_op_name(enum ggml_op op) {
++    switch (op) {
++        case GGML_OP_LIGHTNING_INDEXER: return "GLM-DSA lightning indexer";
++        case GGML_OP_DSA_SPARSE_MASK:   return "GLM-DSA sparse mask";
++        case GGML_OP_DSA_SPARSE_ATTN:   return "GLM-DSA sparse attention";
++        default:                        return nullptr;
++    }
++}
++
++static int llama_glm_dsa_layer_from_named_node(const ggml_tensor * node, const char * prefix) {
++    const size_t prefix_len = strlen(prefix);
++    if (strncmp(node->name, prefix, prefix_len) != 0 || node->name[prefix_len] != '-') {
++        return -1;
++    }
++    return std::stoi(node->name + prefix_len + 1);
++}
++
++static int llama_glm_dsa_required_backend_op_layer(const ggml_tensor * node) {
++    switch (node->op) {
++        case GGML_OP_LIGHTNING_INDEXER:
++            return llama_glm_dsa_layer_from_named_node(node, "indexer_score");
++        case GGML_OP_DSA_SPARSE_MASK:
++            return llama_glm_dsa_layer_from_named_node(node, "dsa_sparse_mask_topk");
++        case GGML_OP_DSA_SPARSE_ATTN:
++            return llama_glm_dsa_layer_from_named_node(node, "dsa_sparse_attn");
++        default:
++            return -1;
++    }
++}
++
++static void llama_glm_dsa_validate_required_backend_ops(
++        const llama_model & model,
++        ggml_backend_sched_t sched,
++        ggml_cgraph * gf) {
++    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
++        ggml_tensor * node = ggml_graph_node(gf, i);
++        const char * op_name = llama_glm_dsa_required_backend_op_name(node->op);
++        if (op_name == nullptr) {
++            continue;
++        }
++
++        const int il = llama_glm_dsa_required_backend_op_layer(node);
++        if (il < 0) {
++            throw std::runtime_error(format(
++                    "%s: could not determine layer for %s node '%s'",
++                    __func__, op_name, node->name));
++        }
++
++        ggml_backend_dev_t device_layer = model.dev_layer(il);
++        ggml_backend_dev_t device_op =
++                ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched, node));
++        if (device_op != device_layer) {
++            throw std::runtime_error(format(
++                    "%s: layer %d is assigned to device %s but %s is assigned to device %s; "
++                    "backend support is required to avoid CPU fallback",
++                    __func__, il, ggml_backend_dev_name(device_layer), op_name, ggml_backend_dev_name(device_op)));
++        }
++    }
++}
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -604,32 +664,14 @@ void llama_context::sched_reserve() {
+     if (model.arch == LLM_ARCH_GLM_DSA && glm_dsa_disable_lightning_indexer) {
+         LLAMA_LOG_WARN("%s: GLM-DSA lightning indexer disabled by LLAMA_GLM_DSA_DISABLE_LIGHTNING_INDEXER\n", __func__);
+     } else if (model.arch == LLM_ARCH_GLM_DSA) {
+-        LLAMA_LOG_INFO("%s: resolving GLM-DSA lightning indexer support:\n", __func__);
++        LLAMA_LOG_INFO("%s: resolving GLM-DSA required backend op support:\n", __func__);
+ 
+         auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+         if (!gf) {
+-            throw std::runtime_error("failed to reserve graph for GLM-DSA lightning indexer check");
++            throw std::runtime_error("failed to reserve graph for GLM-DSA required backend op check");
+         }
+ 
+-        const size_t prefix_len = strlen("indexer_score") + 1;
+-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+-            ggml_tensor * n = ggml_graph_node(gf, i);
+-            if (n->op != GGML_OP_LIGHTNING_INDEXER) {
+-                continue;
+-            }
+-
+-            GGML_ASSERT(strncmp(n->name, "indexer_score-", prefix_len) == 0);
+-            const int il = std::stoi(n->name + prefix_len);
+-            ggml_backend_dev_t device_layer = model.dev_layer(il);
+-            ggml_backend_dev_t device_lid =
+-                ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+-            if (device_lid != device_layer) {
+-                throw std::runtime_error(format(
+-                    "%s: layer %d is assigned to device %s but GLM-DSA lightning indexer "
+-                    "is assigned to device %s; backend support is required to avoid CPU fallback",
+-                    __func__, il, ggml_backend_dev_name(device_layer), ggml_backend_dev_name(device_lid)));
+-            }
+-        }
++        llama_glm_dsa_validate_required_backend_ops(model, sched.get(), gf);
+     }
+ 
+     // reserve worst-case graph
+-- 
+2.53.0
+

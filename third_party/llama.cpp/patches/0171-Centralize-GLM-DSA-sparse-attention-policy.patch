@@ -1,0 +1,335 @@
+From 9c4c377804e9b1c5ba14c03564f56aebf5850170 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 03:21:46 +1000
+Subject: [PATCH] Centralize GLM DSA sparse attention policy
+
+---
+ src/llama-graph.cpp | 275 +++++++++++++++++++++++++++++---------------
+ 1 file changed, 184 insertions(+), 91 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 806140dda..12219c894 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -111,6 +111,145 @@ static ggml_tensor * llama_glm_dsa_top_k_for_sparse_attn(ggml_context * ctx, ggm
+             0);
+ }
+ 
++enum class llama_glm_dsa_sparse_attn_route {
++    DENSE_MASK,
++    DIRECT_SPARSE,
++    COMPACT_FLASH,
++};
++
++struct llama_glm_dsa_sparse_attn_policy {
++    llama_glm_dsa_sparse_attn_route route = llama_glm_dsa_sparse_attn_route::DENSE_MASK;
++    const char * phase = "other";
++    const char * direct_selector_reason = "unknown";
++    const char * compact_selector_reason = "unknown";
++    bool direct_enabled = false;
++    bool prefill_enabled = false;
++    bool decode_shape = false;
++    bool prefill_shape = false;
++    bool large_prefill_shape = false;
++    bool token_shape_allowed = false;
++    bool kq_b_ok = false;
++    bool sinks_ok = false;
++    bool alibi_ok = false;
++    bool soft_cap_ok = false;
++    bool compact_disabled = false;
++    bool compact_large_decode_top_k = false;
++    bool compact_candidate = false;
++    bool flash_attn = false;
++
++    bool use_direct_sparse_attn() const {
++        return route == llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
++    }
++
++    bool use_compact_flash_attn() const {
++        return route == llama_glm_dsa_sparse_attn_route::COMPACT_FLASH;
++    }
++};
++
++static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
++        int64_t sparse_batch,
++        int64_t sparse_streams,
++        int64_t sparse_top_k,
++        int64_t ubatch_tokens,
++        int64_t prefill_cap,
++        int64_t dense_mask_bytes,
++        int64_t dense_mask_limit,
++        bool    direct_sparse_enabled,
++        bool    direct_sparse_prefill_enabled,
++        bool    flash_attn,
++        bool    compact_flash_disabled,
++        bool    kq_b_ok,
++        bool    sinks_ok,
++        bool    alibi_ok,
++        bool    soft_cap_ok) {
++    llama_glm_dsa_sparse_attn_policy policy;
++    policy.direct_enabled = direct_sparse_enabled;
++    policy.prefill_enabled = direct_sparse_prefill_enabled;
++    policy.kq_b_ok = kq_b_ok;
++    policy.sinks_ok = sinks_ok;
++    policy.alibi_ok = alibi_ok;
++    policy.soft_cap_ok = soft_cap_ok;
++    policy.compact_disabled = compact_flash_disabled;
++    policy.flash_attn = flash_attn;
++
++    policy.decode_shape =
++            sparse_streams > 0 &&
++            sparse_batch == 1 &&
++            ubatch_tokens == sparse_streams;
++    policy.prefill_shape =
++            direct_sparse_prefill_enabled &&
++            sparse_batch <= prefill_cap;
++    policy.large_prefill_shape =
++            direct_sparse_prefill_enabled &&
++            sparse_batch > prefill_cap &&
++            dense_mask_bytes > dense_mask_limit;
++    policy.token_shape_allowed =
++            policy.decode_shape ||
++            policy.prefill_shape ||
++            policy.large_prefill_shape;
++    policy.phase =
++            policy.decode_shape ? "decode" :
++            (policy.prefill_shape || policy.large_prefill_shape) ? "prefill" :
++            "other";
++
++    policy.compact_large_decode_top_k =
++            policy.decode_shape &&
++            sparse_top_k > 1024;
++    policy.compact_candidate =
++            !compact_flash_disabled &&
++            policy.compact_large_decode_top_k;
++    const bool compact_ready =
++            policy.compact_candidate &&
++            flash_attn &&
++            kq_b_ok &&
++            sinks_ok &&
++            alibi_ok &&
++            soft_cap_ok;
++    if (compact_ready) {
++        policy.route = llama_glm_dsa_sparse_attn_route::COMPACT_FLASH;
++        policy.direct_selector_reason = "compact_flash_selected";
++        policy.compact_selector_reason = "decode_compact_large_top_k";
++        return policy;
++    }
++
++    const bool direct_ready =
++            direct_sparse_enabled &&
++            policy.token_shape_allowed &&
++            kq_b_ok &&
++            sinks_ok &&
++            alibi_ok &&
++            soft_cap_ok;
++    if (direct_ready) {
++        policy.route = llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
++        policy.direct_selector_reason =
++                policy.decode_shape ? "decode" :
++                policy.prefill_shape ? "short_prefill" :
++                policy.large_prefill_shape ? "dense_mask_guard_large_prefill" :
++                "unknown";
++    } else {
++        policy.direct_selector_reason =
++                !direct_sparse_enabled ? "direct_sparse_disabled" :
++                !policy.token_shape_allowed ? "token_shape_not_allowed" :
++                !kq_b_ok ? "kq_b_present" :
++                !sinks_ok ? "sinks_present" :
++                !alibi_ok ? "alibi_present" :
++                !soft_cap_ok ? "soft_cap_present" :
++                "unknown";
++    }
++
++    policy.compact_selector_reason =
++            compact_flash_disabled ? "disabled" :
++            !flash_attn ? "flash_attn_disabled" :
++            !policy.compact_large_decode_top_k ? "small_decode_top_k_or_not_decode" :
++            !kq_b_ok ? "kq_b_present" :
++            !sinks_ok ? "sinks_present" :
++            !alibi_ok ? "alibi_present" :
++            !soft_cap_ok ? "soft_cap_present" :
++            "unknown";
++
++    return policy;
++}
++
+ static void skippy_glm_dsa_log_direct_sparse_decision(
+         int     layer,
+         int64_t ubatch_tokens,
+@@ -3032,119 +3171,73 @@ ggml_tensor * llm_graph_context::build_attn(
+     const int64_t n_sparse_kv = kq_mask_rows->ne[1];
+     const int64_t n_sparse_top_k = top_k_3d->ne[0];
+     const int64_t dense_sparse_mask_bytes = (int64_t) ggml_nbytes(kq_mask_rows);
+-    const int64_t dense_sparse_mask_limit = skippy_glm_dsa_dense_sparse_mask_max_bytes();
+-    const bool direct_sparse_prefill_enabled = skippy_glm_dsa_direct_sparse_prefill_enabled();
+     const int64_t direct_sparse_prefill_max_tokens = skippy_glm_dsa_direct_sparse_prefill_max_tokens();
+-    const bool direct_sparse_decode_shape =
+-            n_direct_sparse_stream > 0 &&
+-            n_direct_sparse_batch == 1 &&
+-            ubatch.n_tokens == n_direct_sparse_stream;
+-    const bool direct_sparse_prefill_shape =
+-            direct_sparse_prefill_enabled &&
+-            n_direct_sparse_batch <= direct_sparse_prefill_max_tokens;
+-    const bool direct_sparse_large_prefill_shape =
+-            direct_sparse_prefill_enabled &&
+-            n_direct_sparse_batch > direct_sparse_prefill_max_tokens &&
+-            dense_sparse_mask_bytes > dense_sparse_mask_limit;
+-    const bool direct_sparse_token_shape_allowed =
+-            direct_sparse_decode_shape ||
+-            direct_sparse_prefill_shape ||
+-            direct_sparse_large_prefill_shape;
++    const int64_t dense_sparse_mask_limit = skippy_glm_dsa_dense_sparse_mask_max_bytes();
+     const bool direct_sparse_enabled = skippy_glm_dsa_direct_sparse_attn_enabled();
++    const bool direct_sparse_prefill_enabled = skippy_glm_dsa_direct_sparse_prefill_enabled();
+     const bool direct_sparse_kq_b_ok = kq_b == nullptr;
+     const bool direct_sparse_sinks_ok = sinks == nullptr;
+     const bool direct_sparse_alibi_ok = hparams.f_max_alibi_bias == 0.0f;
+     const bool direct_sparse_soft_cap_ok = !hparams.attn_soft_cap;
+-    const bool compact_flash_disabled = skippy_glm_dsa_compact_flash_attn_disabled();
+-    const bool compact_flash_large_decode_top_k =
+-            direct_sparse_decode_shape &&
+-            n_sparse_top_k > 1024;
+-    const bool use_compact_flash_attn =
+-            !compact_flash_disabled &&
+-            cparams.flash_attn &&
+-            compact_flash_large_decode_top_k &&
+-            direct_sparse_kq_b_ok &&
+-            direct_sparse_sinks_ok &&
+-            direct_sparse_alibi_ok &&
+-            direct_sparse_soft_cap_ok;
+-    const char * compact_flash_selector_reason =
+-            use_compact_flash_attn ? "decode_compact_large_top_k" :
+-            compact_flash_disabled ? "disabled" :
+-            !cparams.flash_attn ? "flash_attn_disabled" :
+-            !compact_flash_large_decode_top_k ? "small_decode_top_k_or_not_decode" :
+-            !direct_sparse_kq_b_ok ? "kq_b_present" :
+-            !direct_sparse_sinks_ok ? "sinks_present" :
+-            !direct_sparse_alibi_ok ? "alibi_present" :
+-            !direct_sparse_soft_cap_ok ? "soft_cap_present" :
+-            "unknown";
+-
+-    const bool use_direct_sparse_attn =
+-            !use_compact_flash_attn &&
+-            direct_sparse_enabled &&
+-            direct_sparse_token_shape_allowed &&
+-            direct_sparse_kq_b_ok &&
+-            direct_sparse_sinks_ok &&
+-            direct_sparse_alibi_ok &&
+-            direct_sparse_soft_cap_ok;
+-    const char * direct_sparse_phase =
+-            direct_sparse_decode_shape ? "decode" :
+-            (direct_sparse_prefill_shape || direct_sparse_large_prefill_shape) ? "prefill" :
+-            "other";
+-    const char * direct_sparse_selector_reason =
+-            use_compact_flash_attn ? "compact_flash_selected" :
+-            use_direct_sparse_attn && direct_sparse_decode_shape ? "decode" :
+-            use_direct_sparse_attn && direct_sparse_prefill_shape ? "short_prefill" :
+-            use_direct_sparse_attn && direct_sparse_large_prefill_shape ? "dense_mask_guard_large_prefill" :
+-            !direct_sparse_enabled ? "direct_sparse_disabled" :
+-            !direct_sparse_token_shape_allowed ? "token_shape_not_allowed" :
+-            !direct_sparse_kq_b_ok ? "kq_b_present" :
+-            !direct_sparse_sinks_ok ? "sinks_present" :
+-            !direct_sparse_alibi_ok ? "alibi_present" :
+-            !direct_sparse_soft_cap_ok ? "soft_cap_present" :
+-            "unknown";
+-
+-    skippy_glm_dsa_log_direct_sparse_decision(
+-            il,
+-            ubatch.n_tokens,
++    const llama_glm_dsa_sparse_attn_policy sparse_policy = llama_glm_dsa_choose_sparse_attn_policy(
+             n_direct_sparse_batch,
+             n_direct_sparse_stream,
+-            n_sparse_kv,
+             n_sparse_top_k,
++            ubatch.n_tokens,
+             direct_sparse_prefill_max_tokens,
+             dense_sparse_mask_bytes,
+             dense_sparse_mask_limit,
+             direct_sparse_enabled,
+             direct_sparse_prefill_enabled,
+-            direct_sparse_decode_shape,
+-            direct_sparse_prefill_shape,
+-            direct_sparse_large_prefill_shape,
+-            direct_sparse_token_shape_allowed,
++            cparams.flash_attn,
++            skippy_glm_dsa_compact_flash_attn_disabled(),
+             direct_sparse_kq_b_ok,
+             direct_sparse_sinks_ok,
+             direct_sparse_alibi_ok,
+-            direct_sparse_soft_cap_ok,
+-            use_direct_sparse_attn,
+-            direct_sparse_phase,
+-            direct_sparse_selector_reason);
++            direct_sparse_soft_cap_ok);
+ 
+-    skippy_glm_dsa_log_compact_flash_policy(
++    skippy_glm_dsa_log_direct_sparse_decision(
+             il,
+             ubatch.n_tokens,
++            n_direct_sparse_batch,
++            n_direct_sparse_stream,
+             n_sparse_kv,
+             n_sparse_top_k,
+-            compact_flash_disabled,
+-            compact_flash_large_decode_top_k,
+-            !compact_flash_disabled && compact_flash_large_decode_top_k,
+-            cparams.flash_attn,
+-            direct_sparse_decode_shape,
+-            direct_sparse_kq_b_ok,
+-            direct_sparse_sinks_ok,
+-            direct_sparse_alibi_ok,
+-            direct_sparse_soft_cap_ok,
+-            use_compact_flash_attn,
+-            compact_flash_selector_reason);
++            direct_sparse_prefill_max_tokens,
++            dense_sparse_mask_bytes,
++            dense_sparse_mask_limit,
++            sparse_policy.direct_enabled,
++            sparse_policy.prefill_enabled,
++            sparse_policy.decode_shape,
++            sparse_policy.prefill_shape,
++            sparse_policy.large_prefill_shape,
++            sparse_policy.token_shape_allowed,
++            sparse_policy.kq_b_ok,
++            sparse_policy.sinks_ok,
++            sparse_policy.alibi_ok,
++            sparse_policy.soft_cap_ok,
++            sparse_policy.use_direct_sparse_attn(),
++            sparse_policy.phase,
++            sparse_policy.direct_selector_reason);
+ 
+-    if (use_compact_flash_attn) {
++    skippy_glm_dsa_log_compact_flash_policy(
++            il,
++            ubatch.n_tokens,
++            n_sparse_kv,
++            n_sparse_top_k,
++            sparse_policy.compact_disabled,
++            sparse_policy.compact_large_decode_top_k,
++            sparse_policy.compact_candidate,
++            sparse_policy.flash_attn,
++            sparse_policy.decode_shape,
++            sparse_policy.kq_b_ok,
++            sparse_policy.sinks_ok,
++            sparse_policy.alibi_ok,
++            sparse_policy.soft_cap_ok,
++            sparse_policy.use_compact_flash_attn(),
++            sparse_policy.compact_selector_reason);
++
++    if (sparse_policy.use_compact_flash_attn()) {
+         ggml_tensor * cur = build_attn_mha_dsa_compact_flash(q, k, v, top_k_3d, v_mla, kq_scale, il);
+         cb(cur, "kqv_out", il);
+ 
+@@ -3159,7 +3252,7 @@ ggml_tensor * llm_graph_context::build_attn(
+         return cur;
+     }
+ 
+-    if (use_direct_sparse_attn) {
++    if (sparse_policy.use_direct_sparse_attn()) {
+         ggml_tensor * cur = build_attn_mha_dsa_sparse(q, k, v, kq_mask_rows, top_k_3d, v_mla, kq_scale, il);
+         cb(cur, "kqv_out", il);
+ 
+-- 
+2.53.0
+

@@ -306,8 +306,15 @@ pub struct GlmDsaLayerMicrobenchArgs {
         help = "Allow llama.cpp's native GLM-DSA compact flash-attention policy to select the compact path without forcing it on."
     )]
     pub allow_compact_flash_auto: bool,
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub direct_sparse_prefill: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Do not set the GLM-DSA direct sparse prefill env toggle; prove llama.cpp's native default policy instead."
+    )]
+    pub native_default_direct_sparse_prefill: bool,
     #[arg(
         long,
         default_value_t = false,

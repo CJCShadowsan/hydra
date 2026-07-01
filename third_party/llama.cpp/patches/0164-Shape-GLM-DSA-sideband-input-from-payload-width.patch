@@ -1,0 +1,49 @@
+From bbb8f6b1b30c763bb76279de39b080caa3fa2c85 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 01:35:38 +1000
+Subject: [PATCH] Shape GLM DSA sideband input from payload width
+
+---
+ src/llama-graph.cpp    | 9 ++++++---
+ src/models/glm-dsa.cpp | 5 ++++-
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6140f5dc3..0360e9992 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -440,9 +440,12 @@ bool llm_graph_input_glm_dsa_top_k::can_reuse(const llm_graph_params & params) {
+         return false;
+     }
+ 
+-    const int64_t params_n_top_k = std::min<int64_t>(
+-            mctx->get_lid()->get_n_kv(),
+-            params.hparams.indexer_top_k);
++    const skippy_activation_glm_dsa_top_k & sideband = skippy_graph_get_glm_dsa_top_k();
++    const int64_t params_n_top_k = sideband.values != nullptr ?
++            sideband.n_top_k :
++            std::min<int64_t>(
++                mctx->get_lid()->get_n_kv(),
++                params.hparams.indexer_top_k);
+ 
+     return values &&
+            values->ne[0] == params_n_top_k &&
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 385331161..45ac7de49 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -534,7 +534,10 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
+         GGML_ASSERT(n_stream > 0);
+         GGML_ASSERT(ubatch.n_tokens % n_stream == 0);
+         const int64_t n_batch = ubatch.n_tokens / n_stream;
+-        const int64_t n_top_k = std::min<int64_t>(inp_attn_dsa->mctx->get_lid()->get_n_kv(), n_indexer_top_k);
++        const skippy_activation_glm_dsa_top_k & sideband = skippy_graph_get_glm_dsa_top_k();
++        const int64_t n_top_k = sideband.values != nullptr ?
++                sideband.n_top_k :
++                std::min<int64_t>(inp_attn_dsa->mctx->get_lid()->get_n_kv(), n_indexer_top_k);
+ 
+         auto inp = std::make_unique<llm_graph_input_glm_dsa_top_k>(n_top_k, n_stream);
+         inp->values = ggml_new_tensor_4d(ctx0, GGML_TYPE_I32, n_top_k, n_batch, 1, n_stream);
+-- 
+2.53.0
+

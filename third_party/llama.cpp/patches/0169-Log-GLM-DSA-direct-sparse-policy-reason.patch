@@ -1,0 +1,154 @@
+From f4368cc1c671fe9e7e8a145de47ed71043b959a9 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 02:25:37 +1000
+Subject: [PATCH] Log GLM DSA direct sparse policy reason
+
+---
+ src/llama-graph.cpp | 38 +++++++++++++++++++++++++++++++++++---
+ src/skippy.cpp      | 26 ++++++++++++++++++++++++--
+ 2 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 567f54bb6..806140dda 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -116,6 +116,8 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+         int64_t ubatch_tokens,
+         int64_t sparse_batch,
+         int64_t sparse_streams,
++        int64_t sparse_kv,
++        int64_t sparse_top_k,
+         int64_t prefill_cap,
+         int64_t dense_mask_bytes,
+         int64_t dense_mask_limit,
+@@ -129,20 +131,30 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+         bool    sinks_ok,
+         bool    alibi_ok,
+         bool    soft_cap_ok,
+-        bool    use_direct) {
++        bool    use_direct,
++        const char * phase,
++        const char * selector_reason) {
+     if (!skippy_glm_dsa_direct_sparse_decision_log_enabled()) {
+         return;
+     }
+ 
++    const int64_t kv_topk_ratio = sparse_top_k > 0 ? sparse_kv / sparse_top_k : 0;
++
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld dense_mask_bytes=%lld dense_mask_limit=%lld direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
++            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%lld dense_mask_limit=%lld phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+             layer,
+             (long long) ubatch_tokens,
+             (long long) sparse_batch,
+             (long long) sparse_streams,
+             (long long) prefill_cap,
++            (long long) sparse_kv,
++            (long long) sparse_top_k,
++            0LL,
++            (long long) kv_topk_ratio,
+             (long long) dense_mask_bytes,
+             (long long) dense_mask_limit,
++            phase,
++            selector_reason,
+             direct_enabled ? 1 : 0,
+             prefill_enabled ? 1 : 0,
+             decode_shape ? 1 : 0,
+@@ -3074,12 +3086,30 @@ ggml_tensor * llm_graph_context::build_attn(
+             direct_sparse_sinks_ok &&
+             direct_sparse_alibi_ok &&
+             direct_sparse_soft_cap_ok;
++    const char * direct_sparse_phase =
++            direct_sparse_decode_shape ? "decode" :
++            (direct_sparse_prefill_shape || direct_sparse_large_prefill_shape) ? "prefill" :
++            "other";
++    const char * direct_sparse_selector_reason =
++            use_compact_flash_attn ? "compact_flash_selected" :
++            use_direct_sparse_attn && direct_sparse_decode_shape ? "decode" :
++            use_direct_sparse_attn && direct_sparse_prefill_shape ? "short_prefill" :
++            use_direct_sparse_attn && direct_sparse_large_prefill_shape ? "dense_mask_guard_large_prefill" :
++            !direct_sparse_enabled ? "direct_sparse_disabled" :
++            !direct_sparse_token_shape_allowed ? "token_shape_not_allowed" :
++            !direct_sparse_kq_b_ok ? "kq_b_present" :
++            !direct_sparse_sinks_ok ? "sinks_present" :
++            !direct_sparse_alibi_ok ? "alibi_present" :
++            !direct_sparse_soft_cap_ok ? "soft_cap_present" :
++            "unknown";
+ 
+     skippy_glm_dsa_log_direct_sparse_decision(
+             il,
+             ubatch.n_tokens,
+             n_direct_sparse_batch,
+             n_direct_sparse_stream,
++            n_sparse_kv,
++            n_sparse_top_k,
+             direct_sparse_prefill_max_tokens,
+             dense_sparse_mask_bytes,
+             dense_sparse_mask_limit,
+@@ -3093,7 +3123,9 @@ ggml_tensor * llm_graph_context::build_attn(
+             direct_sparse_sinks_ok,
+             direct_sparse_alibi_ok,
+             direct_sparse_soft_cap_ok,
+-            use_direct_sparse_attn);
++            use_direct_sparse_attn,
++            direct_sparse_phase,
++            direct_sparse_selector_reason);
+ 
+     skippy_glm_dsa_log_compact_flash_policy(
+             il,
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index ef1e772e6..333742122 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1842,6 +1842,10 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+     }
+     const uint64_t dense_mask_bytes = dense_mask_shape != nullptr ? ggml_nbytes(dense_mask_shape) : 0;
+     const uint64_t dense_mask_limit = skippy_glm_dsa_dense_sparse_mask_max_bytes();
++    const int64_t sparse_kv = dense_mask_shape != nullptr ? dense_mask_shape->ne[1] : -1;
++    const int64_t sparse_top_k = top_k != nullptr ? top_k->ne[0] : -1;
++    const int64_t kv_topk_ratio = sparse_top_k > 0 ? sparse_kv / sparse_top_k : 0;
++    const bool direct_enabled = use_direct || skippy_glm_dsa_direct_sparse_attn_enabled();
+     const bool decode_shape =
+             sparse_streams > 0 &&
+             sparse_batch == 1 &&
+@@ -1855,17 +1859,35 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+             sparse_batch > static_cast<int64_t>(prefill_cap) &&
+             dense_mask_bytes > dense_mask_limit;
+     const bool token_shape_allowed = decode_shape || prefill_shape || large_prefill_shape;
++    const char * phase =
++            decode_shape ? "decode" :
++            (prefill_shape || large_prefill_shape) ? "prefill" :
++            "other";
++    const char * selector_reason =
++            use_direct && decode_shape ? "decode" :
++            use_direct && prefill_shape ? "short_prefill" :
++            use_direct && large_prefill_shape ? "dense_mask_guard_large_prefill" :
++            !direct_enabled ? "direct_sparse_disabled" :
++            !token_shape_allowed ? "token_shape_not_allowed" :
++            !use_direct ? "dense_mask_fallback" :
++            "unknown";
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld dense_mask_bytes=%llu dense_mask_limit=%llu direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
++            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%llu dense_mask_limit=%llu phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+             layer,
+             static_cast<long long>(timing.token_count),
+             static_cast<long long>(sparse_batch),
+             static_cast<long long>(sparse_streams),
+             static_cast<long long>(prefill_cap),
++            static_cast<long long>(sparse_kv),
++            static_cast<long long>(sparse_top_k),
++            0LL,
++            static_cast<long long>(kv_topk_ratio),
+             static_cast<unsigned long long>(dense_mask_bytes),
+             static_cast<unsigned long long>(dense_mask_limit),
+-            skippy_glm_dsa_direct_sparse_attn_enabled() ? 1 : 0,
++            phase,
++            selector_reason,
++            direct_enabled ? 1 : 0,
+             prefill_enabled ? 1 : 0,
+             decode_shape ? 1 : 0,
+             prefill_shape ? 1 : 0,
+-- 
+2.53.0
+

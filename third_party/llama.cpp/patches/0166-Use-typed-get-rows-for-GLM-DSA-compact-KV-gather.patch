@@ -1,0 +1,174 @@
+From 61686bd460ebe7eba4058ecd7ad6153e5e3b80c6 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 01:47:38 +1000
+Subject: [PATCH] Use typed get rows for GLM DSA compact KV gather
+
+---
+ ggml/include/ggml.h                       |  5 +++++
+ ggml/src/ggml-cpu/ops.cpp                 | 13 ++++++++++---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  8 ++++++--
+ ggml/src/ggml-metal/ggml-metal-device.h   |  2 +-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  2 +-
+ ggml/src/ggml-metal/ggml-metal.metal      |  1 +
+ ggml/src/ggml.c                           | 23 +++++++++++++++++++++++
+ src/llama-graph.cpp                       |  4 ++--
+ 8 files changed, 49 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index b1823e08e..b76ed1b26 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1667,6 +1667,11 @@ extern "C" {
+             struct ggml_tensor  * a,  // data
+             struct ggml_tensor  * b); // row indices
+ 
++    GGML_API struct ggml_tensor * ggml_get_rows_typed(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,  // data
++            struct ggml_tensor  * b); // row indices
++
+     GGML_API struct ggml_tensor * ggml_get_rows_back(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 986bcf19a..91a973a59 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -4819,9 +4819,16 @@ static void ggml_compute_forward_get_rows_f16(
+ 
+         GGML_ASSERT(i01 >= 0 && i01 < ne01);
+ 
+-        ggml_cpu_fp16_to_fp32(
+-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+-                       (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
++        if (dst->type == GGML_TYPE_F16) {
++            memcpy(
++                    (char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3,
++                    (char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03,
++                    nc*sizeof(ggml_fp16_t));
++        } else {
++            ggml_cpu_fp16_to_fp32(
++                (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
++                           (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
++        }
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 86c71eea9..b19948611 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -146,11 +146,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d(ggml_met
+     return res;
+ }
+ 
+-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_metal_library_t lib, ggml_type tsrc) {
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
+     char base[256];
+     char name[256];
+ 
+-    snprintf(base, 256, "kernel_get_rows_%s", ggml_type_name(tsrc));
++    if (tsrc == GGML_TYPE_F16 && tdst == GGML_TYPE_F16) {
++        snprintf(base, 256, "kernel_get_rows_f16_f16");
++    } else {
++        snprintf(base, 256, "kernel_get_rows_%s", ggml_type_name(tsrc));
++    }
+     snprintf(name, 256, "%s", base);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index b3ca4e2e3..c3322c774 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -111,7 +111,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, enum ggml_type tidx, enum ggml_type tdst);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_mask_fill(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_mask_set (ggml_metal_library_t lib);
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 6534f3cfb..985352b82 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1543,7 +1543,7 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_get_rows(lib, op->src[0]->type);
++    auto pipeline = ggml_metal_library_get_pipeline_get_rows(lib, op->src[0]->type, op->type);
+ 
+     ggml_metal_kargs_get_rows args = {
+         /*.ne00t =*/ ggml_is_quantized(op->src[0]->type) ? ne00/16 : ne00,
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 63c8c19ba..af7b0313c 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -11144,6 +11144,7 @@ typedef decltype(kernel_get_rows_f<float, float>) get_rows_f_t;
+ 
+ template [[host_name("kernel_get_rows_f32")]]  kernel get_rows_f_t kernel_get_rows_f<float, float>;
+ template [[host_name("kernel_get_rows_f16")]]  kernel get_rows_f_t kernel_get_rows_f<half,  float>;
++template [[host_name("kernel_get_rows_f16_f16")]] kernel get_rows_f_t kernel_get_rows_f<half, half>;
+ template [[host_name("kernel_get_rows_i32")]]  kernel get_rows_f_t kernel_get_rows_f<int32_t, int32_t>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_get_rows_bf16")]] kernel get_rows_f_t kernel_get_rows_f<bfloat, float>;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 6c24c7dbe..97b4aee30 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -3883,6 +3883,29 @@ struct ggml_tensor * ggml_get_rows(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_get_rows_typed(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b) {
++    GGML_ASSERT(a->ne[2] == b->ne[1]);
++    GGML_ASSERT(a->ne[3] == b->ne[2]);
++    GGML_ASSERT(b->ne[3] == 1);
++    GGML_ASSERT(b->type == GGML_TYPE_I32);
++
++    enum ggml_type type = a->type;
++    if (ggml_is_quantized(type) || type == GGML_TYPE_BF16) {
++        type = GGML_TYPE_F32;
++    }
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
++
++    result->op     = GGML_OP_GET_ROWS;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
+ // ggml_get_rows_back
+ 
+ struct ggml_tensor * ggml_get_rows_back(
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0360e9992..b6eaf30fb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2652,14 +2652,14 @@ ggml_tensor * llm_graph_context::build_attn_mha_dsa_compact_flash(
+     GGML_ASSERT(top_k->ne[1] == v->ne[2]);
+     GGML_ASSERT(top_k->ne[2] == v->ne[3]);
+ 
+-    ggml_tensor * k_top_k = ggml_get_rows(ctx0, k, top_k);
++    ggml_tensor * k_top_k = ggml_get_rows_typed(ctx0, k, top_k);
+     cb(k_top_k, "dsa_compact_k_topk_rows", il);
+     if (k_top_k->type == GGML_TYPE_F32) {
+         k_top_k = ggml_cast(ctx0, k_top_k, GGML_TYPE_F16);
+         cb(k_top_k, "dsa_compact_k_topk_rows_f16", il);
+     }
+ 
+-    ggml_tensor * v_top_k = ggml_get_rows(ctx0, v, top_k);
++    ggml_tensor * v_top_k = ggml_get_rows_typed(ctx0, v, top_k);
+     cb(v_top_k, "dsa_compact_v_topk_rows", il);
+     if (v_top_k->type == GGML_TYPE_F32) {
+         v_top_k = ggml_cast(ctx0, v_top_k, GGML_TYPE_F16);
+-- 
+2.53.0
+

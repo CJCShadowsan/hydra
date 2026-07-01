@@ -174,6 +174,7 @@ require_file "$MODEL"
 
 missing_model="$WORK_DIR/missing-indexshare.gguf"
 shared_bad_model="$WORK_DIR/shared-with-indexer.gguf"
+full_missing_indexer_model="$WORK_DIR/full-missing-indexer.gguf"
 odd_rope_model="$WORK_DIR/odd-rope.gguf"
 short_indexer_model="$WORK_DIR/short-indexer-head.gguf"
 frequency_conflict_model="$WORK_DIR/indexshare-frequency-conflict.gguf"
@@ -193,6 +194,15 @@ python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
   "$shared_bad_model" \
   --set-indexer-types full,shared,shared \
   --set-u32 glm-dsa.attention.indexer.top_k_frequency=3
+
+python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
+  "$MODEL" \
+  "$full_missing_indexer_model" \
+  --rename-tensor blk.0.indexer.k_norm.weight=blk.0.indexer.k_norm_missing.weight \
+  --rename-tensor blk.0.indexer.k_norm.bias=blk.0.indexer.k_norm_missing.bias \
+  --rename-tensor blk.0.indexer.proj.weight=blk.0.indexer.proj_missing.weight \
+  --rename-tensor blk.0.indexer.attn_k.weight=blk.0.indexer.attn_k_missing.weight \
+  --rename-tensor blk.0.indexer.attn_q_b.weight=blk.0.indexer.attn_q_b_missing.weight
 
 python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
   "$MODEL" \
@@ -237,7 +247,7 @@ python3 "$ROOT/scripts/glm-dsa-gguf-contract-mutator.py" \
   "$MODEL" \
   "$stale_unsplit_model" \
   --rename-tensor blk.0.attn_v_b.weight=blk.0.attn_kv_b.weight \
-  --set-tensor-shape blk.0.attn_kv_b.weight=2,5
+  --set-tensor-shape blk.0.attn_kv_b.weight=2,4
 
 good_status="$(run_llama good "$MODEL")"
 if [[ "$good_status" != "0" ]]; then
@@ -270,6 +280,15 @@ fi
 assert_log_contains \
   "$WORK_DIR/shared_bad.stderr" \
   "GLM_DSA IndexShare metadata declares Shared layer 2 with indexer tensors"
+
+full_missing_indexer_status="$(run_llama full_missing_indexer "$full_missing_indexer_model")"
+if [[ "$full_missing_indexer_status" == "0" ]]; then
+  echo "Full-missing-indexer fixture unexpectedly loaded" >&2
+  exit 1
+fi
+assert_log_contains \
+  "$WORK_DIR/full_missing_indexer.stderr" \
+  "GLM_DSA IndexShare metadata declares Full layer 0 without indexer tensors"
 
 odd_rope_status="$(run_llama odd_rope "$odd_rope_model")"
 if [[ "$odd_rope_status" == "0" ]]; then

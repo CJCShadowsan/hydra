@@ -8,6 +8,9 @@ RUN_SMOKE="${RUN_SMOKE:-1}"
 RUN_BACKEND_OPS="${RUN_BACKEND_OPS:-1}"
 BACKENDS="${BACKENDS:-CPU,MTL0}"
 JOBS="${JOBS:-8}"
+INVENTORY_CONTRACT="${INVENTORY_CONTRACT:-auto}"
+INVENTORY_SOURCE="${INVENTORY_SOURCE:-}"
+INVENTORY_GGUF="${INVENTORY_GGUF:-}"
 BF16_DRY_RUN="${BF16_DRY_RUN:-auto}"
 BF16_SHARD="${BF16_SHARD:-1}"
 BF16_SOURCE="${BF16_SOURCE:-}"
@@ -16,6 +19,7 @@ SKIPPY_QUANTIZE_BIN="${SKIPPY_QUANTIZE_BIN:-$ROOT/target/debug/skippy-quantize}"
 SKIPPY_BENCH_BIN="${SKIPPY_BENCH_BIN:-$ROOT/target/debug/skippy-bench}"
 
 LLAMA_BENCH_BUILD_DIR="${LLAMA_BENCH_BUILD_DIR:-${LLAMA_STAGE_BUILD_DIR:-$ROOT/.deps/llama-build/build-stage-abi-static-metal}}"
+LLAMA_ARCHS_BUILD_DIR="${LLAMA_ARCHS_BUILD_DIR:-$ROOT/.deps/llama-build/build-stage-abi-static-metal-tests}"
 BACKEND_OPS_BUILD_DIR="${BACKEND_OPS_BUILD_DIR:-$ROOT/.deps/llama-build/build-metal-tests}"
 
 usage() {
@@ -24,6 +28,7 @@ Usage: scripts/glm-dsa-phase-a-local-gate.sh [options]
 
 Runs the local, non-destructive Phase A GLM-DSA gate:
   - script syntax and Python syntax checks
+  - real GLM-5.2 SafeTensor/GGUF inventory contract when artifacts are present
   - native llama-only GLM-DSA contract smoke
   - CPU/Metal backend-op parity for GLM-DSA required ops
   - optional BF16 shard dry-run verification only; never repairs shards
@@ -37,6 +42,9 @@ Options:
   --skip-backend-ops        Skip backend-op parity tests.
   --backends LIST           Comma-separated backend list. Default: CPU,MTL0.
   --jobs N                  Build parallelism. Default: 8.
+  --inventory-contract MODE auto, off, or required. Default: auto.
+  --inventory-source PATH   Source GLM-5.2 SafeTensors checkpoint for contract verification.
+  --inventory-gguf PATH     BF16/layer GGUF root for contract verification.
   --bf16-dry-run MODE       auto, off, or required. Default: auto.
   --bf16-source PATH        Source GLM-5.2 SafeTensors checkpoint for dry-run.
   --bf16-target PATH        BF16 GGUF repo root for dry-run.
@@ -47,9 +55,10 @@ Options:
   -h, --help                Show this help.
 
 Environment overrides mirror option names:
-  BUILD, RUN_SMOKE, RUN_BACKEND_OPS, BACKENDS, JOBS, BF16_DRY_RUN,
-  BF16_SOURCE, BF16_TARGET, BF16_SHARD, SKIPPY_QUANTIZE_BIN,
-  SKIPPY_BENCH_BIN.
+  BUILD, RUN_SMOKE, RUN_BACKEND_OPS, BACKENDS, JOBS, INVENTORY_CONTRACT,
+  INVENTORY_SOURCE, INVENTORY_GGUF, BF16_DRY_RUN, BF16_SOURCE, BF16_TARGET,
+  BF16_SHARD, SKIPPY_QUANTIZE_BIN, SKIPPY_BENCH_BIN,
+  LLAMA_BENCH_BUILD_DIR, LLAMA_ARCHS_BUILD_DIR, BACKEND_OPS_BUILD_DIR.
 EOF
 }
 
@@ -73,6 +82,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --jobs)
       JOBS="$2"
+      shift 2
+      ;;
+    --inventory-contract)
+      INVENTORY_CONTRACT="$2"
+      shift 2
+      ;;
+    --inventory-source)
+      INVENTORY_SOURCE="$2"
+      shift 2
+      ;;
+    --inventory-gguf)
+      INVENTORY_GGUF="$2"
       shift 2
       ;;
     --bf16-dry-run)
@@ -162,6 +183,22 @@ detect_bf16_target() {
   return 1
 }
 
+detect_inventory_gguf() {
+  local candidates=(
+    "/Users/lab/glm52-work/bf16-gguf/BF16"
+    "/Volumes/External/models/huggingface/hub/models--meshllm--GLM-5.2-Q2_K-MTP-Q8-layers/snapshots/main/layers"
+    "/Users/lab/models/huggingface/hub/models--meshllm--GLM-5.2-Q2_K-MTP-Q8-layers/snapshots/main/layers"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 syntax_checks() {
   phase "syntax"
   python3 -m py_compile \
@@ -169,13 +206,63 @@ syntax_checks() {
     "$ROOT/scripts/glm-dsa-inventory-verifier.py" \
     "$ROOT/scripts/glm-dsa-tiny-contract-fixture.py"
 
+  python3 "$ROOT/scripts/glm-dsa-inventory-verifier.py" --self-test --json
+
   bash -n \
     "$ROOT/scripts/glm-dsa-indexshare-local-smoke.sh" \
     "$ROOT/scripts/glm-dsa-bf16-rebuild-window.sh" \
     "$ROOT/scripts/glm-dsa-bf16-rebuild-window-test.sh" \
     "$ROOT/scripts/glm-dsa-bf16-repair-stale-shards.sh" \
     "$ROOT/scripts/glm-dsa-bf16-repair-stale-shards-test.sh" \
-    "$ROOT/scripts/glm-dsa-phase-a-local-gate.sh"
+    "$ROOT/scripts/glm-dsa-phase-a-local-gate.sh" \
+    "$ROOT/scripts/glm52-phase-a-malformed-indexshare-negative.sh" \
+    "$ROOT/scripts/glm52-phase-a-missing-indexshare-negative.sh" \
+    "$ROOT/scripts/glm52-phase-a-position-wrong-width-indexshare-negative.sh" \
+    "$ROOT/scripts/glm52-phase-a-real-warmup-wrong-width-indexshare-negative.sh" \
+    "$ROOT/scripts/glm52-phase-a-wrong-width-indexshare-negative.sh"
+}
+
+run_inventory_contract() {
+  case "$INVENTORY_CONTRACT" in
+    off)
+      return
+      ;;
+    auto|required)
+      ;;
+    *)
+      echo "--inventory-contract must be auto, off, or required, got: $INVENTORY_CONTRACT" >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ -z "$INVENTORY_SOURCE" ]]; then
+    INVENTORY_SOURCE="$(detect_bf16_source || true)"
+  fi
+  if [[ -z "$INVENTORY_GGUF" ]]; then
+    INVENTORY_GGUF="$(detect_inventory_gguf || true)"
+  fi
+
+  if [[ -z "$INVENTORY_SOURCE" || -z "$INVENTORY_GGUF" ]]; then
+    if [[ "$INVENTORY_CONTRACT" == "required" ]]; then
+      echo "inventory contract required but source or GGUF path was not found" >&2
+      exit 1
+    fi
+    phase "real GLM-5.2 inventory contract skipped"
+    echo "source: ${INVENTORY_SOURCE:-not found}"
+    echo "gguf: ${INVENTORY_GGUF:-not found}"
+    echo "This is expected on hosts without the GLM-5.2 artifacts mounted."
+    return
+  fi
+
+  phase "real GLM-5.2 inventory contract"
+  require_file "$INVENTORY_SOURCE/config.json"
+  require_file "$INVENTORY_GGUF"
+  local report="${TMPDIR:-/tmp}/glm-dsa-inventory-contract.$$.json"
+  python3 "$ROOT/scripts/glm-dsa-inventory-verifier.py" \
+    --checkpoint "$INVENTORY_SOURCE" \
+    --gguf "$INVENTORY_GGUF" \
+    --json | tee "$report"
+  echo "inventory report: $report"
 }
 
 run_rebuild_helper_fixture() {
@@ -194,8 +281,20 @@ build_local_tools() {
   (cd "$ROOT" && just with-lld cargo build -p skippy-bench)
 
   phase "build llama.cpp GLM-DSA test binaries"
+  cmake --build "$LLAMA_ARCHS_BUILD_DIR" --target test-llama-archs -j "$JOBS"
   cmake --build "$LLAMA_BENCH_BUILD_DIR" --target llama-bench -j "$JOBS"
   cmake --build "$BACKEND_OPS_BUILD_DIR" --target test-backend-ops -j "$JOBS"
+}
+
+run_llama_archs_contract_test() {
+  if [[ "$RUN_SMOKE" != "1" ]]; then
+    return
+  fi
+
+  phase "native llama GLM-DSA arch contract/execution test"
+  local test_bin="$LLAMA_ARCHS_BUILD_DIR/bin/test-llama-archs"
+  require_executable "$test_bin"
+  "$test_bin" -a glm-dsa -s 42
 }
 
 run_contract_smoke() {
@@ -212,6 +311,31 @@ run_contract_smoke() {
     SKIPPY_QUANTIZE_BIN="$SKIPPY_QUANTIZE_BIN" \
     SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
     "$ROOT/scripts/glm-dsa-indexshare-local-smoke.sh"
+
+  phase "native GLM-DSA missing IndexShare negative"
+  OUT_DIR="${TMPDIR:-/tmp}/glm52-phase-a-missing-indexshare-negative.$$" \
+    SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
+    "$ROOT/scripts/glm52-phase-a-missing-indexshare-negative.sh"
+
+  phase "native GLM-DSA malformed IndexShare negative"
+  OUT_DIR="${TMPDIR:-/tmp}/glm52-phase-a-malformed-indexshare-negative.$$" \
+    SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
+    "$ROOT/scripts/glm52-phase-a-malformed-indexshare-negative.sh"
+
+  phase "native GLM-DSA wrong-width IndexShare negative"
+  OUT_DIR="${TMPDIR:-/tmp}/glm52-phase-a-wrong-width-indexshare-negative.$$" \
+    SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
+    "$ROOT/scripts/glm52-phase-a-wrong-width-indexshare-negative.sh"
+
+  phase "native GLM-DSA position wrong-width IndexShare negative"
+  OUT_DIR="${TMPDIR:-/tmp}/glm52-phase-a-position-wrong-width-indexshare-negative.$$" \
+    SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
+    "$ROOT/scripts/glm52-phase-a-position-wrong-width-indexshare-negative.sh"
+
+  phase "native GLM-DSA real-warmup wrong-width IndexShare negative"
+  OUT_DIR="${TMPDIR:-/tmp}/glm52-phase-a-real-warmup-wrong-width-indexshare-negative.$$" \
+    SKIPPY_BENCH_BIN="$SKIPPY_BENCH_BIN" \
+    "$ROOT/scripts/glm52-phase-a-real-warmup-wrong-width-indexshare-negative.sh"
 }
 
 run_backend_ops() {
@@ -288,8 +412,10 @@ run_bf16_dry_run() {
 }
 
 syntax_checks
+run_inventory_contract
 run_rebuild_helper_fixture
 build_local_tools
+run_llama_archs_contract_test
 run_contract_smoke
 run_backend_ops
 run_bf16_dry_run

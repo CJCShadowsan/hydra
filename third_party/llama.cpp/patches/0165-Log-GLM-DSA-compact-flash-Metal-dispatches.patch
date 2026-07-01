@@ -1,0 +1,148 @@
+From 5a0ab4327066b677128e34a89dd1a31e57431c89 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 01:43:15 +1000
+Subject: [PATCH] Log GLM DSA compact flash Metal dispatches
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp | 97 ++++++++++++++++++++++++--
+ 1 file changed, 93 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index d731bc0e0..6534f3cfb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1563,6 +1563,9 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+     const int nth = std::min(args.ne00t, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+     const int nw0 = (args.ne00t + nth - 1)/nth;
++    const int grid_x = nw0*ne10;
++    const int grid_y = ne11;
++    const int grid_z = ne12;
+ 
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+@@ -1570,7 +1573,22 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+-    ggml_metal_encoder_dispatch_threadgroups(enc, nw0*ne10, ne11, ne12, nth, 1, 1);
++    if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++        GGML_LOG_INFO(
++            "skippy: glm_dsa_metal_dispatch op=get_rows kernel=%s tensor=%s src_type=%s top_k_type=%s dst_type=%s rows=%lld grid_x=%d grid_y=%d grid_z=%d threads_x=%d\n",
++            op->src[0]->type == op->type ? "typed" : "promote",
++            ggml_metal_tensor_name(op),
++            ggml_type_name(op->src[0]->type),
++            ggml_type_name(op->src[1]->type),
++            ggml_type_name(op->type),
++            (long long) ne10,
++            grid_x,
++            grid_y,
++            grid_z,
++            nth);
++    }
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, nth, 1, 1);
+ 
+     return 1;
+ }
+@@ -3322,7 +3340,30 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+ 
+         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, ne02, ne03, 32, nsg, 1);
++        const int grid_x = (ne01 + nqptg - 1)/nqptg;
++        const int grid_y = ne02;
++        const int grid_z = ne03;
++        if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++            GGML_LOG_INFO(
++                "skippy: glm_dsa_metal_dispatch op=flash_attn_ext kernel=tile tensor=%s q_type=%s k_type=%s v_type=%s mask_type=%s dst_type=%s q_width=%lld v_width=%lld batch=%lld heads=%lld stream=%lld kv=%lld grid_x=%d grid_y=%d grid_z=%d threads_x=32 threads_y=%d\n",
++                ggml_metal_tensor_name(op),
++                ggml_type_name(op->src[0]->type),
++                ggml_type_name(op->src[1]->type),
++                ggml_type_name(op->src[2]->type),
++                has_mask ? ggml_type_name(op->src[3]->type) : "none",
++                ggml_type_name(op->type),
++                (long long) ne00,
++                (long long) ne20,
++                (long long) ne01,
++                (long long) ne02,
++                (long long) ne03,
++                (long long) ne11,
++                grid_x,
++                grid_y,
++                grid_z,
++                nsg);
++        }
++        ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, 32, nsg, 1);
+ #undef FATTN_SMEM
+     } else {
+         // half4x4 kernel
+@@ -3471,7 +3512,31 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
++            const int grid_x = (ne01 + nqptg - 1)/nqptg;
++            const int grid_y = (ne02 + nhptg - 1)/nhptg;
++            const int grid_z = ne03*nwg;
++            if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++                GGML_LOG_INFO(
++                    "skippy: glm_dsa_metal_dispatch op=flash_attn_ext kernel=vec tensor=%s q_type=%s k_type=%s v_type=%s mask_type=%s dst_type=%s q_width=%lld v_width=%lld batch=%lld heads=%lld stream=%lld kv=%lld grid_x=%d grid_y=%d grid_z=%d threads_x=32 threads_y=%lld nwg=%d\n",
++                    ggml_metal_tensor_name(op),
++                    ggml_type_name(op->src[0]->type),
++                    ggml_type_name(op->src[1]->type),
++                    ggml_type_name(op->src[2]->type),
++                    has_mask ? ggml_type_name(op->src[3]->type) : "none",
++                    ggml_type_name(op->type),
++                    (long long) ne00,
++                    (long long) ne20,
++                    (long long) ne01,
++                    (long long) ne02,
++                    (long long) ne03,
++                    (long long) ne11,
++                    grid_x,
++                    grid_y,
++                    grid_z,
++                    nsg,
++                    nwg);
++            }
++            ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, 32, nsg, 1);
+         } else {
+             // sanity checks
+             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+@@ -3484,7 +3549,31 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
++            const int grid_x = (ne01 + nqptg - 1)/nqptg;
++            const int grid_y = (ne02 + nhptg - 1)/nhptg;
++            const int grid_z = ne03*nwg;
++            if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++                GGML_LOG_INFO(
++                    "skippy: glm_dsa_metal_dispatch op=flash_attn_ext kernel=vec tensor=%s q_type=%s k_type=%s v_type=%s mask_type=%s dst_type=%s q_width=%lld v_width=%lld batch=%lld heads=%lld stream=%lld kv=%lld grid_x=%d grid_y=%d grid_z=%d threads_x=32 threads_y=%lld nwg=%d\n",
++                    ggml_metal_tensor_name(op),
++                    ggml_type_name(op->src[0]->type),
++                    ggml_type_name(op->src[1]->type),
++                    ggml_type_name(op->src[2]->type),
++                    has_mask ? ggml_type_name(op->src[3]->type) : "none",
++                    ggml_type_name(op->type),
++                    (long long) ne00,
++                    (long long) ne20,
++                    (long long) ne01,
++                    (long long) ne02,
++                    (long long) ne03,
++                    (long long) ne11,
++                    grid_x,
++                    grid_y,
++                    grid_z,
++                    nsg,
++                    nwg);
++            }
++            ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, 32, nsg, 1);
+ 
+             // sync the 2 kernels
+             ggml_metal_op_concurrency_reset(ctx);
+-- 
+2.53.0
+
