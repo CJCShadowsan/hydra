@@ -7,6 +7,8 @@ STAGE_MODEL="${STAGE_MODEL:-/Volumes/External/models/huggingface/hub/models--mes
 MODEL_ID="${MODEL_ID:-meshllm/GLM-5.2-Q2_K-MTP-Q8-layers}"
 SKIPPY_BENCH_BIN="${SKIPPY_BENCH_BIN:-$ROOT/target/debug/skippy-bench}"
 OUT_DIR="${OUT_DIR:-/tmp/glm52-phase-c-direct-sparse-decode-gate}"
+ITERATIONS="${ITERATIONS:-3}"
+WARMUP="${WARMUP:-1}"
 QUICK=0
 LONG_KV=0
 LONG_KV_ONLY=0
@@ -34,6 +36,8 @@ Options:
   --model-id ID           Model id recorded in reports.
   --skippy-bench PATH     skippy-bench binary.
   --out-dir PATH          Artifact directory.
+  --iterations N          Measured iterations per case. Default: 3
+  --warmup N              Warmup iterations per case. Default: 1
   --quick                 Run one reduced middle-span smoke case.
   --long-kv               Run larger-KV decode cases after the normal sweep.
   --long-kv-only          Run only the larger-KV decode cases.
@@ -59,6 +63,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --out-dir)
       OUT_DIR="$2"
+      shift 2
+      ;;
+    --iterations)
+      ITERATIONS="$2"
+      shift 2
+      ;;
+    --warmup)
+      WARMUP="$2"
       shift 2
       ;;
     --quick)
@@ -134,6 +146,8 @@ run_decode_case() {
       --metal-dispatch-log \
       --no-metal-topk-moe-route-fusion \
       --out-dir "$case_dir" \
+      --iterations "$ITERATIONS" \
+      --warmup "$WARMUP" \
       "${require_args[@]}" \
       "$@" \
       >"$case_dir/stdout.txt" \
