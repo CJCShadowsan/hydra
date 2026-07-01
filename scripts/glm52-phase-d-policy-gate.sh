@@ -323,6 +323,9 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         "candidate_dsa_sparse_attn_nodes": (candidate_ops.get("dsa_sparse_attn") or {}).get("nodes"),
         "candidate_dsa_sparse_attn_dispatches": candidate_dispatch.get("dsa_sparse_attn_records"),
         "candidate_flash_attn_ext_records": candidate_dispatch.get("flash_attn_ext_records"),
+        "candidate_compact_mask_omission_records": compact_guard.get("execution_mask_omission_records"),
+        "candidate_omitted_mla_kq_mask_records": compact_guard.get("omitted_mla_kq_mask_records"),
+        "candidate_materialized_mla_kq_mask_records": compact_guard.get("materialized_mla_kq_mask_records"),
         "candidate_dense_sparse_mask_dispatches": dense_sparse_mask_dispatches,
         "candidate_indexer_topk_nodes": (candidate_ops.get("indexer_topk") or {}).get("nodes"),
         "candidate_indexer_nodes": (candidate_ops.get("indexer") or {}).get("nodes"),
@@ -370,6 +373,10 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         failures.append(f"{case_dir.name}: compact flash proof failed: {compact_guard.get('failure_summary')}")
     if route == "compact_flash" and not row["candidate_flash_attn_ext_records"]:
         failures.append(f"{case_dir.name}: missing compact flash dispatch evidence")
+    if route == "compact_flash" and not row["candidate_compact_mask_omission_records"]:
+        failures.append(f"{case_dir.name}: missing compact MLA KQ mask-omission evidence")
+    if route == "compact_flash" and row["candidate_materialized_mla_kq_mask_records"] not in (0, None):
+        failures.append(f"{case_dir.name}: compact flash still materialized MLA KQ mask")
 
 summary = {
     "passed": not failures,

@@ -31,8 +31,9 @@ use crate::{
         summarize_metal_dispatch, summarize_routed_moe_timing,
     },
     glm_dsa_op_report::{
-        CompactFlashPolicyRecord, ComputeBufferRecord, DirectSparseDecisionRecord, HotTensorRecord,
-        IndexShareTraceSummary, MetalDispatchRecord, TimingGroupRecord, TimingRecord,
+        CompactFlashMaskRecord, CompactFlashPolicyRecord, ComputeBufferRecord,
+        DirectSparseDecisionRecord, HotTensorRecord, IndexShareTraceSummary, MetalDispatchRecord,
+        TimingGroupRecord, TimingRecord, parse_compact_flash_mask_records,
         parse_compact_flash_policy_records, parse_compute_buffer_records,
         parse_direct_sparse_decision_records, parse_hot_tensor_records,
         parse_indexshare_contract_records, parse_indexshare_trace_records,
@@ -376,6 +377,9 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         compact_flash_policy_records: case.compact_flash_policy_records,
         compact_flash_execution_policy_records: case.compact_flash_execution_policy_records,
         compact_flash_non_measured_policy_records: case.compact_flash_non_measured_policy_records,
+        compact_flash_mask_records: case.compact_flash_mask_records,
+        compact_flash_execution_mask_records: case.compact_flash_execution_mask_records,
+        compact_flash_non_measured_mask_records: case.compact_flash_non_measured_mask_records,
         direct_sparse_decision_records: case.direct_sparse_decision_records,
         direct_sparse_execution_decision_records: case.direct_sparse_execution_decision_records,
         direct_sparse_non_measured_decision_records: case
@@ -459,13 +463,15 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         && !guard.passed
     {
         bail!(
-            "GLM-DSA compact flash proof failed for {}: flash_glm_shape={} typed_get_rows={} compact_get_rows_fused={} promoted_get_rows={} dsa_sparse_attn={} failures={}",
+            "GLM-DSA compact flash proof failed for {}: flash_glm_shape={} typed_get_rows={} compact_get_rows_fused={} promoted_get_rows={} dsa_sparse_attn={} mask_omission_records={} materialized_mla_kq_mask_records={} failures={}",
             guard.checked_case,
             guard.flash_attn_ext_glm_dsa_shape_records,
             guard.get_rows_typed_records,
             guard.dsa_compact_get_rows_fused_records,
             guard.get_rows_promote_records,
             guard.dsa_sparse_attn_records,
+            guard.execution_mask_omission_records,
+            guard.materialized_mla_kq_mask_records,
             guard.failure_summary,
         );
     }
@@ -1116,6 +1122,10 @@ fn run_microbench_case_with_warmup(
     );
     let (compact_flash_non_measured_policy_records, compact_flash_execution_policy_records) =
         split_execution_compact_policy_records(compact_flash_policy_records.clone(), timings.len());
+    let compact_flash_mask_records =
+        retain_case_compact_mask_records(native_timings.compact_flash_mask_records, args.tokens);
+    let (compact_flash_non_measured_mask_records, compact_flash_execution_mask_records) =
+        split_execution_compact_mask_records(compact_flash_mask_records.clone(), timings.len());
     let direct_sparse_decision_records =
         retain_case_decision_records(native_timings.direct_sparse_decision_records, args.tokens);
     let (direct_sparse_non_measured_decision_records, direct_sparse_execution_decision_records) =
@@ -1129,6 +1139,9 @@ fn run_microbench_case_with_warmup(
         compact_flash_policy_records,
         compact_flash_execution_policy_records,
         compact_flash_non_measured_policy_records,
+        compact_flash_mask_records,
+        compact_flash_execution_mask_records,
+        compact_flash_non_measured_mask_records,
         direct_sparse_decision_records,
         direct_sparse_execution_decision_records,
         direct_sparse_non_measured_decision_records,
@@ -1155,7 +1168,7 @@ fn run_microbench_case_with_warmup(
     })
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_microbench_iterations_with_fresh_sessions(
     model: &StageModel,
     args: &GlmDsaLayerMicrobenchArgs,
@@ -1200,7 +1213,7 @@ fn run_microbench_iterations_with_fresh_sessions(
     Ok((timings, outputs))
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_microbench_iterations_with_streaming_kv(
     model: &StageModel,
     args: &GlmDsaLayerMicrobenchArgs,
@@ -1246,7 +1259,7 @@ fn run_microbench_iterations_with_streaming_kv(
     Ok((timings, outputs))
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_microbench_iterations_with_reused_kv(
     model: &StageModel,
     args: &GlmDsaLayerMicrobenchArgs,
@@ -1651,6 +1664,10 @@ fn set_native_diagnostic_flags(flags: MicrobenchFlags, enabled: bool) {
         enabled && flags.op_timing,
     );
     set_env_flag(
+        "SKIPPY_GLM_DSA_LOG_COMPACT_FLASH_POLICY",
+        enabled && flags.metal_dispatch_log,
+    );
+    set_env_flag(
         "SKIPPY_GLM_DSA_LOG_METAL_DISPATCH",
         enabled && flags.metal_dispatch_log,
     );
@@ -2028,6 +2045,10 @@ fn configure_env_flags(
             || flags.metal_dispatch_log
             || args.require_direct_sparse_prefill_proof
             || args.require_partial_top_k_proof,
+    );
+    set_env_flag(
+        "SKIPPY_GLM_DSA_LOG_COMPACT_FLASH_POLICY",
+        flags.metal_dispatch_log || args.require_compact_flash_proof,
     );
     set_env_flag(
         "SKIPPY_GLM_DSA_LOG_METAL_DISPATCH",
@@ -3877,6 +3898,8 @@ impl NativeLogCapture {
             log_path: Some(path),
             compact_flash_policy_records: parse_compact_flash_policy_records(&text)
                 .context("parse native compact flash policy records")?,
+            compact_flash_mask_records: parse_compact_flash_mask_records(&text)
+                .context("parse native compact flash mask records")?,
             direct_sparse_decision_records: parse_direct_sparse_decision_records(&text)
                 .context("parse native direct sparse decisions")?,
             metal_dispatch_records: parse_metal_dispatch_records(&text)
@@ -3926,6 +3949,7 @@ impl Drop for NativeLogCapture {
 struct NativeTimingCapture {
     log_path: Option<PathBuf>,
     compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
+    compact_flash_mask_records: Vec<CompactFlashMaskRecord>,
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     metal_dispatch_records: Vec<MetalDispatchRecord>,
     op_timing_records: Vec<TimingRecord>,
@@ -4048,6 +4072,19 @@ fn retain_case_compact_policy_records(
         .collect()
 }
 
+fn retain_case_compact_mask_records(
+    records: Vec<CompactFlashMaskRecord>,
+    tokens: usize,
+) -> Vec<CompactFlashMaskRecord> {
+    let Ok(tokens) = i64::try_from(tokens) else {
+        return Vec::new();
+    };
+    records
+        .into_iter()
+        .filter(|record| record.ubatch_tokens == tokens)
+        .collect()
+}
+
 fn split_execution_decision_records(
     records: Vec<DirectSparseDecisionRecord>,
     measured_iterations: usize,
@@ -4069,6 +4106,20 @@ fn split_execution_compact_policy_records(
     records: Vec<CompactFlashPolicyRecord>,
     measured_iterations: usize,
 ) -> (Vec<CompactFlashPolicyRecord>, Vec<CompactFlashPolicyRecord>) {
+    if records.is_empty() || measured_iterations == 0 {
+        return (records, Vec::new());
+    }
+    let execution_count = records.len().min(measured_iterations);
+    let split_at = records.len() - execution_count;
+    let non_measured = records[..split_at].to_vec();
+    let execution = records[split_at..].to_vec();
+    (non_measured, execution)
+}
+
+fn split_execution_compact_mask_records(
+    records: Vec<CompactFlashMaskRecord>,
+    measured_iterations: usize,
+) -> (Vec<CompactFlashMaskRecord>, Vec<CompactFlashMaskRecord>) {
     if records.is_empty() || measured_iterations == 0 {
         return (records, Vec::new());
     }
@@ -4662,6 +4713,9 @@ struct MicrobenchCase {
     compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
     compact_flash_execution_policy_records: Vec<CompactFlashPolicyRecord>,
     compact_flash_non_measured_policy_records: Vec<CompactFlashPolicyRecord>,
+    compact_flash_mask_records: Vec<CompactFlashMaskRecord>,
+    compact_flash_execution_mask_records: Vec<CompactFlashMaskRecord>,
+    compact_flash_non_measured_mask_records: Vec<CompactFlashMaskRecord>,
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     direct_sparse_execution_decision_records: Vec<DirectSparseDecisionRecord>,
     direct_sparse_non_measured_decision_records: Vec<DirectSparseDecisionRecord>,
@@ -4689,6 +4743,11 @@ impl MicrobenchCase {
                 .clone(),
             compact_flash_non_measured_policy_records: self
                 .compact_flash_non_measured_policy_records
+                .clone(),
+            compact_flash_mask_records: self.compact_flash_mask_records.clone(),
+            compact_flash_execution_mask_records: self.compact_flash_execution_mask_records.clone(),
+            compact_flash_non_measured_mask_records: self
+                .compact_flash_non_measured_mask_records
                 .clone(),
             direct_sparse_decision_summary: DirectSparseDecisionSummary::default(),
             timing_summary: summarize_elapsed_ms(
@@ -4881,6 +4940,12 @@ struct MicrobenchReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     compact_flash_non_measured_policy_records: Vec<CompactFlashPolicyRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_mask_records: Vec<CompactFlashMaskRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_execution_mask_records: Vec<CompactFlashMaskRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_non_measured_mask_records: Vec<CompactFlashMaskRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_execution_decision_records: Vec<DirectSparseDecisionRecord>,
@@ -5036,6 +5101,10 @@ struct CompactFlashGuardReport {
     dsa_compact_get_rows_fused_records: usize,
     dsa_sparse_attn_records: usize,
     sparse_mask_nodes: u64,
+    mask_omission_records: usize,
+    execution_mask_omission_records: usize,
+    omitted_mla_kq_mask_records: usize,
+    materialized_mla_kq_mask_records: usize,
     policy_phase: Option<String>,
     policy_selector_reason: Option<String>,
     failure_summary: String,
@@ -5393,7 +5462,7 @@ fn build_direct_sparse_prefill_guard(
         .filter(|record| {
             record.op == "dsa_sparse_attn"
                 && dsa_sparse_attn_kernel_is_cached_topk(record.kernel.as_deref())
-                && !record.batch.is_some_and(|batch| batch > 1)
+                && record.batch.is_none_or(|batch| batch <= 1)
         })
         .count();
     let accepted_large_prefill_dispatches = if large_prefill_direct_decisions > 0 {
@@ -5708,6 +5777,14 @@ fn build_compact_flash_guard(candidate: &MicrobenchCaseSummary) -> CompactFlashG
         .iter()
         .filter(|record| record.kernel.as_deref() == Some("promote"))
         .count();
+    let execution_mask_records = &candidate.compact_flash_execution_mask_records;
+    let omitted_mla_kq_mask_records = execution_mask_records
+        .iter()
+        .filter(|record| record.omitted_mla_kq_mask)
+        .count();
+    let materialized_mla_kq_mask_records = execution_mask_records
+        .len()
+        .saturating_sub(omitted_mla_kq_mask_records);
     let execution_policy = candidate
         .compact_flash_execution_policy_records
         .last()
@@ -5731,6 +5808,12 @@ fn build_compact_flash_guard(candidate: &MicrobenchCaseSummary) -> CompactFlashG
     if candidate.op_timing_summary.sparse_mask.nodes > 0 {
         failures.push("sparse_mask_nodes_present");
     }
+    if execution_mask_records.is_empty() {
+        failures.push("missing_compact_mask_omission_evidence");
+    }
+    if materialized_mla_kq_mask_records > 0 {
+        failures.push("mla_kq_mask_materialized");
+    }
     let passed = failures.is_empty();
     CompactFlashGuardReport {
         checked_case: candidate.label,
@@ -5748,6 +5831,10 @@ fn build_compact_flash_guard(candidate: &MicrobenchCaseSummary) -> CompactFlashG
         dsa_compact_get_rows_fused_records: dispatch.dsa_compact_get_rows_fused_records,
         dsa_sparse_attn_records: dispatch.dsa_sparse_attn_records,
         sparse_mask_nodes: candidate.op_timing_summary.sparse_mask.nodes,
+        mask_omission_records: candidate.compact_flash_mask_records.len(),
+        execution_mask_omission_records: execution_mask_records.len(),
+        omitted_mla_kq_mask_records,
+        materialized_mla_kq_mask_records,
         policy_phase: execution_policy.and_then(|record| record.phase.clone()),
         policy_selector_reason: execution_policy.and_then(|record| record.selector_reason.clone()),
         failure_summary: if failures.is_empty() {
@@ -6319,6 +6406,12 @@ struct MicrobenchCaseSummary {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     compact_flash_non_measured_policy_records: Vec<CompactFlashPolicyRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_mask_records: Vec<CompactFlashMaskRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_execution_mask_records: Vec<CompactFlashMaskRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    compact_flash_non_measured_mask_records: Vec<CompactFlashMaskRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_decision_records: Vec<DirectSparseDecisionRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     direct_sparse_execution_decision_records: Vec<DirectSparseDecisionRecord>,
@@ -6359,6 +6452,7 @@ impl DirectSparseSpillSummary {
     }
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn summarize_direct_sparse_spill(records: &[MetalDispatchRecord]) -> DirectSparseSpillSummary {
     let mut summary = DirectSparseSpillSummary::default();
     summary.decode_vec_records = records
@@ -7305,6 +7399,12 @@ mod tests {
                 "dsa_compact_v_topk_rows-30",
                 "typed",
             ));
+        candidate
+            .compact_flash_mask_records
+            .push(compact_flash_mask_record(true));
+        candidate
+            .compact_flash_execution_mask_records
+            .push(compact_flash_mask_record(true));
 
         let guard = build_compact_flash_guard(&candidate);
 
@@ -7313,6 +7413,9 @@ mod tests {
         assert_eq!(guard.compact_get_rows_typed_records, 2);
         assert_eq!(guard.compact_get_rows_promote_records, 0);
         assert_eq!(guard.dsa_sparse_attn_records, 0);
+        assert_eq!(guard.execution_mask_omission_records, 1);
+        assert_eq!(guard.omitted_mla_kq_mask_records, 1);
+        assert_eq!(guard.materialized_mla_kq_mask_records, 0);
         assert_eq!(guard.failure_summary, "none");
     }
 
@@ -7344,6 +7447,9 @@ mod tests {
                 "decode_compact",
                 true,
             ));
+        candidate
+            .compact_flash_execution_mask_records
+            .push(compact_flash_mask_record(true));
 
         let guard = build_compact_flash_guard(&candidate);
 
@@ -7368,6 +7474,9 @@ mod tests {
         candidate
             .metal_dispatch_summary
             .dsa_compact_get_rows_fused_records = 1;
+        candidate
+            .compact_flash_execution_mask_records
+            .push(compact_flash_mask_record(true));
 
         let guard = build_compact_flash_guard(&candidate);
 
@@ -7390,6 +7499,9 @@ mod tests {
             ));
         candidate.metal_dispatch_summary.dsa_sparse_attn_records = 1;
         candidate.op_timing_summary.sparse_mask.nodes = 1;
+        candidate
+            .compact_flash_execution_mask_records
+            .push(compact_flash_mask_record(false));
 
         let guard = build_compact_flash_guard(&candidate);
 
@@ -7408,6 +7520,7 @@ mod tests {
                 .contains("dsa_sparse_attn_dispatch_present")
         );
         assert!(guard.failure_summary.contains("sparse_mask_nodes_present"));
+        assert!(guard.failure_summary.contains("mla_kq_mask_materialized"));
     }
 
     #[test]
@@ -7421,6 +7534,9 @@ mod tests {
         candidate
             .metal_dispatch_records
             .push(compact_get_rows_dispatch("ffn_moe_weights-30", "typed"));
+        candidate
+            .compact_flash_execution_mask_records
+            .push(compact_flash_mask_record(true));
 
         let guard = build_compact_flash_guard(&candidate);
 
@@ -9073,6 +9189,9 @@ mod tests {
             compact_flash_policy_records: Vec::new(),
             compact_flash_execution_policy_records: Vec::new(),
             compact_flash_non_measured_policy_records: Vec::new(),
+            compact_flash_mask_records: Vec::new(),
+            compact_flash_execution_mask_records: Vec::new(),
+            compact_flash_non_measured_mask_records: Vec::new(),
             direct_sparse_decision_summary: DirectSparseDecisionSummary::default(),
             timing_summary: TimingDistributionSummary::default(),
             timing_breakdown: TimingBreakdownSummary::default(),
@@ -9130,6 +9249,9 @@ mod tests {
             compact_flash_policy_records: Vec::new(),
             compact_flash_execution_policy_records: Vec::new(),
             compact_flash_non_measured_policy_records: Vec::new(),
+            compact_flash_mask_records: Vec::new(),
+            compact_flash_execution_mask_records: Vec::new(),
+            compact_flash_non_measured_mask_records: Vec::new(),
             direct_sparse_decision_records: Vec::new(),
             direct_sparse_execution_decision_records: Vec::new(),
             direct_sparse_non_measured_decision_records: Vec::new(),
@@ -9350,6 +9472,17 @@ mod tests {
             no_mask: Some(use_compact),
             use_compact,
             selector_reason: Some(selector_reason.to_string()),
+        }
+    }
+
+    fn compact_flash_mask_record(omitted_mla_kq_mask: bool) -> CompactFlashMaskRecord {
+        CompactFlashMaskRecord {
+            layer: 30,
+            omitted_mla_kq_mask,
+            visible_kv: 4096,
+            ubatch_tokens: 1,
+            streams: 1,
+            max_top_k: 2048,
         }
     }
 

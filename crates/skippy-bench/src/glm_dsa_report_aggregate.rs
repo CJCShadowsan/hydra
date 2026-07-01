@@ -687,7 +687,7 @@ mod tests {
         let finished = group.finish(0.10);
 
         assert_eq!(finished.key.path, "direct_sparse_prefill");
-        assert_eq!(finished.key.direct_sparse_prefill, true);
+        assert!(finished.key.direct_sparse_prefill);
         assert_eq!(finished.key.sparse_attn_threads, Some(256));
         assert_eq!(finished.key.measured_phase.as_deref(), Some("prefill"));
         assert_eq!(finished.runs[0].measured_phase.as_deref(), Some("prefill"));
@@ -891,8 +891,8 @@ mod tests {
         let key = AggregateKey::new(&report, &selected);
 
         assert_eq!(key.path, "compact_flash_native");
-        assert_eq!(key.compact_flash_attn, false);
-        assert_eq!(key.direct_sparse_attn, true);
+        assert!(!key.compact_flash_attn);
+        assert!(key.direct_sparse_attn);
     }
 
     #[test]
@@ -941,7 +941,7 @@ mod tests {
         let key = AggregateKey::new(&report, &selected);
 
         assert_eq!(key.path, "compact_flash_fallback");
-        assert_eq!(key.compact_flash_attn, true);
+        assert!(key.compact_flash_attn);
     }
 
     #[test]
@@ -961,8 +961,8 @@ mod tests {
         let key = AggregateKey::new(&report, &selected);
 
         assert_eq!(key.path, "sparse_mask_flash");
-        assert_eq!(key.direct_sparse_attn, true);
-        assert_eq!(key.compact_flash_attn, false);
+        assert!(key.direct_sparse_attn);
+        assert!(!key.compact_flash_attn);
     }
 
     #[test]

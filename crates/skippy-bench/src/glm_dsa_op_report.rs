@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -11,6 +15,7 @@ const SIDEBAND_FORWARD_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_forward ";
 const SIDEBAND_RECEIVE_PREFIX: &str = "skippy: glm_dsa_top_k_sideband_receive ";
 const DIRECT_SPARSE_DECISION_PREFIX: &str = "skippy: glm_dsa_direct_sparse_decision ";
 const COMPACT_FLASH_POLICY_PREFIX: &str = "skippy: glm_dsa_compact_flash_policy ";
+const COMPACT_FLASH_MASK_PREFIX: &str = "skippy: glm_dsa_compact_flash_mask ";
 const METAL_DISPATCH_PREFIX: &str = "skippy: glm_dsa_metal_dispatch ";
 const HOT_TENSOR_PREFIX: &str = "skippy: glm_dsa_hot_tensor ";
 const COMPUTE_BUFFER_PREFIX: &str = "~llama_context:";
@@ -209,6 +214,16 @@ pub(crate) struct CompactFlashPolicyRecord {
     pub(crate) use_compact: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) selector_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CompactFlashMaskRecord {
+    pub(crate) layer: i32,
+    pub(crate) omitted_mla_kq_mask: bool,
+    pub(crate) visible_kv: i64,
+    pub(crate) ubatch_tokens: i64,
+    pub(crate) streams: i64,
+    pub(crate) max_top_k: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -681,7 +696,7 @@ fn delta(candidate: u64, baseline: u64) -> i128 {
     i128::from(candidate) - i128::from(baseline)
 }
 
-fn require_indexshare_producer_consumer_trace(path: &PathBuf, summary: &LogSummary) -> Result<()> {
+fn require_indexshare_producer_consumer_trace(path: &Path, summary: &LogSummary) -> Result<()> {
     let trace = &summary.indexshare_trace;
     let mut missing = Vec::new();
     if trace.contract_records == 0 {
@@ -811,6 +826,16 @@ pub(crate) fn parse_compact_flash_policy_records(
                 .map(|index| &line[index + COMPACT_FLASH_POLICY_PREFIX.len()..])
         })
         .map(parse_compact_flash_policy_record)
+        .collect()
+}
+
+pub(crate) fn parse_compact_flash_mask_records(text: &str) -> Result<Vec<CompactFlashMaskRecord>> {
+    text.lines()
+        .filter_map(|line| {
+            line.find(COMPACT_FLASH_MASK_PREFIX)
+                .map(|index| &line[index + COMPACT_FLASH_MASK_PREFIX.len()..])
+        })
+        .map(parse_compact_flash_mask_record)
         .collect()
 }
 
@@ -1011,6 +1036,21 @@ fn parse_compact_flash_policy_record(line: &str) -> Result<CompactFlashPolicyRec
         selector_reason: fields
             .get("selector_reason")
             .map(|value| (*value).to_string()),
+    })
+}
+
+fn parse_compact_flash_mask_record(line: &str) -> Result<CompactFlashMaskRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    Ok(CompactFlashMaskRecord {
+        layer: parse_field(&fields, "layer")?,
+        omitted_mla_kq_mask: parse_bool_int_field(&fields, "omitted_mla_kq_mask")?,
+        visible_kv: parse_field(&fields, "visible_kv")?,
+        ubatch_tokens: parse_field(&fields, "ubatch_tokens")?,
+        streams: parse_field(&fields, "streams")?,
+        max_top_k: parse_field(&fields, "max_top_k")?,
     })
 }
 
@@ -1613,14 +1653,16 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::{
         ComparisonKey, OpBucket, Phase, PhaseSummary, SidebandDirection, compare_phase,
-        parse_compact_flash_policy_records, parse_compute_buffer_records,
-        parse_direct_sparse_decision_records, parse_indexshare_contract_records,
-        parse_indexshare_trace_records, parse_metal_dispatch_records, parse_sideband_record,
-        parse_sideband_records, parse_timing_group_records, parse_timing_record,
-        parse_timing_records, require_indexshare_producer_consumer_trace,
-        summarize_comparison_rows, summarize_log,
+        parse_compact_flash_mask_records, parse_compact_flash_policy_records,
+        parse_compute_buffer_records, parse_direct_sparse_decision_records,
+        parse_indexshare_contract_records, parse_indexshare_trace_records,
+        parse_metal_dispatch_records, parse_sideband_record, parse_sideband_records,
+        parse_timing_group_records, parse_timing_record, parse_timing_records,
+        require_indexshare_producer_consumer_trace, summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -1636,6 +1678,7 @@ mod tests {
     const DIRECT_SPARSE_DECISION_LINE_WITH_REASON: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1024 sparse_batch=1024 sparse_streams=1 prefill_cap=32 sparse_kv=99328 sparse_top_k=1024 min_kv_topk_ratio=32 kv_topk_ratio=97 dense_mask_bytes=203423744 dense_mask_limit=268435456 phase=prefill selector_reason=dense_mask_guard_large_prefill direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
+    const COMPACT_FLASH_MASK_LINE: &str = "skippy: glm_dsa_compact_flash_mask layer=30 omitted_mla_kq_mask=1 visible_kv=8192 ubatch_tokens=1 streams=1 max_top_k=2048";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 selected_keys=1048576 q_read_bytes=2415919104 k_read_bytes=1207959552 v_read_bytes=1073741824 mask_read_bytes=4194304 top_k_read_bytes=4194304 scratch_per_tg_bytes=1024 score_fma=603979776 value_fma=536870912 reduction_strategy=threadgroup_direct grid_x=32 grid_y=4 grid_z=8 threads_x=256 nwg=8 tmp_f16=1 dst_partial=1";
     const METAL_DECODE_VEC_REDUCE_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec_reduce tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=4096 heads=64 stream=1 kv=4096 top_k=2048 top_stream=1 rows=262144 partial_bytes=536870912 softmax_bytes=4194304 tmp_bytes=541065216 grid_x=262144 grid_y=1 grid_z=1 threads_x=32 threads_y=2 nwg=2 tmp_f16=1 dst_partial=1";
     const METAL_MUL_MAT_ID_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=mul_mat_id kernel=mul_mv_id tensor=ffn_moe_down-45 src0_type=q3_K src1_type=f32 ids_type=i32 dst_type=f32 ne00=5120 ne01=6144 experts=256 used_experts=8 tokens=1 min_tokens=128 nr0=2 nr1=1 nsg=1 grid_x=1536 grid_y=1 grid_z=8 threads_x=32 threads_y=2";
@@ -1770,6 +1813,19 @@ mod tests {
         assert_eq!(record.no_mask, Some(true));
         assert!(record.use_compact);
         assert_eq!(record.selector_reason.as_deref(), Some("decode_compact"));
+    }
+
+    #[test]
+    fn parses_compact_flash_mask_records() {
+        let records = parse_compact_flash_mask_records(COMPACT_FLASH_MASK_LINE).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.layer, 30);
+        assert!(record.omitted_mla_kq_mask);
+        assert_eq!(record.visible_kv, 8192);
+        assert_eq!(record.ubatch_tokens, 1);
+        assert_eq!(record.streams, 1);
+        assert_eq!(record.max_top_k, 2048);
     }
 
     #[test]
@@ -1972,7 +2028,7 @@ mod tests {
             &contract_records,
         );
 
-        require_indexshare_producer_consumer_trace(&"stage1.log".into(), &summary).unwrap();
+        require_indexshare_producer_consumer_trace(Path::new("stage1.log"), &summary).unwrap();
     }
 
     #[test]
@@ -1990,8 +2046,8 @@ mod tests {
             &contract_records,
         );
 
-        let error =
-            require_indexshare_producer_consumer_trace(&"stage1.log".into(), &summary).unwrap_err();
+        let error = require_indexshare_producer_consumer_trace(Path::new("stage1.log"), &summary)
+            .unwrap_err();
 
         assert!(
             error.to_string().contains("shared_exec"),

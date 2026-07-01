@@ -269,6 +269,9 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         "candidate_flash_attn_ext_records": compact_guard.get("flash_attn_ext_records"),
         "candidate_compact_get_rows_records": compact_guard.get("compact_get_rows_records"),
         "candidate_dsa_compact_get_rows_fused_records": compact_guard.get("dsa_compact_get_rows_fused_records"),
+        "candidate_compact_mask_omission_records": compact_guard.get("execution_mask_omission_records"),
+        "candidate_omitted_mla_kq_mask_records": compact_guard.get("omitted_mla_kq_mask_records"),
+        "candidate_materialized_mla_kq_mask_records": compact_guard.get("materialized_mla_kq_mask_records"),
         "candidate_indexer_topk_nodes": (candidate_ops.get("indexer_topk") or {}).get("nodes"),
         "candidate_indexer_nodes": (candidate_ops.get("indexer") or {}).get("nodes"),
         "candidate_top_k_nodes": (candidate_ops.get("top_k") or {}).get("nodes"),
@@ -303,6 +306,10 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         failures.append(f"{case_dir.name}: missing DSA sparse attention Metal dispatches")
     if proof_kind == "compact_flash" and not row["candidate_flash_attn_ext_records"]:
         failures.append(f"{case_dir.name}: missing compact flash attention dispatch evidence")
+    if proof_kind == "compact_flash" and not row["candidate_compact_mask_omission_records"]:
+        failures.append(f"{case_dir.name}: missing compact MLA KQ mask-omission evidence")
+    if proof_kind == "compact_flash" and row["candidate_materialized_mla_kq_mask_records"] not in (0, None):
+        failures.append(f"{case_dir.name}: compact flash still materialized MLA KQ mask")
     if proof_kind == "compact_flash" and not (
         row["candidate_compact_get_rows_records"]
         or row["candidate_dsa_compact_get_rows_fused_records"]
