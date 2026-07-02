@@ -1,0 +1,45 @@
+From 24dd2210d69eb7deeeed3f60a1a8dffdf424fb3e Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 13:02:21 +1000
+Subject: [PATCH] Use native top-k for GLM MoE route ids
+
+---
+ src/llama-graph.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6c75b9c39..f06afd6c7 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -114,6 +114,10 @@ static bool skippy_glm_dsa_moe_route_weights_enabled() {
+     return skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_MOE_ROUTE_WEIGHTS");
+ }
+ 
++static bool skippy_glm_dsa_moe_top_k_enabled() {
++    return skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_MOE_TOP_K");
++}
++
+ static ggml_tensor * llama_glm_dsa_top_k_for_sparse_attn(ggml_context * ctx, ggml_tensor * top_k) {
+     GGML_ASSERT(top_k != nullptr && "GLM-DSA sparse attention requires top-k indices");
+     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "GLM-DSA top-k indices must be I32");
+@@ -2242,8 +2246,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     // select experts
+-    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+-    cb(selected_experts->src[0], "ffn_moe_argsort", il);
++    const bool use_moe_top_k =
++            arch == LLM_ARCH_GLM_DSA &&
++            skippy_glm_dsa_moe_top_k_enabled();
++    ggml_tensor * selected_experts = use_moe_top_k
++            ? ggml_top_k(ctx0, selection_probs, n_expert_used)        // [n_expert_used, n_tokens]
++            : ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
++    if (!use_moe_top_k) {
++        cb(selected_experts->src[0], "ffn_moe_argsort", il);
++    }
+     cb(selected_experts, "ffn_moe_topk", il);
+ 
+     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
+-- 
+2.53.0
+
