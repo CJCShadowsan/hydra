@@ -1,0 +1,81 @@
+From 872bfb3547a4dc39a5045282631102c0a716c8d9 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 10:56:17 +1000
+Subject: [PATCH] Test GLM route fusion with quantized consumers
+
+---
+ tests/test-backend-ops.cpp | 32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 513dacba5..1923a5d8e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6136,8 +6136,11 @@ struct test_topk_moe_glm_consumer : public test_case {
+     static constexpr int64_t n_expert = 256;
+     static constexpr int64_t n_expert_used = 8;
+     static constexpr int64_t n_tokens = 1;
+-    static constexpr int64_t n_embd = 64;
+-    static constexpr int64_t n_ff = 128;
++    const ggml_type gate_type;
++    const ggml_type up_type;
++    const ggml_type down_type;
++    const int64_t n_embd;
++    const int64_t n_ff;
+ 
+     ggml_tensor * selected_experts = nullptr;
+     ggml_tensor * weights = nullptr;
+@@ -6146,8 +6149,24 @@ struct test_topk_moe_glm_consumer : public test_case {
+     ggml_tensor * ffn_down = nullptr;
+     ggml_tensor * out = nullptr;
+ 
++    test_topk_moe_glm_consumer(
++            ggml_type gate_type = GGML_TYPE_F32,
++            ggml_type up_type   = GGML_TYPE_F32,
++            ggml_type down_type = GGML_TYPE_F32,
++            int64_t   n_embd    = 64,
++            int64_t   n_ff      = 128)
++        : gate_type(gate_type),
++          up_type(up_type),
++          down_type(down_type),
++          n_embd(n_embd),
++          n_ff(n_ff) {
++        GGML_ASSERT(n_embd % ggml_blck_size(gate_type) == 0);
++        GGML_ASSERT(n_embd % ggml_blck_size(up_type) == 0);
++        GGML_ASSERT(n_ff   % ggml_blck_size(down_type) == 0);
++    }
++
+     std::string vars() override {
+-        return VARS_TO_STR5(n_expert, n_expert_used, n_tokens, n_embd, n_ff);
++        return VARS_TO_STR8(gate_type, up_type, down_type, n_expert, n_expert_used, n_tokens, n_embd, n_ff);
+     }
+ 
+     std::string op_desc(ggml_tensor * t) override {
+@@ -6211,13 +6230,13 @@ struct test_topk_moe_glm_consumer : public test_case {
+         cur = ggml_add(ctx, cur, route_anchor);
+         ggml_set_name(cur, "ffn_moe_cur_route_anchored");
+ 
+-        ggml_tensor * gates = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_expert);
++        ggml_tensor * gates = ggml_new_tensor_3d(ctx, gate_type, n_embd, n_ff, n_expert);
+         ggml_set_name(gates, "ffn_gate_exps.weight");
+ 
+-        ggml_tensor * ups = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_expert);
++        ggml_tensor * ups = ggml_new_tensor_3d(ctx, up_type, n_embd, n_ff, n_expert);
+         ggml_set_name(ups, "ffn_up_exps.weight");
+ 
+-        ggml_tensor * downs = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_embd, n_expert);
++        ggml_tensor * downs = ggml_new_tensor_3d(ctx, down_type, n_ff, n_embd, n_expert);
+         ggml_set_name(downs, "ffn_down_exps.weight");
+ 
+         ffn_gate = ggml_mul_mat_id(ctx, gates, cur, selected_experts);
+@@ -10084,6 +10103,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_moe_weighted_sum(6144, 8, 4));
+     test_cases.emplace_back(new test_topk_moe_glm_route());
+     test_cases.emplace_back(new test_topk_moe_glm_consumer());
++    test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256));
+ 
+     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F32, 4, 16, 2, 33, 1));
+     test_cases.emplace_back(new test_lightning_indexer(GGML_TYPE_F16, 4, 16, 2, 33, 1));
+-- 
+2.53.0
+
