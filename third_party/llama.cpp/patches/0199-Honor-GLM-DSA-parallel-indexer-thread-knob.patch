@@ -1,0 +1,54 @@
+From 3612bab63d61e575dfa2e0bd8fa352decf4a85bc Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 18:17:12 +1000
+Subject: [PATCH] Honor GLM DSA parallel indexer thread knob
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 1b17dc4cf..a5414544a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -32,6 +32,26 @@ static bool ggml_metal_lightning_indexer_parallel_requested() {
+     return value && atoi(value) != 0;
+ }
+ 
++static int ggml_metal_lightning_indexer_parallel_threads_requested() {
++    const char * value = getenv("LLAMA_GLM_DSA_PARALLEL_LIGHTNING_INDEXER_THREADS");
++    if (value == nullptr || value[0] == '\0') {
++        return 64;
++    }
++
++    const int requested = atoi(value);
++    switch (requested) {
++        case 32:
++        case 64:
++        case 128:
++        case 256:
++        case 512:
++        case 1024:
++            return requested;
++        default:
++            return 64;
++    }
++}
++
+ static bool ggml_metal_glm_dsa_dispatch_log_enabled() {
+     const char * value = getenv("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH");
+     return value && atoi(value) != 0;
+@@ -4927,8 +4947,9 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+ 
+     const bool parallel_requested = ggml_metal_lightning_indexer_parallel_requested();
+     bool parallel = parallel_requested && ne01 <= 1024;
++    const int requested_parallel_threads = ggml_metal_lightning_indexer_parallel_threads_requested();
+     auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, op, parallel);
+-    int nth = std::min(parallel ? 1024 : 64, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++    int nth = std::min(parallel ? requested_parallel_threads : 64, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+     if (parallel && ne01 > nth) {
+         parallel = false;
+         pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, op, parallel);
+-- 
+2.53.0
+
