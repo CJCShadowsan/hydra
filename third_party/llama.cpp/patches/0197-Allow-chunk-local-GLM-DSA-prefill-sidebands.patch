@@ -1,0 +1,49 @@
+From 3bcdb6e3b96ee86fd4945b44971029a23f105847 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 14:14:25 +1000
+Subject: [PATCH] Allow chunk-local GLM DSA prefill sidebands
+
+---
+ src/skippy.cpp | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 8c34e3232..82c68831e 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1323,6 +1323,23 @@ static uint32_t skippy_glm_dsa_top_k_count_for_sideband_bytes(size_t token_count
+             std::numeric_limits<uint32_t>::max()));
+ }
+ 
++static bool skippy_glm_dsa_sideband_top_k_count_is_valid(
++        size_t token_count,
++        uint32_t actual_top_k,
++        uint32_t expected_top_k) {
++    if (actual_top_k == 0 || expected_top_k == 0) {
++        return false;
++    }
++
++    if (token_count <= 1) {
++        return actual_top_k == expected_top_k;
++    }
++
++    const uint32_t minimum_prefill_top_k = static_cast<uint32_t>(
++            std::min<size_t>(token_count, expected_top_k));
++    return actual_top_k >= minimum_prefill_top_k && actual_top_k <= expected_top_k;
++}
++
+ static size_t skippy_glm_dsa_top_k_bytes(const skippy_session * session, size_t token_count) {
+     const uint32_t n_top_k = skippy_glm_dsa_top_k_count(session, token_count);
+     return skippy_glm_dsa_top_k_bytes_for_count(token_count, n_top_k);
+@@ -1500,7 +1517,7 @@ static enum skippy_status skippy_validate_frame_input(
+             return SKIPPY_STATUS_INVALID_ARGUMENT;
+         }
+         const uint32_t expected_top_k = skippy_glm_dsa_sideband_top_k_count(session, expected_token_count);
+-        if (actual_top_k != expected_top_k) {
++        if (!skippy_glm_dsa_sideband_top_k_count_is_valid(expected_token_count, actual_top_k, expected_top_k)) {
+             char message[256];
+             std::snprintf(
+                     message,
+-- 
+2.53.0
+
