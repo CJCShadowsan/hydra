@@ -1,0 +1,44 @@
+From 21f1e0cf8895b318e4a15396f1b9089e8bca7a0f Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 12:27:02 +1000
+Subject: [PATCH] Quarantine unsafe GLM route pack
+
+---
+ ggml/src/ggml-metal/ggml-metal-common.cpp | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.cpp b/ggml/src/ggml-metal/ggml-metal-common.cpp
+index c8dec0508..5c4a4b4ed 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -218,6 +218,11 @@ static bool ggml_metal_topk_moe_route_pack_enabled() {
+     return value && atoi(value) != 0;
+ }
+ 
++static bool ggml_metal_topk_moe_route_pack_unsafe_enabled() {
++    const char * value = getenv("SKIPPY_GLM_DSA_ENABLE_UNSAFE_METAL_TOPK_MOE_ROUTE_PACK");
++    return value && atoi(value) != 0;
++}
++
+ static bool ggml_metal_dispatch_log_enabled() {
+     const char * value = getenv("SKIPPY_GLM_DSA_LOG_METAL_DISPATCH");
+     return value && atoi(value) != 0;
+@@ -258,7 +263,14 @@ static void ggml_metal_log_topk_moe_route_candidate(const ggml_cgraph * gf, int
+ }
+ 
+ static int ggml_metal_topk_moe_route_pack_len(const ggml_cgraph * gf, int i) {
+-    if (!ggml_metal_topk_moe_route_fusion_enabled() || !ggml_metal_topk_moe_route_pack_enabled() || i + 11 > gf->n_nodes) {
++    // Route packing only changes graph reorder grouping; it does not itself
++    // emit the fused route kernel. Keep the known-broken pack path behind an
++    // explicit unsafe debug switch until route fusion is represented by a real
++    // backend op or the encoder can reliably consume the packed subgraph.
++    if (!ggml_metal_topk_moe_route_fusion_enabled() ||
++            !ggml_metal_topk_moe_route_pack_enabled() ||
++            !ggml_metal_topk_moe_route_pack_unsafe_enabled() ||
++            i + 11 > gf->n_nodes) {
+         return 1;
+     }
+ 
+-- 
+2.53.0
+
