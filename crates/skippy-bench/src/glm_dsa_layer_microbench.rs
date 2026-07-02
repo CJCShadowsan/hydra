@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{BufReader, Cursor, Read, Write},
@@ -56,6 +56,8 @@ const ENV_REAL_TOP_K_CHAIN_SOURCES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_CHAI
 const ENV_REAL_TOP_K_MAX_SOURCE_BYTES: &str = "SKIPPY_BENCH_GLM_DSA_REAL_TOP_K_MAX_SOURCE_BYTES";
 const ENV_STAGE_WIRE_ROUNDTRIP: &str = "SKIPPY_BENCH_GLM_DSA_STAGE_WIRE_ROUNDTRIP";
 const ENV_ALLOW_COMPACT_FLASH_AUTO: &str = "SKIPPY_GLM_DSA_BENCH_ALLOW_COMPACT_FLASH_AUTO";
+const DEFAULT_ROUTE_TRACE_FILTER: &str =
+    "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_norm,ffn_moe_weights_scaled";
 const DEFAULT_SYNTHETIC_TOP_K_WIDTH: usize = 256;
 const DEFAULT_REAL_TOP_K_MAX_SOURCE_BYTES: u64 = 110 * 1024 * 1024 * 1024;
 const GGUF_TENSOR_NAME_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -244,6 +246,9 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
             )?),
             _ => None,
         };
+    let route_tensor_trace_parity = comparison
+        .as_ref()
+        .and_then(build_route_tensor_trace_parity);
 
     let compact_flash_policy_summary = summarize_compact_flash_policy(&case);
     let direct_sparse_decision_summary = summarize_direct_sparse_decisions(&case);
@@ -391,6 +396,7 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
         compute_buffer_records: case.compute_buffer_records,
         optimized_dispatch_probe,
         optimized_dispatch_probe_parity,
+        route_tensor_trace_parity,
         comparison: comparison_report,
         timings: case.timings,
     };
@@ -1056,7 +1062,9 @@ fn run_microbench_case_with_warmup(
     deferred_model_drops: &mut Vec<StageModel>,
 ) -> Result<MicrobenchCase> {
     configure_env_flags(args, flags, allow_compact_flash_auto);
-    let mut native_logs = Some(NativeLogCapture::start(flags.capture_native_logs())?);
+    let mut native_logs = Some(NativeLogCapture::start(
+        flags.capture_native_logs() || args.trace_route_tensors,
+    )?);
     let model = match StageModel::open_from_parts(selected_paths, runtime_config) {
         Ok(model) => model,
         Err(error) => {
@@ -1157,6 +1165,7 @@ fn run_microbench_case_with_warmup(
             args.warmup,
         ),
         indexshare_trace_summary: native_timings.indexshare_trace_summary,
+        tensor_trace_records: native_timings.tensor_trace_records,
         hot_tensor_records: retain_measured_hot_tensor_records(
             native_timings.hot_tensor_records,
             args.tokens,
@@ -2054,6 +2063,24 @@ fn configure_env_flags(
         "SKIPPY_GLM_DSA_LOG_METAL_DISPATCH",
         flags.metal_dispatch_log,
     );
+    set_env_flag("SKIPPY_GLM_DSA_TENSOR_TRACE", args.trace_route_tensors);
+    set_env_flag(
+        "SKIPPY_GLM_DSA_TENSOR_TRACE_STATS",
+        args.trace_route_tensors,
+    );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_TENSOR_TRACE_FILTER",
+        args.trace_route_tensors
+            .then(|| trace_route_tensor_filter(args).to_string()),
+    );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_TENSOR_TRACE_VALUES",
+        args.trace_route_tensors.then(|| "0".to_string()),
+    );
+    set_optional_env(
+        "SKIPPY_GLM_DSA_TENSOR_TRACE_NODES",
+        args.trace_route_tensors.then(|| "128".to_string()),
+    );
     configure_metal_topk_moe_route_fusion_env(flags);
     set_env_flag(
         "SKIPPY_GLM_DSA_MOE_MOTIF_COENCODE",
@@ -2135,6 +2162,15 @@ fn configure_metal_topk_moe_route_fusion_env(flags: MicrobenchFlags) {
         RouteFusionEnvPlan::LegacyOverride(enabled) => {
             set_env_flag("SKIPPY_GLM_DSA_ENABLE_METAL_TOPK_MOE_FUSION", enabled);
         }
+    }
+}
+
+fn trace_route_tensor_filter(args: &GlmDsaLayerMicrobenchArgs) -> &str {
+    let filter = args.trace_route_tensor_filter.trim();
+    if filter.is_empty() {
+        DEFAULT_ROUTE_TRACE_FILTER
+    } else {
+        filter
     }
 }
 
@@ -3912,6 +3948,7 @@ impl NativeLogCapture {
                 &parse_indexshare_contract_records(&text)
                     .context("parse native IndexShare contract trace")?,
             ),
+            tensor_trace_records: parse_tensor_trace_records(&text),
             hot_tensor_records: parse_hot_tensor_records(&text)
                 .context("parse native hot tensor timings")?,
             compute_buffer_records: parse_compute_buffer_records(&text)
@@ -3955,6 +3992,7 @@ struct NativeTimingCapture {
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
     indexshare_trace_summary: IndexShareTraceSummary,
+    tensor_trace_records: Vec<TensorTraceRecord>,
     hot_tensor_records: Vec<HotTensorRecord>,
     compute_buffer_records: Vec<ComputeBufferRecord>,
 }
@@ -4723,6 +4761,7 @@ struct MicrobenchCase {
     op_timing_records: Vec<TimingRecord>,
     group_timing_records: Vec<TimingGroupRecord>,
     indexshare_trace_summary: IndexShareTraceSummary,
+    tensor_trace_records: Vec<TensorTraceRecord>,
     hot_tensor_records: Vec<HotTensorRecord>,
     compute_buffer_records: Vec<ComputeBufferRecord>,
     timings: Vec<IterationTiming>,
@@ -4762,6 +4801,7 @@ impl MicrobenchCase {
             routed_moe_timing_summary: summarize_routed_moe_timing(&self.op_timing_records),
             indexshare_timing_summary: summarize_indexshare_timing(&self.group_timing_records),
             indexshare_trace_summary: self.indexshare_trace_summary.clone(),
+            tensor_trace_records: self.tensor_trace_records.clone(),
             direct_sparse_decision_records: self.direct_sparse_decision_records.clone(),
             direct_sparse_execution_decision_records: self
                 .direct_sparse_execution_decision_records
@@ -4966,8 +5006,195 @@ struct MicrobenchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     optimized_dispatch_probe_parity: Option<ParityComparison>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    route_tensor_trace_parity: Option<RouteTensorTraceParityReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     comparison: Option<MicrobenchComparisonReport>,
     timings: Vec<IterationTiming>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+struct TensorTraceKey {
+    tokens: u64,
+    name: String,
+    occurrence: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TensorTraceRecord {
+    key: TensorTraceKey,
+    tensor_type: String,
+    shape: [i64; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RouteTensorTraceParityReport {
+    matched: bool,
+    baseline_trace_count: usize,
+    candidate_trace_count: usize,
+    compared_trace_count: usize,
+    mismatched_trace_count: usize,
+    missing_in_baseline_count: usize,
+    missing_in_candidate_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mismatches: Vec<RouteTensorTraceMismatchReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_in_baseline: Vec<TensorTraceKey>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_in_candidate: Vec<TensorTraceKey>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RouteTensorTraceMismatchReport {
+    key: TensorTraceKey,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_stats: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_stats: Option<String>,
+    baseline_type: String,
+    candidate_type: String,
+    baseline_shape: [i64; 4],
+    candidate_shape: [i64; 4],
+}
+
+fn build_route_tensor_trace_parity(
+    comparison: &MicrobenchComparison,
+) -> Option<RouteTensorTraceParityReport> {
+    compare_route_tensor_traces(
+        comparison.baseline.tensor_trace_records.clone(),
+        comparison.candidate.tensor_trace_records.clone(),
+    )
+}
+
+fn compare_route_tensor_traces(
+    baseline: Vec<TensorTraceRecord>,
+    candidate: Vec<TensorTraceRecord>,
+) -> Option<RouteTensorTraceParityReport> {
+    if baseline.is_empty() && candidate.is_empty() {
+        return None;
+    }
+
+    let baseline = baseline
+        .into_iter()
+        .map(|record| (record.key.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let candidate = candidate
+        .into_iter()
+        .map(|record| (record.key.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let baseline_keys = baseline.keys().cloned().collect::<BTreeSet<_>>();
+    let candidate_keys = candidate.keys().cloned().collect::<BTreeSet<_>>();
+    let shared_keys = baseline_keys
+        .intersection(&candidate_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_in_baseline = candidate_keys
+        .difference(&baseline_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_in_candidate = baseline_keys
+        .difference(&candidate_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mismatches = shared_keys
+        .iter()
+        .filter_map(|key| compare_route_tensor_trace_record(key, &baseline[key], &candidate[key]))
+        .collect::<Vec<_>>();
+    let matched = !shared_keys.is_empty()
+        && mismatches.is_empty()
+        && missing_in_baseline.is_empty()
+        && missing_in_candidate.is_empty();
+
+    Some(RouteTensorTraceParityReport {
+        matched,
+        baseline_trace_count: baseline.len(),
+        candidate_trace_count: candidate.len(),
+        compared_trace_count: shared_keys.len(),
+        mismatched_trace_count: mismatches.len(),
+        missing_in_baseline_count: missing_in_baseline.len(),
+        missing_in_candidate_count: missing_in_candidate.len(),
+        mismatches,
+        missing_in_baseline,
+        missing_in_candidate,
+    })
+}
+
+fn compare_route_tensor_trace_record(
+    key: &TensorTraceKey,
+    baseline: &TensorTraceRecord,
+    candidate: &TensorTraceRecord,
+) -> Option<RouteTensorTraceMismatchReport> {
+    let reason = if baseline.tensor_type != candidate.tensor_type {
+        Some("type mismatch")
+    } else if baseline.shape != candidate.shape {
+        Some("shape mismatch")
+    } else if baseline.stats.is_none() || candidate.stats.is_none() {
+        Some("missing stats")
+    } else if baseline.stats != candidate.stats {
+        Some("stats digest mismatch")
+    } else {
+        None
+    }?;
+
+    Some(RouteTensorTraceMismatchReport {
+        key: key.clone(),
+        reason: reason.to_string(),
+        baseline_stats: baseline.stats.clone(),
+        candidate_stats: candidate.stats.clone(),
+        baseline_type: baseline.tensor_type.clone(),
+        candidate_type: candidate.tensor_type.clone(),
+        baseline_shape: baseline.shape,
+        candidate_shape: candidate.shape,
+    })
+}
+
+fn parse_tensor_trace_records(log: &str) -> Vec<TensorTraceRecord> {
+    let mut seen = BTreeMap::<(u64, String), usize>::new();
+    log.lines()
+        .filter(|line| line.contains("glm_dsa_tensor_trace"))
+        .filter_map(|line| parse_tensor_trace_record(line, &mut seen))
+        .collect()
+}
+
+fn parse_tensor_trace_record(
+    line: &str,
+    seen: &mut BTreeMap<(u64, String), usize>,
+) -> Option<TensorTraceRecord> {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let tokens = fields.get("tokens")?.parse::<u64>().ok()?;
+    let name = fields.get("name")?.to_string();
+    let occurrence_key = (tokens, name.clone());
+    let occurrence = *seen
+        .entry(occurrence_key)
+        .and_modify(|count| *count += 1)
+        .or_insert(0);
+
+    Some(TensorTraceRecord {
+        key: TensorTraceKey {
+            tokens,
+            name,
+            occurrence,
+        },
+        tensor_type: fields.get("type")?.to_string(),
+        shape: parse_tensor_trace_shape(fields.get("ne")?)?,
+        stats: fields.get("stats").map(|stats| stats.to_string()),
+    })
+}
+
+fn parse_tensor_trace_shape(value: &str) -> Option<[i64; 4]> {
+    let values = value
+        .strip_prefix('[')?
+        .strip_suffix(']')?
+        .split(',')
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    <[i64; 4]>::try_from(values).ok()
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -6399,6 +6626,8 @@ struct MicrobenchCaseSummary {
     indexshare_timing_summary: IndexShareTimingSummary,
     #[serde(skip_serializing_if = "IndexShareTraceSummary::is_empty")]
     indexshare_trace_summary: IndexShareTraceSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tensor_trace_records: Vec<TensorTraceRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     compact_flash_policy_records: Vec<CompactFlashPolicyRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -8541,6 +8770,25 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn route_tensor_trace_parity_detects_digest_mismatch() {
+        let baseline = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=1 op=routed_moe_route node=1 name=ffn_moe_topk-75 type=i32 ne=[8,1,1,1] nb=[4,32,32,32] contiguous=1 nbytes=32 values=[] stats=fnv64:aaaa\n",
+        );
+        let candidate = parse_tensor_trace_records(
+            "skippy: glm_dsa_tensor_trace stage=0 tokens=1 op=routed_moe_route node=1 name=ffn_moe_topk-75 type=i32 ne=[8,1,1,1] nb=[4,32,32,32] contiguous=1 nbytes=32 values=[] stats=fnv64:bbbb\n",
+        );
+
+        let report = compare_route_tensor_traces(baseline, candidate).unwrap();
+
+        assert!(!report.matched);
+        assert_eq!(report.baseline_trace_count, 1);
+        assert_eq!(report.candidate_trace_count, 1);
+        assert_eq!(report.compared_trace_count, 1);
+        assert_eq!(report.mismatched_trace_count, 1);
+        assert_eq!(report.mismatches[0].reason, "stats digest mismatch");
+    }
+
     fn activation_frame_for_test(layer_end: u32, flags: u64) -> ActivationFrame {
         ActivationFrame {
             desc: ActivationDesc {
@@ -8686,6 +8934,8 @@ mod tests {
             parallel_lightning_indexer: true,
             op_timing: true,
             metal_dispatch_log: false,
+            trace_route_tensors: false,
+            trace_route_tensor_filter: DEFAULT_ROUTE_TRACE_FILTER.to_string(),
             metal_topk_moe_route_fusion: true,
             metal_topk_moe_route_fusion_native_default: false,
             moe_motif_coencode: false,
@@ -9235,6 +9485,7 @@ mod tests {
             metal_dispatch_records: Vec::new(),
             op_timing_records: Vec::new(),
             group_timing_records: Vec::new(),
+            tensor_trace_records: Vec::new(),
             hot_tensor_records: Vec::new(),
             compute_buffer_records: Vec::new(),
             timings: Vec::new(),
@@ -9287,6 +9538,7 @@ mod tests {
             op_timing_records: Vec::new(),
             group_timing_records: Vec::new(),
             indexshare_trace_summary,
+            tensor_trace_records: Vec::new(),
             hot_tensor_records: Vec::new(),
             compute_buffer_records: Vec::new(),
             timings: Vec::new(),

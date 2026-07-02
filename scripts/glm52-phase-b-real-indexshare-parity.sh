@@ -37,6 +37,8 @@ SPARSE_ATTN_THREADS="${SPARSE_ATTN_THREADS:-}"
 SPARSE_ATTN_GROUP_HEADS="${SPARSE_ATTN_GROUP_HEADS:-}"
 METAL_DISPATCH_LOG="${METAL_DISPATCH_LOG:-0}"
 METAL_TOPK_MOE_ROUTE_FUSION="${METAL_TOPK_MOE_ROUTE_FUSION:-0}"
+TRACE_ROUTE_TENSORS="${TRACE_ROUTE_TENSORS:-0}"
+TRACE_ROUTE_TENSOR_FILTER="${TRACE_ROUTE_TENSOR_FILTER:-}"
 OUT_DIR="${OUT_DIR:-/tmp}"
 REPORT="${REPORT:-}"
 LOG="${LOG:-}"
@@ -102,6 +104,9 @@ Options:
                            Enable native Metal top-k MoE route fusion during this run.
   --no-metal-topk-moe-route-fusion
                            Disable native Metal top-k MoE route fusion. Default for Phase B.
+  --trace-route-tensors    Capture native route tensor digests and compare baseline/candidate traces.
+  --trace-route-tensor-filter FILTER
+                           Comma-separated tensor-name substrings to trace.
   --out-dir PATH          Default report/log directory. Default: /tmp
   --report PATH           Explicit report path.
   --log PATH              Explicit log path.
@@ -267,6 +272,15 @@ while [[ $# -gt 0 ]]; do
       METAL_TOPK_MOE_ROUTE_FUSION=0
       shift
       ;;
+    --trace-route-tensors)
+      TRACE_ROUTE_TENSORS=1
+      shift
+      ;;
+    --trace-route-tensor-filter)
+      TRACE_ROUTE_TENSORS=1
+      TRACE_ROUTE_TENSOR_FILTER="$2"
+      shift 2
+      ;;
     --out-dir)
       OUT_DIR="$2"
       shift 2
@@ -367,6 +381,12 @@ if [[ "$COMPACT_FLASH_ATTN" == "1" ]]; then
 fi
 if [[ "$REQUIRE_DIRECT_SPARSE_DECODE_PROOF" == "1" ]]; then
   BENCH_ARGS+=(--require-direct-sparse-decode-proof)
+fi
+if [[ "$TRACE_ROUTE_TENSORS" == "1" ]]; then
+  BENCH_ARGS+=(--trace-route-tensors true)
+  if [[ -n "$TRACE_ROUTE_TENSOR_FILTER" ]]; then
+    BENCH_ARGS+=(--trace-route-tensor-filter "$TRACE_ROUTE_TENSOR_FILTER")
+  fi
 fi
 if [[ "$REQUIRE_DIRECT_SPARSE_PREFILL_PROOF" == "1" ]]; then
   BENCH_ARGS+=(--require-direct-sparse-prefill-proof)

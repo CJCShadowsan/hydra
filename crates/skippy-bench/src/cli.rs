@@ -342,6 +342,19 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub metal_dispatch_log: bool,
     #[arg(
         long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Enable native GLM-DSA tensor trace digests for routed-MoE route tensors so baseline/candidate route outputs can be compared."
+    )]
+    pub trace_route_tensors: bool,
+    #[arg(
+        long,
+        default_value = "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_norm,ffn_moe_weights_scaled",
+        help = "Comma-separated native tensor-name substrings traced when --trace-route-tensors is enabled."
+    )]
+    pub trace_route_tensor_filter: String,
+    #[arg(
+        long,
         default_value_t = true,
         action = ArgAction::Set,
         help = "Enable the native Metal GLM-DSA top-k MoE route fusion."
