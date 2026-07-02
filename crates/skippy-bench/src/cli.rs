@@ -295,6 +295,13 @@ pub struct GlmDsaLayerMicrobenchArgs {
     #[arg(
         long,
         default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Do not set the GLM-DSA direct sparse decode env toggle; prove llama.cpp's native default policy instead."
+    )]
+    pub native_default_direct_sparse_attn: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         action = ArgAction::Set,
         help = "Enable the experimental GLM-DSA compact top-k K/V + flash-attention path for the candidate run."
     )]
@@ -1230,6 +1237,7 @@ mod tests {
             "--enable-unproven-large-direct-sparse-prefill",
             "--direct-sparse-prefill-max-tokens",
             "12",
+            "--native-default-direct-sparse-attn",
             "--allow-compact-flash-auto",
             "--require-optimized-route-fusion",
             "--require-moe-weighted-sum-proof",
@@ -1258,6 +1266,7 @@ mod tests {
         assert_eq!(args.dense_sparse_mask_max_bytes, Some(1_048_576));
         assert!(args.enable_unproven_large_direct_sparse_prefill);
         assert_eq!(args.direct_sparse_prefill_max_tokens, Some(12));
+        assert!(args.native_default_direct_sparse_attn);
         assert!(args.allow_compact_flash_auto);
         assert!(args.require_optimized_route_fusion);
         assert!(args.require_moe_weighted_sum_proof);

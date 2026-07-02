@@ -2003,7 +2003,11 @@ fn configure_env_flags(
     flags: MicrobenchFlags,
     allow_compact_flash_auto: bool,
 ) {
-    configure_direct_sparse_env(flags.direct_sparse_attn);
+    if flags.native_default_direct_sparse_attn {
+        clear_direct_sparse_attn_env();
+    } else {
+        configure_direct_sparse_env(flags.direct_sparse_attn);
+    }
     set_env_flag(
         "SKIPPY_GLM_DSA_ENABLE_COMPACT_FLASH_ATTN",
         flags.compact_flash_attn,
@@ -2142,7 +2146,7 @@ fn configure_env_flags(
 
 fn configure_direct_sparse_env(enabled: bool) {
     if enabled {
-        clear_env("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN");
+        set_env_flag("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN", true);
         clear_env("SKIPPY_GLM_DSA_DISABLE_DIRECT_SPARSE_ATTN");
         clear_env("SKIPPY_GLM_DSA_ALLOW_DENSE_SPARSE_MASK_FALLBACK");
     } else {
@@ -2150,6 +2154,12 @@ fn configure_direct_sparse_env(enabled: bool) {
         clear_env("SKIPPY_GLM_DSA_DISABLE_DIRECT_SPARSE_ATTN");
         set_env_flag("SKIPPY_GLM_DSA_ALLOW_DENSE_SPARSE_MASK_FALLBACK", true);
     }
+}
+
+fn clear_direct_sparse_attn_env() {
+    clear_env("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN");
+    clear_env("SKIPPY_GLM_DSA_DISABLE_DIRECT_SPARSE_ATTN");
+    clear_env("SKIPPY_GLM_DSA_ALLOW_DENSE_SPARSE_MASK_FALLBACK");
 }
 
 fn configure_metal_topk_moe_route_fusion_env(flags: MicrobenchFlags) {
@@ -6404,6 +6414,7 @@ fn parse_env_u32(name: &str) -> Option<u32> {
 #[derive(Clone, Copy, Serialize)]
 struct MicrobenchFlags {
     direct_sparse_attn: bool,
+    native_default_direct_sparse_attn: bool,
     compact_flash_attn: bool,
     allow_compact_flash_auto: bool,
     direct_sparse_prefill: bool,
@@ -6432,6 +6443,7 @@ impl MicrobenchFlags {
     fn from_args(args: &GlmDsaLayerMicrobenchArgs) -> Self {
         Self {
             direct_sparse_attn: args.direct_sparse_attn,
+            native_default_direct_sparse_attn: args.native_default_direct_sparse_attn,
             compact_flash_attn: args.compact_flash_attn,
             allow_compact_flash_auto: args.allow_compact_flash_auto,
             direct_sparse_prefill: args.direct_sparse_prefill,
@@ -8087,6 +8099,7 @@ mod tests {
     fn optimized_dispatch_probe_runs_for_diagnostic_reports() {
         let flags = MicrobenchFlags {
             direct_sparse_attn: true,
+            native_default_direct_sparse_attn: false,
             compact_flash_attn: false,
             allow_compact_flash_auto: false,
             direct_sparse_prefill: false,
@@ -8118,6 +8131,7 @@ mod tests {
     fn optimized_dispatch_probe_runs_for_clean_route_fusion_reports() {
         let flags = MicrobenchFlags {
             direct_sparse_attn: true,
+            native_default_direct_sparse_attn: false,
             compact_flash_attn: false,
             allow_compact_flash_auto: false,
             direct_sparse_prefill: false,
@@ -8149,6 +8163,7 @@ mod tests {
     fn optimized_dispatch_probe_skips_clean_non_fusion_reports() {
         let flags = MicrobenchFlags {
             direct_sparse_attn: true,
+            native_default_direct_sparse_attn: false,
             compact_flash_attn: false,
             allow_compact_flash_auto: false,
             direct_sparse_prefill: false,
@@ -8924,6 +8939,7 @@ mod tests {
             cache_type_k: "f16".to_string(),
             cache_type_v: "f16".to_string(),
             direct_sparse_attn: true,
+            native_default_direct_sparse_attn: false,
             compact_flash_attn: false,
             allow_compact_flash_auto: false,
             direct_sparse_prefill: false,
@@ -9438,6 +9454,7 @@ mod tests {
             label,
             flags: MicrobenchFlags {
                 direct_sparse_attn: true,
+                native_default_direct_sparse_attn: false,
                 compact_flash_attn: false,
                 allow_compact_flash_auto: false,
                 direct_sparse_prefill: true,
@@ -9499,6 +9516,7 @@ mod tests {
             label: "candidate",
             flags: MicrobenchFlags {
                 direct_sparse_attn: true,
+                native_default_direct_sparse_attn: false,
                 compact_flash_attn: false,
                 allow_compact_flash_auto: false,
                 direct_sparse_prefill: false,
@@ -9839,6 +9857,7 @@ mod tests {
     fn test_microbench_flags() -> MicrobenchFlags {
         MicrobenchFlags {
             direct_sparse_attn: true,
+            native_default_direct_sparse_attn: false,
             compact_flash_attn: false,
             allow_compact_flash_auto: false,
             direct_sparse_prefill: true,

@@ -362,7 +362,9 @@ BENCH_ARGS=(
   --output "$REPORT"
 )
 
-if [[ "$NATIVE_DEFAULT_DIRECT_SPARSE_ATTN" != "1" ]]; then
+if [[ "$NATIVE_DEFAULT_DIRECT_SPARSE_ATTN" == "1" ]]; then
+  BENCH_ARGS+=(--native-default-direct-sparse-attn)
+else
   BENCH_ARGS+=(--direct-sparse-attn "$([[ "$DIRECT_SPARSE_ATTN" == "1" ]] && echo true || echo false)")
 fi
 if [[ "$NATIVE_DEFAULT_DIRECT_SPARSE_PREFILL" == "1" ]]; then
