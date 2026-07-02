@@ -7,6 +7,8 @@ STAGE_MODEL="${STAGE_MODEL:-/Volumes/External/models/huggingface/hub/models--mes
 MODEL_ID="${MODEL_ID:-meshllm/GLM-5.2-Q2_K-MTP-Q8-layers}"
 SKIPPY_BENCH_BIN="${SKIPPY_BENCH_BIN:-$ROOT/target/debug/skippy-bench}"
 OUT_DIR="${OUT_DIR:-/tmp/glm52-phase-d-policy-gate}"
+ITERATIONS="${ITERATIONS:-1}"
+WARMUP="${WARMUP:-0}"
 QUICK=0
 
 usage() {
@@ -36,6 +38,8 @@ Options:
   --model-id ID           Model id recorded in reports.
   --skippy-bench PATH     skippy-bench binary.
   --out-dir PATH          Artifact directory.
+  --iterations N          Measured iterations per case. Default: 1
+  --warmup N              Warmup iterations per case. Default: 0
   --quick                 Run a smaller matrix without compact/verification cases.
   -h, --help              Show this help.
 
@@ -59,6 +63,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --out-dir)
       OUT_DIR="$2"
+      shift 2
+      ;;
+    --iterations)
+      ITERATIONS="$2"
+      shift 2
+      ;;
+    --warmup)
+      WARMUP="$2"
       shift 2
       ;;
     --quick)
@@ -165,6 +177,8 @@ run_case() {
       --out-dir "$case_dir" \
       --report "$case_dir/report.json" \
       --log "$case_dir/run.log" \
+      --iterations "$ITERATIONS" \
+      --warmup "$WARMUP" \
       "${require_args[@]}" \
       "$@" \
       >"$case_dir/stdout.txt" \
