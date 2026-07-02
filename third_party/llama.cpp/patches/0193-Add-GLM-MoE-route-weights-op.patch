@@ -1,0 +1,557 @@
+From f7f5ee47968b4113ed6277aeea061799c0dee973 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 12:50:21 +1000
+Subject: [PATCH] Add GLM MoE route weights op
+
+---
+ ggml/include/ggml.h                       |  9 ++++
+ ggml/src/ggml-cpu/ggml-cpu.c              |  5 ++
+ ggml/src/ggml-cpu/ops.cpp                 | 62 ++++++++++++++++++++++
+ ggml/src/ggml-cpu/ops.h                   |  1 +
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 11 ++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-device.m   | 16 ++++++
+ ggml/src/ggml-metal/ggml-metal-impl.h     | 17 ++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 63 +++++++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.h      |  1 +
+ ggml/src/ggml-metal/ggml-metal.metal      | 44 ++++++++++++++++
+ ggml/src/ggml.c                           | 37 ++++++++++++-
+ src/llama-graph.cpp                       | 61 +++++++++++++---------
+ 13 files changed, 303 insertions(+), 25 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index b76ed1b26..a8e086e8e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -571,6 +571,7 @@ extern "C" {
+         GGML_OP_LIGHTNING_INDEXER,
+         GGML_OP_DSA_SPARSE_MASK,
+         GGML_OP_DSA_SPARSE_ATTN,
++        GGML_OP_MOE_ROUTE_WEIGHTS,
+         GGML_OP_MOE_WEIGHTED_SUM,
+ 
+         GGML_OP_UNARY,
+@@ -2609,6 +2610,14 @@ extern "C" {
+             struct ggml_tensor  * experts,
+             struct ggml_tensor  * weights);
+ 
++    GGML_API struct ggml_tensor * ggml_moe_route_weights(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * probs,
++            struct ggml_tensor  * ids,
++            bool                  norm,
++            float                 clamp_min,
++            float                 scale);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8ea1a4487..a45f27a3e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2063,6 +2063,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsa_sparse_attn(params, tensor);
+             } break;
++        case GGML_OP_MOE_ROUTE_WEIGHTS:
++            {
++                ggml_compute_forward_moe_route_weights(params, tensor);
++            } break;
+         case GGML_OP_MOE_WEIGHTED_SUM:
+             {
+                 ggml_compute_forward_moe_weighted_sum(params, tensor);
+@@ -2390,6 +2394,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_LIGHTNING_INDEXER:
+         case GGML_OP_DSA_SPARSE_MASK:
+         case GGML_OP_DSA_SPARSE_ATTN:
++        case GGML_OP_MOE_ROUTE_WEIGHTS:
+         case GGML_OP_MOE_WEIGHTED_SUM:
+             {
+                 n_tasks = n_threads;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 91a973a59..fff5a2ceb 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11092,6 +11092,68 @@ void ggml_compute_forward_dsa_sparse_attn(
+     }
+ }
+ 
++// ggml_compute_forward_moe_route_weights
++
++void ggml_compute_forward_moe_route_weights(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * probs = dst->src[0]; // [1, n_expert, n_tokens, 1]
++    const ggml_tensor * ids   = dst->src[1]; // [n_expert_used, n_tokens, 1, 1]
++
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(probs->type == GGML_TYPE_F32);
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(probs->ne[0] == 1);
++    GGML_ASSERT(dst->ne[0] == 1);
++    GGML_ASSERT(dst->ne[1] == ids->ne[0]);
++    GGML_ASSERT(dst->ne[2] == ids->ne[1]);
++    GGML_ASSERT(probs->ne[2] == ids->ne[1]);
++
++    const int64_t n_expert      = probs->ne[1];
++    const int64_t n_expert_used = ids->ne[0];
++    const int64_t n_tokens      = ids->ne[1];
++    const bool    norm          = ggml_get_op_params_i32(dst, 2) != 0;
++    const float   clamp_min     = ggml_get_op_params_f32(dst, 0);
++    const float   scale         = ggml_get_op_params_f32(dst, 1);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t dr = (n_tokens + nth - 1) / nth;
++    const int64_t t0 = dr * ith;
++    const int64_t t1 = MIN(t0 + dr, n_tokens);
++
++    for (int64_t token = t0; token < t1; ++token) {
++        float sum = 0.0f;
++
++        if (norm) {
++            for (int64_t expert_idx = 0; expert_idx < n_expert_used; ++expert_idx) {
++                const int32_t expert = *(const int32_t *) ((const char *) ids->data +
++                        expert_idx * ids->nb[0] + token * ids->nb[1]);
++                GGML_ASSERT(expert >= 0 && expert < n_expert);
++                sum += *(const float *) ((const char *) probs->data +
++                        expert * probs->nb[1] + token * probs->nb[2]);
++            }
++            sum = MAX(sum, clamp_min);
++        }
++
++        for (int64_t expert_idx = 0; expert_idx < n_expert_used; ++expert_idx) {
++            const int32_t expert = *(const int32_t *) ((const char *) ids->data +
++                    expert_idx * ids->nb[0] + token * ids->nb[1]);
++            GGML_ASSERT(expert >= 0 && expert < n_expert);
++
++            float weight = *(const float *) ((const char *) probs->data +
++                    expert * probs->nb[1] + token * probs->nb[2]);
++            if (norm) {
++                weight /= sum;
++            }
++            weight *= scale;
++
++            *(float *) ((char *) dst->data + expert_idx * dst->nb[1] + token * dst->nb[2]) = weight;
++        }
++    }
++}
++
+ // ggml_compute_forward_moe_weighted_sum
+ 
+ void ggml_compute_forward_moe_weighted_sum(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 5b2ad997e..d93c7ff9a 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -108,6 +108,7 @@ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * par
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsa_sparse_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsa_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_moe_route_weights(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_moe_weighted_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index ce3a29faf..4316ddb4d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1396,6 +1396,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe_route(g
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_route_weights(ggml_metal_library_t lib) {
++    const char * name = "kernel_moe_route_weights_f32_i32";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_weighted_sum(ggml_metal_library_t lib) {
+     const char * name = "kernel_moe_weighted_sum_f32";
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 1427cde01..b09f32d51 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -147,6 +147,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_m
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe_route    (ggml_metal_library_t lib);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_route_weights (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_weighted_sum  (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_weighted_sum_x4(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin               (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse );
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 67bbe4604..3f3ea674c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1332,6 +1332,22 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                    op->src[1]->ne[3] == 1 &&
+                    op->ne[0] == op->src[0]->ne[0] &&
+                    op->ne[1] == op->src[0]->ne[2];
++        case GGML_OP_MOE_ROUTE_WEIGHTS:
++            return op->type == GGML_TYPE_F32 &&
++                   op->src[0]->type == GGML_TYPE_F32 &&
++                   op->src[1]->type == GGML_TYPE_I32 &&
++                   op->nb[0] == sizeof(float) &&
++                   op->src[0]->nb[0] == sizeof(float) &&
++                   op->src[1]->nb[0] == sizeof(int32_t) &&
++                   op->src[0]->ne[0] == 1 &&
++                   op->src[1]->ne[0] <= 16 &&
++                   op->src[1]->ne[1] == op->src[0]->ne[2] &&
++                   op->src[1]->ne[2] == 1 &&
++                   op->src[1]->ne[3] == 1 &&
++                   op->src[0]->ne[3] == 1 &&
++                   op->ne[0] == 1 &&
++                   op->ne[1] == op->src[1]->ne[0] &&
++                   op->ne[2] == op->src[1]->ne[1];
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_MUL_MAT:
+         case GGML_OP_MUL_MAT_ID:
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 47666a99a..8d0575315 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1241,6 +1241,23 @@ typedef struct {
+     uint64_t weights_nb2;
+ } ggml_metal_kargs_topk_moe_route;
+ 
++typedef struct {
++    int32_t  n_expert;
++    int32_t  n_tokens;
++    int32_t  n_expert_used;
++    int32_t  norm;
++    float    clamp_min;
++    float    scale;
++    int32_t  _pad0;
++    int32_t  _pad1;
++    uint64_t probs_nb1;
++    uint64_t probs_nb2;
++    uint64_t ids_nb0;
++    uint64_t ids_nb1;
++    uint64_t dst_nb1;
++    uint64_t dst_nb2;
++} ggml_metal_kargs_moe_route_weights;
++
+ typedef struct {
+     int32_t  n_embd;
+     int32_t  n_tokens;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 3c460d75b..1b17dc4cf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -741,6 +741,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_dsa_sparse_attn(ctx, idx);
+             } break;
++        case GGML_OP_MOE_ROUTE_WEIGHTS:
++            {
++                n_fuse = ggml_metal_op_moe_route_weights(ctx, idx);
++            } break;
+         case GGML_OP_MOE_WEIGHTED_SUM:
+             {
+                 n_fuse = ggml_metal_op_moe_weighted_sum(ctx, idx);
+@@ -5227,6 +5231,65 @@ int ggml_metal_op_dsa_sparse_attn(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_moe_route_weights(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
++    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
++
++    ggml_metal_kargs_moe_route_weights args = {
++        /*.n_expert      =*/ ne01,
++        /*.n_tokens      =*/ ne11,
++        /*.n_expert_used =*/ ne10,
++        /*.norm          =*/ ggml_get_op_params_i32(op, 2),
++        /*.clamp_min     =*/ ggml_get_op_params_f32(op, 0),
++        /*.scale         =*/ ggml_get_op_params_f32(op, 1),
++        /*._pad0         =*/ 0,
++        /*._pad1         =*/ 0,
++        /*.probs_nb1     =*/ nb01,
++        /*.probs_nb2     =*/ nb02,
++        /*.ids_nb0       =*/ nb10,
++        /*.ids_nb1       =*/ nb11,
++        /*.dst_nb1       =*/ nb1,
++        /*.dst_nb2       =*/ nb2,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_moe_route_weights(lib);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                     0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]),    1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]),    2);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),            3);
++
++    const int nth = 1;
++
++    if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++        GGML_LOG_INFO(
++            "skippy: glm_dsa_metal_dispatch op=moe_route_weights tensor=%s probs=%s ids=%s experts=%d tokens=%d used_experts=%d norm=%d scale=%g grid_x=%d grid_y=1 grid_z=1 threads_x=%d\n",
++            ggml_metal_tensor_name(op),
++            ggml_metal_tensor_name(op->src[0]),
++            ggml_metal_tensor_name(op->src[1]),
++            args.n_expert,
++            args.n_tokens,
++            args.n_expert_used,
++            args.norm,
++            (double) args.scale,
++            args.n_tokens,
++            nth);
++    }
++
++    ggml_metal_encoder_dispatch_threadgroups(enc, args.n_tokens, 1, 1, nth, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_moe_weighted_sum(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 5b2dd013a..b9cab7c24 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -62,6 +62,7 @@ int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsa_sparse_mask   (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsa_sparse_attn   (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_moe_route_weights (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_moe_weighted_sum  (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index a4db2db7d..eaad613bd 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -5874,6 +5874,50 @@ kernel void kernel_topk_moe_route_f32_i32(
+     }
+ }
+ 
++kernel void kernel_moe_route_weights_f32_i32(
++        constant ggml_metal_kargs_moe_route_weights & args,
++        device const char    * probs,
++        device const char    * ids,
++        device       char    * dst,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]]) {
++    if (tpitg.x != 0) {
++        return;
++    }
++
++    constexpr int32_t MAX_TOP_K = 16;
++    float weights[MAX_TOP_K];
++
++    const int32_t token = int32_t(tgpig.x);
++    if (token >= args.n_tokens || args.n_expert_used <= 0 || args.n_expert_used > MAX_TOP_K) {
++        return;
++    }
++
++    float sum = 0.0f;
++    for (int32_t i = 0; i < args.n_expert_used; ++i) {
++        const int32_t expert = ((device const int32_t *) (ids + i*args.ids_nb0 + token*args.ids_nb1))[0];
++        float weight = 0.0f;
++        if (expert >= 0 && expert < args.n_expert) {
++            weight = ((device const float *) (probs + expert*args.probs_nb1 + token*args.probs_nb2))[0];
++        }
++        weights[i] = weight;
++        sum += weight;
++    }
++
++    if (args.norm) {
++        sum = max(sum, args.clamp_min);
++    }
++
++    for (int32_t i = 0; i < args.n_expert_used; ++i) {
++        float weight = weights[i];
++        if (args.norm) {
++            weight /= sum;
++        }
++        weight *= args.scale;
++        ((device float *) (dst + i*args.dst_nb1 + token*args.dst_nb2))[0] = weight;
++    }
++}
++
+ kernel void kernel_moe_weighted_sum_f32(
+         constant ggml_metal_kargs_moe_weighted_sum & args,
+         device const char * experts,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 97b4aee30..94eaa3aec 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1067,6 +1067,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "LIGHTNING_INDEXER",
+     "DSA_SPARSE_MASK",
+     "DSA_SPARSE_ATTN",
++    "MOE_ROUTE_WEIGHTS",
+     "MOE_WEIGHTED_SUM",
+ 
+     "UNARY",
+@@ -1085,7 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1182,6 +1183,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "lightning_indexer(q, k, weights, scale_embd, scale_heads)",
+     "dsa_sparse_mask(kq_mask, top_k)",
+     "dsa_sparse_attn(q, k, v, kq_mask, top_k)",
++    "moe_route_weights(probs, ids)",
+     "moe_weighted_sum(experts, weights)",
+ 
+     "unary(x)",
+@@ -1200,7 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6411,6 +6413,37 @@ struct ggml_tensor * ggml_dsa_sparse_attn(
+ 
+ // ggml_moe_weighted_sum
+ 
++struct ggml_tensor * ggml_moe_route_weights(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * probs,
++        struct ggml_tensor  * ids,
++        bool                  norm,
++        float                 clamp_min,
++        float                 scale) {
++
++    GGML_ASSERT(probs->type == GGML_TYPE_F32);
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(probs->ne[0] == 1);
++    GGML_ASSERT(ids->ne[0] > 0);
++    GGML_ASSERT(ids->ne[1] == probs->ne[2]);
++    GGML_ASSERT(ids->ne[2] == 1);
++    GGML_ASSERT(ids->ne[3] == 1);
++    GGML_ASSERT(probs->ne[3] == 1);
++
++    int64_t ne[3] = { 1, ids->ne[0], ids->ne[1] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
++
++    ggml_set_op_params_f32(result, 0, clamp_min);
++    ggml_set_op_params_f32(result, 1, scale);
++    ggml_set_op_params_i32(result, 2, norm ? 1 : 0);
++
++    result->op     = GGML_OP_MOE_ROUTE_WEIGHTS;
++    result->src[0] = probs;
++    result->src[1] = ids;
++
++    return result;
++}
++
+ struct ggml_tensor * ggml_moe_weighted_sum(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * experts,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 3a05a2173..6c75b9c39 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -110,6 +110,10 @@ static bool skippy_glm_dsa_moe_weighted_sum_enabled() {
+     return skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_MOE_WEIGHTED_SUM");
+ }
+ 
++static bool skippy_glm_dsa_moe_route_weights_enabled() {
++    return skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_MOE_ROUTE_WEIGHTS");
++}
++
+ static ggml_tensor * llama_glm_dsa_top_k_for_sparse_attn(ggml_context * ctx, ggml_tensor * top_k) {
+     GGML_ASSERT(top_k != nullptr && "GLM-DSA sparse attention requires top-k indices");
+     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && "GLM-DSA top-k indices must be I32");
+@@ -2251,35 +2255,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+     }
+ 
+-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+-    cb(weights, "ffn_moe_weights", il);
+-
++    const bool use_moe_route_weights =
++            arch == LLM_ARCH_GLM_DSA &&
++            skippy_glm_dsa_moe_route_weights_enabled() &&
++            gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT;
+ 
+-    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+-        weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
+-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+-        cb(weights, "ffn_moe_weights_softmax", il);
+-    }
++    ggml_tensor * weights = nullptr;
++    if (use_moe_route_weights) {
++        const float route_scale = w_scale != 0.0f ? w_scale : 1.0f;
++        weights = ggml_moe_route_weights(ctx0, probs, selected_experts, norm_w, 6.103515625e-5, route_scale);
++        cb(weights, "ffn_moe_route_weights", il);
++    } else {
++        weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
++        cb(weights, "ffn_moe_weights", il);
++
++        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
++            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
++            weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
++            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
++            cb(weights, "ffn_moe_weights_softmax", il);
++        }
+ 
+-    if (norm_w) {
+-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
++        if (norm_w) {
++            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+ 
+-        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+-        cb(weights_sum, "ffn_moe_weights_sum", il);
++            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
++            cb(weights_sum, "ffn_moe_weights_sum", il);
+ 
+-        // Avoid division by zero, clamp to smallest number representable by F16
+-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+-        cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
++            // Avoid division by zero, clamp to smallest number representable by F16
++            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
++            cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+ 
+-        weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
+-        cb(weights, "ffn_moe_weights_norm", il);
++            weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
++            cb(weights, "ffn_moe_weights_norm", il);
+ 
+-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+-    }
+-    if (w_scale != 0.0f && w_scale != 1.0f) {
+-        weights = ggml_scale(ctx0, weights, w_scale);
+-        cb(weights, "ffn_moe_weights_scaled", il);
++            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
++        }
++        if (w_scale != 0.0f && w_scale != 1.0f) {
++            weights = ggml_scale(ctx0, weights, w_scale);
++            cb(weights, "ffn_moe_weights_scaled", il);
++        }
+     }
+ 
+     //call early so that topk-moe can be used
+-- 
+2.53.0
+

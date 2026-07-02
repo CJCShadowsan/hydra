@@ -131,6 +131,7 @@ pub(crate) struct GlmDsaDispatchSummary {
     pub(crate) dsa_sparse_attn_value_fma: u64,
     pub(crate) dsa_sparse_attn_max_scratch_per_tg_bytes: u64,
     pub(crate) mul_mat_id_records: usize,
+    pub(crate) moe_route_weights_records: usize,
     pub(crate) moe_weighted_sum_records: usize,
     pub(crate) moe_weighted_sum_f32x4_records: usize,
     pub(crate) moe_weighted_sum_already_weighted_records: usize,
@@ -267,6 +268,7 @@ pub(crate) fn summarize_metal_dispatch(records: &[MetalDispatchRecord]) -> GlmDs
                     .max(record.scratch_per_tg_bytes.unwrap_or(0));
             }
             "mul_mat_id" => summary.mul_mat_id_records += 1,
+            "moe_route_weights" => summary.moe_route_weights_records += 1,
             "moe_weighted_sum" => {
                 summary.moe_weighted_sum_records += 1;
                 if record.kernel.as_deref() == Some("f32x4") {
@@ -737,6 +739,7 @@ mod tests {
             dispatch("topk_moe_route_fused", None, "route", None),
             fused_candidate,
             skipped_candidate,
+            dispatch("moe_route_weights", None, "ffn_moe_route_weights", None),
             dispatch("moe_weighted_sum", Some("f32x4"), "weighted", None),
             dispatch(
                 "mul_mat_id",
@@ -784,7 +787,7 @@ mod tests {
 
         let summary = summarize_metal_dispatch(&records);
 
-        assert_eq!(summary.records, 11);
+        assert_eq!(summary.records, 12);
         assert_eq!(summary.topk_moe_route_fused_records, 1);
         assert_eq!(summary.topk_moe_route_encode_records, 2);
         assert_eq!(summary.topk_moe_route_pack_candidate_records, 0);
@@ -794,6 +797,7 @@ mod tests {
         assert_eq!(summary.topk_moe_route_encode_fused_candidate_records, 1);
         assert_eq!(summary.topk_moe_route_encode_skipped_candidate_records, 1);
         assert_eq!(summary.mul_mat_id_records, 4);
+        assert_eq!(summary.moe_route_weights_records, 1);
         assert_eq!(summary.moe_weighted_sum_f32x4_records, 1);
         assert_eq!(summary.moe_weighted_sum_already_weighted_records, 1);
         assert_eq!(summary.mul_mv_id_weighted_sum_fused_records, 1);
@@ -812,7 +816,7 @@ mod tests {
         assert_eq!(summary.route_fusion_reasons[0].records, 1);
         assert_eq!(summary.route_fusion_reasons[1].reason, "shape_or_sequence");
         assert_eq!(summary.route_fusion_reasons[1].records, 1);
-        assert_eq!(summary.dispatch_shapes.len(), 10);
+        assert_eq!(summary.dispatch_shapes.len(), 11);
     }
 
     #[test]
