@@ -128,7 +128,7 @@ diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 70ca4f017..738ca1e55 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -110,6 +110,10 @@ static bool skippy_glm_dsa_moe_weighted_sum_enabled() {
+@@ -110,6 +110,14 @@ static bool skippy_glm_dsa_moe_weighted_sum_enabled() {
      return skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_MOE_WEIGHTED_SUM");
  }
  
@@ -136,10 +136,14 @@ index 70ca4f017..738ca1e55 100644
 +    return skippy_env_enabled("SKIPPY_GLM_DSA_EXPERIMENTAL_Q3_DOWN_WEIGHTED_PARALLEL");
 +}
 +
++static bool skippy_glm_dsa_log_moe_down_weighted_slots_decision() {
++    return skippy_env_enabled("SKIPPY_GLM_DSA_LOG_MOE_DOWN_WEIGHTED_SLOTS_DECISION");
++}
++
  static bool skippy_glm_dsa_moe_route_weights_enabled() {
      if (skippy_env_disabled("SKIPPY_GLM_DSA_ENABLE_MOE_ROUTE_WEIGHTS") ||
          skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_MOE_ROUTE_WEIGHTS")) {
-@@ -2467,7 +2471,50 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2467,7 +2471,52 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
              GGML_ABORT("fatal error");
      }
  
@@ -158,7 +162,9 @@ index 70ca4f017..738ca1e55 100644
 +        cur->ne[1] == n_expert_used &&
 +        cur->ne[2] == n_tokens;
 +
-+    if (arch == LLM_ARCH_GLM_DSA && skippy_glm_dsa_q3_down_weighted_parallel_enabled()) {
++    if (arch == LLM_ARCH_GLM_DSA &&
++            skippy_glm_dsa_q3_down_weighted_parallel_enabled() &&
++            skippy_glm_dsa_log_moe_down_weighted_slots_decision()) {
 +        fprintf(stderr,
 +            "skippy: glm_dsa_moe_down_weighted_slots_decision layer=%d use=%d down_type=%s has_down_bias=%d has_down_scale=%d weights_type=%s weights_shape=[%lld,%lld,%lld] cur_type=%s cur_shape=[%lld,%lld,%lld] n_expert_used=%lld n_tokens=%lld\n",
 +            il,
@@ -202,4 +208,3 @@ index 70ca4f017..738ca1e55 100644
          return moe_out;
 -- 
 2.54.0 (Apple Git-157)
-
