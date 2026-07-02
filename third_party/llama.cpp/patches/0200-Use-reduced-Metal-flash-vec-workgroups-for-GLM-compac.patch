@@ -1,0 +1,78 @@
+From 7f73ee5e1eab8f61eb95aa7e8fdb88b831d30b80 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Thu, 2 Jul 2026 23:30:00 +1000
+Subject: [PATCH] Use reduced Metal flash vec workgroups for GLM compact decode
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp | 14 ++++++++++++++
+ ggml/src/ggml-metal/ggml-metal.metal   | 14 ++++++++++----
+ 2 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index a5414544a..d4f8f0421 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3652,6 +3652,20 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+                 nsg *= 2;
+             }
+         }
++        if (!has_mask &&
++                !has_sinks &&
++                !has_bias &&
++                !has_scap &&
++                !has_kvpad &&
++                op->src[1]->type == GGML_TYPE_F16 &&
++                op->src[2]->type == GGML_TYPE_F16 &&
++                ne00 == 576 &&
++                ne20 == 512 &&
++                ne01 == 1 &&
++                ne11 == 2048) {
++            nwg = 8;
++            nsg = 1;
++        }
+ 
+         ggml_metal_kargs_flash_attn_ext_vec args = {
+             /*.ne01          =*/ ne01,
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index eaad613bd..393468daf 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -7837,14 +7837,20 @@ kernel void kernel_flash_attn_ext_vec_reduce(
+     const uint64_t rid = tgpig;
+ 
+     const short iwg = tiisg;
++    const bool active = iwg < NWG;
+ 
+     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
+ 
+-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
+-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
++    float S = 0.0f;
++    float M = -FLT_MAX/2;
++
++    if (active) {
++        S = ss[rid*(2*NWG) + 2*iwg + 0];
++        M = ss[rid*(2*NWG) + 2*iwg + 1];
++    }
+ 
+     const float m  = simd_max(M);
+-    const float ms = exp(M - m);
++    const float ms = active ? exp(M - m) : 0.0f;
+ 
+     S = simd_sum(S*ms);
+     S = S == 0.0f ? 0.0f : 1.0f/S;
+@@ -7863,7 +7872,11 @@ kernel void kernel_flash_attn_ext_vec_reduce(
+     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+ 
+     for (short i = sgitg; i < DV4; i += NWG) {
+-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
++        float4 partial = 0.0f;
++        if (active) {
++            partial = htmp4[i*NWG + iwg]*ms;
++        }
++        const float4 v = simd_sum(partial);
+ 
+         if (iwg == 0) {
+             dst4[i] = v*S;
+-- 
+2.50.0
