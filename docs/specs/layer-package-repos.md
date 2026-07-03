@@ -443,6 +443,23 @@ For `glm-dsa-v1`, the current threshold intent is:
 | `compact_flash_min_kv` | Minimum KV length where compact selected-KV flash attention is worth considering. |
 | `dense_mask_max_bytes` | Maximum dense sparse-mask allocation the runtime should permit before forcing a sparse fallback. |
 
+For GLM-DSA threshold tuning, consumers SHOULD reason from the package tensor
+sizes rather than from model names alone. The relevant first-order estimates
+are:
+
+| Quantity | Formula | Example |
+| --- | --- | --- |
+| Hidden activation bytes | `tokens * hidden_width * activation_bytes` | GLM-5.2 width `6144`: `12 KiB/token` at f16 or `24 KiB/token` at f32. |
+| IndexShare sideband bytes | `tokens * top_k * 4` | Width `768`: `3 KiB/token`, `384 KiB` for a 128-token chunk. |
+| Dense sparse-mask bytes | `tokens * visible_kv * 4` | At `128k` visible KV: `512 KiB/token`, `64 MiB` for a 128-token chunk, `1 GiB` for a 2048-token chunk. |
+
+These numbers are intentionally policy inputs, not schema requirements. A
+package with a different `attention.indexer.top_k`, hidden width, activation
+wire dtype, or context target will produce different thresholds. The important
+contract is that packages expose enough policy and threshold information for
+the runtime to explain why it selected dense, direct sparse, compact-flash, or
+fallback execution.
+
 #### Speculative Decoding
 
 When present, `generation` may also declare `speculative_decoding` defaults:

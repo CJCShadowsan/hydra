@@ -50,6 +50,15 @@ the source of truth for validated defaults and consumers must log any override
 or fallback. See
 [specs/layer-package-repos.md](specs/layer-package-repos.md#generation-defaults).
 
+The threshold values should be grounded in tensor sizes. For example, a
+GLM-DSA top-k sideband costs `tokens * top_k * 4` bytes, while a dense sparse
+mask costs roughly `tokens * visible_kv * 4` bytes. With a representative
+GLM-5.2 split package sideband width of `768` i32 values per token, the
+IndexShare sideband is `3 KiB/token`; at `128k` visible KV, the corresponding
+dense mask is `512 KiB/token`. That size gap is why GLM-DSA packages should
+record dense-mask and compact-flash thresholds instead of leaving sparse policy
+implicit.
+
 ## Local package tooling
 
 `skippy-model-package` is the local inspection and writing tool. Current
