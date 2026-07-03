@@ -1,0 +1,146 @@
+From 1147045cb19578205ba0051f928065d4d3a30df9 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 08:51:28 +1000
+Subject: [PATCH 216/216] Reject Shared-first GLM DSA IndexShare metadata
+
+---
+ src/models/glm-dsa.cpp     | 29 +++++++++++++++++++++++++
+ tests/test-llama-archs.cpp | 44 ++++++++++++++++++++++++++++++++++----
+ 2 files changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 55724ee73..0a392f8ff 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -207,6 +207,34 @@ static bool llama_glm_dsa_metadata_layer_is_full(const llama_hparams & hparams,
+     return false;
+ }
+ 
++static void llama_glm_dsa_validate_indexshare_sequence(const llama_hparams & hparams) {
++    bool saw_full = false;
++    bool saw_role = false;
++    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++        bool metadata_matched = false;
++        const bool full_layer = llama_glm_dsa_metadata_layer_is_full(hparams, il, &metadata_matched);
++        if (!metadata_matched) {
++            continue;
++        }
++
++        saw_role = true;
++        if (full_layer) {
++            saw_full = true;
++            continue;
++        }
++
++        if (!saw_full) {
++            std::ostringstream message;
++            message << "GLM_DSA IndexShare Shared layer " << il << " has no preceding Full layer";
++            throw std::runtime_error(message.str());
++        }
++    }
++
++    if (saw_role && !saw_full) {
++        throw std::runtime_error("GLM_DSA IndexShare metadata must declare at least one Full layer");
++    }
++}
++
+ static void llama_glm_dsa_validate_indexshare_layer_contract(int il, const llama_hparams & hparams, const llama_layer & layer) {
+     const llama_model_loader_stage_filter & stage_filter = llama_model_loader_get_stage_filter();
+     if (stage_filter.enabled && (il < stage_filter.layer_start || il >= stage_filter.layer_end)) {
+@@ -455,6 +483,7 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+         throw std::runtime_error("GLM_DSA IndexShare metadata requires attention.indexer.types or attention.indexer.top_k_frequency");
+     }
+     llama_glm_dsa_validate_indexer_type_frequency_consistency(hparams);
++    llama_glm_dsa_validate_indexshare_sequence(hparams);
+ 
+     // Expert gating function (GLM-4.5 uses sigmoid)
+     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index c7739908a..f83024081 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -80,6 +80,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
+ enum class glm_dsa_indexshare_fixture {
+     DEFAULT,
+     CONFLICTING_METADATA,
++    SHARED_FIRST,
+ };
+ 
+ static gguf_context_ptr get_gguf_ctx(
+@@ -208,11 +209,15 @@ static gguf_context_ptr get_gguf_ctx(
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, arch == LLM_ARCH_GLM_DSA ? uint32_t(128) : uint32_t(64));
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
+     if (arch == LLM_ARCH_GLM_DSA) {
+-        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(1));
+-        ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(0));
+         if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::CONFLICTING_METADATA) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(0));
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared"}));
++        } else if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::SHARED_FIRST) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"shared", "full"}));
+         } else {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(0));
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "full"}));
+         }
+     }
+@@ -270,6 +275,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
+ }
+ 
+ static bool test_glm_dsa_rejects_conflicting_indexshare_metadata(const size_t seed) {
++    static constexpr const char * expected_error =
++            "attention.indexer.types conflicts with attention.indexer.top_k_frequency";
++
+     try {
+         gguf_context_ptr gguf_ctx = get_gguf_ctx(
+                 LLM_ARCH_GLM_DSA,
+@@ -286,7 +294,33 @@ static bool test_glm_dsa_rejects_conflicting_indexshare_metadata(const size_t se
+         GGML_UNUSED(model);
+     } catch (const std::exception & err) {
+         const std::string message = err.what();
+-        return message.find("attention.indexer.types conflicts with attention.indexer.top_k_frequency") != std::string::npos;
++        return message.find(expected_error) != std::string::npos;
++    }
++
++    return false;
++}
++
++static bool test_glm_dsa_rejects_shared_first_indexshare_metadata(const size_t seed) {
++    static constexpr const char * expected_error =
++            "GLM_DSA IndexShare Shared layer 0 has no preceding Full layer";
++
++    try {
++        gguf_context_ptr gguf_ctx = get_gguf_ctx(
++                LLM_ARCH_GLM_DSA,
++                true,
++                glm_dsa_indexshare_fixture::SHARED_FIRST);
++
++        llama_model_params model_params = llama_model_default_params();
++        model_params.progress_callback = silent_model_load_progress;
++        size_t tmp = seed;
++        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
++        if (!model) {
++            return true;
++        }
++        GGML_UNUSED(model);
++    } catch (const std::exception & err) {
++        const std::string message = err.what();
++        return message.find(expected_error) != std::string::npos;
+     }
+ 
+     return false;
+@@ -590,7 +624,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+ 
+     bool all_ok = true;
+     if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_GLM_DSA) {
+-        const bool glm_dsa_contract_ok = test_glm_dsa_rejects_conflicting_indexshare_metadata(seed);
++        const bool glm_dsa_contract_ok =
++                test_glm_dsa_rejects_conflicting_indexshare_metadata(seed) &&
++                test_glm_dsa_rejects_shared_first_indexshare_metadata(seed);
+         if (!glm_dsa_contract_ok) {
+             fprintf(stderr, "GLM_DSA IndexShare metadata conflict test failed\n");
+             all_ok = false;
+-- 
+2.53.0
+
