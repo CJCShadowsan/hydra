@@ -147,7 +147,7 @@ run_case() {
     require_args+=(--require-direct-sparse-decode-proof)
   elif [[ "$proof" == "compact" ]]; then
     allow_compact_flash_auto=1
-    require_args+=(--allow-compact-flash-auto --require-compact-flash-proof)
+    require_args+=(--allow-compact-flash-auto --selected-row-flash --require-compact-flash-proof)
   elif [[ "$proof" == "prefill" ]]; then
     direct_sparse_prefill=1
     require_args+=(--direct-sparse-prefill --require-direct-sparse-prefill-proof)
@@ -224,10 +224,10 @@ if [[ "$QUICK" != "1" ]]; then
   run_case decode-compact-large-topk compact compact_flash decode decode_compact_mask_omitted 0 \
     --layer-start 74 \
     --layer-end 78 \
-    --ctx-size 512 \
+    --ctx-size 2048 \
     --tokens 1 \
-    --position-start 128 \
-    --kv-warmup-tokens 128 \
+    --position-start 1024 \
+    --kv-warmup-tokens 1024 \
     --kv-warmup-chunk-tokens 128 \
     --n-batch 128 \
     --n-ubatch 128
@@ -337,6 +337,9 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         "candidate_dsa_sparse_attn_nodes": (candidate_ops.get("dsa_sparse_attn") or {}).get("nodes"),
         "candidate_dsa_sparse_attn_dispatches": candidate_dispatch.get("dsa_sparse_attn_records"),
         "candidate_flash_attn_ext_records": candidate_dispatch.get("flash_attn_ext_records"),
+        "candidate_selected_row_flash_records": candidate_dispatch.get("selected_row_flash_records"),
+        "candidate_selected_row_flash_skip_records": candidate_dispatch.get("selected_row_flash_skip_records"),
+        "candidate_selected_row_flash_contract_skip_records": candidate_dispatch.get("selected_row_flash_contract_skip_records"),
         "candidate_compact_get_rows_records": compact_guard.get("compact_get_rows_records"),
         "candidate_dsa_compact_get_rows_fused_records": compact_guard.get("dsa_compact_get_rows_fused_records"),
         "candidate_compact_get_rows_nodes": (candidate_ops.get("compact_get_rows") or {}).get("nodes"),
@@ -390,11 +393,15 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         failures.append(f"{case_dir.name}: missing DSA sparse-attention dispatch evidence")
     if route == "compact_flash" and not row["compact_flash_guard_passed"]:
         failures.append(f"{case_dir.name}: compact flash proof failed: {compact_guard.get('failure_summary')}")
-    if route == "compact_flash" and not row["candidate_flash_attn_ext_records"]:
+    if route == "compact_flash" and not (
+        row["candidate_flash_attn_ext_records"]
+        or row["candidate_selected_row_flash_records"]
+    ):
         failures.append(f"{case_dir.name}: missing compact flash dispatch evidence")
     if route == "compact_flash" and not (
         row["candidate_compact_get_rows_records"]
         or row["candidate_dsa_compact_get_rows_fused_records"]
+        or row["candidate_selected_row_flash_skip_records"]
     ):
         failures.append(f"{case_dir.name}: missing compact K/V gather evidence")
     if (
@@ -435,6 +442,8 @@ for row in rows:
         f"reason={row['observed_reason']} sparse_mask={row['candidate_sparse_mask_nodes']} "
         f"dsa_dispatches={row['candidate_dsa_sparse_attn_dispatches']} "
         f"flash_dispatches={row['candidate_flash_attn_ext_records']} "
+        f"selected_row_flash={row['candidate_selected_row_flash_records']} "
+        f"selected_row_skip={row['candidate_selected_row_flash_skip_records']} "
         f"compact_get_rows_nodes={row['candidate_compact_get_rows_nodes']} "
         f"compact_get_rows_us={row['candidate_compact_get_rows_us']}{ratio_text}"
     )
