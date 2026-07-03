@@ -21,8 +21,8 @@ Runs the strict Phase-C decode gate for native GLM-5.2 sparse decode policy.
 
 This gate assumes Phase A and Phase B are already closed. It proves decode only:
 
-  - direct sparse decode decisions are selected for the proven small-top-k shape;
-  - compact K/V gather + flash attention is selected for the large-top-k shape;
+  - direct sparse decode decisions are selected for top-k within the proven decode cap;
+  - compact K/V gather + flash attention is selected only beyond that cap;
   - sparse-mask timing nodes are absent in the candidate;
   - dense sparse-mask Metal dispatches are absent in the candidate;
   - native DSA sparse-attention or compact-flash execution evidence is present;
@@ -187,7 +187,7 @@ elif [[ "$LONG_KV_ONLY" != "1" ]]; then
     --kv-warmup-chunk-tokens 64 \
     --n-batch 64 \
     --n-ubatch 64
-  run_decode_case decode-late compact \
+  run_decode_case decode-late direct \
     --layer-start 74 \
     --layer-end 78 \
     --ctx-size 512 \
@@ -349,7 +349,7 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
 summary = {
     "passed": not failures,
     "phase": "C",
-    "scope": "native GLM-5.2 sparse decode policy; direct sparse for small top-k, compact flash for large top-k; dense sparse masks, route fusion, prefill, MTP, and split work disabled",
+    "scope": "native GLM-5.2 sparse decode policy; direct sparse for top-k within the decode cap, compact flash beyond the cap; dense sparse masks, route fusion, prefill, MTP, and split work disabled",
     "rows": rows,
     "failures": failures,
 }
