@@ -1,0 +1,118 @@
+From a39bf114bcd58bd7db2633c68148f28ba29d28f3 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 09:28:27 +1000
+Subject: [PATCH 222/222] Test GLM DSA selected row flash backend
+
+---
+ tests/test-backend-ops.cpp | 81 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1923a5d8e..12bca783b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -51,6 +51,14 @@
+ #   define N_THREADS std::thread::hardware_concurrency()
+ #endif
+ 
++static void set_test_env(const char * name, const char * value) {
++#if defined(_WIN32)
++    _putenv_s(name, value);
++#else
++    setenv(name, value, true);
++#endif
++}
++
+ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+     size_t nels = ggml_nelements(tensor);
+     std::vector<float> data(nels);
+@@ -7527,6 +7535,78 @@ struct test_flash_attn_ext : public test_case {
+     }
+ };
+ 
++struct test_glm_dsa_selected_row_flash : public test_case {
++    const int64_t kv;
++    const int64_t top_k;
++
++    std::string vars() override {
++        return VARS_TO_STR2(kv, top_k);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "GLM_DSA_SELECTED_ROW_FLASH";
++    }
++
++    test_glm_dsa_selected_row_flash(int64_t kv = 257, int64_t top_k = 64)
++        : kv(kv), top_k(top_k) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        set_test_env("SKIPPY_GLM_DSA_EXPERIMENTAL_SELECTED_ROW_FLASH", "1");
++
++        ggml_tensor * q         = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 576, 1, 1, 1);
++        ggml_tensor * packed_kv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 576, kv, 1, 1);
++        ggml_tensor * top_k_ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, top_k, 1, 1, 1);
++
++        ggml_set_name(q,         "q");
++        ggml_set_name(packed_kv, "packed_kv");
++        ggml_set_name(top_k_ids, "top_k");
++
++        ggml_tensor * k_top_k = ggml_get_rows_typed(ctx, packed_kv, top_k_ids);
++        ggml_set_name(k_top_k, "dsa_compact_k_topk_rows");
++
++        ggml_tensor * v_top_k = ggml_view_4d(
++                ctx,
++                k_top_k,
++                512, k_top_k->ne[1], k_top_k->ne[2], k_top_k->ne[3],
++                k_top_k->nb[1], k_top_k->nb[2], k_top_k->nb[3],
++                0);
++        ggml_set_name(v_top_k, "dsa_compact_v_topk_view");
++
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k_top_k, v_top_k, nullptr, 1.0f/sqrtf(576.0f), 0.0f, 0.0f);
++        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "top_k") == 0) {
++                std::vector<int32_t> data(top_k);
++                for (int64_t i = 0; i < top_k; ++i) {
++                    data[i] = (int32_t) ((i*37) % kv);
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t, -0.25f, 0.25f);
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    double max_err() override {
++        return 5e-3;
++    }
++
++    bool run_whole_graph() override {
++        return true;
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -10136,6 +10216,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 1, 4, 1, 64, 1, false, true));
+     test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 513, 1, 8, 1, 513, 1, false, true));
+     test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 64, 8, 1, 64, 1));
++    test_cases.emplace_back(new test_glm_dsa_selected_row_flash(257, 64));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+-- 
+2.53.0
+
