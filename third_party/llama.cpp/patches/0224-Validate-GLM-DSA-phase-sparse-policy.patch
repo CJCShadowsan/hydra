@@ -1,0 +1,279 @@
+From ee7ea927fd1f4b939dba7e5c5d31cfcba84b78bf Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 09:41:44 +1000
+Subject: [PATCH 224/224] Validate GLM DSA phase sparse policy
+
+---
+ src/llama-graph.cpp        | 33 +++++++++++--
+ tests/test-llama-archs.cpp | 94 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 123 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5a1308aac..945d1d771 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -132,6 +132,20 @@ static int64_t skippy_glm_dsa_dense_sparse_mask_max_bytes() {
+     return parsed <= 0 ? INT64_MAX : parsed;
+ }
+ 
++static int64_t skippy_glm_dsa_compact_flash_min_kv() {
++    const char * value = getenv("SKIPPY_GLM_DSA_COMPACT_FLASH_MIN_KV");
++    if (value == nullptr || value[0] == '\0') {
++        const skippy_graph_filter & filter = skippy_graph_get_filter();
++        if (filter.glm_dsa_policy_profile != 0 && filter.glm_dsa_compact_flash_min_kv > 0) {
++            return filter.glm_dsa_compact_flash_min_kv;
++        }
++        return 0;
++    }
++
++    const int64_t parsed = atoll(value);
++    return parsed <= 0 ? 0 : parsed;
++}
++
+ static ggml_type llama_glm_dsa_mla_kq_mask_type(const llama_cparams & cparams) {
+     return cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ }
+@@ -224,9 +238,11 @@ struct llama_glm_dsa_sparse_attn_policy {
+     bool compact_disabled = false;
+     bool compact_large_decode_top_k = false;
+     bool compact_mask_omitted = false;
++    bool compact_kv_ok = false;
+     bool compact_candidate = false;
+     bool flash_attn = false;
+     int64_t direct_sparse_decode_max_top_k = 0;
++    int64_t compact_flash_min_kv = 0;
+ 
+     bool use_direct_sparse_attn() const {
+         return route == llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
+@@ -256,6 +272,7 @@ static int64_t skippy_glm_dsa_direct_sparse_decode_max_top_k() {
+ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         int64_t sparse_batch,
+         int64_t sparse_streams,
++        int64_t sparse_kv,
+         int64_t sparse_top_k,
+         int64_t ubatch_tokens,
+         int64_t prefill_cap,
+@@ -282,6 +299,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     policy.compact_mask_omitted = compact_mask_omitted;
+     policy.flash_attn = flash_attn;
+     policy.direct_sparse_decode_max_top_k = skippy_glm_dsa_direct_sparse_decode_max_top_k();
++    policy.compact_flash_min_kv = skippy_glm_dsa_compact_flash_min_kv();
+ 
+     policy.decode_shape =
+             sparse_streams > 0 &&
+@@ -307,9 +325,11 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     policy.compact_large_decode_top_k =
+             policy.decode_shape &&
+             sparse_top_k > policy.direct_sparse_decode_max_top_k;
++    policy.compact_kv_ok = sparse_kv >= policy.compact_flash_min_kv;
+     policy.compact_candidate =
+             !compact_flash_disabled &&
+             policy.decode_shape &&
++            policy.compact_kv_ok &&
+             (policy.compact_large_decode_top_k || compact_mask_omitted);
+     const bool compact_ready =
+             policy.compact_candidate &&
+@@ -360,6 +380,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+             compact_flash_disabled ? "disabled" :
+             !flash_attn ? "flash_attn_disabled" :
+             !policy.decode_shape ? "not_decode" :
++            !policy.compact_kv_ok ? "kv_below_min" :
+             !policy.compact_large_decode_top_k && !compact_mask_omitted ? "small_decode_top_k" :
+             !kq_b_ok ? "kq_b_present" :
+             !sinks_ok ? "sinks_present" :
+@@ -397,6 +418,7 @@ static bool llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+     const llama_glm_dsa_sparse_attn_policy policy = llama_glm_dsa_choose_sparse_attn_policy(
+             n_batch,
+             n_stream,
++            n_kv,
+             top_k,
+             ubatch.n_tokens,
+             skippy_glm_dsa_direct_sparse_prefill_max_tokens(),
+@@ -517,8 +539,10 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+         int64_t visible_kv,
+         int64_t top_k,
+         int64_t decode_max_top_k,
++        int64_t compact_min_kv,
+         bool    disabled,
+         bool    large_decode_top_k,
++        bool    kv_ok,
+         bool    enabled,
+         bool    flash_attn,
+         bool    decode_shape,
+@@ -534,18 +558,18 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+     }
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld decode_max_top_k=%lld kv_topk_ratio=%lld min_kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d ratio_ok=%d enabled=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
++            "skippy: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld decode_max_top_k=%lld compact_min_kv=%lld kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d kv_ok=%d enabled=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
+             layer,
+             (long long) ubatch_tokens,
+             (long long) visible_kv,
+             (long long) top_k,
+             (long long) decode_max_top_k,
++            (long long) compact_min_kv,
+             top_k > 0 ? (long long) (visible_kv/top_k) : 0LL,
+-            2LL,
+             0,
+             disabled ? 1 : 0,
+             large_decode_top_k ? 1 : 0,
+-            0,
++            kv_ok ? 1 : 0,
+             enabled ? 1 : 0,
+             flash_attn ? 1 : 0,
+             decode_shape ? "decode" : "other",
+@@ -3572,6 +3596,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     const llama_glm_dsa_sparse_attn_policy sparse_policy = llama_glm_dsa_choose_sparse_attn_policy(
+             n_direct_sparse_batch,
+             n_direct_sparse_stream,
++            n_sparse_kv,
+             n_sparse_top_k,
+             ubatch.n_tokens,
+             direct_sparse_prefill_max_tokens,
+@@ -3619,8 +3644,10 @@ ggml_tensor * llm_graph_context::build_attn(
+             n_sparse_kv,
+             n_sparse_top_k,
+             sparse_policy.direct_sparse_decode_max_top_k,
++            sparse_policy.compact_flash_min_kv,
+             sparse_policy.compact_disabled,
+             sparse_policy.compact_large_decode_top_k,
++            sparse_policy.compact_kv_ok,
+             sparse_policy.compact_candidate,
+             sparse_policy.flash_attn,
+             sparse_policy.decode_shape,
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index d016abe05..71ee43bf0 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -577,6 +577,31 @@ static glm_dsa_graph_op_counts run_glm_dsa_decode_graph_after_prefill(
+     return counts;
+ }
+ 
++static glm_dsa_graph_op_counts run_glm_dsa_prefill_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs, uint32_t n_tokens) {
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(
++            LLM_ARCH_GLM_DSA,
++            true,
++            glm_dsa_indexshare_fixture::FULL_SHARED);
++    glm_dsa_graph_op_counts counts;
++    auto model_ctx = get_model_and_ctx(
++            gguf_ctx.get(),
++            nullptr,
++            seed,
++            devs,
++            LLAMA_SPLIT_MODE_LAYER,
++            false,
++            glm_dsa_graph_op_counter_callback,
++            &counts,
++            LLAMA_FLASH_ATTN_TYPE_ENABLED);
++
++    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
++    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
++    decode_tokens(model_ctx.second.get(), tokens, 0);
++
++    return counts;
++}
++
+ static bool test_glm_dsa_direct_sparse_decode_graph(
+         const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+     try {
+@@ -600,6 +625,7 @@ static bool test_glm_dsa_compact_decode_graph(
+         const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+     try {
+         scoped_test_env compact_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "4");
++        scoped_test_env compact_min_kv("SKIPPY_GLM_DSA_COMPACT_FLASH_MIN_KV", "1");
+         scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
+         const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
+ 
+@@ -616,6 +642,27 @@ static bool test_glm_dsa_compact_decode_graph(
+     }
+ }
+ 
++static bool test_glm_dsa_compact_min_kv_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env compact_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "4");
++        scoped_test_env compact_min_kv("SKIPPY_GLM_DSA_COMPACT_FLASH_MIN_KV", "1024");
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA compact min-kv decode graph counted total=%d sparse_mask=%d sparse_mask_nodes=%d compact_get_rows=%d dsa_sparse_attn=%d flash_attn=%d\n",
++                    counts.total, counts.sparse_mask, counts.sparse_mask_nodes, counts.compact_get_rows, counts.dsa_sparse_attn, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA compact min-kv decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
+ static bool test_glm_dsa_compact_disabled_decode_graph(
+         const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+     try {
+@@ -637,6 +684,48 @@ static bool test_glm_dsa_compact_disabled_decode_graph(
+     }
+ }
+ 
++static bool test_glm_dsa_short_prefill_direct_sparse_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph(seed, devs, 8);
++
++        if (counts.dsa_sparse_attn == 0 || counts.compact_get_rows != 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0) {
++            fprintf(stderr,
++                    "GLM_DSA short prefill graph counted total=%d dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.dsa_sparse_attn, counts.compact_get_rows, counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA short prefill graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_long_prefill_dense_mask_guard_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        scoped_test_env dense_mask_limit("SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES", "1");
++        scoped_test_env large_prefill_enabled("SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph(seed, devs, 16);
++
++        if (counts.dsa_sparse_attn == 0 || counts.compact_get_rows != 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0) {
++            fprintf(stderr,
++                    "GLM_DSA long prefill dense-mask guard graph counted total=%d dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.dsa_sparse_attn, counts.compact_get_rows, counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA long prefill dense-mask guard graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
+ static std::vector<float> get_logits(
+         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+@@ -910,7 +999,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+                 test_glm_dsa_periodic_full_shared_indexshare_graph(seed, {}) &&
+                 test_glm_dsa_direct_sparse_decode_graph(seed, {}) &&
+                 test_glm_dsa_compact_decode_graph(seed, {}) &&
+-                test_glm_dsa_compact_disabled_decode_graph(seed, {});
++                test_glm_dsa_compact_min_kv_decode_graph(seed, {}) &&
++                test_glm_dsa_compact_disabled_decode_graph(seed, {}) &&
++                test_glm_dsa_short_prefill_direct_sparse_graph(seed, {}) &&
++                test_glm_dsa_long_prefill_dense_mask_guard_graph(seed, {});
+         if (!glm_dsa_contract_ok) {
+             fprintf(stderr, "GLM_DSA IndexShare metadata contract test failed\n");
+             all_ok = false;
+-- 
+2.53.0
+
