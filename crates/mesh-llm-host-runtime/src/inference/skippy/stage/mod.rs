@@ -342,84 +342,13 @@ impl StageControlState {
             });
         }
         let key = stage_key(&load.topology_id, &load.run_id, &load.stage_id);
-        if let Some(existing) = self.stages.remove(&key) {
-            existing.server.shutdown().await?;
-        }
-
-        let bind_addr = materialize_stage_bind_addr(parse_bind_addr(&load.bind_addr)?)?;
-        let mut effective_load = load;
-        effective_load.bind_addr = bind_addr.to_string();
-        super::configure_materialized_stage_cache();
-        let package_request = effective_load.clone();
-        let mut resolved_package = None;
-        if let Some(package) = tokio::task::spawn_blocking(move || {
-            super::materialization::resolve_stage_load_package(&package_request)
-        })
-        .await
-        .context("join resolve stage load package task")??
-        {
-            tracing::info!(
-                topology_id = %effective_load.topology_id,
-                run_id = %effective_load.run_id,
-                stage_id = %effective_load.stage_id,
-                local_ref = %package.local_ref,
-                source_model_bytes = ?package.source_model_bytes,
-                "split stage package resolved"
-            );
-            effective_load.model_path = Some(package.local_ref.clone());
-            effective_load.source_model_bytes = package.source_model_bytes;
-            resolved_package = Some(package);
-        }
+        self.stop_existing_stage(&key).await?;
+        let (effective_load, resolved_package, bind_addr) =
+            resolve_effective_stage_load(load).await?;
         let config = stage_config(&effective_load, None, resolved_package.as_ref())?;
-        tracing::info!(
-            topology_id = %effective_load.topology_id,
-            run_id = %effective_load.run_id,
-            stage_id = %effective_load.stage_id,
-            stage_index = effective_load.stage_index,
-            layer_start = effective_load.layer_start,
-            layer_end = effective_load.layer_end,
-            bind_addr = %bind_addr,
-            model_path = ?effective_load.model_path,
-            source_model_bytes = ?effective_load.source_model_bytes,
-            load_mode = ?effective_load.load_mode,
-            "starting split binary stage"
-        );
-        let server = skippy_server::start_binary_stage(BinaryStageOptions {
-            config,
-            topology: None,
-            bind_addr,
-            activation_width: effective_load.activation_width,
-            wire_dtype: effective_load.wire_dtype.into(),
-            metrics_otlp_grpc: None,
-            telemetry_queue_capacity: 0,
-            telemetry_level: TelemetryLevel::Off,
-            max_inflight: effective_load.lane_count as usize,
-            reply_credit_limit: None,
-            async_prefill_forward: true,
-            downstream_wire_condition: WireCondition::new(0.0, None)?,
-            downstream_connect_timeout_secs: 30,
-            native_mtp_enabled: effective_load.native_mtp_enabled,
-            openai: None,
-        });
-        tracing::info!(
-            topology_id = %effective_load.topology_id,
-            run_id = %effective_load.run_id,
-            stage_id = %effective_load.stage_id,
-            bind_addr = %bind_addr,
-            "split binary stage task spawned; waiting for readiness"
-        );
-        if let Err(error) =
-            wait_for_binary_stage_ready(bind_addr, stage_load_timeout(&effective_load)).await
-        {
-            let last_error = server.status().last_error;
-            let context = stage_load_failure_context(
-                &effective_load,
-                "binary stage did not become ready",
-                last_error.as_deref(),
-            );
-            let _ = server.shutdown().await;
-            return Err(error.context(context));
-        }
+        log_starting_split_stage(&effective_load, bind_addr);
+        let server = start_split_binary_stage(config, &effective_load, bind_addr)?;
+        let server = wait_for_started_binary_stage(&effective_load, bind_addr, server).await?;
         tracing::info!(
             topology_id = %effective_load.topology_id,
             run_id = %effective_load.run_id,
@@ -452,6 +381,13 @@ impl StageControlState {
             status,
             error: None,
         })
+    }
+
+    async fn stop_existing_stage(&mut self, key: &str) -> Result<()> {
+        if let Some(existing) = self.stages.remove(key) {
+            existing.server.shutdown().await?;
+        }
+        Ok(())
     }
 
     async fn stop(&mut self, stop: StageStopRequest) -> Result<StageReadyResponse> {
@@ -603,6 +539,104 @@ fn parse_bind_addr(bind_addr: &str) -> Result<SocketAddr> {
     bind_addr
         .parse()
         .with_context(|| format!("parse stage bind_addr {bind_addr:?}"))
+}
+
+async fn resolve_effective_stage_load(
+    load: StageLoadRequest,
+) -> Result<(
+    StageLoadRequest,
+    Option<super::materialization::ResolvedStagePackage>,
+    SocketAddr,
+)> {
+    let bind_addr = materialize_stage_bind_addr(parse_bind_addr(&load.bind_addr)?)?;
+    let mut effective_load = load;
+    effective_load.bind_addr = bind_addr.to_string();
+    super::configure_materialized_stage_cache();
+    let package_request = effective_load.clone();
+    let resolved_package = tokio::task::spawn_blocking(move || {
+        super::materialization::resolve_stage_load_package(&package_request)
+    })
+    .await
+    .context("join resolve stage load package task")??;
+    if let Some(package) = resolved_package.as_ref() {
+        tracing::info!(
+            topology_id = %effective_load.topology_id,
+            run_id = %effective_load.run_id,
+            stage_id = %effective_load.stage_id,
+            local_ref = %package.local_ref,
+            source_model_bytes = ?package.source_model_bytes,
+            "split stage package resolved"
+        );
+        effective_load.model_path = Some(package.local_ref.clone());
+        effective_load.source_model_bytes = package.source_model_bytes;
+    }
+    Ok((effective_load, resolved_package, bind_addr))
+}
+
+fn log_starting_split_stage(load: &StageLoadRequest, bind_addr: SocketAddr) {
+    tracing::info!(
+        topology_id = %load.topology_id,
+        run_id = %load.run_id,
+        stage_id = %load.stage_id,
+        stage_index = load.stage_index,
+        layer_start = load.layer_start,
+        layer_end = load.layer_end,
+        bind_addr = %bind_addr,
+        model_path = ?load.model_path,
+        source_model_bytes = ?load.source_model_bytes,
+        load_mode = ?load.load_mode,
+        "starting split binary stage"
+    );
+}
+
+fn start_split_binary_stage(
+    config: StageConfig,
+    load: &StageLoadRequest,
+    bind_addr: SocketAddr,
+) -> Result<EmbeddedServerHandle> {
+    let server = skippy_server::start_binary_stage(BinaryStageOptions {
+        config,
+        topology: None,
+        bind_addr,
+        activation_width: load.activation_width,
+        wire_dtype: load.wire_dtype.into(),
+        metrics_otlp_grpc: None,
+        telemetry_queue_capacity: 0,
+        telemetry_level: TelemetryLevel::Off,
+        max_inflight: load.lane_count as usize,
+        reply_credit_limit: None,
+        async_prefill_forward: true,
+        downstream_wire_condition: WireCondition::new(0.0, None)?,
+        downstream_connect_timeout_secs: 30,
+        native_mtp_enabled: load.native_mtp_enabled,
+        openai: None,
+    });
+    tracing::info!(
+        topology_id = %load.topology_id,
+        run_id = %load.run_id,
+        stage_id = %load.stage_id,
+        bind_addr = %bind_addr,
+        "split binary stage task spawned; waiting for readiness"
+    );
+    Ok(server)
+}
+
+async fn wait_for_started_binary_stage(
+    load: &StageLoadRequest,
+    bind_addr: SocketAddr,
+    server: EmbeddedServerHandle,
+) -> Result<EmbeddedServerHandle> {
+    if let Err(error) = wait_for_binary_stage_ready(bind_addr, stage_load_timeout(load)).await {
+        let last_error = server.status().last_error;
+        let context = stage_load_failure_context(
+            load,
+            "binary stage did not become ready",
+            last_error.as_deref(),
+        );
+        let _ = server.shutdown().await;
+        return Err(error.context(context));
+    }
+    Ok(server)
 }
 
 fn materialize_stage_bind_addr(bind_addr: SocketAddr) -> Result<SocketAddr> {
@@ -767,7 +801,6 @@ fn stage_config(
         use_mmap_buffer: true,
         selected_device: load.selected_device.clone(),
         kv_cache: None,
-        native_mtp_enabled: load.native_mtp_enabled,
         load_mode: load.load_mode.clone(),
         bind_addr: load.bind_addr.clone(),
         upstream: load.upstream.as_ref().map(peer_config),

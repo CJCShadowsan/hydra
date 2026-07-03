@@ -933,16 +933,13 @@ impl StageOpenAiBackend {
                 &decode_message,
                 &[current],
                 None,
-                BinaryStageExecutionOptions::new(
-                    false,
-                    stage_output_activation_capacity(
-                        request.config,
-                        decode_message.token_count,
-                        request.activation_width,
-                    )
-                    .map_err(openai_backend_error)?,
-                    request.native_mtp_enabled,
-                ),
+                false,
+                stage_output_activation_capacity(
+                    request.config,
+                    decode_message.token_count,
+                    request.activation_width,
+                )
+                .map_err(openai_backend_error)?,
             )
             .map_err(openai_backend_error)?
             .2;

@@ -419,7 +419,6 @@ impl ResolvedEmbeddedOpenAiArgs {
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,
             draft_n_gpu_layers: self.draft_n_gpu_layers,
-            native_mtp_enabled: self.native_mtp_enabled,
             activation_width: self.activation_width,
             wire_dtype: self.wire_dtype,
             reply_credit_limit: self.reply_credit_limit,

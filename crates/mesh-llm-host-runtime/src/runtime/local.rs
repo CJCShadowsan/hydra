@@ -1511,7 +1511,7 @@ fn split_runtime_stage_load_request(
         cache_type_k: resolved_config.cache_type_k.clone(),
         cache_type_v: resolved_config.cache_type_v.clone(),
         flash_attn_type: resolved_config.flash_attn_type,
-        native_mtp_enabled: resolved_config.native_mtp_enabled,
+        native_mtp_enabled: settings.embedded_openai.native_mtp_enabled,
         shutdown_generation: spec.generation.generation,
         coordinator_term: spec.generation.coordinator_term,
         coordinator_id: Some(spec.node.id()),
@@ -4255,7 +4255,6 @@ stop = ["END"]
             settings.runtime_options.config.projector_path.as_deref(),
             Some(projector_path.to_string_lossy().as_ref())
         );
-        assert!(!settings.runtime_options.config.native_mtp_enabled);
         assert!(!settings.embedded_openai.native_mtp_enabled);
         assert_eq!(settings.embedded_openai.generation_concurrency, 4);
         assert_eq!(settings.embedded_openai.default_max_tokens, 321);

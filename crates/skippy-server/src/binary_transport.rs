@@ -275,6 +275,7 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
         async_prefill_forward,
         downstream_wire_condition,
         downstream_connect_timeout_secs,
+        native_mtp_enabled: _,
         openai,
     } = options;
     eprintln!(

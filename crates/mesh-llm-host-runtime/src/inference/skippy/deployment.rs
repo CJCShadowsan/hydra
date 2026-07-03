@@ -109,7 +109,6 @@ pub(crate) fn stage0_config(
         use_mmap_buffer: true,
         selected_device,
         kv_cache: None,
-        native_mtp_enabled: context.native_mtp_enabled,
         load_mode: LoadMode::LayerPackage,
         bind_addr: "127.0.0.1:0".to_string(),
         upstream: None,
