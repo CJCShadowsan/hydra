@@ -1,0 +1,25 @@
+From a8092db489ce739eabc9cd662597452b56a75e23 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Fri, 3 Jul 2026 13:02:28 +1000
+Subject: [PATCH] Raise GLM DSA direct sparse decode cap
+
+---
+ src/llama-graph.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index abb3682c4..bc713d04e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -198,7 +198,7 @@ struct llama_glm_dsa_sparse_attn_policy {
+     }
+ };
+ 
+-static constexpr int64_t LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K = 128;
++static constexpr int64_t LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K = 256;
+ 
+ static int64_t skippy_glm_dsa_direct_sparse_decode_max_top_k() {
+     const char * value = getenv("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K");
+-- 
+2.53.0
+
