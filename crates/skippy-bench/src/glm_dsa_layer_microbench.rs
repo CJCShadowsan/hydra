@@ -2973,13 +2973,7 @@ fn generate_real_top_k_frame(
     guard_real_top_k_source_start(&source_input, &source_start_artifact_role)
         .context("check GLM-DSA real top-k source start")?;
     let source_config = runtime_config_for_range(args, source_layer_start, source_layer_end)?;
-    let source_flags = MicrobenchFlags {
-        direct_sparse_attn: false,
-        direct_sparse_prefill: false,
-        enable_unproven_large_direct_sparse_prefill: false,
-        direct_sparse_prefill_max_tokens: None,
-        ..flags
-    };
+    let source_flags = flags;
     configure_env_flags(args, source_flags, allow_compact_flash_auto(args));
     let source_model = StageModel::open_from_parts(&source_selected.absolute_paths, &source_config)
         .with_context(|| {

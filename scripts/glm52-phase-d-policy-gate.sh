@@ -220,6 +220,20 @@ run_case prefill-long-safe-fallback dense-prefill dense_mask other token_shape_n
   --direct-sparse-prefill-max-tokens 8 \
   --dense-sparse-mask-max-bytes 1
 
+run_case prefill-long-direct-sparse prefill direct_sparse prefill dense_mask_guard_large_prefill 1 \
+  --layer-start 30 \
+  --layer-end 34 \
+  --ctx-size 512 \
+  --tokens 64 \
+  --position-start 0 \
+  --kv-warmup-tokens 0 \
+  --kv-warmup-chunk-tokens 64 \
+  --n-batch 64 \
+  --n-ubatch 64 \
+  --enable-unproven-large-direct-sparse-prefill \
+  --direct-sparse-prefill-max-tokens 8 \
+  --dense-sparse-mask-max-bytes 1
+
 if [[ "$QUICK" != "1" ]]; then
   run_case decode-compact-large-topk compact compact_flash decode decode_compact_mask_omitted 0 \
     --layer-start 74 \
