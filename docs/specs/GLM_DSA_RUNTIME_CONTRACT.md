@@ -172,9 +172,12 @@ The sideband format is:
 - width: `n_top_k` inferred from sideband byte count
 - byte size: `token_count * n_top_k * sizeof(i32)`
 
-The sideband width must be positive and must not exceed what the consuming stage
-can consume for the current token count and KV shape. The activation frame
-`layer_end` must exactly match the consumer stage `layer_start`.
+The sideband width must be positive and must exactly match what the consuming
+stage expects for the current token count and KV shape. A narrower sideband is
+invalid because Shared consumers would otherwise run with a partial visibility
+window for the current session position. A wider sideband is invalid because it
+does not match the graph input shape. The activation frame `layer_end` must
+exactly match the consumer stage `layer_start`.
 
 GLM-DSA top-k sidebands cannot be combined with other activation sidebands.
 
@@ -194,7 +197,8 @@ The runtime must fail hard, with a clear error, for:
 - impossible MoE hparams, such as `expert_used_count > expert_count`
 - consumer slices entered without a top-k sideband
 - sideband payload size not divisible by `token_count * sizeof(i32)`
-- sideband width larger than the consumer can use
+- sideband width that does not exactly match the consumer's current IndexShare
+  width
 - activation frame layer boundary mismatch
 - GLM-DSA sideband on a non-GLM-DSA stage
 

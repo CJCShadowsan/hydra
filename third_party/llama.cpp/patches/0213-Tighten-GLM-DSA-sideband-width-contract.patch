@@ -1,0 +1,25 @@
+From 5f2c2638b09a4054369b27c08c19300e0bad8caf Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Fri, 3 Jul 2026 17:07:23 +1000
+Subject: [PATCH] Tighten GLM DSA sideband width contract
+
+---
+ src/skippy.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 1a62befa6..3dd2def9c 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1334,7 +1334,7 @@ static bool skippy_glm_dsa_sideband_top_k_count_is_valid(
+         return false;
+     }
+ 
+-    return actual_top_k <= expected_top_k;
++    return actual_top_k == expected_top_k;
+ }
+ 
+ static size_t skippy_glm_dsa_top_k_bytes(const skippy_session * session, size_t token_count) {
+-- 
+2.53.0
+
