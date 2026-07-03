@@ -1,0 +1,88 @@
+From 7667e7c590396da711fb356a78e325d613ebdb39 Mon Sep 17 00:00:00 2001
+From: Mesh LLM <dev@mesh-llm.local>
+Date: Fri, 3 Jul 2026 12:17:52 +1000
+Subject: [PATCH] Bypass GLM DSA compact gather when top-k covers KV
+
+---
+ src/llama-graph.cpp | 51 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 51 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9c46e0b74..9fb492e9b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -56,6 +56,10 @@ static bool skippy_glm_dsa_top1_attn_disabled() {
+     return skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_TOP1_ATTN");
+ }
+ 
++static bool skippy_glm_dsa_all_kv_flash_disabled() {
++    return skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_ALL_KV_FLASH");
++}
++
+ static bool skippy_glm_dsa_direct_sparse_prefill_enabled() {
+     if (skippy_env_disabled("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL") ||
+         skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_DIRECT_SPARSE_PREFILL")) {
+@@ -517,6 +521,23 @@ static void skippy_glm_dsa_log_compact_flash_mask(
+             (long long) max_top_k);
+ }
+ 
++static void skippy_glm_dsa_log_all_kv_flash(
++        int     layer,
++        int64_t visible_kv,
++        int64_t top_k,
++        bool    v_trans) {
++    if (!skippy_glm_dsa_compact_flash_policy_log_enabled()) {
++        return;
++    }
++
++    LLAMA_LOG_INFO(
++            "skippy: glm_dsa_all_kv_flash layer=%d visible_kv=%lld top_k=%lld v_trans=%d reason=top_k_covers_visible_kv\n",
++            layer,
++            (long long) visible_kv,
++            (long long) top_k,
++            v_trans ? 1 : 0);
++}
++
+ void skippy_graph_set_filter(const skippy_graph_filter & filter) {
+     g_skippy_graph_filter = filter;
+ }
+@@ -3047,6 +3068,36 @@ ggml_tensor * llm_graph_context::build_attn_mha_dsa_compact_flash(
+     GGML_ASSERT(top_k->ne[1] == v->ne[2]);
+     GGML_ASSERT(top_k->ne[2] == v->ne[3]);
+ 
++    if (!skippy_glm_dsa_all_kv_flash_disabled() && top_k->ne[0] >= k->ne[1]) {
++        skippy_glm_dsa_log_all_kv_flash(il, k->ne[1], top_k->ne[0], v_trans);
++
++        ggml_tensor * cur = ggml_flash_attn_ext(
++                ctx0,
++                q,
++                k,
++                v,
++                nullptr,
++                kq_scale,
++                hparams.f_max_alibi_bias,
++                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
++        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
++
++        if (v_mla) {
++            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++            cur = ggml_mul_mat(ctx0, v_mla, cur);
++            cb(cur, "fattn_mla", il);
++            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++            cur = ggml_cont(ctx0, cur);
++        }
++
++        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
++
++        ggml_build_forward_expand(gf, cur);
++
++        return cur;
++    }
++
+     if (!skippy_glm_dsa_top1_attn_disabled() && top_k->ne[0] == 1) {
+         ggml_tensor * cur = ggml_dsa_top1_attn(ctx0, q, v, top_k);
+         cb(cur, "dsa_top1_attn", il);
+-- 
+2.53.0
+
