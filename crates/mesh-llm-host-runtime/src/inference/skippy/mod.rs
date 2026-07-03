@@ -155,6 +155,7 @@ pub(crate) struct SkippyModelLoadOptions {
     pub(crate) telemetry: SkippyTelemetryOptions,
     pub(crate) openai_guardrails: Option<OpenAiGuardrailsConfig>,
     pub(crate) native_mtp_enabled: bool,
+    pub(crate) glm_dsa_policy: Option<skippy_runtime::GlmDsaPolicyConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +240,7 @@ impl SkippyModelLoadOptions {
             telemetry: SkippyTelemetryOptions::off(),
             openai_guardrails: Some(OpenAiGuardrailsConfig::disabled_for_skippy()),
             native_mtp_enabled: true,
+            glm_dsa_policy: None,
         }
     }
 
@@ -397,6 +399,7 @@ impl SkippyModelHandle {
             topology: None,
             n_threads: options.n_threads,
             n_threads_batch: options.n_threads_batch,
+            glm_dsa_policy: options.glm_dsa_policy.clone(),
             metrics_otlp_grpc: options.telemetry.metrics_otlp_grpc.clone(),
             telemetry_queue_capacity: options.telemetry.queue_capacity,
             telemetry_level: options.telemetry.level,
@@ -499,6 +502,7 @@ impl SkippyModelHandle {
                 topology: None,
                 n_threads: options.n_threads,
                 n_threads_batch: options.n_threads_batch,
+                glm_dsa_policy: options.glm_dsa_policy.clone(),
                 metrics_otlp_grpc: options.telemetry.metrics_otlp_grpc.clone(),
                 telemetry_queue_capacity: options.telemetry.queue_capacity,
                 telemetry_level: options.telemetry.level,
@@ -631,6 +635,7 @@ impl SkippyModelHandle {
                 topology: None,
                 n_threads: None,
                 n_threads_batch: None,
+                glm_dsa_policy: None,
                 metrics_otlp_grpc: telemetry.metrics_otlp_grpc.clone(),
                 telemetry_queue_capacity: telemetry.queue_capacity,
                 telemetry_level: telemetry.level,

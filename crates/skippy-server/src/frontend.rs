@@ -1347,6 +1347,7 @@ impl DraftRunner {
                 use_mmap: true,
                 use_mmap_prefetch: true,
                 use_mmap_buffer: true,
+                glm_dsa_policy: None,
             },
         )
         .with_context(|| format!("open draft model {}", path.display()))?;

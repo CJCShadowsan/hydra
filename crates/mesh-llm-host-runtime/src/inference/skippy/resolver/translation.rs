@@ -23,8 +23,8 @@ use super::request_defaults::{
 use super::support::resolve_prefill_chunk_policy;
 use super::types::{
     BUILTIN_PREFILL_ADAPTIVE_MAX, BUILTIN_PREFILL_ADAPTIVE_START, BUILTIN_PREFILL_ADAPTIVE_STEP,
-    BUILTIN_PREFILL_CHUNK_SIZE, ResolvedEmbeddedOpenAiArgs, ResolvedSkippyConfig,
-    ResolvedStageKvCache,
+    BUILTIN_PREFILL_CHUNK_SIZE, ResolvedEmbeddedOpenAiArgs, ResolvedGenerationPolicyConfig,
+    ResolvedSkippyConfig, ResolvedStageKvCache,
 };
 
 impl ResolvedSkippyConfig {
@@ -47,6 +47,7 @@ impl ResolvedSkippyConfig {
         }
         let mut options = self.base_model_load_options(telemetry);
         options.native_mtp_enabled = self.speculative.native_mtp_enabled;
+        options.glm_dsa_policy = runtime_glm_dsa_policy(self.generation_policy.as_ref());
         // Pre-compute the package identity so single_stage_config skips the
         // SHA-256 hash. Without this the same hash runs again in
         // SkippyModelHandle::load_with_hooks, doubling I/O (issue #717).
@@ -149,6 +150,7 @@ impl ResolvedSkippyConfig {
             topology: None,
             n_threads: self.throughput.threads,
             n_threads_batch: self.throughput.threads_batch,
+            glm_dsa_policy: runtime_glm_dsa_policy(self.generation_policy.as_ref()),
             metrics_otlp_grpc: telemetry.metrics_otlp_grpc.clone(),
             telemetry_queue_capacity: telemetry.queue_capacity,
             telemetry_level: telemetry.level,
@@ -321,6 +323,25 @@ impl ResolvedSkippyConfig {
             }
         }
     }
+}
+
+fn runtime_glm_dsa_policy(
+    policy: Option<&ResolvedGenerationPolicyConfig>,
+) -> Option<skippy_runtime::GlmDsaPolicyConfig> {
+    let policy = policy?;
+    if policy.profile != "glm-dsa-v1" {
+        return None;
+    }
+
+    let mut runtime_policy = skippy_runtime::GlmDsaPolicyConfig::glm_dsa_v1();
+    runtime_policy.direct_sparse_attn =
+        matches!(policy.decode.as_str(), "compact-flash" | "direct-sparse");
+    runtime_policy.disable_compact_flash_attn = policy.decode != "compact-flash";
+    runtime_policy.direct_sparse_prefill = policy.short_prefill == "direct-sparse";
+    runtime_policy.short_prefill_max_tokens = policy.thresholds.short_prefill_max_tokens;
+    runtime_policy.dense_sparse_mask_max_bytes = policy.thresholds.dense_mask_max_bytes;
+    runtime_policy.compact_flash_min_kv = policy.thresholds.compact_flash_min_kv;
+    Some(runtime_policy)
 }
 
 impl ResolvedEmbeddedOpenAiArgs {

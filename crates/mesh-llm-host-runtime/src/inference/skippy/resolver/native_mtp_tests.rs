@@ -173,6 +173,7 @@ fn resolver_exposes_package_generation_policy() {
 
     let policy = resolved
         .generation_policy
+        .as_ref()
         .expect("package policy should be carried into resolved config");
     assert_eq!(policy.profile, "glm-dsa-v1");
     assert_eq!(policy.decode, "compact-flash");
@@ -184,6 +185,22 @@ fn resolver_exposes_package_generation_policy() {
     assert_eq!(policy.thresholds.short_prefill_max_tokens, Some(2048));
     assert_eq!(policy.thresholds.compact_flash_min_kv, Some(256));
     assert_eq!(policy.thresholds.dense_mask_max_bytes, Some(268435456));
+
+    let runtime_options = resolved
+        .to_embedded_runtime_options(&SkippyTelemetryOptions::off(), None, LoadMode::RuntimeSlice)
+        .expect("GLM-DSA policy should convert into runtime options");
+    let runtime_policy = runtime_options
+        .glm_dsa_policy
+        .expect("GLM-DSA package policy should reach runtime launch options");
+    assert_eq!(
+        runtime_policy.profile,
+        skippy_runtime::GlmDsaPolicyConfig::glm_dsa_v1().profile
+    );
+    assert!(runtime_policy.direct_sparse_attn);
+    assert!(!runtime_policy.direct_sparse_prefill);
+    assert_eq!(runtime_policy.short_prefill_max_tokens, Some(2048));
+    assert_eq!(runtime_policy.compact_flash_min_kv, Some(256));
+    assert_eq!(runtime_policy.dense_sparse_mask_max_bytes, Some(268435456));
 }
 
 #[test]

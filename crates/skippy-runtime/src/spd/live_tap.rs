@@ -375,6 +375,7 @@ fn open_live_stage_model(
         use_mmap: true,
         use_mmap_prefetch: false,
         use_mmap_buffer: true,
+        glm_dsa_policy: None,
     };
     match &config.model_source {
         SpdLiveTapModelSource::Gguf(model_path) => StageModel::open(model_path, &runtime_config)

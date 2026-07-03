@@ -21,6 +21,7 @@ use skippy_runtime::package::SelectedPackageParts;
 pub struct RuntimeLaunchOverrides {
     pub n_threads: Option<usize>,
     pub n_threads_batch: Option<usize>,
+    pub glm_dsa_policy: Option<skippy_runtime::GlmDsaPolicyConfig>,
 }
 
 pub struct RuntimeState {
@@ -1321,6 +1322,7 @@ fn runtime_config_from_stage_config(
         include_embeddings: config.layer_start == 0,
         include_output: config.downstream.is_none(),
         filter_tensors_on_load: config.filter_tensors_on_load,
+        glm_dsa_policy: overrides.glm_dsa_policy.clone(),
     })
 }
 
@@ -1534,6 +1536,12 @@ mod tests {
         let overrides = RuntimeLaunchOverrides {
             n_threads: Some(8),
             n_threads_batch: Some(4),
+            glm_dsa_policy: Some(skippy_runtime::GlmDsaPolicyConfig {
+                short_prefill_max_tokens: Some(2048),
+                dense_sparse_mask_max_bytes: Some(256 * 1024 * 1024),
+                compact_flash_min_kv: Some(256),
+                ..skippy_runtime::GlmDsaPolicyConfig::glm_dsa_v1()
+            }),
         };
 
         let runtime_config = runtime_config_from_stage_config(&config, &overrides).unwrap();
@@ -1547,6 +1555,13 @@ mod tests {
         assert_eq!(runtime_config.n_ubatch, Some(256));
         assert_eq!(runtime_config.n_threads, Some(8));
         assert_eq!(runtime_config.n_threads_batch, Some(4));
+        assert_eq!(
+            runtime_config
+                .glm_dsa_policy
+                .as_ref()
+                .and_then(|policy| policy.short_prefill_max_tokens),
+            Some(2048)
+        );
         assert_eq!(
             runtime_config.flash_attn_type,
             RuntimeFlashAttentionType::Enabled

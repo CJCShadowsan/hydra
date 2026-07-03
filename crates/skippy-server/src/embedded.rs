@@ -63,6 +63,7 @@ pub struct EmbeddedRuntimeOptions {
     pub topology: Option<StageTopology>,
     pub n_threads: Option<usize>,
     pub n_threads_batch: Option<usize>,
+    pub glm_dsa_policy: Option<skippy_runtime::GlmDsaPolicyConfig>,
     pub metrics_otlp_grpc: Option<String>,
     pub telemetry_queue_capacity: usize,
     pub telemetry_level: TelemetryLevel,
@@ -102,6 +103,7 @@ impl SkippyRuntimeHandle {
             &RuntimeLaunchOverrides {
                 n_threads: options.n_threads,
                 n_threads_batch: options.n_threads_batch,
+                glm_dsa_policy: options.glm_dsa_policy,
             },
         )?
         .with_context(|| format!("stage {} requires model_path", options.config.stage_id))?;
@@ -143,6 +145,7 @@ impl SkippyRuntimeHandle {
             &RuntimeLaunchOverrides {
                 n_threads: options.n_threads,
                 n_threads_batch: options.n_threads_batch,
+                glm_dsa_policy: options.glm_dsa_policy,
             },
             model_open_event_reporter.as_mut().map(|reporter| {
                 reporter.as_mut() as &mut (dyn FnMut(skippy_runtime::RuntimeEvent) + Send)

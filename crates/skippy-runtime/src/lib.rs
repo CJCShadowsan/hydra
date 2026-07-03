@@ -47,6 +47,52 @@ pub const SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH: u32 = 1024;
 /// 0=silent, 1=error, 2=warn, 3=info (default), 4=debug.
 pub const LLAMA_LOG_LEVEL_DEBUG: &str = "4";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlmDsaPolicyConfig {
+    pub profile: i32,
+    pub direct_sparse_attn: bool,
+    pub direct_sparse_prefill: bool,
+    pub disable_compact_flash_attn: bool,
+    pub unproven_large_direct_sparse_prefill: bool,
+    pub short_prefill_max_tokens: Option<u32>,
+    pub direct_sparse_decode_max_top_k: Option<u32>,
+    pub dense_sparse_mask_max_bytes: Option<u64>,
+    pub compact_flash_min_kv: Option<u32>,
+}
+
+impl GlmDsaPolicyConfig {
+    pub fn glm_dsa_v1() -> Self {
+        Self {
+            profile: skippy_ffi::GLM_DSA_POLICY_PROFILE_V1,
+            direct_sparse_attn: true,
+            direct_sparse_prefill: false,
+            disable_compact_flash_attn: false,
+            unproven_large_direct_sparse_prefill: false,
+            short_prefill_max_tokens: None,
+            direct_sparse_decode_max_top_k: None,
+            dense_sparse_mask_max_bytes: None,
+            compact_flash_min_kv: None,
+        }
+    }
+
+    fn flags(&self) -> u32 {
+        let mut flags = 0;
+        if self.direct_sparse_attn {
+            flags |= skippy_ffi::GLM_DSA_POLICY_DIRECT_SPARSE_ATTN;
+        }
+        if self.direct_sparse_prefill {
+            flags |= skippy_ffi::GLM_DSA_POLICY_DIRECT_SPARSE_PREFILL;
+        }
+        if self.disable_compact_flash_attn {
+            flags |= skippy_ffi::GLM_DSA_POLICY_DISABLE_COMPACT_FLASH_ATTN;
+        }
+        if self.unproven_large_direct_sparse_prefill {
+            flags |= skippy_ffi::GLM_DSA_POLICY_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL;
+        }
+        flags
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(i32)]
 pub enum FlashAttentionType {
@@ -866,6 +912,7 @@ pub struct RuntimeConfig {
     pub include_embeddings: bool,
     pub include_output: bool,
     pub filter_tensors_on_load: bool,
+    pub glm_dsa_policy: Option<GlmDsaPolicyConfig>,
 }
 
 impl RuntimeConfig {
@@ -961,6 +1008,39 @@ impl RuntimeConfig {
                 include_embeddings: self.include_embeddings,
                 include_output: self.include_output,
                 selected_backend_device: selected_backend_device_ptr,
+                glm_dsa_policy_profile: self
+                    .glm_dsa_policy
+                    .as_ref()
+                    .map(|policy| policy.profile)
+                    .unwrap_or(skippy_ffi::GLM_DSA_POLICY_PROFILE_NONE),
+                glm_dsa_policy_flags: self
+                    .glm_dsa_policy
+                    .as_ref()
+                    .map(GlmDsaPolicyConfig::flags)
+                    .unwrap_or(0),
+                glm_dsa_short_prefill_max_tokens: optional_u32_to_i32(
+                    self.glm_dsa_policy
+                        .as_ref()
+                        .and_then(|policy| policy.short_prefill_max_tokens),
+                    "glm_dsa_short_prefill_max_tokens",
+                )?,
+                glm_dsa_direct_sparse_decode_max_top_k: optional_u32_to_i32(
+                    self.glm_dsa_policy
+                        .as_ref()
+                        .and_then(|policy| policy.direct_sparse_decode_max_top_k),
+                    "glm_dsa_direct_sparse_decode_max_top_k",
+                )?,
+                glm_dsa_dense_sparse_mask_max_bytes: self
+                    .glm_dsa_policy
+                    .as_ref()
+                    .and_then(|policy| policy.dense_sparse_mask_max_bytes)
+                    .unwrap_or(0),
+                glm_dsa_compact_flash_min_kv: optional_u32_to_i32(
+                    self.glm_dsa_policy
+                        .as_ref()
+                        .and_then(|policy| policy.compact_flash_min_kv),
+                    "glm_dsa_compact_flash_min_kv",
+                )?,
             },
             _selected_backend_device: selected_backend_device,
         })
@@ -972,7 +1052,7 @@ impl RuntimeConfig {
             .unwrap_or_else(|| default_n_batch_for_lane_count(self.lane_count));
         let n_ubatch = self.n_ubatch.unwrap_or(LLAMA_SERVER_DEFAULT_N_UBATCH);
         format!(
-            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} use_mmap={} use_mmap_prefetch={} use_mmap_buffer={} include_embeddings={} include_output={} filter_tensors_on_load={}",
+            "stage_index={} layers={}..{} ctx={} lanes={} n_batch={} n_ubatch={} n_gpu_layers={} backend={} cache_k={} cache_v={} flash_attn={:?} load_mode={:?} use_mmap={} use_mmap_prefetch={} use_mmap_buffer={} include_embeddings={} include_output={} filter_tensors_on_load={} glm_dsa_policy={}",
             self.stage_index,
             self.layer_start,
             self.layer_end,
@@ -992,8 +1072,20 @@ impl RuntimeConfig {
             self.include_embeddings,
             self.include_output,
             self.filter_tensors_on_load,
+            self.glm_dsa_policy
+                .as_ref()
+                .map(|policy| policy.profile.to_string())
+                .unwrap_or_else(|| "none".to_string()),
         )
     }
+}
+
+fn optional_u32_to_i32(value: Option<u32>, field: &'static str) -> Result<i32> {
+    value
+        .map(i32::try_from)
+        .transpose()
+        .with_context(|| format!("{field} exceeds i32"))?
+        .map_or(Ok(0), Ok)
 }
 
 fn default_n_batch_for_lane_count(lane_count: u32) -> u32 {
@@ -1034,6 +1126,7 @@ impl Default for RuntimeConfig {
             include_embeddings: true,
             include_output: true,
             filter_tensors_on_load: false,
+            glm_dsa_policy: None,
         }
     }
 }
@@ -4509,6 +4602,7 @@ mod tests {
             use_mmap: true,
             use_mmap_prefetch: false,
             use_mmap_buffer: false,
+            glm_dsa_policy: None,
         };
         StageModel::open(model_path, &config)
     }

@@ -1,9 +1,17 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 30;
+pub const ABI_VERSION_PATCH: u32 = 31;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
+
+pub const GLM_DSA_POLICY_PROFILE_NONE: i32 = 0;
+pub const GLM_DSA_POLICY_PROFILE_V1: i32 = 1;
+
+pub const GLM_DSA_POLICY_DIRECT_SPARSE_ATTN: u32 = 1 << 0;
+pub const GLM_DSA_POLICY_DIRECT_SPARSE_PREFILL: u32 = 1 << 1;
+pub const GLM_DSA_POLICY_DISABLE_COMPACT_FLASH_ATTN: u32 = 1 << 2;
+pub const GLM_DSA_POLICY_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL: u32 = 1 << 3;
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -201,6 +209,12 @@ pub struct RuntimeConfig {
     pub include_embeddings: bool,
     pub include_output: bool,
     pub selected_backend_device: *const c_char,
+    pub glm_dsa_policy_profile: i32,
+    pub glm_dsa_policy_flags: u32,
+    pub glm_dsa_short_prefill_max_tokens: i32,
+    pub glm_dsa_direct_sparse_decode_max_top_k: i32,
+    pub glm_dsa_dense_sparse_mask_max_bytes: u64,
+    pub glm_dsa_compact_flash_min_kv: i32,
 }
 
 #[repr(C)]
