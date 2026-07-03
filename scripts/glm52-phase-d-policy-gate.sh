@@ -242,9 +242,9 @@ if [[ "$QUICK" != "1" ]]; then
     --tokens 1 \
     --position-start 1024 \
     --kv-warmup-tokens 1024 \
-    --kv-warmup-chunk-tokens 128 \
-    --n-batch 128 \
-    --n-ubatch 128
+    --kv-warmup-chunk-tokens 1024 \
+    --n-batch 1024 \
+    --n-ubatch 1024
 
   run_case verification-like-suffix prefill direct_sparse prefill short_prefill 0 \
     --layer-start 30 \
