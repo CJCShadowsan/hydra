@@ -148,6 +148,7 @@ run_decode_case() {
       --out-dir "$case_dir" \
       --iterations "$ITERATIONS" \
       --warmup "$WARMUP" \
+      --skip-native-indexshare-poison \
       "${require_args[@]}" \
       "$@" \
       >"$case_dir/stdout.txt" \

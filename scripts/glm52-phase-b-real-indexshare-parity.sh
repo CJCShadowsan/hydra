@@ -33,6 +33,7 @@ DIRECT_SPARSE_PREFILL_MAX_TOKENS="${DIRECT_SPARSE_PREFILL_MAX_TOKENS:-}"
 DENSE_SPARSE_MASK_MAX_BYTES="${DENSE_SPARSE_MASK_MAX_BYTES:-}"
 REQUIRE_DIRECT_SPARSE_DECODE_PROOF="${REQUIRE_DIRECT_SPARSE_DECODE_PROOF:-0}"
 REQUIRE_DIRECT_SPARSE_PREFILL_PROOF="${REQUIRE_DIRECT_SPARSE_PREFILL_PROOF:-0}"
+SKIP_NATIVE_INDEXSHARE_POISON="${SKIP_NATIVE_INDEXSHARE_POISON:-0}"
 SPARSE_ATTN_THREADS="${SPARSE_ATTN_THREADS:-}"
 SPARSE_ATTN_GROUP_HEADS="${SPARSE_ATTN_GROUP_HEADS:-}"
 METAL_DISPATCH_LOG="${METAL_DISPATCH_LOG:-0}"
@@ -97,6 +98,10 @@ Options:
                            Set the dense sparse-mask byte guard threshold.
   --require-direct-sparse-prefill-proof
                            Fail unless direct sparse prefill avoids sparse-mask nodes and dispatches DSA sparse attention.
+  --skip-native-indexshare-poison
+                           Skip the poison/sensitivity leg. Use this for
+                           Phase-C decode/compact gates after Phase-B sideband
+                           sensitivity has already been proven.
   --sparse-attn-threads N  Set SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS for candidate runs.
   --sparse-attn-group-heads N
                            Set SKIPPY_GLM_DSA_SPARSE_ATTN_DECODE_GROUP_HEADS for candidate runs.
@@ -259,6 +264,10 @@ while [[ $# -gt 0 ]]; do
       METAL_DISPATCH_LOG=1
       shift
       ;;
+    --skip-native-indexshare-poison)
+      SKIP_NATIVE_INDEXSHARE_POISON=1
+      shift
+      ;;
     --sparse-attn-threads)
       SPARSE_ATTN_THREADS="$2"
       shift 2
@@ -410,6 +419,9 @@ fi
 if [[ "$REQUIRE_DIRECT_SPARSE_PREFILL_PROOF" == "1" ]]; then
   BENCH_ARGS+=(--require-direct-sparse-prefill-proof)
 fi
+if [[ "$SKIP_NATIVE_INDEXSHARE_POISON" == "1" ]]; then
+  BENCH_ARGS+=(--skip-native-indexshare-poison)
+fi
 if [[ -n "$SPARSE_ATTN_THREADS" ]]; then
   BENCH_ARGS+=(--sparse-attn-threads "$SPARSE_ATTN_THREADS")
 fi
@@ -430,6 +442,7 @@ if [[ "$COMPACT_FLASH_NO_MASK" == "1" ]]; then
   export SKIPPY_GLM_DSA_ENABLE_COMPACT_FLASH_NO_MASK=1
 fi
 export GLM52_EXPECT_COMPACT_FLASH_NO_MASK="$COMPACT_FLASH_NO_MASK"
+export GLM52_SKIP_NATIVE_INDEXSHARE_POISON="$SKIP_NATIVE_INDEXSHARE_POISON"
 
 "$SKIPPY_BENCH_BIN" "${BENCH_ARGS[@]}" \
   >"$LOG" 2>&1
@@ -457,6 +470,7 @@ candidate_timing = candidate.get("timing_summary") or {}
 compact_guard = report.get("compact_flash_guard")
 direct_decode_guard = report.get("direct_sparse_decode_guard")
 expect_compact_no_mask = os.environ.get("GLM52_EXPECT_COMPACT_FLASH_NO_MASK") == "1"
+skip_native_indexshare_poison = os.environ.get("GLM52_SKIP_NATIVE_INDEXSHARE_POISON") == "1"
 
 def walk_dicts(obj):
     if isinstance(obj, dict):
@@ -483,9 +497,9 @@ def candidate_metal_records():
 failures = []
 if not parity.get("passed"):
     failures.append(f"parity failed: {parity}")
-if not sensitivity.get("passed"):
+if not skip_native_indexshare_poison and not sensitivity.get("passed"):
     failures.append(f"sideband sensitivity proof failed: {sensitivity}")
-if sensitivity.get("poisoned_hidden_mismatches", 0) < 1 and sensitivity.get("poisoned_hidden_max_abs_diff", 0) == 0:
+if not skip_native_indexshare_poison and sensitivity.get("poisoned_hidden_mismatches", 0) < 1 and sensitivity.get("poisoned_hidden_max_abs_diff", 0) == 0:
     failures.append(f"poisoned sideband did not change hidden output: {sensitivity}")
 if parity.get("hidden_mismatches") not in (0, None):
     failures.append(f"hidden mismatches present: {parity}")
@@ -547,8 +561,11 @@ print(f"report={report_path}")
 print(f"full_layers={guard.get('full_layers')}")
 print(f"shared_layers={guard.get('shared_layers')}")
 print(f"shared_exec_with_input_top_k={guard.get('shared_exec_with_input_top_k')}")
-print(f"sideband_sensitivity={sensitivity.get('passed')}")
-print(f"sideband_poison_changed_i32={((sensitivity.get('poison') or {}).get('changed_i32_count'))}")
+if skip_native_indexshare_poison:
+    print("sideband_sensitivity=skipped")
+else:
+    print(f"sideband_sensitivity={sensitivity.get('passed')}")
+    print(f"sideband_poison_changed_i32={((sensitivity.get('poison') or {}).get('changed_i32_count'))}")
 print(f"candidate_indexer_topk_nodes={candidate_ops.get('indexer_topk', {}).get('nodes')}")
 print(f"candidate_sparse_mask_nodes={candidate_ops.get('sparse_mask', {}).get('nodes')}")
 if compact_guard is not None:
