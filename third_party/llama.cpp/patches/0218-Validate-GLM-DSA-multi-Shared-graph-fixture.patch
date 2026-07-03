@@ -1,0 +1,114 @@
+From 76ac7d50821c8e875512f4615cddb7dc0db2af5b Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 09:03:38 +1000
+Subject: [PATCH 218/218] Validate GLM DSA multi Shared graph fixture
+
+---
+ tests/test-llama-archs.cpp | 44 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 6c3c863e6..ae250f28e 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -82,6 +82,7 @@ enum class glm_dsa_indexshare_fixture {
+     CONFLICTING_METADATA,
+     SHARED_FIRST,
+     FULL_SHARED,
++    FULL_SHARED_SHARED,
+ };
+ 
+ static gguf_context_ptr get_gguf_ctx(
+@@ -117,6 +118,9 @@ static gguf_context_ptr get_gguf_ctx(
+         n_embd = 128;
+         n_head = 1;
+         n_ff   = 192;
++        if (arch == LLM_ARCH_GLM_DSA && glm_dsa_indexshare == glm_dsa_indexshare_fixture::FULL_SHARED_SHARED) {
++            n_layer = 3;
++        }
+     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+         n_layer = 3;
+     } else if (arch == LLM_ARCH_CHAMELEON) {
+@@ -220,6 +224,10 @@ static gguf_context_ptr get_gguf_ctx(
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(2));
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(1));
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared"}));
++        } else if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::FULL_SHARED_SHARED) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(3));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared", "shared"}));
+         } else {
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(1));
+             ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(0));
+@@ -391,13 +399,16 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+     return std::make_pair(std::move(model), std::move(lctx));
+ }
+ 
+-static bool test_glm_dsa_full_shared_indexshare_graph(
+-        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++static bool test_glm_dsa_indexshare_graph(
++        const size_t seed,
++        const std::vector<ggml_backend_dev_t> & devs,
++        const glm_dsa_indexshare_fixture fixture,
++        const char * label) {
+     try {
+         gguf_context_ptr gguf_ctx = get_gguf_ctx(
+                 LLM_ARCH_GLM_DSA,
+                 true,
+-                glm_dsa_indexshare_fixture::FULL_SHARED);
++                fixture);
+         glm_dsa_graph_op_counts counts;
+         auto model_ctx = get_model_and_ctx(
+                 gguf_ctx.get(),
+@@ -414,17 +425,35 @@ static bool test_glm_dsa_full_shared_indexshare_graph(
+         get_logits(model_ctx.first.get(), model_ctx.second.get(), tokens, false);
+ 
+         if (counts.top_k != 1 || counts.lightning_indexer != 1) {
+-            fprintf(stderr, "GLM_DSA Full->Shared graph counted top_k=%d lightning_indexer=%d\n",
+-                    counts.top_k, counts.lightning_indexer);
++            fprintf(stderr, "GLM_DSA %s graph counted top_k=%d lightning_indexer=%d\n",
++                    label, counts.top_k, counts.lightning_indexer);
+             return false;
+         }
+         return true;
+     } catch (const std::exception & err) {
+-        fprintf(stderr, "GLM_DSA Full->Shared graph test failed: %s\n", err.what());
++        fprintf(stderr, "GLM_DSA %s graph test failed: %s\n", label, err.what());
+         return false;
+     }
+ }
+ 
++static bool test_glm_dsa_full_shared_indexshare_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    return test_glm_dsa_indexshare_graph(
++            seed,
++            devs,
++            glm_dsa_indexshare_fixture::FULL_SHARED,
++            "Full->Shared");
++}
++
++static bool test_glm_dsa_full_shared_shared_indexshare_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    return test_glm_dsa_indexshare_graph(
++            seed,
++            devs,
++            glm_dsa_indexshare_fixture::FULL_SHARED_SHARED,
++            "Full->Shared->Shared");
++}
++
+ static std::vector<float> get_logits(
+         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+@@ -693,7 +722,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+         const bool glm_dsa_contract_ok =
+                 test_glm_dsa_rejects_conflicting_indexshare_metadata(seed) &&
+                 test_glm_dsa_rejects_shared_first_indexshare_metadata(seed) &&
+-                test_glm_dsa_full_shared_indexshare_graph(seed, {});
++                test_glm_dsa_full_shared_indexshare_graph(seed, {}) &&
++                test_glm_dsa_full_shared_shared_indexshare_graph(seed, {});
+         if (!glm_dsa_contract_ok) {
+             fprintf(stderr, "GLM_DSA IndexShare metadata contract test failed\n");
+             all_ok = false;
+-- 
+2.53.0
+
