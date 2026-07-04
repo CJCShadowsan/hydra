@@ -111,6 +111,7 @@ struct BackendEvidenceSummary {
     metal_dispatch_ops: BTreeMap<String, usize>,
     metal_compact_get_rows_records: usize,
     metal_compact_flash_no_mask_records: usize,
+    support: BackendSupportSummary,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -118,6 +119,16 @@ struct BackendComputeBufferDeviceSummary {
     records: usize,
     mismatched_records: usize,
     max_size_mib: f64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct BackendSupportSummary {
+    cpu_compute_observed: bool,
+    metal_runtime_observed: bool,
+    metal_compute_observed: bool,
+    metal_dispatch_observed: bool,
+    metal_compact_dispatch_observed: bool,
+    cuda_observed: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -676,6 +687,9 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         if args.require_metal_compact_dispatch {
             require_metal_compact_dispatch(path, &summary)?;
         }
+        if args.require_local_apple_backend_matrix {
+            require_local_apple_backend_matrix(path, &summary)?;
+        }
         logs.push(summary);
     }
     Ok(GlmDsaOpReport { logs })
@@ -1193,6 +1207,39 @@ fn require_metal_compact_dispatch(path: &Path, summary: &LogSummary) -> Result<(
         path.display(),
         missing.join(","),
         backend
+    )
+}
+
+fn require_local_apple_backend_matrix(path: &Path, summary: &LogSummary) -> Result<()> {
+    let support = &summary.backend.support;
+    let mut missing = Vec::new();
+    if !support.cpu_compute_observed {
+        missing.push("cpu_compute_observed");
+    }
+    if !support.metal_runtime_observed {
+        missing.push("metal_runtime_observed");
+    }
+    if !support.metal_compute_observed {
+        missing.push("metal_compute_observed");
+    }
+    if !support.metal_dispatch_observed {
+        missing.push("metal_dispatch_observed");
+    }
+    if !support.metal_compact_dispatch_observed {
+        missing.push("metal_compact_dispatch_observed");
+    }
+    if support.cuda_observed {
+        missing.push("cuda_absent_on_local_apple");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} does not prove the local Apple backend support matrix; missing {}; backend={:?}",
+        path.display(),
+        missing.join(","),
+        summary.backend
     )
 }
 
@@ -1910,7 +1957,22 @@ fn summarize_backend_evidence(
             summary.metal_compact_flash_no_mask_records += 1;
         }
     }
+    summary.support = summarize_backend_support(&summary);
     summary
+}
+
+fn summarize_backend_support(summary: &BackendEvidenceSummary) -> BackendSupportSummary {
+    BackendSupportSummary {
+        cpu_compute_observed: summary.compute_buffer_devices.contains_key("CPU"),
+        metal_runtime_observed: summary.metal_device_init_records > 0
+            && summary.metal_init_records > 0
+            && !summary.metal_device_names.is_empty(),
+        metal_compute_observed: summary.compute_buffer_devices.contains_key("MTL0"),
+        metal_dispatch_observed: summary.metal_dispatch_records > 0,
+        metal_compact_dispatch_observed: summary.metal_compact_get_rows_records > 0
+            && summary.metal_compact_flash_no_mask_records > 0,
+        cuda_observed: summary.cuda_records > 0,
+    }
 }
 
 fn is_metal_compact_get_rows(record: &MetalDispatchRecord) -> bool {
@@ -2456,9 +2518,9 @@ mod tests {
         parse_sideband_records, parse_timing_group_records, parse_timing_record,
         parse_timing_records, require_compact_decode_policy_evidence,
         require_compact_decode_without_sparse_mask, require_glm52_runtime_contract,
-        require_indexshare_producer_consumer_trace, require_local_backend_evidence,
-        require_metal_compact_dispatch, summarize_backend_evidence, summarize_comparison_rows,
-        summarize_log,
+        require_indexshare_producer_consumer_trace, require_local_apple_backend_matrix,
+        require_local_backend_evidence, require_metal_compact_dispatch, summarize_backend_evidence,
+        summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -2872,6 +2934,12 @@ llama_context: n_ctx_seq     = 256";
         assert_eq!(backend.metal_dispatch_records, 1);
         assert_eq!(backend.metal_dispatch_ops.get("dsa_sparse_attn"), Some(&1));
         assert_eq!(backend.cuda_records, 0);
+        assert!(backend.support.cpu_compute_observed);
+        assert!(backend.support.metal_runtime_observed);
+        assert!(backend.support.metal_compute_observed);
+        assert!(backend.support.metal_dispatch_observed);
+        assert!(!backend.support.metal_compact_dispatch_observed);
+        assert!(!backend.support.cuda_observed);
     }
 
     #[test]
@@ -2894,6 +2962,7 @@ llama_context: n_ctx_seq     = 256";
         assert_eq!(backend.metal_dispatch_ops.get("flash_attn_ext"), Some(&1));
         assert_eq!(backend.metal_compact_get_rows_records, 1);
         assert_eq!(backend.metal_compact_flash_no_mask_records, 1);
+        assert!(backend.support.metal_compact_dispatch_observed);
     }
 
     #[test]
@@ -2919,6 +2988,61 @@ llama_context: n_ctx_seq     = 256";
         );
 
         require_metal_compact_dispatch(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn accepts_local_apple_backend_matrix_guard() {
+        let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
+        let runtime_contract = parse_runtime_contract_summary(BACKEND_EVIDENCE_LINES);
+        let compute_buffers = parse_compute_buffer_records(BACKEND_EVIDENCE_LINES).unwrap();
+        let metal_dispatch = parse_metal_dispatch_records(&format!(
+            "{METAL_COMPACT_GET_ROWS_LINE}\n{METAL_COMPACT_FLASH_NO_MASK_LINE}"
+        ))
+        .unwrap();
+        let backend = summarize_backend_evidence(
+            BACKEND_EVIDENCE_LINES,
+            &runtime_contract,
+            &compute_buffers,
+            &metal_dispatch,
+        );
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing)
+                .with_runtime_contract(&runtime_contract)
+                .with_backend(&backend),
+        );
+
+        require_local_apple_backend_matrix(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn rejects_local_apple_backend_matrix_guard_without_compact_metal() {
+        let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
+        let runtime_contract = parse_runtime_contract_summary(BACKEND_EVIDENCE_LINES);
+        let compute_buffers = parse_compute_buffer_records(BACKEND_EVIDENCE_LINES).unwrap();
+        let metal_dispatch = parse_metal_dispatch_records(METAL_DISPATCH_LINE).unwrap();
+        let backend = summarize_backend_evidence(
+            BACKEND_EVIDENCE_LINES,
+            &runtime_contract,
+            &compute_buffers,
+            &metal_dispatch,
+        );
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing)
+                .with_runtime_contract(&runtime_contract)
+                .with_backend(&backend),
+        );
+
+        let error =
+            require_local_apple_backend_matrix(Path::new("stage1.log"), &summary).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("metal_compact_dispatch_observed"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

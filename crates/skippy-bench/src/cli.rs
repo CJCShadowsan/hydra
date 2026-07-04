@@ -211,6 +211,11 @@ pub struct GlmDsaOpReportArgs {
         help = "Fail unless Metal dispatch logs prove compact top-k get_rows plus no-mask flash attention."
     )]
     pub require_metal_compact_dispatch: bool,
+    #[arg(
+        long,
+        help = "Fail unless the local Apple backend matrix proves CPU compute, Metal runtime/compute/compact dispatch, and no CUDA backend evidence."
+    )]
+    pub require_local_apple_backend_matrix: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
