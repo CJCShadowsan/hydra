@@ -186,6 +186,11 @@ pub struct GlmDsaOpReportArgs {
         help = "Fail unless IndexShare trace proves Full producer top-k generation and Shared consumer reuse."
     )]
     pub require_indexshare_producer_consumer: bool,
+    #[arg(
+        long,
+        help = "Fail unless every decode stage uses compact K/V gather and has zero sparse-mask nodes."
+    )]
+    pub require_compact_decode_no_sparse_mask: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }

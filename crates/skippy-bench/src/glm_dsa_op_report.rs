@@ -498,6 +498,9 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         if args.require_indexshare_producer_consumer {
             require_indexshare_producer_consumer_trace(path, &summary)?;
         }
+        if args.require_compact_decode_no_sparse_mask {
+            require_compact_decode_without_sparse_mask(path, &summary)?;
+        }
         logs.push(summary);
     }
     Ok(GlmDsaOpReport { logs })
@@ -765,6 +768,54 @@ fn require_indexshare_producer_consumer_trace(path: &Path, summary: &LogSummary)
         missing.join(","),
         trace
     )
+}
+
+fn require_compact_decode_without_sparse_mask(path: &Path, summary: &LogSummary) -> Result<()> {
+    let mut failures = Vec::new();
+    let mut decode_stages = 0usize;
+    for (stage, phases) in &summary.stage_records {
+        let Some(decode) = phases.get(&Phase::Decode) else {
+            continue;
+        };
+        decode_stages += 1;
+        let compact_nodes = optional_nodes(&decode.compact_get_rows);
+        let sparse_breakdown_nodes = optional_nodes(&decode.sparse_mask_fill)
+            + optional_nodes(&decode.sparse_mask_topk)
+            + optional_nodes(&decode.sparse_mask_add);
+        if compact_nodes == 0 {
+            failures.push(format!("stage {stage}: missing compact_get_rows"));
+        }
+        if decode.sparse_mask.nodes != 0 || decode.sparse_mask.elapsed_us != 0 {
+            failures.push(format!(
+                "stage {stage}: sparse_mask nodes={} us={}",
+                decode.sparse_mask.nodes, decode.sparse_mask.elapsed_us
+            ));
+        }
+        if sparse_breakdown_nodes != 0 {
+            failures.push(format!(
+                "stage {stage}: sparse_mask breakdown nodes={sparse_breakdown_nodes}"
+            ));
+        }
+        if optional_nodes(&decode.dsa_sparse_attn) != 0 {
+            failures.push(format!("stage {stage}: direct sparse attention selected"));
+        }
+    }
+    if decode_stages == 0 {
+        failures.push("no decode stage records".to_string());
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} does not prove compact GLM-DSA decode without dense sparse-mask materialization; {}",
+        path.display(),
+        failures.join("; ")
+    )
+}
+
+fn optional_nodes(bucket: &Option<OpBucket>) -> u64 {
+    bucket.as_ref().map_or(0, |bucket| bucket.nodes)
 }
 
 pub(crate) fn parse_timing_records(text: &str) -> Result<Vec<TimingRecord>> {
@@ -1716,7 +1767,8 @@ mod tests {
         parse_indexshare_contract_records, parse_indexshare_trace_records,
         parse_metal_dispatch_records, parse_sideband_record, parse_sideband_records,
         parse_timing_group_records, parse_timing_record, parse_timing_records,
-        require_indexshare_producer_consumer_trace, summarize_comparison_rows, summarize_log,
+        require_compact_decode_without_sparse_mask, require_indexshare_producer_consumer_trace,
+        summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -1724,6 +1776,7 @@ mod tests {
     const LINE_WITH_SPARSE_BREAKDOWN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 sparse_mask_fill_nodes=47 sparse_mask_fill_us=1000 sparse_mask_topk_nodes=47 sparse_mask_topk_us=2000 sparse_mask_add_nodes=47 sparse_mask_add_us=3000 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const LINE_WITH_DSA_SPARSE_ATTN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=0 sparse_mask_us=0 dsa_sparse_attn_nodes=47 dsa_sparse_attn_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const LINE_WITH_COMPACT_GET_ROWS: &str = "skippy: glm_dsa_op_timing stage=1 tokens=1 total_us=24000 indexer_topk_nodes=0 indexer_topk_us=0 sparse_mask_nodes=0 sparse_mask_us=0 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 compact_get_rows_nodes=6 compact_get_rows_us=900 mla_attention_nodes=3 mla_attention_us=2100 routed_moe_nodes=54 routed_moe_us=18000 shared_expert_nodes=12 shared_expert_us=3000";
+    const DECODE_LINE_WITH_SPARSE_MASK: &str = "skippy: glm_dsa_op_timing stage=1 tokens=1 total_us=24000 indexer_topk_nodes=0 indexer_topk_us=0 sparse_mask_nodes=6 sparse_mask_us=900 sparse_mask_fill_nodes=2 sparse_mask_fill_us=700 sparse_mask_topk_nodes=4 sparse_mask_topk_us=200 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 compact_get_rows_nodes=0 compact_get_rows_us=0 mla_attention_nodes=3 mla_attention_us=2100 routed_moe_nodes=54 routed_moe_us=18000 shared_expert_nodes=12 shared_expert_us=3000";
     const GROUP_LINE_LAYER_0: &str = "skippy: glm_dsa_group_timing stage=1 tokens=128 group=layer_0 total_us=600000 indexer_topk_nodes=100 indexer_topk_us=50000 indexer_nodes=80 indexer_us=30000 top_k_nodes=20 top_k_us=20000 sparse_mask_nodes=40 sparse_mask_us=1000 sparse_mask_fill_nodes=0 sparse_mask_fill_us=0 sparse_mask_topk_nodes=40 sparse_mask_topk_us=1000 sparse_mask_add_nodes=0 sparse_mask_add_us=0 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 mla_attention_nodes=1 mla_attention_us=9000 routed_moe_nodes=0 routed_moe_us=0 shared_expert_nodes=0 shared_expert_us=0";
     const GROUP_LINE_LAYER_1: &str = "skippy: glm_dsa_group_timing stage=1 tokens=128 group=layer_1 total_us=875800 indexer_topk_nodes=175 indexer_topk_us=79065 indexer_nodes=155 indexer_us=50000 top_k_nodes=20 top_k_us=29065 sparse_mask_nodes=195 sparse_mask_us=113543 sparse_mask_fill_nodes=47 sparse_mask_fill_us=1000 sparse_mask_topk_nodes=47 sparse_mask_topk_us=2000 sparse_mask_add_nodes=47 sparse_mask_add_us=3000 dsa_sparse_attn_nodes=0 dsa_sparse_attn_us=0 mla_attention_nodes=46 mla_attention_us=26234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const SIDEBAND_LINE: &str = "skippy: glm_dsa_top_k_sideband_forward stage=stage-0 request=1 session=2 kind=DecodeEmbd pos_start=718 tokens=1 hidden_bytes=24576 sideband_bytes=3072 sideband_i32=768";
@@ -2189,6 +2242,28 @@ mod tests {
 
         assert!(
             error.to_string().contains("shared_exec"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn accepts_compact_decode_without_sparse_mask_guard() {
+        let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
+        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &[], &[]);
+
+        require_compact_decode_without_sparse_mask(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn rejects_compact_decode_guard_when_sparse_mask_is_present() {
+        let timing = parse_timing_records(DECODE_LINE_WITH_SPARSE_MASK).unwrap();
+        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &[], &[]);
+
+        let error = require_compact_decode_without_sparse_mask(Path::new("stage1.log"), &summary)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("sparse_mask"),
             "unexpected error: {error:#}"
         );
     }
