@@ -99,6 +99,8 @@ enum Command {
         verify_sha256: bool,
     },
     GlmDsaContract {
+        #[arg(long)]
+        require_generation_policy: bool,
         path: PathBuf,
     },
     RepairGlmDsaIndexshareMetadata {
@@ -477,7 +479,10 @@ fn main() -> Result<()> {
             stages,
             verify_sha256,
         } => run_preflight(package, stages, verify_sha256),
-        Command::GlmDsaContract { path } => run_glm_dsa_contract(path),
+        Command::GlmDsaContract {
+            require_generation_policy,
+            path,
+        } => run_glm_dsa_contract(path, require_generation_policy),
         Command::RepairGlmDsaIndexshareMetadata { package, in_place } => {
             repair_glm_dsa_indexshare_metadata(package, in_place)
         }
@@ -1106,8 +1111,13 @@ fn run_preflight(package: PathBuf, stages: Option<usize>, verify_sha256: bool) -
     Ok(())
 }
 
-fn run_glm_dsa_contract(path: PathBuf) -> Result<()> {
-    let report = glm_dsa_contract::validate_path(&path)?;
+fn run_glm_dsa_contract(path: PathBuf, require_generation_policy: bool) -> Result<()> {
+    let report = glm_dsa_contract::validate_path_with_options(
+        &path,
+        glm_dsa_contract::GlmDsaContractOptions {
+            require_generation_policy,
+        },
+    )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     if !report.valid {
         bail!("GLM-DSA contract validation failed");

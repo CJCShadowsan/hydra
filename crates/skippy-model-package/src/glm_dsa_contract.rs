@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use model_ref::split_gguf_shard_info;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use skippy_runtime::ModelInfo;
 
 const MAX_GGUF_STRING_BYTES: u64 = 1_000_000;
@@ -82,6 +82,22 @@ const NEXTN_TENSORS: &[&str] = &[
     "nextn.hnorm.weight",
 ];
 
+const GLM_DSA_POLICY_PROFILE: &str = "glm-dsa-v1";
+const GLM_DSA_POLICY_DECODE: &str = "compact-flash";
+const GLM_DSA_POLICY_SHORT_PREFILL: &str = "dense";
+const GLM_DSA_POLICY_LONG_PREFILL: &str = "sparse-chunked";
+const GLM_DSA_POLICY_VERIFY: &str = "auto";
+const GLM_DSA_POLICY_INDEXSHARE: &str = "required";
+const GLM_DSA_POLICY_SELECTED_ROW_FLASH: &str = "evidence-gated";
+const GLM_DSA_SHORT_PREFILL_MAX_TOKENS: u32 = 2048;
+const GLM_DSA_COMPACT_FLASH_MIN_KV: u32 = 1;
+const GLM_DSA_DENSE_MASK_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GlmDsaContractOptions {
+    pub(crate) require_generation_policy: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct GlmDsaContractReport {
     pub(crate) valid: bool,
@@ -96,9 +112,32 @@ pub(crate) struct GlmDsaContractReport {
     pub(crate) role_source: Option<String>,
     pub(crate) full_layers: Vec<u32>,
     pub(crate) shared_layers: Vec<u32>,
+    pub(crate) generation_policy_required: bool,
+    pub(crate) generation_policy: Option<GlmDsaGenerationPolicyReport>,
+    pub(crate) generation_thresholds: Option<GlmDsaGenerationThresholdReport>,
     pub(crate) metadata_errors: Vec<String>,
     pub(crate) tensor_errors: Vec<String>,
+    pub(crate) generation_policy_errors: Vec<String>,
+    pub(crate) generation_threshold_errors: Vec<String>,
     pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GlmDsaGenerationPolicyReport {
+    pub(crate) profile: String,
+    pub(crate) decode: String,
+    pub(crate) short_prefill: String,
+    pub(crate) long_prefill: String,
+    pub(crate) verify: String,
+    pub(crate) indexshare: Option<String>,
+    pub(crate) selected_row_flash: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GlmDsaGenerationThresholdReport {
+    pub(crate) short_prefill_max_tokens: Option<u32>,
+    pub(crate) compact_flash_min_kv: Option<u32>,
+    pub(crate) dense_mask_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +156,50 @@ struct ContractInput {
     gguf_files: Vec<String>,
     metadata: GgufMetadata,
     tensors: BTreeSet<String>,
+    generation: Option<PackageGeneration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageManifest {
+    #[serde(default)]
+    generation: Option<PackageGeneration>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageGeneration {
+    #[serde(default)]
+    policy: Option<PackageGenerationPolicy>,
+    #[serde(default)]
+    thresholds: Option<PackageGenerationThresholds>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageGenerationPolicy {
+    profile: String,
+    decode: String,
+    short_prefill: String,
+    long_prefill: String,
+    verify: String,
+    #[serde(default)]
+    indexshare: Option<String>,
+    #[serde(default)]
+    experimental: Option<PackageGenerationExperimentalPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageGenerationExperimentalPolicy {
+    #[serde(default)]
+    selected_row_flash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageGenerationThresholds {
+    #[serde(default)]
+    short_prefill_max_tokens: Option<u32>,
+    #[serde(default)]
+    compact_flash_min_kv: Option<u32>,
+    #[serde(default)]
+    dense_mask_max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +209,13 @@ enum IndexShareRole {
 }
 
 pub(crate) fn validate_path(path: &Path) -> Result<GlmDsaContractReport> {
+    validate_path_with_options(path, GlmDsaContractOptions::default())
+}
+
+pub(crate) fn validate_path_with_options(
+    path: &Path,
+    options: GlmDsaContractOptions,
+) -> Result<GlmDsaContractReport> {
     let files = collect_gguf_files(path)?;
     ensure!(
         !files.is_empty(),
@@ -155,8 +245,9 @@ pub(crate) fn validate_path(path: &Path) -> Result<GlmDsaContractReport> {
             .collect(),
         metadata,
         tensors,
+        generation: read_package_generation(path)?,
     };
-    Ok(validate_contract(input))
+    Ok(validate_contract(input, options))
 }
 
 fn artifact_kind(path: &Path) -> &'static str {
@@ -171,7 +262,7 @@ fn artifact_kind(path: &Path) -> &'static str {
     }
 }
 
-fn validate_contract(input: ContractInput) -> GlmDsaContractReport {
+fn validate_contract(input: ContractInput, options: GlmDsaContractOptions) -> GlmDsaContractReport {
     let mut report = GlmDsaContractReport {
         valid: false,
         path: input.path,
@@ -190,15 +281,200 @@ fn validate_contract(input: ContractInput) -> GlmDsaContractReport {
         role_source: None,
         full_layers: Vec::new(),
         shared_layers: Vec::new(),
+        generation_policy_required: options.require_generation_policy,
+        generation_policy: None,
+        generation_thresholds: None,
         metadata_errors: Vec::new(),
         tensor_errors: Vec::new(),
+        generation_policy_errors: Vec::new(),
+        generation_threshold_errors: Vec::new(),
         warnings: Vec::new(),
     };
 
     validate_metadata(&input.metadata, &mut report);
     validate_tensors(&input.metadata, &input.tensors, &mut report);
-    report.valid = report.metadata_errors.is_empty() && report.tensor_errors.is_empty();
+    validate_generation_policy(input.generation.as_ref(), options, &mut report);
+    report.valid = report.metadata_errors.is_empty()
+        && report.tensor_errors.is_empty()
+        && report.generation_policy_errors.is_empty()
+        && report.generation_threshold_errors.is_empty();
     report
+}
+
+fn read_package_generation(path: &Path) -> Result<Option<PackageGeneration>> {
+    let manifest_path = path.join("model-package.json");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let manifest = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read {}", manifest_path.display()))?;
+    let manifest: PackageManifest = serde_json::from_str(&manifest)
+        .with_context(|| format!("parse {}", manifest_path.display()))?;
+    Ok(manifest.generation)
+}
+
+fn validate_generation_policy(
+    generation: Option<&PackageGeneration>,
+    options: GlmDsaContractOptions,
+    report: &mut GlmDsaContractReport,
+) {
+    let Some(generation) = generation else {
+        if options.require_generation_policy {
+            report
+                .generation_policy_errors
+                .push("model-package.json missing generation block".to_string());
+        }
+        return;
+    };
+
+    if let Some(policy) = generation.policy.as_ref() {
+        let selected_row_flash = policy
+            .experimental
+            .as_ref()
+            .and_then(|experimental| experimental.selected_row_flash.clone());
+        report.generation_policy = Some(GlmDsaGenerationPolicyReport {
+            profile: policy.profile.clone(),
+            decode: policy.decode.clone(),
+            short_prefill: policy.short_prefill.clone(),
+            long_prefill: policy.long_prefill.clone(),
+            verify: policy.verify.clone(),
+            indexshare: policy.indexshare.clone(),
+            selected_row_flash: selected_row_flash.clone(),
+        });
+
+        expect_generation_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.profile",
+            &policy.profile,
+            GLM_DSA_POLICY_PROFILE,
+        );
+        expect_generation_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.decode",
+            &policy.decode,
+            GLM_DSA_POLICY_DECODE,
+        );
+        expect_generation_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.short_prefill",
+            &policy.short_prefill,
+            GLM_DSA_POLICY_SHORT_PREFILL,
+        );
+        expect_generation_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.long_prefill",
+            &policy.long_prefill,
+            GLM_DSA_POLICY_LONG_PREFILL,
+        );
+        expect_generation_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.verify",
+            &policy.verify,
+            GLM_DSA_POLICY_VERIFY,
+        );
+        expect_generation_optional_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.indexshare",
+            policy.indexshare.as_deref(),
+            GLM_DSA_POLICY_INDEXSHARE,
+        );
+        expect_generation_optional_value(
+            &mut report.generation_policy_errors,
+            "generation.policy.experimental.selected_row_flash",
+            selected_row_flash.as_deref(),
+            GLM_DSA_POLICY_SELECTED_ROW_FLASH,
+        );
+    } else if options.require_generation_policy {
+        report
+            .generation_policy_errors
+            .push("generation.policy is required for GLM-DSA packages".to_string());
+    }
+
+    validate_generation_thresholds(generation.thresholds.as_ref(), options, report);
+}
+
+fn validate_generation_thresholds(
+    thresholds: Option<&PackageGenerationThresholds>,
+    options: GlmDsaContractOptions,
+    report: &mut GlmDsaContractReport,
+) {
+    let Some(thresholds) = thresholds else {
+        if options.require_generation_policy {
+            report
+                .generation_threshold_errors
+                .push("generation.thresholds is required for GLM-DSA packages".to_string());
+        }
+        return;
+    };
+
+    report.generation_thresholds = Some(GlmDsaGenerationThresholdReport {
+        short_prefill_max_tokens: thresholds.short_prefill_max_tokens,
+        compact_flash_min_kv: thresholds.compact_flash_min_kv,
+        dense_mask_max_bytes: thresholds.dense_mask_max_bytes,
+    });
+    expect_generation_optional_u32(
+        &mut report.generation_threshold_errors,
+        "generation.thresholds.short_prefill_max_tokens",
+        thresholds.short_prefill_max_tokens,
+        GLM_DSA_SHORT_PREFILL_MAX_TOKENS,
+    );
+    expect_generation_optional_u32(
+        &mut report.generation_threshold_errors,
+        "generation.thresholds.compact_flash_min_kv",
+        thresholds.compact_flash_min_kv,
+        GLM_DSA_COMPACT_FLASH_MIN_KV,
+    );
+    expect_generation_optional_u64(
+        &mut report.generation_threshold_errors,
+        "generation.thresholds.dense_mask_max_bytes",
+        thresholds.dense_mask_max_bytes,
+        GLM_DSA_DENSE_MASK_MAX_BYTES,
+    );
+}
+
+fn expect_generation_value(errors: &mut Vec<String>, field: &str, actual: &str, expected: &str) {
+    if actual != expected {
+        errors.push(format!("{field} must be {expected}, got {actual}"));
+    }
+}
+
+fn expect_generation_optional_value(
+    errors: &mut Vec<String>,
+    field: &str,
+    actual: Option<&str>,
+    expected: &str,
+) {
+    match actual {
+        Some(actual) if actual == expected => {}
+        Some(actual) => errors.push(format!("{field} must be {expected}, got {actual}")),
+        None => errors.push(format!("missing {field}")),
+    }
+}
+
+fn expect_generation_optional_u32(
+    errors: &mut Vec<String>,
+    field: &str,
+    actual: Option<u32>,
+    expected: u32,
+) {
+    match actual {
+        Some(actual) if actual == expected => {}
+        Some(actual) => errors.push(format!("{field} must be {expected}, got {actual}")),
+        None => errors.push(format!("missing {field}")),
+    }
+}
+
+fn expect_generation_optional_u64(
+    errors: &mut Vec<String>,
+    field: &str,
+    actual: Option<u64>,
+    expected: u64,
+) {
+    match actual {
+        Some(actual) if actual == expected => {}
+        Some(actual) => errors.push(format!("{field} must be {expected}, got {actual}")),
+        None => errors.push(format!("missing {field}")),
+    }
 }
 
 fn validate_metadata(metadata: &GgufMetadata, report: &mut GlmDsaContractReport) {
@@ -894,7 +1170,7 @@ mod tests {
     #[test]
     fn validates_minimal_glm_dsa_contract() {
         let input = mock_input(false);
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(report.valid, "{report:#?}");
         assert_eq!(report.effective_decoder_layers, Some(3));
@@ -904,9 +1180,83 @@ mod tests {
     }
 
     #[test]
+    fn strict_contract_rejects_missing_generation_policy() {
+        let input = mock_input(false);
+        let report = validate_contract(
+            input,
+            GlmDsaContractOptions {
+                require_generation_policy: true,
+            },
+        );
+
+        assert!(!report.valid);
+        assert!(report.generation_policy_required);
+        assert!(report.generation_policy_errors.iter().any(|error| {
+            error.contains("model-package.json missing generation block")
+                || error.contains("generation.policy is required")
+        }));
+    }
+
+    #[test]
+    fn strict_contract_accepts_glm_dsa_generation_policy() {
+        let mut input = mock_input(false);
+        input.generation = Some(mock_generation());
+        let report = validate_contract(
+            input,
+            GlmDsaContractOptions {
+                require_generation_policy: true,
+            },
+        );
+
+        assert!(report.valid, "{report:#?}");
+        let policy = report.generation_policy.expect("policy should be reported");
+        assert_eq!(policy.profile, GLM_DSA_POLICY_PROFILE);
+        assert_eq!(policy.decode, GLM_DSA_POLICY_DECODE);
+        assert_eq!(
+            policy.indexshare.as_deref(),
+            Some(GLM_DSA_POLICY_INDEXSHARE)
+        );
+        let thresholds = report
+            .generation_thresholds
+            .expect("thresholds should be reported");
+        assert_eq!(
+            thresholds.short_prefill_max_tokens,
+            Some(GLM_DSA_SHORT_PREFILL_MAX_TOKENS)
+        );
+        assert_eq!(
+            thresholds.dense_mask_max_bytes,
+            Some(GLM_DSA_DENSE_MASK_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn strict_contract_rejects_wrong_glm_dsa_generation_threshold() {
+        let mut input = mock_input(false);
+        let mut generation = mock_generation();
+        generation
+            .thresholds
+            .as_mut()
+            .expect("thresholds")
+            .compact_flash_min_kv = Some(256);
+        input.generation = Some(generation);
+
+        let report = validate_contract(
+            input,
+            GlmDsaContractOptions {
+                require_generation_policy: true,
+            },
+        );
+
+        assert!(!report.valid);
+        assert!(report.generation_threshold_errors.iter().any(|error| {
+            error.contains("generation.thresholds.compact_flash_min_kv must be 1")
+        }));
+    }
+
+    #[test]
     fn rejects_partial_indexer_group() {
         let input = mock_input(true);
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(
@@ -922,7 +1272,7 @@ mod tests {
         let mut input = mock_input(false);
         remove_indexer_tensors(&mut input.tensors, 0);
 
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(
@@ -940,7 +1290,7 @@ mod tests {
         let mut input = mock_input(false);
         add_indexer_tensors(&mut input.tensors, 1);
 
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(
@@ -958,7 +1308,7 @@ mod tests {
         let mut input = mock_input(false);
         remove_indexer_tensors(&mut input.tensors, 3);
 
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(
@@ -973,7 +1323,7 @@ mod tests {
     #[test]
     fn derives_glm52_frequency_cadence() {
         let input = mock_frequency_input(true);
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(report.valid, "{report:#?}");
         assert_eq!(report.role_source.as_deref(), Some("metadata_frequency"));
@@ -984,7 +1334,7 @@ mod tests {
     #[test]
     fn rejects_frequency_without_skip_offset() {
         let input = mock_frequency_input(false);
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(report.metadata_errors.iter().any(|error| {
@@ -1004,7 +1354,7 @@ mod tests {
             .u32s
             .insert("glm-dsa.attention.indexer.skip_top_k_offset".to_string(), 2);
 
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(
@@ -1044,7 +1394,7 @@ mod tests {
             .metadata
             .array_strings
             .remove("glm-dsa.attention.indexer.types");
-        let report = validate_contract(input);
+        let report = validate_contract(input, GlmDsaContractOptions::default());
 
         assert!(!report.valid);
         assert!(
@@ -1099,6 +1449,7 @@ mod tests {
             gguf_files: Vec::new(),
             metadata,
             tensors,
+            generation: None,
         }
     }
 
@@ -1165,6 +1516,7 @@ mod tests {
             gguf_files: Vec::new(),
             metadata,
             tensors,
+            generation: None,
         }
     }
 
@@ -1186,6 +1538,27 @@ mod tests {
             .bools
             .insert("glm-dsa.expert_weights_norm".to_string(), true);
         metadata
+    }
+
+    fn mock_generation() -> PackageGeneration {
+        PackageGeneration {
+            policy: Some(PackageGenerationPolicy {
+                profile: GLM_DSA_POLICY_PROFILE.to_string(),
+                decode: GLM_DSA_POLICY_DECODE.to_string(),
+                short_prefill: GLM_DSA_POLICY_SHORT_PREFILL.to_string(),
+                long_prefill: GLM_DSA_POLICY_LONG_PREFILL.to_string(),
+                verify: GLM_DSA_POLICY_VERIFY.to_string(),
+                indexshare: Some(GLM_DSA_POLICY_INDEXSHARE.to_string()),
+                experimental: Some(PackageGenerationExperimentalPolicy {
+                    selected_row_flash: Some(GLM_DSA_POLICY_SELECTED_ROW_FLASH.to_string()),
+                }),
+            }),
+            thresholds: Some(PackageGenerationThresholds {
+                short_prefill_max_tokens: Some(GLM_DSA_SHORT_PREFILL_MAX_TOKENS),
+                compact_flash_min_kv: Some(GLM_DSA_COMPACT_FLASH_MIN_KV),
+                dense_mask_max_bytes: Some(GLM_DSA_DENSE_MASK_MAX_BYTES),
+            }),
+        }
     }
 
     fn add_base_layer_tensors(tensors: &mut BTreeSet<String>, layer: u32) {
