@@ -1,0 +1,37 @@
+From aedcfdd1b9f5596bb8c83d8fada88f7d40ce3e4e Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 17:48:22 +1000
+Subject: [PATCH] Allow GLM DSA chunked prefill sidebands
+
+---
+ src/skippy.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index bb236814e..aa85a5c87 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1334,12 +1334,18 @@ static bool skippy_glm_dsa_sideband_top_k_count_is_valid(
+         size_t token_count,
+         uint32_t actual_top_k,
+         uint32_t expected_top_k) {
+-    GGML_UNUSED(token_count);
+-
+     if (actual_top_k == 0 || expected_top_k == 0) {
+         return false;
+     }
+ 
++    // Decode sidebands describe one token and must match the current visible KV
++    // width exactly. Prefill sidebands can be chunk-local: llama.cpp emits the
++    // actual per-chunk top-k width, while the receiving staged session may have
++    // a larger accumulated KV prefix.
++    if (token_count > 1) {
++        return actual_top_k <= expected_top_k;
++    }
++
+     return actual_top_k == expected_top_k;
+ }
+ 
+-- 
+2.53.0
+
