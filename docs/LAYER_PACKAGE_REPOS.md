@@ -127,6 +127,11 @@ for `376.28 us` (`97.3%`). Route/top-k plus weighted sum is only `10.53 us`
 not add new manifest schema: package policy still belongs under
 `generation.policy`, and numeric resolver hints still belong under
 `generation.thresholds`.
+The extended MoE fixture keeps that conclusion intact: current routed FFN
+decode estimates at `387.26 us`, a merged q2_K gate+up tensor shape estimates
+`378.91 us` (`1.02x`), and a q2_K down-projection alternative estimates
+`338.90 us` (`1.14x`) before quality is measured. That makes q3_K routed down
+the more interesting performance/quality tradeoff than gate/up tensor merging.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

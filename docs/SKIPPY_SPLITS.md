@@ -83,6 +83,11 @@ per routed FFN decode layer, with `376.28 us` (`97.3%`) in routed
 gate/up/down matmuls and only `10.53 us` (`2.7%`) in route/top-k plus weighted
 sum. That is an optimization target for llama.cpp backend kernels, not a
 reason to add a Skippy-specific generation schema.
+The extended fixture measured a merged q2_K gate+up shape at only `1.02x`
+faster for the per-layer estimate, while a q2_K down-projection alternative
+would be `1.14x` faster before quality is measured. That keeps the split-layer
+contract unchanged and points local llama.cpp work at expert matmul kernels and
+controlled down-projection quant experiments.
 
 The main split-serving implication is that Skippy should pass through the
 resolved `generation.policy` and `generation.thresholds` contract, not add a

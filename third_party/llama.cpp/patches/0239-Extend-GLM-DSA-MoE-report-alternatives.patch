@@ -1,0 +1,74 @@
+From 8585313c001b93b6b867a5b46161f888b35e1cc5 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 11:40:44 +1000
+Subject: [PATCH 239/239] Extend GLM DSA MoE report alternatives
+
+---
+ scripts/glm52-phase-e-moe-report.sh | 16 +++++++++++++---
+ tests/test-backend-ops.cpp          |  2 ++
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index f637e6264..c141a23a7 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -45,7 +45,7 @@ moe_csv="${out_dir}/moe-bottleneck-perf.csv"
+ summary="${out_dir}/summary.md"
+ 
+ echo "== GLM-DSA MoE bottleneck perf rows =="
+-moe_filter='n_embd=6144|m=2048|m=6144|n_tokens=1|n_tokens=4|n_embd=256'
++moe_filter='n_embd=6144|m=2048|m=4096|m=6144|n_tokens=1|n_tokens=4|n_embd=256'
+ "${test_backend_ops}" perf \
+     -o TOPK_MOE_GLM_ROUTE,TOPK_MOE_GLM_CONSUMER,MOE_WEIGHTED_SUM,MUL_MAT_ID \
+     -p "${moe_filter}" \
+@@ -109,8 +109,10 @@ route = find("TOPK_MOE_GLM_ROUTE")
+ weighted_1 = find("MOE_WEIGHTED_SUM", "n_tokens=1")
+ weighted_4 = find("MOE_WEIGHTED_SUM", "n_tokens=4")
+ consumer_q = find("TOPK_MOE_GLM_CONSUMER", "gate_type=q2_K")
+-gate_up = find("MUL_MAT_ID", "type_a=q2_K")
+-down = find("MUL_MAT_ID", "type_a=q3_K")
++gate_up = find("MUL_MAT_ID", "type_a=q2_K,type_b=f32,n_mats=256,n_used=8,b=0,m=2048,n=1,k=6144")
++merged_gate_up = find("MUL_MAT_ID", "type_a=q2_K,type_b=f32,n_mats=256,n_used=8,b=0,m=4096,n=1,k=6144")
++down_q2 = find("MUL_MAT_ID", "type_a=q2_K,type_b=f32,n_mats=256,n_used=8,b=0,m=6144,n=1,k=2048")
++down = find("MUL_MAT_ID", "type_a=q3_K,type_b=f32,n_mats=256,n_used=8,b=0,m=6144,n=1,k=2048")
+ 
+ estimated_decode = None
+ if route and weighted_1 and gate_up and down:
+@@ -142,6 +144,8 @@ add_row("Weighted sum, 1 token", weighted_1)
+ add_row("Weighted sum, 4 tokens", weighted_4)
+ add_row("Small quantized whole-graph consumer", consumer_q)
+ add_row("Routed gate/up matmul", gate_up)
++add_row("Merged routed gate+up matmul", merged_gate_up)
++add_row("Routed down matmul, q2_K alternative", down_q2)
+ add_row("Routed down matmul", down)
+ 
+ lines.extend([
+@@ -155,6 +159,12 @@ if estimated_decode is not None:
+     lines.append(f"- Estimated per-layer routed FFN decode cost: `{estimated_decode:.2f} us`.")
+     lines.append(f"- Expert matmuls: `{matmul_cost:.2f} us` ({100.0 * matmul_cost / estimated_decode:.1f}% of estimate).")
+     lines.append(f"- Route + weighted sum: `{overhead:.2f} us` ({100.0 * overhead / estimated_decode:.1f}% of estimate).")
++    if merged_gate_up:
++        merged_cost = merged_gate_up["us"] + down["us"] + overhead
++        lines.append(f"- Merged gate+up estimate: `{merged_cost:.2f} us` ({estimated_decode / merged_cost:.2f}x faster than current estimate).")
++    if down_q2:
++        q2_down_cost = 2.0 * gate_up["us"] + down_q2["us"] + overhead
++        lines.append(f"- q2_K down estimate: `{q2_down_cost:.2f} us` ({estimated_decode / q2_down_cost:.2f}x faster than current estimate, quality tradeoff not measured here).")
+ else:
+     lines.append("- Missing rows prevented the per-layer estimate.")
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 098da035a..9339cb050 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10436,6 +10436,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_topk_moe_glm_consumer());
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 8, false, 2048, 1, 6144));
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 8, false, 4096, 1, 6144));
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 8, false, 6144, 1, 2048));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, 8, false, 6144, 1, 2048));
+ 
+     // GLM-DSA sparse-attention decode threshold shapes.
+-- 
+2.53.0
+

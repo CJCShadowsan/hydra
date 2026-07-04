@@ -533,6 +533,12 @@ for `10.53 us` (`2.7%`). These numbers justify prioritizing backend
 not require a new manifest object. Policy remains the semantic phase contract
 under `generation.policy`; performance cutoffs and byte/token limits remain
 numeric resolver inputs under `generation.thresholds`.
+The extended fixture measured the current q2_K/q2_K/q3_K routed FFN estimate at
+`387.26 us`, a merged q2_K gate+up tensor shape at `378.91 us` (`1.02x`), and
+a q2_K down-projection alternative at `338.90 us` (`1.14x`, quality not
+measured by that microbench). Treat those as optimization-priority evidence,
+not as manifest schema: a package may record thresholds and validated policy
+choices, but quality-bearing quant changes still need separate evaluation.
 
 The IndexShare numbers are why `generation.policy.indexshare` is a first-class
 policy field instead of an implementation note. For GLM-5.2-style DSA with a
