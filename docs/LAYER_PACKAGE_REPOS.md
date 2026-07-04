@@ -69,7 +69,8 @@ Minimal GLM-DSA shape:
       "verify": "auto",
       "indexshare": "required",
       "experimental": {
-        "selected_row_flash": "evidence-gated"
+        "selected_row_flash": "evidence-gated",
+        "moe_weighted_down": "evidence-gated"
       }
     },
     "thresholds": {
@@ -121,17 +122,19 @@ short prefill and verification dense by default unless a backend-specific sparse
 path has its own evidence.
 After those phase gates, the next measured local bottleneck is routed expert
 decode rather than top-k routing. The current Metal MoE fixture estimates one
-GLM-5.2 routed FFN decode layer at `386.81 us`, with expert matmuls accounting
-for `376.28 us` (`97.3%`). Route/top-k plus weighted sum is only `10.53 us`
-(`2.7%`). That evidence should inform runtime optimization order, but it does
+GLM-5.2 routed FFN decode layer at `391.75 us`, with expert matmuls accounting
+for `380.28 us` (`97.1%`). Route/top-k plus weighted sum is only `11.47 us`
+(`2.9%`). That evidence should inform runtime optimization order, but it does
 not add new manifest schema: package policy still belongs under
 `generation.policy`, and numeric resolver hints still belong under
 `generation.thresholds`.
-The extended MoE fixture keeps that conclusion intact: current routed FFN
-decode estimates at `387.26 us`, a merged q2_K gate+up tensor shape estimates
-`378.91 us` (`1.02x`), and a q2_K down-projection alternative estimates
-`338.90 us` (`1.14x`) before quality is measured. That makes q3_K routed down
-the more interesting performance/quality tradeoff than gate/up tensor merging.
+The extended MoE fixture keeps that conclusion intact: a merged q2_K gate+up
+tensor shape estimates `382.84 us` (`1.02x`), moving MoE weights before the
+down projection measured `7.74 us` versus `7.93 us` (`1.02x`) on the small
+quantized whole-graph fixture, and a q2_K down-projection alternative
+estimates `343.23 us` (`1.14x`) before quality is measured. That makes q3_K
+routed down the more interesting performance/quality tradeoff than gate/up
+tensor merging or weighted-down graph shape alone.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

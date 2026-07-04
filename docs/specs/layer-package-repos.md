@@ -193,7 +193,8 @@ Minimal shape:
       "verify": "auto",
       "indexshare": "required",
       "experimental": {
-        "selected_row_flash": "evidence-gated"
+        "selected_row_flash": "evidence-gated",
+        "moe_weighted_down": "evidence-gated"
       }
     },
     "thresholds": {
@@ -391,6 +392,10 @@ Policy values are intentionally phase-specific:
 - `experimental.selected_row_flash`: controls selected-row flash fusion. Use
   `evidence-gated` until the package has reproducible wins for that path on the
   target backend.
+- `experimental.moe_weighted_down`: controls moving MoE route weights before
+  the routed down projection instead of applying them in the output weighted
+  sum. Use `evidence-gated`; current evidence makes this a small graph-shape
+  experiment, not a replacement for expert matmul optimization.
 
 Suggested semantic path values are:
 
@@ -457,6 +462,7 @@ For `glm-dsa-v1`, the current phase intent is:
 | `verify` | `auto` | Let the runtime select a verifier path until verifier-specific parity is proven. |
 | `indexshare` | `required` | Reuse Full-layer top-k/index state for Shared GLM-DSA layers instead of silent recompute. |
 | `experimental.selected_row_flash` | `evidence-gated` | Enable compact selected-row flash only when package/backend evidence proves parity and a win. |
+| `experimental.moe_weighted_down` | `evidence-gated` | Enable weighted-down MoE graph shape only when package/backend evidence proves parity and a win. |
 
 For `glm-dsa-v1`, the current threshold intent is:
 
@@ -526,19 +532,21 @@ quant.
 
 Once those attention phase gates are in place, the measured local GLM-5.2
 bottleneck shifts to routed expert matmuls. The current Metal MoE fixture
-estimates a routed FFN decode layer at `386.81 us`: routed gate/up/down matmuls
-account for `376.28 us` (`97.3%`), while route/top-k plus weighted sum accounts
-for `10.53 us` (`2.7%`). These numbers justify prioritizing backend
+estimates a routed FFN decode layer at `391.75 us`: routed gate/up/down matmuls
+account for `380.28 us` (`97.1%`), while route/top-k plus weighted sum accounts
+for `11.47 us` (`2.9%`). These numbers justify prioritizing backend
 `MUL_MAT_ID`/expert matmul work after sparse-attention correctness, but they do
 not require a new manifest object. Policy remains the semantic phase contract
 under `generation.policy`; performance cutoffs and byte/token limits remain
 numeric resolver inputs under `generation.thresholds`.
-The extended fixture measured the current q2_K/q2_K/q3_K routed FFN estimate at
-`387.26 us`, a merged q2_K gate+up tensor shape at `378.91 us` (`1.02x`), and
-a q2_K down-projection alternative at `338.90 us` (`1.14x`, quality not
-measured by that microbench). Treat those as optimization-priority evidence,
-not as manifest schema: a package may record thresholds and validated policy
-choices, but quality-bearing quant changes still need separate evaluation.
+The extended fixture measured a merged q2_K gate+up tensor shape at
+`382.84 us` (`1.02x`), a weighted-down MoE graph shape at `7.74 us` versus
+`7.93 us` (`1.02x`) on the small quantized whole-graph fixture, and a q2_K
+down-projection alternative at `343.23 us` (`1.14x`, quality not measured by
+that microbench). Treat those as optimization-priority evidence, not as a new
+model-family schema branch: a package may record validated runtime policy under
+`generation.policy`, but quality-bearing quant changes still need separate
+evaluation.
 
 The IndexShare numbers are why `generation.policy.indexshare` is a first-class
 policy field instead of an implementation note. For GLM-5.2-style DSA with a
