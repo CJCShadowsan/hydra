@@ -564,30 +564,31 @@ quant.
 
 Once those attention phase gates are in place, the measured local GLM-5.2
 bottleneck shifts to MoE expert execution. The current Metal MoE fixture
-estimates a routed FFN decode layer at `391.43 us`: routed gate/up/down matmuls
-account for `380.86 us` (`97.3%`), while route/top-k plus weighted sum accounts
-for `10.57 us` (`2.7%`). The shared expert is equally important: a
-production-shaped fused GLU shared expert plus final add measured `415.61 us`,
-making the routed+shared FFN estimate `807.04 us` with the shared expert at
-`51.5%`. These numbers justify prioritizing backend `MUL_MAT_ID`/expert matmul
+estimates a routed FFN decode layer at `392.16 us`: routed gate/up/down matmuls
+account for `376.36 us` (`96.0%`), routed fused SwiGLU accounts for `5.31 us`
+(`1.4%`), and route/top-k plus weighted sum accounts for `10.49 us` (`2.7%`).
+The shared expert is equally important: a production-shaped fused GLU shared
+expert plus final add measured `425.48 us`, making the routed+shared FFN
+estimate `817.64 us` with the shared expert at `52.0%`. These numbers justify
+prioritizing backend `MUL_MAT_ID`/expert matmul
 and shared-expert work after sparse-attention correctness, but they do not
 require a new manifest object. Policy remains the semantic phase contract under
 `generation.policy`; performance cutoffs and byte/token limits remain numeric
 resolver inputs under `generation.thresholds`.
 A component breakdown also corrected a bad diagnostic path: the unfused
-`silu(gate) * up` whole-graph row measured `318.69 us`, but the normal
+`silu(gate) * up` whole-graph row measured `327.13 us`, but the normal
 llama.cpp shared expert path already uses `ggml_swiglu_split()`. The fused
-SwiGLU split row measured only `4.91 us` (`9.17 us` including final add), so
+SwiGLU split row measured only `4.20 us` (`8.28 us` including final add), so
 custom activation fusion is not the next local target. Treat the fused GLU
 numbers as the production-shaped evidence and keep optimization pressure on
 routed q2/q3 `MUL_MAT_ID`, q2_K down quality experiments, and shared-expert
 whole execution.
 The extended fixture measured a merged q2_K routed gate/up tensor shape at
-`380.80 us` (`1.03x` faster than the current routed estimate), a merged shared
-gate/up fused GLU shape at `403.58 us` (`1.03x` faster than separate shared
-gate/up), a weighted-down MoE graph shape at `7.28 us` versus `7.39 us`
+`384.01 us` (`1.02x` faster than the current routed estimate), a merged shared
+gate/up fused GLU shape at `412.71 us` (`1.03x` faster than separate shared
+gate/up), a weighted-down MoE graph shape at `7.12 us` versus `7.26 us`
 (`1.02x`) on the small quantized whole-graph fixture, and a q2_K
-down-projection alternative at `342.65 us` (`1.14x`, quality not measured by
+down-projection alternative at `343.68 us` (`1.14x`, quality not measured by
 that microbench). Treat those as optimization-priority evidence, not as a new
 model-family schema branch: a package may record validated runtime policy under
 `generation.policy`, but quality-bearing quant changes still need separate

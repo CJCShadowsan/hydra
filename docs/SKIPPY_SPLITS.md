@@ -86,17 +86,18 @@ At the configured GLM-5.2 `top_k=768` width, compact selected-row flash measured
 `984.50-988.95 us/run` on the same shapes.
 After those phase decisions, measured GLM-5.2 FFN decode cost is dominated by
 MoE expert execution, not route/top-k overhead. The current Metal fixture
-estimates `391.43 us` per routed FFN decode layer, with `380.86 us` (`97.3%`)
-in routed gate/up/down matmuls and only `10.57 us` (`2.7%`) in route/top-k plus
-weighted sum. A production-shaped fused GLU shared expert plus final add
-measured `415.61 us`, making the routed+shared FFN estimate `807.04 us`; shared
-expert execution is `51.5%` of that estimate. The isolated fused SwiGLU split
-row is only `4.91 us`; the earlier unfused activation/mul diagnostic measured
-`318.69 us`, but that path does not represent the normal llama.cpp shared
+estimates `392.16 us` per routed FFN decode layer, with `376.36 us` (`96.0%`)
+in routed gate/up/down matmuls, `5.31 us` (`1.4%`) in routed fused SwiGLU, and
+only `10.49 us` (`2.7%`) in route/top-k plus weighted sum. A
+production-shaped fused GLU shared expert plus final add measured `425.48 us`,
+making the routed+shared FFN estimate `817.64 us`; shared expert execution is
+`52.0%` of that estimate. The isolated shared fused SwiGLU split row is only
+`4.20 us`; the earlier unfused activation/mul diagnostic measured `327.13 us`,
+but that path does not represent the normal llama.cpp shared
 expert graph because `build_ffn()` already uses `ggml_swiglu_split()`. The
 remaining MoE optimization target is therefore routed/shared expert matmul and
 whole-graph execution, not a reason to add a Skippy-specific generation schema.
-The extended fixture measured a merged q2_K routed gate/up shape at `1.03x`
+The extended fixture measured a merged q2_K routed gate/up shape at `1.02x`
 faster for the routed estimate, a merged shared gate/up fused GLU shape at
 `1.03x` faster for the shared expert, a weighted-down MoE graph shape at
 `1.02x` on the small quantized whole-graph fixture, and a q2_K down-projection

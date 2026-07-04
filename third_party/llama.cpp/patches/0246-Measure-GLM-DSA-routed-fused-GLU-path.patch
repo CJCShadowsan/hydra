@@ -1,0 +1,255 @@
+From 3285c3e40aae33aa8b2a2fc23dc7f9b68b91e8e1 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 13:45:35 +1000
+Subject: [PATCH] Measure GLM DSA routed fused GLU path
+
+---
+ scripts/glm52-phase-e-moe-report.sh | 38 ++++++++----
+ tests/test-backend-ops.cpp          | 92 ++++++++++++++++++++++++++---
+ 2 files changed, 111 insertions(+), 19 deletions(-)
+
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index af500581e..2ffc81db3 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -47,11 +47,11 @@ summary="${out_dir}/summary.md"
+ echo "== GLM-DSA MoE bottleneck perf rows =="
+ moe_filter='n_embd=6144|m=2048|m=4096|m=6144|n_tokens=1|n_tokens=4|n_embd=256'
+ "${test_backend_ops}" perf \
+-    -o TOPK_MOE_GLM_ROUTE,TOPK_MOE_GLM_CONSUMER,GLM_SHEXP_CONSUMER,GLM_SHEXP_COMPONENT,MOE_WEIGHTED_SUM,MUL_MAT_ID \
++    -o TOPK_MOE_GLM_ROUTE,TOPK_MOE_GLM_CONSUMER,TOPK_MOE_GLM_ACTIVATION,GLM_SHEXP_CONSUMER,GLM_SHEXP_COMPONENT,MOE_WEIGHTED_SUM,MUL_MAT_ID \
+     -p "${moe_filter}" \
+     --output console 2>&1 | tee "${moe_log}"
+ "${test_backend_ops}" perf \
+-    -o TOPK_MOE_GLM_ROUTE,TOPK_MOE_GLM_CONSUMER,GLM_SHEXP_CONSUMER,GLM_SHEXP_COMPONENT,MOE_WEIGHTED_SUM,MUL_MAT_ID \
++    -o TOPK_MOE_GLM_ROUTE,TOPK_MOE_GLM_CONSUMER,TOPK_MOE_GLM_ACTIVATION,GLM_SHEXP_CONSUMER,GLM_SHEXP_COMPONENT,MOE_WEIGHTED_SUM,MUL_MAT_ID \
+     -p "${moe_filter}" \
+     --output csv > "${moe_csv}"
+ 
+@@ -108,8 +108,12 @@ def find(name, *needles):
+ route = find("TOPK_MOE_GLM_ROUTE")
+ weighted_1 = find("MOE_WEIGHTED_SUM", "n_tokens=1")
+ weighted_4 = find("MOE_WEIGHTED_SUM", "n_tokens=4")
+-consumer_q = find("TOPK_MOE_GLM_CONSUMER", "gate_type=q2_K")
+-consumer_q_weighted = find("TOPK_MOE_GLM_CONSUMER", "weighted_down=1")
++consumer_q = find("TOPK_MOE_GLM_CONSUMER", "gate_type=q2_K", "weighted_down=0", "fused_glu=0")
++consumer_q_fused = find("TOPK_MOE_GLM_CONSUMER", "gate_type=q2_K", "weighted_down=0", "fused_glu=1")
++consumer_q_weighted = find("TOPK_MOE_GLM_CONSUMER", "weighted_down=1", "fused_glu=0")
++consumer_q_weighted_fused = find("TOPK_MOE_GLM_CONSUMER", "weighted_down=1", "fused_glu=1")
++moe_act_unfused = find("TOPK_MOE_GLM_ACTIVATION", "n_ff=2048", "fused_glu=0")
++moe_act_fused = find("TOPK_MOE_GLM_ACTIVATION", "n_ff=2048", "fused_glu=1")
+ shexp_unfused = find("GLM_SHEXP_CONSUMER", "n_embd=6144", "fused_glu=0")
+ shexp_fused = find("GLM_SHEXP_CONSUMER", "n_embd=6144", "fused_glu=1", "merged_gate_up=0")
+ shexp_merged = find("GLM_SHEXP_CONSUMER", "n_embd=6144", "fused_glu=1", "merged_gate_up=1")
+@@ -129,8 +133,8 @@ down_q2 = find("MUL_MAT_ID", "type_a=q2_K,type_b=f32,n_mats=256,n_used=8,b=0,m=6
+ down = find("MUL_MAT_ID", "type_a=q3_K,type_b=f32,n_mats=256,n_used=8,b=0,m=6144,n=1,k=2048")
+ 
+ estimated_decode = None
+-if route and weighted_1 and gate_up and down:
+-    estimated_decode = route["us"] + 2.0 * gate_up["us"] + down["us"] + weighted_1["us"]
++if route and weighted_1 and gate_up and down and moe_act_fused:
++    estimated_decode = route["us"] + 2.0 * gate_up["us"] + moe_act_fused["us"] + down["us"] + weighted_1["us"]
+ 
+ lines = [
+     "# GLM-5.2 Phase E MoE Report",
+@@ -156,8 +160,12 @@ def add_row(label, row):
+ add_row("Route/top-k + weights", route)
+ add_row("Weighted sum, 1 token", weighted_1)
+ add_row("Weighted sum, 4 tokens", weighted_4)
+-add_row("Small quantized whole-graph consumer", consumer_q)
+-add_row("Small quantized whole-graph consumer, weighted down", consumer_q_weighted)
++add_row("Small quantized whole-graph consumer, unfused diagnostic", consumer_q)
++add_row("Small quantized whole-graph consumer, fused GLU", consumer_q_fused)
++add_row("Small quantized whole-graph consumer, weighted down unfused diagnostic", consumer_q_weighted)
++add_row("Small quantized whole-graph consumer, weighted down fused GLU", consumer_q_weighted_fused)
++add_row("Routed activation/mul whole graph, unfused diagnostic", moe_act_unfused)
++add_row("Routed fused SwiGLU split", moe_act_fused)
+ add_row("Small shared expert + final add, unfused diagnostic", shexp_small)
+ add_row("Small shared expert + final add, fused GLU", shexp_small_fused)
+ add_row("Small shared expert + final add, merged gate/up fused GLU", shexp_small_merged)
+@@ -183,18 +191,24 @@ lines.extend([
+ ])
+ if estimated_decode is not None:
+     matmul_cost = 2.0 * gate_up["us"] + down["us"]
++    activation_cost = moe_act_fused["us"]
+     overhead = route["us"] + weighted_1["us"]
+     lines.append(f"- Estimated per-layer routed FFN decode cost: `{estimated_decode:.2f} us`.")
+     lines.append(f"- Expert matmuls: `{matmul_cost:.2f} us` ({100.0 * matmul_cost / estimated_decode:.1f}% of estimate).")
++    lines.append(f"- Routed fused SwiGLU split: `{activation_cost:.2f} us` ({100.0 * activation_cost / estimated_decode:.1f}% of estimate).")
+     lines.append(f"- Route + weighted sum: `{overhead:.2f} us` ({100.0 * overhead / estimated_decode:.1f}% of estimate).")
+     if merged_gate_up:
+-        merged_cost = merged_gate_up["us"] + down["us"] + overhead
++        merged_cost = merged_gate_up["us"] + activation_cost + down["us"] + overhead
+         lines.append(f"- Merged gate+up estimate: `{merged_cost:.2f} us` ({estimated_decode / merged_cost:.2f}x faster than current estimate).")
+     if down_q2:
+-        q2_down_cost = 2.0 * gate_up["us"] + down_q2["us"] + overhead
++        q2_down_cost = 2.0 * gate_up["us"] + activation_cost + down_q2["us"] + overhead
+         lines.append(f"- q2_K down estimate: `{q2_down_cost:.2f} us` ({estimated_decode / q2_down_cost:.2f}x faster than current estimate, quality tradeoff not measured here).")
+-    if consumer_q and consumer_q_weighted:
+-        lines.append(f"- Small weighted-down whole-graph fixture: `{consumer_q_weighted['us']:.2f} us` ({consumer_q['us'] / consumer_q_weighted['us']:.2f}x faster than baseline).")
++    if consumer_q and consumer_q_fused:
++        lines.append(f"- Small routed fused GLU whole-graph fixture: `{consumer_q_fused['us']:.2f} us` ({consumer_q['us'] / consumer_q_fused['us']:.2f}x faster than unfused diagnostic).")
++    if consumer_q_fused and consumer_q_weighted_fused:
++        lines.append(f"- Small weighted-down fused GLU whole-graph fixture: `{consumer_q_weighted_fused['us']:.2f} us` ({consumer_q_fused['us'] / consumer_q_weighted_fused['us']:.2f}x faster than fused baseline).")
++    if moe_act_unfused and moe_act_fused:
++        lines.append(f"- Routed unfused activation/mul diagnostic: `{moe_act_unfused['us']:.2f} us`; fused SwiGLU split: `{moe_act_fused['us']:.2f} us` (`{moe_act_unfused['us'] / moe_act_fused['us']:.2f}x` faster).")
+     if shexp_fused:
+         full_ffn = estimated_decode + shexp_fused["us"]
+         lines.append(f"- Shared expert + final add, fused GLU: `{shexp_fused['us']:.2f} us`; routed+shared FFN estimate: `{full_ffn:.2f} us`.")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 33383feef..324b7ff0d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6156,6 +6156,7 @@ struct test_topk_moe_glm_consumer : public test_case {
+     const int64_t n_embd;
+     const int64_t n_ff;
+     const bool weighted_down;
++    const bool fused_glu;
+ 
+     ggml_tensor * selected_experts = nullptr;
+     ggml_tensor * weights = nullptr;
+@@ -6170,20 +6171,22 @@ struct test_topk_moe_glm_consumer : public test_case {
+             ggml_type down_type = GGML_TYPE_F32,
+             int64_t   n_embd    = 64,
+             int64_t   n_ff      = 128,
+-            bool      weighted_down = false)
++            bool      weighted_down = false,
++            bool      fused_glu = false)
+         : gate_type(gate_type),
+           up_type(up_type),
+           down_type(down_type),
+           n_embd(n_embd),
+           n_ff(n_ff),
+-          weighted_down(weighted_down) {
++          weighted_down(weighted_down),
++          fused_glu(fused_glu) {
+         GGML_ASSERT(n_embd % ggml_blck_size(gate_type) == 0);
+         GGML_ASSERT(n_embd % ggml_blck_size(up_type) == 0);
+         GGML_ASSERT(n_ff   % ggml_blck_size(down_type) == 0);
+     }
+ 
+     std::string vars() override {
+-        return VARS_TO_STR9(gate_type, up_type, down_type, n_expert, n_expert_used, n_tokens, n_embd, n_ff, weighted_down);
++        return VARS_TO_STR10(gate_type, up_type, down_type, n_expert, n_expert_used, n_tokens, n_embd, n_ff, weighted_down, fused_glu);
+     }
+ 
+     std::string op_desc(ggml_tensor * t) override {
+@@ -6262,11 +6265,17 @@ struct test_topk_moe_glm_consumer : public test_case {
+         ffn_up = ggml_mul_mat_id(ctx, ups, cur, selected_experts);
+         ggml_set_name(ffn_up, "ffn_moe_up");
+ 
+-        ggml_tensor * ffn_act = ggml_silu(ctx, ffn_gate);
+-        ggml_set_name(ffn_act, "ffn_moe_gate_silu");
++        ggml_tensor * ffn_act = nullptr;
++        if (fused_glu) {
++            ffn_act = ggml_swiglu_split(ctx, ffn_gate, ffn_up);
++            ggml_set_name(ffn_act, "ffn_moe_swiglu");
++        } else {
++            ffn_act = ggml_silu(ctx, ffn_gate);
++            ggml_set_name(ffn_act, "ffn_moe_gate_silu");
+ 
+-        ffn_act = ggml_mul(ctx, ffn_act, ffn_up);
+-        ggml_set_name(ffn_act, "ffn_moe_gate_up");
++            ffn_act = ggml_mul(ctx, ffn_act, ffn_up);
++            ggml_set_name(ffn_act, "ffn_moe_gate_up");
++        }
+ 
+         if (weighted_down) {
+             ffn_act = ggml_mul(ctx, ffn_act, weights);
+@@ -6318,6 +6327,68 @@ struct test_topk_moe_glm_consumer : public test_case {
+     }
+ };
+ 
++struct test_topk_moe_glm_activation : public test_case {
++    const int64_t n_ff;
++    const int64_t n_expert_used;
++    const int64_t n_tokens;
++    const bool fused_glu;
++
++    test_topk_moe_glm_activation(
++            int64_t n_ff = 2048,
++            int64_t n_expert_used = 8,
++            int64_t n_tokens = 1,
++            bool    fused_glu = true)
++        : n_ff(n_ff),
++          n_expert_used(n_expert_used),
++          n_tokens(n_tokens),
++          fused_glu(fused_glu) {
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR4(n_ff, n_expert_used, n_tokens, fused_glu);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "TOPK_MOE_GLM_ACTIVATION";
++    }
++
++    bool run_whole_graph() override {
++        return true;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_expert_used, n_tokens);
++        ggml_set_name(gate, "ffn_moe_gate");
++
++        ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_expert_used, n_tokens);
++        ggml_set_name(up, "ffn_moe_up");
++
++        if (fused_glu) {
++            ggml_tensor * act = ggml_swiglu_split(ctx, gate, up);
++            ggml_set_name(act, "ffn_moe_swiglu");
++            return act;
++        }
++
++        ggml_tensor * act = ggml_silu(ctx, gate);
++        ggml_set_name(act, "ffn_moe_gate_silu");
++
++        act = ggml_mul(ctx, act, up);
++        ggml_set_name(act, "ffn_moe_gate_up");
++        return act;
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t, -0.5f, 0.5f);
++        }
++    }
++};
++
+ struct test_glm_shexp_consumer : public test_case {
+     const ggml_type gate_type;
+     const ggml_type up_type;
+@@ -10497,9 +10568,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_topk_moe_glm_route());
+     test_cases.emplace_back(new test_topk_moe_glm_consumer());
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256));
++    test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256, false, true));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256, 1, true));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256, 1, true, true));
++    test_cases.emplace_back(new test_topk_moe_glm_activation(256, 8, 1, false));
++    test_cases.emplace_back(new test_topk_moe_glm_activation(256, 8, 1, true));
+     for (int component = 0; component <= 6; ++component) {
+         test_cases.emplace_back(new test_glm_shexp_component(component, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256));
+     }
+@@ -10744,7 +10818,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_moe_weighted_sum(6144, 8, 4));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer());
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256));
++    test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256, false, true));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256, true));
++    test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256, true, true));
++    test_cases.emplace_back(new test_topk_moe_glm_activation(2048, 8, 1, false));
++    test_cases.emplace_back(new test_topk_moe_glm_activation(2048, 8, 1, true));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256, 1, true));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256, 1, true, true));
+-- 
+2.53.0
+

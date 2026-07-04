@@ -146,25 +146,26 @@ short prefill and verification dense by default unless a backend-specific sparse
 path has its own evidence.
 After those phase gates, the next measured local bottleneck is the MoE FFN
 rather than top-k routing. The current Metal MoE fixture estimates one GLM-5.2
-routed FFN decode layer at `391.43 us`, with expert matmuls accounting for
-`380.86 us` (`97.3%`). Route/top-k plus weighted sum is only `10.57 us`
-(`2.7%`). The shared expert is not small. A production-shaped fused GLU shared
-expert plus final add measured `415.61 us`, making the routed+shared FFN
-estimate `807.04 us` with the shared expert at `51.5%`. The fused SwiGLU row
-itself is cheap (`4.91 us`, or `9.17 us` including final add); the earlier
-unfused `silu(gate) * up` diagnostic row measured `318.69 us` but does not
+routed FFN decode layer at `392.16 us`, with expert matmuls accounting for
+`376.36 us` (`96.0%`). Routed fused SwiGLU is only `5.31 us` (`1.4%`), and
+route/top-k plus weighted sum is only `10.49 us` (`2.7%`). The shared expert is
+not small. A production-shaped fused GLU shared expert plus final add measured
+`425.48 us`, making the routed+shared FFN estimate `817.64 us` with the shared
+expert at `52.0%`. The shared fused SwiGLU row itself is cheap (`4.20 us`, or
+`8.28 us` including final add); the earlier unfused `silu(gate) * up`
+diagnostic row measured `327.13 us` but does not
 represent the normal llama.cpp `build_ffn()` path, which already uses
 `ggml_swiglu_split()`. That evidence should inform runtime optimization order,
 but it does not add new manifest schema: package policy still belongs under
 `generation.policy`, and numeric resolver hints still belong under
 `generation.thresholds`.
 The extended MoE fixture keeps that conclusion intact: a merged q2_K routed
-gate/up tensor shape estimates `380.80 us` (`1.03x` faster than the current
-routed estimate), a merged shared gate/up fused GLU shape measured `403.58 us`
+gate/up tensor shape estimates `384.01 us` (`1.02x` faster than the current
+routed estimate), a merged shared gate/up fused GLU shape measured `412.71 us`
 (`1.03x` faster than separate shared gate/up), moving MoE weights before the
-down projection measured `7.28 us` versus `7.39 us` (`1.02x`) on the small
+down projection measured `7.12 us` versus `7.26 us` (`1.02x`) on the small
 quantized whole-graph fixture, and a q2_K down-projection alternative
-estimates `342.65 us` (`1.14x`) before quality is measured. That makes q3_K
+estimates `343.68 us` (`1.14x`) before quality is measured. That makes q3_K
 routed down, q2_K down quality testing, and shared-expert whole execution more
 interesting than custom activation fusion. Merged shared gate/up is worth
 keeping as an evidence-gated package/runtime option, but it is a small win on
