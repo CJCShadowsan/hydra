@@ -1,0 +1,154 @@
+From 1106510f21f7fe7d6f6ce3121512745fb4e4ba91 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 14:32:56 +1000
+Subject: [PATCH] Measure GLM DSA fixed q3 down block path
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 16 +++++++++++-
+ ggml/src/ggml-metal/ggml-metal.metal      |  5 ++--
+ scripts/glm52-phase-e-moe-report.sh       | 32 +++++++++++++++++++++++
+ 3 files changed, 50 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 8d782fde6..1983a296d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -53,6 +53,11 @@ static int ggml_metal_glm_dsa_q3_k_mul_mv_id_nr0_requested() {
+     }
+ }
+ 
++static bool ggml_metal_glm_dsa_q3_k_mul_mv_id_glm_down_requested() {
++    const char * value = getenv("LLAMA_GLM_DSA_Q3_K_MUL_MV_ID_GLM_DOWN");
++    return value != nullptr && value[0] != '\0' && atoi(value) != 0;
++}
++
+ ggml_metal_device_t ggml_metal_device_get(int device) {
+     static std::vector<ggml_metal_device_ptr> devs;
+ 
+@@ -1236,7 +1241,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             {
+                 nsg = ggml_metal_glm_dsa_q3_k_mul_mv_id_nsg_requested();
+                 nr0 = ggml_metal_glm_dsa_q3_k_mul_mv_id_nr0_requested();
+-                if (nr0 != N_R0_Q3_K) {
++                const bool is_glm_down =
++                    op->src[0]->ne[0] == 2048 &&
++                    op->src[0]->ne[1] == 6144 &&
++                    op->src[2]->ne[0] == 8 &&
++                    op->src[2]->ne[1] == 1;
++                if (is_glm_down &&
++                        nr0 == N_R0_Q3_K &&
++                        ggml_metal_glm_dsa_q3_k_mul_mv_id_glm_down_requested()) {
++                    suffix = "_glm_down";
++                } else if (nr0 != N_R0_Q3_K) {
+                     snprintf(name, sizeof(name), "_r%d", nr0);
+                     suffix = name;
+                 }
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 60b0d9556..056bf3384 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -8082,7 +8082,7 @@ kernel void kernel_mul_mv_q2_K_f32(
+     kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+ }
+ 
+-template<int nr0, typename args_t>
++template<int nr0, typename args_t, int fixed_nb = -1>
+ void kernel_mul_mv_q3_K_f32_impl(
+         args_t args,
+         device const char * src0,
+@@ -8094,7 +8094,7 @@ void kernel_mul_mv_q3_K_f32_impl(
+         ushort sgitg) {
+     const short NSG = FC_mul_mv_nsg;
+ 
+-    const int nb = args.ne00/QK_K;
++    const int nb = fixed_nb > 0 ? fixed_nb : args.ne00/QK_K;
+ 
+     const int r0 = tgpig.x;
+     const int r1 = tgpig.y;
+@@ -11881,6 +11881,7 @@ template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t
+ 
+ template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
+ template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
++template [[host_name("kernel_mul_mv_id_q3_K_f32_glm_down")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl<N_R0_Q3_K, ggml_metal_kargs_mul_mv, 8>>>;
+ template [[host_name("kernel_mul_mv_id_q3_K_f32_r1")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <1>>>;
+ template [[host_name("kernel_mul_mv_id_q3_K_f32_r2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <2>>>;
+ template [[host_name("kernel_mul_mv_id_q3_K_f32_r8")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <8>>>;
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index 9a0d0bdd4..7a995d72d 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -300,6 +300,15 @@ if [[ "${GLM52_PHASE_E_KERNEL_SWEEP:-0}" != "0" ]]; then
+             --output console > "${sweep_dir}/q3-k-mul-mv-id-nr0-${nr0}.console.log" 2>&1
+     done
+ 
++    for nsg in 2 4; do
++        LLAMA_GLM_DSA_Q3_K_MUL_MV_ID_GLM_DOWN=1 \
++        LLAMA_GLM_DSA_Q3_K_MUL_MV_ID_NSG="${nsg}" \
++            "${test_backend_ops}" perf \
++            -o MUL_MAT_ID \
++            -p 'type_a=q3_K,type_b=f32,n_mats=256,n_used=8,b=0,m=6144,n=1,k=2048' \
++            --output console > "${sweep_dir}/q3-k-mul-mv-id-glm-down-nsg-${nsg}.console.log" 2>&1
++    done
++
+     python3 - "${summary}" "${sweep_dir}" <<'PY'
+ import os
+ import re
+@@ -338,6 +347,12 @@ for nr0 in (1, 2, 4, 8):
+     row = next((item for item in parsed if "type_a=q3_K" in item["params"]), None)
+     q3_nr0_rows.append((nr0, row))
+ 
++q3_glm_down_rows = []
++for nsg in (2, 4):
++    parsed = rows(sweep_dir / f"q3-k-mul-mv-id-glm-down-nsg-{nsg}.console.log")
++    row = next((item for item in parsed if "type_a=q3_K" in item["params"]), None)
++    q3_glm_down_rows.append((nsg, row))
++
+ lines = [
+     "",
+     "## Optional Kernel Sweep",
+@@ -364,11 +379,19 @@ for nr0, row in q3_nr0_rows:
+     else:
+         lines.append(f"| q3_K `mul_mv_id` nr0={nr0} | missing | missing |")
+ 
++for nsg, row in q3_glm_down_rows:
++    if row:
++        lines.append(f"| q3_K fixed-block GLM down nsg={nsg} | `{row['params']}` | {row['us']:.2f} us |")
++    else:
++        lines.append(f"| q3_K fixed-block GLM down nsg={nsg} | missing | missing |")
++
+ forced_q3 = next((row for row in forced_rows if "type_a=q3_K" in row["params"]), None)
+ default_q3 = next((row for nsg, row in q3_rows if nsg == 2 and row), None)
+ best_q3 = min((row for _, row in q3_rows if row), key=lambda row: row["us"], default=None)
+ default_nr0_q3 = next((row for nr0, row in q3_nr0_rows if nr0 == 4 and row), None)
+ best_nr0_q3 = min((row for _, row in q3_nr0_rows if row), key=lambda row: row["us"], default=None)
++default_glm_down_q3 = next((row for nsg, row in q3_glm_down_rows if nsg == 2 and row), None)
++best_glm_down_q3 = min((row for _, row in q3_glm_down_rows if row), key=lambda row: row["us"], default=None)
+ 
+ require_gates = os.environ.get("GLM52_PHASE_E_REQUIRE_GATES", "0") != "0"
+ 
+@@ -390,6 +413,11 @@ if require_gates:
+         for nr0, row in q3_nr0_rows
+         if row is None
+     )
++    missing.extend(
++        f"q3_K fixed-block GLM down nsg={nsg}"
++        for nsg, row in q3_glm_down_rows
++        if row is None
++    )
+     if missing:
+         gate_fail("missing Phase E kernel sweep rows: " + ", ".join(missing))
+     if forced_q3["us"] <= default_q3["us"] * 2.0:
+@@ -406,6 +434,10 @@ if default_q3 and best_q3:
+     lines.append(f"- q3_K `mul_mv_id` simdgroup tuning is noise-level here: default nsg=2 is `{default_q3['us']:.2f} us`, best measured row is `{best_q3['us']:.2f} us`.")
+ if default_nr0_q3 and best_nr0_q3:
+     lines.append(f"- q3_K `mul_mv_id` row-height tuning: default nr0=4 is `{default_nr0_q3['us']:.2f} us`, best measured row is `{best_nr0_q3['us']:.2f} us`.")
++if default_q3 and default_glm_down_q3:
++    lines.append(f"- q3_K fixed-block GLM down specialization: default nsg=2 is `{default_glm_down_q3['us']:.2f} us` versus ordinary q3_K `mul_mv_id` at `{default_q3['us']:.2f} us`.")
++if best_glm_down_q3 and default_q3:
++    lines.append(f"- Best fixed-block GLM down row is `{best_glm_down_q3['us']:.2f} us`, `{default_q3['us'] / best_glm_down_q3['us']:.2f}x` versus ordinary default q3_K `mul_mv_id`.")
+ 
+ section = "\n".join(lines) + "\n"
+ summary.write_text(summary.read_text() + section)
+-- 
+2.53.0
+
