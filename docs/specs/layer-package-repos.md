@@ -198,7 +198,7 @@ Minimal shape:
     },
     "thresholds": {
       "short_prefill_max_tokens": 2048,
-      "compact_flash_min_kv": 256,
+      "compact_flash_min_kv": 1,
       "dense_mask_max_bytes": 268435456
     },
     "speculative_decoding": {
@@ -304,7 +304,7 @@ Keep these responsibilities separate. Policy fields should answer "which
 execution path is intended for this phase?" Threshold fields should answer
 "when should the runtime choose or reject that path?" For example,
 `decode: "compact-flash"` belongs under `generation.policy`, while
-`compact_flash_min_kv: 256` belongs under `generation.thresholds`.
+`compact_flash_min_kv: 1` belongs under `generation.thresholds`.
 
 The `generation` object is intentionally generic. Do not add
 model-family-specific sub-objects such as `generation.glm_dsa`; use a stable
@@ -348,7 +348,7 @@ The current proposed shape is:
     },
     "thresholds": {
       "short_prefill_max_tokens": 2048,
-      "compact_flash_min_kv": 256,
+      "compact_flash_min_kv": 1,
       "dense_mask_max_bytes": 268435456
     }
   }
@@ -467,6 +467,18 @@ measured `63.40 us/run`, direct sparse attention measured `106.57 us/run`, and
 dense masked flash measured `71.72 us/run`. That makes the compact selected-row
 path about `1.68x` faster than direct sparse and about `1.13x` faster than dense
 masked flash for this fixture.
+
+Model-native early decode is more decisive because `top_k` can equal the
+visible KV length before the full configured indexer width is reachable.
+Compact selected-row flash measured `61.90 us/run` at `kv=128,top_k=128`,
+`60.71 us/run` at `kv=256,top_k=256`, `61.24 us/run` at
+`kv=257,top_k=257`, and `57.99 us/run` at `kv=513,top_k=513`. Direct sparse
+measured `137.15 us/run`, `209.97 us/run`, `249.30 us/run`, and
+`711.10 us/run` on the same shapes. That makes compact selected-row flash
+about `2.2x`, `3.5x`, `4.1x`, and `12.3x` faster than direct sparse across
+those early decode points. This is why `glm-dsa-v1` uses compact flash as the
+default decode route and reserves direct sparse decode for explicit runtime
+experiments.
 
 Short phase fixtures measured the opposite shape for direct sparse prefill:
 dense masked flash stayed around `68.58-70.80 us/run` for 4-16 token batches,

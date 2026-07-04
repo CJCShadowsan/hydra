@@ -62,8 +62,11 @@ and IndexShare `required`, but Skippy should only select those paths when the
 embedded llama runtime reports support and should log any fallback. Current
 Metal backend evidence for one-token decode shows compact selected-row flash at
 `63.40 us/run` versus direct sparse at `106.57 us/run` and dense masked flash at
-`71.72 us/run` on the `kv=257,top_k=64` fixture family. For short phase shapes,
-dense masked flash measured `68.58-70.80 us/run` versus
+`71.72 us/run` on the `kv=257,top_k=64` fixture family. For model-native early
+decode where `top_k = visible_kv`, compact selected-row flash measured
+`57.99-61.90 us/run` across `kv=128..513`, while direct sparse measured
+`137.15-711.10 us/run` on the same shapes. For short phase shapes, dense masked
+flash measured `68.58-70.80 us/run` versus
 `461.98-473.75 us/run` for direct sparse at 4-16 tokens, so Skippy should treat
 short prefill and verification as dense defaults unless the embedded llama
 runtime resolves an explicit, measured sparse override.

@@ -65,6 +65,12 @@ compact selected-row flash at `63.40 us/run` for
 `106.57 us/run`, and dense masked flash at `71.72 us/run` on the comparable
 one-token shape. That is the evidence behind preferring
 `decode: "compact-flash"` once parity is proven on the target package/backend.
+For model-native early decode where `top_k = visible_kv`, compact selected-row
+flash measured `61.90 us` at `kv=128`, `60.71 us` at `kv=256`, `61.24 us` at
+`kv=257`, and `57.99 us` at `kv=513`; direct sparse measured `137.15 us`,
+`209.97 us`, `249.30 us`, and `711.10 us` for the same shapes. That is why
+native GLM-DSA decode should prefer compact flash over direct sparse by default
+when flash attention is available.
 The same fixture family measured dense masked flash much faster than direct
 sparse for short phase shapes (`68.58-70.80 us/run` versus
 `461.98-473.75 us/run` for 4-16 tokens), so GLM-DSA packages should keep
