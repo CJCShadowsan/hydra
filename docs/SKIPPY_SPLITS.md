@@ -85,21 +85,21 @@ At the configured GLM-5.2 `top_k=768` width, compact selected-row flash measured
 `55.11-55.62 us/run` for `kv=1024..2048`, while direct sparse measured
 `984.50-988.95 us/run` on the same shapes.
 After those phase decisions, measured GLM-5.2 FFN decode cost is dominated by
-MoE expert execution, not route/top-k overhead. The current Metal fixture
-estimates `392.16 us` per routed FFN decode layer, with `376.36 us` (`96.0%`)
-in routed gate/up/down matmuls, `5.31 us` (`1.4%`) in routed fused SwiGLU, and
-only `10.49 us` (`2.7%`) in route/top-k plus weighted sum. A
-production-shaped fused GLU shared expert plus final add measured `425.48 us`,
-making the routed+shared FFN estimate `817.64 us`; shared expert execution is
-`52.0%` of that estimate. The isolated shared fused SwiGLU split row is only
-`4.20 us`; the earlier unfused activation/mul diagnostic measured `327.13 us`,
-but that path does not represent the normal llama.cpp shared
-expert graph because `build_ffn()` already uses `ggml_swiglu_split()`. The
-remaining MoE optimization target is therefore routed/shared expert matmul and
-whole-graph execution, not a reason to add a Skippy-specific generation schema.
+MoE expert execution, not route/top-k overhead. The gated Metal fixture
+estimates `391.61 us` per routed FFN decode layer, with `375.83 us` (`96.0%`)
+in routed gate/up/down matmuls, `5.24 us` (`1.3%`) in routed fused SwiGLU, and
+only `10.54 us` (`2.7%`) in route/top-k plus weighted sum. A
+production-shaped fused GLU shared expert plus final add measured `410.19 us`,
+making the routed+shared FFN estimate `801.80 us`; shared expert execution is
+`51.2%` of that estimate. The isolated shared fused SwiGLU split row is only
+`4.37 us`; the earlier unfused activation/mul diagnostic measured `296.90 us`,
+but that path does not represent the normal llama.cpp shared expert graph
+because `build_ffn()` already uses `ggml_swiglu_split()`. The remaining MoE
+optimization target is therefore routed/shared expert matmul and whole-graph
+execution, not a reason to add a Skippy-specific generation schema.
 The extended fixture measured a merged q2_K routed gate/up shape at `1.02x`
 faster for the routed estimate, a merged shared gate/up fused GLU shape at
-`1.03x` faster for the shared expert, a weighted-down MoE graph shape at
+`1.02x` faster for the shared expert, a weighted-down MoE graph shape at
 `1.02x` on the small quantized whole-graph fixture, and a q2_K down-projection
 alternative at `1.14x` faster before quality is measured. That keeps the
 split-layer contract unchanged and points local llama.cpp work at expert matmul
@@ -107,14 +107,14 @@ kernels, shared-expert whole execution, and controlled down-projection quant
 experiments. Merged shared gate/up may be recorded as an evidence-gated
 `generation.policy.experimental` option by packages that actually contain that
 validated artifact shape.
-The Phase E kernel sweep also showed that generic dispatch tuning is not the
-lever: forcing one-token q3_K routed down through `mul_mm_id` measured
-`850.64 us` versus `165.86 us` on the default `mul_mv_id` path, and q3_K
-`mul_mv_id` simdgroup tuning stayed within measurement noise. The follow-up
-row-height sweep confirmed the same shape: forced q3_K `mul_mm_id` measured
-`842.49 us` versus `163.96 us` on default `mul_mv_id`, simdgroup tuning only
-moved the best row to `163.52 us`, and q3_K row-height tuning found no faster
-row than default `nr0=4` at `164.62 us`.
+The Phase E report can be made a hard evidence gate with
+`GLM52_PHASE_E_REQUIRE_GATES=1`; when the optional kernel sweep is enabled it
+also proves the dispatch alternatives are present. That sweep showed generic
+dispatch tuning is not the lever: forcing one-token q3_K routed down through
+`mul_mm_id` measured `927.49 us` versus `164.63 us` on the default `mul_mv_id`
+path, q3_K `mul_mv_id` simdgroup tuning stayed within measurement noise
+(`164.63 us` default versus `163.63 us` best), and q3_K row-height tuning found
+no faster row than default `nr0=4` at `165.11 us`.
 
 The main split-serving implication is that Skippy should pass through the
 resolved `generation.policy` and `generation.thresholds` contract, not add a

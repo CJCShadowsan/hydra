@@ -145,40 +145,41 @@ sparse for short phase shapes (`68.58-70.80 us/run` versus
 short prefill and verification dense by default unless a backend-specific sparse
 path has its own evidence.
 After those phase gates, the next measured local bottleneck is the MoE FFN
-rather than top-k routing. The current Metal MoE fixture estimates one GLM-5.2
-routed FFN decode layer at `392.16 us`, with expert matmuls accounting for
-`376.36 us` (`96.0%`). Routed fused SwiGLU is only `5.31 us` (`1.4%`), and
-route/top-k plus weighted sum is only `10.49 us` (`2.7%`). The shared expert is
+rather than top-k routing. The gated Metal MoE fixture estimates one GLM-5.2
+routed FFN decode layer at `391.61 us`, with expert matmuls accounting for
+`375.83 us` (`96.0%`). Routed fused SwiGLU is only `5.24 us` (`1.3%`), and
+route/top-k plus weighted sum is only `10.54 us` (`2.7%`). The shared expert is
 not small. A production-shaped fused GLU shared expert plus final add measured
-`425.48 us`, making the routed+shared FFN estimate `817.64 us` with the shared
-expert at `52.0%`. The shared fused SwiGLU row itself is cheap (`4.20 us`, or
-`8.28 us` including final add); the earlier unfused `silu(gate) * up`
-diagnostic row measured `327.13 us` but does not
-represent the normal llama.cpp `build_ffn()` path, which already uses
-`ggml_swiglu_split()`. That evidence should inform runtime optimization order,
-but it does not add new manifest schema: package policy still belongs under
-`generation.policy`, and numeric resolver hints still belong under
-`generation.thresholds`.
+`410.19 us`, making the routed+shared FFN estimate `801.80 us` with the shared
+expert at `51.2%`. The shared fused SwiGLU row itself is cheap (`4.37 us`, or
+`8.45 us` including final add); the earlier unfused `silu(gate) * up`
+diagnostic row measured `296.90 us` but does not represent the normal llama.cpp
+`build_ffn()` path, which already uses `ggml_swiglu_split()`. That evidence
+should inform runtime optimization order, but it does not add new manifest
+schema: package policy still belongs under `generation.policy`, and numeric
+resolver hints still belong under `generation.thresholds`.
 The extended MoE fixture keeps that conclusion intact: a merged q2_K routed
-gate/up tensor shape estimates `384.01 us` (`1.02x` faster than the current
-routed estimate), a merged shared gate/up fused GLU shape measured `412.71 us`
-(`1.03x` faster than separate shared gate/up), moving MoE weights before the
-down projection measured `7.12 us` versus `7.26 us` (`1.02x`) on the small
+gate/up tensor shape estimates `384.72 us` (`1.02x` faster than the current
+routed estimate), a merged shared gate/up fused GLU shape measured `403.43 us`
+(`1.02x` faster than separate shared gate/up), moving MoE weights before the
+down projection measured `7.14 us` versus `7.26 us` (`1.02x`) on the small
 quantized whole-graph fixture, and a q2_K down-projection alternative
-estimates `343.68 us` (`1.14x`) before quality is measured. That makes q3_K
+estimates `342.86 us` (`1.14x`) before quality is measured. That makes q3_K
 routed down, q2_K down quality testing, and shared-expert whole execution more
 interesting than custom activation fusion. Merged shared gate/up is worth
 keeping as an evidence-gated package/runtime option, but it is a small win on
 this fixture rather than a reason to create a GLM-specific generation schema.
-The optional Phase E kernel sweep also rules out two tempting kernel-policy
-shortcuts: forcing one-token MoE through Metal `mul_mm_id` measured `850.64 us`
-for q3_K routed down versus `165.86 us` on the default `mul_mv_id` path, while
-q3_K `mul_mv_id` simdgroup tuning was noise-level (`165.86 us` default versus
-`165.26 us` best measured). A follow-up row-height sweep reached the same
-conclusion: forcing one-token q3_K down through `mul_mm_id` measured
-`842.49 us` versus `163.96 us` on default `mul_mv_id`, simdgroup tuning
-measured `163.96 us` default versus `163.52 us` best, and q3_K row-height
-tuning measured `164.62 us` for default `nr0=4` with no faster row. The next
+The Phase E report can be run as a hard evidence gate with
+`GLM52_PHASE_E_REQUIRE_GATES=1`; the gated rows require production-shaped
+routed/shared MoE, q2/q3 down alternatives, and the optional kernel sweep rows
+when `GLM52_PHASE_E_KERNEL_SWEEP=1` is enabled. The optional sweep rules out two
+tempting kernel-policy shortcuts: forcing one-token MoE through Metal
+`mul_mm_id` measured `927.49 us` for q3_K routed down versus `164.63 us` on the
+default `mul_mv_id` path, while q3_K `mul_mv_id` simdgroup tuning was
+noise-level (`164.63 us` default versus `163.63 us` best measured). The
+row-height sweep reached the same conclusion: q3_K row-height tuning measured
+`165.11 us` for default `nr0=4`, which was also the best sampled row; `nr0=1`
+and `nr0=2` were around `195-197 us`, and `nr0=8` was `166.24 us`. The next
 meaningful local target is therefore a real q3_K routed-down specialization or
 a quality-tested down-projection quant change, not generic matrix-matrix
 cutoff, simdgroup, or row-height tuning.
