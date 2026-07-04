@@ -25,8 +25,8 @@ use skippy_topology::{
 
 use crate::{
     cli::{
-        LocalSplitBinaryArgs, LocalSplitChainBinaryArgs, LocalSplitCompareArgs,
-        LocalSplitInprocessArgs,
+        LocalSplitBinaryArgs, LocalSplitChainBinaryArgs, LocalSplitChainInprocessArgs,
+        LocalSplitCompareArgs, LocalSplitInprocessArgs,
     },
     model_identity::model_identity_for_path,
     support::{
@@ -63,6 +63,24 @@ struct BinaryChainResult {
     stage0_wire_sideband_i32_count: usize,
     stage0_wire_message_bytes: usize,
     stage0_payload_bytes: u64,
+    split_layer_1: u32,
+    split_layer_2: u32,
+    layer_end: u32,
+}
+
+struct InprocessChainBoundaryResult {
+    model_identity: ModelIdentity,
+    token_id: i32,
+    activation_width: i32,
+    stage0_payload_bytes: u64,
+    stage0_sideband_bytes: usize,
+    stage0_sideband_i32_count: usize,
+    stage1_payload_bytes: u64,
+    stage1_sideband_bytes: usize,
+    stage1_sideband_i32_count: usize,
+    stage2_payload_bytes: u64,
+    stage2_sideband_bytes: usize,
+    stage2_sideband_i32_count: usize,
     split_layer_1: u32,
     split_layer_2: u32,
     layer_end: u32,
@@ -218,6 +236,48 @@ pub fn local_split_chain_binary(args: LocalSplitChainBinaryArgs) -> Result<()> {
                     "layer_start": result.split_layer_2,
                     "layer_end": result.layer_end,
                     "returned_predicted_token": true,
+                }
+            ]
+        }))?
+    );
+    Ok(())
+}
+
+pub fn local_split_chain_inprocess(args: LocalSplitChainInprocessArgs) -> Result<()> {
+    let result = run_inprocess_chain_boundary(args)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "mode": "local-split-chain-inprocess",
+            "boundary_only": true,
+            "model_identity": result.model_identity,
+            "token_id": result.token_id,
+            "activation_width": result.activation_width,
+            "stages": [
+                {
+                    "stage_index": 0,
+                    "layer_start": 0,
+                    "layer_end": result.split_layer_1,
+                    "payload_bytes": result.stage0_payload_bytes,
+                    "sideband_bytes": result.stage0_sideband_bytes,
+                    "sideband_i32_count": result.stage0_sideband_i32_count,
+                },
+                {
+                    "stage_index": 1,
+                    "layer_start": result.split_layer_1,
+                    "layer_end": result.split_layer_2,
+                    "payload_bytes": result.stage1_payload_bytes,
+                    "sideband_bytes": result.stage1_sideband_bytes,
+                    "sideband_i32_count": result.stage1_sideband_i32_count,
+                },
+                {
+                    "stage_index": 2,
+                    "layer_start": result.split_layer_2,
+                    "layer_end": result.layer_end,
+                    "payload_bytes": result.stage2_payload_bytes,
+                    "sideband_bytes": result.stage2_sideband_bytes,
+                    "sideband_i32_count": result.stage2_sideband_i32_count,
+                    "returned_activation_boundary": true,
                 }
             ]
         }))?
@@ -704,6 +764,160 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     })
 }
 
+fn run_inprocess_chain_boundary(
+    args: LocalSplitChainInprocessArgs,
+) -> Result<InprocessChainBoundaryResult> {
+    if args.split_layer_1 == 0
+        || args.split_layer_1 >= args.split_layer_2
+        || args.split_layer_2 >= args.layer_end
+    {
+        bail!("split_layer_1 and split_layer_2 must partition 0..layer_end in ascending order");
+    }
+    let stage_load_mode = parse_stage_load_mode(&args.stage_load_mode)?;
+    if stage_load_mode.protocol == ProtocolLoadMode::RuntimeSlice {
+        validate_local_topology_plan(
+            &args.model_path,
+            args.layer_end,
+            &[args.split_layer_1, args.split_layer_2],
+            3,
+            "f16",
+        )?;
+    }
+    let model_identity = model_identity_for_path(&args.model_id, Some(&args.model_path))?;
+    let stage0_config = chain_stage_config(0, 0, args.split_layer_1, true, &stage_load_mode, &args);
+    let stage1_config = chain_stage_config(
+        1,
+        args.split_layer_1,
+        args.split_layer_2,
+        false,
+        &stage_load_mode,
+        &args,
+    );
+    let stage2_config = chain_stage_config(
+        2,
+        args.split_layer_2,
+        args.layer_end,
+        false,
+        &stage_load_mode,
+        &args,
+    );
+    let stage0 = open_stage_model_for_binary_split(
+        &args.model_path,
+        &args.model_id,
+        "local-split-chain-inprocess",
+        "stage-0",
+        &stage_load_mode,
+        &stage0_config,
+    )
+    .context("failed to open stage 0")?;
+    let stage1 = open_stage_model_for_binary_split(
+        &args.model_path,
+        &args.model_id,
+        "local-split-chain-inprocess",
+        "stage-1",
+        &stage_load_mode,
+        &stage1_config,
+    )
+    .context("failed to open stage 1")?;
+    let stage2 = open_stage_model_for_binary_split(
+        &args.model_path,
+        &args.model_id,
+        "local-split-chain-inprocess",
+        "stage-2",
+        &stage_load_mode,
+        &stage2_config,
+    )
+    .context("failed to open stage 2")?;
+    let tokens = stage0
+        .tokenize(&args.prompt, true)
+        .context("failed to tokenize prompt")?;
+    let token_id = *tokens.first().context("prompt produced no tokens")?;
+    let mut session0 = stage0
+        .create_session()
+        .context("failed to create stage 0 session")?;
+    let mut session1 = stage1
+        .create_session()
+        .context("failed to create stage 1 session")?;
+    let mut session2 = stage2
+        .create_session()
+        .context("failed to create stage 2 session")?;
+
+    let (_stage0_prediction, boundary0) = session0
+        .decode_step_frame(token_id, None, 0)
+        .context("stage 0 failed to produce activation frame")?;
+    if boundary0.payload.is_empty() {
+        bail!("stage 0 produced an empty activation frame");
+    }
+    let activation_width = boundary_activation_width(&boundary0, &[0])?;
+
+    let (_stage1_prediction, boundary1) = session1
+        .decode_step_frame(token_id, Some(&boundary0), 0)
+        .context("stage 1 failed to consume activation frame")?;
+    if boundary1.payload.is_empty() {
+        bail!("stage 1 produced an empty activation frame");
+    }
+
+    let (_stage2_prediction, boundary2) = session2
+        .decode_step_frame(token_id, Some(&boundary1), 0)
+        .context("stage 2 failed to consume activation frame")?;
+    if boundary2.payload.is_empty() {
+        bail!("stage 2 produced an empty activation frame");
+    }
+
+    Ok(InprocessChainBoundaryResult {
+        model_identity,
+        token_id,
+        activation_width,
+        stage0_payload_bytes: boundary0.desc.payload_bytes,
+        stage0_sideband_bytes: glm_dsa_sideband_bytes(&boundary0, &[0])?,
+        stage0_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary0, &[0])?,
+        stage1_payload_bytes: boundary1.desc.payload_bytes,
+        stage1_sideband_bytes: glm_dsa_sideband_bytes(&boundary1, &[0])?,
+        stage1_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary1, &[0])?,
+        stage2_payload_bytes: boundary2.desc.payload_bytes,
+        stage2_sideband_bytes: glm_dsa_sideband_bytes(&boundary2, &[0])?,
+        stage2_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary2, &[0])?,
+        split_layer_1: args.split_layer_1,
+        split_layer_2: args.split_layer_2,
+        layer_end: args.layer_end,
+    })
+}
+
+fn chain_stage_config(
+    stage_index: u32,
+    layer_start: u32,
+    layer_end: u32,
+    include_embeddings: bool,
+    stage_load_mode: &ParsedStageLoadMode,
+    args: &LocalSplitChainInprocessArgs,
+) -> RuntimeConfig {
+    RuntimeConfig {
+        stage_index,
+        layer_start,
+        layer_end,
+        ctx_size: args.ctx_size,
+        lane_count: 1,
+        n_batch: None,
+        n_ubatch: None,
+        n_threads: None,
+        n_threads_batch: None,
+        n_gpu_layers: args.n_gpu_layers,
+        selected_backend_device: None,
+        cache_type_k: skippy_runtime::GGML_TYPE_F16,
+        cache_type_v: skippy_runtime::GGML_TYPE_F16,
+        flash_attn_type: skippy_runtime::FlashAttentionType::Auto,
+        load_mode: stage_load_mode.runtime,
+        projector_path: None,
+        use_mmap: stage_load_mode.use_mmap,
+        use_mmap_prefetch: stage_load_mode.use_mmap,
+        use_mmap_buffer: stage_load_mode.use_mmap,
+        include_embeddings,
+        include_output: false,
+        filter_tensors_on_load: true,
+        glm_dsa_policy: None,
+    }
+}
+
 struct LocalSplitTopologyStage<'a> {
     stage_id: &'a str,
     stage_index: u32,
@@ -980,6 +1194,25 @@ fn boundary_activation_width(frame: &ActivationFrame, positions: &[i32]) -> Resu
         .checked_sub(sideband_bytes)
         .context("GLM-DSA sideband estimate exceeds activation payload")?;
     activation_width_from_hidden_bytes(hidden_bytes, frame.desc.token_count)
+}
+
+fn glm_dsa_sideband_bytes(frame: &ActivationFrame, positions: &[i32]) -> Result<usize> {
+    let state_flags = activation_state_flags_from_frame_flags(frame.desc.flags);
+    if (state_flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) == 0 {
+        return Ok(0);
+    }
+    let sideband_i32 = glm_dsa_decode_sideband_i32_count(positions)?;
+    sideband_i32
+        .checked_mul(std::mem::size_of::<i32>())
+        .context("GLM-DSA sideband byte count overflow")
+}
+
+fn glm_dsa_sideband_i32_count(frame: &ActivationFrame, positions: &[i32]) -> Result<usize> {
+    let state_flags = activation_state_flags_from_frame_flags(frame.desc.flags);
+    if (state_flags & state_flags::GLM_DSA_TOP_K_SIDEBAND) == 0 {
+        return Ok(0);
+    }
+    glm_dsa_decode_sideband_i32_count(positions)
 }
 
 fn encode_boundary_wire_payload(

@@ -19,6 +19,7 @@ pub enum CommandKind {
     LocalSplitInprocess(LocalSplitInprocessArgs),
     LocalSplitBinary(LocalSplitBinaryArgs),
     LocalSplitCompare(LocalSplitCompareArgs),
+    LocalSplitChainInprocess(LocalSplitChainInprocessArgs),
     LocalSplitChainBinary(LocalSplitChainBinaryArgs),
     #[command(name = "verify-span-local")]
     VerifySpanLocal(VerifySpanLocalArgs),
@@ -1083,6 +1084,32 @@ pub struct LocalSplitCompareArgs {
 }
 
 #[derive(Parser)]
+pub struct LocalSplitChainInprocessArgs {
+    #[arg(long)]
+    pub model_path: PathBuf,
+    #[arg(
+        long,
+        default_value = "runtime-slice",
+        help = "Stage load mode for --model-path. Use layer-package when --model-path points at a Skippy layer package directory."
+    )]
+    pub stage_load_mode: String,
+    #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
+    pub model_id: String,
+    #[arg(long, default_value_t = 10)]
+    pub split_layer_1: u32,
+    #[arg(long, default_value_t = 20)]
+    pub split_layer_2: u32,
+    #[arg(long, default_value_t = 30)]
+    pub layer_end: u32,
+    #[arg(long, default_value_t = 128)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = 0)]
+    pub n_gpu_layers: i32,
+    #[arg(long, default_value = "Hello")]
+    pub prompt: String,
+}
+
+#[derive(Parser)]
 pub struct LocalSplitChainBinaryArgs {
     #[arg(long, default_value = "target/debug/skippy-server")]
     pub stage_server_bin: PathBuf,
@@ -1310,6 +1337,35 @@ mod tests {
 
         let CommandKind::LocalSplitChainBinary(args) = cli.command else {
             panic!("expected local-split-chain-binary subcommand");
+        };
+
+        assert_eq!(args.model_path, PathBuf::from("/tmp/glm52-layers"));
+        assert_eq!(args.stage_load_mode, "layer-package");
+        assert_eq!(args.split_layer_1, 6);
+        assert_eq!(args.split_layer_2, 7);
+        assert_eq!(args.layer_end, 8);
+    }
+
+    #[test]
+    fn parses_local_split_chain_inprocess_layer_package_mode() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "local-split-chain-inprocess",
+            "--model-path",
+            "/tmp/glm52-layers",
+            "--stage-load-mode",
+            "layer-package",
+            "--split-layer-1",
+            "6",
+            "--split-layer-2",
+            "7",
+            "--layer-end",
+            "8",
+        ])
+        .unwrap();
+
+        let CommandKind::LocalSplitChainInprocess(args) = cli.command else {
+            panic!("expected local-split-chain-inprocess subcommand");
         };
 
         assert_eq!(args.model_path, PathBuf::from("/tmp/glm52-layers"));
