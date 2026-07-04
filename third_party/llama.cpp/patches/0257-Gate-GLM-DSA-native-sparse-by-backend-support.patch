@@ -1,0 +1,319 @@
+From ed4540f05167b059335efbfe49beb831c509b9f5 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 19:12:47 +1000
+Subject: [PATCH] Gate GLM DSA native sparse by backend support
+
+---
+ src/llama-context.cpp |  7 +++++
+ src/llama-graph.cpp   | 64 +++++++++++++++++++++++++++++++++++++++++--
+ src/llama-graph.h     |  5 ++++
+ src/skippy.cpp        |  3 +-
+ 4 files changed, 76 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6b4f66641..3d59b5bdd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2488,12 +2488,19 @@ llm_graph_params llama_context::graph_params(
+                       const llama_ubatch & ubatch,
+             const llama_memory_context_i * mctx,
+                           llm_graph_type   gtype) const {
++    std::vector<int> layer_backend_device_types;
++    layer_backend_device_types.reserve(model.hparams.n_layer_all);
++    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
++        layer_backend_device_types.push_back((int) ggml_backend_dev_type(model.dev_layer(il)));
++    }
++
+     return {
+         /*.arch        =*/ model.arch,
+         /*.hparams     =*/ model.hparams,
+         /*.cparams     =*/ cparams,
+         /*.ubatch      =*/ ubatch,
+         /*.gtype       =*/ gtype,
++        /*.layer_backend_device_types =*/ std::move(layer_backend_device_types),
+         /*.sched       =*/ sched.get(),
+         /*.backend_cpu =*/ backend_cpu,
+         /*.cvec        =*/ cvec.get(),
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b8c63cf9d..86a62d6ed 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -238,6 +238,45 @@ enum class llama_glm_dsa_sparse_attn_route {
+     COMPACT_FLASH,
+ };
+ 
++static bool llama_glm_dsa_backend_supports_native_sparse(int backend_device_type) {
++    switch (backend_device_type) {
++        case GGML_BACKEND_DEVICE_TYPE_GPU:
++        case GGML_BACKEND_DEVICE_TYPE_IGPU:
++        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
++            return true;
++        case GGML_BACKEND_DEVICE_TYPE_CPU:
++        case GGML_BACKEND_DEVICE_TYPE_META:
++            return false;
++    }
++
++    return false;
++}
++
++static bool llama_glm_dsa_layer_backend_supports_native_sparse(
++        const std::vector<int> & layer_backend_device_types,
++        int il) {
++    if (il < 0 || (size_t) il >= layer_backend_device_types.size()) {
++        return false;
++    }
++
++    return llama_glm_dsa_backend_supports_native_sparse(layer_backend_device_types[il]);
++}
++
++static bool llama_glm_dsa_all_layer_backends_support_native_sparse(
++        const std::vector<int> & layer_backend_device_types) {
++    if (layer_backend_device_types.empty()) {
++        return false;
++    }
++
++    for (int backend_device_type : layer_backend_device_types) {
++        if (!llama_glm_dsa_backend_supports_native_sparse(backend_device_type)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ struct llama_glm_dsa_sparse_attn_policy {
+     llama_glm_dsa_sparse_attn_route route = llama_glm_dsa_sparse_attn_route::DENSE_MASK;
+     const char * phase = "other";
+@@ -259,6 +298,7 @@ struct llama_glm_dsa_sparse_attn_policy {
+     bool compact_mask_omitted = false;
+     bool compact_kv_ok = false;
+     bool compact_candidate = false;
++    bool backend_sparse_supported = false;
+     bool flash_attn = false;
+     int64_t direct_sparse_decode_max_top_k = 0;
+     int64_t compact_flash_min_kv = 0;
+@@ -302,6 +342,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         bool    direct_sparse_prefill_enabled,
+         bool    unproven_large_direct_sparse_prefill_enabled,
+         bool    flash_attn,
++        bool    backend_sparse_supported,
+         bool    compact_flash_disabled,
+         bool    compact_mask_omitted,
+         bool    kq_b_ok,
+@@ -317,6 +358,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     policy.soft_cap_ok = soft_cap_ok;
+     policy.compact_disabled = compact_flash_disabled;
+     policy.compact_mask_omitted = compact_mask_omitted;
++    policy.backend_sparse_supported = backend_sparse_supported;
+     policy.flash_attn = flash_attn;
+     policy.direct_sparse_decode_max_top_k = skippy_glm_dsa_direct_sparse_decode_max_top_k();
+     policy.compact_flash_min_kv = skippy_glm_dsa_compact_flash_min_kv();
+@@ -361,6 +403,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+             (policy.compact_large_decode_top_k || compact_mask_omitted);
+     const bool compact_ready =
+             policy.compact_candidate &&
++            backend_sparse_supported &&
+             flash_attn &&
+             kq_b_ok &&
+             sinks_ok &&
+@@ -377,6 +420,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+ 
+     const bool direct_ready =
+             direct_sparse_enabled &&
++            backend_sparse_supported &&
+             policy.token_shape_allowed &&
+             !policy.compact_large_decode_top_k &&
+             !compact_mask_omitted &&
+@@ -395,6 +439,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     } else {
+         policy.direct_selector_reason =
+                 !direct_sparse_enabled ? "direct_sparse_disabled" :
++                !backend_sparse_supported ? "backend_sparse_unsupported" :
+                 !policy.token_shape_allowed ? "token_shape_not_allowed" :
+                 policy.compact_large_decode_top_k ? "direct_sparse_top_k_too_large" :
+                 compact_mask_omitted ? "mla_kq_mask_omitted" :
+@@ -407,6 +452,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+ 
+     policy.compact_selector_reason =
+             compact_flash_disabled ? "disabled" :
++            !backend_sparse_supported ? "backend_sparse_unsupported" :
+             !flash_attn ? "flash_attn_disabled" :
+             !policy.decode_shape ? "not_decode" :
+             !policy.compact_kv_ok ? "kv_below_min" :
+@@ -425,6 +471,7 @@ static bool llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+         const llama_cparams & cparams,
+         const llama_ubatch  & ubatch,
+         const llama_kv_cache_context * mctx_mla,
++        bool backend_sparse_supported,
+         bool eligible) {
+     if (!eligible || mctx_mla == nullptr) {
+         return false;
+@@ -458,6 +505,7 @@ static bool llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+             skippy_glm_dsa_direct_sparse_prefill_enabled(),
+             skippy_glm_dsa_unproven_large_direct_sparse_prefill_enabled(),
+             cparams.flash_attn,
++            backend_sparse_supported,
+             skippy_glm_dsa_compact_flash_attn_disabled(),
+             false,
+             true,
+@@ -522,6 +570,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+         bool    prefill_shape,
+         bool    large_prefill_shape,
+         bool    token_shape_allowed,
++        bool    backend_sparse_supported,
+         bool    kq_b_ok,
+         bool    sinks_ok,
+         bool    alibi_ok,
+@@ -536,7 +585,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+     const int64_t kv_topk_ratio = sparse_top_k > 0 ? sparse_kv / sparse_top_k : 0;
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%lld dense_mask_limit=%lld phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d verify_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
++            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%lld dense_mask_limit=%lld phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d verify_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d backend_sparse_supported=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+             layer,
+             (long long) ubatch_tokens,
+             (long long) sparse_batch,
+@@ -558,6 +607,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+             prefill_shape ? 1 : 0,
+             large_prefill_shape ? 1 : 0,
+             token_shape_allowed ? 1 : 0,
++            backend_sparse_supported ? 1 : 0,
+             kq_b_ok ? 1 : 0,
+             sinks_ok ? 1 : 0,
+             alibi_ok ? 1 : 0,
+@@ -576,6 +626,7 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+         bool    large_decode_top_k,
+         bool    kv_ok,
+         bool    enabled,
++        bool    backend_sparse_supported,
+         bool    flash_attn,
+         bool    decode_shape,
+         bool    no_mask,
+@@ -590,7 +641,7 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+     }
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld decode_max_top_k=%lld compact_min_kv=%lld kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d kv_ok=%d enabled=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
++            "skippy: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld decode_max_top_k=%lld compact_min_kv=%lld kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d kv_ok=%d enabled=%d backend_sparse_supported=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
+             layer,
+             (long long) ubatch_tokens,
+             (long long) visible_kv,
+@@ -603,6 +654,7 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+             large_decode_top_k ? 1 : 0,
+             kv_ok ? 1 : 0,
+             enabled ? 1 : 0,
++            backend_sparse_supported ? 1 : 0,
+             flash_attn ? 1 : 0,
+             decode_shape ? "decode" : "other",
+             decode_shape ? 1 : 0,
+@@ -1337,6 +1389,7 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
+             params.cparams,
+             params.ubatch,
+             mctx->get_mla(),
++            llama_glm_dsa_all_layer_backends_support_native_sparse(params.layer_backend_device_types),
+             glm_dsa_compact_decode_mask_eligible);
+ 
+     res &= compact_decode_mla_mask_omitted == skip_mla_mask;
+@@ -1894,6 +1947,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     n_ctx_orig       (cparams.n_ctx_orig_yarn),
+     pooling_type     (cparams.pooling_type),
+     rope_type        (hparams.rope_type),
++    layer_backend_device_types(params.layer_backend_device_types),
+     sched            (params.sched),
+     backend_cpu      (params.backend_cpu),
+     cvec             (params.cvec),
+@@ -3625,6 +3679,8 @@ ggml_tensor * llm_graph_context::build_attn(
+     const bool direct_sparse_sinks_ok = sinks == nullptr;
+     const bool direct_sparse_alibi_ok = hparams.f_max_alibi_bias == 0.0f;
+     const bool direct_sparse_soft_cap_ok = !hparams.attn_soft_cap;
++    const bool backend_sparse_supported =
++            llama_glm_dsa_layer_backend_supports_native_sparse(layer_backend_device_types, il);
+     const bool verification_batch = llama_glm_dsa_verification_batch_shape(
+             ubatch,
+             n_direct_sparse_batch,
+@@ -3643,6 +3699,7 @@ ggml_tensor * llm_graph_context::build_attn(
+             direct_sparse_prefill_enabled,
+             skippy_glm_dsa_unproven_large_direct_sparse_prefill_enabled(),
+             cparams.flash_attn,
++            backend_sparse_supported,
+             skippy_glm_dsa_compact_flash_attn_disabled(),
+             kq_mask == nullptr,
+             direct_sparse_kq_b_ok,
+@@ -3668,6 +3725,7 @@ ggml_tensor * llm_graph_context::build_attn(
+             sparse_policy.prefill_shape,
+             sparse_policy.large_prefill_shape,
+             sparse_policy.token_shape_allowed,
++            sparse_policy.backend_sparse_supported,
+             sparse_policy.kq_b_ok,
+             sparse_policy.sinks_ok,
+             sparse_policy.alibi_ok,
+@@ -3687,6 +3745,7 @@ ggml_tensor * llm_graph_context::build_attn(
+             sparse_policy.compact_large_decode_top_k,
+             sparse_policy.compact_kv_ok,
+             sparse_policy.compact_candidate,
++            sparse_policy.backend_sparse_supported,
+             sparse_policy.flash_attn,
+             sparse_policy.decode_shape,
+             kq_mask == nullptr,
+@@ -3932,6 +3991,7 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
+             cparams,
+             ubatch,
+             mctx_cur->get_mla(),
++            llama_glm_dsa_all_layer_backends_support_native_sparse(layer_backend_device_types),
+             inp->glm_dsa_compact_decode_mask_eligible);
+ 
+     {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4a7420b1b..0477f50bf 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -712,6 +712,8 @@ struct llm_graph_params {
+ 
+     llm_graph_type gtype;
+ 
++    std::vector<int> layer_backend_device_types;
++
+     ggml_backend_sched_t sched;
+     ggml_backend_t backend_cpu;
+ 
+@@ -804,6 +806,7 @@ struct llm_graph_params {
+             cparams.causal_attn == other.cparams.causal_attn &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
++            layer_backend_device_types == other.layer_backend_device_types &&
+             cvec  == other.cvec  &&
+             loras == other.loras &&
+             cross == other.cross;
+@@ -939,6 +942,8 @@ struct llm_graph_context {
+     const enum llama_pooling_type pooling_type;
+     const enum llama_rope_type    rope_type;
+ 
++    const std::vector<int> & layer_backend_device_types;
++
+     ggml_backend_sched_t sched;
+ 
+     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index aa85a5c87..3ae3494a6 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1985,7 +1985,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+             "unknown";
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%llu dense_mask_limit=%llu phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
++            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%llu dense_mask_limit=%llu phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d backend_sparse_supported=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+             layer,
+             static_cast<long long>(timing.token_count),
+             static_cast<long long>(sparse_batch),
+@@ -2010,6 +2010,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+             1,
+             1,
+             1,
++            1,
+             use_direct ? 1 : 0);
+ }
+ 
+-- 
+2.53.0
+
