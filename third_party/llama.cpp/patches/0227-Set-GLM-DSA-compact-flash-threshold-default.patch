@@ -1,0 +1,65 @@
+From fe75af911ef77959a5973133cb6240ef73fc7297 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 10:00:03 +1000
+Subject: [PATCH 227/227] Set GLM DSA compact flash threshold default
+
+---
+ src/llama-graph.cpp        |  2 +-
+ tests/test-llama-archs.cpp | 21 +++++++++++++++++++++
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 947dc8741..6bba48b4a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -139,7 +139,7 @@ static int64_t skippy_glm_dsa_compact_flash_min_kv() {
+         if (filter.glm_dsa_policy_profile != 0 && filter.glm_dsa_compact_flash_min_kv > 0) {
+             return filter.glm_dsa_compact_flash_min_kv;
+         }
+-        return 0;
++        return 256;
+     }
+ 
+     const int64_t parsed = atoll(value);
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 8cb4abad2..4e022109a 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -692,6 +692,26 @@ static bool test_glm_dsa_compact_min_kv_decode_graph(
+     }
+ }
+ 
++static bool test_glm_dsa_default_compact_threshold_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env compact_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "4");
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.compact_get_rows == 0 || counts.flash_attn == 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA default compact-threshold decode graph counted total=%d compact_get_rows=%d flash_attn=%d sparse_mask=%d sparse_mask_nodes=%d dsa_sparse_attn=%d\n",
++                    counts.total, counts.compact_get_rows, counts.flash_attn, counts.sparse_mask, counts.sparse_mask_nodes, counts.dsa_sparse_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA default compact-threshold decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
+ static bool test_glm_dsa_compact_disabled_decode_graph(
+         const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+     try {
+@@ -1050,6 +1070,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+                 test_glm_dsa_direct_sparse_decode_graph(seed, {}) &&
+                 test_glm_dsa_compact_decode_graph(seed, {}) &&
+                 test_glm_dsa_compact_min_kv_decode_graph(seed, {}) &&
++                test_glm_dsa_default_compact_threshold_decode_graph(seed, {}) &&
+                 test_glm_dsa_compact_disabled_decode_graph(seed, {}) &&
+                 test_glm_dsa_verify_dense_graph(seed, {}) &&
+                 test_glm_dsa_short_prefill_dense_graph(seed, {}) &&
+-- 
+2.53.0
+
