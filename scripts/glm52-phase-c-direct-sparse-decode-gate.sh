@@ -23,6 +23,8 @@ This gate assumes Phase A and Phase B are already closed. It proves decode only:
 
   - direct sparse decode decisions are selected for top-k within the proven decode cap;
   - compact K/V gather + flash attention is selected only beyond that cap;
+  - high-position Shared-consumer compact flash works with an explicit
+    2048-wide IndexShare/top-k sideband when --long-kv is enabled;
   - sparse-mask timing nodes are absent in the candidate;
   - dense sparse-mask Metal dispatches are absent in the candidate;
   - native DSA sparse-attention or compact-flash execution evidence is present;
@@ -179,6 +181,32 @@ run_dense_parity_case() {
     2>"$case_dir/stderr.txt"
 }
 
+run_synthetic_consumer_case() {
+  local name="$1"
+  shift
+  local case_dir="$OUT_DIR/$name"
+  mkdir -p "$case_dir"
+  echo "compact_flash_synthetic_consumer" >"$case_dir/proof-kind.txt"
+  SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_SIDEBAND=1 \
+    SKIPPY_BENCH_GLM_DSA_SYNTHETIC_TOP_K_WIDTH=2048 \
+    "$SKIPPY_BENCH_BIN" glm-dsa-layer-microbench \
+      --stage-model "$STAGE_MODEL" \
+      --model-id "$MODEL_ID" \
+      --iterations "$ITERATIONS" \
+      --warmup "$WARMUP" \
+      --synthetic-kv-warmup \
+      --native-default-direct-sparse-attn \
+      --direct-sparse-prefill false \
+      --allow-compact-flash-auto \
+      --require-compact-flash-proof \
+      --metal-dispatch-log true \
+      --metal-topk-moe-route-fusion false \
+      --output "$case_dir/report.json" \
+      "$@" \
+      >"$case_dir/stdout.txt" \
+      2>"$case_dir/stderr.txt"
+}
+
 if [[ "$QUICK" == "1" ]]; then
   run_dense_parity_case dense-parity-middle-quick \
     --layer-start 30 \
@@ -264,6 +292,15 @@ if [[ "$LONG_KV" == "1" ]]; then
     --kv-warmup-chunk-tokens 1024 \
     --n-batch 1024 \
     --n-ubatch 1024
+  run_synthetic_consumer_case decode-shared-consumer-pos65536-syntopk2048 \
+    --layer-start 7 \
+    --layer-end 10 \
+    --ctx-size 131072 \
+    --tokens 1 \
+    --position-start 65536 \
+    --kv-warmup-tokens 65536 \
+    --n-batch 512 \
+    --n-ubatch 512
 fi
 
 python3 - "$OUT_DIR" <<'PY'
@@ -288,6 +325,12 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
     parity = comparison.get("parity") or {}
     candidate = comparison.get("candidate") or {}
     baseline = comparison.get("baseline") or {}
+    is_synthetic_consumer = (
+        (case_dir / "proof-kind.txt").exists()
+        and (case_dir / "proof-kind.txt").read_text().strip() == "compact_flash_synthetic_consumer"
+    )
+    if is_synthetic_consumer:
+        candidate = report
     guard = report.get("direct_sparse_decode_guard") or {}
     compact_guard = report.get("compact_flash_guard") or {}
     native_guard = report.get("native_indexshare_guard") or {}
@@ -337,10 +380,16 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         proof_kind = "direct_sparse"
     elif proof_kind == "compact":
         proof_kind = "compact_flash"
+    elif proof_kind == "compact_flash_synthetic_consumer":
+        proof_kind = "compact_flash_synthetic_consumer"
+    input_source = report.get("input_source") or {}
     row = {
         "label": case_dir.name,
         "report": str(report_path),
         "proof_kind": proof_kind,
+        "input_source_kind": input_source.get("kind"),
+        "input_source_top_k_sideband": input_source.get("top_k_sideband"),
+        "synthetic_kv_warmup": report.get("synthetic_kv_warmup"),
         "tokens": report.get("tokens"),
         "position_start": report.get("position_start"),
         "kv_warmup_tokens": report.get("kv_warmup_tokens"),
@@ -417,17 +466,17 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         row["diagnostic_ratio"] = baseline_timing / candidate_timing
     rows.append(row)
 
-    if not row["parity_passed"]:
+    if proof_kind != "compact_flash_synthetic_consumer" and not row["parity_passed"]:
         failures.append(f"{case_dir.name}: parity failed")
-    if row["hidden_mismatches"] not in (0, None):
+    if proof_kind != "compact_flash_synthetic_consumer" and row["hidden_mismatches"] not in (0, None):
         failures.append(f"{case_dir.name}: hidden mismatches {row['hidden_mismatches']}")
-    if row["sideband_mismatched_bytes"] not in (0, None):
+    if proof_kind != "compact_flash_synthetic_consumer" and row["sideband_mismatched_bytes"] not in (0, None):
         failures.append(f"{case_dir.name}: sideband mismatch {row['sideband_mismatched_bytes']}")
-    if proof_kind != "dense_parity" and not row["native_indexshare_guard_passed"]:
+    if proof_kind not in ("dense_parity", "compact_flash_synthetic_consumer") and not row["native_indexshare_guard_passed"]:
         failures.append(f"{case_dir.name}: native IndexShare guard failed")
     if proof_kind in ("direct_sparse", "dense_parity") and not row["direct_sparse_decode_guard_passed"]:
         failures.append(f"{case_dir.name}: direct sparse decode guard failed: {row['direct_sparse_failure_summary']}")
-    if proof_kind == "compact_flash" and not row["compact_flash_guard_passed"]:
+    if proof_kind in ("compact_flash", "compact_flash_synthetic_consumer") and not row["compact_flash_guard_passed"]:
         failures.append(f"{case_dir.name}: compact flash guard failed: {row['compact_flash_failure_summary']}")
     if row["candidate_sparse_mask_nodes"] not in (0, None):
         failures.append(f"{case_dir.name}: sparse-mask nodes still present")
@@ -443,25 +492,32 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
         failures.append(f"{case_dir.name}: dense parity baseline did not materialize sparse masks")
     if proof_kind == "dense_parity" and row["baseline_dsa_sparse_attn_dispatches"] not in (0, None):
         failures.append(f"{case_dir.name}: dense parity baseline used DSA sparse attention")
-    if proof_kind == "compact_flash" and not row["candidate_flash_attn_ext_records"]:
+    if proof_kind in ("compact_flash", "compact_flash_synthetic_consumer") and not row["candidate_flash_attn_ext_records"]:
         failures.append(f"{case_dir.name}: missing compact flash attention dispatch evidence")
-    if proof_kind == "compact_flash" and not row["candidate_partial_kv_flash_records"]:
+    if proof_kind in ("compact_flash", "compact_flash_synthetic_consumer") and not row["candidate_partial_kv_flash_records"]:
         failures.append(f"{case_dir.name}: compact flash did not prove partial-KV sparse selection")
-    if proof_kind == "compact_flash" and not row["candidate_compact_mask_omission_records"]:
+    if proof_kind in ("compact_flash", "compact_flash_synthetic_consumer") and not row["candidate_compact_mask_omission_records"]:
         failures.append(f"{case_dir.name}: missing compact MLA KQ mask-omission evidence")
-    if proof_kind == "compact_flash" and row["candidate_materialized_mla_kq_mask_records"] not in (0, None):
+    if proof_kind in ("compact_flash", "compact_flash_synthetic_consumer") and row["candidate_materialized_mla_kq_mask_records"] not in (0, None):
         failures.append(f"{case_dir.name}: compact flash still materialized MLA KQ mask")
-    if proof_kind == "compact_flash" and not (
+    if proof_kind in ("compact_flash", "compact_flash_synthetic_consumer") and not (
         row["candidate_compact_get_rows_records"]
         or row["candidate_dsa_compact_get_rows_fused_records"]
     ):
         failures.append(f"{case_dir.name}: missing compact K/V gather evidence")
     if (
-        proof_kind == "compact_flash"
+        proof_kind in ("compact_flash", "compact_flash_synthetic_consumer")
         and row["candidate_compact_get_rows_records"]
         and not row["candidate_compact_get_rows_nodes"]
     ):
         failures.append(f"{case_dir.name}: missing compact K/V gather timing nodes")
+    if proof_kind == "compact_flash_synthetic_consumer":
+        if row["input_source_kind"] != "synthetic" or row["input_source_top_k_sideband"] != 2048:
+            failures.append(f"{case_dir.name}: expected synthetic 2048-wide top-k sideband input")
+        if not row["synthetic_kv_warmup"]:
+            failures.append(f"{case_dir.name}: expected synthetic KV warmup")
+        if row["position_start"] < 65536 or row["kv_warmup_tokens"] < 65536:
+            failures.append(f"{case_dir.name}: expected high-position 65k consumer proof")
     if proof_kind != "dense_parity" and row["candidate_indexer_topk_nodes"] not in (0, None):
         failures.append(f"{case_dir.name}: candidate recomputed indexer_topk")
     if proof_kind != "dense_parity" and row["candidate_indexer_nodes"] not in (0, None):
@@ -472,7 +528,7 @@ for case_dir in sorted(path for path in out_dir.iterdir() if path.is_dir()):
 summary = {
     "passed": not failures,
     "phase": "C",
-    "scope": "native GLM-5.2 sparse decode policy; direct sparse for top-k within the decode cap, compact flash beyond the cap; dense sparse masks, route fusion, prefill, MTP, and split work disabled",
+    "scope": "native GLM-5.2 sparse decode policy; direct sparse for top-k within the decode cap, compact flash beyond the cap, and high-position Shared-consumer compact flash with explicit synthetic IndexShare sideband; dense sparse masks, route fusion, prefill, MTP, and split work disabled",
     "rows": rows,
     "failures": failures,
 }

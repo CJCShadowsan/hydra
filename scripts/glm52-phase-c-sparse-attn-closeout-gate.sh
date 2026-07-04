@@ -22,6 +22,8 @@ The wrapper combines:
   - true dense fallback parity vs direct sparse decode
   - direct sparse decode rows with Full/Shared IndexShare sideband reuse
   - compact flash long-KV decode rows
+  - high-position Shared-consumer compact flash with explicit 2048-wide
+    IndexShare/top-k sideband
   - prefill policy rows for short direct sparse, guarded large direct sparse,
     and safe dense fallback
 
@@ -157,6 +159,8 @@ if not any(row.get("proof_kind") == "direct_sparse" for row in decode_rows):
     failures.append("missing direct sparse decode row")
 if not quick and not any(row.get("proof_kind") == "compact_flash" for row in decode_rows):
     failures.append("missing compact flash decode row")
+if not quick and not any(row.get("proof_kind") == "compact_flash_synthetic_consumer" for row in decode_rows):
+    failures.append("missing high-position Shared-consumer compact flash row")
 if not any(row.get("label") == "prefill-short" for row in prefill_rows):
     failures.append("missing short prefill row")
 if not any(row.get("label") == "prefill-long-direct-sparse" for row in prefill_rows):
