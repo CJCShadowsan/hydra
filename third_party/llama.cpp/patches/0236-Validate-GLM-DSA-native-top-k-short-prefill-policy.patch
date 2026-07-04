@@ -1,0 +1,75 @@
+From cd018517ea861136a45da965f099fb64c01d964b Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 11:05:00 +1000
+Subject: [PATCH 236/236] Validate GLM DSA native top-k short prefill policy
+
+---
+ tests/test-llama-archs.cpp | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index e83bf35db..5a01a20ea 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -690,7 +690,8 @@ static glm_dsa_graph_op_counts run_glm_dsa_prefill_graph(
+         const std::vector<ggml_backend_dev_t> & devs,
+         uint32_t n_tokens,
+         uint32_t context_length = 128,
+-        uint32_t indexer_top_k = 8) {
++        uint32_t indexer_top_k = 8,
++        bool output_all = true) {
+     gguf_context_ptr gguf_ctx = get_gguf_ctx(
+             LLM_ARCH_GLM_DSA,
+             true,
+@@ -711,7 +712,7 @@ static glm_dsa_graph_op_counts run_glm_dsa_prefill_graph(
+ 
+     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
+     const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
+-    decode_tokens(model_ctx.second.get(), tokens, 0);
++    decode_tokens(model_ctx.second.get(), tokens, 0, output_all);
+ 
+     return counts;
+ }
+@@ -964,6 +965,31 @@ static bool test_glm_dsa_short_prefill_dense_graph(
+     }
+ }
+ 
++static bool test_glm_dsa_native_top_k_short_prefill_dense_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "2048");
++        // GLM-5.2's package policy keeps short prefill dense below the
++        // threshold. Use output_all=false so this remains prefill rather than
++        // speculative verification, while still exercising native top_k=768.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph(seed, devs, 768, 1024, 768, false);
++
++        if (counts.top_k == 0 || counts.max_top_k_width != 768 ||
++                counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA native top-k short prefill graph counted total=%d top_k=%d max_top_k_width=%lld dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.top_k, (long long) counts.max_top_k_width, counts.dsa_sparse_attn, counts.compact_get_rows,
++                    counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA native top-k short prefill dense graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
+ static bool test_glm_dsa_long_prefill_dense_mask_guard_graph(
+         const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+     try {
+@@ -1297,6 +1323,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+                 test_glm_dsa_verify_dense_graph(seed, {}) &&
+                 test_glm_dsa_native_top_k_verify_dense_graph(seed, {}) &&
+                 test_glm_dsa_short_prefill_dense_graph(seed, {}) &&
++                test_glm_dsa_native_top_k_short_prefill_dense_graph(seed, {}) &&
+                 test_glm_dsa_long_prefill_dense_mask_guard_graph(seed, {}) &&
+                 test_glm_dsa_native_top_k_long_prefill_dense_mask_guard_graph(seed, {});
+         if (!glm_dsa_contract_ok) {
+-- 
+2.53.0
+
