@@ -75,6 +75,21 @@ impl GlmDsaPolicyConfig {
         }
     }
 
+    fn native_log_summary(&self) -> String {
+        format!(
+            "profile={},direct_sparse_attn={},direct_sparse_prefill={},disable_compact_flash_attn={},unproven_large_direct_sparse_prefill={},short_prefill_max_tokens={},direct_sparse_decode_max_top_k={},dense_sparse_mask_max_bytes={},compact_flash_min_kv={}",
+            self.profile,
+            self.direct_sparse_attn,
+            self.direct_sparse_prefill,
+            self.disable_compact_flash_attn,
+            self.unproven_large_direct_sparse_prefill,
+            optional_u32_log(self.short_prefill_max_tokens),
+            optional_u32_log(self.direct_sparse_decode_max_top_k),
+            optional_u64_log(self.dense_sparse_mask_max_bytes),
+            optional_u32_log(self.compact_flash_min_kv),
+        )
+    }
+
     fn flags(&self) -> u32 {
         let mut flags = 0;
         if self.direct_sparse_attn {
@@ -91,6 +106,18 @@ impl GlmDsaPolicyConfig {
         }
         flags
     }
+}
+
+fn optional_u32_log(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn optional_u64_log(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1074,7 +1101,7 @@ impl RuntimeConfig {
             self.filter_tensors_on_load,
             self.glm_dsa_policy
                 .as_ref()
-                .map(|policy| policy.profile.to_string())
+                .map(GlmDsaPolicyConfig::native_log_summary)
                 .unwrap_or_else(|| "none".to_string()),
         )
     }
@@ -4266,7 +4293,7 @@ mod tests {
 
     use super::{
         ChatTemplateMessage, FlashAttentionType, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0,
-        LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
+        GlmDsaPolicyConfig, LLAMA_SERVER_DEFAULT_N_BATCH, LLAMA_SERVER_DEFAULT_N_UBATCH, ModelInfo,
         NativeLogAggregator, NativeLogEvent, RuntimeConfig, RuntimeLoadMode,
         SKIPPY_UNIFIED_KV_DEFAULT_N_BATCH, SamplingConfig, StageModel, Status, TensorRole,
         flush_native_log_writer, format_skippy_error, parse_cache_type, parse_layer_assign_index,
@@ -4556,6 +4583,38 @@ mod tests {
         assert_eq!(raw.raw.n_ubatch, LLAMA_SERVER_DEFAULT_N_UBATCH as i32);
         assert_eq!(raw.raw.n_threads, 12);
         assert_eq!(raw.raw.n_threads_batch, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_config_raw_and_log_preserve_glm_dsa_policy() -> anyhow::Result<()> {
+        let config = RuntimeConfig {
+            glm_dsa_policy: Some(GlmDsaPolicyConfig {
+                short_prefill_max_tokens: Some(2048),
+                compact_flash_min_kv: Some(1),
+                dense_sparse_mask_max_bytes: Some(268_435_456),
+                ..GlmDsaPolicyConfig::glm_dsa_v1()
+            }),
+            ..RuntimeConfig::default()
+        };
+
+        let raw = config.as_raw()?;
+        let summary = config.native_log_summary();
+
+        assert_eq!(
+            raw.raw.glm_dsa_policy_profile,
+            skippy_ffi::GLM_DSA_POLICY_PROFILE_V1
+        );
+        assert_ne!(raw.raw.glm_dsa_policy_flags, 0);
+        assert_eq!(raw.raw.glm_dsa_short_prefill_max_tokens, 2048);
+        assert_eq!(raw.raw.glm_dsa_compact_flash_min_kv, 1);
+        assert_eq!(raw.raw.glm_dsa_dense_sparse_mask_max_bytes, 268_435_456);
+        assert!(summary.contains("glm_dsa_policy=profile=1"));
+        assert!(summary.contains("direct_sparse_attn=true"));
+        assert!(summary.contains("disable_compact_flash_attn=false"));
+        assert!(summary.contains("short_prefill_max_tokens=2048"));
+        assert!(summary.contains("compact_flash_min_kv=1"));
+        assert!(summary.contains("dense_sparse_mask_max_bytes=268435456"));
         Ok(())
     }
 

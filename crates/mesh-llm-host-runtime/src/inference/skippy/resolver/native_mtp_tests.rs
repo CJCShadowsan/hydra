@@ -141,13 +141,13 @@ fn glm_dsa_generation() -> PackageGenerationInfo {
             indexshare: Some("required".to_string()),
             experimental: Some(
                 skippy_runtime::package::PackageGenerationExperimentalPolicyInfo {
-                    selected_row_flash: Some("off".to_string()),
+                    selected_row_flash: Some("evidence-gated".to_string()),
                 },
             ),
         }),
         thresholds: Some(PackageGenerationThresholdsInfo {
             short_prefill_max_tokens: Some(2048),
-            compact_flash_min_kv: Some(256),
+            compact_flash_min_kv: Some(1),
             dense_mask_max_bytes: Some(268435456),
         }),
         speculative_decoding: None,
@@ -181,9 +181,9 @@ fn resolver_exposes_package_generation_policy() {
     assert_eq!(policy.long_prefill, "sparse-chunked");
     assert_eq!(policy.verify, "auto");
     assert_eq!(policy.indexshare.as_deref(), Some("required"));
-    assert_eq!(policy.selected_row_flash.as_deref(), Some("off"));
+    assert_eq!(policy.selected_row_flash.as_deref(), Some("evidence-gated"));
     assert_eq!(policy.thresholds.short_prefill_max_tokens, Some(2048));
-    assert_eq!(policy.thresholds.compact_flash_min_kv, Some(256));
+    assert_eq!(policy.thresholds.compact_flash_min_kv, Some(1));
     assert_eq!(policy.thresholds.dense_mask_max_bytes, Some(268435456));
 
     let runtime_options = resolved
@@ -199,7 +199,7 @@ fn resolver_exposes_package_generation_policy() {
     assert!(runtime_policy.direct_sparse_attn);
     assert!(!runtime_policy.direct_sparse_prefill);
     assert_eq!(runtime_policy.short_prefill_max_tokens, Some(2048));
-    assert_eq!(runtime_policy.compact_flash_min_kv, Some(256));
+    assert_eq!(runtime_policy.compact_flash_min_kv, Some(1));
     assert_eq!(runtime_policy.dense_sparse_mask_max_bytes, Some(268435456));
 }
 

@@ -15,7 +15,7 @@ use skippy_runtime::{
 };
 
 use crate::package::select_package_parts;
-use skippy_runtime::package::SelectedPackageParts;
+use skippy_runtime::package::{PackageGenerationInfo, SelectedPackageParts, inspect_layer_package};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeLaunchOverrides {
@@ -1288,6 +1288,8 @@ fn runtime_config_from_stage_config(
         .map(u32::try_from)
         .transpose()
         .with_context(|| format!("n_threads_batch exceeds u32 for {}", config.stage_id))?;
+    let glm_dsa_policy = effective_glm_dsa_policy(config, overrides)?;
+
     Ok(RuntimeConfig {
         stage_index: config.stage_index,
         layer_start: config.layer_start,
@@ -1322,8 +1324,56 @@ fn runtime_config_from_stage_config(
         include_embeddings: config.layer_start == 0,
         include_output: config.downstream.is_none(),
         filter_tensors_on_load: config.filter_tensors_on_load,
-        glm_dsa_policy: overrides.glm_dsa_policy.clone(),
+        glm_dsa_policy,
     })
+}
+
+fn effective_glm_dsa_policy(
+    config: &StageConfig,
+    overrides: &RuntimeLaunchOverrides,
+) -> Result<Option<skippy_runtime::GlmDsaPolicyConfig>> {
+    if overrides.glm_dsa_policy.is_some() {
+        return Ok(overrides.glm_dsa_policy.clone());
+    }
+    if config.load_mode != LoadMode::LayerPackage {
+        return Ok(None);
+    }
+    let Some(model_path) = config.model_path.as_deref() else {
+        return Ok(None);
+    };
+    let info = inspect_layer_package(model_path).with_context(|| {
+        format!(
+            "inspect layer package generation policy for {}",
+            config.stage_id
+        )
+    })?;
+    Ok(runtime_glm_dsa_policy_from_generation(
+        info.generation.as_ref(),
+    ))
+}
+
+fn runtime_glm_dsa_policy_from_generation(
+    generation: Option<&PackageGenerationInfo>,
+) -> Option<skippy_runtime::GlmDsaPolicyConfig> {
+    let generation = generation?;
+    let policy = generation.policy.as_ref()?;
+    if policy.profile != "glm-dsa-v1" {
+        return None;
+    }
+
+    let thresholds = generation.thresholds.as_ref();
+    let mut runtime_policy = skippy_runtime::GlmDsaPolicyConfig::glm_dsa_v1();
+    runtime_policy.direct_sparse_attn =
+        matches!(policy.decode.as_str(), "compact-flash" | "direct-sparse");
+    runtime_policy.disable_compact_flash_attn = policy.decode != "compact-flash";
+    runtime_policy.direct_sparse_prefill = policy.short_prefill == "direct-sparse";
+    runtime_policy.short_prefill_max_tokens =
+        thresholds.and_then(|thresholds| thresholds.short_prefill_max_tokens);
+    runtime_policy.dense_sparse_mask_max_bytes =
+        thresholds.and_then(|thresholds| thresholds.dense_mask_max_bytes);
+    runtime_policy.compact_flash_min_kv =
+        thresholds.and_then(|thresholds| thresholds.compact_flash_min_kv);
+    Some(runtime_policy)
 }
 
 fn open_stage_model(path: &std::path::Path, runtime_config: &RuntimeConfig) -> Result<StageModel> {
@@ -1363,6 +1413,8 @@ fn open_stage_model_from_parts_with_events(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use anyhow::{Result, bail};
     use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig, StageDevice};
     use skippy_runtime::FlashAttentionType as RuntimeFlashAttentionType;
@@ -1569,19 +1621,65 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_derives_glm_dsa_policy_from_layer_package_generation() {
+        let package_dir = tempfile::tempdir().unwrap();
+        write_glm_dsa_package_manifest(package_dir.path());
+        let config = layer_package_stage_config(package_dir.path().to_string_lossy().to_string());
+
+        let runtime_config =
+            runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
+        let policy = runtime_config
+            .glm_dsa_policy
+            .expect("GLM-DSA package generation policy should reach runtime config");
+
+        assert!(policy.direct_sparse_attn);
+        assert!(!policy.direct_sparse_prefill);
+        assert!(!policy.disable_compact_flash_attn);
+        assert_eq!(policy.short_prefill_max_tokens, Some(2048));
+        assert_eq!(policy.compact_flash_min_kv, Some(1));
+        assert_eq!(policy.dense_sparse_mask_max_bytes, Some(268_435_456));
+    }
+
+    #[test]
+    fn runtime_config_prefers_explicit_glm_dsa_override_over_package_policy() {
+        let package_dir = tempfile::tempdir().unwrap();
+        write_glm_dsa_package_manifest(package_dir.path());
+        let config = layer_package_stage_config(package_dir.path().to_string_lossy().to_string());
+        let overrides = RuntimeLaunchOverrides {
+            glm_dsa_policy: Some(skippy_runtime::GlmDsaPolicyConfig {
+                compact_flash_min_kv: Some(42),
+                disable_compact_flash_attn: true,
+                ..skippy_runtime::GlmDsaPolicyConfig::glm_dsa_v1()
+            }),
+            ..RuntimeLaunchOverrides::default()
+        };
+
+        let runtime_config = runtime_config_from_stage_config(&config, &overrides).unwrap();
+        let policy = runtime_config
+            .glm_dsa_policy
+            .expect("explicit GLM-DSA policy override should be preserved");
+
+        assert_eq!(policy.compact_flash_min_kv, Some(42));
+        assert!(policy.disable_compact_flash_attn);
+    }
+
+    #[test]
     fn runtime_config_omits_input_embeddings_for_final_non_first_stage() {
+        let package_dir = tempfile::tempdir().unwrap();
+        write_glm_dsa_package_manifest(package_dir.path());
+        let package_path = package_dir.path().to_string_lossy().to_string();
         let config = StageConfig {
             run_id: "run-a".to_string(),
             topology_id: "topology-a".to_string(),
             model_id: "model-a".to_string(),
-            package_ref: Some("/tmp/package".to_string()),
+            package_ref: Some(package_path.clone()),
             manifest_sha256: Some("manifest".to_string()),
             source_model_path: None,
             source_model_sha256: None,
             source_model_bytes: None,
             materialized_path: None,
             materialized_pinned: false,
-            model_path: Some("/tmp/package".to_string()),
+            model_path: Some(package_path),
             projector_path: None,
             stage_id: "stage-2".to_string(),
             stage_index: 2,
@@ -1767,5 +1865,114 @@ mod tests {
         config.downstream = None;
 
         assert!(!should_attach_package_projector(&config));
+    }
+
+    fn layer_package_stage_config(model_path: String) -> StageConfig {
+        StageConfig {
+            run_id: "run-a".to_string(),
+            topology_id: "topology-a".to_string(),
+            model_id: "model-a".to_string(),
+            package_ref: Some(model_path.clone()),
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some(model_path),
+            projector_path: None,
+            stage_id: "stage-0".to_string(),
+            stage_index: 0,
+            layer_start: 0,
+            layer_end: 1,
+            ctx_size: 512,
+            lane_count: 1,
+            n_batch: None,
+            n_ubatch: None,
+            n_gpu_layers: -1,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Auto,
+            filter_tensors_on_load: true,
+            use_mmap: true,
+            use_mmap_buffer: true,
+            selected_device: None,
+            kv_cache: None,
+            load_mode: LoadMode::LayerPackage,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: None,
+            downstream: None,
+        }
+    }
+
+    fn write_glm_dsa_package_manifest(package_dir: &std::path::Path) {
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "model_id": "model-a",
+            "source_model": {
+                "path": "model-a.gguf",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "format": "layer-package",
+            "layer_count": 1,
+            "activation_width": 4096,
+            "generation": {
+                "policy": {
+                    "profile": "glm-dsa-v1",
+                    "decode": "compact-flash",
+                    "short_prefill": "dense",
+                    "long_prefill": "sparse-chunked",
+                    "verify": "auto",
+                    "indexshare": "required",
+                    "experimental": {
+                        "selected_row_flash": "evidence-gated"
+                    }
+                },
+                "thresholds": {
+                    "short_prefill_max_tokens": 2048,
+                    "compact_flash_min_kv": 1,
+                    "dense_mask_max_bytes": 268435456
+                }
+            },
+            "shared": {
+                "metadata": {
+                    "path": "metadata.gguf",
+                    "tensor_count": 1,
+                    "tensor_bytes": 1,
+                    "artifact_bytes": 1,
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                },
+                "embeddings": {
+                    "path": "embeddings.gguf",
+                    "tensor_count": 1,
+                    "tensor_bytes": 1,
+                    "artifact_bytes": 1,
+                    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                },
+                "output": {
+                    "path": "output.gguf",
+                    "tensor_count": 1,
+                    "tensor_bytes": 1,
+                    "artifact_bytes": 1,
+                    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                }
+            },
+            "layers": [
+                {
+                    "layer_index": 0,
+                    "path": "layers/00000.gguf",
+                    "tensor_count": 1,
+                    "tensor_bytes": 1,
+                    "artifact_bytes": 1,
+                    "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                }
+            ],
+            "skippy_abi_version": "0.1.31"
+        });
+        fs::write(
+            package_dir.join("model-package.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 }
