@@ -119,6 +119,14 @@ sparse for short phase shapes (`68.58-70.80 us/run` versus
 `461.98-473.75 us/run` for 4-16 tokens), so GLM-DSA packages should keep
 short prefill and verification dense by default unless a backend-specific sparse
 path has its own evidence.
+After those phase gates, the next measured local bottleneck is routed expert
+decode rather than top-k routing. The current Metal MoE fixture estimates one
+GLM-5.2 routed FFN decode layer at `386.81 us`, with expert matmuls accounting
+for `376.28 us` (`97.3%`). Route/top-k plus weighted sum is only `10.53 us`
+(`2.7%`). That evidence should inform runtime optimization order, but it does
+not add new manifest schema: package policy still belongs under
+`generation.policy`, and numeric resolver hints still belong under
+`generation.thresholds`.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

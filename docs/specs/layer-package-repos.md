@@ -524,6 +524,16 @@ policy after backend evidence exists. Treat these as backend evidence for the
 current threshold defaults, not as portable constants across every device or
 quant.
 
+Once those attention phase gates are in place, the measured local GLM-5.2
+bottleneck shifts to routed expert matmuls. The current Metal MoE fixture
+estimates a routed FFN decode layer at `386.81 us`: routed gate/up/down matmuls
+account for `376.28 us` (`97.3%`), while route/top-k plus weighted sum accounts
+for `10.53 us` (`2.7%`). These numbers justify prioritizing backend
+`MUL_MAT_ID`/expert matmul work after sparse-attention correctness, but they do
+not require a new manifest object. Policy remains the semantic phase contract
+under `generation.policy`; performance cutoffs and byte/token limits remain
+numeric resolver inputs under `generation.thresholds`.
+
 The IndexShare numbers are why `generation.policy.indexshare` is a first-class
 policy field instead of an implementation note. For GLM-5.2-style DSA with a
 `top_k` width of `768`, carrying the shared top-k sideband costs `3 KiB/token`.
