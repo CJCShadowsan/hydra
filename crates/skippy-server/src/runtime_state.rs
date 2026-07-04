@@ -1160,12 +1160,14 @@ pub fn load_runtime_with_overrides(
                     .first()
                     .map(|path| path.to_string_lossy().to_string());
             }
+            log_runtime_config(config, &runtime_config);
             open_stage_model_from_parts(&selected.absolute_paths, &runtime_config)?
         }
         _ => {
             let Some(model_path) = config.model_path.as_ref().map(std::path::Path::new) else {
                 return Ok(None);
             };
+            log_runtime_config(config, &runtime_config);
             open_stage_model(model_path, &runtime_config)?
         }
     };
@@ -1206,6 +1208,7 @@ pub fn load_runtime_with_overrides_and_open_events(
                     .first()
                     .map(|path| path.to_string_lossy().to_string());
             }
+            log_runtime_config(config, &runtime_config);
             open_stage_model_from_parts_with_events(
                 &selected.absolute_paths,
                 &runtime_config,
@@ -1216,6 +1219,7 @@ pub fn load_runtime_with_overrides_and_open_events(
             let Some(model_path) = config.model_path.as_ref().map(std::path::Path::new) else {
                 return Ok(None);
             };
+            log_runtime_config(config, &runtime_config);
             open_stage_model_with_events(model_path, &runtime_config, model_open_event_reporter)?
         }
     };
@@ -1268,6 +1272,14 @@ fn log_layer_package_open(
 
 fn should_attach_package_projector(config: &StageConfig) -> bool {
     config.stage_index == 0 && config.layer_start == 0
+}
+
+fn log_runtime_config(config: &StageConfig, runtime_config: &RuntimeConfig) {
+    eprintln!(
+        "skippy-server: runtime-config stage_id={} {}",
+        config.stage_id,
+        runtime_config.native_log_summary(),
+    );
 }
 
 fn runtime_config_from_stage_config(

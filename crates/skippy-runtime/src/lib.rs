@@ -75,7 +75,7 @@ impl GlmDsaPolicyConfig {
         }
     }
 
-    fn native_log_summary(&self) -> String {
+    pub fn native_log_summary(&self) -> String {
         format!(
             "profile={},direct_sparse_attn={},direct_sparse_prefill={},disable_compact_flash_attn={},unproven_large_direct_sparse_prefill={},short_prefill_max_tokens={},direct_sparse_decode_max_top_k={},dense_sparse_mask_max_bytes={},compact_flash_min_kv={}",
             self.profile,
@@ -1073,7 +1073,7 @@ impl RuntimeConfig {
         })
     }
 
-    fn native_log_summary(&self) -> String {
+    pub fn native_log_summary(&self) -> String {
         let n_batch = self
             .n_batch
             .unwrap_or_else(|| default_n_batch_for_lane_count(self.lane_count));
