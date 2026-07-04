@@ -209,6 +209,8 @@ pub(crate) struct CompactFlashPolicyRecord {
     pub(crate) enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) backend_sparse_supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backend_compact_supported: Option<bool>,
     pub(crate) flash_attn: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) phase: Option<String>,
@@ -1053,6 +1055,10 @@ fn parse_compact_flash_policy_record(line: &str) -> Result<CompactFlashPolicyRec
             &fields,
             "backend_sparse_supported",
         )?,
+        backend_compact_supported: parse_optional_bool_int_field(
+            &fields,
+            "backend_compact_supported",
+        )?,
         flash_attn: parse_bool_int_field(&fields, "flash_attn")?,
         phase: fields.get("phase").map(|value| (*value).to_string()),
         decode_shape: parse_bool_int_field(&fields, "decode_shape")?,
@@ -1728,7 +1734,7 @@ mod tests {
     const DIRECT_SPARSE_DECISION_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1 sparse_batch=1 sparse_streams=1 prefill_cap=8 decode_max_top_k=256 sparse_kv=256 sparse_top_k=129 min_kv_topk_ratio=0 kv_topk_ratio=1 dense_mask_bytes=512 dense_mask_limit=536870912 phase=decode selector_reason=backend_sparse_unsupported direct_enabled=1 prefill_enabled=1 decode_shape=1 verify_shape=0 prefill_shape=1 large_prefill_shape=0 token_shape_allowed=1 backend_sparse_supported=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
-    const COMPACT_FLASH_POLICY_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=256 top_k=129 decode_max_top_k=256 compact_min_kv=1 kv_topk_ratio=1 forced=0 disabled=0 large_decode_top_k=0 kv_ok=1 enabled=0 backend_sparse_supported=0 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=0 use_compact=0 selector_reason=backend_sparse_unsupported";
+    const COMPACT_FLASH_POLICY_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=256 top_k=129 decode_max_top_k=256 compact_min_kv=1 kv_topk_ratio=1 forced=0 disabled=0 large_decode_top_k=0 kv_ok=1 enabled=0 backend_compact_supported=0 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=0 use_compact=0 selector_reason=backend_compact_unsupported";
     const COMPACT_FLASH_POLICY_LINE_WITHOUT_MIN_RATIO: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
     const COMPACT_FLASH_MASK_LINE: &str = "skippy: glm_dsa_compact_flash_mask layer=30 omitted_mla_kq_mask=1 visible_kv=8192 ubatch_tokens=1 streams=1 max_top_k=2048";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 selected_keys=1048576 q_read_bytes=2415919104 k_read_bytes=1207959552 v_read_bytes=1073741824 mask_read_bytes=4194304 top_k_read_bytes=4194304 scratch_per_tg_bytes=1024 score_fma=603979776 value_fma=536870912 reduction_strategy=threadgroup_direct grid_x=32 grid_y=4 grid_z=8 threads_x=256 nwg=8 tmp_f16=1 dst_partial=1";
@@ -1884,6 +1890,7 @@ mod tests {
         assert!(record.use_compact);
         assert_eq!(record.selector_reason.as_deref(), Some("decode_compact"));
         assert_eq!(record.backend_sparse_supported, None);
+        assert_eq!(record.backend_compact_supported, None);
     }
 
     #[test]
@@ -1956,9 +1963,10 @@ mod tests {
         let record = &records[0];
         assert_eq!(
             record.selector_reason.as_deref(),
-            Some("backend_sparse_unsupported")
+            Some("backend_compact_unsupported")
         );
-        assert_eq!(record.backend_sparse_supported, Some(false));
+        assert_eq!(record.backend_sparse_supported, None);
+        assert_eq!(record.backend_compact_supported, Some(false));
         assert!(!record.use_compact);
     }
 

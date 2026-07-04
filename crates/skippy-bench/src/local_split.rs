@@ -73,6 +73,17 @@ struct InprocessChainBoundaryResult {
     token_id: i32,
     predicted_token: Option<i32>,
     activation_width: i32,
+    prefill_token_count: u32,
+    decode_position: i32,
+    prefill_stage0_payload_bytes: u64,
+    prefill_stage0_sideband_bytes: usize,
+    prefill_stage0_sideband_i32_count: usize,
+    prefill_stage1_payload_bytes: u64,
+    prefill_stage1_sideband_bytes: usize,
+    prefill_stage1_sideband_i32_count: usize,
+    prefill_stage2_payload_bytes: u64,
+    prefill_stage2_sideband_bytes: usize,
+    prefill_stage2_sideband_i32_count: usize,
     stage0_payload_bytes: u64,
     stage0_sideband_bytes: usize,
     stage0_sideband_i32_count: usize,
@@ -256,6 +267,30 @@ pub fn local_split_chain_inprocess(args: LocalSplitChainInprocessArgs) -> Result
             "token_id": result.token_id,
             "predicted_token": result.predicted_token,
             "activation_width": result.activation_width,
+            "prefill_token_count": result.prefill_token_count,
+            "decode_position": result.decode_position,
+            "prefill": {
+                "stages": [
+                    {
+                        "stage_index": 0,
+                        "payload_bytes": result.prefill_stage0_payload_bytes,
+                        "sideband_bytes": result.prefill_stage0_sideband_bytes,
+                        "sideband_i32_count": result.prefill_stage0_sideband_i32_count,
+                    },
+                    {
+                        "stage_index": 1,
+                        "payload_bytes": result.prefill_stage1_payload_bytes,
+                        "sideband_bytes": result.prefill_stage1_sideband_bytes,
+                        "sideband_i32_count": result.prefill_stage1_sideband_i32_count,
+                    },
+                    {
+                        "stage_index": 2,
+                        "payload_bytes": result.prefill_stage2_payload_bytes,
+                        "sideband_bytes": result.prefill_stage2_sideband_bytes,
+                        "sideband_i32_count": result.prefill_stage2_sideband_i32_count,
+                    }
+                ]
+            },
             "stages": [
                 {
                     "stage_index": 0,
@@ -856,7 +891,8 @@ fn run_inprocess_chain_boundary(
     let tokens = stage0
         .tokenize(&args.prompt, true)
         .context("failed to tokenize prompt")?;
-    let token_id = *tokens.first().context("prompt produced no tokens")?;
+    let (prefill_tokens, decode_token_id, decode_position, decode_positions) =
+        split_prefill_decode_tokens(&tokens, args.prefill_token_count)?;
     let mut session0 = stage0
         .create_session()
         .context("failed to create stage 0 session")?;
@@ -867,23 +903,35 @@ fn run_inprocess_chain_boundary(
         .create_session()
         .context("failed to create stage 2 session")?;
 
+    let prefill = if prefill_tokens.is_empty() {
+        InprocessChainPrefillMetrics::default()
+    } else {
+        run_inprocess_chain_prefill(
+            &mut session0,
+            &mut session1,
+            &mut session2,
+            prefill_tokens,
+            args.final_output,
+        )?
+    };
+
     let (_stage0_prediction, boundary0) = session0
-        .decode_step_frame(token_id, None, 0)
+        .decode_step_frame(decode_token_id, None, 0)
         .context("stage 0 failed to produce activation frame")?;
     if boundary0.payload.is_empty() {
         bail!("stage 0 produced an empty activation frame");
     }
-    let activation_width = boundary_activation_width(&boundary0, &[0])?;
+    let activation_width = boundary_activation_width(&boundary0, &decode_positions)?;
 
     let (_stage1_prediction, boundary1) = session1
-        .decode_step_frame(token_id, Some(&boundary0), 0)
+        .decode_step_frame(decode_token_id, Some(&boundary0), 0)
         .context("stage 1 failed to consume activation frame")?;
     if boundary1.payload.is_empty() {
         bail!("stage 1 produced an empty activation frame");
     }
 
     let (stage2_prediction, boundary2) = session2
-        .decode_step_frame(token_id, Some(&boundary1), 0)
+        .decode_step_frame(decode_token_id, Some(&boundary1), 0)
         .context("stage 2 failed to consume activation frame")?;
     if args.final_output {
         if stage2_prediction < 0 {
@@ -895,23 +943,116 @@ fn run_inprocess_chain_boundary(
 
     Ok(InprocessChainBoundaryResult {
         model_identity,
-        token_id,
+        token_id: decode_token_id,
         predicted_token: args.final_output.then_some(stage2_prediction),
         activation_width,
+        prefill_token_count: args.prefill_token_count,
+        decode_position,
+        prefill_stage0_payload_bytes: prefill.stage0_payload_bytes,
+        prefill_stage0_sideband_bytes: prefill.stage0_sideband_bytes,
+        prefill_stage0_sideband_i32_count: prefill.stage0_sideband_i32_count,
+        prefill_stage1_payload_bytes: prefill.stage1_payload_bytes,
+        prefill_stage1_sideband_bytes: prefill.stage1_sideband_bytes,
+        prefill_stage1_sideband_i32_count: prefill.stage1_sideband_i32_count,
+        prefill_stage2_payload_bytes: prefill.stage2_payload_bytes,
+        prefill_stage2_sideband_bytes: prefill.stage2_sideband_bytes,
+        prefill_stage2_sideband_i32_count: prefill.stage2_sideband_i32_count,
         stage0_payload_bytes: boundary0.desc.payload_bytes,
-        stage0_sideband_bytes: glm_dsa_sideband_bytes(&boundary0, &[0])?,
-        stage0_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary0, &[0])?,
+        stage0_sideband_bytes: glm_dsa_sideband_bytes(&boundary0, &decode_positions)?,
+        stage0_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary0, &decode_positions)?,
         stage1_payload_bytes: boundary1.desc.payload_bytes,
-        stage1_sideband_bytes: glm_dsa_sideband_bytes(&boundary1, &[0])?,
-        stage1_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary1, &[0])?,
+        stage1_sideband_bytes: glm_dsa_sideband_bytes(&boundary1, &decode_positions)?,
+        stage1_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary1, &decode_positions)?,
         stage2_payload_bytes: boundary2.desc.payload_bytes,
-        stage2_sideband_bytes: glm_dsa_sideband_bytes(&boundary2, &[0])?,
-        stage2_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary2, &[0])?,
+        stage2_sideband_bytes: glm_dsa_sideband_bytes(&boundary2, &decode_positions)?,
+        stage2_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary2, &decode_positions)?,
         split_layer_1: args.split_layer_1,
         split_layer_2: args.split_layer_2,
         layer_end: args.layer_end,
         final_output: args.final_output,
     })
+}
+
+#[derive(Default)]
+struct InprocessChainPrefillMetrics {
+    stage0_payload_bytes: u64,
+    stage0_sideband_bytes: usize,
+    stage0_sideband_i32_count: usize,
+    stage1_payload_bytes: u64,
+    stage1_sideband_bytes: usize,
+    stage1_sideband_i32_count: usize,
+    stage2_payload_bytes: u64,
+    stage2_sideband_bytes: usize,
+    stage2_sideband_i32_count: usize,
+}
+
+fn split_prefill_decode_tokens(
+    tokens: &[i32],
+    prefill_token_count: u32,
+) -> Result<(&[i32], i32, i32, Vec<i32>)> {
+    let decode_index =
+        usize::try_from(prefill_token_count).context("prefill token count exceeds usize")?;
+    let decode_token = *tokens.get(decode_index).with_context(|| {
+        format!(
+            "prompt produced {} token(s), but --prefill-token-count {prefill_token_count} requires at least {} token(s)",
+            tokens.len(),
+            decode_index + 1
+        )
+    })?;
+    let decode_position =
+        i32::try_from(prefill_token_count).context("decode position exceeds i32")?;
+    Ok((
+        &tokens[..decode_index],
+        decode_token,
+        decode_position,
+        vec![decode_position],
+    ))
+}
+
+fn run_inprocess_chain_prefill(
+    session0: &mut skippy_runtime::StageSession,
+    session1: &mut skippy_runtime::StageSession,
+    session2: &mut skippy_runtime::StageSession,
+    prefill_tokens: &[i32],
+    final_output: bool,
+) -> Result<InprocessChainPrefillMetrics> {
+    let positions = positions_for_token_count(prefill_tokens.len())?;
+    let boundary0 = session0
+        .prefill_chunk_frame_with_positions(prefill_tokens, &positions, None, 0)
+        .context("stage 0 failed to prefill activation frame")?;
+    if boundary0.payload.is_empty() {
+        bail!("stage 0 produced an empty prefill activation frame");
+    }
+    let boundary1 = session1
+        .prefill_chunk_frame_with_positions(prefill_tokens, &positions, Some(&boundary0), 0)
+        .context("stage 1 failed to consume prefill activation frame")?;
+    if boundary1.payload.is_empty() {
+        bail!("stage 1 produced an empty prefill activation frame");
+    }
+    let boundary2 = session2
+        .prefill_chunk_frame_with_positions(prefill_tokens, &positions, Some(&boundary1), 0)
+        .context("stage 2 failed to consume prefill activation frame")?;
+    if !final_output && boundary2.payload.is_empty() {
+        bail!("stage 2 produced an empty prefill activation frame");
+    }
+
+    Ok(InprocessChainPrefillMetrics {
+        stage0_payload_bytes: boundary0.desc.payload_bytes,
+        stage0_sideband_bytes: glm_dsa_sideband_bytes(&boundary0, &positions)?,
+        stage0_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary0, &positions)?,
+        stage1_payload_bytes: boundary1.desc.payload_bytes,
+        stage1_sideband_bytes: glm_dsa_sideband_bytes(&boundary1, &positions)?,
+        stage1_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary1, &positions)?,
+        stage2_payload_bytes: boundary2.desc.payload_bytes,
+        stage2_sideband_bytes: glm_dsa_sideband_bytes(&boundary2, &positions)?,
+        stage2_sideband_i32_count: glm_dsa_sideband_i32_count(&boundary2, &positions)?,
+    })
+}
+
+fn positions_for_token_count(token_count: usize) -> Result<Vec<i32>> {
+    (0..token_count)
+        .map(|position| i32::try_from(position).context("position exceeds i32"))
+        .collect()
 }
 
 fn chain_stage_config(

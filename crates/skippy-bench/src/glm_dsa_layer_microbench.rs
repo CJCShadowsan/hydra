@@ -10918,6 +10918,7 @@ mod tests {
             ratio_ok: Some(true),
             enabled: true,
             backend_sparse_supported: None,
+            backend_compact_supported: None,
             flash_attn: true,
             phase: Some(phase.to_string()),
             decode_shape: phase == "decode",

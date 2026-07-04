@@ -1109,6 +1109,12 @@ pub struct LocalSplitChainInprocessArgs {
     pub prompt: String,
     #[arg(
         long,
+        default_value_t = 0,
+        help = "Prefill this many prompt tokens through the in-process chain, then decode the next token. The prompt must tokenize to at least N+1 tokens."
+    )]
+    pub prefill_token_count: u32,
+    #[arg(
+        long,
         help = "Make the final stage include the output head and require a predicted token. Use only when --layer-end is the model output boundary."
     )]
     pub final_output: bool,
@@ -1366,6 +1372,8 @@ mod tests {
             "7",
             "--layer-end",
             "8",
+            "--prefill-token-count",
+            "16",
             "--final-output",
         ])
         .unwrap();
@@ -1379,6 +1387,7 @@ mod tests {
         assert_eq!(args.split_layer_1, 6);
         assert_eq!(args.split_layer_2, 7);
         assert_eq!(args.layer_end, 8);
+        assert_eq!(args.prefill_token_count, 16);
         assert!(args.final_output);
     }
 
