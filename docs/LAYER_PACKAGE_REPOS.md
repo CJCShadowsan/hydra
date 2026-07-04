@@ -47,6 +47,12 @@ Threshold values are numbers the resolver uses to decide whether a policy is
 appropriate on the current request/backend. A package should not encode Metal,
 CUDA, or Skippy implementation names in either place.
 
+Native speculation defaults belong beside those fields as
+`generation.speculative_decoding`. Keep it as a strategy map, not as a backend
+switch: `native-mtp` says the package has preserved native prediction tensors
+and recommends that strategy; it does not force a Skippy-specific speculation
+implementation.
+
 For GLM-DSA packages, set `generation.policy.profile` to `glm-dsa-v1` and
 declare phase choices such as decode `compact-flash`, short-prefill `dense`,
 long-prefill `sparse-chunked`, and IndexShare `required`. The policy values
@@ -78,6 +84,22 @@ Minimal GLM-DSA shape:
       "short_prefill_max_tokens": 2048,
       "compact_flash_min_kv": 1,
       "dense_mask_max_bytes": 268435456
+    },
+    "speculative_decoding": {
+      "default": "native-mtp-n1",
+      "strategies": {
+        "native-mtp-n1": {
+          "type": "native-mtp",
+          "prediction_depth": 1,
+          "layer_indices": [78],
+          "window_policy": {
+            "default": "fixed",
+            "initial_window": 1,
+            "min_window": 1,
+            "max_window": 1
+          }
+        }
+      }
     }
   }
 }
@@ -90,6 +112,7 @@ Authoring rule of thumb:
 | `generation.policy` | Stable semantic execution choices validated for the package. | `profile`, `decode`, `short_prefill`, `long_prefill`, `verify`, `indexshare` |
 | `generation.policy.experimental` | Named opt-in paths that need package/backend evidence before becoming defaults. | `selected_row_flash`, `moe_weighted_down`, `moe_merged_shared_gate_up` |
 | `generation.thresholds` | Numeric resolver inputs used to accept, reject, or fall back from a policy. | `short_prefill_max_tokens`, `compact_flash_min_kv`, `dense_mask_max_bytes` |
+| `generation.speculative_decoding` | Package-owned native or draft speculation strategy defaults. | `native-mtp-n1`, `prediction_depth`, `layer_indices`, `window_policy` |
 | GGUF metadata | Architecture correctness and tensor layout requirements. | GLM-DSA q/k/v split dimensions, IndexShare roles, MTP tensor presence |
 
 Writers should emit a profile only after the artifact actually matches that
@@ -117,6 +140,13 @@ IndexShare sideband is `3 KiB/token`: `384 KiB` for a 128-token chunk,
 for 2048 tokens. That size gap is why GLM-DSA packages should record
 dense-mask and compact-flash thresholds instead of leaving sparse policy
 implicit.
+
+Generation fields are not a place to record every benchmark knob. For example,
+q2_K routed-down quant experiments, Metal simdgroup sweeps, row-height tuning,
+or `mul_mv_id` versus `mul_mm_id` dispatch choices should stay in benchmark
+reports and runtime capability evidence until they become portable semantic
+policy. If they do become package defaults, express them as a profile version,
+a phase policy, or a numeric threshold rather than a backend flag.
 
 For current GLM-DSA decode tuning, the llama.cpp Metal fixtures measured
 compact selected-row flash at `63.40 us/run` for
@@ -195,6 +225,13 @@ against an isolated routed FFN estimate of `391.13 us`; both rows are plausible,
 and q2_K down is `1.09x` faster end-to-end on that production-shaped graph. This
 keeps q2_K down quality testing on the table, but with a more realistic
 whole-graph speedup than the isolated matmul estimate.
+The production sanity probe also now samples the weighted-down q3_K graph
+directly. A focused validation run measured q3_K baseline at `1000.10 us`,
+q3_K weighted-down at `1015.46 us`, and q2_K down at `765.54 us`. That makes
+weighted-down slower on the production-shaped graph (`0.98x` versus baseline)
+despite small-shape wins, while q2_K down remains the only measured
+whole-graph speedup candidate. Keep `moe_weighted_down` evidence-gated rather
+than making it a package default.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

@@ -301,6 +301,9 @@ The `generation` object has two separate responsibilities:
   that were validated for this artifact.
 - `generation.thresholds` supplies numeric resolver hints used to decide when a
   phase choice applies.
+- `generation.speculative_decoding` declares package-owned native or draft
+  speculation strategy defaults, when the artifact actually contains or
+  references the required tensors/models.
 
 Use this split consistently:
 
@@ -309,6 +312,7 @@ Use this split consistently:
 | `generation.policy` | Portable, semantic execution decisions for this artifact. | `profile`, `decode`, `short_prefill`, `long_prefill`, `verify`, `indexshare` |
 | `generation.policy.experimental` | Named experimental policy paths that are valid only with explicit evidence and logging. | `selected_row_flash`, `moe_weighted_down`, `moe_merged_shared_gate_up` |
 | `generation.thresholds` | Numeric decision inputs for the policy resolver. | token limits, byte limits, minimum KV sizes |
+| `generation.speculative_decoding` | Package-owned speculation strategy defaults. | `default`, `strategies`, `native-mtp`, `prediction_depth`, `window_policy` |
 | GGUF metadata | Architecture and tensor-layout correctness contract. | attention dimensions, IndexShare roles, native MTP tensor layout |
 
 Keep these responsibilities separate. Policy fields should answer "which
@@ -322,6 +326,14 @@ model-family-specific sub-objects such as `generation.glm_dsa`; use a stable
 `generation.policy.profile` instead. This keeps the manifest shape reusable for
 future sparse attention, native prediction, and verifier policies without
 creating one schema branch per model family.
+
+Keep backend tuning out of the manifest unless it can be expressed as portable
+policy or threshold data. Kernel names, Metal/CUDA dispatch choices, simdgroup
+tuning, row-height sweeps, and quant-kernel experiments are runtime capability
+or benchmark evidence. They should not become manifest fields such as
+`generation.metal` or `generation.glm_dsa`. When evidence graduates into a
+package default, record it as a profile version, a phase policy, a numeric
+threshold, or a speculation strategy.
 
 Runtime config and explicit CLI/environment overrides MAY override these
 defaults for experiments, but consumers SHOULD log the final resolved policy and
@@ -622,6 +634,16 @@ at `739.91 us` against a `391.13 us` isolated routed FFN estimate. Both rows
 are plausible, and q2_K down is `1.09x` faster end-to-end on the
 production-shaped graph. Generation policy should therefore treat q2_K routed
 down as a quality-test candidate, not as a proven default.
+The same sanity probe now measures the weighted-down q3_K graph in the
+production shape as an explicit advisory row. A focused validation run measured
+q3_K baseline at `1000.10 us`, q3_K weighted-down at `1015.46 us`, and q2_K
+down at `765.54 us`. That makes weighted-down slower on the production-shaped
+graph (`0.98x` versus baseline) even though small 256-wide fixtures can look
+faster. Keep `generation.policy.experimental.moe_weighted_down` at
+`evidence-gated`; it is not a package default. The q2_K down alternative is
+still the useful follow-up because it produced the only whole-graph speedup,
+but it needs quality validation before it can become a model-package quant
+policy.
 
 The IndexShare numbers are why `generation.policy.indexshare` is a first-class
 policy field instead of an implementation note. For GLM-5.2-style DSA with a
@@ -656,6 +678,10 @@ When present, `generation` may also declare `speculative_decoding` defaults:
 - `default`: the strategy id the package recommends for this distribution.
 - `strategies`: a map of strategy id to strategy configuration.
 
+This object is a sibling of `policy` and `thresholds`. It is not an
+experimental policy field, because speculation can be disabled, forced, or
+selected independently from the attention/MoE phase resolver.
+
 The current native MTP strategy shape is:
 
 ```json
@@ -681,6 +707,9 @@ Native MTP strategy rules:
   conversion.
 - `window_policy` SHOULD be fixed to `1` until runtimes support wider native
   MTP heads.
+- package writers MUST NOT advertise a native MTP default unless validation has
+  found the required native prediction tensors in the selected package
+  artifacts.
 
 Draft-model speculation may use the same strategy map with `type:
 "draft-model"` and fields such as `draft_model` and adaptive `window_policy`.

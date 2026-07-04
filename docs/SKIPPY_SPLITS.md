@@ -99,14 +99,17 @@ optimization target is therefore routed/shared expert matmul and whole-graph
 execution, not a reason to add a Skippy-specific generation schema.
 The extended fixture measured a merged q2_K routed gate/up shape at `1.02x`
 faster for the routed estimate, a merged shared gate/up fused GLU shape at
-only `1.01x` faster for the shared expert, no weighted-down speedup on the
-small quantized whole-graph fixture (`0.99x`), and a q2_K down-projection
-alternative at `1.14x` faster before quality is measured. Shared-expert q3_K
-was slower (`0.92x` versus q4_K), while shared-expert q2_K was essentially tied
-(`1.00x` versus q4_K), so lowering shared-expert quant is not a Metal
-throughput lever. That keeps the
-split-layer contract unchanged and points local llama.cpp work at expert matmul
-kernels and controlled down-projection quant experiments.
+only `1.01x` faster for the shared expert, and a q2_K down-projection
+alternative at `1.14x` faster before quality is measured. A production-shaped
+routed whole-graph sanity run then measured q3_K baseline at `1000.10 us`,
+q3_K weighted-down at `1015.46 us`, and q2_K down at `765.54 us`; the
+weighted-down shape is therefore slower on the real graph despite small-shape
+wins, while q2_K down remains the only measured whole-graph speedup candidate.
+Shared-expert q3_K was slower (`0.92x` versus q4_K), while shared-expert q2_K
+was essentially tied (`1.00x` versus q4_K), so lowering shared-expert quant is
+not a Metal throughput lever. That keeps the split-layer contract unchanged and
+points local llama.cpp work at expert matmul kernels and controlled
+down-projection quant experiments.
 The Phase E report can be made a hard evidence gate with
 `GLM52_PHASE_E_REQUIRE_GATES=1`; when the optional kernel sweep is enabled it
 also proves the dispatch alternatives are present. That sweep showed generic

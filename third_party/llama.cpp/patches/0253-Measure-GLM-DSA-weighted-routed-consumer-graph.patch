@@ -1,0 +1,77 @@
+From ba52f7d1e1a43575f95f9b12e5bbe65d85dc0178 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 16:11:05 +1000
+Subject: [PATCH] Measure GLM DSA weighted routed consumer graph
+
+---
+ scripts/glm52-phase-e-moe-report.sh | 13 ++++++++-----
+ tests/test-backend-ops.cpp          |  1 +
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index e70237a97..909ffcb87 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -287,7 +287,7 @@ if [[ "${GLM52_PHASE_E_ROUTED_WHOLE_GRAPH_SANITY:-0}" != "0" ]]; then
+     sanity_log="${out_dir}/routed-whole-graph-sanity.console.log"
+     "${test_backend_ops}" perf \
+         -o TOPK_MOE_GLM_CONSUMER_SANITY \
+-        -p 'n_embd=6144,n_ff=2048,weighted_down=0,fused_glu=1' \
++        -p 'n_embd=6144,n_ff=2048,.*fused_glu=1' \
+         --output console > "${sanity_log}" 2>&1
+ 
+     python3 - "${summary}" "${sanity_log}" <<'PY'
+@@ -319,8 +319,9 @@ estimate_match = estimate_re.search(summary_text)
+ estimate_us = float(estimate_match.group("us")) if estimate_match else None
+ require_gates = os.environ.get("GLM52_PHASE_E_REQUIRE_GATES", "0") != "0"
+ 
+-q3 = next((row for row in rows if "down_type=q3_K" in row["params"]), None)
+-q2 = next((row for row in rows if "down_type=q2_K" in row["params"]), None)
++q3 = next((row for row in rows if "down_type=q3_K" in row["params"] and "weighted_down=0" in row["params"]), None)
++q3_weighted = next((row for row in rows if "down_type=q3_K" in row["params"] and "weighted_down=1" in row["params"]), None)
++q2 = next((row for row in rows if "down_type=q2_K" in row["params"] and "weighted_down=0" in row["params"]), None)
+ 
+ lines = [
+     "",
+@@ -340,7 +341,7 @@ def verdict(row):
+         return "rejected: below 25% of isolated routed FFN estimate"
+     return "plausible"
+ 
+-for label, row in (("q3_K down", q3), ("q2_K down", q2)):
++for label, row in (("q3_K down", q3), ("q3_K weighted-down", q3_weighted), ("q2_K down", q2)):
+     if row is None:
+         lines.append(f"| {label} | missing | missing | missing |")
+     else:
+@@ -349,6 +350,8 @@ for label, row in (("q3_K down", q3), ("q2_K down", q2)):
+ if q3 and q2:
+     lines.append("")
+     lines.append(f"- q2_K whole-graph speedup versus q3_K from the sanity probe: `{q3['us'] / q2['us']:.2f}x`.")
++if q3 and q3_weighted:
++    lines.append(f"- q3_K weighted-down whole-graph speedup versus q3_K baseline: `{q3['us'] / q3_weighted['us']:.2f}x`.")
+ if estimate_us is not None:
+     lines.append(f"- Isolated routed FFN estimate used for plausibility: `{estimate_us:.2f} us`.")
+ lines.append(f"- Raw artifact: `{sanity_log.name}`.")
+@@ -359,7 +362,7 @@ print(section)
+ 
+ if require_gates:
+     failures = []
+-    for label, row in (("q3_K down", q3), ("q2_K down", q2)):
++    for label, row in (("q3_K down", q3), ("q3_K weighted-down", q3_weighted), ("q2_K down", q2)):
+         row_verdict = verdict(row)
+         if row_verdict != "plausible":
+             failures.append(f"{label}: {row_verdict}")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f1ffefc59..81ec4fa8b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10828,6 +10828,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256, true));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 256, 256, true, true));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 6144, 2048, false, true, true));
++    test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 6144, 2048, true, true, true));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 6144, 2048, false, true, true));
+     test_cases.emplace_back(new test_topk_moe_glm_activation(2048, 8, 1, false));
+     test_cases.emplace_back(new test_topk_moe_glm_activation(2048, 8, 1, true));
+-- 
+2.53.0
+
