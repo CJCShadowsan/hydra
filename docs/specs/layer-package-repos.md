@@ -343,7 +343,7 @@ The current proposed shape is:
       "verify": "auto",
       "indexshare": "required",
       "experimental": {
-        "selected_row_flash": "off"
+        "selected_row_flash": "evidence-gated"
       }
     },
     "thresholds": {
@@ -480,6 +480,16 @@ those early decode points. This is why `glm-dsa-v1` uses compact flash as the
 default decode route and reserves direct sparse decode for explicit runtime
 experiments.
 
+For the configured GLM-5.2 IndexShare width, the compact path is more
+important once visible KV grows beyond the `768` selected rows. The Metal
+fixtures measured compact selected-row flash at `55.11 us/run` for
+`kv=1024,top_k=768` and `55.62 us/run` for `kv=2048,top_k=768`. Direct sparse
+attention on the same `dk=576,dv=512,top_k=768` shapes measured
+`988.95 us/run` and `984.50 us/run`. That is roughly an `18x` decode-path win
+for compact selected-KV flash over direct sparse at the model-native top-k
+width. The exact `top_k >= visible_kv` boundary is a separate all-KV flash
+bypass in the llama.cpp graph, not a selected-row kernel case.
+
 Short phase fixtures measured the opposite shape for direct sparse prefill:
 dense masked flash stayed around `68.58-70.80 us/run` for 4-16 token batches,
 while direct sparse measured `461.98-473.75 us/run`. That makes dense masked
@@ -489,6 +499,31 @@ defaults, with direct sparse prefill reserved for explicit runtime/package
 policy after backend evidence exists. Treat these as backend evidence for the
 current threshold defaults, not as portable constants across every device or
 quant.
+
+The IndexShare numbers are why `generation.policy.indexshare` is a first-class
+policy field instead of an implementation note. For GLM-5.2-style DSA with a
+`top_k` width of `768`, carrying the shared top-k sideband costs `3 KiB/token`.
+That is `384 KiB` for a 128-token chunk, `1.5 MiB` for 512 tokens, `6 MiB` for
+2048 tokens, and `384 MiB` for a full 128k-token window. By comparison, a dense
+float sparse mask over 128k visible KV costs `512 KiB/token`: `64 MiB` for 128
+tokens, `256 MiB` for 512 tokens, and `1 GiB` for 2048 tokens. IndexShare still
+has real bandwidth cost, but it is dramatically smaller than dense mask
+materialization and preserves the model's Full-layer routing decision for
+Shared layers.
+
+Generation policy consumers should therefore treat the GLM-DSA policy as a
+phase-aware resolver contract:
+
+- Decode starts with `compact-flash` when backend support exists, because the
+  compact selected-row path wins on measured one-token and early-decode shapes.
+- Short prefill starts with `dense`, because measured sparse/indexer overhead is
+  worse below the package threshold.
+- Long prefill starts with `sparse-chunked`, because dense masks become
+  memory-hostile as visible KV grows.
+- Verification starts with `auto` until verifier-specific sparse parity and
+  performance are measured.
+- IndexShare is `required`, because Shared layers should consume the model's
+  cached top-k decision rather than recomputing silently.
 
 #### Speculative Decoding
 

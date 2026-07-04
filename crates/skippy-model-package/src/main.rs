@@ -2063,7 +2063,7 @@ fn package_generation(tensors: &[TensorInfo]) -> Option<PackageGeneration> {
             verify: "auto".to_string(),
             indexshare: Some("required".to_string()),
             experimental: Some(PackageGenerationExperimentalPolicy {
-                selected_row_flash: Some("off".to_string()),
+                selected_row_flash: Some("evidence-gated".to_string()),
             }),
         })
     } else {
@@ -2071,7 +2071,7 @@ fn package_generation(tensors: &[TensorInfo]) -> Option<PackageGeneration> {
     };
     let thresholds = policy.as_ref().map(|_| PackageGenerationThresholds {
         short_prefill_max_tokens: Some(2048),
-        compact_flash_min_kv: Some(256),
+        compact_flash_min_kv: Some(1),
         dense_mask_max_bytes: Some(256 * 1024 * 1024),
     });
     if mtp_layers.is_empty() && policy.is_none() {
@@ -2393,13 +2393,13 @@ mod tests {
                 .experimental
                 .as_ref()
                 .and_then(|policy| policy.selected_row_flash.as_deref()),
-            Some("off")
+            Some("evidence-gated")
         );
         let thresholds = generation
             .thresholds
             .expect("GLM-DSA should declare resolver thresholds");
         assert_eq!(thresholds.short_prefill_max_tokens, Some(2048));
-        assert_eq!(thresholds.compact_flash_min_kv, Some(256));
+        assert_eq!(thresholds.compact_flash_min_kv, Some(1));
         assert_eq!(thresholds.dense_mask_max_bytes, Some(256 * 1024 * 1024));
         assert!(generation.speculative_decoding.is_none());
     }

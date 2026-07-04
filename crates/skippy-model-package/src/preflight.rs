@@ -547,7 +547,7 @@ fn validate_generation_policy(
             "empty_generation_policy_field",
             "generation.policy.experimental.selected_row_flash must not be empty when present",
             Some("model-package.json".to_string()),
-            "set selected_row_flash to a stable value such as off or remove the field",
+            "set selected_row_flash to a stable value such as evidence-gated or remove the field",
         );
     }
 }

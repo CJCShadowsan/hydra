@@ -70,6 +70,19 @@ flash measured `68.58-70.80 us/run` versus
 `461.98-473.75 us/run` for direct sparse at 4-16 tokens, so Skippy should treat
 short prefill and verification as dense defaults unless the embedded llama
 runtime resolves an explicit, measured sparse override.
+At the configured GLM-5.2 `top_k=768` width, compact selected-row flash measured
+`55.11-55.62 us/run` for `kv=1024..2048`, while direct sparse measured
+`984.50-988.95 us/run` on the same shapes. The `top_k >= visible_kv` boundary
+is handled by llama.cpp's all-KV flash bypass rather than by the selected-row
+kernel.
+
+The main split-serving implication is that Skippy should pass through the
+resolved `generation.policy` and `generation.thresholds` contract, not add a
+separate GLM-DSA policy surface. With a GLM-5.2-style `top_k` width of `768`,
+IndexShare costs `3 KiB/token` (`6 MiB` for 2048 tokens), while a dense sparse
+mask at `128k` visible KV costs `512 KiB/token` (`1 GiB` for 2048 tokens). That
+gap is the reason the package contract requires Shared-layer IndexShare and
+long-prefill sparse/chunked execution once llama.cpp has the native path.
 
 ```bash
 # node A: starts the private mesh and becomes the coordinator

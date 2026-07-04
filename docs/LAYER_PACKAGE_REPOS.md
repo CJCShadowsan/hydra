@@ -54,9 +54,12 @@ The threshold values should be grounded in tensor sizes. For example, a
 GLM-DSA top-k sideband costs `tokens * top_k * 4` bytes, while a dense sparse
 mask costs roughly `tokens * visible_kv * 4` bytes. With a representative
 GLM-5.2 split package sideband width of `768` i32 values per token, the
-IndexShare sideband is `3 KiB/token`; at `128k` visible KV, the corresponding
-dense mask is `512 KiB/token`. That size gap is why GLM-DSA packages should
-record dense-mask and compact-flash thresholds instead of leaving sparse policy
+IndexShare sideband is `3 KiB/token`: `384 KiB` for a 128-token chunk,
+`1.5 MiB` for 512 tokens, `6 MiB` for 2048 tokens, and `384 MiB` for a full
+128k-token window. At `128k` visible KV, the corresponding dense mask is
+`512 KiB/token`: `64 MiB` for 128 tokens, `256 MiB` for 512 tokens, and `1 GiB`
+for 2048 tokens. That size gap is why GLM-DSA packages should record
+dense-mask and compact-flash thresholds instead of leaving sparse policy
 implicit.
 
 For current GLM-DSA decode tuning, the llama.cpp Metal fixtures measured
@@ -71,11 +74,21 @@ flash measured `61.90 us` at `kv=128`, `60.71 us` at `kv=256`, `61.24 us` at
 `209.97 us`, `249.30 us`, and `711.10 us` for the same shapes. That is why
 native GLM-DSA decode should prefer compact flash over direct sparse by default
 when flash attention is available.
+At GLM-5.2's configured `top_k=768` width, compact selected-row flash measured
+`55.11-55.62 us/run` for `kv=1024..2048`, while direct sparse measured
+`984.50-988.95 us/run` on the same shapes. That is roughly an `18x` win for
+compact selected-KV flash over direct sparse once visible KV exceeds the
+selected-row window.
 The same fixture family measured dense masked flash much faster than direct
 sparse for short phase shapes (`68.58-70.80 us/run` versus
 `461.98-473.75 us/run` for 4-16 tokens), so GLM-DSA packages should keep
 short prefill and verification dense by default unless a backend-specific sparse
 path has its own evidence.
+
+In practice, this means the package's `generation` block is the phase-aware
+contract: decode prefers compact flash, short prefill prefers dense, long
+prefill avoids dense masks, verification remains `auto`, and Shared-layer
+IndexShare is required unless an explicit fallback is selected and logged.
 
 ## Local package tooling
 
