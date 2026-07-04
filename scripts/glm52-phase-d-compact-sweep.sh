@@ -189,7 +189,7 @@ for window in "${WINDOW_LIST[@]}"; do
     printf '\n' >>"$case_dir/command.sh"
     echo "window $layer_start..$layer_end pos=$position -> $case_dir"
     set +e
-    env -u LLAMA_GLM_DSA_COMPACT_FLASH_NWG LLAMA_STAGE_BACKEND=metal \
+    env -u LLAMA_GLM_DSA_COMPACT_FLASH_NWG -u LLAMA_GLM_DSA_SELECTED_ROW_FLASH_NWG LLAMA_STAGE_BACKEND=metal \
       "${cmd[@]}" >"$case_dir/run.log" 2>&1
     rc=$?
     set -e
