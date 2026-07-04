@@ -546,18 +546,21 @@ current threshold defaults, not as portable constants across every device or
 quant.
 
 Once those attention phase gates are in place, the measured local GLM-5.2
-bottleneck shifts to routed expert matmuls. The current Metal MoE fixture
-estimates a routed FFN decode layer at `387.92 us`: routed gate/up/down matmuls
-account for `377.05 us` (`97.2%`), while route/top-k plus weighted sum accounts
-for `10.87 us` (`2.8%`). These numbers justify prioritizing backend
-`MUL_MAT_ID`/expert matmul work after sparse-attention correctness, but they do
-not require a new manifest object. Policy remains the semantic phase contract
-under `generation.policy`; performance cutoffs and byte/token limits remain
-numeric resolver inputs under `generation.thresholds`.
+bottleneck shifts to MoE expert execution. The current Metal MoE fixture
+estimates a routed FFN decode layer at `392.99 us`: routed gate/up/down matmuls
+account for `381.89 us` (`97.2%`), while route/top-k plus weighted sum accounts
+for `11.10 us` (`2.8%`). The shared expert is equally important: q4_K shared
+expert plus final add measured `439.59 us`, making the routed+shared FFN
+estimate `832.58 us` with the shared expert at `52.8%`. These numbers justify
+prioritizing backend `MUL_MAT_ID`/expert matmul and shared-expert work after
+sparse-attention correctness, but they do not require a new manifest object.
+Policy remains the semantic phase contract under `generation.policy`;
+performance cutoffs and byte/token limits remain numeric resolver inputs under
+`generation.thresholds`.
 The extended fixture measured a merged q2_K gate+up tensor shape at
-`381.17 us` (`1.02x`), a weighted-down MoE graph shape at `7.07 us` versus
-`6.97 us` (`0.99x`) on the small quantized whole-graph fixture, and a q2_K
-down-projection alternative at `339.00 us` (`1.14x`, quality not measured by
+`383.05 us` (`1.03x`), a weighted-down MoE graph shape at `7.93 us` versus
+`7.72 us` (`0.97x`) on the small quantized whole-graph fixture, and a q2_K
+down-projection alternative at `344.33 us` (`1.14x`, quality not measured by
 that microbench). Treat those as optimization-priority evidence, not as a new
 model-family schema branch: a package may record validated runtime policy under
 `generation.policy`, but quality-bearing quant changes still need separate
