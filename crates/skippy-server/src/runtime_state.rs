@@ -1381,6 +1381,8 @@ fn runtime_glm_dsa_policy_from_generation(
     runtime_policy.direct_sparse_prefill = policy.short_prefill == "direct-sparse";
     runtime_policy.short_prefill_max_tokens =
         thresholds.and_then(|thresholds| thresholds.short_prefill_max_tokens);
+    runtime_policy.direct_sparse_decode_max_top_k =
+        thresholds.and_then(|thresholds| thresholds.direct_sparse_decode_max_top_k);
     runtime_policy.dense_sparse_mask_max_bytes =
         thresholds.and_then(|thresholds| thresholds.dense_mask_max_bytes);
     runtime_policy.compact_flash_min_kv =

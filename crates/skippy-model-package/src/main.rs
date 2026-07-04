@@ -272,6 +272,8 @@ struct PackageGenerationThresholds {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     short_prefill_max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_sparse_decode_max_top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     compact_flash_min_kv: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dense_mask_max_bytes: Option<u64>,
@@ -2090,6 +2092,7 @@ fn package_generation(tensors: &[TensorInfo]) -> Option<PackageGeneration> {
     };
     let thresholds = policy.as_ref().map(|_| PackageGenerationThresholds {
         short_prefill_max_tokens: Some(2048),
+        direct_sparse_decode_max_top_k: Some(256),
         compact_flash_min_kv: Some(1),
         dense_mask_max_bytes: Some(256 * 1024 * 1024),
     });
@@ -2418,6 +2421,7 @@ mod tests {
             .thresholds
             .expect("GLM-DSA should declare resolver thresholds");
         assert_eq!(thresholds.short_prefill_max_tokens, Some(2048));
+        assert_eq!(thresholds.direct_sparse_decode_max_top_k, Some(256));
         assert_eq!(thresholds.compact_flash_min_kv, Some(1));
         assert_eq!(thresholds.dense_mask_max_bytes, Some(256 * 1024 * 1024));
         assert!(generation.speculative_decoding.is_none());

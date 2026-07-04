@@ -103,6 +103,7 @@ pub(crate) struct ResolvedGenerationPolicyConfig {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ResolvedGenerationThresholdsConfig {
     pub(crate) short_prefill_max_tokens: Option<u32>,
+    pub(crate) direct_sparse_decode_max_top_k: Option<u32>,
     pub(crate) compact_flash_min_kv: Option<u32>,
     pub(crate) dense_mask_max_bytes: Option<u64>,
 }

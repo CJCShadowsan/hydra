@@ -110,6 +110,8 @@ pub(crate) struct PreflightGenerationThresholds {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub short_prefill_max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_sparse_decode_max_top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_flash_min_kv: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dense_mask_max_bytes: Option<u64>,
@@ -206,6 +208,8 @@ struct PackageGenerationExperimentalPolicy {
 struct PackageGenerationThresholds {
     #[serde(default)]
     short_prefill_max_tokens: Option<u32>,
+    #[serde(default)]
+    direct_sparse_decode_max_top_k: Option<u32>,
     #[serde(default)]
     compact_flash_min_kv: Option<u32>,
     #[serde(default)]
@@ -564,6 +568,14 @@ fn validate_generation_thresholds(
             "set a positive token threshold or remove the field",
         );
     }
+    if thresholds.direct_sparse_decode_max_top_k == Some(0) {
+        report.error(
+            "invalid_generation_threshold_zero",
+            "generation.thresholds.direct_sparse_decode_max_top_k must be greater than zero",
+            Some("model-package.json".to_string()),
+            "set a positive top-k threshold or remove the field",
+        );
+    }
     if thresholds.compact_flash_min_kv == Some(0) {
         report.error(
             "invalid_generation_threshold_zero",
@@ -735,6 +747,7 @@ fn preflight_generation_thresholds(
 ) -> PreflightGenerationThresholds {
     PreflightGenerationThresholds {
         short_prefill_max_tokens: thresholds.short_prefill_max_tokens,
+        direct_sparse_decode_max_top_k: thresholds.direct_sparse_decode_max_top_k,
         compact_flash_min_kv: thresholds.compact_flash_min_kv,
         dense_mask_max_bytes: thresholds.dense_mask_max_bytes,
     }
@@ -1469,6 +1482,7 @@ mod tests {
                 },
                 "thresholds": {
                     "short_prefill_max_tokens": 2048,
+                    "direct_sparse_decode_max_top_k": 256,
                     "compact_flash_min_kv": 256,
                     "dense_mask_max_bytes": 268435456
                 }
@@ -1502,6 +1516,7 @@ mod tests {
             .thresholds
             .expect("thresholds should be reported");
         assert_eq!(thresholds.short_prefill_max_tokens, Some(2048));
+        assert_eq!(thresholds.direct_sparse_decode_max_top_k, Some(256));
         assert_eq!(thresholds.compact_flash_min_kv, Some(256));
         assert_eq!(thresholds.dense_mask_max_bytes, Some(268435456));
         fs::remove_dir_all(dir).unwrap();

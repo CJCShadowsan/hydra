@@ -84,6 +84,7 @@ pub struct PackageGenerationExperimentalPolicyInfo {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PackageGenerationThresholdsInfo {
     pub short_prefill_max_tokens: Option<u32>,
+    pub direct_sparse_decode_max_top_k: Option<u32>,
     pub compact_flash_min_kv: Option<u32>,
     pub dense_mask_max_bytes: Option<u64>,
 }
@@ -261,6 +262,8 @@ struct PackageGenerationExperimentalPolicy {
 struct PackageGenerationThresholds {
     #[serde(default)]
     short_prefill_max_tokens: Option<u32>,
+    #[serde(default)]
+    direct_sparse_decode_max_top_k: Option<u32>,
     #[serde(default)]
     compact_flash_min_kv: Option<u32>,
     #[serde(default)]
@@ -634,6 +637,7 @@ fn package_generation_thresholds_info(
 ) -> PackageGenerationThresholdsInfo {
     PackageGenerationThresholdsInfo {
         short_prefill_max_tokens: thresholds.short_prefill_max_tokens,
+        direct_sparse_decode_max_top_k: thresholds.direct_sparse_decode_max_top_k,
         compact_flash_min_kv: thresholds.compact_flash_min_kv,
         dense_mask_max_bytes: thresholds.dense_mask_max_bytes,
     }
@@ -1615,6 +1619,7 @@ mod tests {
                 },
                 "thresholds": {
                     "short_prefill_max_tokens": 2048,
+                    "direct_sparse_decode_max_top_k": 256,
                     "compact_flash_min_kv": 256,
                     "dense_mask_max_bytes": 268435456
                 }
@@ -1639,6 +1644,7 @@ mod tests {
         );
         let thresholds = generation.thresholds.expect("thresholds should be exposed");
         assert_eq!(thresholds.short_prefill_max_tokens, Some(2048));
+        assert_eq!(thresholds.direct_sparse_decode_max_top_k, Some(256));
         assert_eq!(thresholds.compact_flash_min_kv, Some(256));
         assert_eq!(thresholds.dense_mask_max_bytes, Some(268435456));
     }

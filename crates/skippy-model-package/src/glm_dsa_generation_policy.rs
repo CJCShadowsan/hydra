@@ -15,6 +15,7 @@ const GLM_DSA_POLICY_VERIFY: &str = "auto";
 const GLM_DSA_POLICY_INDEXSHARE: &str = "required";
 const GLM_DSA_POLICY_SELECTED_ROW_FLASH: &str = "evidence-gated";
 const GLM_DSA_SHORT_PREFILL_MAX_TOKENS: u32 = 2048;
+const GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K: u32 = 256;
 const GLM_DSA_COMPACT_FLASH_MIN_KV: u32 = 1;
 const GLM_DSA_DENSE_MASK_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -115,6 +116,7 @@ fn expected_policy() -> Value {
 fn expected_thresholds() -> Value {
     json!({
         "short_prefill_max_tokens": GLM_DSA_SHORT_PREFILL_MAX_TOKENS,
+        "direct_sparse_decode_max_top_k": GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K,
         "compact_flash_min_kv": GLM_DSA_COMPACT_FLASH_MIN_KV,
         "dense_mask_max_bytes": GLM_DSA_DENSE_MASK_MAX_BYTES
     })
@@ -166,6 +168,10 @@ mod tests {
         assert_eq!(
             manifest.pointer("/generation/thresholds/compact_flash_min_kv"),
             Some(&json!(1))
+        );
+        assert_eq!(
+            manifest.pointer("/generation/thresholds/direct_sparse_decode_max_top_k"),
+            Some(&json!(256))
         );
         assert_eq!(
             manifest.pointer("/generation/speculative_decoding/default"),

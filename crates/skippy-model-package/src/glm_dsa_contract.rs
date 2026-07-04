@@ -90,6 +90,7 @@ const GLM_DSA_POLICY_VERIFY: &str = "auto";
 const GLM_DSA_POLICY_INDEXSHARE: &str = "required";
 const GLM_DSA_POLICY_SELECTED_ROW_FLASH: &str = "evidence-gated";
 const GLM_DSA_SHORT_PREFILL_MAX_TOKENS: u32 = 2048;
+const GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K: u32 = 256;
 const GLM_DSA_COMPACT_FLASH_MIN_KV: u32 = 1;
 const GLM_DSA_DENSE_MASK_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -136,6 +137,7 @@ pub(crate) struct GlmDsaGenerationPolicyReport {
 #[derive(Debug, Serialize)]
 pub(crate) struct GlmDsaGenerationThresholdReport {
     pub(crate) short_prefill_max_tokens: Option<u32>,
+    pub(crate) direct_sparse_decode_max_top_k: Option<u32>,
     pub(crate) compact_flash_min_kv: Option<u32>,
     pub(crate) dense_mask_max_bytes: Option<u64>,
 }
@@ -196,6 +198,8 @@ struct PackageGenerationExperimentalPolicy {
 struct PackageGenerationThresholds {
     #[serde(default)]
     short_prefill_max_tokens: Option<u32>,
+    #[serde(default)]
+    direct_sparse_decode_max_top_k: Option<u32>,
     #[serde(default)]
     compact_flash_min_kv: Option<u32>,
     #[serde(default)]
@@ -409,6 +413,7 @@ fn validate_generation_thresholds(
 
     report.generation_thresholds = Some(GlmDsaGenerationThresholdReport {
         short_prefill_max_tokens: thresholds.short_prefill_max_tokens,
+        direct_sparse_decode_max_top_k: thresholds.direct_sparse_decode_max_top_k,
         compact_flash_min_kv: thresholds.compact_flash_min_kv,
         dense_mask_max_bytes: thresholds.dense_mask_max_bytes,
     });
@@ -417,6 +422,12 @@ fn validate_generation_thresholds(
         "generation.thresholds.short_prefill_max_tokens",
         thresholds.short_prefill_max_tokens,
         GLM_DSA_SHORT_PREFILL_MAX_TOKENS,
+    );
+    expect_generation_optional_u32(
+        &mut report.generation_threshold_errors,
+        "generation.thresholds.direct_sparse_decode_max_top_k",
+        thresholds.direct_sparse_decode_max_top_k,
+        GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K,
     );
     expect_generation_optional_u32(
         &mut report.generation_threshold_errors,
@@ -1224,6 +1235,10 @@ mod tests {
             Some(GLM_DSA_SHORT_PREFILL_MAX_TOKENS)
         );
         assert_eq!(
+            thresholds.direct_sparse_decode_max_top_k,
+            Some(GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K)
+        );
+        assert_eq!(
             thresholds.dense_mask_max_bytes,
             Some(GLM_DSA_DENSE_MASK_MAX_BYTES)
         );
@@ -1555,6 +1570,7 @@ mod tests {
             }),
             thresholds: Some(PackageGenerationThresholds {
                 short_prefill_max_tokens: Some(GLM_DSA_SHORT_PREFILL_MAX_TOKENS),
+                direct_sparse_decode_max_top_k: Some(GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K),
                 compact_flash_min_kv: Some(GLM_DSA_COMPACT_FLASH_MIN_KV),
                 dense_mask_max_bytes: Some(GLM_DSA_DENSE_MASK_MAX_BYTES),
             }),

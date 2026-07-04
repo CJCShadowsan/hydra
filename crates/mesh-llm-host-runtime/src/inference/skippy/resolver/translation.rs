@@ -339,6 +339,8 @@ fn runtime_glm_dsa_policy(
     runtime_policy.disable_compact_flash_attn = policy.decode != "compact-flash";
     runtime_policy.direct_sparse_prefill = policy.short_prefill == "direct-sparse";
     runtime_policy.short_prefill_max_tokens = policy.thresholds.short_prefill_max_tokens;
+    runtime_policy.direct_sparse_decode_max_top_k =
+        policy.thresholds.direct_sparse_decode_max_top_k;
     runtime_policy.dense_sparse_mask_max_bytes = policy.thresholds.dense_mask_max_bytes;
     runtime_policy.compact_flash_min_kv = policy.thresholds.compact_flash_min_kv;
     Some(runtime_policy)

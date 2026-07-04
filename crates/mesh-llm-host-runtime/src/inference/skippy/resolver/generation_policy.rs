@@ -12,6 +12,7 @@ pub(super) fn resolve_generation_policy_config(
         .as_ref()
         .map(|thresholds| ResolvedGenerationThresholdsConfig {
             short_prefill_max_tokens: thresholds.short_prefill_max_tokens,
+            direct_sparse_decode_max_top_k: thresholds.direct_sparse_decode_max_top_k,
             compact_flash_min_kv: thresholds.compact_flash_min_kv,
             dense_mask_max_bytes: thresholds.dense_mask_max_bytes,
         })

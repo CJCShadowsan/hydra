@@ -35,6 +35,7 @@ pub const GGML_TYPE_Q4_0: u32 = 2;
 pub const GGML_TYPE_Q8_0: u32 = 8;
 pub const LLAMA_SERVER_DEFAULT_N_BATCH: u32 = 2048;
 pub const LLAMA_SERVER_DEFAULT_N_UBATCH: u32 = 512;
+pub const GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K: u32 = 256;
 /// Smaller default prefill batch for multi-lane skippy serving.
 ///
 /// When `lane_count > 1`, skippy enables llama.cpp unified KV mode: every
@@ -69,7 +70,7 @@ impl GlmDsaPolicyConfig {
             disable_compact_flash_attn: false,
             unproven_large_direct_sparse_prefill: false,
             short_prefill_max_tokens: None,
-            direct_sparse_decode_max_top_k: None,
+            direct_sparse_decode_max_top_k: Some(GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K),
             dense_sparse_mask_max_bytes: None,
             compact_flash_min_kv: None,
         }
@@ -4591,6 +4592,7 @@ mod tests {
         let config = RuntimeConfig {
             glm_dsa_policy: Some(GlmDsaPolicyConfig {
                 short_prefill_max_tokens: Some(2048),
+                direct_sparse_decode_max_top_k: Some(256),
                 compact_flash_min_kv: Some(1),
                 dense_sparse_mask_max_bytes: Some(268_435_456),
                 ..GlmDsaPolicyConfig::glm_dsa_v1()
@@ -4607,12 +4609,14 @@ mod tests {
         );
         assert_ne!(raw.raw.glm_dsa_policy_flags, 0);
         assert_eq!(raw.raw.glm_dsa_short_prefill_max_tokens, 2048);
+        assert_eq!(raw.raw.glm_dsa_direct_sparse_decode_max_top_k, 256);
         assert_eq!(raw.raw.glm_dsa_compact_flash_min_kv, 1);
         assert_eq!(raw.raw.glm_dsa_dense_sparse_mask_max_bytes, 268_435_456);
         assert!(summary.contains("glm_dsa_policy=profile=1"));
         assert!(summary.contains("direct_sparse_attn=true"));
         assert!(summary.contains("disable_compact_flash_attn=false"));
         assert!(summary.contains("short_prefill_max_tokens=2048"));
+        assert!(summary.contains("direct_sparse_decode_max_top_k=256"));
         assert!(summary.contains("compact_flash_min_kv=1"));
         assert!(summary.contains("dense_sparse_mask_max_bytes=268435456"));
         Ok(())
