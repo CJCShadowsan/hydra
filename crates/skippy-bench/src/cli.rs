@@ -191,6 +191,11 @@ pub struct GlmDsaOpReportArgs {
         help = "Fail unless every decode stage uses compact K/V gather and has zero sparse-mask nodes."
     )]
     pub require_compact_decode_no_sparse_mask: bool,
+    #[arg(
+        long,
+        help = "Fail unless decode policy logs prove compact fallback was selected with backend support evidence."
+    )]
+    pub require_compact_decode_policy_evidence: bool,
     #[arg(long)]
     pub output: Option<PathBuf>,
 }

@@ -72,11 +72,102 @@ struct LogSummary {
     hottest_group_records: Vec<HotGroupSummary>,
     sideband_records: BTreeMap<String, BTreeMap<Phase, SidebandSummary>>,
     indexshare_trace: IndexShareTraceSummary,
+    policy: PolicySummary,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct GlmDsaOpReport {
     logs: Vec<LogSummary>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct PolicySummary {
+    direct_sparse: DirectSparsePolicySummary,
+    compact_flash: CompactFlashPolicySummary,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct DirectSparsePolicySummary {
+    records: usize,
+    decode_records: usize,
+    prefill_records: usize,
+    use_direct_records: usize,
+    decode_use_direct_records: usize,
+    decode_backend_sparse_supported: BoolOptionCounts,
+    selector_reasons: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct CompactFlashPolicySummary {
+    records: usize,
+    decode_records: usize,
+    use_compact_records: usize,
+    decode_use_compact_records: usize,
+    decode_no_mask_records: usize,
+    decode_backend_compact_supported: BoolOptionCounts,
+    selector_reasons: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct BoolOptionCounts {
+    true_records: usize,
+    false_records: usize,
+    unknown_records: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LogRecordInputs<'a> {
+    timing_records: &'a [TimingRecord],
+    group_records: &'a [TimingGroupRecord],
+    sideband_records: &'a [SidebandRecord],
+    indexshare_records: &'a [IndexShareTraceRecord],
+    indexshare_contract_records: &'a [IndexShareContractRecord],
+    direct_sparse_policy_records: &'a [DirectSparseDecisionRecord],
+    compact_flash_policy_records: &'a [CompactFlashPolicyRecord],
+}
+
+impl<'a> LogRecordInputs<'a> {
+    fn new(timing_records: &'a [TimingRecord]) -> Self {
+        Self {
+            timing_records,
+            group_records: &[],
+            sideband_records: &[],
+            indexshare_records: &[],
+            indexshare_contract_records: &[],
+            direct_sparse_policy_records: &[],
+            compact_flash_policy_records: &[],
+        }
+    }
+
+    fn with_group_records(mut self, records: &'a [TimingGroupRecord]) -> Self {
+        self.group_records = records;
+        self
+    }
+
+    fn with_sideband_records(mut self, records: &'a [SidebandRecord]) -> Self {
+        self.sideband_records = records;
+        self
+    }
+
+    fn with_indexshare_records(
+        mut self,
+        trace_records: &'a [IndexShareTraceRecord],
+        contract_records: &'a [IndexShareContractRecord],
+    ) -> Self {
+        self.indexshare_records = trace_records;
+        self.indexshare_contract_records = contract_records;
+        self
+    }
+
+    fn with_policy_records(
+        mut self,
+        direct_sparse_records: &'a [DirectSparseDecisionRecord],
+        compact_flash_records: &'a [CompactFlashPolicyRecord],
+    ) -> Self {
+        self.direct_sparse_policy_records = direct_sparse_records;
+        self.compact_flash_policy_records = compact_flash_records;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -472,6 +563,10 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         })?;
         let group_records = parse_timing_group_records(&text)
             .with_context(|| format!("parse GLM-DSA group timing records in {}", path.display()))?;
+        let direct_sparse_policy_records = parse_direct_sparse_decision_records(&text)
+            .with_context(|| format!("parse GLM-DSA direct sparse policy in {}", path.display()))?;
+        let compact_flash_policy_records = parse_compact_flash_policy_records(&text)
+            .with_context(|| format!("parse GLM-DSA compact flash policy in {}", path.display()))?;
         let records = match args.first_records {
             Some(limit) => records.into_iter().take(limit).collect::<Vec<_>>(),
             None => records,
@@ -489,17 +584,20 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         };
         let summary = summarize_log(
             path.clone(),
-            &records,
-            &group_records,
-            &sideband_records,
-            &indexshare_records,
-            &indexshare_contract_records,
+            LogRecordInputs::new(&records)
+                .with_group_records(&group_records)
+                .with_sideband_records(&sideband_records)
+                .with_indexshare_records(&indexshare_records, &indexshare_contract_records)
+                .with_policy_records(&direct_sparse_policy_records, &compact_flash_policy_records),
         );
         if args.require_indexshare_producer_consumer {
             require_indexshare_producer_consumer_trace(path, &summary)?;
         }
         if args.require_compact_decode_no_sparse_mask {
             require_compact_decode_without_sparse_mask(path, &summary)?;
+        }
+        if args.require_compact_decode_policy_evidence {
+            require_compact_decode_policy_evidence(path, &summary)?;
         }
         logs.push(summary);
     }
@@ -811,6 +909,45 @@ fn require_compact_decode_without_sparse_mask(path: &Path, summary: &LogSummary)
         "{} does not prove compact GLM-DSA decode without dense sparse-mask materialization; {}",
         path.display(),
         failures.join("; ")
+    )
+}
+
+fn require_compact_decode_policy_evidence(path: &Path, summary: &LogSummary) -> Result<()> {
+    let mut missing = Vec::new();
+    let direct = &summary.policy.direct_sparse;
+    let compact = &summary.policy.compact_flash;
+
+    if direct.decode_records == 0 {
+        missing.push("direct_sparse_decode_policy_records");
+    }
+    if compact.decode_records == 0 {
+        missing.push("compact_flash_decode_policy_records");
+    }
+    if compact.decode_use_compact_records == 0 {
+        missing.push("compact_decode_selected");
+    }
+    if compact.decode_no_mask_records == 0 {
+        missing.push("compact_decode_no_mask");
+    }
+    if compact.decode_backend_compact_supported.true_records == 0 {
+        missing.push("backend_compact_supported");
+    }
+    if direct.decode_backend_sparse_supported.false_records == 0 {
+        missing.push("backend_sparse_unsupported_or_explicit_fallback");
+    }
+    if direct.decode_use_direct_records != 0 {
+        missing.push("direct_sparse_not_selected_for_compact_fallback");
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} does not prove compact GLM-DSA decode policy/fallback evidence; missing {}; policy={:?}",
+        path.display(),
+        missing.join(","),
+        summary.policy
     )
 }
 
@@ -1424,16 +1561,9 @@ fn parse_optional_string_field(fields: &BTreeMap<&str, &str>, name: &str) -> Opt
     fields.get(name).map(ToString::to_string)
 }
 
-fn summarize_log(
-    path: PathBuf,
-    records: &[TimingRecord],
-    group_records: &[TimingGroupRecord],
-    sideband_records: &[SidebandRecord],
-    indexshare_records: &[IndexShareTraceRecord],
-    indexshare_contract_records: &[IndexShareContractRecord],
-) -> LogSummary {
+fn summarize_log(path: PathBuf, inputs: LogRecordInputs<'_>) -> LogSummary {
     let mut stage_records: BTreeMap<i32, BTreeMap<Phase, PhaseSummary>> = BTreeMap::new();
-    for record in records {
+    for record in inputs.timing_records {
         let summary = stage_records
             .entry(record.stage)
             .or_default()
@@ -1445,7 +1575,7 @@ fn summarize_log(
 
     let mut grouped_records: BTreeMap<i32, BTreeMap<String, BTreeMap<Phase, PhaseSummary>>> =
         BTreeMap::new();
-    for record in group_records {
+    for record in inputs.group_records {
         let timing = &record.timing;
         let summary = grouped_records
             .entry(timing.stage)
@@ -1463,18 +1593,123 @@ fn summarize_log(
     }
     let hottest_group_records = summarize_hottest_groups(&grouped_records);
 
-    let sideband_records = summarize_sideband_records(sideband_records);
-    let indexshare_trace =
-        summarize_indexshare_trace_records(indexshare_records, indexshare_contract_records);
+    let sideband_records = summarize_sideband_records(inputs.sideband_records);
+    let indexshare_trace = summarize_indexshare_trace_records(
+        inputs.indexshare_records,
+        inputs.indexshare_contract_records,
+    );
+    let policy = summarize_policy_records(
+        inputs.direct_sparse_policy_records,
+        inputs.compact_flash_policy_records,
+    );
     LogSummary {
         path,
-        records: records.len(),
+        records: inputs.timing_records.len(),
         stage_records,
         group_records: grouped_records,
         hottest_group_records,
         sideband_records,
         indexshare_trace,
+        policy,
     }
+}
+
+fn summarize_policy_records(
+    direct_sparse_records: &[DirectSparseDecisionRecord],
+    compact_flash_records: &[CompactFlashPolicyRecord],
+) -> PolicySummary {
+    PolicySummary {
+        direct_sparse: summarize_direct_sparse_policy(direct_sparse_records),
+        compact_flash: summarize_compact_flash_policy(compact_flash_records),
+    }
+}
+
+fn summarize_direct_sparse_policy(
+    records: &[DirectSparseDecisionRecord],
+) -> DirectSparsePolicySummary {
+    let mut summary = DirectSparsePolicySummary {
+        records: records.len(),
+        ..DirectSparsePolicySummary::default()
+    };
+    for record in records {
+        let is_decode = policy_is_decode(record.phase.as_deref(), record.decode_shape);
+        let is_prefill = policy_is_prefill(record.phase.as_deref(), record.prefill_shape);
+        if is_decode {
+            summary.decode_records += 1;
+            add_bool_option_count(
+                &mut summary.decode_backend_sparse_supported,
+                record.backend_sparse_supported,
+            );
+        }
+        if is_prefill {
+            summary.prefill_records += 1;
+        }
+        if record.use_direct {
+            summary.use_direct_records += 1;
+            if is_decode {
+                summary.decode_use_direct_records += 1;
+            }
+        }
+        add_selector_reason(
+            &mut summary.selector_reasons,
+            record.selector_reason.as_deref(),
+        );
+    }
+    summary
+}
+
+fn summarize_compact_flash_policy(
+    records: &[CompactFlashPolicyRecord],
+) -> CompactFlashPolicySummary {
+    let mut summary = CompactFlashPolicySummary {
+        records: records.len(),
+        ..CompactFlashPolicySummary::default()
+    };
+    for record in records {
+        let is_decode = policy_is_decode(record.phase.as_deref(), record.decode_shape);
+        if is_decode {
+            summary.decode_records += 1;
+            add_bool_option_count(
+                &mut summary.decode_backend_compact_supported,
+                record.backend_compact_supported,
+            );
+            if record.no_mask == Some(true) {
+                summary.decode_no_mask_records += 1;
+            }
+        }
+        if record.use_compact {
+            summary.use_compact_records += 1;
+            if is_decode {
+                summary.decode_use_compact_records += 1;
+            }
+        }
+        add_selector_reason(
+            &mut summary.selector_reasons,
+            record.selector_reason.as_deref(),
+        );
+    }
+    summary
+}
+
+fn policy_is_decode(phase: Option<&str>, decode_shape: bool) -> bool {
+    phase == Some("decode") || phase.is_none() && decode_shape
+}
+
+fn policy_is_prefill(phase: Option<&str>, prefill_shape: bool) -> bool {
+    phase == Some("prefill") || phase.is_none() && prefill_shape
+}
+
+fn add_bool_option_count(counts: &mut BoolOptionCounts, value: Option<bool>) {
+    match value {
+        Some(true) => counts.true_records += 1,
+        Some(false) => counts.false_records += 1,
+        None => counts.unknown_records += 1,
+    }
+}
+
+fn add_selector_reason(reasons: &mut BTreeMap<String, usize>, reason: Option<&str>) {
+    let reason = reason.unwrap_or("unknown");
+    *reasons.entry(reason.to_string()).or_default() += 1;
 }
 
 pub(crate) fn summarize_indexshare_trace_records(
@@ -1761,14 +1996,14 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ComparisonKey, OpBucket, Phase, PhaseSummary, SidebandDirection, compare_phase,
-        parse_compact_flash_mask_records, parse_compact_flash_policy_records,
+        ComparisonKey, LogRecordInputs, OpBucket, Phase, PhaseSummary, SidebandDirection,
+        compare_phase, parse_compact_flash_mask_records, parse_compact_flash_policy_records,
         parse_compute_buffer_records, parse_direct_sparse_decision_records,
         parse_indexshare_contract_records, parse_indexshare_trace_records,
         parse_metal_dispatch_records, parse_sideband_record, parse_sideband_records,
         parse_timing_group_records, parse_timing_record, parse_timing_records,
-        require_compact_decode_without_sparse_mask, require_indexshare_producer_consumer_trace,
-        summarize_comparison_rows, summarize_log,
+        require_compact_decode_policy_evidence, require_compact_decode_without_sparse_mask,
+        require_indexshare_producer_consumer_trace, summarize_comparison_rows, summarize_log,
     };
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -1787,6 +2022,7 @@ mod tests {
     const DIRECT_SPARSE_DECISION_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1 sparse_batch=1 sparse_streams=1 prefill_cap=8 decode_max_top_k=256 sparse_kv=256 sparse_top_k=129 min_kv_topk_ratio=0 kv_topk_ratio=1 dense_mask_bytes=512 dense_mask_limit=536870912 phase=decode selector_reason=backend_sparse_unsupported direct_enabled=1 prefill_enabled=1 decode_shape=1 verify_shape=0 prefill_shape=1 large_prefill_shape=0 token_shape_allowed=1 backend_sparse_supported=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
+    const COMPACT_FLASH_POLICY_BACKEND_SUPPORTED_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=256 top_k=256 decode_max_top_k=4 compact_min_kv=1 kv_topk_ratio=1 forced=0 disabled=0 large_decode_top_k=1 kv_ok=1 enabled=1 backend_compact_supported=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact_mask_omitted";
     const COMPACT_FLASH_POLICY_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=256 top_k=129 decode_max_top_k=256 compact_min_kv=1 kv_topk_ratio=1 forced=0 disabled=0 large_decode_top_k=0 kv_ok=1 enabled=0 backend_compact_supported=0 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=0 use_compact=0 selector_reason=backend_compact_unsupported";
     const COMPACT_FLASH_POLICY_LINE_WITHOUT_MIN_RATIO: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
     const COMPACT_FLASH_MASK_LINE: &str = "skippy: glm_dsa_compact_flash_mask layer=30 omitted_mla_kq_mask=1 visible_kv=8192 ubatch_tokens=1 streams=1 max_top_k=2048";
@@ -1822,7 +2058,7 @@ mod tests {
         assert_eq!(record.top_k_nodes, Some(40));
         assert_eq!(record.top_k_us, Some(49_065));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&[record]));
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1841,7 +2077,7 @@ mod tests {
         assert_eq!(record.sparse_mask_topk_us, Some(2000));
         assert_eq!(record.sparse_mask_add_us, Some(3000));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&[record]));
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1860,7 +2096,7 @@ mod tests {
         assert_eq!(record.dsa_sparse_attn_nodes, Some(47));
         assert_eq!(record.dsa_sparse_attn_us, Some(114543));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&[record]));
         let prefill = summary
             .stage_records
             .get(&1)
@@ -1876,7 +2112,7 @@ mod tests {
         assert_eq!(record.compact_get_rows_nodes, Some(6));
         assert_eq!(record.compact_get_rows_us, Some(900));
 
-        let summary = summarize_log("stage1.log".into(), &[record], &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&[record]));
         let decode = summary
             .stage_records
             .get(&1)
@@ -2174,11 +2410,7 @@ mod tests {
         let contract_records = parse_indexshare_contract_records(INDEXSHARE_CONTRACT_LINE).unwrap();
         let summary = summarize_log(
             "stage1.log".into(),
-            &timing,
-            &[],
-            &[],
-            &records,
-            &contract_records,
+            LogRecordInputs::new(&timing).with_indexshare_records(&records, &contract_records),
         );
 
         assert_eq!(summary.indexshare_trace.contract_records, 1);
@@ -2212,11 +2444,7 @@ mod tests {
         let contract_records = parse_indexshare_contract_records(INDEXSHARE_CONTRACT_LINE).unwrap();
         let summary = summarize_log(
             "stage1.log".into(),
-            &timing,
-            &[],
-            &[],
-            &records,
-            &contract_records,
+            LogRecordInputs::new(&timing).with_indexshare_records(&records, &contract_records),
         );
 
         require_indexshare_producer_consumer_trace(Path::new("stage1.log"), &summary).unwrap();
@@ -2230,11 +2458,7 @@ mod tests {
         let contract_records = parse_indexshare_contract_records(INDEXSHARE_CONTRACT_LINE).unwrap();
         let summary = summarize_log(
             "stage1.log".into(),
-            &timing,
-            &[],
-            &[],
-            &records,
-            &contract_records,
+            LogRecordInputs::new(&timing).with_indexshare_records(&records, &contract_records),
         );
 
         let error = require_indexshare_producer_consumer_trace(Path::new("stage1.log"), &summary)
@@ -2249,7 +2473,7 @@ mod tests {
     #[test]
     fn accepts_compact_decode_without_sparse_mask_guard() {
         let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&timing));
 
         require_compact_decode_without_sparse_mask(Path::new("stage1.log"), &summary).unwrap();
     }
@@ -2257,13 +2481,98 @@ mod tests {
     #[test]
     fn rejects_compact_decode_guard_when_sparse_mask_is_present() {
         let timing = parse_timing_records(DECODE_LINE_WITH_SPARSE_MASK).unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&timing));
 
         let error = require_compact_decode_without_sparse_mask(Path::new("stage1.log"), &summary)
             .unwrap_err();
 
         assert!(
             error.to_string().contains("sparse_mask"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn summarizes_decode_policy_backend_evidence() {
+        let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_BACKEND_UNSUPPORTED_LINE)
+                .unwrap();
+        let compact_policy =
+            parse_compact_flash_policy_records(COMPACT_FLASH_POLICY_BACKEND_SUPPORTED_LINE)
+                .unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &compact_policy),
+        );
+
+        assert_eq!(summary.policy.direct_sparse.decode_records, 1);
+        assert_eq!(
+            summary
+                .policy
+                .direct_sparse
+                .decode_backend_sparse_supported
+                .false_records,
+            1
+        );
+        assert_eq!(summary.policy.direct_sparse.decode_use_direct_records, 0);
+        assert_eq!(summary.policy.compact_flash.decode_records, 1);
+        assert_eq!(summary.policy.compact_flash.decode_use_compact_records, 1);
+        assert_eq!(summary.policy.compact_flash.decode_no_mask_records, 1);
+        assert_eq!(
+            summary
+                .policy
+                .compact_flash
+                .decode_backend_compact_supported
+                .true_records,
+            1
+        );
+        assert_eq!(
+            summary
+                .policy
+                .compact_flash
+                .selector_reasons
+                .get("decode_compact_mask_omitted"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn accepts_compact_decode_policy_evidence_guard() {
+        let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_BACKEND_UNSUPPORTED_LINE)
+                .unwrap();
+        let compact_policy =
+            parse_compact_flash_policy_records(COMPACT_FLASH_POLICY_BACKEND_SUPPORTED_LINE)
+                .unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &compact_policy),
+        );
+
+        require_compact_decode_policy_evidence(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn rejects_compact_decode_policy_guard_without_backend_support() {
+        let timing = parse_timing_records(LINE_WITH_COMPACT_GET_ROWS).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_BACKEND_UNSUPPORTED_LINE)
+                .unwrap();
+        let compact_policy =
+            parse_compact_flash_policy_records(COMPACT_FLASH_POLICY_BACKEND_UNSUPPORTED_LINE)
+                .unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &compact_policy),
+        );
+
+        let error =
+            require_compact_decode_policy_evidence(Path::new("stage1.log"), &summary).unwrap_err();
+
+        assert!(
+            error.to_string().contains("backend_compact_supported"),
             "unexpected error: {error:#}"
         );
     }
@@ -2379,7 +2688,7 @@ mod tests {
                 .replace("total_us=1475800", "total_us=200")
         );
         let records = parse_timing_records(&text).unwrap();
-        let summary = summarize_log("stage1.log".into(), &records, &[], &[], &[], &[]);
+        let summary = summarize_log("stage1.log".into(), LogRecordInputs::new(&records));
         let stages = summary.stage_records.get(&1).unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
@@ -2414,7 +2723,10 @@ mod tests {
             "{LINE}\n{GROUP_LINE_LAYER_0}\n{GROUP_LINE_LAYER_1}"
         ))
         .unwrap();
-        let summary = summarize_log("stage1.log".into(), &timing, &groups, &[], &[], &[]);
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_group_records(&groups),
+        );
         let stage = summary.group_records.get(&1).unwrap();
         let layer_0 = stage.get("layer_0").unwrap().get(&Phase::Prefill).unwrap();
         let layer_1 = stage.get("layer_1").unwrap().get(&Phase::Prefill).unwrap();
@@ -2472,7 +2784,10 @@ mod tests {
     fn summarizes_sideband_payload_ratios() {
         let timing = parse_timing_records(LINE).unwrap();
         let sideband = parse_sideband_records(SIDEBAND_LINE).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[], &[]);
+        let summary = summarize_log(
+            "stage0.log".into(),
+            LogRecordInputs::new(&timing).with_sideband_records(&sideband),
+        );
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let decode = stages.get(&Phase::Decode).unwrap();
         assert_eq!(decode.records, 1);
@@ -2499,7 +2814,10 @@ mod tests {
         let timing = parse_timing_records(LINE).unwrap();
         let text = format!("{SIDEBAND_LINE}\n{SIDEBAND_RECEIVE_LINE}");
         let sideband = parse_sideband_records(&text).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[], &[]);
+        let summary = summarize_log(
+            "stage0.log".into(),
+            LogRecordInputs::new(&timing).with_sideband_records(&sideband),
+        );
         let forward = summary
             .sideband_records
             .get("stage-0")
@@ -2524,7 +2842,10 @@ mod tests {
     fn summarizes_sideband_padding_for_prefill() {
         let timing = parse_timing_records(LINE).unwrap();
         let sideband = parse_sideband_records(PADDED_PREFILL_SIDEBAND_LINE).unwrap();
-        let summary = summarize_log("stage0.log".into(), &timing, &[], &sideband, &[], &[]);
+        let summary = summarize_log(
+            "stage0.log".into(),
+            LogRecordInputs::new(&timing).with_sideband_records(&sideband),
+        );
         let stages = summary.sideband_records.get("stage-0").unwrap();
         let prefill = stages.get(&Phase::Prefill).unwrap();
         assert_eq!(prefill.tokens, 128);
