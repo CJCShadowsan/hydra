@@ -146,28 +146,28 @@ short prefill and verification dense by default unless a backend-specific sparse
 path has its own evidence.
 After those phase gates, the next measured local bottleneck is the MoE FFN
 rather than top-k routing. The gated Metal MoE fixture estimates one GLM-5.2
-routed FFN decode layer at `390.23 us`, with expert matmuls accounting for
-`374.44 us` (`96.0%`). Routed fused SwiGLU is only `5.34 us` (`1.4%`), and
-route/top-k plus weighted sum is only `10.45 us` (`2.7%`). The shared expert is
+routed FFN decode layer at `391.13 us`, with expert matmuls accounting for
+`375.42 us` (`96.0%`). Routed fused SwiGLU is only `5.35 us` (`1.4%`), and
+route/top-k plus weighted sum is only `10.36 us` (`2.6%`). The shared expert is
 not small. A production-shaped fused GLU shared expert plus final add measured
-`393.95 us`, making the routed+shared FFN estimate `784.18 us` with the shared
-expert at `50.2%`. The shared fused SwiGLU row itself is cheap (`4.35 us`, or
-`8.37 us` including final add); the earlier unfused `silu(gate) * up`
-diagnostic row measured `296.63 us` but does not represent the normal llama.cpp
+`405.32 us`, making the routed+shared FFN estimate `796.45 us` with the shared
+expert at `50.9%`. The shared fused SwiGLU row itself is cheap (`4.09 us`, or
+`8.24 us` including final add); the earlier unfused `silu(gate) * up`
+diagnostic row measured `291.73 us` but does not represent the normal llama.cpp
 `build_ffn()` path, which already uses `ggml_swiglu_split()`. That evidence
 should inform runtime optimization order, but it does not add new manifest
 schema: package policy still belongs under `generation.policy`, and numeric
 resolver hints still belong under `generation.thresholds`.
 The extended MoE fixture keeps that conclusion intact: a merged q2_K routed
-gate/up tensor shape estimates `382.79 us` (`1.02x` faster than the current
-routed estimate), a merged shared gate/up fused GLU shape measured `384.98 us`
-(`1.02x` faster than separate shared gate/up), moving MoE weights before the
-down projection measured `7.20 us` versus `7.28 us` (`1.01x`) on the small
+gate/up tensor shape estimates `385.00 us` (`1.02x` faster than the current
+routed estimate), a merged shared gate/up fused GLU shape measured `382.75 us`
+(`1.06x` faster than separate shared gate/up), moving MoE weights before the
+down projection measured `439.38 us` versus `442.34 us` (`1.01x`) on the small
 quantized whole-graph fixture, and a q2_K down-projection alternative
-estimates `341.80 us` (`1.14x`) before quality is measured. The same fixture
+estimates `342.59 us` (`1.14x`) before quality is measured. The same fixture
 now measures shared-expert q3_K and q2_K alternatives: q3_K is slower at
-`421.79 us` (`0.93x` versus q4_K), while q2_K is effectively tied at
-`388.74 us` (`1.01x` versus q4_K). That makes q2_K down quality testing and
+`443.86 us` (`0.91x` versus q4_K), while q2_K is effectively tied at
+`403.84 us` (`1.00x` versus q4_K). That makes q2_K down quality testing and
 deeper expert matmul/layout work more interesting than custom activation
 fusion, shared-expert quant lowering, or merged shared gate/up.
 The Phase E report can be run as a hard evidence gate with
@@ -186,13 +186,15 @@ and `162.67 us` at `nsg=4`, only `1.01x` faster than ordinary default q3_K
 `mul_mv_id`. The next meaningful local target is therefore a deeper expert
 matmul/layout specialization or a quality-tested down-projection quant change,
 not generic matrix-matrix cutoff, simdgroup, row-height, or fixed-block tuning.
-The optional production-sized `TOPK_MOE_GLM_CONSUMER_SANITY` rows are diagnostic
-only. They are accepted only if they are physically plausible against the
-isolated routed FFN estimate. The first sanity probe measured q3_K down at
-`7.14 us` and q2_K down at `6.97 us`, both below 25% of the isolated
-`391.14 us` routed FFN estimate, so the report rejects them. Do not use those
-whole-graph rows as production routed-MoE speed evidence until the backend
-timing path is understood.
+The production-sized `TOPK_MOE_GLM_CONSUMER_SANITY` rows now run the full
+routed MoE graph in perf mode. This fixed an earlier harness issue where the
+fixture had `run_whole_graph()` for correctness but still timed only the final
+`GGML_OP_MOE_WEIGHTED_SUM` during perf. With `perf_runs_whole_graph()` enabled,
+the sanity probe measured q3_K down at `803.92 us` and q2_K down at `739.91 us`
+against an isolated routed FFN estimate of `391.13 us`; both rows are plausible,
+and q2_K down is `1.09x` faster end-to-end on that production-shaped graph. This
+keeps q2_K down quality testing on the table, but with a more realistic
+whole-graph speedup than the isolated matmul estimate.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

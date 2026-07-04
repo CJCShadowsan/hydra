@@ -1,0 +1,82 @@
+From 0a927f36763bc9552e286f302002f96617448d0e Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 15:43:23 +1000
+Subject: [PATCH] Run GLM DSA routed consumer perf as whole graph
+
+---
+ scripts/glm52-phase-e-moe-report.sh | 16 ++++++++++++++--
+ tests/test-backend-ops.cpp          |  1 +
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index bbd1167cc..e70237a97 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -56,9 +56,9 @@ moe_filter='n_embd=6144|m=2048|m=4096|m=6144|n_tokens=1|n_tokens=4|n_embd=256'
+     --output csv > "${moe_csv}"
+ 
+ python3 - "${moe_log}" "${summary}" <<'PY'
++import os
+ import re
+ import sys
+-import os
+ from pathlib import Path
+ 
+ moe_log, summary = map(Path, sys.argv[1:])
+@@ -291,6 +291,7 @@ if [[ "${GLM52_PHASE_E_ROUTED_WHOLE_GRAPH_SANITY:-0}" != "0" ]]; then
+         --output console > "${sanity_log}" 2>&1
+ 
+     python3 - "${summary}" "${sanity_log}" <<'PY'
++import os
+ import re
+ import sys
+ from pathlib import Path
+@@ -316,6 +317,7 @@ rows = [
+ ]
+ estimate_match = estimate_re.search(summary_text)
+ estimate_us = float(estimate_match.group("us")) if estimate_match else None
++require_gates = os.environ.get("GLM52_PHASE_E_REQUIRE_GATES", "0") != "0"
+ 
+ q3 = next((row for row in rows if "down_type=q3_K" in row["params"]), None)
+ q2 = next((row for row in rows if "down_type=q2_K" in row["params"]), None)
+@@ -346,7 +348,7 @@ for label, row in (("q3_K down", q3), ("q2_K down", q2)):
+ 
+ if q3 and q2:
+     lines.append("")
+-    lines.append(f"- Raw q2/q3 ratio from the sanity probe: `{q3['us'] / q2['us']:.2f}x`.")
++    lines.append(f"- q2_K whole-graph speedup versus q3_K from the sanity probe: `{q3['us'] / q2['us']:.2f}x`.")
+ if estimate_us is not None:
+     lines.append(f"- Isolated routed FFN estimate used for plausibility: `{estimate_us:.2f} us`.")
+ lines.append(f"- Raw artifact: `{sanity_log.name}`.")
+@@ -354,6 +356,16 @@ lines.append(f"- Raw artifact: `{sanity_log.name}`.")
+ section = "\n".join(lines) + "\n"
+ summary.write_text(summary_text + section)
+ print(section)
++
++if require_gates:
++    failures = []
++    for label, row in (("q3_K down", q3), ("q2_K down", q2)):
++        row_verdict = verdict(row)
++        if row_verdict != "plausible":
++            failures.append(f"{label}: {row_verdict}")
++    if failures:
++        print("error: routed whole-graph sanity gate failed: " + ", ".join(failures), file=sys.stderr)
++        sys.exit(2)
+ PY
+ fi
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index aa0f8143a..f1ffefc59 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6198,6 +6198,7 @@ struct test_topk_moe_glm_consumer : public test_case {
+     }
+ 
+     bool run_whole_graph() override { return true; }
++    bool perf_runs_whole_graph() override { return true; }
+ 
+     ggml_tensor * build_glm_route(ggml_context * ctx) {
+         ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+-- 
+2.53.0
+
