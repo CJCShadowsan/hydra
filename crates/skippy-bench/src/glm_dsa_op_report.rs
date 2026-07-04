@@ -200,10 +200,10 @@ pub(crate) struct CompactFlashPolicyRecord {
     pub(crate) visible_kv: i64,
     pub(crate) top_k: i64,
     pub(crate) kv_topk_ratio: i64,
-    pub(crate) min_kv_topk_ratio: i64,
+    pub(crate) min_kv_topk_ratio: Option<i64>,
     pub(crate) forced: bool,
     pub(crate) disabled: bool,
-    pub(crate) ratio_ok: bool,
+    pub(crate) ratio_ok: Option<bool>,
     pub(crate) enabled: bool,
     pub(crate) flash_attn: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -839,7 +839,10 @@ pub(crate) fn parse_compact_flash_policy_records(
             line.find(COMPACT_FLASH_POLICY_PREFIX)
                 .map(|index| &line[index + COMPACT_FLASH_POLICY_PREFIX.len()..])
         })
-        .map(parse_compact_flash_policy_record)
+        .map(|line| {
+            parse_compact_flash_policy_record(line)
+                .with_context(|| format!("parse compact flash policy line: {line}"))
+        })
         .collect()
 }
 
@@ -1033,10 +1036,10 @@ fn parse_compact_flash_policy_record(line: &str) -> Result<CompactFlashPolicyRec
         visible_kv: parse_field(&fields, "visible_kv")?,
         top_k: parse_field(&fields, "top_k")?,
         kv_topk_ratio: parse_field(&fields, "kv_topk_ratio")?,
-        min_kv_topk_ratio: parse_field(&fields, "min_kv_topk_ratio")?,
+        min_kv_topk_ratio: parse_optional_field(&fields, "min_kv_topk_ratio")?,
         forced: parse_bool_int_field(&fields, "forced")?,
         disabled: parse_bool_int_field(&fields, "disabled")?,
-        ratio_ok: parse_bool_int_field(&fields, "ratio_ok")?,
+        ratio_ok: parse_optional_bool_int_field(&fields, "ratio_ok")?,
         enabled: parse_bool_int_field(&fields, "enabled")?,
         flash_attn: parse_bool_int_field(&fields, "flash_attn")?,
         phase: fields.get("phase").map(|value| (*value).to_string()),
@@ -1712,6 +1715,7 @@ mod tests {
     const DIRECT_SPARSE_DECISION_LINE_WITH_REASON: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1024 sparse_batch=1024 sparse_streams=1 prefill_cap=32 sparse_kv=99328 sparse_top_k=1024 min_kv_topk_ratio=32 kv_topk_ratio=97 dense_mask_bytes=203423744 dense_mask_limit=268435456 phase=prefill selector_reason=dense_mask_guard_large_prefill direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
     const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
+    const COMPACT_FLASH_POLICY_LINE_WITHOUT_MIN_RATIO: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
     const COMPACT_FLASH_MASK_LINE: &str = "skippy: glm_dsa_compact_flash_mask layer=30 omitted_mla_kq_mask=1 visible_kv=8192 ubatch_tokens=1 streams=1 max_top_k=2048";
     const METAL_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=32 heads=4 stream=1 kv=32 top_k=1024 top_stream=1 selected_keys=1048576 q_read_bytes=2415919104 k_read_bytes=1207959552 v_read_bytes=1073741824 mask_read_bytes=4194304 top_k_read_bytes=4194304 scratch_per_tg_bytes=1024 score_fma=603979776 value_fma=536870912 reduction_strategy=threadgroup_direct grid_x=32 grid_y=4 grid_z=8 threads_x=256 nwg=8 tmp_f16=1 dst_partial=1";
     const METAL_DECODE_VEC_REDUCE_DISPATCH_LINE: &str = "skippy: glm_dsa_metal_dispatch op=dsa_sparse_attn kernel=decode_vec_reduce tensor=blk.30.dsa_sparse_attn q_type=f32 k_type=f16 v_type=f16 mask_type=f32 top_k_type=i32 dst_type=f32 q_width=576 v_width=512 batch=4096 heads=64 stream=1 kv=4096 top_k=2048 top_stream=1 rows=262144 partial_bytes=536870912 softmax_bytes=4194304 tmp_bytes=541065216 grid_x=262144 grid_y=1 grid_z=1 threads_x=32 threads_y=2 nwg=2 tmp_f16=1 dst_partial=1";
@@ -1849,10 +1853,10 @@ mod tests {
         assert_eq!(record.visible_kv, 8192);
         assert_eq!(record.top_k, 2048);
         assert_eq!(record.kv_topk_ratio, 4);
-        assert_eq!(record.min_kv_topk_ratio, 2);
+        assert_eq!(record.min_kv_topk_ratio, Some(2));
         assert!(!record.forced);
         assert!(!record.disabled);
-        assert!(record.ratio_ok);
+        assert_eq!(record.ratio_ok, Some(true));
         assert!(record.enabled);
         assert!(record.flash_attn);
         assert_eq!(record.phase.as_deref(), Some("decode"));
@@ -1864,6 +1868,18 @@ mod tests {
         assert_eq!(record.no_mask, Some(true));
         assert!(record.use_compact);
         assert_eq!(record.selector_reason.as_deref(), Some("decode_compact"));
+    }
+
+    #[test]
+    fn parses_compact_flash_policy_without_min_ratio() {
+        let records =
+            parse_compact_flash_policy_records(COMPACT_FLASH_POLICY_LINE_WITHOUT_MIN_RATIO)
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.min_kv_topk_ratio, None);
+        assert_eq!(record.kv_topk_ratio, 4);
+        assert!(record.use_compact);
     }
 
     #[test]

@@ -18,9 +18,10 @@ use skippy_protocol::binary::{
 };
 use skippy_runtime::package::{PackagePart, PackageStageRequest, select_layer_package_parts};
 use skippy_runtime::{
-    ActivationDesc, ActivationFrame, FlashAttentionType, RuntimeActivationDType,
-    RuntimeActivationLayout, RuntimeConfig, RuntimeKvPageDesc, RuntimeLoadMode, StageModel,
-    parse_cache_type, redirect_native_logs_to_file, restore_native_logs,
+    ActivationDesc, ActivationFrame, FlashAttentionType, GlmDsaPolicyConfig,
+    RuntimeActivationDType, RuntimeActivationLayout, RuntimeConfig, RuntimeKvPageDesc,
+    RuntimeLoadMode, StageModel, parse_cache_type, redirect_native_logs_to_file,
+    restore_native_logs,
 };
 
 use crate::{
@@ -2851,7 +2852,27 @@ fn runtime_config_for_range(
         include_embeddings: false,
         include_output: false,
         filter_tensors_on_load: true,
+        glm_dsa_policy: Some(runtime_glm_dsa_policy(args)),
     })
+}
+
+fn runtime_glm_dsa_policy(args: &GlmDsaLayerMicrobenchArgs) -> GlmDsaPolicyConfig {
+    let compact_flash_enabled = args.compact_flash_attn || allow_compact_flash_auto(args);
+    let direct_sparse_attn =
+        args.direct_sparse_attn || args.native_default_direct_sparse_attn || compact_flash_enabled;
+    let direct_sparse_prefill =
+        args.direct_sparse_prefill || args.native_default_direct_sparse_prefill;
+
+    GlmDsaPolicyConfig {
+        direct_sparse_attn,
+        direct_sparse_prefill,
+        disable_compact_flash_attn: !compact_flash_enabled,
+        unproven_large_direct_sparse_prefill: args.enable_unproven_large_direct_sparse_prefill,
+        short_prefill_max_tokens: args.direct_sparse_prefill_max_tokens,
+        dense_sparse_mask_max_bytes: args.dense_sparse_mask_max_bytes,
+        compact_flash_min_kv: Some(1),
+        ..GlmDsaPolicyConfig::glm_dsa_v1()
+    }
 }
 
 fn bounded_u32(value: usize) -> u32 {
@@ -4829,7 +4850,7 @@ fn summarize_compact_flash_policy_slice(
         if record.disabled {
             summary.disabled += 1;
         }
-        if record.ratio_ok {
+        if record.ratio_ok == Some(true) {
             summary.ratio_ok += 1;
         }
         if record.enabled {
@@ -10769,10 +10790,10 @@ mod tests {
             visible_kv: 4096,
             top_k: 2048,
             kv_topk_ratio: 2,
-            min_kv_topk_ratio: 2,
+            min_kv_topk_ratio: Some(2),
             forced: false,
             disabled: false,
-            ratio_ok: true,
+            ratio_ok: Some(true),
             enabled: true,
             flash_attn: true,
             phase: Some(phase.to_string()),

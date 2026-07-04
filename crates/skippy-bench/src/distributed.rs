@@ -2603,6 +2603,7 @@ fn tokenizer_runtime_config(
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load,
+        glm_dsa_policy: None,
     }
 }
 

@@ -260,6 +260,7 @@ fn run_full_model_decode(
         include_embeddings: true,
         include_output: true,
         filter_tensors_on_load: false,
+        glm_dsa_policy: None,
     };
     let model = StageModel::open(model_path, &config).context("failed to open full model")?;
     let tokens = model
@@ -342,6 +343,7 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
+        glm_dsa_policy: None,
     };
     let stage0 = open_stage_model_for_binary_split(
         &args.model_path,
@@ -481,6 +483,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
+        glm_dsa_policy: None,
     };
     let stage0 =
         StageModel::open(&args.model_path, &stage0_config).context("failed to open stage 0")?;
@@ -1148,6 +1151,7 @@ pub fn local_split_inprocess(args: LocalSplitInprocessArgs) -> Result<()> {
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
+        glm_dsa_policy: None,
     };
     let stage1_config = RuntimeConfig {
         stage_index: 1,
@@ -1172,6 +1176,7 @@ pub fn local_split_inprocess(args: LocalSplitInprocessArgs) -> Result<()> {
         include_embeddings: false,
         include_output: true,
         filter_tensors_on_load: true,
+        glm_dsa_policy: None,
     };
 
     let stage0 =

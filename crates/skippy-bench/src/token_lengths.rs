@@ -93,6 +93,7 @@ pub fn token_lengths(args: TokenLengthsArgs) -> Result<()> {
             include_embeddings: true,
             include_output: false,
             filter_tensors_on_load: true,
+            glm_dsa_policy: None,
         },
     )
     .with_context(|| format!("open tokenizer model {}", args.model_path.display()))?;

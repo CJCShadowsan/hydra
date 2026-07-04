@@ -154,6 +154,7 @@ fn full_runtime_config(args: &VerifySpanLocalArgs) -> Result<RuntimeConfig> {
         include_embeddings: true,
         include_output: true,
         filter_tensors_on_load: false,
+        glm_dsa_policy: None,
     })
 }
 
@@ -440,6 +441,7 @@ fn split_runtime_configs(
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
+        glm_dsa_policy: None,
     };
     let stage1 = RuntimeConfig {
         stage_index: 1,
@@ -464,6 +466,7 @@ fn split_runtime_configs(
         include_embeddings: false,
         include_output: true,
         filter_tensors_on_load: true,
+        glm_dsa_policy: None,
     };
     Ok((stage0, stage1))
 }
