@@ -402,8 +402,8 @@ fn run_binary_split(args: BinarySplitConfig) -> Result<BinarySplitResult> {
         load_mode: stage_load_mode.runtime,
         projector_path: None,
         use_mmap: stage_load_mode.use_mmap,
-        use_mmap_prefetch: stage_load_mode.use_mmap,
-        use_mmap_buffer: stage_load_mode.use_mmap,
+        use_mmap_prefetch: stage_load_mode.use_mmap_prefetch,
+        use_mmap_buffer: stage_load_mode.use_mmap_buffer,
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
@@ -545,8 +545,8 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         load_mode: stage_load_mode.runtime,
         projector_path: None,
         use_mmap: stage_load_mode.use_mmap,
-        use_mmap_prefetch: stage_load_mode.use_mmap,
-        use_mmap_buffer: stage_load_mode.use_mmap,
+        use_mmap_prefetch: stage_load_mode.use_mmap_prefetch,
+        use_mmap_buffer: stage_load_mode.use_mmap_buffer,
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
@@ -941,8 +941,8 @@ fn chain_stage_config(
         load_mode: stage_load_mode.runtime,
         projector_path: None,
         use_mmap: stage_load_mode.use_mmap,
-        use_mmap_prefetch: stage_load_mode.use_mmap,
-        use_mmap_buffer: stage_load_mode.use_mmap,
+        use_mmap_prefetch: stage_load_mode.use_mmap_prefetch,
+        use_mmap_buffer: stage_load_mode.use_mmap_buffer,
         include_embeddings,
         include_output,
         filter_tensors_on_load: true,
@@ -986,6 +986,8 @@ struct ParsedStageLoadMode {
     protocol: ProtocolLoadMode,
     protocol_str: &'static str,
     use_mmap: bool,
+    use_mmap_prefetch: bool,
+    use_mmap_buffer: bool,
 }
 
 fn parse_stage_load_mode(load_mode: &str) -> Result<ParsedStageLoadMode> {
@@ -995,21 +997,35 @@ fn parse_stage_load_mode(load_mode: &str) -> Result<ParsedStageLoadMode> {
             protocol: ProtocolLoadMode::ArtifactSlice,
             protocol_str: "artifact-slice",
             use_mmap: true,
+            use_mmap_prefetch: true,
+            use_mmap_buffer: true,
         }),
         "layer-package" => Ok(ParsedStageLoadMode {
             runtime: RuntimeLoadMode::LayerPackage,
             protocol: ProtocolLoadMode::LayerPackage,
             protocol_str: "layer-package",
             use_mmap: false,
+            use_mmap_prefetch: false,
+            use_mmap_buffer: false,
+        }),
+        "layer-package-mmap" => Ok(ParsedStageLoadMode {
+            runtime: RuntimeLoadMode::LayerPackage,
+            protocol: ProtocolLoadMode::LayerPackage,
+            protocol_str: "layer-package",
+            use_mmap: true,
+            use_mmap_prefetch: false,
+            use_mmap_buffer: true,
         }),
         "runtime-slice" => Ok(ParsedStageLoadMode {
             runtime: RuntimeLoadMode::RuntimeSlice,
             protocol: ProtocolLoadMode::RuntimeSlice,
             protocol_str: "runtime-slice",
             use_mmap: true,
+            use_mmap_prefetch: true,
+            use_mmap_buffer: true,
         }),
         other => bail!(
-            "unsupported --stage-load-mode {other}; expected runtime-slice, artifact-slice, or layer-package"
+            "unsupported --stage-load-mode {other}; expected runtime-slice, artifact-slice, layer-package, or layer-package-mmap"
         ),
     }
 }
@@ -1533,6 +1549,20 @@ mod tests {
         assert_eq!(parsed.protocol, ProtocolLoadMode::LayerPackage);
         assert_eq!(parsed.protocol_str, "layer-package");
         assert!(!parsed.use_mmap);
+        assert!(!parsed.use_mmap_prefetch);
+        assert!(!parsed.use_mmap_buffer);
+    }
+
+    #[test]
+    fn parses_layer_package_mmap_stage_load_mode_without_prefetch() {
+        let parsed = parse_stage_load_mode("layer-package-mmap").unwrap();
+
+        assert!(matches!(parsed.runtime, RuntimeLoadMode::LayerPackage));
+        assert_eq!(parsed.protocol, ProtocolLoadMode::LayerPackage);
+        assert_eq!(parsed.protocol_str, "layer-package");
+        assert!(parsed.use_mmap);
+        assert!(!parsed.use_mmap_prefetch);
+        assert!(parsed.use_mmap_buffer);
     }
 
     #[test]

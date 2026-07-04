@@ -1028,7 +1028,7 @@ pub struct LocalSplitBinaryArgs {
     #[arg(
         long,
         default_value = "runtime-slice",
-        help = "Stage load mode for --model-path. Use layer-package when --model-path points at a Skippy layer package directory."
+        help = "Stage load mode for --model-path. Use layer-package or layer-package-mmap when --model-path points at a Skippy layer package directory."
     )]
     pub stage_load_mode: String,
     #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
@@ -1090,7 +1090,7 @@ pub struct LocalSplitChainInprocessArgs {
     #[arg(
         long,
         default_value = "runtime-slice",
-        help = "Stage load mode for --model-path. Use layer-package when --model-path points at a Skippy layer package directory."
+        help = "Stage load mode for --model-path. Use layer-package or layer-package-mmap when --model-path points at a Skippy layer package directory."
     )]
     pub stage_load_mode: String,
     #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
@@ -1123,7 +1123,7 @@ pub struct LocalSplitChainBinaryArgs {
     #[arg(
         long,
         default_value = "runtime-slice",
-        help = "Stage load mode for --model-path. Use layer-package when --model-path points at a Skippy layer package directory."
+        help = "Stage load mode for --model-path. Use layer-package or layer-package-mmap when --model-path points at a Skippy layer package directory."
     )]
     pub stage_load_mode: String,
     #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
@@ -1304,7 +1304,7 @@ mod tests {
             "--model-path",
             "/tmp/glm52-layers",
             "--stage-load-mode",
-            "layer-package",
+            "layer-package-mmap",
             "--split-layer",
             "31",
             "--layer-end",
@@ -1317,7 +1317,7 @@ mod tests {
         };
 
         assert_eq!(args.model_path, PathBuf::from("/tmp/glm52-layers"));
-        assert_eq!(args.stage_load_mode, "layer-package");
+        assert_eq!(args.stage_load_mode, "layer-package-mmap");
         assert_eq!(args.split_layer, 31);
         assert_eq!(args.layer_end, 32);
     }
