@@ -174,9 +174,14 @@ The optional Phase E kernel sweep also rules out two tempting kernel-policy
 shortcuts: forcing one-token MoE through Metal `mul_mm_id` measured `850.64 us`
 for q3_K routed down versus `165.86 us` on the default `mul_mv_id` path, while
 q3_K `mul_mv_id` simdgroup tuning was noise-level (`165.86 us` default versus
-`165.26 us` best measured). The next meaningful local target is therefore a
-real q3_K routed-down specialization or a quality-tested down-projection quant
-change, not generic matrix-matrix cutoff tuning.
+`165.26 us` best measured). A follow-up row-height sweep reached the same
+conclusion: forcing one-token q3_K down through `mul_mm_id` measured
+`842.49 us` versus `163.96 us` on default `mul_mv_id`, simdgroup tuning
+measured `163.96 us` default versus `163.52 us` best, and q3_K row-height
+tuning measured `164.62 us` for default `nr0=4` with no faster row. The next
+meaningful local target is therefore a real q3_K routed-down specialization or
+a quality-tested down-projection quant change, not generic matrix-matrix
+cutoff, simdgroup, or row-height tuning.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

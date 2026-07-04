@@ -110,7 +110,11 @@ validated artifact shape.
 The Phase E kernel sweep also showed that generic dispatch tuning is not the
 lever: forcing one-token q3_K routed down through `mul_mm_id` measured
 `850.64 us` versus `165.86 us` on the default `mul_mv_id` path, and q3_K
-`mul_mv_id` simdgroup tuning stayed within measurement noise.
+`mul_mv_id` simdgroup tuning stayed within measurement noise. The follow-up
+row-height sweep confirmed the same shape: forced q3_K `mul_mm_id` measured
+`842.49 us` versus `163.96 us` on default `mul_mv_id`, simdgroup tuning only
+moved the best row to `163.52 us`, and q3_K row-height tuning found no faster
+row than default `nr0=4` at `164.62 us`.
 
 The main split-serving implication is that Skippy should pass through the
 resolved `generation.policy` and `generation.thresholds` contract, not add a

@@ -603,6 +603,14 @@ path. q3_K `mul_mv_id` simdgroup tuning measured `165.86 us` at the default
 than a real policy win. That rules out generic matrix-matrix cutoff tuning as
 the next lever; q3_K routed down needs either a specialized kernel or a
 quality-tested quantization change.
+A follow-up q3_K row-height sweep kept that conclusion intact. Forced
+one-token q3_K down through `mul_mm_id` measured `842.49 us`, while the default
+`mul_mv_id` path measured `163.96 us`. Simdgroup tuning moved the best sampled
+row only to `163.52 us`, and row-height tuning found no faster row than the
+default `nr0=4` at `164.62 us`; `nr0=1` and `nr0=2` were both around
+`195-197 us`, and `nr0=8` was `166.38 us`. Keep q3_K down work focused on a
+real kernel specialization or a quality-tested q2_K down alternative, not
+generic dispatch knobs.
 
 The IndexShare numbers are why `generation.policy.indexshare` is a first-class
 policy field instead of an implementation note. For GLM-5.2-style DSA with a

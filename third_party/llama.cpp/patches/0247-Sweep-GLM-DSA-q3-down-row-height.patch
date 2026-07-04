@@ -1,0 +1,128 @@
+From c97a852797d9504f09470b81e3e867852cd31c02 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 13:59:26 +1000
+Subject: [PATCH] Sweep GLM DSA q3 down row height
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 24 ++++++++++++++++++++++-
+ ggml/src/ggml-metal/ggml-metal.metal      |  3 +++
+ scripts/glm52-phase-e-moe-report.sh       | 24 +++++++++++++++++++++++
+ 3 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 0378a654f..8d782fde6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -35,6 +35,24 @@ static int ggml_metal_glm_dsa_q3_k_mul_mv_id_nsg_requested() {
+     }
+ }
+ 
++static int ggml_metal_glm_dsa_q3_k_mul_mv_id_nr0_requested() {
++    const char * value = getenv("LLAMA_GLM_DSA_Q3_K_MUL_MV_ID_NR0");
++    if (value == nullptr || value[0] == '\0') {
++        return N_R0_Q3_K;
++    }
++
++    const int requested = atoi(value);
++    switch (requested) {
++        case 1:
++        case 2:
++        case 4:
++        case 8:
++            return requested;
++        default:
++            return N_R0_Q3_K;
++    }
++}
++
+ ggml_metal_device_t ggml_metal_device_get(int device) {
+     static std::vector<ggml_metal_device_ptr> devs;
+ 
+@@ -1217,7 +1235,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+         case GGML_TYPE_Q3_K:
+             {
+                 nsg = ggml_metal_glm_dsa_q3_k_mul_mv_id_nsg_requested();
+-                nr0 = N_R0_Q3_K;
++                nr0 = ggml_metal_glm_dsa_q3_k_mul_mv_id_nr0_requested();
++                if (nr0 != N_R0_Q3_K) {
++                    snprintf(name, sizeof(name), "_r%d", nr0);
++                    suffix = name;
++                }
+             } break;
+         case GGML_TYPE_Q4_K:
+             {
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 021b0e2fb..60b0d9556 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -11881,6 +11881,9 @@ template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t
+ 
+ template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl   <N_R0_Q2_K>>>;
+ template [[host_name("kernel_mul_mv_id_q3_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <N_R0_Q3_K>>>;
++template [[host_name("kernel_mul_mv_id_q3_K_f32_r1")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <1>>>;
++template [[host_name("kernel_mul_mv_id_q3_K_f32_r2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <2>>>;
++template [[host_name("kernel_mul_mv_id_q3_K_f32_r8")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_impl   <8>>>;
+ template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl   <N_R0_Q4_K>>>;
+ template [[host_name("kernel_mul_mv_id_q5_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q5_K_f32_impl   <N_R0_Q5_K>>>;
+ template [[host_name("kernel_mul_mv_id_q6_K_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q6_K_f32_impl   <N_R0_Q6_K>>>;
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index 2ffc81db3..5496f7db3 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -262,6 +262,14 @@ if [[ "${GLM52_PHASE_E_KERNEL_SWEEP:-0}" != "0" ]]; then
+             --output console > "${sweep_dir}/q3-k-mul-mv-id-nsg-${nsg}.console.log" 2>&1
+     done
+ 
++    for nr0 in 1 2 4 8; do
++        LLAMA_GLM_DSA_Q3_K_MUL_MV_ID_NR0="${nr0}" \
++            "${test_backend_ops}" perf \
++            -o MUL_MAT_ID \
++            -p 'type_a=q3_K,type_b=f32,n_mats=256,n_used=8,b=0,m=6144,n=1,k=2048' \
++            --output console > "${sweep_dir}/q3-k-mul-mv-id-nr0-${nr0}.console.log" 2>&1
++    done
++
+     python3 - "${summary}" "${sweep_dir}" <<'PY'
+ import re
+ import sys
+@@ -293,6 +301,12 @@ for nsg in (1, 2, 4):
+     row = next((item for item in parsed if "type_a=q3_K" in item["params"]), None)
+     q3_rows.append((nsg, row))
+ 
++q3_nr0_rows = []
++for nr0 in (1, 2, 4, 8):
++    parsed = rows(sweep_dir / f"q3-k-mul-mv-id-nr0-{nr0}.console.log")
++    row = next((item for item in parsed if "type_a=q3_K" in item["params"]), None)
++    q3_nr0_rows.append((nr0, row))
++
+ lines = [
+     "",
+     "## Optional Kernel Sweep",
+@@ -313,15 +327,25 @@ for nsg, row in q3_rows:
+     else:
+         lines.append(f"| q3_K `mul_mv_id` nsg={nsg} | missing | missing |")
+ 
++for nr0, row in q3_nr0_rows:
++    if row:
++        lines.append(f"| q3_K `mul_mv_id` nr0={nr0} | `{row['params']}` | {row['us']:.2f} us |")
++    else:
++        lines.append(f"| q3_K `mul_mv_id` nr0={nr0} | missing | missing |")
++
+ forced_q3 = next((row for row in forced_rows if "type_a=q3_K" in row["params"]), None)
+ default_q3 = next((row for nsg, row in q3_rows if nsg == 2 and row), None)
+ best_q3 = min((row for _, row in q3_rows if row), key=lambda row: row["us"], default=None)
++default_nr0_q3 = next((row for nr0, row in q3_nr0_rows if nr0 == 4 and row), None)
++best_nr0_q3 = min((row for _, row in q3_nr0_rows if row), key=lambda row: row["us"], default=None)
+ 
+ lines.extend(["", "### Kernel Sweep Notes", ""])
+ if forced_q3 and default_q3:
+     lines.append(f"- Forcing `mul_mm_id` at one token measured `{forced_q3['us']:.2f} us` for q3_K down versus `{default_q3['us']:.2f} us` on the default `mul_mv_id` path; keep one-token decode on matrix-vector kernels.")
+ if default_q3 and best_q3:
+     lines.append(f"- q3_K `mul_mv_id` simdgroup tuning is noise-level here: default nsg=2 is `{default_q3['us']:.2f} us`, best measured row is `{best_q3['us']:.2f} us`.")
++if default_nr0_q3 and best_nr0_q3:
++    lines.append(f"- q3_K `mul_mv_id` row-height tuning: default nr0=4 is `{default_nr0_q3['us']:.2f} us`, best measured row is `{best_nr0_q3['us']:.2f} us`.")
+ 
+ section = "\n".join(lines) + "\n"
+ summary.write_text(summary.read_text() + section)
+-- 
+2.53.0
+
