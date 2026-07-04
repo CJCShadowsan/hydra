@@ -71,6 +71,7 @@ struct BinaryChainResult {
 struct InprocessChainBoundaryResult {
     model_identity: ModelIdentity,
     token_id: i32,
+    predicted_token: Option<i32>,
     activation_width: i32,
     stage0_payload_bytes: u64,
     stage0_sideband_bytes: usize,
@@ -84,6 +85,7 @@ struct InprocessChainBoundaryResult {
     split_layer_1: u32,
     split_layer_2: u32,
     layer_end: u32,
+    final_output: bool,
 }
 
 fn ensure_reply_kind(
@@ -249,9 +251,10 @@ pub fn local_split_chain_inprocess(args: LocalSplitChainInprocessArgs) -> Result
         "{}",
         serde_json::to_string_pretty(&json!({
             "mode": "local-split-chain-inprocess",
-            "boundary_only": true,
+            "boundary_only": !result.final_output,
             "model_identity": result.model_identity,
             "token_id": result.token_id,
+            "predicted_token": result.predicted_token,
             "activation_width": result.activation_width,
             "stages": [
                 {
@@ -277,7 +280,8 @@ pub fn local_split_chain_inprocess(args: LocalSplitChainInprocessArgs) -> Result
                     "payload_bytes": result.stage2_payload_bytes,
                     "sideband_bytes": result.stage2_sideband_bytes,
                     "sideband_i32_count": result.stage2_sideband_i32_count,
-                    "returned_activation_boundary": true,
+                    "returned_activation_boundary": !result.final_output,
+                    "returned_predicted_token": result.final_output,
                 }
             ]
         }))?
@@ -774,6 +778,17 @@ fn run_inprocess_chain_boundary(
         bail!("split_layer_1 and split_layer_2 must partition 0..layer_end in ascending order");
     }
     let stage_load_mode = parse_stage_load_mode(&args.stage_load_mode)?;
+    if args.final_output && stage_load_mode.protocol == ProtocolLoadMode::LayerPackage {
+        let package = inspect_layer_package(&args.model_path.display().to_string())
+            .context("inspect layer package for final-output boundary")?;
+        if args.layer_end != package.layer_count {
+            bail!(
+                "--final-output requires --layer-end to match package layer_count {}; got {}",
+                package.layer_count,
+                args.layer_end
+            );
+        }
+    }
     if stage_load_mode.protocol == ProtocolLoadMode::RuntimeSlice {
         validate_local_topology_plan(
             &args.model_path,
@@ -784,11 +799,20 @@ fn run_inprocess_chain_boundary(
         )?;
     }
     let model_identity = model_identity_for_path(&args.model_id, Some(&args.model_path))?;
-    let stage0_config = chain_stage_config(0, 0, args.split_layer_1, true, &stage_load_mode, &args);
+    let stage0_config = chain_stage_config(
+        0,
+        0,
+        args.split_layer_1,
+        true,
+        false,
+        &stage_load_mode,
+        &args,
+    );
     let stage1_config = chain_stage_config(
         1,
         args.split_layer_1,
         args.split_layer_2,
+        false,
         false,
         &stage_load_mode,
         &args,
@@ -798,6 +822,7 @@ fn run_inprocess_chain_boundary(
         args.split_layer_2,
         args.layer_end,
         false,
+        args.final_output,
         &stage_load_mode,
         &args,
     );
@@ -857,16 +882,21 @@ fn run_inprocess_chain_boundary(
         bail!("stage 1 produced an empty activation frame");
     }
 
-    let (_stage2_prediction, boundary2) = session2
+    let (stage2_prediction, boundary2) = session2
         .decode_step_frame(token_id, Some(&boundary1), 0)
         .context("stage 2 failed to consume activation frame")?;
-    if boundary2.payload.is_empty() {
+    if args.final_output {
+        if stage2_prediction < 0 {
+            bail!("final output stage did not return a predicted token");
+        }
+    } else if boundary2.payload.is_empty() {
         bail!("stage 2 produced an empty activation frame");
     }
 
     Ok(InprocessChainBoundaryResult {
         model_identity,
         token_id,
+        predicted_token: args.final_output.then_some(stage2_prediction),
         activation_width,
         stage0_payload_bytes: boundary0.desc.payload_bytes,
         stage0_sideband_bytes: glm_dsa_sideband_bytes(&boundary0, &[0])?,
@@ -880,6 +910,7 @@ fn run_inprocess_chain_boundary(
         split_layer_1: args.split_layer_1,
         split_layer_2: args.split_layer_2,
         layer_end: args.layer_end,
+        final_output: args.final_output,
     })
 }
 
@@ -888,6 +919,7 @@ fn chain_stage_config(
     layer_start: u32,
     layer_end: u32,
     include_embeddings: bool,
+    include_output: bool,
     stage_load_mode: &ParsedStageLoadMode,
     args: &LocalSplitChainInprocessArgs,
 ) -> RuntimeConfig {
@@ -912,7 +944,7 @@ fn chain_stage_config(
         use_mmap_prefetch: stage_load_mode.use_mmap,
         use_mmap_buffer: stage_load_mode.use_mmap,
         include_embeddings,
-        include_output: false,
+        include_output,
         filter_tensors_on_load: true,
         glm_dsa_policy: None,
     }

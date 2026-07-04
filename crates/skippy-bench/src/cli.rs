@@ -1107,6 +1107,11 @@ pub struct LocalSplitChainInprocessArgs {
     pub n_gpu_layers: i32,
     #[arg(long, default_value = "Hello")]
     pub prompt: String,
+    #[arg(
+        long,
+        help = "Make the final stage include the output head and require a predicted token. Use only when --layer-end is the model output boundary."
+    )]
+    pub final_output: bool,
 }
 
 #[derive(Parser)]
@@ -1361,6 +1366,7 @@ mod tests {
             "7",
             "--layer-end",
             "8",
+            "--final-output",
         ])
         .unwrap();
 
@@ -1373,6 +1379,7 @@ mod tests {
         assert_eq!(args.split_layer_1, 6);
         assert_eq!(args.split_layer_2, 7);
         assert_eq!(args.layer_end, 8);
+        assert!(args.final_output);
     }
 
     #[test]
