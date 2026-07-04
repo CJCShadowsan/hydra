@@ -1,0 +1,77 @@
+From 4eb9fc09ac933459e3df0a36c3232cdb2da46899 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 4 Jul 2026 10:34:12 +1000
+Subject: [PATCH 231/231] Validate GLM DSA short-history compact decode
+
+---
+ tests/test-llama-archs.cpp | 31 +++++++++++++++++++++++++++----
+ 1 file changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index aabff0af8..ed2ae7005 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -611,7 +611,7 @@ static void decode_tokens(llama_context * lctx, const std::vector<llama_token> &
+ }
+ 
+ static glm_dsa_graph_op_counts run_glm_dsa_decode_graph_after_prefill(
+-        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs, uint32_t n_prefill = 16) {
+     gguf_context_ptr gguf_ctx = get_gguf_ctx(
+             LLM_ARCH_GLM_DSA,
+             true,
+@@ -629,11 +629,11 @@ static glm_dsa_graph_op_counts run_glm_dsa_decode_graph_after_prefill(
+             LLAMA_FLASH_ATTN_TYPE_ENABLED);
+ 
+     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
+-    const std::vector<llama_token> tokens = get_tokens(17, n_vocab, seed);
+-    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + 16), 0);
++    const std::vector<llama_token> tokens = get_tokens(n_prefill + 1, n_vocab, seed);
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + n_prefill), 0);
+ 
+     counts = {};
+-    decode_tokens(model_ctx.second.get(), std::vector<llama_token>{tokens[16]}, 16);
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>{tokens[n_prefill]}, n_prefill);
+ 
+     return counts;
+ }
+@@ -772,6 +772,28 @@ static bool test_glm_dsa_default_compact_decode_graph(
+     }
+ }
+ 
++static bool test_glm_dsa_short_history_compact_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        // During one-token decode, IndexShare top-k is selected from the previous
++        // KV state while attention sees previous+current KV. Even at short
++        // history, this should exercise compact selected-KV flash, not all-KV flash.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs, 4);
++
++        if (counts.compact_get_rows == 0 || counts.flash_attn == 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA short-history compact decode graph counted total=%d compact_get_rows=%d flash_attn=%d sparse_mask=%d sparse_mask_nodes=%d dsa_sparse_attn=%d\n",
++                    counts.total, counts.compact_get_rows, counts.flash_attn, counts.sparse_mask, counts.sparse_mask_nodes, counts.dsa_sparse_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA short-history compact decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
+ static bool test_glm_dsa_compact_disabled_decode_graph(
+         const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
+     try {
+@@ -1131,6 +1153,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+                 test_glm_dsa_compact_decode_graph(seed, {}) &&
+                 test_glm_dsa_compact_min_kv_decode_graph(seed, {}) &&
+                 test_glm_dsa_default_compact_decode_graph(seed, {}) &&
++                test_glm_dsa_short_history_compact_decode_graph(seed, {}) &&
+                 test_glm_dsa_compact_disabled_decode_graph(seed, {}) &&
+                 test_glm_dsa_verify_dense_graph(seed, {}) &&
+                 test_glm_dsa_short_prefill_dense_graph(seed, {}) &&
+-- 
+2.53.0
+

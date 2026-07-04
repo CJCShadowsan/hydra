@@ -68,12 +68,16 @@ compact selected-row flash at `63.40 us/run` for
 `106.57 us/run`, and dense masked flash at `71.72 us/run` on the comparable
 one-token shape. That is the evidence behind preferring
 `decode: "compact-flash"` once parity is proven on the target package/backend.
-For model-native early decode where `top_k = visible_kv`, compact selected-row
-flash measured `61.90 us` at `kv=128`, `60.71 us` at `kv=256`, `61.24 us` at
-`kv=257`, and `57.99 us` at `kv=513`; direct sparse measured `137.15 us`,
-`209.97 us`, `249.30 us`, and `711.10 us` for the same shapes. That is why
-native GLM-DSA decode should prefer compact flash over direct sparse by default
-when flash attention is available.
+For exact-boundary fixtures where selected KV equals visible KV, compact
+selected-row flash measured `61.90 us` at `kv=128`, `60.71 us` at `kv=256`,
+`61.24 us` at `kv=257`, and `57.99 us` at `kv=513`; direct sparse measured
+`137.15 us`, `209.97 us`, `249.30 us`, and `711.10 us` for the same shapes.
+The literal `top_k >= visible_kv` boundary is handled by llama.cpp's all-KV
+flash bypass, but ordinary one-token decode after prefill is different:
+IndexShare top-k is selected from the previous KV state while attention sees
+previous+current KV. Even at short history, that route still exercises compact
+selected-KV flash. That is why native GLM-DSA decode should prefer compact
+flash over direct sparse by default when flash attention is available.
 At GLM-5.2's configured `top_k=768` width, compact selected-row flash measured
 `55.11-55.62 us/run` for `kv=1024..2048`, while direct sparse measured
 `984.50-988.95 us/run` on the same shapes. That is roughly an `18x` win for

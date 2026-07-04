@@ -62,19 +62,21 @@ and IndexShare `required`, but Skippy should only select those paths when the
 embedded llama runtime reports support and should log any fallback. Current
 Metal backend evidence for one-token decode shows compact selected-row flash at
 `63.40 us/run` versus direct sparse at `106.57 us/run` and dense masked flash at
-`71.72 us/run` on the `kv=257,top_k=64` fixture family. For model-native early
-decode where `top_k = visible_kv`, compact selected-row flash measured
-`57.99-61.90 us/run` across `kv=128..513`, while direct sparse measured
-`137.15-711.10 us/run` on the same shapes. For short phase shapes, dense masked
-flash measured `68.58-70.80 us/run` versus
+`71.72 us/run` on the `kv=257,top_k=64` fixture family. Exact-boundary
+fixtures where selected KV equals visible KV measured compact selected-row
+flash at `57.99-61.90 us/run` across `kv=128..513`, while direct sparse
+measured `137.15-711.10 us/run` on the same shapes. The literal
+`top_k >= visible_kv` boundary is handled by llama.cpp's all-KV flash bypass,
+but ordinary one-token decode after prefill still takes the compact selected-KV
+route because IndexShare top-k is selected from the previous KV state while
+attention sees previous+current KV. For short phase shapes, dense masked flash
+measured `68.58-70.80 us/run` versus
 `461.98-473.75 us/run` for direct sparse at 4-16 tokens, so Skippy should treat
 short prefill and verification as dense defaults unless the embedded llama
 runtime resolves an explicit, measured sparse override.
 At the configured GLM-5.2 `top_k=768` width, compact selected-row flash measured
 `55.11-55.62 us/run` for `kv=1024..2048`, while direct sparse measured
-`984.50-988.95 us/run` on the same shapes. The `top_k >= visible_kv` boundary
-is handled by llama.cpp's all-KV flash bypass rather than by the selected-row
-kernel.
+`984.50-988.95 us/run` on the same shapes.
 
 The main split-serving implication is that Skippy should pass through the
 resolved `generation.policy` and `generation.thresholds` contract, not add a

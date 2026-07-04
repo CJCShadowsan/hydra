@@ -468,17 +468,20 @@ dense masked flash measured `71.72 us/run`. That makes the compact selected-row
 path about `1.68x` faster than direct sparse and about `1.13x` faster than dense
 masked flash for this fixture.
 
-Model-native early decode is more decisive because `top_k` can equal the
-visible KV length before the full configured indexer width is reachable.
-Compact selected-row flash measured `61.90 us/run` at `kv=128,top_k=128`,
-`60.71 us/run` at `kv=256,top_k=256`, `61.24 us/run` at
-`kv=257,top_k=257`, and `57.99 us/run` at `kv=513,top_k=513`. Direct sparse
-measured `137.15 us/run`, `209.97 us/run`, `249.30 us/run`, and
-`711.10 us/run` on the same shapes. That makes compact selected-row flash
-about `2.2x`, `3.5x`, `4.1x`, and `12.3x` faster than direct sparse across
-those early decode points. This is why `glm-dsa-v1` uses compact flash as the
-default decode route and reserves direct sparse decode for explicit runtime
-experiments.
+Exact-boundary fixtures where selected KV equals visible KV are more decisive
+than the base one-token fixture. Compact selected-row flash measured
+`61.90 us/run` at `kv=128,top_k=128`, `60.71 us/run` at
+`kv=256,top_k=256`, `61.24 us/run` at `kv=257,top_k=257`, and
+`57.99 us/run` at `kv=513,top_k=513`. Direct sparse measured
+`137.15 us/run`, `209.97 us/run`, `249.30 us/run`, and `711.10 us/run` on the
+same shapes. That makes compact selected-row flash about `2.2x`, `3.5x`,
+`4.1x`, and `12.3x` faster than direct sparse across those exact-boundary
+points. The literal `top_k >= visible_kv` boundary is a separate all-KV flash
+bypass in the llama.cpp graph, but ordinary one-token decode after prefill
+still exercises compact selected-KV flash because IndexShare top-k is selected
+from the previous KV state while attention sees previous+current KV. This is
+why `glm-dsa-v1` uses compact flash as the default decode route and reserves
+direct sparse decode for explicit runtime experiments.
 
 For the configured GLM-5.2 IndexShare width, the compact path is more
 important once visible KV grows beyond the `768` selected rows. The Metal
@@ -487,8 +490,7 @@ fixtures measured compact selected-row flash at `55.11 us/run` for
 attention on the same `dk=576,dv=512,top_k=768` shapes measured
 `988.95 us/run` and `984.50 us/run`. That is roughly an `18x` decode-path win
 for compact selected-KV flash over direct sparse at the model-native top-k
-width. The exact `top_k >= visible_kv` boundary is a separate all-KV flash
-bypass in the llama.cpp graph, not a selected-row kernel case.
+width.
 
 Short phase fixtures measured the opposite shape for direct sparse prefill:
 dense masked flash stayed around `68.58-70.80 us/run` for 4-16 token batches,
@@ -515,7 +517,8 @@ Generation policy consumers should therefore treat the GLM-DSA policy as a
 phase-aware resolver contract:
 
 - Decode starts with `compact-flash` when backend support exists, because the
-  compact selected-row path wins on measured one-token and early-decode shapes.
+  compact selected-row path wins on measured one-token and post-prefill decode
+  shapes.
 - Short prefill starts with `dense`, because measured sparse/indexer overhead is
   worse below the package threshold.
 - Long prefill starts with `sparse-chunked`, because dense masks become
