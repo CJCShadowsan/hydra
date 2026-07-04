@@ -451,13 +451,16 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     {
         bail!("split_layer_1 and split_layer_2 must partition 0..layer_end in ascending order");
     }
-    validate_local_topology_plan(
-        &args.model_path,
-        args.layer_end,
-        &[args.split_layer_1, args.split_layer_2],
-        3,
-        &args.activation_wire_dtype,
-    )?;
+    let stage_load_mode = parse_stage_load_mode(&args.stage_load_mode)?;
+    if stage_load_mode.protocol == ProtocolLoadMode::RuntimeSlice {
+        validate_local_topology_plan(
+            &args.model_path,
+            args.layer_end,
+            &[args.split_layer_1, args.split_layer_2],
+            3,
+            &args.activation_wire_dtype,
+        )?;
+    }
     let wire_dtype = parse_wire_dtype(&args.activation_wire_dtype)?;
     let model_identity = model_identity_for_path(&args.model_id, Some(&args.model_path))?;
     let stage0_config = RuntimeConfig {
@@ -475,18 +478,25 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         cache_type_k: skippy_runtime::GGML_TYPE_F16,
         cache_type_v: skippy_runtime::GGML_TYPE_F16,
         flash_attn_type: skippy_runtime::FlashAttentionType::Auto,
-        load_mode: RuntimeLoadMode::RuntimeSlice,
+        load_mode: stage_load_mode.runtime,
         projector_path: None,
-        use_mmap: true,
-        use_mmap_prefetch: true,
-        use_mmap_buffer: true,
+        use_mmap: stage_load_mode.use_mmap,
+        use_mmap_prefetch: stage_load_mode.use_mmap,
+        use_mmap_buffer: stage_load_mode.use_mmap,
         include_embeddings: true,
         include_output: false,
         filter_tensors_on_load: true,
         glm_dsa_policy: None,
     };
-    let stage0 =
-        StageModel::open(&args.model_path, &stage0_config).context("failed to open stage 0")?;
+    let stage0 = open_stage_model_for_binary_split(
+        &args.model_path,
+        &args.model_id,
+        "local-split-chain-binary",
+        "stage-0",
+        &stage_load_mode,
+        &stage0_config,
+    )
+    .context("failed to open stage 0")?;
     let tokens = stage0
         .tokenize(&args.prompt, true)
         .context("failed to tokenize prompt")?;
@@ -518,7 +528,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         "ctx_size": args.ctx_size,
         "n_gpu_layers": args.n_gpu_layers,
         "filter_tensors_on_load": true,
-        "load_mode": "runtime-slice",
+        "load_mode": stage_load_mode.protocol_str,
         "bind_addr": args.stage2_bind_addr,
         "upstream": {
             "stage_id": "stage-1",
@@ -539,7 +549,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         "ctx_size": args.ctx_size,
         "n_gpu_layers": args.n_gpu_layers,
         "filter_tensors_on_load": true,
-        "load_mode": "runtime-slice",
+        "load_mode": stage_load_mode.protocol_str,
         "bind_addr": args.stage1_bind_addr,
         "upstream": {
             "stage_id": "stage-0",
@@ -565,7 +575,7 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
     let topology = local_split_topology(
         "local-split-chain-binary",
         &model_identity.model_id,
-        "runtime-slice",
+        stage_load_mode.protocol_str,
         &[
             LocalSplitTopologyStage {
                 stage_id: "stage-0",
@@ -610,7 +620,15 @@ fn run_binary_chain(args: LocalSplitChainBinaryArgs) -> Result<BinaryChainResult
         &args.activation_wire_dtype,
     ]);
     configure_child_logs(&mut stage2_command, args.child_logs);
-    let _stage2 = ChildGuard::spawn(stage2_command)?;
+    let mut stage2 = ChildGuard::spawn(stage2_command)?;
+    let stage2_ready = connect_ready_while_child_running(
+        args.stage2_bind_addr,
+        args.startup_timeout_secs,
+        &mut stage2,
+    )
+    .context("stage 2 binary server did not become ready")?;
+    drop(stage2_ready);
+    let _stage2 = stage2;
 
     let mut stage1_command = Command::new(&args.stage_server_bin);
     stage1_command.args([
