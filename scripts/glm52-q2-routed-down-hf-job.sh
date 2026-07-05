@@ -16,6 +16,8 @@ set -euo pipefail
 #     --volume hf://buckets/meshllm/glm52-q2-routed-down:/mnt/work \
 #     --env DRY_RUN=1 \
 #     --env TARGET_PACKAGE_REPO=meshllm/GLM-5.2-Q2_K-RoutedDown-MTP-Q8-layers \
+#     --detach \
+#     -- \
 #     rust:1.88-bookworm \
 #     bash -lc 'curl -fsSL https://raw.githubusercontent.com/Mesh-LLM/mesh-llm/feat/jianyang-glm-52/scripts/glm52-q2-routed-down-hf-job.sh | bash'
 #

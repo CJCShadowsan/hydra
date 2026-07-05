@@ -1,0 +1,25 @@
+From 1ef04ba91b6de2281f9eaefad25b2696667c9c12 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Mon, 6 Jul 2026 09:50:17 +1000
+Subject: [PATCH] Fix GLM DSA timing reset for GCC
+
+---
+ src/skippy.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 76b49d558..0a0dfcb28 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -2480,7 +2480,7 @@ static void skippy_glm_dsa_op_timing_begin(skippy_session * session, size_t toke
+     const uint32_t trace_node_limit = timing.trace_node_limit;
+     const uint32_t trace_stats_max_bytes = timing.trace_stats_max_bytes;
+     const std::string trace_filter = timing.trace_filter;
+-    timing = {};
++    timing = skippy_glm_dsa_op_timing{};
+     timing.enabled = enabled;
+     timing.print_timing = print_timing;
+     timing.trace_tensors = trace_tensors;
+-- 
+2.53.0
+
