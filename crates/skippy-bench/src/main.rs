@@ -10,6 +10,7 @@ mod local_split;
 mod model_identity;
 mod support;
 mod token_lengths;
+mod verify_span_binary;
 mod verify_span_local;
 
 use anyhow::Result;
@@ -28,6 +29,7 @@ use crate::{
         local_split_compare, local_split_inprocess,
     },
     token_lengths::token_lengths,
+    verify_span_binary::verify_span_binary,
     verify_span_local::verify_span_local,
 };
 
@@ -40,6 +42,7 @@ fn main() -> Result<()> {
         CommandKind::LocalSplitChainInprocess(args) => local_split_chain_inprocess(args),
         CommandKind::LocalSplitChainBinary(args) => local_split_chain_binary(args),
         CommandKind::VerifySpanLocal(args) => verify_span_local(args),
+        CommandKind::VerifySpanBinary(args) => verify_span_binary(args),
         CommandKind::ChatCorpus(args) => chat_corpus(args),
         CommandKind::TokenLengths(args) => token_lengths(args),
         CommandKind::FocusedRuntime(args) => focused_runtime(args),

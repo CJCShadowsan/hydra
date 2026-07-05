@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 5 Jul 2026 21:35:00 +1000
+Subject: [PATCH] Classify GLM DSA verification phase independently
+
+---
+ src/llama-graph.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6bd54a10d..9cd5c9c10 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -325,6 +325,7 @@ struct llama_glm_dsa_sparse_attn_policy {
+     bool prefill_enabled = false;
+     bool decode_shape = false;
+     bool verify_shape = false;
++    bool verify_token_shape_allowed = false;
+     bool prefill_shape = false;
+     bool large_prefill_shape = false;
+     bool token_shape_allowed = false;
+@@ -410,7 +411,9 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+             sparse_batch == 1 &&
+             ubatch_tokens == sparse_streams;
+     policy.verify_shape =
+-            verification_batch &&
++            verification_batch;
++    policy.verify_token_shape_allowed =
++            policy.verify_shape &&
+             direct_sparse_prefill_enabled &&
+             sparse_batch <= prefill_cap;
+     policy.prefill_shape =
+@@ -425,7 +428,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+             dense_mask_bytes > dense_mask_limit;
+     policy.token_shape_allowed =
+             policy.decode_shape ||
+-            policy.verify_shape ||
++            policy.verify_token_shape_allowed ||
+             policy.prefill_shape ||
+             policy.large_prefill_shape;
+     policy.phase =
+@@ -482,6 +485,8 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         policy.direct_selector_reason =
+                 !direct_sparse_enabled ? "direct_sparse_disabled" :
+                 !backend_sparse_supported ? "backend_sparse_unsupported" :
++                policy.verify_shape && !direct_sparse_prefill_enabled ? "verify_sparse_disabled" :
++                policy.verify_shape && sparse_batch > prefill_cap ? "verify_batch_over_cap" :
+                 !policy.token_shape_allowed ? "token_shape_not_allowed" :
+                 policy.compact_large_decode_top_k ? "direct_sparse_top_k_too_large" :
+                 compact_mask_omitted ? "mla_kq_mask_omitted" :
+-- 
+2.39.5
+
