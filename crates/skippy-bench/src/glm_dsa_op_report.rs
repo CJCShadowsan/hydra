@@ -603,6 +603,7 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
     let mut logs = Vec::with_capacity(args.log.len());
     for path in &args.log {
         let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let text = filter_report_log_text(path, &text, args)?;
         let records = parse_timing_records(&text)
             .with_context(|| format!("parse GLM-DSA op timing records in {}", path.display()))?;
         let indexshare_records = parse_indexshare_trace_records(&text)
@@ -693,6 +694,95 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         logs.push(summary);
     }
     Ok(GlmDsaOpReport { logs })
+}
+
+fn filter_report_log_text(path: &Path, text: &str, args: &GlmDsaOpReportArgs) -> Result<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+
+    let anchor = report_log_anchor(path, &lines, args)?;
+    let start = anchor
+        .map(|index| index.saturating_sub(args.include_before_lines))
+        .unwrap_or(0);
+    let end = report_log_end(path, &lines, start, args)?;
+
+    Ok(lines[start..end].join("\n"))
+}
+
+fn report_log_anchor(
+    path: &Path,
+    lines: &[&str],
+    args: &GlmDsaOpReportArgs,
+) -> Result<Option<usize>> {
+    if let Some(marker) = &args.from_marker {
+        return lines
+            .iter()
+            .position(|line| line.contains(marker))
+            .map(Some)
+            .with_context(|| format!("{} has no --from-marker {:?}", path.display(), marker));
+    }
+
+    if let Some(marker) = &args.from_last_marker {
+        return lines
+            .iter()
+            .rposition(|line| line.contains(marker))
+            .map(Some)
+            .with_context(|| format!("{} has no --from-last-marker {:?}", path.display(), marker));
+    }
+
+    if args.request_id.is_some() || args.session_id.is_some() {
+        return lines
+            .iter()
+            .position(|line| report_log_line_matches_ids(line, args))
+            .map(Some)
+            .with_context(|| {
+                format!(
+                    "{} has no line matching request_id={:?} session_id={:?}",
+                    path.display(),
+                    args.request_id,
+                    args.session_id
+                )
+            });
+    }
+
+    Ok(None)
+}
+
+fn report_log_end(
+    path: &Path,
+    lines: &[&str],
+    start: usize,
+    args: &GlmDsaOpReportArgs,
+) -> Result<usize> {
+    let Some(marker) = &args.until_marker else {
+        return Ok(lines.len());
+    };
+
+    lines[start.saturating_add(1)..]
+        .iter()
+        .position(|line| line.contains(marker))
+        .map(|relative| start + 1 + relative)
+        .with_context(|| format!("{} has no --until-marker {:?}", path.display(), marker))
+}
+
+fn report_log_line_matches_ids(line: &str, args: &GlmDsaOpReportArgs) -> bool {
+    let fields = line
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect::<BTreeMap<_, _>>();
+    let request_matches = args
+        .request_id
+        .is_none_or(|id| parse_u64_field(&fields, "request") == Some(id));
+    let session_matches = args
+        .session_id
+        .is_none_or(|id| parse_u64_field(&fields, "session") == Some(id));
+    request_matches && session_matches
+}
+
+fn parse_u64_field(fields: &BTreeMap<&str, &str>, key: &str) -> Option<u64> {
+    fields.get(key).and_then(|value| value.parse::<u64>().ok())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -2511,21 +2601,23 @@ fn nonzero_div(numerator: u64, denominator: u64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::{
         ComparisonKey, LogRecordInputs, OpBucket, Phase, PhaseSummary, SidebandDirection,
-        compare_phase, parse_compact_flash_mask_records, parse_compact_flash_policy_records,
-        parse_compute_buffer_records, parse_direct_sparse_decision_records,
-        parse_indexshare_contract_records, parse_indexshare_trace_records,
-        parse_metal_dispatch_records, parse_runtime_contract_summary, parse_sideband_record,
-        parse_sideband_records, parse_timing_group_records, parse_timing_record,
-        parse_timing_records, require_compact_decode_policy_evidence,
-        require_compact_decode_without_sparse_mask, require_glm52_runtime_contract,
-        require_indexshare_producer_consumer_trace, require_local_apple_backend_matrix,
-        require_local_backend_evidence, require_metal_compact_dispatch, summarize_backend_evidence,
-        summarize_comparison_rows, summarize_log,
+        compare_phase, filter_report_log_text, parse_compact_flash_mask_records,
+        parse_compact_flash_policy_records, parse_compute_buffer_records,
+        parse_direct_sparse_decision_records, parse_indexshare_contract_records,
+        parse_indexshare_trace_records, parse_metal_dispatch_records,
+        parse_runtime_contract_summary, parse_sideband_record, parse_sideband_records,
+        parse_timing_group_records, parse_timing_record, parse_timing_records,
+        require_compact_decode_policy_evidence, require_compact_decode_without_sparse_mask,
+        require_glm52_runtime_contract, require_indexshare_producer_consumer_trace,
+        require_local_apple_backend_matrix, require_local_backend_evidence,
+        require_metal_compact_dispatch, summarize_backend_evidence, summarize_comparison_rows,
+        summarize_log,
     };
+    use crate::cli::GlmDsaOpReportArgs;
 
     const LINE: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
     const LINE_WITH_INDEXER_BREAKDOWN: &str = "skippy: glm_dsa_op_timing stage=1 tokens=128 total_us=1475800 indexer_topk_nodes=275 indexer_topk_us=129065 indexer_nodes=235 indexer_us=80000 top_k_nodes=40 top_k_us=49065 sparse_mask_nodes=235 sparse_mask_us=114543 mla_attention_nodes=47 mla_attention_us=35234 routed_moe_nodes=47 routed_moe_us=379574 shared_expert_nodes=47 shared_expert_us=817384";
@@ -2584,6 +2676,70 @@ print_info: n_layer_all           = 79
 print_info: n_layer_dense_lead    = 3
 llama_context: n_ctx         = 256
 llama_context: n_ctx_seq     = 256";
+
+    fn report_args() -> GlmDsaOpReportArgs {
+        GlmDsaOpReportArgs {
+            log: vec![PathBuf::from("stage.log")],
+            from_marker: None,
+            from_last_marker: None,
+            include_before_lines: 0,
+            until_marker: None,
+            request_id: None,
+            session_id: None,
+            first_records: None,
+            require_indexshare_producer_consumer: false,
+            require_compact_decode_no_sparse_mask: false,
+            require_compact_decode_policy_evidence: false,
+            require_glm52_runtime_contract: false,
+            require_local_backend_evidence: false,
+            require_metal_compact_dispatch: false,
+            require_local_apple_backend_matrix: false,
+            output: None,
+        }
+    }
+
+    #[test]
+    fn filters_report_log_from_marker_with_context_lines() {
+        let mut args = report_args();
+        args.from_marker = Some("phase=decode".to_string());
+        args.include_before_lines = 2;
+        let text = [
+            "prefill-noise",
+            "llama_glm_dsa_log_indexshare_contract: GLM_DSA IndexShare source=metadata_types full_layers=21 shared_layers=57 indexer_tensor_layers=17 target_indexer_tensor_layers=17 filtered_indexer_groups=17 out_of_stage_indexer_groups=4 stage_filtered=1 layer_start=0 layer_end=60 top_k=2048 top_k_frequency=4 skip_top_k_offset=3 nextn_layers=1",
+            "llama_glm_dsa_log_indexshare_exec: GLM_DSA IndexShare exec layer=0 role=full input_top_k=1 stage_filtered=1 layer_start=0 layer_end=60",
+            DIRECT_SPARSE_DECISION_COMPACT_SELECTED_LINE,
+            LINE_WITH_COMPACT_GET_ROWS,
+        ]
+        .join("\n");
+
+        let filtered = filter_report_log_text(Path::new("stage.log"), &text, &args).unwrap();
+
+        assert!(!filtered.contains("prefill-noise"));
+        assert!(filtered.contains("GLM_DSA IndexShare source=metadata_types"));
+        assert!(filtered.contains("phase=decode"));
+        assert!(filtered.contains("glm_dsa_op_timing"));
+    }
+
+    #[test]
+    fn filters_report_log_from_request_and_session_ids() {
+        let mut args = report_args();
+        args.request_id = Some(123);
+        args.session_id = Some(456);
+        args.include_before_lines = 1;
+        let text = [
+            "old request=1 session=2",
+            "context-line",
+            "skippy: glm_dsa_top_k_sideband_receive stage=stage-1 request=123 session=456 kind=DecodeEmbd pos_start=0 tokens=1 hidden_bytes=1 sideband_bytes=1 sideband_i32=1",
+            LINE_WITH_COMPACT_GET_ROWS,
+        ]
+        .join("\n");
+
+        let filtered = filter_report_log_text(Path::new("stage.log"), &text, &args).unwrap();
+
+        assert!(!filtered.contains("old request=1"));
+        assert!(filtered.starts_with("context-line"));
+        assert!(filtered.contains("request=123 session=456"));
+    }
 
     #[test]
     fn parses_timing_record_with_prefix() {

@@ -182,6 +182,38 @@ pub struct GlmDsaOpReportArgs {
     pub log: Vec<PathBuf>,
     #[arg(
         long,
+        help = "Only parse the window starting at the first log line containing this marker."
+    )]
+    pub from_marker: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "from_marker",
+        help = "Only parse the window starting at the last log line containing this marker."
+    )]
+    pub from_last_marker: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Include N lines before the selected from-marker/request/session anchor."
+    )]
+    pub include_before_lines: usize,
+    #[arg(
+        long,
+        help = "Stop parsing before the first line after the selected start containing this marker."
+    )]
+    pub until_marker: Option<String>,
+    #[arg(
+        long,
+        help = "When no marker is supplied, start at the first line with this request id."
+    )]
+    pub request_id: Option<u64>,
+    #[arg(
+        long,
+        help = "When no marker is supplied, start at the first line with this session id."
+    )]
+    pub session_id: Option<u64>,
+    #[arg(
+        long,
         help = "Only include the first N timing records from each log. Use this for one request when a REPL log contains follow-up prompts."
     )]
     pub first_records: Option<usize>,
@@ -1688,6 +1720,38 @@ mod tests {
         assert_eq!(args.compare_metal_sparse_attn_threads_baseline, Some(32));
         assert!(!args.compare_dense_fallback);
         assert!(!args.compare_cpu_direct_sparse);
+    }
+
+    #[test]
+    fn parses_glm_dsa_op_report_window_filters() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "glm-dsa-op-report",
+            "--log",
+            "/tmp/stage-0.log",
+            "--from-marker",
+            "phase=decode",
+            "--include-before-lines",
+            "8",
+            "--until-marker",
+            "request=next",
+            "--request-id",
+            "123",
+            "--session-id",
+            "456",
+        ])
+        .unwrap();
+
+        let CommandKind::GlmDsaOpReport(args) = cli.command else {
+            panic!("expected glm-dsa-op-report subcommand");
+        };
+
+        assert_eq!(args.log, vec![PathBuf::from("/tmp/stage-0.log")]);
+        assert_eq!(args.from_marker.as_deref(), Some("phase=decode"));
+        assert_eq!(args.include_before_lines, 8);
+        assert_eq!(args.until_marker.as_deref(), Some("request=next"));
+        assert_eq!(args.request_id, Some(123));
+        assert_eq!(args.session_id, Some(456));
     }
 
     #[test]
