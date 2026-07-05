@@ -25,6 +25,8 @@ pub enum CommandKind {
     VerifySpanLocal(VerifySpanLocalArgs),
     #[command(name = "verify-span-binary")]
     VerifySpanBinary(VerifySpanBinaryArgs),
+    #[command(name = "decode-binary")]
+    DecodeBinary(DecodeBinaryArgs),
     #[command(name = "chat-corpus")]
     ChatCorpus(ChatCorpusArgs),
     #[command(name = "token-lengths")]
@@ -742,6 +744,30 @@ pub struct VerifySpanBinaryArgs {
 }
 
 #[derive(Parser)]
+pub struct DecodeBinaryArgs {
+    #[arg(long, default_value = "127.0.0.1:19031")]
+    pub first_stage_addr: SocketAddr,
+    #[arg(long, default_value_t = 60)]
+    pub startup_timeout_secs: u64,
+    #[arg(long, default_value_t = 120)]
+    pub io_timeout_secs: u64,
+    #[arg(long, default_value = "f16")]
+    pub activation_wire_dtype: String,
+    #[arg(
+        long,
+        default_value = "1,2,3,4,5,6,7,8,9,10,11,12",
+        help = "Comma-separated prompt token IDs. All except the last are sent as prefill; the last is the first decode token."
+    )]
+    pub prompt_token_ids: String,
+    #[arg(long, default_value_t = 1)]
+    pub max_new_tokens: usize,
+    #[arg(long, default_value_t = 128)]
+    pub prefill_chunk_size: usize,
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
 pub struct ChatCorpusArgs {
     #[arg(long, default_value = "http://127.0.0.1:9337/v1")]
     pub base_url: String,
@@ -1386,6 +1412,32 @@ mod tests {
         assert_eq!(args.first_stage_addr.to_string(), "192.168.0.10:19031");
         assert_eq!(args.prompt_token_ids, "1,2,3,4");
         assert_eq!(args.verify_token_ids.as_deref(), Some("4,5"));
+        assert_eq!(args.prefill_chunk_size, 2);
+    }
+
+    #[test]
+    fn parses_decode_binary_command() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "decode-binary",
+            "--first-stage-addr",
+            "192.168.0.10:19031",
+            "--prompt-token-ids",
+            "1,2,3,4",
+            "--max-new-tokens",
+            "2",
+            "--prefill-chunk-size",
+            "2",
+        ])
+        .unwrap();
+
+        let CommandKind::DecodeBinary(args) = cli.command else {
+            panic!("expected decode-binary subcommand");
+        };
+
+        assert_eq!(args.first_stage_addr.to_string(), "192.168.0.10:19031");
+        assert_eq!(args.prompt_token_ids, "1,2,3,4");
+        assert_eq!(args.max_new_tokens, 2);
         assert_eq!(args.prefill_chunk_size, 2);
     }
 

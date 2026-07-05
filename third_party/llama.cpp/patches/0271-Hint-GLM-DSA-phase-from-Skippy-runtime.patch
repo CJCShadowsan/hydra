@@ -1,0 +1,381 @@
+From 0dd7ee76df9a9228027a22890a9aa6203af4a03e Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 5 Jul 2026 21:40:52 +1000
+Subject: [PATCH] Hint GLM DSA phase from Skippy runtime
+
+---
+ src/llama-graph.cpp |  22 +++++--
+ src/llama-graph.h   |   8 +++
+ src/skippy.cpp      | 147 +++++++++++++++++++++++++++++++++++---------
+ 3 files changed, 144 insertions(+), 33 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9cd5c9c10..cfe26814c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -326,6 +326,7 @@ struct llama_glm_dsa_sparse_attn_policy {
+     bool decode_shape = false;
+     bool verify_shape = false;
+     bool verify_token_shape_allowed = false;
++    bool prefill_observed = false;
+     bool prefill_shape = false;
+     bool large_prefill_shape = false;
+     bool token_shape_allowed = false;
+@@ -406,22 +407,33 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     policy.direct_sparse_decode_max_top_k = skippy_glm_dsa_direct_sparse_decode_max_top_k();
+     policy.compact_flash_min_kv = skippy_glm_dsa_compact_flash_min_kv();
+
++    const int32_t phase_hint = skippy_graph_get_filter().glm_dsa_phase_hint;
++    const bool phase_hint_auto = phase_hint == SKIPPY_GLM_DSA_PHASE_HINT_AUTO;
++    const bool phase_hint_prefill = phase_hint == SKIPPY_GLM_DSA_PHASE_HINT_PREFILL;
++    const bool phase_hint_decode = phase_hint == SKIPPY_GLM_DSA_PHASE_HINT_DECODE;
++    const bool phase_hint_verify = phase_hint == SKIPPY_GLM_DSA_PHASE_HINT_VERIFY;
++
+     policy.decode_shape =
++            (phase_hint_auto || phase_hint_decode) &&
+             sparse_streams > 0 &&
+             sparse_batch == 1 &&
+             ubatch_tokens == sparse_streams;
+     policy.verify_shape =
+-            verification_batch;
++            phase_hint_verify ||
++            (phase_hint_auto && verification_batch);
++    policy.prefill_observed =
++            phase_hint_prefill ||
++            (!policy.decode_shape && !policy.verify_shape && sparse_batch > 1);
+     policy.verify_token_shape_allowed =
+             policy.verify_shape &&
+             direct_sparse_prefill_enabled &&
+             sparse_batch <= prefill_cap;
+     policy.prefill_shape =
+-            !verification_batch &&
++            policy.prefill_observed &&
+             direct_sparse_prefill_enabled &&
+             sparse_batch <= prefill_cap;
+     policy.large_prefill_shape =
+-            !verification_batch &&
++            policy.prefill_observed &&
+             direct_sparse_prefill_enabled &&
+             unproven_large_direct_sparse_prefill_enabled &&
+             sparse_batch > prefill_cap &&
+@@ -434,7 +446,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     policy.phase =
+             policy.decode_shape ? "decode" :
+             policy.verify_shape ? "verify" :
+-            (policy.prefill_shape || policy.large_prefill_shape) ? "prefill" :
++            policy.prefill_observed ? "prefill" :
+             "other";
+
+     policy.compact_large_decode_top_k =
+@@ -487,6 +499,8 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+                 !backend_sparse_supported ? "backend_sparse_unsupported" :
+                 policy.verify_shape && !direct_sparse_prefill_enabled ? "verify_sparse_disabled" :
+                 policy.verify_shape && sparse_batch > prefill_cap ? "verify_batch_over_cap" :
++                policy.prefill_observed && !direct_sparse_prefill_enabled ? "prefill_sparse_disabled" :
++                policy.prefill_observed && sparse_batch > prefill_cap ? "prefill_batch_over_cap" :
+                 !policy.token_shape_allowed ? "token_shape_not_allowed" :
+                 policy.compact_large_decode_top_k ? "direct_sparse_top_k_too_large" :
+                 compact_mask_omitted ? "mla_kq_mask_omitted" :
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 0ba65bc59..7a58d7607 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -28,6 +28,13 @@ class llama_memory_recurrent_context;
+ class llama_memory_hybrid_context;
+ class llama_memory_hybrid_iswa_context;
+
++enum skippy_glm_dsa_phase_hint : int32_t {
++    SKIPPY_GLM_DSA_PHASE_HINT_AUTO = 0,
++    SKIPPY_GLM_DSA_PHASE_HINT_PREFILL = 1,
++    SKIPPY_GLM_DSA_PHASE_HINT_DECODE = 2,
++    SKIPPY_GLM_DSA_PHASE_HINT_VERIFY = 3,
++};
++
+ struct skippy_graph_filter {
+     bool enabled = false;
+     int32_t layer_start = 0;
+@@ -40,6 +47,7 @@ struct skippy_graph_filter {
+     int32_t glm_dsa_direct_sparse_decode_max_top_k = 0;
+     uint64_t glm_dsa_dense_sparse_mask_max_bytes = 0;
+     int32_t glm_dsa_compact_flash_min_kv = 0;
++    int32_t glm_dsa_phase_hint = SKIPPY_GLM_DSA_PHASE_HINT_AUTO;
+ };
+
+ struct skippy_activation_tokens {
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index ce5125c1d..62614186b 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -990,20 +990,27 @@ struct skippy_filter_scope {
+ };
+
+ struct skippy_graph_filter_scope {
+-    explicit skippy_graph_filter_scope(const skippy_runtime_config * config) {
+-        if (config != nullptr && (config->filter_tensors_on_load || config->glm_dsa_policy_profile != 0)) {
++    explicit skippy_graph_filter_scope(
++            const skippy_runtime_config * config,
++            int32_t glm_dsa_phase_hint = SKIPPY_GLM_DSA_PHASE_HINT_AUTO) {
++        const bool has_phase_hint = glm_dsa_phase_hint != SKIPPY_GLM_DSA_PHASE_HINT_AUTO;
++        if ((config != nullptr && (config->filter_tensors_on_load || config->glm_dsa_policy_profile != 0)) ||
++                has_phase_hint) {
+             skippy_graph_filter filter;
+-            filter.enabled = config->filter_tensors_on_load;
+-            filter.layer_start = config->layer_start;
+-            filter.layer_end = config->layer_end;
+-            filter.include_embeddings = config->include_embeddings;
+-            filter.include_output = config->include_output;
+-            filter.glm_dsa_policy_profile = config->glm_dsa_policy_profile;
+-            filter.glm_dsa_policy_flags = config->glm_dsa_policy_flags;
+-            filter.glm_dsa_short_prefill_max_tokens = config->glm_dsa_short_prefill_max_tokens;
+-            filter.glm_dsa_direct_sparse_decode_max_top_k = config->glm_dsa_direct_sparse_decode_max_top_k;
+-            filter.glm_dsa_dense_sparse_mask_max_bytes = config->glm_dsa_dense_sparse_mask_max_bytes;
+-            filter.glm_dsa_compact_flash_min_kv = config->glm_dsa_compact_flash_min_kv;
++            if (config != nullptr) {
++                filter.enabled = config->filter_tensors_on_load;
++                filter.layer_start = config->layer_start;
++                filter.layer_end = config->layer_end;
++                filter.include_embeddings = config->include_embeddings;
++                filter.include_output = config->include_output;
++                filter.glm_dsa_policy_profile = config->glm_dsa_policy_profile;
++                filter.glm_dsa_policy_flags = config->glm_dsa_policy_flags;
++                filter.glm_dsa_short_prefill_max_tokens = config->glm_dsa_short_prefill_max_tokens;
++                filter.glm_dsa_direct_sparse_decode_max_top_k = config->glm_dsa_direct_sparse_decode_max_top_k;
++                filter.glm_dsa_dense_sparse_mask_max_bytes = config->glm_dsa_dense_sparse_mask_max_bytes;
++                filter.glm_dsa_compact_flash_min_kv = config->glm_dsa_compact_flash_min_kv;
++            }
++            filter.glm_dsa_phase_hint = glm_dsa_phase_hint;
+             skippy_graph_set_filter(filter);
+             enabled = true;
+         }
+@@ -1612,13 +1619,14 @@ static enum skippy_status skippy_decode_batch(
+         skippy_session * session,
+         llama_batch batch,
+         size_t token_count,
++        int32_t glm_dsa_phase_hint,
+         struct skippy_error ** out_error) {
+     if (session == nullptr || session->ctx == nullptr || token_count == 0) {
+         skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and at least one token are required");
+         return SKIPPY_STATUS_INVALID_ARGUMENT;
+     }
+
+-    skippy_graph_filter_scope graph_filter_scope(&session->stage_model->config);
++    skippy_graph_filter_scope graph_filter_scope(&session->stage_model->config, glm_dsa_phase_hint);
+     skippy_glm_dsa_op_timing_begin(session, token_count);
+     const int32_t rc = llama_decode(session->ctx, batch);
+     skippy_glm_dsa_op_timing_end(session);
+@@ -2677,6 +2685,7 @@ static enum skippy_status skippy_decode_tokens(
+         const llama_token * token_ids,
+         size_t token_count,
+         bool request_logits,
++        int32_t glm_dsa_phase_hint,
+         struct skippy_error ** out_error) {
+     (void) request_logits;
+
+@@ -2710,7 +2719,7 @@ static enum skippy_status skippy_decode_tokens(
+             /*seq_id   =*/ &seq_ids,
+             /*logits   =*/ &logits,
+         };
+-        enum skippy_status status = skippy_decode_batch(session, batch, 1, out_error);
++        enum skippy_status status = skippy_decode_batch(session, batch, 1, glm_dsa_phase_hint, out_error);
+         if (status == SKIPPY_STATUS_OK) {
+             status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, pos, out_error);
+         }
+@@ -2731,7 +2740,7 @@ static enum skippy_status skippy_decode_tokens(
+         batch.logits[i] = request_logits && i == n_tokens - 1 ? 1 : 0;
+     }
+
+-    enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
++    enum skippy_status status = skippy_decode_batch(session, batch, token_count, glm_dsa_phase_hint, out_error);
+     llama_batch_free(batch);
+     if (status == SKIPPY_STATUS_OK) {
+         status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, token_start, out_error);
+@@ -2771,7 +2780,12 @@ static enum skippy_status skippy_verify_token_batch(
+         batch.logits[i] = 1;
+     }
+
+-    enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
++    enum skippy_status status = skippy_decode_batch(
++            session,
++            batch,
++            token_count,
++            SKIPPY_GLM_DSA_PHASE_HINT_VERIFY,
++            out_error);
+     llama_batch_free(batch);
+     return status;
+ }
+@@ -3510,6 +3524,7 @@ static enum skippy_status skippy_decode_activation_frame(
+         size_t position_count,
+         size_t token_count,
+         bool request_logits,
++        int32_t glm_dsa_phase_hint,
+         struct skippy_error ** out_error) {
+     if (session == nullptr || session->ctx == nullptr || input_desc == nullptr || input_payload == nullptr || token_count == 0) {
+         skippy_set_error(out_error, SKIPPY_STATUS_INVALID_ARGUMENT, "session and activation frame input are required");
+@@ -3597,7 +3612,12 @@ static enum skippy_status skippy_decode_activation_frame(
+             skippy_glm_dsa_top_k_count_from_desc(session, input_desc),
+             skippy_glm_dsa_n_stream(session),
+             token_start);
+-    enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
++    enum skippy_status status = skippy_decode_batch(
++            session,
++            batch,
++            token_count,
++            glm_dsa_phase_hint,
++            out_error);
+     if (status == SKIPPY_STATUS_OK && token_ids != nullptr) {
+         status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, token_start, out_error);
+     }
+@@ -3670,7 +3690,12 @@ static enum skippy_status skippy_verify_activation_frame(
+             skippy_glm_dsa_top_k_count_from_desc(session, input_desc),
+             skippy_glm_dsa_n_stream(session),
+             token_start);
+-    enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
++    enum skippy_status status = skippy_decode_batch(
++            session,
++            batch,
++            token_count,
++            SKIPPY_GLM_DSA_PHASE_HINT_VERIFY,
++            out_error);
+     if (!alias_input_payload) {
+         llama_batch_free(batch);
+     }
+@@ -4618,7 +4643,13 @@ enum skippy_status skippy_prefill_chunk(
+         *out_output_activation_bytes = 0;
+     }
+
+-    return skippy_decode_tokens(session, token_ids, token_count, false, out_error);
++    return skippy_decode_tokens(
++            session,
++            token_ids,
++            token_count,
++            false,
++            SKIPPY_GLM_DSA_PHASE_HINT_PREFILL,
++            out_error);
+ }
+
+ enum skippy_status skippy_decode_step_sampled(
+@@ -4641,7 +4672,13 @@ enum skippy_status skippy_decode_step_sampled(
+         *out_output_activation_bytes = 0;
+     }
+
+-    enum skippy_status status = skippy_decode_tokens(session, &token_id, 1, true, out_error);
++    enum skippy_status status = skippy_decode_tokens(
++            session,
++            &token_id,
++            1,
++            true,
++            SKIPPY_GLM_DSA_PHASE_HINT_DECODE,
++            out_error);
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+     }
+@@ -4706,7 +4743,9 @@ enum skippy_status skippy_decode_batch_sampled(
+         batch.logits[i] = 1;
+     }
+
+-    skippy_graph_filter_scope graph_filter_scope(&first->stage_model->config);
++    skippy_graph_filter_scope graph_filter_scope(
++            &first->stage_model->config,
++            SKIPPY_GLM_DSA_PHASE_HINT_DECODE);
+     const int32_t rc = llama_decode(first->ctx, batch);
+     if (rc != 0) {
+         llama_batch_free(batch);
+@@ -4817,9 +4856,25 @@ static enum skippy_status skippy_prefill_chunk_frame_impl(
+     }
+
+     if (skippy_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+-        status = skippy_decode_activation_frame(session, input_desc, input_payload, token_ids, positions, position_count, token_count, request_logits, out_error);
++        status = skippy_decode_activation_frame(
++                session,
++                input_desc,
++                input_payload,
++                token_ids,
++                positions,
++                position_count,
++                token_count,
++                request_logits,
++                SKIPPY_GLM_DSA_PHASE_HINT_PREFILL,
++                out_error);
+     } else {
+-        status = skippy_decode_tokens(session, token_ids, token_count, request_logits, out_error);
++        status = skippy_decode_tokens(
++                session,
++                token_ids,
++                token_count,
++                request_logits,
++                SKIPPY_GLM_DSA_PHASE_HINT_PREFILL,
++                out_error);
+     }
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+@@ -4994,9 +5049,25 @@ enum skippy_status skippy_decode_step_frame_sampled(
+     }
+
+     if (skippy_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+-        status = skippy_decode_activation_frame(session, input_desc, input_payload, &token_id, nullptr, 0, 1, true, out_error);
++        status = skippy_decode_activation_frame(
++                session,
++                input_desc,
++                input_payload,
++                &token_id,
++                nullptr,
++                0,
++                1,
++                true,
++                SKIPPY_GLM_DSA_PHASE_HINT_DECODE,
++                out_error);
+     } else {
+-        status = skippy_decode_tokens(session, &token_id, 1, true, out_error);
++        status = skippy_decode_tokens(
++                session,
++                &token_id,
++                1,
++                true,
++                SKIPPY_GLM_DSA_PHASE_HINT_DECODE,
++                out_error);
+     }
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+@@ -5185,7 +5256,9 @@ enum skippy_status skippy_decode_step_frame_batch_sampled(
+     };
+
+     skippy_activation_tokens_scope activation_tokens_scope(token_ids, request_count);
+-    skippy_graph_filter_scope graph_filter_scope(&first->stage_model->config);
++    skippy_graph_filter_scope graph_filter_scope(
++            &first->stage_model->config,
++            SKIPPY_GLM_DSA_PHASE_HINT_DECODE);
+     const int32_t rc = llama_decode(first->ctx, batch);
+     if (rc != 0) {
+         skippy_set_error(out_error, SKIPPY_STATUS_RUNTIME_ERROR, "llama_decode failed");
+@@ -5295,11 +5368,27 @@ enum skippy_status skippy_verify_tokens_frame_sampled(
+     if (skippy_is_filtered(session) && session->stage_model->config.layer_start > 0) {
+         status = session->stage_model->config.include_output ?
+                 skippy_verify_activation_frame(session, input_desc, input_payload, token_ids, token_count, out_error) :
+-                skippy_decode_activation_frame(session, input_desc, input_payload, token_ids, nullptr, 0, token_count, false, out_error);
++                skippy_decode_activation_frame(
++                        session,
++                        input_desc,
++                        input_payload,
++                        token_ids,
++                        nullptr,
++                        0,
++                        token_count,
++                        false,
++                        SKIPPY_GLM_DSA_PHASE_HINT_VERIFY,
++                        out_error);
+     } else {
+         status = session->stage_model->config.include_output ?
+                 skippy_verify_token_batch(session, token_ids, token_count, out_error) :
+-                skippy_decode_tokens(session, token_ids, token_count, false, out_error);
++                skippy_decode_tokens(
++                        session,
++                        token_ids,
++                        token_count,
++                        false,
++                        SKIPPY_GLM_DSA_PHASE_HINT_VERIFY,
++                        out_error);
+     }
+     if (status != SKIPPY_STATUS_OK) {
+         return status;
+--
+2.53.0

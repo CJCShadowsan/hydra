@@ -1,5 +1,6 @@
 mod chat_corpus;
 mod cli;
+mod decode_binary;
 mod distributed;
 mod glm_dsa_layer_microbench;
 mod glm_dsa_microbench_summary;
@@ -19,6 +20,7 @@ use clap::Parser;
 use crate::{
     chat_corpus::chat_corpus,
     cli::{Cli, CommandKind},
+    decode_binary::decode_binary,
     distributed::{drive_existing, focused_runtime, run_distributed},
     glm_dsa_layer_microbench::glm_dsa_layer_microbench,
     glm_dsa_op_report::{glm_dsa_op_compare, glm_dsa_op_report},
@@ -43,6 +45,7 @@ fn main() -> Result<()> {
         CommandKind::LocalSplitChainBinary(args) => local_split_chain_binary(args),
         CommandKind::VerifySpanLocal(args) => verify_span_local(args),
         CommandKind::VerifySpanBinary(args) => verify_span_binary(args),
+        CommandKind::DecodeBinary(args) => decode_binary(args),
         CommandKind::ChatCorpus(args) => chat_corpus(args),
         CommandKind::TokenLengths(args) => token_lengths(args),
         CommandKind::FocusedRuntime(args) => focused_runtime(args),
