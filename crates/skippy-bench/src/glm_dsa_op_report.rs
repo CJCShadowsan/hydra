@@ -709,6 +709,9 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         if args.require_short_prefill_policy_evidence {
             require_short_prefill_policy_evidence(path, &summary)?;
         }
+        if args.require_long_prefill_policy_evidence {
+            require_long_prefill_policy_evidence(path, &summary)?;
+        }
         if args.require_verify_policy_evidence {
             require_verify_policy_evidence(path, &summary)?;
         }
@@ -1203,6 +1206,64 @@ fn require_short_prefill_policy_evidence(path: &Path, summary: &LogSummary) -> R
         missing.join(","),
         summary.policy
     )
+}
+
+fn require_long_prefill_policy_evidence(path: &Path, summary: &LogSummary) -> Result<()> {
+    let direct = &summary.policy.direct_sparse;
+    let mut missing = Vec::new();
+
+    if direct.prefill_records == 0 {
+        missing.push("direct_sparse_prefill_policy_records");
+    }
+    if direct.prefill_large_records == 0 {
+        missing.push("large_prefill_shape_records");
+    }
+    if direct.prefill_large_use_direct_records == 0 {
+        missing.push("large_prefill_direct_sparse_selected");
+    }
+    if direct.prefill_large_use_direct_records != direct.prefill_large_records {
+        missing.push("all_large_prefill_records_select_direct_sparse");
+    }
+    if !direct
+        .selector_reasons
+        .contains_key("dense_mask_guard_large_prefill")
+    {
+        missing.push("dense_mask_guard_large_prefill_selector");
+    }
+    if direct.decode_records != 0 {
+        missing.push("long_prefill_window_without_decode_records");
+    }
+    if direct.verify_records != 0 {
+        missing.push("long_prefill_window_without_verify_records");
+    }
+    if !summary
+        .stage_records
+        .values()
+        .any(prefill_uses_direct_sparse)
+    {
+        missing.push("stage_prefill_direct_sparse_timing");
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} does not prove long-prefill GLM-DSA dense sparse-mask guard evidence; missing {}; policy={:?}; stage_records={:?}",
+        path.display(),
+        missing.join(","),
+        summary.policy,
+        summary.stage_records
+    )
+}
+
+fn prefill_uses_direct_sparse(phases: &BTreeMap<Phase, PhaseSummary>) -> bool {
+    let Some(prefill) = phases.get(&Phase::Prefill) else {
+        return false;
+    };
+    prefill.sparse_mask.nodes == 0
+        && optional_nodes(&prefill.dsa_sparse_attn) > 0
+        && optional_elapsed_us(&prefill.dsa_sparse_attn) > 0
 }
 
 fn require_verify_policy_evidence(path: &Path, summary: &LogSummary) -> Result<()> {
@@ -2764,9 +2825,9 @@ mod tests {
         require_compact_decode_policy_evidence, require_compact_decode_without_sparse_mask,
         require_glm52_runtime_contract, require_indexshare_producer_consumer_trace,
         require_local_apple_backend_matrix, require_local_backend_evidence,
-        require_metal_compact_dispatch, require_short_prefill_policy_evidence,
-        require_verify_policy_evidence, summarize_backend_evidence, summarize_comparison_rows,
-        summarize_log,
+        require_long_prefill_policy_evidence, require_metal_compact_dispatch,
+        require_short_prefill_policy_evidence, require_verify_policy_evidence,
+        summarize_backend_evidence, summarize_comparison_rows, summarize_log,
     };
     use crate::cli::GlmDsaOpReportArgs;
 
@@ -2847,6 +2908,7 @@ llama_context: n_ctx_seq     = 256";
             require_compact_decode_no_sparse_mask: false,
             require_compact_decode_policy_evidence: false,
             require_short_prefill_policy_evidence: false,
+            require_long_prefill_policy_evidence: false,
             require_verify_policy_evidence: false,
             require_glm52_runtime_contract: false,
             require_local_backend_evidence: false,
@@ -3732,6 +3794,48 @@ llama_context: n_ctx_seq     = 256";
         assert_eq!(summary.policy.direct_sparse.prefill_large_records, 0);
         assert_eq!(summary.policy.direct_sparse.prefill_use_direct_records, 0);
         require_short_prefill_policy_evidence(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn accepts_long_prefill_policy_evidence_guard() {
+        let timing = parse_timing_records(LINE_WITH_DSA_SPARSE_ATTN).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_LINE_WITH_REASON).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &[]),
+        );
+
+        assert_eq!(summary.policy.direct_sparse.prefill_large_records, 1);
+        assert_eq!(
+            summary
+                .policy
+                .direct_sparse
+                .prefill_large_use_direct_records,
+            1
+        );
+        require_long_prefill_policy_evidence(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn rejects_long_prefill_policy_evidence_guard_with_sparse_mask_timing() {
+        let timing = parse_timing_records(LINE_WITH_SPARSE_BREAKDOWN).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_LINE_WITH_REASON).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &[]),
+        );
+
+        let error =
+            require_long_prefill_policy_evidence(Path::new("stage1.log"), &summary).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("stage_prefill_direct_sparse_timing"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

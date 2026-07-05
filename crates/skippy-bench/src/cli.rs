@@ -245,6 +245,11 @@ pub struct GlmDsaOpReportArgs {
     pub require_short_prefill_policy_evidence: bool,
     #[arg(
         long,
+        help = "Fail unless long-prefill GLM-DSA policy/timing logs prove the dense sparse-mask guard selected direct sparse attention."
+    )]
+    pub require_long_prefill_policy_evidence: bool,
+    #[arg(
+        long,
         help = "Fail unless verification GLM-DSA policy logs prove verify-phase classification and an intended route."
     )]
     pub require_verify_policy_evidence: bool,
@@ -1763,6 +1768,7 @@ mod tests {
             "--session-id",
             "456",
             "--require-short-prefill-policy-evidence",
+            "--require-long-prefill-policy-evidence",
             "--require-verify-policy-evidence",
         ])
         .unwrap();
@@ -1778,6 +1784,7 @@ mod tests {
         assert_eq!(args.request_id, Some(123));
         assert_eq!(args.session_id, Some(456));
         assert!(args.require_short_prefill_policy_evidence);
+        assert!(args.require_long_prefill_policy_evidence);
         assert!(args.require_verify_policy_evidence);
     }
 
