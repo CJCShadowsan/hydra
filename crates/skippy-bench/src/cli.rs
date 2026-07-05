@@ -234,6 +234,11 @@ pub struct GlmDsaOpReportArgs {
     pub require_compact_decode_policy_evidence: bool,
     #[arg(
         long,
+        help = "Fail unless short-prefill GLM-DSA policy logs prove the conservative non-direct sparse path."
+    )]
+    pub require_short_prefill_policy_evidence: bool,
+    #[arg(
+        long,
         help = "Fail unless runtime metadata proves the expected GLM-5.2 GLM-DSA contract."
     )]
     pub require_glm52_runtime_contract: bool,
@@ -1739,6 +1744,7 @@ mod tests {
             "123",
             "--session-id",
             "456",
+            "--require-short-prefill-policy-evidence",
         ])
         .unwrap();
 
@@ -1752,6 +1758,7 @@ mod tests {
         assert_eq!(args.until_marker.as_deref(), Some("request=next"));
         assert_eq!(args.request_id, Some(123));
         assert_eq!(args.session_id, Some(456));
+        assert!(args.require_short_prefill_policy_evidence);
     }
 
     #[test]

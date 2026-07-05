@@ -142,8 +142,11 @@ struct DirectSparsePolicySummary {
     records: usize,
     decode_records: usize,
     prefill_records: usize,
+    prefill_large_records: usize,
     use_direct_records: usize,
     decode_use_direct_records: usize,
+    prefill_use_direct_records: usize,
+    prefill_large_use_direct_records: usize,
     decode_backend_sparse_supported: BoolOptionCounts,
     selector_reasons: BTreeMap<String, usize>,
 }
@@ -679,6 +682,9 @@ fn build_report(args: &GlmDsaOpReportArgs) -> Result<GlmDsaOpReport> {
         if args.require_compact_decode_policy_evidence {
             require_compact_decode_policy_evidence(path, &summary)?;
         }
+        if args.require_short_prefill_policy_evidence {
+            require_short_prefill_policy_evidence(path, &summary)?;
+        }
         if args.require_glm52_runtime_contract {
             require_glm52_runtime_contract(path, &summary)?;
         }
@@ -1130,6 +1136,41 @@ fn require_compact_decode_policy_evidence(path: &Path, summary: &LogSummary) -> 
 
     bail!(
         "{} does not prove compact GLM-DSA decode policy/fallback evidence; missing {}; policy={:?}",
+        path.display(),
+        missing.join(","),
+        summary.policy
+    )
+}
+
+fn require_short_prefill_policy_evidence(path: &Path, summary: &LogSummary) -> Result<()> {
+    let direct = &summary.policy.direct_sparse;
+    let mut missing = Vec::new();
+
+    if direct.prefill_records == 0 {
+        missing.push("direct_sparse_prefill_policy_records");
+    }
+    if direct.prefill_large_records != 0 {
+        missing.push("short_prefill_window_without_large_prefill");
+    }
+    if !direct
+        .selector_reasons
+        .contains_key("prefill_sparse_disabled")
+    {
+        missing.push("prefill_sparse_disabled_selector");
+    }
+    if direct.prefill_use_direct_records != 0 {
+        missing.push("short_prefill_direct_sparse_not_selected");
+    }
+    if direct.decode_records != 0 {
+        missing.push("prefill_window_without_decode_records");
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "{} does not prove short-prefill GLM-DSA conservative policy evidence; missing {}; policy={:?}",
         path.display(),
         missing.join(","),
         summary.policy
@@ -2251,11 +2292,20 @@ fn summarize_direct_sparse_policy(
         }
         if is_prefill {
             summary.prefill_records += 1;
+            if record.large_prefill_shape == Some(true) {
+                summary.prefill_large_records += 1;
+            }
         }
         if record.use_direct {
             summary.use_direct_records += 1;
             if is_decode {
                 summary.decode_use_direct_records += 1;
+            }
+            if is_prefill {
+                summary.prefill_use_direct_records += 1;
+                if record.large_prefill_shape == Some(true) {
+                    summary.prefill_large_use_direct_records += 1;
+                }
             }
         }
         add_selector_reason(
@@ -2614,8 +2664,8 @@ mod tests {
         require_compact_decode_policy_evidence, require_compact_decode_without_sparse_mask,
         require_glm52_runtime_contract, require_indexshare_producer_consumer_trace,
         require_local_apple_backend_matrix, require_local_backend_evidence,
-        require_metal_compact_dispatch, summarize_backend_evidence, summarize_comparison_rows,
-        summarize_log,
+        require_metal_compact_dispatch, require_short_prefill_policy_evidence,
+        summarize_backend_evidence, summarize_comparison_rows, summarize_log,
     };
     use crate::cli::GlmDsaOpReportArgs;
 
@@ -2635,6 +2685,7 @@ mod tests {
     const DIRECT_SPARSE_DECISION_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1 sparse_batch=1 sparse_streams=1 prefill_cap=8 decode_max_top_k=256 sparse_kv=256 sparse_top_k=129 min_kv_topk_ratio=0 kv_topk_ratio=1 dense_mask_bytes=512 dense_mask_limit=536870912 phase=decode selector_reason=backend_sparse_unsupported direct_enabled=1 prefill_enabled=1 decode_shape=1 verify_shape=0 prefill_shape=1 large_prefill_shape=0 token_shape_allowed=1 backend_sparse_supported=0 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const DIRECT_SPARSE_DECISION_COMPACT_SELECTED_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=1 sparse_batch=1 sparse_streams=1 prefill_cap=8 decode_max_top_k=256 sparse_kv=2304 sparse_top_k=2048 min_kv_topk_ratio=0 kv_topk_ratio=1 dense_mask_bytes=4608 dense_mask_limit=536870912 phase=decode selector_reason=compact_flash_selected direct_enabled=1 prefill_enabled=1 decode_shape=1 verify_shape=0 prefill_shape=1 large_prefill_shape=0 token_shape_allowed=1 backend_sparse_supported=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const LARGE_PREFILL_DIRECT_SPARSE_DECISION_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=4096 sparse_batch=4096 sparse_streams=1 prefill_cap=32 dense_mask_bytes=2147483648 dense_mask_limit=536870912 direct_enabled=1 prefill_enabled=1 decode_shape=0 prefill_shape=0 large_prefill_shape=1 token_shape_allowed=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=1";
+    const SHORT_PREFILL_SPARSE_DISABLED_LINE: &str = "skippy: glm_dsa_direct_sparse_decision layer=30 ubatch_tokens=128 sparse_batch=128 sparse_streams=1 prefill_cap=2048 decode_max_top_k=256 sparse_kv=512 sparse_top_k=384 min_kv_topk_ratio=0 kv_topk_ratio=1 dense_mask_bytes=131072 dense_mask_limit=268435456 phase=prefill selector_reason=prefill_sparse_disabled direct_enabled=1 prefill_enabled=0 decode_shape=0 verify_shape=0 prefill_shape=0 large_prefill_shape=0 token_shape_allowed=0 backend_sparse_supported=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 use_direct=0";
     const COMPACT_FLASH_POLICY_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=8192 top_k=2048 kv_topk_ratio=4 min_kv_topk_ratio=2 forced=0 disabled=0 ratio_ok=1 enabled=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact";
     const COMPACT_FLASH_POLICY_BACKEND_SUPPORTED_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=256 top_k=256 decode_max_top_k=4 compact_min_kv=1 kv_topk_ratio=1 forced=0 disabled=0 large_decode_top_k=1 kv_ok=1 enabled=1 backend_compact_supported=1 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=1 use_compact=1 selector_reason=decode_compact_mask_omitted";
     const COMPACT_FLASH_POLICY_BACKEND_UNSUPPORTED_LINE: &str = "skippy: glm_dsa_compact_flash_policy layer=30 ubatch_tokens=1 visible_kv=256 top_k=129 decode_max_top_k=256 compact_min_kv=1 kv_topk_ratio=1 forced=0 disabled=0 large_decode_top_k=0 kv_ok=1 enabled=0 backend_compact_supported=0 flash_attn=1 phase=decode decode_shape=1 kq_b_ok=1 sinks_ok=1 alibi_ok=1 soft_cap_ok=1 no_mask=0 use_compact=0 selector_reason=backend_compact_unsupported";
@@ -2690,6 +2741,7 @@ llama_context: n_ctx_seq     = 256";
             require_indexshare_producer_consumer: false,
             require_compact_decode_no_sparse_mask: false,
             require_compact_decode_policy_evidence: false,
+            require_short_prefill_policy_evidence: false,
             require_glm52_runtime_contract: false,
             require_local_backend_evidence: false,
             require_metal_compact_dispatch: false,
@@ -3558,6 +3610,43 @@ llama_context: n_ctx_seq     = 256";
         );
 
         require_compact_decode_policy_evidence(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn accepts_short_prefill_policy_evidence_guard() {
+        let timing = parse_timing_records(LINE_WITH_SPARSE_BREAKDOWN).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(SHORT_PREFILL_SPARSE_DISABLED_LINE).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &[]),
+        );
+
+        assert_eq!(summary.policy.direct_sparse.prefill_records, 1);
+        assert_eq!(summary.policy.direct_sparse.prefill_large_records, 0);
+        assert_eq!(summary.policy.direct_sparse.prefill_use_direct_records, 0);
+        require_short_prefill_policy_evidence(Path::new("stage1.log"), &summary).unwrap();
+    }
+
+    #[test]
+    fn rejects_short_prefill_policy_evidence_guard_when_direct_sparse_selected() {
+        let timing = parse_timing_records(LINE_WITH_SPARSE_BREAKDOWN).unwrap();
+        let direct_policy =
+            parse_direct_sparse_decision_records(DIRECT_SPARSE_DECISION_LINE_WITH_REASON).unwrap();
+        let summary = summarize_log(
+            "stage1.log".into(),
+            LogRecordInputs::new(&timing).with_policy_records(&direct_policy, &[]),
+        );
+
+        let error =
+            require_short_prefill_policy_evidence(Path::new("stage1.log"), &summary).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("short_prefill_window_without_large_prefill"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
