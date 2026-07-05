@@ -4,14 +4,14 @@ Date: Sat, 4 Jul 2026 17:13:12 +1000
 Subject: [PATCH] Allow GLM DSA padded vocab tensors
 
 ---
- src/models/glm-dsa.cpp | 14 ++++++++------
- 1 file changed, 8 insertions(+), 6 deletions(-)
+ src/models/glm-dsa.cpp | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
 
 diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
 index 617777690..c3d729e10 100644
 --- a/src/models/glm-dsa.cpp
 +++ b/src/models/glm-dsa.cpp
-@@ -498,9 +498,11 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+@@ -498,9 +498,17 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
      }
  }
  
@@ -20,11 +20,17 @@ index 617777690..c3d729e10 100644
      LLAMA_LOAD_LOCALS;
      const int64_t n_expert_shared = hparams.n_expert_shared;
 +    uint32_t n_vocab_tensor = vocab.n_tokens();
-+    ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab_tensor, false);
++    const bool has_vocab_size = ml.get_key(LLM_KV_VOCAB_SIZE, n_vocab_tensor, false);
++    if (!has_vocab_size) {
++        const ggml_tensor * tok_embd_meta = ml.get_tensor_meta(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str());
++        if (tok_embd_meta != nullptr && tok_embd_meta->ne[0] == n_embd && tok_embd_meta->ne[1] > n_vocab_tensor) {
++            n_vocab_tensor = tok_embd_meta->ne[1];
++        }
++    }
  
      const bool is_mla = hparams.is_mla();
      if (!is_mla) {
-@@ -519,14 +521,14 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
+@@ -519,14 +527,14 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
  
      const int64_t n_ff_exp        = hparams.n_ff_exp;
  
@@ -42,7 +48,7 @@ index 617777690..c3d729e10 100644
      }
  
      for (int i = 0; i < n_layer_all; ++i) {
-@@ -613,8 +615,8 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
+@@ -613,8 +621,8 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
              layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM, "weight", i), { n_embd }, flags);
  
              // Optional tensors

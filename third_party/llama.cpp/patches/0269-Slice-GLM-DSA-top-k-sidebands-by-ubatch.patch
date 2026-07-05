@@ -1,0 +1,117 @@
+From 5d1f048805e3159aa30c934e2a959cfbfbe53a7a Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sun, 5 Jul 2026 20:03:00 +1000
+Subject: [PATCH] Slice GLM DSA top-k sidebands by ubatch
+
+---
+ src/llama-graph.cpp | 18 +++++++++++++-----
+ src/llama-graph.h   |  1 +
+ src/skippy.cpp      | 10 ++++++----
+ 3 files changed, 20 insertions(+), 9 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d27648af2..6bd54a10d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -970,19 +970,27 @@ bool llm_graph_input_gemma3n_altup::can_reuse(const llm_graph_params & params) {
+ void llm_graph_input_glm_dsa_top_k::set_input(const llama_ubatch * ubatch) {
+     const skippy_activation_glm_dsa_top_k & sideband = skippy_graph_get_glm_dsa_top_k();
+     GGML_ASSERT(sideband.values != nullptr);
+-    GGML_ASSERT(sideband.token_count == ubatch->n_tokens);
++    GGML_ASSERT(sideband.token_count >= ubatch->n_tokens);
+     GGML_ASSERT(sideband.n_top_k == n_top_k);
+     GGML_ASSERT(sideband.n_stream == n_stream);
+     GGML_ASSERT(n_stream > 0);
+-    GGML_ASSERT(((int64_t) sideband.token_count % n_stream) == 0);
++    GGML_ASSERT(((int64_t) ubatch->n_tokens % n_stream) == 0);
+     GGML_ASSERT(values != nullptr);
+     GGML_ASSERT(values->type == GGML_TYPE_I32);
+     GGML_ASSERT(values->ne[0] == n_top_k);
+-    GGML_ASSERT(values->ne[1] == (int64_t) sideband.token_count / n_stream);
++    GGML_ASSERT(values->ne[1] == (int64_t) ubatch->n_tokens / n_stream);
+     GGML_ASSERT(values->ne[2] == 1);
+     GGML_ASSERT(values->ne[3] == n_stream);
+ 
+-    ggml_backend_tensor_set(values, sideband.values, 0, sideband.token_count*n_top_k*ggml_element_size(values));
++    size_t token_offset = 0;
++    if (ubatch->pos != nullptr && ubatch->pos[0] >= sideband.pos_start) {
++        token_offset = static_cast<size_t>(ubatch->pos[0] - sideband.pos_start);
++    }
++    GGML_ASSERT(token_offset <= sideband.token_count);
++    GGML_ASSERT(token_offset + ubatch->n_tokens <= sideband.token_count);
++
++    const int32_t * values_src = sideband.values + token_offset*n_top_k;
++    ggml_backend_tensor_set(values, values_src, 0, ubatch->n_tokens*n_top_k*ggml_element_size(values));
+ }
+ 
+ bool llm_graph_input_glm_dsa_top_k::can_reuse(const llm_graph_params & params) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 0477f50bf..0ba65bc59 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -65,6 +65,7 @@ struct skippy_activation_glm_dsa_top_k {
+     uint32_t token_count = 0;
+     uint32_t n_top_k = 0;
+     uint32_t n_stream = 0; // runtime layout is I32 [n_top_k, n_batch, 1, n_stream]
++    llama_pos pos_start = 0;
+ };
+ 
+ void skippy_graph_set_filter(const skippy_graph_filter & filter);
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 977933224..ce5125c1d 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -1100,7 +1100,8 @@ struct skippy_glm_dsa_top_k_scope {
+             const void * payload,
+             size_t hidden_bytes,
+             uint32_t n_top_k,
+-            uint32_t n_stream) {
++            uint32_t n_stream,
++            llama_pos pos_start) {
+         if (desc != nullptr &&
+             payload != nullptr &&
+             (desc->flags & SKIPPY_ACTIVATION_FLAG_GLM_DSA_TOP_K) != 0) {
+@@ -1109,6 +1110,7 @@ struct skippy_glm_dsa_top_k_scope {
+             sideband.token_count = desc->token_count;
+             sideband.n_top_k = n_top_k;
+             sideband.n_stream = n_stream;
++            sideband.pos_start = pos_start;
+             skippy_graph_set_glm_dsa_top_k(sideband);
+             enabled = true;
+         }
+@@ -3587,13 +3589,14 @@ static enum skippy_status skippy_decode_activation_frame(
+     skippy_activation_tokens_scope activation_tokens_scope(token_ids, token_count);
+     skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
+     skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
++    const llama_pos token_start = pos_storage.empty() ? session->n_past : pos_storage[0];
+     skippy_glm_dsa_top_k_scope glm_dsa_top_k_scope(
+             input_desc,
+             input_payload,
+             hidden_bytes,
+             skippy_glm_dsa_top_k_count_from_desc(session, input_desc),
+-            skippy_glm_dsa_n_stream(session));
+-    const llama_pos token_start = pos_storage.empty() ? session->n_past : pos_storage[0];
++            skippy_glm_dsa_n_stream(session),
++            token_start);
+     enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
+     if (status == SKIPPY_STATUS_OK && token_ids != nullptr) {
+         status = skippy_mtp_sync_target_tokens(session, token_ids, token_count, token_start, out_error);
+@@ -3659,13 +3662,14 @@ static enum skippy_status skippy_verify_activation_frame(
+ 
+     skippy_rwkv7_v_first_scope rwkv7_v_first_scope(input_desc, input_payload, hidden_bytes, n_embd);
+     skippy_gemma3n_altup_scope gemma3n_altup_scope(input_desc, input_payload, n_embd, n_altup);
++    const llama_pos token_start = session->n_past;
+     skippy_glm_dsa_top_k_scope glm_dsa_top_k_scope(
+             input_desc,
+             input_payload,
+             hidden_bytes,
+             skippy_glm_dsa_top_k_count_from_desc(session, input_desc),
+-            skippy_glm_dsa_n_stream(session));
+-    const llama_pos token_start = session->n_past;
++            skippy_glm_dsa_n_stream(session),
++            token_start);
+     enum skippy_status status = skippy_decode_batch(session, batch, token_count, out_error);
+     if (!alias_input_payload) {
+         llama_batch_free(batch);
+-- 
+2.53.0
