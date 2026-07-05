@@ -188,18 +188,17 @@ diagnostic row measured `291.73 us` but does not represent the normal llama.cpp
 should inform runtime optimization order, but it does not add new manifest
 schema: package policy still belongs under `generation.policy`, and numeric
 resolver hints still belong under `generation.thresholds`.
-The extended MoE fixture keeps that conclusion intact: a merged q2_K routed
-gate/up tensor shape estimates `385.00 us` (`1.02x` faster than the current
-routed estimate), a merged shared gate/up fused GLU shape measured `382.75 us`
-(`1.06x` faster than separate shared gate/up), moving MoE weights before the
-down projection measured `439.38 us` versus `442.34 us` (`1.01x`) on the small
-quantized whole-graph fixture, and a q2_K down-projection alternative
-estimates `342.59 us` (`1.14x`) before quality is measured. The same fixture
-now measures shared-expert q3_K and q2_K alternatives: q3_K is slower at
-`443.86 us` (`0.91x` versus q4_K), while q2_K is effectively tied at
-`403.84 us` (`1.00x` versus q4_K). That makes q2_K down quality testing and
-deeper expert matmul/layout work more interesting than custom activation
-fusion, shared-expert quant lowering, or merged shared gate/up.
+The combined FFN fixture keeps that conclusion intact with a cleaner
+production-shaped signal than the earlier isolated rows. With
+`n_embd=6144`, the q3_K routed down baseline measured `1147.21 us`; changing
+decoder routed down projections to q2_K measured `817.38 us` (`1.40x` faster),
+and keeping q3_K routed down while using merged shared gate/up measured
+`868.59 us` (`1.32x` faster). Route/top-k plus weights measured only `3.26 us`,
+weighted sum measured `6.69 us`, and routed fused SwiGLU measured `5.09 us`, so
+the next practical levers are whole-graph expert matmul/layout work and a
+quality-tested q2_K routed-down quant recipe. The q2_K routed-down recipe must
+exclude `blk.78`, the native NextN/MTP block, until quality and speculation
+tests prove that lowering the MTP block is acceptable.
 The Phase E report can be run as a hard evidence gate with
 `GLM52_PHASE_E_REQUIRE_GATES=1`; the gated rows require production-shaped
 routed/shared MoE, q2/q3 down alternatives, and the optional kernel sweep rows
@@ -216,22 +215,14 @@ and `162.67 us` at `nsg=4`, only `1.01x` faster than ordinary default q3_K
 `mul_mv_id`. The next meaningful local target is therefore a deeper expert
 matmul/layout specialization or a quality-tested down-projection quant change,
 not generic matrix-matrix cutoff, simdgroup, row-height, or fixed-block tuning.
-The production-sized `TOPK_MOE_GLM_CONSUMER_SANITY` rows now run the full
-routed MoE graph in perf mode. This fixed an earlier harness issue where the
-fixture had `run_whole_graph()` for correctness but still timed only the final
-`GGML_OP_MOE_WEIGHTED_SUM` during perf. With `perf_runs_whole_graph()` enabled,
-the sanity probe measured q3_K down at `803.92 us` and q2_K down at `739.91 us`
-against an isolated routed FFN estimate of `391.13 us`; both rows are plausible,
-and q2_K down is `1.09x` faster end-to-end on that production-shaped graph. This
-keeps q2_K down quality testing on the table, but with a more realistic
-whole-graph speedup than the isolated matmul estimate.
-The production sanity probe also now samples the weighted-down q3_K graph
-directly. A focused validation run measured q3_K baseline at `1000.10 us`,
-q3_K weighted-down at `1015.46 us`, and q2_K down at `765.54 us`. That makes
-weighted-down slower on the production-shaped graph (`0.98x` versus baseline)
-despite small-shape wins, while q2_K down remains the only measured
-whole-graph speedup candidate. Keep `moe_weighted_down` evidence-gated rather
-than making it a package default.
+The earlier `TOPK_MOE_GLM_CONSUMER_SANITY` rows remain useful as harness
+history: they fixed a perf-mode bug where the fixture had `run_whole_graph()`
+for correctness but timed only the final `GGML_OP_MOE_WEIGHTED_SUM` during
+perf. The newer combined FFN fixture supersedes those rows as the decision
+gate because it keeps routed and shared experts together. Keep
+`moe_weighted_down` evidence-gated rather than making it a package default; the
+combined decision path now favors q2_K routed-down quality testing and merged
+shared gate/up investigation.
 
 In practice, this means the package's `generation` block is the phase-aware
 contract: decode prefers compact flash, short prefill prefers dense, long

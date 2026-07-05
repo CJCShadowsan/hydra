@@ -440,6 +440,9 @@ Policy values are intentionally phase-specific:
   the routed down projection instead of applying them in the output weighted
   sum. Use `evidence-gated`; current evidence makes this a small graph-shape
   experiment, not a replacement for expert matmul optimization.
+- `experimental.moe_merged_shared_gate_up`: controls merged shared-expert
+  gate/up execution. Use `evidence-gated` until the package/backend has
+  reproducible combined-FFN graph wins and parity evidence.
 
 Suggested semantic path values are:
 
@@ -507,6 +510,7 @@ For `glm-dsa-v1`, the current phase intent is:
 | `indexshare` | `required` | Reuse Full-layer top-k/index state for Shared GLM-DSA layers instead of silent recompute. |
 | `experimental.selected_row_flash` | `evidence-gated` | Enable compact selected-row flash only when package/backend evidence proves parity and a win. |
 | `experimental.moe_weighted_down` | `evidence-gated` | Enable weighted-down MoE graph shape only when package/backend evidence proves parity and a win. |
+| `experimental.moe_merged_shared_gate_up` | `evidence-gated` | Enable merged shared-expert gate/up only when package/backend evidence proves parity and a combined-graph win. |
 
 For `glm-dsa-v1`, the current threshold intent is:
 
@@ -595,15 +599,17 @@ custom activation fusion is not the next local target. Treat the fused GLU
 numbers as the production-shaped evidence and keep optimization pressure on
 routed q2/q3 `MUL_MAT_ID`, q2_K down quality experiments, and deeper expert
 matmul/layout work.
-The extended fixture measured a merged q2_K routed gate/up tensor shape at
-`385.00 us` (`1.02x` faster than the current routed estimate), a merged shared
-gate/up fused GLU shape at `382.75 us` (`1.06x` faster than separate shared
-gate/up), a weighted-down MoE graph shape at `439.38 us` versus `442.34 us`
-(`1.01x`) on the small quantized whole-graph fixture, and a q2_K
-down-projection alternative at `342.59 us` (`1.14x`, quality not measured by
-that microbench). Shared-expert q3_K measured `443.86 us` (`0.91x` versus
-q4_K), and shared-expert q2_K measured `403.84 us` (`1.00x` versus q4_K), so
-lowering shared-expert quant is not a Metal throughput lever. Treat those as
+The combined FFN fixture is the current Phase E decision gate because it keeps
+routed and shared expert execution in one production-shaped graph. With
+`n_embd=6144`, the q3_K routed down baseline measured `1147.21 us`; changing
+decoder routed down projections to q2_K measured `817.38 us` (`1.40x` faster),
+and keeping q3_K routed down while using merged shared gate/up measured
+`868.59 us` (`1.32x` faster). Route/top-k plus weights measured only `3.26 us`,
+weighted sum measured `6.69 us`, and routed fused SwiGLU measured `5.09 us`, so
+the next practical levers are whole-graph expert matmul/layout work and a
+quality-tested q2_K routed-down quant recipe. The q2_K routed-down recipe must
+exclude `blk.78`, the native NextN/MTP block, until quality and speculation
+tests prove that lowering the MTP block is acceptable. Treat these as
 optimization-priority evidence, not as a new model-family schema branch:
 quality-bearing quant changes still need separate evaluation under the normal
 benchmark flow.
@@ -622,28 +628,16 @@ A fixed `k=2048` q3_K GLM-down specialization measured `164.04 us` at default
 q3_K `mul_mv_id`. Keep q3_K down work focused on a deeper expert matmul/layout
 specialization or a quality-tested q2_K down alternative, not generic
 matrix-matrix cutoff, simdgroup, row-height, or fixed-block knobs.
-Production-shaped routed whole-graph consumer rows are exposed through
-`GLM52_PHASE_E_ROUTED_WHOLE_GRAPH_SANITY=1` and are accepted only when they are
-physically plausible against the isolated routed FFN estimate. The routed
-consumer fixture now opts into `perf_runs_whole_graph()`, matching its
-correctness-mode `run_whole_graph()` behavior. Before that fix, perf mode timed
-only the final `GGML_OP_MOE_WEIGHTED_SUM`, so the production-shaped row looked
-like a bogus `~7 us` weighted-sum-only result. With the full graph timed, the
-production-shaped sanity probe reported q3_K down at `803.92 us` and q2_K down
-at `739.91 us` against a `391.13 us` isolated routed FFN estimate. Both rows
-are plausible, and q2_K down is `1.09x` faster end-to-end on the
-production-shaped graph. Generation policy should therefore treat q2_K routed
-down as a quality-test candidate, not as a proven default.
-The same sanity probe now measures the weighted-down q3_K graph in the
-production shape as an explicit advisory row. A focused validation run measured
-q3_K baseline at `1000.10 us`, q3_K weighted-down at `1015.46 us`, and q2_K
-down at `765.54 us`. That makes weighted-down slower on the production-shaped
-graph (`0.98x` versus baseline) even though small 256-wide fixtures can look
-faster. Keep `generation.policy.experimental.moe_weighted_down` at
-`evidence-gated`; it is not a package default. The q2_K down alternative is
-still the useful follow-up because it produced the only whole-graph speedup,
-but it needs quality validation before it can become a model-package quant
-policy.
+Production-shaped routed whole-graph consumer rows remain useful as harness
+history and as a guard against timing only a graph tail. They fixed an earlier
+perf-mode issue where the fixture had `run_whole_graph()` for correctness but
+timed only the final `GGML_OP_MOE_WEIGHTED_SUM` during perf. The newer combined
+FFN fixture supersedes those rows as the policy decision gate because it keeps
+routed and shared experts together. Keep
+`generation.policy.experimental.moe_weighted_down` at `evidence-gated`; it is
+not a package default. The q2_K down alternative is still the useful follow-up
+because it produced the clearest combined-graph speedup, but it needs quality
+validation before it can become a model-package quant policy.
 
 The IndexShare numbers are why `generation.policy.indexshare` is a first-class
 policy field instead of an implementation note. For GLM-5.2-style DSA with a
