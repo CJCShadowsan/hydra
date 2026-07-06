@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Mon, 6 Jul 2026 18:45:00 +1000
+Subject: [PATCH] Measure GLM DSA q2 weighted down candidate
+
+---
+ scripts/glm52-phase-e-moe-report.sh | 17 ++++++++++++++---
+ tests/test-backend-ops.cpp          |  3 +++
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/scripts/glm52-phase-e-moe-report.sh b/scripts/glm52-phase-e-moe-report.sh
+index 5d277d511..b14dcdec0 100755
+--- a/scripts/glm52-phase-e-moe-report.sh
++++ b/scripts/glm52-phase-e-moe-report.sh
+@@ -124,7 +124,8 @@ shexp_small = find("GLM_SHEXP_CONSUMER", "n_embd=256", "fused_glu=0")
+ shexp_small_fused = find("GLM_SHEXP_CONSUMER", "n_embd=256", "fused_glu=1", "merged_gate_up=0")
+ shexp_small_merged = find("GLM_SHEXP_CONSUMER", "n_embd=256", "fused_glu=1", "merged_gate_up=1")
+ ffn_q3 = find("GLM_FFN_CONSUMER", "routed_down_type=q3_K", "n_embd=6144", "merged_shexp_gate_up=0")
+-ffn_q2 = find("GLM_FFN_CONSUMER", "routed_down_type=q2_K", "n_embd=6144", "merged_shexp_gate_up=0")
++ffn_q2 = find("GLM_FFN_CONSUMER", "routed_down_type=q2_K", "n_embd=6144", "weighted_down=0", "merged_shexp_gate_up=0")
++ffn_q2_weighted = find("GLM_FFN_CONSUMER", "routed_down_type=q2_K", "n_embd=6144", "weighted_down=1", "merged_shexp_gate_up=0")
+ ffn_q3_merged_shexp = find("GLM_FFN_CONSUMER", "routed_down_type=q3_K", "n_embd=6144", "merged_shexp_gate_up=1")
+ ffn_small = find("GLM_FFN_CONSUMER", "n_embd=256")
+ shexp_gate = find("GLM_SHEXP_COMPONENT", "component=0", "n_embd=6144")
+@@ -227,6 +228,7 @@ add_row("Routed down matmul, q2_K alternative", down_q2)
+ add_row("Routed down matmul", down)
+ add_row("Combined routed+shared FFN, q3_K routed down", ffn_q3)
+ add_row("Combined routed+shared FFN, q2_K routed down", ffn_q2)
++add_row("Combined routed+shared FFN, q2_K routed down weighted slots", ffn_q2_weighted)
+ add_row("Combined routed+shared FFN, q3_K routed down + merged shared gate/up", ffn_q3_merged_shexp)
+ 
+ lines.extend([
+@@ -280,6 +282,8 @@ if estimated_decode is not None:
+         lines.append(f"- Combined routed+shared FFN, q3_K routed down: `{ffn_q3['us']:.2f} us`.")
+     if ffn_q3 and ffn_q2:
+         lines.append(f"- Combined FFN q2_K routed-down alternative: `{ffn_q2['us']:.2f} us` (`{ffn_q3['us'] / ffn_q2['us']:.2f}x` faster, quality tradeoff not measured here).")
++    if ffn_q2 and ffn_q2_weighted:
++        lines.append(f"- Combined FFN q2_K weighted routed-down slots: `{ffn_q2_weighted['us']:.2f} us` (`{ffn_q2['us'] / ffn_q2_weighted['us']:.2f}x` versus q2_K baseline).")
+     if ffn_q3 and ffn_q3_merged_shexp:
+         lines.append(f"- Combined FFN merged shared gate/up: `{ffn_q3_merged_shexp['us']:.2f} us` (`{ffn_q3['us'] / ffn_q3_merged_shexp['us']:.2f}x` faster than separate shared gate/up).")
+ else:
+@@ -337,6 +341,7 @@ require_gates = os.environ.get("GLM52_PHASE_E_REQUIRE_GATES", "0") != "0"
+ q3 = next((row for row in rows if "down_type=q3_K" in row["params"] and "weighted_down=0" in row["params"]), None)
+ q3_weighted = next((row for row in rows if "down_type=q3_K" in row["params"] and "weighted_down=1" in row["params"]), None)
+ q2 = next((row for row in rows if "down_type=q2_K" in row["params"] and "weighted_down=0" in row["params"]), None)
++q2_weighted = next((row for row in rows if "down_type=q2_K" in row["params"] and "weighted_down=1" in row["params"]), None)
+ 
+ lines = [
+     "",
+@@ -356,7 +361,7 @@ def verdict(row):
+         return "rejected: below 25% of isolated routed FFN estimate"
+     return "plausible"
+ 
+-for label, row in (("q3_K down", q3), ("q3_K weighted-down", q3_weighted), ("q2_K down", q2)):
++for label, row in (("q3_K down", q3), ("q3_K weighted-down", q3_weighted), ("q2_K down", q2), ("q2_K weighted-down", q2_weighted)):
+     if row is None:
+         lines.append(f"| {label} | missing | missing | missing |")
+     else:
+@@ -369,6 +374,9 @@ if q3 and q2:
+ if q3 and q3_weighted:
+     weighted_speedup = q3["us"] / q3_weighted["us"]
+     lines.append(f"- q3_K weighted-down whole-graph speedup versus q3_K baseline: `{weighted_speedup:.2f}x`.")
++if q2 and q2_weighted:
++    q2_weighted_speedup = q2["us"] / q2_weighted["us"]
++    lines.append(f"- q2_K weighted-down whole-graph speedup versus q2_K baseline: `{q2_weighted_speedup:.2f}x`.")
+ if estimate_us is not None:
+     lines.append(f"- Isolated routed FFN estimate used for plausibility: `{estimate_us:.2f} us`.")
+ lines.append(f"- Raw artifact: `{sanity_log.name}`.")
+@@ -389,6 +397,13 @@ if q3 and q3_weighted:
+     else:
+         decision_lines.append(
+             f"- Weighted-down q3_K is not a speed win in this run (`{weighted_speedup:.2f}x`), so keep it off by default.")
++if q2 and q2_weighted:
++    if q2_weighted_speedup > 1.02:
++        decision_lines.append(
++            f"- Weighted-down q2_K should be tested in real decode (`{q2_weighted_speedup:.2f}x` in the whole-graph sanity probe).")
++    else:
++        decision_lines.append(
++            f"- Weighted-down q2_K is not a speed win in this run (`{q2_weighted_speedup:.2f}x`), so keep it off by default.")
+ if estimate_us is not None and q3:
+     lines.append(f"- Full-shape q3_K sanity is `{q3['us'] / estimate_us:.2f}x` the isolated routed FFN estimate.")
+     decision_lines.append(
+@@ -404,7 +419,7 @@ print(section)
+ 
+ if require_gates:
+     failures = []
+-    for label, row in (("q3_K down", q3), ("q3_K weighted-down", q3_weighted), ("q2_K down", q2)):
++    for label, row in (("q3_K down", q3), ("q3_K weighted-down", q3_weighted), ("q2_K down", q2), ("q2_K weighted-down", q2_weighted)):
+         row_verdict = verdict(row)
+         if row_verdict != "plausible":
+             failures.append(f"{label}: {row_verdict}")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 97bff5cee..7677dc48f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11192,6 +11192,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 6144, 2048, false, true, true));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, 6144, 2048, true, true, true));
+     test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 6144, 2048, false, true, true));
++    test_cases.emplace_back(new test_topk_moe_glm_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 6144, 2048, true, true, true));
+     test_cases.emplace_back(new test_topk_moe_glm_activation(2048, 8, 1, false));
+     test_cases.emplace_back(new test_topk_moe_glm_activation(2048, 8, 1, true));
+     test_cases.emplace_back(new test_glm_shexp_consumer(GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256));
+@@ -11206,6 +11207,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+                 GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 256));
+     test_cases.emplace_back(new test_glm_ffn_consumer());
+     test_cases.emplace_back(new test_glm_ffn_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K));
++    test_cases.emplace_back(new test_glm_ffn_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K,
++                GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 6144, 2048, true, true));
+     test_cases.emplace_back(new test_glm_ffn_consumer(GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                 GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 6144, 2048, true, false, true));
+     for (int component = 0; component <= 6; ++component) {
+-- 
+2.53.0
+
