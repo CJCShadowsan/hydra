@@ -1986,6 +1986,8 @@ impl DriverTokenizer {
                 n_threads: None,
                 n_threads_batch: None,
                 n_gpu_layers: args.n_gpu_layers,
+                mmap: None,
+                mlock: false,
                 selected_backend_device: None,
                 cache_type_k: skippy_runtime::GGML_TYPE_F16,
                 cache_type_v: skippy_runtime::GGML_TYPE_F16,

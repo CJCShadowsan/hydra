@@ -1,6 +1,6 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 28;
+pub const ABI_VERSION_PATCH: u32 = 30;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
@@ -207,6 +207,9 @@ pub struct RuntimeConfig {
     pub n_threads: i32,
     pub n_threads_batch: i32,
     pub n_gpu_layers: i32,
+    pub has_mmap_override: bool,
+    pub use_mmap: bool,
+    pub use_mlock: bool,
     pub cache_type_k: i32,
     pub cache_type_v: i32,
     pub flash_attn_type: i32,
@@ -245,6 +248,23 @@ pub struct Session {
 pub struct ModelInfo {
     _private: [u8; 0],
 }
+
+pub type SkippyModelAttachMtpDraftModelFn = unsafe extern "C" fn(
+    target_model: *mut Model,
+    path: *const c_char,
+    config: *const RuntimeConfig,
+    out_error: *mut *mut Error,
+) -> Status;
+
+pub type SkippyDecodeStepSampledMtpFn = unsafe extern "C" fn(
+    session: *mut Session,
+    token_id: i32,
+    sampling: *const SamplingConfig,
+    out_predicted_token: *mut i32,
+    max_draft_tokens: usize,
+    out_mtp_draft: *mut NativeMtpDraft,
+    out_error: *mut *mut Error,
+) -> Status;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -523,12 +543,15 @@ pub struct KvPageDesc {
     pub flags: u64,
 }
 
+pub const NATIVE_MTP_MAX_DRAFT_TOKENS: usize = 8;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativeMtpDraft {
     pub version: u32,
     pub available: bool,
-    pub token_id: i32,
+    pub token_count: i32,
+    pub token_ids: [i32; NATIVE_MTP_MAX_DRAFT_TOKENS],
     pub proposal_compute_us: i64,
 }
 
@@ -797,7 +820,7 @@ mod dynamic {
         skippy_prefill_chunk_frame_with_positions(session: *mut Session, token_ids: *const i32, token_count: usize, positions: *const i32, position_count: usize, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk_frame_sampled_with_positions(session: *mut Session, token_ids: *const i32, token_count: usize, positions: *const i32, position_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_frame_sampled(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
-        skippy_decode_step_frame_sampled_mtp_n1(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_mtp_draft: *mut NativeMtpDraft, out_error: *mut *mut Error) -> Status;
+        skippy_decode_step_frame_sampled_mtp(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, max_draft_tokens: usize, out_mtp_draft: *mut NativeMtpDraft, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_frame_batch_sampled(sessions: *const *mut Session, token_ids: *const i32, sampling: *const *const SamplingConfig, input_descs: *const *const ActivationDesc, input_payloads: *const *const c_void, output_descs: *mut ActivationDesc, output_payloads: *const *mut c_void, output_payload_capacities: *const usize, out_output_payload_bytes: *mut usize, out_predicted_tokens: *mut i32, predicted_token_capacity: usize, request_count: usize, out_error: *mut *mut Error) -> Status;
         skippy_verify_tokens_frame_sampled(session: *mut Session, token_ids: *const i32, token_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_session_copy_output_activation_frame(session: *mut Session, token_count: usize, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
@@ -940,6 +963,24 @@ mod dynamic {
         })
     }
 
+    pub fn skippy_model_attach_mtp_draft_model_fn() -> Option<SkippyModelAttachMtpDraftModelFn> {
+        static CACHE: OnceLock<Option<SkippyModelAttachMtpDraftModelFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyModelAttachMtpDraftModelFn>(
+                b"skippy_model_attach_mtp_draft_model\0",
+            )
+        })
+    }
+
+    pub fn skippy_decode_step_sampled_mtp_fn() -> Option<SkippyDecodeStepSampledMtpFn> {
+        static CACHE: OnceLock<Option<SkippyDecodeStepSampledMtpFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            symbols().lookup_optional::<SkippyDecodeStepSampledMtpFn>(
+                b"skippy_decode_step_sampled_mtp\0",
+            )
+        })
+    }
+
     pub fn skippy_model_open_from_parts_with_events_fn()
     -> Option<SkippyModelOpenFromPartsWithEventsFn> {
         static CACHE: OnceLock<Option<SkippyModelOpenFromPartsWithEventsFn>> = OnceLock::new();
@@ -1076,6 +1117,32 @@ mod dynamic {
             )
         }
     }
+
+    #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+    pub unsafe fn skippy_decode_step_sampled_mtp(
+        session: *mut Session,
+        token_id: i32,
+        sampling: *const SamplingConfig,
+        out_predicted_token: *mut i32,
+        max_draft_tokens: usize,
+        out_mtp_draft: *mut NativeMtpDraft,
+        out_error: *mut *mut Error,
+    ) -> Status {
+        let Some(function) = skippy_decode_step_sampled_mtp_fn() else {
+            return Status::Unsupported;
+        };
+        unsafe {
+            function(
+                session,
+                token_id,
+                sampling,
+                out_predicted_token,
+                max_draft_tokens,
+                out_mtp_draft,
+                out_error,
+            )
+        }
+    }
 }
 
 #[cfg(feature = "dynamic-runtime")]
@@ -1129,6 +1196,13 @@ unsafe extern "C" {
         path_count: usize,
         config: *const RuntimeConfig,
         out_model: *mut *mut Model,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_model_attach_mtp_draft_model(
+        target_model: *mut Model,
+        path: *const c_char,
+        config: *const RuntimeConfig,
         out_error: *mut *mut Error,
     ) -> Status;
 
@@ -1239,6 +1313,16 @@ unsafe extern "C" {
         out_error: *mut *mut Error,
     ) -> Status;
 
+    pub fn skippy_decode_step_sampled_mtp(
+        session: *mut Session,
+        token_id: i32,
+        sampling: *const SamplingConfig,
+        out_predicted_token: *mut i32,
+        max_draft_tokens: usize,
+        out_mtp_draft: *mut NativeMtpDraft,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
     pub fn skippy_decode_batch_sampled(
         sessions: *const *mut Session,
         token_ids: *const i32,
@@ -1340,7 +1424,7 @@ unsafe extern "C" {
         out_error: *mut *mut Error,
     ) -> Status;
 
-    pub fn skippy_decode_step_frame_sampled_mtp_n1(
+    pub fn skippy_decode_step_frame_sampled_mtp(
         session: *mut Session,
         token_id: i32,
         sampling: *const SamplingConfig,
@@ -1351,6 +1435,7 @@ unsafe extern "C" {
         output_payload_capacity: usize,
         out_output_payload_bytes: *mut usize,
         out_predicted_token: *mut i32,
+        max_draft_tokens: usize,
         out_mtp_draft: *mut NativeMtpDraft,
         out_error: *mut *mut Error,
     ) -> Status;
@@ -1695,6 +1780,16 @@ unsafe extern "C" {
         logits_last: bool,
         new_n_past: *mut i32,
     ) -> c_int;
+}
+
+#[cfg(not(feature = "dynamic-runtime"))]
+pub fn skippy_model_attach_mtp_draft_model_fn() -> Option<SkippyModelAttachMtpDraftModelFn> {
+    Some(skippy_model_attach_mtp_draft_model)
+}
+
+#[cfg(not(feature = "dynamic-runtime"))]
+pub fn skippy_decode_step_sampled_mtp_fn() -> Option<SkippyDecodeStepSampledMtpFn> {
+    Some(skippy_decode_step_sampled_mtp)
 }
 
 pub type Opaque = c_void;

@@ -272,7 +272,12 @@ fn run_binary_stage(options: BinaryStageOptions, shutdown: Arc<AtomicBool>) -> R
                 speculative_window: openai_options.speculative_window,
                 adaptive_speculative_window: openai_options.adaptive_speculative_window,
                 draft_n_gpu_layers: openai_options.draft_n_gpu_layers,
+                ngram_min: openai_options.ngram_min,
+                ngram_max: openai_options.ngram_max,
                 native_mtp_enabled,
+                native_mtp_draft_model_path: None,
+                native_mtp_max_tokens: openai_options.native_mtp_max_tokens,
+                native_mtp_min_tokens: openai_options.native_mtp_min_tokens,
                 activation_width,
                 wire_dtype,
                 reply_credit_limit,
@@ -1744,11 +1749,13 @@ fn native_mtp_prediction_tokens(predicted: i32, draft: Option<NativeMtpDraft>) -
     let Some(draft) = draft else {
         return vec![predicted];
     };
-    vec![
-        predicted,
-        draft.token_id,
-        draft.proposal_compute_us.clamp(0, i64::from(i32::MAX)) as i32,
-    ]
+    let token_count = i32::try_from(draft.token_ids.len()).unwrap_or(i32::MAX);
+    let mut tokens = Vec::with_capacity(draft.token_ids.len() + 3);
+    tokens.push(predicted);
+    tokens.push(token_count);
+    tokens.extend(draft.token_ids);
+    tokens.push(draft.proposal_compute_us.clamp(0, i64::from(i32::MAX)) as i32);
+    tokens
 }
 
 fn binary_auto_align_session_enabled() -> bool {
@@ -3785,6 +3792,7 @@ pub(crate) struct BinaryStageExecutionOptions {
     pub(crate) sample_final_prefill: bool,
     pub(crate) output_capacity: usize,
     pub(crate) native_mtp_enabled: bool,
+    pub(crate) native_mtp_max_tokens: usize,
 }
 
 impl BinaryStageExecutionOptions {
@@ -3797,7 +3805,13 @@ impl BinaryStageExecutionOptions {
             sample_final_prefill,
             output_capacity,
             native_mtp_enabled,
+            native_mtp_max_tokens: 1,
         }
+    }
+
+    pub(crate) fn with_native_mtp_max_tokens(mut self, value: usize) -> Self {
+        self.native_mtp_max_tokens = value.max(1);
+        self
     }
 }
 
@@ -3859,12 +3873,13 @@ pub(crate) fn run_binary_stage_message(
                 )?;
                 return Ok((predicted, vec![predicted], output));
             }
-            let (predicted, native_mtp, output) = runtime.decode_frame_sampled_mtp_n1(
+            let (predicted, native_mtp, output) = runtime.decode_frame_sampled_mtp(
                 session_id,
                 token_id,
                 sampling.as_ref(),
                 input,
                 options.output_capacity,
+                options.native_mtp_max_tokens,
             )?;
             Ok((
                 predicted,
