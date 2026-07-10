@@ -1,0 +1,3029 @@
+From 725f2555cccface8a9add5f3ee2cb1fd8705916d Mon Sep 17 00:00:00 2001
+From: Mesh-LLM CI <ci@mesh-llm.local>
+Date: Sat, 11 Jul 2026 09:24:47 +1000
+Subject: [PATCH 92/93] Lock GLM DSA native runtime policy and validation
+
+Consolidates patches 0204 through 0236: native DSA KV pages, selected-row flash, typed Full/Shared policy, metadata and backend guards, phase-aware decode and prefill choices, and model/backend correctness and performance gates.
+---
+ ggml/include/ggml.h                       |   7 +
+ ggml/src/ggml-cpu/ggml-cpu.c              |   9 +
+ ggml/src/ggml-cpu/ops.cpp                 |  70 ++
+ ggml/src/ggml-cpu/ops.h                   |   1 +
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  41 ++
+ ggml/src/ggml-metal/ggml-metal-device.h   |   2 +
+ ggml/src/ggml-metal/ggml-metal-device.m   |  18 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     |  37 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 473 +++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.h      |   1 +
+ ggml/src/ggml-metal/ggml-metal.metal      | 331 +++++++++
+ ggml/src/ggml.c                           |  36 +-
+ include/skippy.h                          |  17 +
+ include/skippy/common.h                   |   2 +-
+ src/llama-graph.cpp                       | 213 +++++-
+ src/llama-graph.h                         |   6 +
+ src/models/glm-dsa.cpp                    |  47 +-
+ src/skippy.cpp                            |  45 +-
+ tests/test-backend-ops.cpp                | 116 ++++
+ tests/test-llama-archs.cpp                | 789 +++++++++++++++++++++-
+ 20 files changed, 2234 insertions(+), 27 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index a8e086e8e..a62d33a89 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -571,6 +571,7 @@ extern "C" {
+         GGML_OP_LIGHTNING_INDEXER,
+         GGML_OP_DSA_SPARSE_MASK,
+         GGML_OP_DSA_SPARSE_ATTN,
++        GGML_OP_DSA_TOP1_ATTN,
+         GGML_OP_MOE_ROUTE_WEIGHTS,
+         GGML_OP_MOE_WEIGHTED_SUM,
+ 
+@@ -2605,6 +2606,12 @@ extern "C" {
+             struct ggml_tensor  * top_k,
+             float                 scale);
+ 
++    GGML_API struct ggml_tensor * ggml_dsa_top1_attn(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * top_k);
++
+     GGML_API struct ggml_tensor * ggml_moe_weighted_sum(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * experts,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index a45f27a3e..6b21f26d5 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2063,6 +2063,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsa_sparse_attn(params, tensor);
+             } break;
++        case GGML_OP_DSA_TOP1_ATTN:
++            {
++                ggml_compute_forward_dsa_top1_attn(params, tensor);
++            } break;
+         case GGML_OP_MOE_ROUTE_WEIGHTS:
+             {
+                 ggml_compute_forward_moe_route_weights(params, tensor);
+@@ -2394,6 +2398,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_LIGHTNING_INDEXER:
+         case GGML_OP_DSA_SPARSE_MASK:
+         case GGML_OP_DSA_SPARSE_ATTN:
++        case GGML_OP_DSA_TOP1_ATTN:
+         case GGML_OP_MOE_ROUTE_WEIGHTS:
+         case GGML_OP_MOE_WEIGHTED_SUM:
+             {
+@@ -2989,6 +2994,10 @@ struct ggml_cplan ggml_graph_plan(
+                         const int64_t n_top_k = node->src[4]->ne[0];
+                         cur = sizeof(float) * (dk + dv + n_top_k + CACHE_LINE_SIZE_F32) * n_tasks;
+                     } break;
++                case GGML_OP_DSA_TOP1_ATTN:
++                    {
++                        cur = 0;
++                    } break;
+                 case GGML_OP_COUNT:
+                     {
+                         GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 720fdb591..e6a8781e8 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11092,6 +11092,76 @@ void ggml_compute_forward_dsa_sparse_attn(
+     }
+ }
+ 
++// ggml_compute_forward_dsa_top1_attn
++
++void ggml_compute_forward_dsa_top1_attn(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0]; // q: [Dk, n_batch, n_head, n_stream]
++    const ggml_tensor * src1 = dst->src[1]; // v: [Dv, n_kv, n_v_head, n_stream]
++    const ggml_tensor * src2 = dst->src[2]; // top_k: [1, n_batch, n_top_stream, 1]
++
++    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
++    GGML_ASSERT(src2->type == GGML_TYPE_I32);
++
++    GGML_ASSERT(dst->ne[0] == src1->ne[0]);
++    GGML_ASSERT(dst->ne[1] == src0->ne[1]);
++    GGML_ASSERT(dst->ne[2] == src0->ne[2]);
++    GGML_ASSERT(dst->ne[3] == src0->ne[3]);
++
++    const int64_t dv           = src1->ne[0];
++    const int64_t n_batch      = src0->ne[1];
++    const int64_t n_head       = src0->ne[2];
++    const int64_t n_stream     = src0->ne[3];
++    const int64_t n_kv         = src1->ne[1];
++    const int64_t n_v_head     = src1->ne[2];
++    const int64_t n_top_stream = src2->ne[2];
++
++    GGML_ASSERT(src0->ne[3] == src1->ne[3]);
++    GGML_ASSERT(src2->ne[0] == 1);
++    GGML_ASSERT(src2->ne[1] == n_batch);
++    GGML_ASSERT(n_stream % n_top_stream == 0);
++    GGML_ASSERT(src2->ne[3] == 1);
++    GGML_ASSERT(n_head % n_v_head == 0);
++
++    ggml_to_float_t const v_to_float = ggml_get_type_traits(src1->type)->to_float;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t total = n_stream * n_head * n_batch;
++    const int64_t dr    = (total + nth - 1) / nth;
++    const int64_t i0    = dr * ith;
++    const int64_t i1    = MIN(i0 + dr, total);
++
++    for (int64_t i = i0; i < i1; ++i) {
++        const int64_t i_batch      = i % n_batch;
++        const int64_t i_head       = (i / n_batch) % n_head;
++        const int64_t i_stream     = i / (n_batch * n_head);
++        const int64_t i_v_head     = i_head / (n_head / n_v_head);
++        const int64_t i_top_stream = i_stream % n_top_stream;
++
++        const char * top_k_data = (const char *) src2->data +
++                i_batch * src2->nb[1] + i_top_stream * src2->nb[2];
++        const int32_t i_kv = *(const int32_t *) top_k_data;
++        GGML_ASSERT(i_kv >= 0 && i_kv < n_kv);
++
++        const char * v_row = (const char *) src1->data +
++                i_kv * src1->nb[1] + i_v_head * src1->nb[2] + i_stream * src1->nb[3];
++        float * dst_row = (float *) ((char *) dst->data +
++                i_batch * dst->nb[1] + i_head * dst->nb[2] + i_stream * dst->nb[3]);
++
++        if (src1->type == GGML_TYPE_F32) {
++            memcpy(dst_row, v_row, dv * sizeof(float));
++        } else {
++            GGML_ASSERT(v_to_float);
++            v_to_float(v_row, dst_row, dv);
++        }
++    }
++}
++
+ // ggml_compute_forward_moe_route_weights
+ 
+ void ggml_compute_forward_moe_route_weights(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index d93c7ff9a..f08fa78c2 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -108,6 +108,7 @@ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * par
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsa_sparse_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsa_sparse_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsa_top1_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_moe_route_weights(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_moe_weighted_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 4316ddb4d..eba88f678 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -266,6 +266,47 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_attn_
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_selected_row_flash_vec(
++        ggml_metal_library_t lib,
++        int32_t nsg,
++        int32_t nwg) {
++    const char * base = "kernel_selected_row_flash_vec_f16_dk576_dv512";
++
++    char name[256];
++    snprintf(name, sizeof(name), "%s_nsg=%d_nwg=%d", base, nsg, nwg);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int32(cv, nsg, FC_FLASH_ATTN_EXT_VEC + 22);
++        ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT_VEC + 23);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    return res;
++}
++
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_top1_attn(ggml_metal_library_t lib, const ggml_tensor * op) {
++    assert(op->op == GGML_OP_DSA_TOP1_ATTN);
++
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_dsa_top1_attn_%s", ggml_type_name(op->src[1]->type));
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char base[256];
+     char name[256];
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index b09f32d51..a1fff68a4 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -118,6 +118,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_spars
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_attn    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_attn_cached_topk(ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_sparse_attn_decode_grouped(ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsa_top1_attn      (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_selected_row_flash_vec(ggml_metal_library_t lib, int32_t nsg, int32_t nwg);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 3f3ea674c..7b075f357 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1318,6 +1318,24 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                    op->ne[1] == op->src[0]->ne[1] &&
+                    op->ne[2] == op->src[0]->ne[2] &&
+                    op->ne[3] == op->src[0]->ne[3];
++        case GGML_OP_DSA_TOP1_ATTN:
++            return op->type == GGML_TYPE_F32 &&
++                   op->src[0]->type == GGML_TYPE_F32 &&
++                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
++                   op->src[2]->type == GGML_TYPE_I32 &&
++                   op->nb[0] == sizeof(float) &&
++                   op->src[0]->nb[0] == sizeof(float) &&
++                   op->src[1]->nb[0] == ggml_type_size(op->src[1]->type) &&
++                   op->src[2]->ne[0] == 1 &&
++                   op->src[2]->ne[1] == op->src[0]->ne[1] &&
++                   op->src[0]->ne[3] == op->src[1]->ne[3] &&
++                   op->src[0]->ne[3] % op->src[2]->ne[2] == 0 &&
++                   op->src[2]->ne[3] == 1 &&
++                   op->src[0]->ne[2] % op->src[1]->ne[2] == 0 &&
++                   op->ne[0] == op->src[1]->ne[0] &&
++                   op->ne[1] == op->src[0]->ne[1] &&
++                   op->ne[2] == op->src[0]->ne[2] &&
++                   op->ne[3] == op->src[0]->ne[3];
+         case GGML_OP_MOE_WEIGHTED_SUM:
+             return op->type == GGML_TYPE_F32 &&
+                    op->src[0]->type == GGML_TYPE_F32 &&
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index d498dd2c0..e59f50e50 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1057,6 +1057,43 @@ typedef struct {
+     float    scale;
+ } ggml_metal_kargs_dsa_sparse_attn;
+ 
++typedef ggml_metal_kargs_dsa_sparse_attn ggml_metal_kargs_selected_row_flash;
++
++typedef struct {
++    int32_t  ne00;
++    int32_t  ne01;
++    int32_t  ne02;
++    int32_t  ne03;
++    uint64_t nb00;
++    uint64_t nb01;
++    uint64_t nb02;
++    uint64_t nb03;
++    int32_t  ne10;
++    int32_t  ne11;
++    int32_t  ne12;
++    int32_t  ne13;
++    uint64_t nb10;
++    uint64_t nb11;
++    uint64_t nb12;
++    uint64_t nb13;
++    int32_t  ne20;
++    int32_t  ne21;
++    int32_t  ne22;
++    int32_t  ne23;
++    uint64_t nb20;
++    uint64_t nb21;
++    uint64_t nb22;
++    uint64_t nb23;
++    int32_t  ne0;
++    int32_t  ne1;
++    int32_t  ne2;
++    int32_t  ne3;
++    uint64_t nb0;
++    uint64_t nb1;
++    uint64_t nb2;
++    uint64_t nb3;
++} ggml_metal_kargs_dsa_top1_attn;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index c54d4267b..208a1bf43 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -62,6 +62,11 @@ static bool ggml_metal_glm_dsa_topk_moe_fusion_enabled() {
+     return value && atoi(value) != 0;
+ }
+ 
++static bool ggml_metal_glm_dsa_selected_row_flash_enabled() {
++    const char * value = getenv("SKIPPY_GLM_DSA_EXPERIMENTAL_SELECTED_ROW_FLASH");
++    return value && atoi(value) != 0;
++}
++
+ static int ggml_metal_glm_dsa_sparse_attn_threads_requested() {
+     const char * value = getenv("SKIPPY_GLM_DSA_SPARSE_ATTN_THREADS");
+     if (value == nullptr || value[0] == '\0') {
+@@ -219,6 +224,11 @@ struct ggml_metal_op {
+         return ggml_graph_node(gf, i);
+     }
+ 
++    int32_t graph_node_use_count(int i) const {
++        assert(i >= 0 && i < gf->n_nodes);
++        return ggml_node_get_use_count(gf, i);
++    }
++
+     int filtered_count_for_graph_span(int i0, int graph_count) const {
+         const int graph_start = graph_index(i0);
+         const int graph_end = graph_start + graph_count;
+@@ -284,6 +294,197 @@ private:
+     std::vector<int> idxs;
+ };
+ 
++static void ggml_metal_log_selected_row_flash_candidate(ggml_metal_op_t ctx, int idx) {
++    if (!ggml_metal_glm_dsa_dispatch_log_enabled() || !ggml_metal_glm_dsa_selected_row_flash_enabled()) {
++        return;
++    }
++
++    const ggml_tensor * get_rows = ctx->node(idx);
++    if (get_rows == nullptr || get_rows->op != GGML_OP_GET_ROWS ||
++            get_rows->name[0] == '\0' || std::strstr(get_rows->name, "dsa_compact_") == nullptr) {
++        return;
++    }
++
++    const int graph_idx = ctx->graph_index(idx);
++    const int use_count = ctx->graph_node_use_count(graph_idx);
++    const int graph_end = std::min(ctx->split_end(), ctx->graph_node_count());
++
++    const ggml_tensor * consumer = nullptr;
++    int consumer_graph_idx = -1;
++    int consumer_src_slot = -1;
++    int consumer_count = 0;
++    const ggml_tensor * view = nullptr;
++    const ggml_tensor * flash = nullptr;
++    int flash_graph_idx = -1;
++    for (int graph_i = graph_idx + 1; graph_i < graph_end; ++graph_i) {
++        const ggml_tensor * candidate = ctx->graph_node(graph_i);
++        if (candidate->op == GGML_OP_VIEW && candidate->src[0] == get_rows && view == nullptr) {
++            view = candidate;
++        }
++        if (candidate->op == GGML_OP_FLASH_ATTN_EXT &&
++                candidate->src[1] == get_rows &&
++                candidate->src[2] != nullptr &&
++                (candidate->src[2] == get_rows ||
++                 (candidate->src[2]->op == GGML_OP_VIEW && candidate->src[2]->src[0] == get_rows))) {
++            flash = candidate;
++            flash_graph_idx = graph_i;
++        }
++        for (int src_i = 0; src_i < GGML_MAX_SRC; ++src_i) {
++            if (candidate->src[src_i] == get_rows) {
++                ++consumer_count;
++                if (consumer == nullptr) {
++                    consumer = candidate;
++                    consumer_graph_idx = graph_i;
++                    consumer_src_slot = src_i;
++                }
++            }
++        }
++    }
++
++    const bool is_flash = consumer != nullptr && consumer->op == GGML_OP_FLASH_ATTN_EXT;
++    const bool is_k_or_v = is_flash && (consumer_src_slot == 1 || consumer_src_slot == 2);
++    const bool packed_kv_view = flash != nullptr && flash->src[1] == get_rows &&
++            flash->src[2] != nullptr && flash->src[2]->op == GGML_OP_VIEW && flash->src[2]->src[0] == get_rows;
++    const char * reason = packed_kv_view ? "accepted_packed_kv_view" :
++            consumer == nullptr ? "consumer_not_found" :
++            !is_flash ? "consumer_not_flash_attn_ext" :
++            !is_k_or_v ? "consumer_not_kv" :
++            consumer_count != use_count ? "consumer_count_mismatch" :
++            "accepted_graph_pattern";
++
++    GGML_LOG_INFO(
++            "skippy: glm_dsa_metal_dispatch op=selected_row_flash_candidate tensor=%s reason=%s graph_uid=%llu split_start=%d split_end=%d filtered_idx=%d filtered_nodes=%d graph_idx=%d use_count=%d get_rows_uses=%d consumer_count=%d consumer_graph_idx=%d consumer_op=%s consumer_tensor=%s consumer_src_slot=%d next_tensor=%s flash_graph_idx=%d generic=0 view=%d src_type=%s rows_type=%s dst_type=%s rows=%lld width=%lld consumer_kv=%lld consumer_heads=%lld consumer_stream=%lld kv=%lld heads=%lld stream=%lld grid_x=1 grid_y=1 grid_z=1 threads_x=1\n",
++            ggml_metal_tensor_name(get_rows),
++            reason,
++            (unsigned long long) ctx->graph_uid(),
++            ctx->split_start(),
++            ctx->split_end(),
++            idx,
++            ctx->n_nodes(),
++            graph_idx,
++            use_count,
++            use_count,
++            consumer_count,
++            consumer_graph_idx,
++            consumer ? ggml_op_name(consumer->op) : "none",
++            ggml_metal_tensor_name(consumer),
++            consumer_src_slot,
++            ggml_metal_tensor_name(flash),
++            flash_graph_idx,
++            view != nullptr,
++            get_rows->src[0] ? ggml_type_name(get_rows->src[0]->type) : "none",
++            get_rows->src[1] ? ggml_type_name(get_rows->src[1]->type) : "none",
++            ggml_type_name(get_rows->type),
++            (long long) get_rows->ne[1],
++            (long long) get_rows->ne[0],
++            consumer ? (long long) consumer->ne[1] : -1LL,
++            consumer ? (long long) consumer->ne[2] : -1LL,
++            consumer ? (long long) consumer->ne[3] : -1LL,
++            flash && flash->src[1] ? (long long) flash->src[1]->ne[1] : 0LL,
++            flash && flash->src[0] ? (long long) flash->src[0]->ne[2] : 0LL,
++            flash && flash->src[0] ? (long long) flash->src[0]->ne[3] : 0LL);
++}
++
++static bool ggml_metal_selected_row_flash_shape_ok(const ggml_tensor * flash) {
++    if (flash == nullptr || flash->op != GGML_OP_FLASH_ATTN_EXT ||
++            !ggml_metal_glm_dsa_selected_row_flash_enabled()) {
++        return false;
++    }
++
++    ggml_tensor * rows = flash->src[1];
++    ggml_tensor * view = flash->src[2];
++    if (flash->src[0] == nullptr || rows == nullptr || view == nullptr ||
++            rows->op != GGML_OP_GET_ROWS || view->op != GGML_OP_VIEW || view->src[0] != rows ||
++            rows->src[0] == nullptr || rows->src[1] == nullptr) {
++        return false;
++    }
++
++    const float max_bias = ggml_get_op_params_f32(flash, 1);
++    const float logit_softcap = ggml_get_op_params_f32(flash, 2);
++    if (flash->src[3] != nullptr || flash->src[4] != nullptr || max_bias != 0.0f || logit_softcap != 0.0f) {
++        return false;
++    }
++
++    return flash->src[0]->type == GGML_TYPE_F32 &&
++        rows->src[0]->type == GGML_TYPE_F16 &&
++        rows->src[1]->type == GGML_TYPE_I32 &&
++        rows->type == GGML_TYPE_F16 &&
++        view->type == GGML_TYPE_F16 &&
++        flash->type == GGML_TYPE_F32 &&
++        rows->ne[0] == rows->src[0]->ne[0] &&
++        view->ne[0] > 0 &&
++        view->ne[0] <= rows->src[0]->ne[0] &&
++        rows->ne[1] == rows->src[1]->ne[0] &&
++        rows->src[1]->ne[0] <= 4096 &&
++        flash->src[0]->ne[0] == rows->src[0]->ne[0] &&
++        flash->ne[0] == view->ne[0];
++}
++
++static ggml_tensor * ggml_metal_find_selected_row_flash_consumer(ggml_metal_op_t ctx, int idx, ggml_tensor * rows) {
++    if (!ctx->use_fusion || rows == nullptr || !ggml_metal_glm_dsa_selected_row_flash_enabled()) {
++        return nullptr;
++    }
++
++    const int graph_idx = ctx->graph_index(idx);
++    const int graph_end = std::min(ctx->split_end(), ctx->graph_node_count());
++    for (int graph_i = graph_idx + 1; graph_i < graph_end; ++graph_i) {
++        ggml_tensor * candidate = ctx->graph_node(graph_i);
++        if (candidate->op == GGML_OP_FLASH_ATTN_EXT &&
++                candidate->src[1] == rows &&
++                candidate->src[2] != nullptr &&
++                candidate->src[2]->op == GGML_OP_VIEW &&
++                candidate->src[2]->src[0] == rows &&
++                ggml_metal_selected_row_flash_shape_ok(candidate)) {
++            return candidate;
++        }
++    }
++
++    return nullptr;
++}
++
++static bool ggml_metal_selected_row_flash_can_defer_compact_k_rows(ggml_metal_op_t ctx, int idx, const ggml_tensor * rows) {
++    if (rows == nullptr || rows->op != GGML_OP_GET_ROWS || !ggml_metal_glm_dsa_selected_row_flash_enabled()) {
++        return false;
++    }
++
++    if (rows->name[0] == '\0' || std::strstr(rows->name, "dsa_compact_k_topk_rows") == nullptr) {
++        return false;
++    }
++
++    if (rows->src[0] == nullptr || rows->src[1] == nullptr) {
++        return false;
++    }
++
++    const int graph_idx = ctx->graph_index(idx);
++    const int32_t use_count = ctx->graph_node_use_count(graph_idx);
++
++    return use_count == 2 &&
++        rows->src[0]->type == GGML_TYPE_F16 &&
++        rows->src[1]->type == GGML_TYPE_I32 &&
++        rows->type == GGML_TYPE_F16 &&
++        rows->ne[0] == rows->src[0]->ne[0] &&
++        rows->ne[1] == rows->src[1]->ne[0] &&
++        rows->src[1]->ne[0] <= 4096;
++}
++
++static bool ggml_metal_selected_row_flash_vec_shape_ok(const ggml_tensor * op) {
++    if (!ggml_metal_selected_row_flash_shape_ok(op)) {
++        return false;
++    }
++
++    const ggml_tensor * q = op->src[0];
++    const ggml_tensor * rows = op->src[1];
++    const ggml_tensor * view = op->src[2];
++
++    return q->ne[0] == 576 &&
++        view->ne[0] == 512 &&
++        q->ne[1] == 1 &&
++        rows->src[0]->ne[2] == 1 &&
++        view->ne[2] == 1 &&
++        rows->src[0]->ne[3] == 1 &&
++        view->ne[3] == 1;
++}
++
+ ggml_metal_op_t ggml_metal_op_init(
+         ggml_metal_device_t dev,
+         ggml_metal_cmd_buf_t cmd_buf,
+@@ -761,6 +962,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_dsa_sparse_attn(ctx, idx);
+             } break;
++        case GGML_OP_DSA_TOP1_ATTN:
++            {
++                n_fuse = ggml_metal_op_dsa_top1_attn(ctx, idx);
++            } break;
+         case GGML_OP_MOE_ROUTE_WEIGHTS:
+             {
+                 n_fuse = ggml_metal_op_moe_route_weights(ctx, idx);
+@@ -1575,6 +1780,24 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
+ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
++    ggml_metal_log_selected_row_flash_candidate(ctx, idx);
++    if (ggml_metal_find_selected_row_flash_consumer(ctx, idx, op) != nullptr) {
++        if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++            GGML_LOG_INFO(
++                "skippy: glm_dsa_metal_dispatch op=selected_row_flash_skip tensor=%s reason=deferred_to_flash grid_x=1 grid_y=1 grid_z=1 threads_x=1\n",
++                ggml_metal_tensor_name(op));
++        }
++        return 1;
++    }
++    if (ggml_metal_selected_row_flash_can_defer_compact_k_rows(ctx, idx, op)) {
++        if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++            GGML_LOG_INFO(
++                "skippy: glm_dsa_metal_dispatch op=selected_row_flash_skip tensor=%s reason=deferred_compact_k_contract grid_x=1 grid_y=1 grid_z=1 threads_x=1\n",
++                ggml_metal_tensor_name(op));
++        }
++        return 1;
++    }
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+@@ -3086,6 +3309,26 @@ static int32_t ggml_metal_glm_dsa_compact_flash_nwg_requested() {
+     }
+ }
+ 
++static int32_t ggml_metal_glm_dsa_selected_row_flash_nwg_requested() {
++    const char * value = getenv("LLAMA_GLM_DSA_SELECTED_ROW_FLASH_NWG");
++    if (value == nullptr || value[0] == '\0') {
++        return 32;
++    }
++
++    const int requested = atoi(value);
++    switch (requested) {
++        case 1:
++        case 2:
++        case 4:
++        case 8:
++        case 16:
++        case 32:
++            return requested;
++        default:
++            return 32;
++    }
++}
++
+ static bool ggml_metal_glm_dsa_compact_flash_shape(
+         const ggml_tensor * op,
+         bool                has_mask,
+@@ -3250,9 +3493,173 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
+     return res;
+ }
+ 
++static int ggml_metal_op_selected_row_flash_vec(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++    if (!ggml_metal_selected_row_flash_vec_shape_ok(op)) {
++        return 0;
++    }
++
++    ggml_tensor * q = op->src[0];
++    ggml_tensor * rows = op->src[1];
++    ggml_tensor * view = op->src[2];
++    ggml_tensor * packed_kv = rows->src[0];
++    ggml_tensor * top_k = rows->src[1];
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    ggml_metal_kargs_selected_row_flash args = {
++        /*.ne00 =*/ (int32_t) q->ne[0],
++        /*.ne01 =*/ (int32_t) q->ne[1],
++        /*.ne02 =*/ (int32_t) q->ne[2],
++        /*.ne03 =*/ (int32_t) q->ne[3],
++        /*.nb00 =*/ q->nb[0],
++        /*.nb01 =*/ q->nb[1],
++        /*.nb02 =*/ q->nb[2],
++        /*.nb03 =*/ q->nb[3],
++        /*.ne10 =*/ (int32_t) packed_kv->ne[0],
++        /*.ne11 =*/ (int32_t) packed_kv->ne[1],
++        /*.ne12 =*/ (int32_t) packed_kv->ne[2],
++        /*.ne13 =*/ (int32_t) packed_kv->ne[3],
++        /*.nb10 =*/ packed_kv->nb[0],
++        /*.nb11 =*/ packed_kv->nb[1],
++        /*.nb12 =*/ packed_kv->nb[2],
++        /*.nb13 =*/ packed_kv->nb[3],
++        /*.ne20 =*/ (int32_t) view->ne[0],
++        /*.ne21 =*/ (int32_t) view->ne[1],
++        /*.ne22 =*/ (int32_t) view->ne[2],
++        /*.ne23 =*/ (int32_t) view->ne[3],
++        /*.nb20 =*/ view->nb[0],
++        /*.nb21 =*/ view->nb[1],
++        /*.nb22 =*/ view->nb[2],
++        /*.nb23 =*/ view->nb[3],
++        /*.ne30 =*/ 0,
++        /*.ne31 =*/ 0,
++        /*.ne32 =*/ 0,
++        /*.ne33 =*/ 0,
++        /*.nb30 =*/ 0,
++        /*.nb31 =*/ 0,
++        /*.nb32 =*/ 0,
++        /*.nb33 =*/ 0,
++        /*.ne40 =*/ (int32_t) top_k->ne[0],
++        /*.ne41 =*/ (int32_t) top_k->ne[1],
++        /*.ne42 =*/ (int32_t) top_k->ne[2],
++        /*.ne43 =*/ (int32_t) top_k->ne[3],
++        /*.nb40 =*/ top_k->nb[0],
++        /*.nb41 =*/ top_k->nb[1],
++        /*.nb42 =*/ top_k->nb[2],
++        /*.nb43 =*/ top_k->nb[3],
++        /*.ne0  =*/ (int32_t) op->ne[0],
++        /*.ne1  =*/ (int32_t) op->ne[1],
++        /*.ne2  =*/ (int32_t) op->ne[2],
++        /*.ne3  =*/ (int32_t) op->ne[3],
++        /*.nb0  =*/ op->nb[0],
++        /*.nb1  =*/ op->nb[1],
++        /*.nb2  =*/ op->nb[2],
++        /*.nb3  =*/ op->nb[3],
++        /*.scale =*/ ggml_get_op_params_f32(op, 0),
++    };
++
++    const int32_t nsg = 1;
++    // Selected-row flash fuses the compact gather into attention. On the
++    // GLM-5.2 top_k=768 shape it wants the generic flash width, not the
++    // lower all-KV compact-flash default.
++    const int32_t nwg = ggml_metal_glm_dsa_selected_row_flash_nwg_requested();
++
++    auto pipeline = ggml_metal_library_get_pipeline_selected_row_flash_vec(lib, nsg, nwg);
++    GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++
++    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
++    ggml_metal_buffer_id bid_pad = bid_dst;
++    bid_pad.offs += ggml_nbytes(op);
++
++    ggml_metal_buffer_id bid_blk = bid_pad;
++    bid_blk.offs += ggml_metal_op_flash_attn_ext_extra_pad(op);
++
++    ggml_metal_buffer_id bid_tmp = bid_blk;
++    bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
++
++    ggml_metal_buffer_id bid_v = ggml_metal_get_buffer_id(packed_kv);
++    bid_v.offs += view->view_offs;
++
++#define SELECTED_ROW_FLASH_VEC_SMEM(nsg_) (GGML_PAD(((GGML_PAD(args.ne00, 128) + 4*OP_FLASH_ATTN_EXT_VEC_NCPSG + 2*GGML_PAD(args.ne20, 128))*(nsg_))*(sizeof(float)/2), 16))
++    const size_t smem = SELECTED_ROW_FLASH_VEC_SMEM(nsg);
++#undef SELECTED_ROW_FLASH_VEC_SMEM
++
++    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
++    GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
++
++    ggml_metal_op_concurrency_reset(ctx);
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                    0);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),            1);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(packed_kv),    2);
++    ggml_metal_encoder_set_buffer  (enc, bid_v,                                  3);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(top_k),        4);
++
++    const int grid_x = (args.ne01 + OP_FLASH_ATTN_EXT_VEC_NQPSG - 1)/OP_FLASH_ATTN_EXT_VEC_NQPSG;
++    const int grid_y = args.ne02;
++    const int grid_z = args.ne03*nwg;
++
++    if (nwg == 1) {
++        GGML_ASSERT(ggml_metal_op_flash_attn_ext_extra_tmp(op) == 0);
++        ggml_metal_encoder_set_buffer(enc, bid_dst, 5);
++        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++        ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, 32, nsg, 1);
++    } else {
++        GGML_ASSERT(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
++        ggml_metal_encoder_set_buffer(enc, bid_tmp, 5);
++        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
++        ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, 32, nsg, 1);
++
++        ggml_metal_op_concurrency_reset(ctx);
++
++        ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
++            (int32_t) (args.ne1*args.ne2*args.ne3),
++        };
++
++        auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, args.ne20, nwg);
++        ggml_metal_encoder_set_pipeline(enc, pipeline0);
++        ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
++        ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
++        ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, args0.nrows, 1, 1, 32*nwg, 1, 1);
++    }
++
++    if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++        GGML_LOG_INFO(
++            "skippy: glm_dsa_metal_dispatch op=selected_row_flash kernel=gather_vec tensor=%s q_type=%s k_type=%s top_k_type=%s dst_type=%s q_width=%lld v_width=%lld batch=%lld heads=%lld stream=%lld kv=%lld top_k=%lld nwg=%d smem=%zu grid_x=%d grid_y=%d grid_z=%d threads_x=32 threads_y=%d\n",
++            ggml_metal_tensor_name(op),
++            ggml_type_name(q->type),
++            ggml_type_name(packed_kv->type),
++            ggml_type_name(top_k->type),
++            ggml_type_name(op->type),
++            (long long) args.ne00,
++            (long long) args.ne20,
++            (long long) args.ne01,
++            (long long) args.ne02,
++            (long long) args.ne03,
++            (long long) args.ne11,
++            (long long) args.ne40,
++            nwg,
++            smem,
++            grid_x,
++            grid_y,
++            grid_z,
++            nsg);
++    }
++
++    return 1;
++}
++
+ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
++    if (int selected_row_flash = ggml_metal_op_selected_row_flash_vec(ctx, idx)) {
++        return selected_row_flash;
++    }
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+@@ -5358,6 +5765,72 @@ int ggml_metal_op_dsa_sparse_attn(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_dsa_top1_attn(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_library_t lib = ctx->lib;
++    ggml_metal_encoder_t enc = ctx->enc;
++
++    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
++    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
++    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
++
++    ggml_metal_kargs_dsa_top1_attn args = {
++        /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02, /*.ne03 =*/ ne03,
++        /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
++        /*.ne10 =*/ ne10, /*.ne11 =*/ ne11, /*.ne12 =*/ ne12, /*.ne13 =*/ ne13,
++        /*.nb10 =*/ nb10, /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
++        /*.ne20 =*/ ne20, /*.ne21 =*/ ne21, /*.ne22 =*/ ne22, /*.ne23 =*/ ne23,
++        /*.nb20 =*/ nb20, /*.nb21 =*/ nb21, /*.nb22 =*/ nb22, /*.nb23 =*/ nb23,
++        /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1,  /*.ne2  =*/ ne2,  /*.ne3  =*/ ne3,
++        /*.nb0  =*/ nb0,  /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
++    };
++
++    auto pipeline = ggml_metal_library_get_pipeline_dsa_top1_attn(lib, op);
++
++    int ida = 0;
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  ida++);
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++); // q
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), ida++); // v
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // top_k
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
++
++    const int nth = std::min(64, std::max(1, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)));
++    const int grid_x = (ne0 + nth - 1)/nth;
++    const int grid_y = ne1*ne2;
++    const int grid_z = ne3;
++    if (ggml_metal_glm_dsa_dispatch_log_enabled()) {
++        GGML_LOG_INFO(
++            "skippy: glm_dsa_metal_dispatch op=dsa_top1_attn tensor=%s q_type=%s v_type=%s top_k_type=%s dst_type=%s v_width=%lld batch=%lld heads=%lld stream=%lld kv=%lld value_heads=%lld top_stream=%lld grid_x=%d grid_y=%d grid_z=%d threads_x=%d\n",
++            ggml_metal_tensor_name(op),
++            ggml_type_name(op->src[0]->type),
++            ggml_type_name(op->src[1]->type),
++            ggml_type_name(op->src[2]->type),
++            ggml_type_name(op->type),
++            (long long) ne10,
++            (long long) ne1,
++            (long long) ne2,
++            (long long) ne3,
++            (long long) ne11,
++            (long long) ne12,
++            (long long) ne22,
++            grid_x,
++            grid_y,
++            grid_z,
++            nth);
++    }
++    ggml_metal_encoder_dispatch_threadgroups(enc, grid_x, grid_y, grid_z, nth, 1, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_moe_route_weights(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index b9cab7c24..b9bcc44c3 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -62,6 +62,7 @@ int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsa_sparse_mask   (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsa_sparse_attn   (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_dsa_top1_attn     (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_moe_route_weights (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_moe_weighted_sum  (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 3f13775be..021b0e2fb 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9906,6 +9906,292 @@ kernel void kernel_dsa_sparse_mask_set(
+     }
+ }
+ 
++kernel void kernel_selected_row_flash_vec_f16_dk576_dv512(
++        constant ggml_metal_kargs_selected_row_flash & args,
++        device const char    * q,
++        device const char    * k,
++        device const char    * v,
++        device const int32_t * top_k,
++        device       char    * dst,
++        threadgroup  half    * shmem_f16 [[threadgroup(0)]],
++        uint3                 tgpig [[threadgroup_position_in_grid]],
++        ushort                tiisg [[thread_index_in_simdgroup]],
++        ushort                sgitg [[simdgroup_index_in_threadgroup]]) {
++#define NWG (FC_flash_attn_ext_vec_nwg)
++#define NSG (FC_flash_attn_ext_vec_nsg)
++
++    constexpr short DK = 576;
++    constexpr short DV = 512;
++    constexpr short C  = OP_FLASH_ATTN_EXT_VEC_NCPSG;
++    constexpr short NE = 2;
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NL = NW/NE;
++
++    constexpr short DK4 = DK/4;
++    constexpr short DV4 = DV/4;
++    constexpr short PK  = PAD2(DK, 128);
++    constexpr short PK4 = PK/4;
++    constexpr short PV  = PAD2(DV, 128);
++    constexpr short PV4 = PV/4;
++    constexpr short SH  = 4*C;
++
++    const short iwg = tgpig.z%NWG;
++
++    const ushort iq3 = tgpig.z/NWG;
++    const ushort iq2 = tgpig.y;
++    const ushort iq1 = tgpig.x;
++
++    if (iq1 >= args.ne01 || iq2 >= args.ne02 || iq3 >= args.ne03) {
++        return;
++    }
++
++    threadgroup half4  * sq4 = (threadgroup half4  *) (shmem_f16 +                      0*PK);
++    threadgroup float  * ss  = (threadgroup float  *) (shmem_f16 +   sgitg*SH       + NSG*PK);
++    threadgroup float4 * ss4 = (threadgroup float4 *) (shmem_f16 +   sgitg*SH       + NSG*PK);
++    threadgroup float4 * so4 = (threadgroup float4 *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH);
++
++    so4 += tiisg;
++
++    {
++        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
++
++        const short i_k_head = iq2/(args.ne02/args.ne12);
++        const short i_v_head = iq2/(args.ne02/args.ne22);
++        const short i_k_stream = iq3%args.ne13;
++        const short i_v_stream = iq3%args.ne23;
++
++        k += i_k_head*args.nb12 + i_k_stream*args.nb13;
++        v += i_v_head*args.nb22 + i_v_stream*args.nb23;
++    }
++
++    device const float4 * q4 = (device const float4 *) ((device const char *) q);
++    for (short i = tiisg; i < PK4; i += NW) {
++        if (i < DK4) {
++            sq4[i] = half4(q4[i]);
++        } else {
++            sq4[i] = half4(0.0h);
++        }
++    }
++
++    for (short i = 0; i < DV4/NL; ++i) {
++        so4[i*NL] = float4(0.0f);
++    }
++
++    for (short i = tiisg; i < SH/4; i += NW) {
++        ss4[i] = float4(0.0f);
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    float S = 0.0f;
++    float M = -FLT_MAX/2;
++
++    const short tx = tiisg%NL;
++    const short ty = tiisg/NL;
++    const short top_stream = iq3%args.ne42;
++
++    for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
++        const int ic = ic0*C;
++        if (ic >= args.ne40) {
++            break;
++        }
++
++        float mqk[C/NE] = { [0 ... C/NE - 1] = 0.0f };
++
++        for (short cc = 0; cc < C/NE; ++cc) {
++            const int row_slot = ic + NE*cc + ty;
++            int32_t i_kv = -1;
++            if (row_slot < args.ne40) {
++                i_kv = ((device const int32_t *) ((device const char *) top_k +
++                        row_slot*args.nb40 + iq1*args.nb41 + top_stream*args.nb42))[0];
++            }
++
++            if (i_kv >= 0 && i_kv < args.ne11) {
++                device const half4 * pk4 = (device const half4 *) (k + i_kv*args.nb11);
++                for (short ii = 0; ii < DK4/NL; ++ii) {
++                    const short i = ii*NL + tx;
++                    mqk[cc] += dot(float4(pk4[i]), float4(sq4[i]));
++                }
++            }
++
++            if (NE <= 1) {
++                mqk[cc] += simd_shuffle_down(mqk[cc], 16);
++            }
++            if (NE <= 2) {
++                mqk[cc] += simd_shuffle_down(mqk[cc],  8);
++            }
++            if (NE <= 4) {
++                mqk[cc] += simd_shuffle_down(mqk[cc],  4);
++            }
++            if (NE <= 8) {
++                mqk[cc] += simd_shuffle_down(mqk[cc],  2);
++            }
++            if (NE <= 16) {
++                mqk[cc] += simd_shuffle_down(mqk[cc],  1);
++            }
++
++            mqk[cc] = simd_shuffle(mqk[cc], NL*ty);
++        }
++
++        {
++            const int row_slot = ic + NE*tx + ty;
++            int32_t i_kv = -1;
++            if (row_slot < args.ne40) {
++                i_kv = ((device const int32_t *) ((device const char *) top_k +
++                        row_slot*args.nb40 + iq1*args.nb41 + top_stream*args.nb42))[0];
++            }
++
++            ss[NE*tx + ty] = (i_kv >= 0 && i_kv < args.ne11) ? mqk[tx]*args.scale : -MAXHALF;
++        }
++
++        simdgroup_barrier(mem_flags::mem_threadgroup);
++
++        {
++            const float m = M;
++            const float s = ss[tiisg];
++
++            M = simd_max(max(M, s));
++
++            const float ms = exp(m - M);
++            const float vs = exp(s - M);
++
++            S = S*ms + simd_sum(vs);
++            ss[tiisg] = vs;
++
++            if ((DV4/NL % NW == 0) || ty == 0) {
++                for (short ii = 0; ii < DV4/NL; ++ii) {
++                    so4[ii*NL] *= ms;
++                }
++            }
++        }
++
++        simdgroup_barrier(mem_flags::mem_threadgroup);
++
++        {
++            float4 lo[DV4/NL];
++            for (short ii = 0; ii < DV4/NL; ++ii) {
++                lo[ii] = float4(0.0f);
++            }
++
++            for (short cc = 0; cc < C/NE; ++cc) {
++                const int row_slot = ic + NE*cc + ty;
++                int32_t i_kv = -1;
++                if (row_slot < args.ne40) {
++                    i_kv = ((device const int32_t *) ((device const char *) top_k +
++                            row_slot*args.nb40 + iq1*args.nb41 + top_stream*args.nb42))[0];
++                }
++
++                if (i_kv >= 0 && i_kv < args.ne11) {
++                    device const half4 * pv4 = (device const half4 *) (v + i_kv*args.nb21);
++                    const float p = ss[NE*cc + ty];
++                    for (short ii = 0; ii < DV4/NL; ++ii) {
++                        const short i = ii*NL + tx;
++                        lo[ii] += float4(pv4[i])*float4(p);
++                    }
++                }
++            }
++
++            for (short ii = 0; ii < DV4/NL; ++ii) {
++                if (NE > 1) {
++                    lo[ii][0] += simd_shuffle_down(lo[ii][0], 16);
++                    lo[ii][1] += simd_shuffle_down(lo[ii][1], 16);
++                    lo[ii][2] += simd_shuffle_down(lo[ii][2], 16);
++                    lo[ii][3] += simd_shuffle_down(lo[ii][3], 16);
++                }
++                if (NE > 2) {
++                    lo[ii][0] += simd_shuffle_down(lo[ii][0],  8);
++                    lo[ii][1] += simd_shuffle_down(lo[ii][1],  8);
++                    lo[ii][2] += simd_shuffle_down(lo[ii][2],  8);
++                    lo[ii][3] += simd_shuffle_down(lo[ii][3],  8);
++                }
++                if (NE > 4) {
++                    lo[ii][0] += simd_shuffle_down(lo[ii][0],  4);
++                    lo[ii][1] += simd_shuffle_down(lo[ii][1],  4);
++                    lo[ii][2] += simd_shuffle_down(lo[ii][2],  4);
++                    lo[ii][3] += simd_shuffle_down(lo[ii][3],  4);
++                }
++                if (NE > 8) {
++                    lo[ii][0] += simd_shuffle_down(lo[ii][0],  2);
++                    lo[ii][1] += simd_shuffle_down(lo[ii][1],  2);
++                    lo[ii][2] += simd_shuffle_down(lo[ii][2],  2);
++                    lo[ii][3] += simd_shuffle_down(lo[ii][3],  2);
++                }
++                if (NE > 16) {
++                    lo[ii][0] += simd_shuffle_down(lo[ii][0],  1);
++                    lo[ii][1] += simd_shuffle_down(lo[ii][1],  1);
++                    lo[ii][2] += simd_shuffle_down(lo[ii][2],  1);
++                    lo[ii][3] += simd_shuffle_down(lo[ii][3],  1);
++                }
++            }
++
++            if ((DV4/NL % NW == 0) || ty == 0) {
++                for (short ii = 0; ii < DV4/NL; ++ii) {
++                    so4[ii*NL] += lo[ii];
++                }
++            }
++        }
++    }
++
++    if (tiisg == 0) {
++        ss[0] = S;
++        ss[1] = M;
++    }
++
++    so4 -= tiisg;
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (short r = NSG/2; r > 0; r >>= 1) {
++        if (sgitg < r) {
++            const float S0 = ss[           0];
++            const float S1 = ss[r*(SH/2) + 0];
++
++            const float M0 = ss[           1];
++            const float M1 = ss[r*(SH/2) + 1];
++
++            const float m = max(M0, M1);
++
++            const float ms0 = exp(M0 - m);
++            const float ms1 = exp(M1 - m);
++
++            const float sum = S0*ms0 + S1*ms1;
++
++            if (tiisg == 0) {
++                ss[0] = sum;
++                ss[1] = m;
++            }
++
++            for (short i = tiisg; i < DV4; i += NW) {
++                so4[i] = so4[i]*ms0 + so4[i + r*PV4]*ms1;
++            }
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    if (sgitg == 0) {
++        const int64_t nrows = args.ne3*args.ne2*args.ne1;
++        const int64_t rid = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
++
++        device float4 * dst4 = (device float4 *) dst;
++        device float  * dst1 = (device float  *) dst + nrows*DV*NWG;
++
++        const float inv_s = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
++
++        for (short i = tiisg; i < DV4; i += NW) {
++            dst4[rid*DV4*NWG + NWG*i + iwg] = so4[i]*inv_s;
++        }
++
++        if (NWG > 1 && tiisg == 0) {
++            dst1[rid*(2*NWG) + 2*iwg + 0] = ss[0];
++            dst1[rid*(2*NWG) + 2*iwg + 1] = ss[1];
++        }
++    }
++
++#undef NWG
++#undef NSG
++}
++
+ template<typename K, typename V, typename M>
+ kernel void kernel_dsa_sparse_attn_impl(
+         constant ggml_metal_kargs_dsa_sparse_attn & args,
+@@ -10481,6 +10767,51 @@ template [[host_name("kernel_dsa_sparse_attn_decode_grouped_f16_f32_f16")]] kern
+ template [[host_name("kernel_dsa_sparse_attn_decode_grouped_f16_f16_f32")]] kernel kernel_dsa_sparse_attn_decode_grouped_t kernel_dsa_sparse_attn_decode_grouped_impl<half,  half,  float>;
+ template [[host_name("kernel_dsa_sparse_attn_decode_grouped_f16_f16_f16")]] kernel kernel_dsa_sparse_attn_decode_grouped_t kernel_dsa_sparse_attn_decode_grouped_impl<half,  half,  half>;
+ 
++template<typename T>
++kernel void kernel_dsa_top1_attn_impl(
++        constant ggml_metal_kargs_dsa_top1_attn & args,
++        device   const char * q [[buffer(1)]],
++        device   const char * v [[buffer(2)]],
++        device   const char * top_k [[buffer(3)]],
++        device         char * dst [[buffer(4)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]],
++        ushort3 ntg[[threads_per_threadgroup]]) {
++    (void) q;
++
++    const int32_t i0 = tgpig.x*ntg.x + tiitg;
++    const int32_t i_batch = tgpig.y % args.ne1;
++    const int32_t i_head = tgpig.y / args.ne1;
++    const int32_t i_stream = tgpig.z;
++
++    if (i0 >= args.ne0 || i_batch >= args.ne1 || i_head >= args.ne2 || i_stream >= args.ne3) {
++        return;
++    }
++
++    const int32_t heads_per_v_head = args.ne2 / args.ne12;
++    const int32_t i_v_head = i_head / heads_per_v_head;
++    const int32_t i_top_stream = i_stream % args.ne22;
++
++    device const int32_t * top_k_ptr = (device const int32_t *) (top_k +
++            i_batch*args.nb21 + i_top_stream*args.nb22);
++    const int32_t i_kv = *top_k_ptr;
++    if (i_kv < 0 || i_kv >= args.ne11) {
++        return;
++    }
++
++    device const T * v_row = (device const T *) (v +
++            i_kv*args.nb11 + i_v_head*args.nb12 + i_stream*args.nb13);
++    device float * dst_row = (device float *) (dst +
++            i_batch*args.nb1 + i_head*args.nb2 + i_stream*args.nb3);
++
++    dst_row[i0] = float(v_row[i0]);
++}
++
++typedef decltype(kernel_dsa_top1_attn_impl<float>) kernel_dsa_top1_attn_t;
++
++template [[host_name("kernel_dsa_top1_attn_f32")]] kernel kernel_dsa_top1_attn_t kernel_dsa_top1_attn_impl<float>;
++template [[host_name("kernel_dsa_top1_attn_f16")]] kernel kernel_dsa_top1_attn_t kernel_dsa_top1_attn_impl<half>;
++
+ kernel void kernel_diag_f32(
+         constant ggml_metal_kargs_diag & args,
+         device   const char * src0,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 94eaa3aec..fd25ec902 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1067,6 +1067,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "LIGHTNING_INDEXER",
+     "DSA_SPARSE_MASK",
+     "DSA_SPARSE_ATTN",
++    "DSA_TOP1_ATTN",
+     "MOE_ROUTE_WEIGHTS",
+     "MOE_WEIGHTED_SUM",
+ 
+@@ -1086,7 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1183,6 +1184,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "lightning_indexer(q, k, weights, scale_embd, scale_heads)",
+     "dsa_sparse_mask(kq_mask, top_k)",
+     "dsa_sparse_attn(q, k, v, kq_mask, top_k)",
++    "dsa_top1_attn(q, v, top_k)",
+     "moe_route_weights(probs, ids)",
+     "moe_weighted_sum(experts, weights)",
+ 
+@@ -1202,7 +1204,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6411,6 +6413,36 @@ struct ggml_tensor * ggml_dsa_sparse_attn(
+     return result;
+ }
+ 
++// ggml_dsa_top1_attn
++
++struct ggml_tensor * ggml_dsa_top1_attn(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * top_k) {
++
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16);
++    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
++
++    GGML_ASSERT(q->ne[3] == v->ne[3]);
++    GGML_ASSERT(top_k->ne[0] == 1);
++    GGML_ASSERT(top_k->ne[1] == q->ne[1]);
++    GGML_ASSERT(q->ne[3] % top_k->ne[2] == 0);
++    GGML_ASSERT(top_k->ne[3] == 1);
++    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
++
++    int64_t ne[4] = { v->ne[0], q->ne[1], q->ne[2], q->ne[3] };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    result->op     = GGML_OP_DSA_TOP1_ATTN;
++    result->src[0] = q;
++    result->src[1] = v;
++    result->src[2] = top_k;
++
++    return result;
++}
++
+ // ggml_moe_weighted_sum
+ 
+ struct ggml_tensor * ggml_moe_route_weights(
+diff --git a/include/skippy.h b/include/skippy.h
+index d2f4951d6..20e501473 100644
+--- a/include/skippy.h
++++ b/include/skippy.h
+@@ -45,6 +45,14 @@ enum skippy_activation_layout {
+ #define SKIPPY_ACTIVATION_FLAG_GEMMA3N_ALTUP   (UINT64_C(1) << 1)
+ #define SKIPPY_ACTIVATION_FLAG_GLM_DSA_TOP_K   (UINT64_C(1) << 3)
+ 
++#define SKIPPY_GLM_DSA_POLICY_PROFILE_NONE     0
++#define SKIPPY_GLM_DSA_POLICY_PROFILE_V1       1
++
++#define SKIPPY_GLM_DSA_POLICY_DIRECT_SPARSE_ATTN                  (UINT32_C(1) << 0)
++#define SKIPPY_GLM_DSA_POLICY_DIRECT_SPARSE_PREFILL               (UINT32_C(1) << 1)
++#define SKIPPY_GLM_DSA_POLICY_DISABLE_COMPACT_FLASH_ATTN          (UINT32_C(1) << 2)
++#define SKIPPY_GLM_DSA_POLICY_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL (UINT32_C(1) << 3)
++
+ struct skippy_model;
+ struct skippy_session;
+ struct skippy_model_info;
+@@ -79,6 +87,15 @@ struct skippy_runtime_config {
+     // "Vulkan1", or "CPU". When set, skippy loads the model only on that
+     // backend device instead of relying on llama.cpp default device ordering.
+     const char * selected_backend_device;
++
++    // Optional GLM-DSA execution policy resolved from package generation
++    // metadata. Zero values preserve llama.cpp built-in/env behavior.
++    int32_t  glm_dsa_policy_profile;
++    uint32_t glm_dsa_policy_flags;
++    int32_t  glm_dsa_short_prefill_max_tokens;
++    int32_t  glm_dsa_direct_sparse_decode_max_top_k;
++    uint64_t glm_dsa_dense_sparse_mask_max_bytes;
++    int32_t  glm_dsa_compact_flash_min_kv;
+ };
+ 
+ struct skippy_tensor_info {
+diff --git a/include/skippy/common.h b/include/skippy/common.h
+index b7186bc9e..14084eeeb 100644
+--- a/include/skippy/common.h
++++ b/include/skippy/common.h
+@@ -26,7 +26,7 @@ extern "C" {
+ 
+ #define SKIPPY_ABI_VERSION_MAJOR 0
+ #define SKIPPY_ABI_VERSION_MINOR 1
+-#define SKIPPY_ABI_VERSION_PATCH 30
++#define SKIPPY_ABI_VERSION_PATCH 31
+ 
+ enum skippy_feature {
+     SKIPPY_FEATURE_RUNTIME_SLICE          = 1 << 0,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5007773f5..ffb5afc62 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -25,6 +25,11 @@ static thread_local skippy_activation_rwkv7_v_first g_skippy_rwkv7_v_first;
+ static thread_local skippy_activation_gemma3n_altup g_skippy_gemma3n_altup;
+ static thread_local skippy_activation_glm_dsa_top_k g_skippy_glm_dsa_top_k;
+ 
++static constexpr uint32_t LLAMA_SKIPPY_GLM_DSA_POLICY_DIRECT_SPARSE_ATTN                   = UINT32_C(1) << 0;
++static constexpr uint32_t LLAMA_SKIPPY_GLM_DSA_POLICY_DIRECT_SPARSE_PREFILL                = UINT32_C(1) << 1;
++static constexpr uint32_t LLAMA_SKIPPY_GLM_DSA_POLICY_DISABLE_COMPACT_FLASH_ATTN           = UINT32_C(1) << 2;
++static constexpr uint32_t LLAMA_SKIPPY_GLM_DSA_POLICY_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL = UINT32_C(1) << 3;
++
+ static bool skippy_env_enabled(const char * name) {
+     const char * value = getenv(name);
+     return value != nullptr && strcmp(value, "0") != 0 && strcmp(value, "false") != 0 && strcmp(value, "FALSE") != 0;
+@@ -44,30 +49,68 @@ static bool skippy_glm_dsa_direct_sparse_attn_enabled() {
+         skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_DIRECT_SPARSE_ATTN")) {
+         return false;
+     }
++    if (skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_ATTN")) {
++        return true;
++    }
++    const skippy_graph_filter & filter = skippy_graph_get_filter();
++    if (filter.glm_dsa_policy_profile != 0) {
++        return (filter.glm_dsa_policy_flags & LLAMA_SKIPPY_GLM_DSA_POLICY_DIRECT_SPARSE_ATTN) != 0;
++    }
+ 
+     return true;
+ }
+ 
+ static bool skippy_glm_dsa_compact_flash_attn_disabled() {
++    const skippy_graph_filter & filter = skippy_graph_get_filter();
++    if (filter.glm_dsa_policy_profile != 0 &&
++            (filter.glm_dsa_policy_flags & LLAMA_SKIPPY_GLM_DSA_POLICY_DISABLE_COMPACT_FLASH_ATTN) != 0) {
++        return true;
++    }
+     return skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_COMPACT_FLASH_ATTN");
+ }
+ 
++static bool skippy_glm_dsa_top1_attn_disabled() {
++    return skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_TOP1_ATTN");
++}
++
++static bool skippy_glm_dsa_all_kv_flash_disabled() {
++    return skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_ALL_KV_FLASH");
++}
++
+ static bool skippy_glm_dsa_direct_sparse_prefill_enabled() {
+     if (skippy_env_disabled("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL") ||
+         skippy_env_enabled("SKIPPY_GLM_DSA_DISABLE_DIRECT_SPARSE_PREFILL")) {
+         return false;
+     }
++    if (skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL")) {
++        return true;
++    }
++    const skippy_graph_filter & filter = skippy_graph_get_filter();
++    if (filter.glm_dsa_policy_profile != 0) {
++        return (filter.glm_dsa_policy_flags & LLAMA_SKIPPY_GLM_DSA_POLICY_DIRECT_SPARSE_PREFILL) != 0;
++    }
+ 
+-    return true;
++    return false;
+ }
+ 
+ static bool skippy_glm_dsa_unproven_large_direct_sparse_prefill_enabled() {
++    if (skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL")) {
++        return true;
++    }
++    const skippy_graph_filter & filter = skippy_graph_get_filter();
++    if (filter.glm_dsa_policy_profile != 0) {
++        return (filter.glm_dsa_policy_flags & LLAMA_SKIPPY_GLM_DSA_POLICY_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL) != 0;
++    }
+     return skippy_env_enabled("SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL");
+ }
+ 
+ static int64_t skippy_glm_dsa_direct_sparse_prefill_max_tokens() {
+     const char * value = getenv("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS");
+     if (value == nullptr || value[0] == '\0') {
++        const skippy_graph_filter & filter = skippy_graph_get_filter();
++        if (filter.glm_dsa_policy_profile != 0 && filter.glm_dsa_short_prefill_max_tokens > 0) {
++            return filter.glm_dsa_short_prefill_max_tokens;
++        }
+         return 8;
+     }
+ 
+@@ -78,6 +121,10 @@ static int64_t skippy_glm_dsa_direct_sparse_prefill_max_tokens() {
+ static int64_t skippy_glm_dsa_dense_sparse_mask_max_bytes() {
+     const char * value = getenv("SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES");
+     if (value == nullptr || value[0] == '\0') {
++        const skippy_graph_filter & filter = skippy_graph_get_filter();
++        if (filter.glm_dsa_policy_profile != 0 && filter.glm_dsa_dense_sparse_mask_max_bytes > 0) {
++            return (int64_t) filter.glm_dsa_dense_sparse_mask_max_bytes;
++        }
+         return 512LL * 1024LL * 1024LL;
+     }
+ 
+@@ -85,6 +132,20 @@ static int64_t skippy_glm_dsa_dense_sparse_mask_max_bytes() {
+     return parsed <= 0 ? INT64_MAX : parsed;
+ }
+ 
++static int64_t skippy_glm_dsa_compact_flash_min_kv() {
++    const char * value = getenv("SKIPPY_GLM_DSA_COMPACT_FLASH_MIN_KV");
++    if (value == nullptr || value[0] == '\0') {
++        const skippy_graph_filter & filter = skippy_graph_get_filter();
++        if (filter.glm_dsa_policy_profile != 0 && filter.glm_dsa_compact_flash_min_kv > 0) {
++            return filter.glm_dsa_compact_flash_min_kv;
++        }
++        return 1;
++    }
++
++    const int64_t parsed = atoll(value);
++    return parsed <= 0 ? 0 : parsed;
++}
++
+ static ggml_type llama_glm_dsa_mla_kq_mask_type(const llama_cparams & cparams) {
+     return cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ }
+@@ -97,6 +158,24 @@ static int64_t llama_glm_dsa_kq_mask_nbytes(
+     return (int64_t) ggml_row_size(type, n_kv) * n_batch * n_stream;
+ }
+ 
++static bool llama_glm_dsa_verification_batch_shape(
++        const llama_ubatch & ubatch,
++        int64_t             sparse_batch,
++        int64_t             sparse_streams) {
++    if (ubatch.pos == nullptr || ubatch.output == nullptr || ubatch.n_tokens <= 1 || sparse_batch <= 1 || sparse_streams <= 0) {
++        return false;
++    }
++    if (ubatch.n_tokens % sparse_streams != 0 || ubatch.pos[0] <= 0) {
++        return false;
++    }
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (!ubatch.output[i]) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool skippy_glm_dsa_direct_sparse_decision_log_enabled() {
+     return skippy_env_enabled("SKIPPY_GLM_DSA_LOG_DIRECT_SPARSE_DECISIONS");
+ }
+@@ -167,6 +246,7 @@ struct llama_glm_dsa_sparse_attn_policy {
+     bool direct_enabled = false;
+     bool prefill_enabled = false;
+     bool decode_shape = false;
++    bool verify_shape = false;
+     bool prefill_shape = false;
+     bool large_prefill_shape = false;
+     bool token_shape_allowed = false;
+@@ -177,8 +257,11 @@ struct llama_glm_dsa_sparse_attn_policy {
+     bool compact_disabled = false;
+     bool compact_large_decode_top_k = false;
+     bool compact_mask_omitted = false;
++    bool compact_kv_ok = false;
+     bool compact_candidate = false;
+     bool flash_attn = false;
++    int64_t direct_sparse_decode_max_top_k = 0;
++    int64_t compact_flash_min_kv = 0;
+ 
+     bool use_direct_sparse_attn() const {
+         return route == llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
+@@ -189,13 +272,29 @@ struct llama_glm_dsa_sparse_attn_policy {
+     }
+ };
+ 
+-static constexpr int64_t LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K = 128;
++static constexpr int64_t LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K = 0;
++
++static int64_t skippy_glm_dsa_direct_sparse_decode_max_top_k() {
++    const char * value = getenv("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K");
++    if (value == nullptr || value[0] == '\0') {
++        const skippy_graph_filter & filter = skippy_graph_get_filter();
++        if (filter.glm_dsa_policy_profile != 0 && filter.glm_dsa_direct_sparse_decode_max_top_k > 0) {
++            return filter.glm_dsa_direct_sparse_decode_max_top_k;
++        }
++        return LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K;
++    }
++
++    const int64_t parsed = atoll(value);
++    return parsed <= 0 ? INT64_MAX : parsed;
++}
+ 
+ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         int64_t sparse_batch,
+         int64_t sparse_streams,
++        int64_t sparse_kv,
+         int64_t sparse_top_k,
+         int64_t ubatch_tokens,
++        bool    verification_batch,
+         int64_t prefill_cap,
+         int64_t dense_mask_bytes,
+         int64_t dense_mask_limit,
+@@ -219,34 +318,46 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+     policy.compact_disabled = compact_flash_disabled;
+     policy.compact_mask_omitted = compact_mask_omitted;
+     policy.flash_attn = flash_attn;
++    policy.direct_sparse_decode_max_top_k = skippy_glm_dsa_direct_sparse_decode_max_top_k();
++    policy.compact_flash_min_kv = skippy_glm_dsa_compact_flash_min_kv();
+ 
+     policy.decode_shape =
+             sparse_streams > 0 &&
+             sparse_batch == 1 &&
+             ubatch_tokens == sparse_streams;
++    policy.verify_shape =
++            verification_batch &&
++            direct_sparse_prefill_enabled &&
++            sparse_batch <= prefill_cap;
+     policy.prefill_shape =
++            !verification_batch &&
+             direct_sparse_prefill_enabled &&
+             sparse_batch <= prefill_cap;
+     policy.large_prefill_shape =
++            !verification_batch &&
+             direct_sparse_prefill_enabled &&
+             unproven_large_direct_sparse_prefill_enabled &&
+             sparse_batch > prefill_cap &&
+             dense_mask_bytes > dense_mask_limit;
+     policy.token_shape_allowed =
+             policy.decode_shape ||
++            policy.verify_shape ||
+             policy.prefill_shape ||
+             policy.large_prefill_shape;
+     policy.phase =
+             policy.decode_shape ? "decode" :
++            policy.verify_shape ? "verify" :
+             (policy.prefill_shape || policy.large_prefill_shape) ? "prefill" :
+             "other";
+ 
+     policy.compact_large_decode_top_k =
+             policy.decode_shape &&
+-            sparse_top_k > LLAMA_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K;
++            sparse_top_k > policy.direct_sparse_decode_max_top_k;
++    policy.compact_kv_ok = sparse_kv >= policy.compact_flash_min_kv;
+     policy.compact_candidate =
+             !compact_flash_disabled &&
+             policy.decode_shape &&
++            policy.compact_kv_ok &&
+             (policy.compact_large_decode_top_k || compact_mask_omitted);
+     const bool compact_ready =
+             policy.compact_candidate &&
+@@ -277,6 +388,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+         policy.route = llama_glm_dsa_sparse_attn_route::DIRECT_SPARSE;
+         policy.direct_selector_reason =
+                 policy.decode_shape ? "decode" :
++                policy.verify_shape ? "verify" :
+                 policy.prefill_shape ? "short_prefill" :
+                 policy.large_prefill_shape ? "dense_mask_guard_large_prefill" :
+                 "unknown";
+@@ -297,6 +409,7 @@ static llama_glm_dsa_sparse_attn_policy llama_glm_dsa_choose_sparse_attn_policy(
+             compact_flash_disabled ? "disabled" :
+             !flash_attn ? "flash_attn_disabled" :
+             !policy.decode_shape ? "not_decode" :
++            !policy.compact_kv_ok ? "kv_below_min" :
+             !policy.compact_large_decode_top_k && !compact_mask_omitted ? "small_decode_top_k" :
+             !kq_b_ok ? "kq_b_present" :
+             !sinks_ok ? "sinks_present" :
+@@ -334,8 +447,10 @@ static bool llama_glm_dsa_can_skip_mla_kq_mask_for_compact_decode(
+     const llama_glm_dsa_sparse_attn_policy policy = llama_glm_dsa_choose_sparse_attn_policy(
+             n_batch,
+             n_stream,
++            n_kv,
+             top_k,
+             ubatch.n_tokens,
++            false,
+             skippy_glm_dsa_direct_sparse_prefill_max_tokens(),
+             nbytes,
+             skippy_glm_dsa_dense_sparse_mask_max_bytes(),
+@@ -397,11 +512,13 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+         int64_t sparse_kv,
+         int64_t sparse_top_k,
+         int64_t prefill_cap,
++        int64_t decode_max_top_k,
+         int64_t dense_mask_bytes,
+         int64_t dense_mask_limit,
+         bool    direct_enabled,
+         bool    prefill_enabled,
+         bool    decode_shape,
++        bool    verify_shape,
+         bool    prefill_shape,
+         bool    large_prefill_shape,
+         bool    token_shape_allowed,
+@@ -419,12 +536,13 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+     const int64_t kv_topk_ratio = sparse_top_k > 0 ? sparse_kv / sparse_top_k : 0;
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%lld dense_mask_limit=%lld phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
++            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%lld dense_mask_limit=%lld phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d verify_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+             layer,
+             (long long) ubatch_tokens,
+             (long long) sparse_batch,
+             (long long) sparse_streams,
+             (long long) prefill_cap,
++            (long long) decode_max_top_k,
+             (long long) sparse_kv,
+             (long long) sparse_top_k,
+             0LL,
+@@ -436,6 +554,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision(
+             direct_enabled ? 1 : 0,
+             prefill_enabled ? 1 : 0,
+             decode_shape ? 1 : 0,
++            verify_shape ? 1 : 0,
+             prefill_shape ? 1 : 0,
+             large_prefill_shape ? 1 : 0,
+             token_shape_allowed ? 1 : 0,
+@@ -451,8 +570,11 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+         int64_t ubatch_tokens,
+         int64_t visible_kv,
+         int64_t top_k,
++        int64_t decode_max_top_k,
++        int64_t compact_min_kv,
+         bool    disabled,
+         bool    large_decode_top_k,
++        bool    kv_ok,
+         bool    enabled,
+         bool    flash_attn,
+         bool    decode_shape,
+@@ -468,17 +590,18 @@ static void skippy_glm_dsa_log_compact_flash_policy(
+     }
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld kv_topk_ratio=%lld min_kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d ratio_ok=%d enabled=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
++            "skippy: glm_dsa_compact_flash_policy layer=%d ubatch_tokens=%lld visible_kv=%lld top_k=%lld decode_max_top_k=%lld compact_min_kv=%lld kv_topk_ratio=%lld forced=%d disabled=%d large_decode_top_k=%d kv_ok=%d enabled=%d flash_attn=%d phase=%s decode_shape=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d no_mask=%d use_compact=%d selector_reason=%s\n",
+             layer,
+             (long long) ubatch_tokens,
+             (long long) visible_kv,
+             (long long) top_k,
++            (long long) decode_max_top_k,
++            (long long) compact_min_kv,
+             top_k > 0 ? (long long) (visible_kv/top_k) : 0LL,
+-            2LL,
+             0,
+             disabled ? 1 : 0,
+             large_decode_top_k ? 1 : 0,
+-            0,
++            kv_ok ? 1 : 0,
+             enabled ? 1 : 0,
+             flash_attn ? 1 : 0,
+             decode_shape ? "decode" : "other",
+@@ -513,6 +636,23 @@ static void skippy_glm_dsa_log_compact_flash_mask(
+             (long long) max_top_k);
+ }
+ 
++static void skippy_glm_dsa_log_all_kv_flash(
++        int     layer,
++        int64_t visible_kv,
++        int64_t top_k,
++        bool    v_trans) {
++    if (!skippy_glm_dsa_compact_flash_policy_log_enabled()) {
++        return;
++    }
++
++    LLAMA_LOG_INFO(
++            "skippy: glm_dsa_all_kv_flash layer=%d visible_kv=%lld top_k=%lld v_trans=%d reason=top_k_covers_visible_kv\n",
++            layer,
++            (long long) visible_kv,
++            (long long) top_k,
++            v_trans ? 1 : 0);
++}
++
+ void skippy_graph_set_filter(const skippy_graph_filter & filter) {
+     g_skippy_graph_filter = filter;
+ }
+@@ -3043,6 +3183,54 @@ ggml_tensor * llm_graph_context::build_attn_mha_dsa_compact_flash(
+     GGML_ASSERT(top_k->ne[1] == v->ne[2]);
+     GGML_ASSERT(top_k->ne[2] == v->ne[3]);
+ 
++    if (!skippy_glm_dsa_all_kv_flash_disabled() && top_k->ne[0] >= k->ne[1]) {
++        skippy_glm_dsa_log_all_kv_flash(il, k->ne[1], top_k->ne[0], v_trans);
++
++        ggml_tensor * cur = ggml_flash_attn_ext(
++                ctx0,
++                q,
++                k,
++                v,
++                nullptr,
++                kq_scale,
++                hparams.f_max_alibi_bias,
++                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
++        cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
++        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
++
++        if (v_mla) {
++            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++            cur = ggml_mul_mat(ctx0, v_mla, cur);
++            cb(cur, "fattn_mla", il);
++            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++            cur = ggml_cont(ctx0, cur);
++        }
++
++        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
++
++        ggml_build_forward_expand(gf, cur);
++
++        return cur;
++    }
++
++    if (!skippy_glm_dsa_top1_attn_disabled() && top_k->ne[0] == 1) {
++        ggml_tensor * cur = ggml_dsa_top1_attn(ctx0, q, v, top_k);
++        cb(cur, "dsa_top1_attn", il);
++
++        if (v_mla) {
++            cur = ggml_mul_mat(ctx0, v_mla, cur);
++            cb(cur, "fattn_mla", il);
++            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
++            cur = ggml_cont(ctx0, cur);
++        }
++
++        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
++
++        ggml_build_forward_expand(gf, cur);
++
++        return cur;
++    }
++
+     ggml_tensor * k_top_k = ggml_get_rows_typed(ctx0, k, top_k);
+     cb(k_top_k, "dsa_compact_k_topk_rows", il);
+     if (k_top_k->type == GGML_TYPE_F32) {
+@@ -3437,11 +3625,17 @@ ggml_tensor * llm_graph_context::build_attn(
+     const bool direct_sparse_sinks_ok = sinks == nullptr;
+     const bool direct_sparse_alibi_ok = hparams.f_max_alibi_bias == 0.0f;
+     const bool direct_sparse_soft_cap_ok = !hparams.attn_soft_cap;
++    const bool verification_batch = llama_glm_dsa_verification_batch_shape(
++            ubatch,
++            n_direct_sparse_batch,
++            n_direct_sparse_stream);
+     const llama_glm_dsa_sparse_attn_policy sparse_policy = llama_glm_dsa_choose_sparse_attn_policy(
+             n_direct_sparse_batch,
+             n_direct_sparse_stream,
++            n_sparse_kv,
+             n_sparse_top_k,
+             ubatch.n_tokens,
++            verification_batch,
+             direct_sparse_prefill_max_tokens,
+             dense_sparse_mask_bytes,
+             dense_sparse_mask_limit,
+@@ -3464,11 +3658,13 @@ ggml_tensor * llm_graph_context::build_attn(
+             n_sparse_kv,
+             n_sparse_top_k,
+             direct_sparse_prefill_max_tokens,
++            sparse_policy.direct_sparse_decode_max_top_k,
+             dense_sparse_mask_bytes,
+             dense_sparse_mask_limit,
+             sparse_policy.direct_enabled,
+             sparse_policy.prefill_enabled,
+             sparse_policy.decode_shape,
++            sparse_policy.verify_shape,
+             sparse_policy.prefill_shape,
+             sparse_policy.large_prefill_shape,
+             sparse_policy.token_shape_allowed,
+@@ -3485,8 +3681,11 @@ ggml_tensor * llm_graph_context::build_attn(
+             ubatch.n_tokens,
+             n_sparse_kv,
+             n_sparse_top_k,
++            sparse_policy.direct_sparse_decode_max_top_k,
++            sparse_policy.compact_flash_min_kv,
+             sparse_policy.compact_disabled,
+             sparse_policy.compact_large_decode_top_k,
++            sparse_policy.compact_kv_ok,
+             sparse_policy.compact_candidate,
+             sparse_policy.flash_attn,
+             sparse_policy.decode_shape,
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 4c8bab6f1..4a7420b1b 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -34,6 +34,12 @@ struct skippy_graph_filter {
+     int32_t layer_end = 0;
+     bool include_embeddings = false;
+     bool include_output = false;
++    int32_t glm_dsa_policy_profile = 0;
++    uint32_t glm_dsa_policy_flags = 0;
++    int32_t glm_dsa_short_prefill_max_tokens = 0;
++    int32_t glm_dsa_direct_sparse_decode_max_top_k = 0;
++    uint64_t glm_dsa_dense_sparse_mask_max_bytes = 0;
++    int32_t glm_dsa_compact_flash_min_kv = 0;
+ };
+ 
+ struct skippy_activation_tokens {
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index dcd7f00dc..617777690 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -173,11 +173,10 @@ static void llama_glm_dsa_validate_indexer_type_frequency_consistency(const llam
+     }
+ 
+     if (conflict_count > 0) {
+-        LLAMA_LOG_WARN(
+-                "%s: GLM_DSA attention.indexer.types differs from top_k_frequency at %d layer(s), first=%d; using explicit indexer.types metadata\n",
+-                __func__,
+-                conflict_count,
+-                first_conflict);
++        std::ostringstream message;
++        message << "GLM_DSA attention.indexer.types conflicts with attention.indexer.top_k_frequency at "
++                << conflict_count << " layer(s), first=" << first_conflict;
++        throw std::runtime_error(message.str());
+     }
+ }
+ 
+@@ -208,6 +207,34 @@ static bool llama_glm_dsa_metadata_layer_is_full(const llama_hparams & hparams,
+     return false;
+ }
+ 
++static void llama_glm_dsa_validate_indexshare_sequence(const llama_hparams & hparams) {
++    bool saw_full = false;
++    bool saw_role = false;
++    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++        bool metadata_matched = false;
++        const bool full_layer = llama_glm_dsa_metadata_layer_is_full(hparams, il, &metadata_matched);
++        if (!metadata_matched) {
++            continue;
++        }
++
++        saw_role = true;
++        if (full_layer) {
++            saw_full = true;
++            continue;
++        }
++
++        if (!saw_full) {
++            std::ostringstream message;
++            message << "GLM_DSA IndexShare Shared layer " << il << " has no preceding Full layer";
++            throw std::runtime_error(message.str());
++        }
++    }
++
++    if (saw_role && !saw_full) {
++        throw std::runtime_error("GLM_DSA IndexShare metadata must declare at least one Full layer");
++    }
++}
++
+ static void llama_glm_dsa_validate_indexshare_layer_contract(int il, const llama_hparams & hparams, const llama_layer & layer) {
+     const llama_model_loader_stage_filter & stage_filter = llama_model_loader_get_stage_filter();
+     if (stage_filter.enabled && (il < stage_filter.layer_start || il >= stage_filter.layer_end)) {
+@@ -456,6 +483,7 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+         throw std::runtime_error("GLM_DSA IndexShare metadata requires attention.indexer.types or attention.indexer.top_k_frequency");
+     }
+     llama_glm_dsa_validate_indexer_type_frequency_consistency(hparams);
++    llama_glm_dsa_validate_indexshare_sequence(hparams);
+ 
+     // Expert gating function (GLM-4.5 uses sigmoid)
+     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+@@ -537,7 +565,14 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
+ 
+         // GLM-DSA IndexShare metadata describes target decoder layers only. Native MTP
+         // blocks can still carry full decoder-shaped tensors and complete indexer tensors.
+-        const int indexer_flags = flags | TENSOR_NOT_REQUIRED;
++        bool indexer_metadata_matched = false;
++        const bool indexer_metadata_full =
++                i < (int) hparams.n_layer() &&
++                llama_glm_dsa_metadata_layer_is_full(hparams, i, &indexer_metadata_matched);
++        const bool skip_virtual_indexer =
++                indexer_metadata_matched && !indexer_metadata_full;
++        const int indexer_flags =
++                flags | TENSOR_NOT_REQUIRED | (skip_virtual_indexer ? TENSOR_SKIP_IF_VIRTUAL : 0);
+         layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {hparams.indexer_head_size}, indexer_flags);
+         layer.indexer_k_norm_b = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "bias",   i), {hparams.indexer_head_size}, indexer_flags);
+         layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, indexer_flags);
+diff --git a/src/skippy.cpp b/src/skippy.cpp
+index 7e24b154d..bb236814e 100644
+--- a/src/skippy.cpp
++++ b/src/skippy.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-ext.h"
+ #include "llama-graph.h"
+ #include "llama-kv-cache.h"
++#include "llama-kv-cache-dsa.h"
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+@@ -990,13 +991,19 @@ struct skippy_filter_scope {
+ 
+ struct skippy_graph_filter_scope {
+     explicit skippy_graph_filter_scope(const skippy_runtime_config * config) {
+-        if (config != nullptr && config->filter_tensors_on_load) {
++        if (config != nullptr && (config->filter_tensors_on_load || config->glm_dsa_policy_profile != 0)) {
+             skippy_graph_filter filter;
+-            filter.enabled = true;
++            filter.enabled = config->filter_tensors_on_load;
+             filter.layer_start = config->layer_start;
+             filter.layer_end = config->layer_end;
+             filter.include_embeddings = config->include_embeddings;
+             filter.include_output = config->include_output;
++            filter.glm_dsa_policy_profile = config->glm_dsa_policy_profile;
++            filter.glm_dsa_policy_flags = config->glm_dsa_policy_flags;
++            filter.glm_dsa_short_prefill_max_tokens = config->glm_dsa_short_prefill_max_tokens;
++            filter.glm_dsa_direct_sparse_decode_max_top_k = config->glm_dsa_direct_sparse_decode_max_top_k;
++            filter.glm_dsa_dense_sparse_mask_max_bytes = config->glm_dsa_dense_sparse_mask_max_bytes;
++            filter.glm_dsa_compact_flash_min_kv = config->glm_dsa_compact_flash_min_kv;
+             skippy_graph_set_filter(filter);
+             enabled = true;
+         }
+@@ -1333,7 +1340,7 @@ static bool skippy_glm_dsa_sideband_top_k_count_is_valid(
+         return false;
+     }
+ 
+-    return actual_top_k <= expected_top_k;
++    return actual_top_k == expected_top_k;
+ }
+ 
+ static size_t skippy_glm_dsa_top_k_bytes(const skippy_session * session, size_t token_count) {
+@@ -1720,7 +1727,24 @@ static uint64_t skippy_glm_dsa_dense_sparse_mask_max_bytes() {
+     return parsed;
+ }
+ 
+-static constexpr int64_t SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K = 128;
++static constexpr int64_t SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K = 256;
++
++static int64_t skippy_glm_dsa_direct_sparse_decode_max_top_k() {
++    const char * value = std::getenv("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K");
++    if (value == nullptr || value[0] == '\0') {
++        return SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K;
++    }
++
++    char * end = nullptr;
++    errno = 0;
++    const long long parsed = std::strtoll(value, &end, 10);
++    if (errno != 0 || end == value || *end != '\0') {
++        return SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_DEFAULT_MAX_TOP_K;
++    }
++
++    return parsed <= 0 ? INT64_MAX : parsed;
++}
++
+ 
+ static bool skippy_name_starts_with(const char * name, const char * prefix) {
+     return name != nullptr && std::strncmp(name, prefix, std::strlen(prefix)) == 0;
+@@ -1920,6 +1944,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+     const uint64_t dense_mask_limit = skippy_glm_dsa_dense_sparse_mask_max_bytes();
+     const int64_t sparse_kv = dense_mask_shape != nullptr ? dense_mask_shape->ne[1] : -1;
+     const int64_t sparse_top_k = top_k != nullptr ? top_k->ne[0] : -1;
++    const int64_t decode_max_top_k = skippy_glm_dsa_direct_sparse_decode_max_top_k();
+     const int64_t kv_topk_ratio = sparse_top_k > 0 ? sparse_kv / sparse_top_k : 0;
+     const bool direct_enabled = use_direct || skippy_glm_dsa_direct_sparse_attn_enabled();
+     const bool decode_shape =
+@@ -1938,7 +1963,7 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+     const bool token_shape_allowed = decode_shape || prefill_shape || large_prefill_shape;
+     const bool direct_top_k_too_large =
+             decode_shape &&
+-            sparse_top_k > SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K;
++            sparse_top_k > decode_max_top_k;
+     const char * phase =
+             decode_shape ? "decode" :
+             (prefill_shape || large_prefill_shape) ? "prefill" :
+@@ -1954,12 +1979,13 @@ static void skippy_glm_dsa_log_direct_sparse_decision_for_tensor(
+             "unknown";
+ 
+     LLAMA_LOG_INFO(
+-            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%llu dense_mask_limit=%llu phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
++            "skippy: glm_dsa_direct_sparse_decision layer=%d ubatch_tokens=%lld sparse_batch=%lld sparse_streams=%lld prefill_cap=%lld decode_max_top_k=%lld sparse_kv=%lld sparse_top_k=%lld min_kv_topk_ratio=%lld kv_topk_ratio=%lld dense_mask_bytes=%llu dense_mask_limit=%llu phase=%s selector_reason=%s direct_enabled=%d prefill_enabled=%d decode_shape=%d prefill_shape=%d large_prefill_shape=%d token_shape_allowed=%d kq_b_ok=%d sinks_ok=%d alibi_ok=%d soft_cap_ok=%d use_direct=%d\n",
+             layer,
+             static_cast<long long>(timing.token_count),
+             static_cast<long long>(sparse_batch),
+             static_cast<long long>(sparse_streams),
+             static_cast<long long>(prefill_cap),
++            static_cast<long long>(decode_max_top_k),
+             static_cast<long long>(sparse_kv),
+             static_cast<long long>(sparse_top_k),
+             0LL,
+@@ -5690,6 +5716,13 @@ static llama_kv_cache * skippy_get_kv_cache(
+     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
+         return kv;
+     }
++    if (auto * dsa = dynamic_cast<llama_kv_cache_dsa *>(memory)) {
++        llama_kv_cache * kv = dsa->get_mla();
++        if (kv == nullptr) {
++            skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "runtime has no GLM-DSA MLA KV cache");
++        }
++        return kv;
++    }
+ 
+     skippy_set_error(out_error, SKIPPY_STATUS_UNSUPPORTED, "runtime memory type is not supported for native KV pages");
+     return nullptr;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1923a5d8e..6dba72141 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -51,6 +51,14 @@
+ #   define N_THREADS std::thread::hardware_concurrency()
+ #endif
+ 
++static void set_test_env(const char * name, const char * value) {
++#if defined(_WIN32)
++    _putenv_s(name, value);
++#else
++    setenv(name, value, true);
++#endif
++}
++
+ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+     size_t nels = ggml_nelements(tensor);
+     std::vector<float> data(nels);
+@@ -7090,6 +7098,11 @@ struct test_dsa_sparse_attn : public test_case {
+         return type_k == GGML_TYPE_F16 || type_v == GGML_TYPE_F16 || type_mask == GGML_TYPE_F16 ? 2e-6 : 1e-7;
+     }
+ 
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2ULL * (uint64_t) n_head * (uint64_t) n_stream * (uint64_t) n_batch * (uint64_t) n_top_k * (uint64_t) (dk + dv);
++    }
++
+     bool run_whole_graph() override {
+         return true;
+     }
+@@ -7527,6 +7540,83 @@ struct test_flash_attn_ext : public test_case {
+     }
+ };
+ 
++struct test_glm_dsa_selected_row_flash : public test_case {
++    const int64_t kv;
++    const int64_t top_k;
++
++    std::string vars() override {
++        return VARS_TO_STR2(kv, top_k);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "GLM_DSA_SELECTED_ROW_FLASH";
++    }
++
++    test_glm_dsa_selected_row_flash(int64_t kv = 257, int64_t top_k = 64)
++        : kv(kv), top_k(top_k) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        set_test_env("SKIPPY_GLM_DSA_EXPERIMENTAL_SELECTED_ROW_FLASH", "1");
++
++        ggml_tensor * q         = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 576, 1, 1, 1);
++        ggml_tensor * packed_kv = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 576, kv, 1, 1);
++        ggml_tensor * top_k_ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, top_k, 1, 1, 1);
++
++        ggml_set_name(q,         "q");
++        ggml_set_name(packed_kv, "packed_kv");
++        ggml_set_name(top_k_ids, "top_k");
++
++        ggml_tensor * k_top_k = ggml_get_rows_typed(ctx, packed_kv, top_k_ids);
++        ggml_set_name(k_top_k, "dsa_compact_k_topk_rows");
++
++        ggml_tensor * v_top_k = ggml_view_4d(
++                ctx,
++                k_top_k,
++                512, k_top_k->ne[1], k_top_k->ne[2], k_top_k->ne[3],
++                k_top_k->nb[1], k_top_k->nb[2], k_top_k->nb[3],
++                0);
++        ggml_set_name(v_top_k, "dsa_compact_v_topk_view");
++
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k_top_k, v_top_k, nullptr, 1.0f/sqrtf(576.0f), 0.0f, 0.0f);
++        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "top_k") == 0) {
++                std::vector<int32_t> data(top_k);
++                for (int64_t i = 0; i < top_k; ++i) {
++                    data[i] = (int32_t) ((i*37) % kv);
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t, -0.25f, 0.25f);
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    double max_err() override {
++        return 5e-3;
++    }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2ULL * (uint64_t) top_k * (576 + 512);
++    }
++
++    bool run_whole_graph() override {
++        return true;
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -10136,6 +10226,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 1, 4, 1, 64, 1, false, true));
+     test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 513, 1, 8, 1, 513, 1, false, true));
+     test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 64, 8, 1, 64, 1));
++    test_cases.emplace_back(new test_glm_dsa_selected_row_flash(257, 64));
++    test_cases.emplace_back(new test_glm_dsa_selected_row_flash(1024, 768));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
+@@ -10341,6 +10433,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 8, false, 2048, 1, 6144));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, 8, false, 6144, 1, 2048));
+ 
++    // GLM-DSA sparse-attention decode threshold shapes.
++    for (int64_t kv : {128, 256, 257, 513}) {
++        test_cases.emplace_back(new test_glm_dsa_selected_row_flash(kv, 64));
++        test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, kv, 1, 1, 1, 64, 1));
++        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {1, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    for (int64_t kv : {128, 256, 257, 513}) {
++        test_cases.emplace_back(new test_glm_dsa_selected_row_flash(kv, kv));
++        test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, kv, 1, 1, 1, kv, 1));
++    }
++    // GLM-5.2 configured IndexShare width after visible KV exceeds top_k.
++    // The top_k >= visible_kv boundary uses the graph-level all-KV flash bypass.
++    for (int64_t kv : {1024, 2048}) {
++        test_cases.emplace_back(new test_glm_dsa_selected_row_flash(kv, 768));
++        test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, kv, 1, 1, 1, 768, 1));
++    }
++
++    // GLM-DSA sparse-attention short phase shapes.
++    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 4, 1, 1, 64, 1));
++    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {1, 1}, 257, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 8, 1, 1, 64, 1));
++    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {1, 1}, 257, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_dsa_sparse_attn(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, 576, 512, 257, 16, 1, 1, 64, 1));
++    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {1, 1}, 257, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
+     // gpt-oss-20b
+     for (int bs : {1, 4, 8, 512}) {
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index e5cd24f44..5a01a20ea 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -14,6 +14,7 @@
+ #include <cinttypes>
+ #include <cstddef>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <cstdint>
+ #include <random>
+@@ -77,10 +78,24 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
+     return ret;
+ }
+ 
+-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
++enum class glm_dsa_indexshare_fixture {
++    DEFAULT,
++    CONFLICTING_METADATA,
++    SHARED_FIRST,
++    FULL_SHARED,
++    FULL_SHARED_SHARED,
++    PERIODIC_FULL_SHARED,
++};
++
++static gguf_context_ptr get_gguf_ctx(
++        const llm_arch arch,
++        const bool moe,
++        const glm_dsa_indexshare_fixture glm_dsa_indexshare = glm_dsa_indexshare_fixture::DEFAULT,
++        const uint32_t context_length = 128,
++        const uint32_t glm_dsa_indexer_top_k = 8) {
+     gguf_context_ptr ret(gguf_init_empty());
+     llama_model_saver ms(arch, ret.get());
+-    const uint32_t n_ctx = 128;
++    const uint32_t n_ctx = context_length;
+ 
+     uint32_t n_vocab = 128;
+     uint32_t n_embd  = 256;
+@@ -107,6 +122,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+         n_embd = 128;
+         n_head = 1;
+         n_ff   = 192;
++        if (arch == LLM_ARCH_GLM_DSA && glm_dsa_indexshare == glm_dsa_indexshare_fixture::FULL_SHARED_SHARED) {
++            n_layer = 3;
++        } else if (arch == LLM_ARCH_GLM_DSA && glm_dsa_indexshare == glm_dsa_indexshare_fixture::PERIODIC_FULL_SHARED) {
++            n_layer = 4;
++        }
+     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+         n_layer = 3;
+     } else if (arch == LLM_ARCH_CHAMELEON) {
+@@ -198,9 +218,31 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+ 
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, arch == LLM_ARCH_GLM_DSA ? uint32_t(128) : uint32_t(64));
+-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
++    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      arch == LLM_ARCH_GLM_DSA ? glm_dsa_indexer_top_k : uint32_t(8));
+     if (arch == LLM_ARCH_GLM_DSA) {
+-        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "full"}));
++        if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::CONFLICTING_METADATA) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(0));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared"}));
++        } else if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::SHARED_FIRST) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"shared", "full"}));
++        } else if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::FULL_SHARED) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(2));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared"}));
++        } else if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::FULL_SHARED_SHARED) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(3));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared", "shared"}));
++        } else if (glm_dsa_indexshare == glm_dsa_indexshare_fixture::PERIODIC_FULL_SHARED) {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(3));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "shared", "shared", "full"}));
++        } else {
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K_FREQUENCY, uint32_t(1));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_SKIP_TOP_K_OFFSET, uint32_t(0));
++            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, std::vector<std::string>({"full", "full"}));
++        }
+     }
+     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
+@@ -255,9 +297,204 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
+     return true;
+ }
+ 
++static void set_test_env(const char * name, const char * value) {
++#if defined(_WIN32)
++    _putenv_s(name, value);
++#else
++    setenv(name, value, true);
++#endif
++}
++
++static void unset_test_env(const char * name) {
++#if defined(_WIN32)
++    _putenv_s(name, "");
++#else
++    unsetenv(name);
++#endif
++}
++
++class scoped_test_env {
++public:
++    scoped_test_env(const char * name, const char * value) : name(name) {
++        const char * old_value = getenv(name);
++        if (old_value != nullptr) {
++            had_old_value = true;
++            this->old_value = old_value;
++        }
++        set_test_env(name, value);
++    }
++
++    ~scoped_test_env() {
++        if (had_old_value) {
++            set_test_env(name, old_value.c_str());
++        } else {
++            unset_test_env(name);
++        }
++    }
++
++private:
++    const char * name;
++    bool had_old_value = false;
++    std::string old_value;
++};
++
++static bool test_glm_dsa_rejects_conflicting_indexshare_metadata(const size_t seed) {
++    static constexpr const char * expected_error =
++            "attention.indexer.types conflicts with attention.indexer.top_k_frequency";
++
++    try {
++        gguf_context_ptr gguf_ctx = get_gguf_ctx(
++                LLM_ARCH_GLM_DSA,
++                true,
++                glm_dsa_indexshare_fixture::CONFLICTING_METADATA);
++
++        llama_model_params model_params = llama_model_default_params();
++        model_params.progress_callback = silent_model_load_progress;
++        size_t tmp = seed;
++        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
++        if (!model) {
++            return true;
++        }
++        GGML_UNUSED(model);
++    } catch (const std::exception & err) {
++        const std::string message = err.what();
++        return message.find(expected_error) != std::string::npos;
++    }
++
++    return false;
++}
++
++static bool test_glm_dsa_rejects_shared_first_indexshare_metadata(const size_t seed) {
++    static constexpr const char * expected_error =
++            "GLM_DSA IndexShare Shared layer 0 has no preceding Full layer";
++
++    try {
++        gguf_context_ptr gguf_ctx = get_gguf_ctx(
++                LLM_ARCH_GLM_DSA,
++                true,
++                glm_dsa_indexshare_fixture::SHARED_FIRST);
++
++        llama_model_params model_params = llama_model_default_params();
++        model_params.progress_callback = silent_model_load_progress;
++        size_t tmp = seed;
++        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
++        if (!model) {
++            return true;
++        }
++        GGML_UNUSED(model);
++    } catch (const std::exception & err) {
++        const std::string message = err.what();
++        return message.find(expected_error) != std::string::npos;
++    }
++
++    return false;
++}
++
++struct glm_dsa_graph_op_counts {
++    int total             = 0;
++    int lightning_indexer = 0;
++    int top_k             = 0;
++    int top_k_consumers   = 0;
++    int compact_get_rows  = 0;
++    int flash_attn        = 0;
++    int sparse_mask       = 0;
++    int sparse_mask_nodes = 0;
++    int dsa_sparse_attn   = 0;
++    int64_t max_top_k_width = 0;
++    int64_t max_compact_rows = 0;
++};
++
++static bool glm_dsa_is_indexshare_top_k_tensor(const ggml_tensor * tensor) {
++    if (tensor == nullptr) {
++        return false;
++    }
++    if (strncmp(tensor->name, "ffn_moe_topk", strlen("ffn_moe_topk")) == 0) {
++        return false;
++    }
++    return tensor->op == GGML_OP_TOP_K ||
++            strncmp(tensor->name, "top_k", strlen("top_k")) == 0;
++}
++
++static bool glm_dsa_tensor_wraps_indexshare_top_k(const ggml_tensor * tensor, int depth = 0) {
++    if (tensor == nullptr || depth > 4) {
++        return false;
++    }
++    if (glm_dsa_is_indexshare_top_k_tensor(tensor)) {
++        return true;
++    }
++    if (tensor->op == GGML_OP_VIEW ||
++            tensor->op == GGML_OP_RESHAPE ||
++            tensor->op == GGML_OP_CONT ||
++            tensor->op == GGML_OP_PERMUTE) {
++        return glm_dsa_tensor_wraps_indexshare_top_k(tensor->src[0], depth + 1);
++    }
++    return false;
++}
++
++static bool glm_dsa_tensor_consumes_indexshare_top_k(const ggml_tensor * tensor) {
++    if (tensor == nullptr) {
++        return false;
++    }
++    if (tensor->op == GGML_OP_DSA_SPARSE_MASK) {
++        return glm_dsa_tensor_wraps_indexshare_top_k(tensor->src[1]);
++    }
++    if (tensor->op == GGML_OP_DSA_SPARSE_ATTN) {
++        return glm_dsa_tensor_wraps_indexshare_top_k(tensor->src[4]);
++    }
++    if (tensor->op == GGML_OP_DSA_TOP1_ATTN) {
++        return glm_dsa_tensor_wraps_indexshare_top_k(tensor->src[2]);
++    }
++    if (tensor->op == GGML_OP_GET_ROWS &&
++            (strncmp(tensor->name, "dsa_compact_", strlen("dsa_compact_")) == 0 ||
++             strncmp(tensor->name, "dsa_sparse_mask_topk", strlen("dsa_sparse_mask_topk")) == 0)) {
++        return glm_dsa_tensor_wraps_indexshare_top_k(tensor->src[1]);
++    }
++    return false;
++}
++
++static bool glm_dsa_graph_op_counter_callback(ggml_tensor * tensor, bool ask, void * user_data) {
++    glm_dsa_graph_op_counts * counts = static_cast<glm_dsa_graph_op_counts *>(user_data);
++    ++counts->total;
++    if (!ask) {
++        return true;
++    }
++
++    if (tensor->op == GGML_OP_LIGHTNING_INDEXER) {
++        ++counts->lightning_indexer;
++    } else if (tensor->op == GGML_OP_TOP_K) {
++        if (strncmp(tensor->name, "ffn_moe_topk", strlen("ffn_moe_topk")) != 0) {
++            ++counts->top_k;
++            counts->max_top_k_width = std::max(counts->max_top_k_width, tensor->ne[0]);
++        }
++    } else if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
++        ++counts->flash_attn;
++    } else if (tensor->op == GGML_OP_DSA_SPARSE_MASK) {
++        ++counts->sparse_mask;
++    } else if (tensor->op == GGML_OP_DSA_SPARSE_ATTN) {
++        ++counts->dsa_sparse_attn;
++    }
++
++    if (glm_dsa_tensor_consumes_indexshare_top_k(tensor)) {
++        ++counts->top_k_consumers;
++    }
++    if (strncmp(tensor->name, "dsa_compact_", strlen("dsa_compact_")) == 0) {
++        ++counts->compact_get_rows;
++        counts->max_compact_rows = std::max(counts->max_compact_rows, tensor->ne[1]);
++    }
++    if (strncmp(tensor->name, "dsa_sparse_mask", strlen("dsa_sparse_mask")) == 0) {
++        ++counts->sparse_mask_nodes;
++    }
++    return true;
++}
++
++static std::vector<float> get_logits(
++        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode);
++
+ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
++        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
++        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
++        const llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO) {
+     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
+     llama_model_params model_params = llama_model_default_params();
+     model_params.progress_callback = silent_model_load_progress;
+@@ -273,6 +510,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+     if (!encode) {
+         ctx_params.n_ubatch = 64;
+     }
++    ctx_params.flash_attn_type = flash_attn_type;
++    ctx_params.cb_eval = cb_eval;
++    ctx_params.cb_eval_user_data = cb_eval_user_data;
+ 
+     size_t tmp = seed;
+     llama_model_ptr model(gguf_ctx != nullptr ?
+@@ -288,6 +528,520 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+     return std::make_pair(std::move(model), std::move(lctx));
+ }
+ 
++static bool test_glm_dsa_indexshare_graph(
++        const size_t seed,
++        const std::vector<ggml_backend_dev_t> & devs,
++        const glm_dsa_indexshare_fixture fixture,
++        const char * label,
++        const int expected_producers = 1,
++        const int expected_consumers = 2) {
++    try {
++        gguf_context_ptr gguf_ctx = get_gguf_ctx(
++                LLM_ARCH_GLM_DSA,
++                true,
++                fixture);
++        glm_dsa_graph_op_counts counts;
++        auto model_ctx = get_model_and_ctx(
++                gguf_ctx.get(),
++                nullptr,
++                seed,
++                devs,
++                LLAMA_SPLIT_MODE_LAYER,
++                false,
++                glm_dsa_graph_op_counter_callback,
++                &counts);
++
++        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
++        const std::vector<llama_token> tokens = get_tokens(8, n_vocab, seed);
++        get_logits(model_ctx.first.get(), model_ctx.second.get(), tokens, false);
++
++        if (counts.top_k != expected_producers ||
++                counts.lightning_indexer != expected_producers ||
++                counts.top_k_consumers != expected_consumers) {
++            fprintf(stderr, "GLM_DSA %s graph counted top_k=%d lightning_indexer=%d top_k_consumers=%d\n",
++                    label, counts.top_k, counts.lightning_indexer, counts.top_k_consumers);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA %s graph test failed: %s\n", label, err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_full_shared_indexshare_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    return test_glm_dsa_indexshare_graph(
++            seed,
++            devs,
++            glm_dsa_indexshare_fixture::FULL_SHARED,
++            "Full->Shared",
++            1,
++            2);
++}
++
++static bool test_glm_dsa_full_shared_shared_indexshare_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    return test_glm_dsa_indexshare_graph(
++            seed,
++            devs,
++            glm_dsa_indexshare_fixture::FULL_SHARED_SHARED,
++            "Full->Shared->Shared",
++            1,
++            3);
++}
++
++static bool test_glm_dsa_periodic_full_shared_indexshare_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    return test_glm_dsa_indexshare_graph(
++            seed,
++            devs,
++            glm_dsa_indexshare_fixture::PERIODIC_FULL_SHARED,
++            "Full->Shared->Shared->Full",
++            2,
++            4);
++}
++
++static void decode_tokens(llama_context * lctx, const std::vector<llama_token> & tokens, llama_pos start_pos, bool output_all = true) {
++    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        const bool output = output_all || i + 1 == tokens.size();
++        common_batch_add(batch, tokens[i], start_pos + (llama_pos) i, {0}, output);
++    }
++    batch.n_tokens = tokens.size();
++    if (llama_decode(lctx, batch)) {
++        llama_batch_free(batch);
++        throw std::runtime_error("failed to decode batch");
++    }
++    llama_batch_free(batch);
++}
++
++static glm_dsa_graph_op_counts run_glm_dsa_decode_graph_after_prefill(
++        const size_t seed,
++        const std::vector<ggml_backend_dev_t> & devs,
++        uint32_t n_prefill = 16,
++        uint32_t context_length = 128,
++        uint32_t indexer_top_k = 8) {
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(
++            LLM_ARCH_GLM_DSA,
++            true,
++            glm_dsa_indexshare_fixture::FULL_SHARED,
++            context_length,
++            indexer_top_k);
++    glm_dsa_graph_op_counts counts;
++    auto model_ctx = get_model_and_ctx(
++            gguf_ctx.get(),
++            nullptr,
++            seed,
++            devs,
++            LLAMA_SPLIT_MODE_LAYER,
++            false,
++            glm_dsa_graph_op_counter_callback,
++            &counts,
++            LLAMA_FLASH_ATTN_TYPE_ENABLED);
++
++    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
++    const std::vector<llama_token> tokens = get_tokens(n_prefill + 1, n_vocab, seed);
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + n_prefill), 0);
++
++    counts = {};
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>{tokens[n_prefill]}, n_prefill);
++
++    return counts;
++}
++
++static glm_dsa_graph_op_counts run_glm_dsa_verify_graph_after_prefill(
++        const size_t seed,
++        const std::vector<ggml_backend_dev_t> & devs,
++        uint32_t n_prefill = 16,
++        uint32_t n_verify = 4,
++        uint32_t context_length = 128,
++        uint32_t indexer_top_k = 8) {
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(
++            LLM_ARCH_GLM_DSA,
++            true,
++            glm_dsa_indexshare_fixture::FULL_SHARED,
++            context_length,
++            indexer_top_k);
++    glm_dsa_graph_op_counts counts;
++    auto model_ctx = get_model_and_ctx(
++            gguf_ctx.get(),
++            nullptr,
++            seed,
++            devs,
++            LLAMA_SPLIT_MODE_LAYER,
++            false,
++            glm_dsa_graph_op_counter_callback,
++            &counts,
++            LLAMA_FLASH_ATTN_TYPE_ENABLED);
++
++    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
++    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_verify, n_vocab, seed);
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + n_prefill), 0, false);
++
++    counts = {};
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin() + n_prefill, tokens.end()), n_prefill, true);
++
++    return counts;
++}
++
++static glm_dsa_graph_op_counts run_glm_dsa_prefill_graph(
++        const size_t seed,
++        const std::vector<ggml_backend_dev_t> & devs,
++        uint32_t n_tokens,
++        uint32_t context_length = 128,
++        uint32_t indexer_top_k = 8,
++        bool output_all = true) {
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(
++            LLM_ARCH_GLM_DSA,
++            true,
++            glm_dsa_indexshare_fixture::FULL_SHARED,
++            context_length,
++            indexer_top_k);
++    glm_dsa_graph_op_counts counts;
++    auto model_ctx = get_model_and_ctx(
++            gguf_ctx.get(),
++            nullptr,
++            seed,
++            devs,
++            LLAMA_SPLIT_MODE_LAYER,
++            false,
++            glm_dsa_graph_op_counter_callback,
++            &counts,
++            LLAMA_FLASH_ATTN_TYPE_ENABLED);
++
++    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
++    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
++    decode_tokens(model_ctx.second.get(), tokens, 0, output_all);
++
++    return counts;
++}
++
++static glm_dsa_graph_op_counts run_glm_dsa_prefill_graph_after_prefill(
++        const size_t seed,
++        const std::vector<ggml_backend_dev_t> & devs,
++        uint32_t n_prefill,
++        uint32_t n_tokens,
++        uint32_t context_length,
++        uint32_t indexer_top_k) {
++    gguf_context_ptr gguf_ctx = get_gguf_ctx(
++            LLM_ARCH_GLM_DSA,
++            true,
++            glm_dsa_indexshare_fixture::FULL_SHARED,
++            context_length,
++            indexer_top_k);
++    glm_dsa_graph_op_counts counts;
++    auto model_ctx = get_model_and_ctx(
++            gguf_ctx.get(),
++            nullptr,
++            seed,
++            devs,
++            LLAMA_SPLIT_MODE_LAYER,
++            false,
++            glm_dsa_graph_op_counter_callback,
++            &counts,
++            LLAMA_FLASH_ATTN_TYPE_ENABLED);
++
++    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_ctx.first.get()));
++    const std::vector<llama_token> tokens = get_tokens(n_prefill + n_tokens, n_vocab, seed);
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin(), tokens.begin() + n_prefill), 0, false);
++
++    counts = {};
++    decode_tokens(model_ctx.second.get(), std::vector<llama_token>(tokens.begin() + n_prefill, tokens.end()), n_prefill, false);
++
++    return counts;
++}
++
++static bool test_glm_dsa_direct_sparse_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env direct_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "1024");
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.dsa_sparse_attn == 0 || counts.compact_get_rows != 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0) {
++            fprintf(stderr,
++                    "GLM_DSA direct sparse decode graph counted total=%d dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.dsa_sparse_attn, counts.compact_get_rows, counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA direct sparse decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_compact_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env compact_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "4");
++        scoped_test_env compact_min_kv("SKIPPY_GLM_DSA_COMPACT_FLASH_MIN_KV", "1");
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.compact_get_rows == 0 || counts.flash_attn == 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA compact decode graph counted total=%d compact_get_rows=%d flash_attn=%d sparse_mask=%d sparse_mask_nodes=%d dsa_sparse_attn=%d\n",
++                    counts.total, counts.compact_get_rows, counts.flash_attn, counts.sparse_mask, counts.sparse_mask_nodes, counts.dsa_sparse_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA compact decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_compact_min_kv_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env compact_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "4");
++        scoped_test_env compact_min_kv("SKIPPY_GLM_DSA_COMPACT_FLASH_MIN_KV", "1024");
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA compact min-kv decode graph counted total=%d sparse_mask=%d sparse_mask_nodes=%d compact_get_rows=%d dsa_sparse_attn=%d flash_attn=%d\n",
++                    counts.total, counts.sparse_mask, counts.sparse_mask_nodes, counts.compact_get_rows, counts.dsa_sparse_attn, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA compact min-kv decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_default_compact_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.compact_get_rows == 0 || counts.flash_attn == 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA default compact decode graph counted total=%d compact_get_rows=%d flash_attn=%d sparse_mask=%d sparse_mask_nodes=%d dsa_sparse_attn=%d\n",
++                    counts.total, counts.compact_get_rows, counts.flash_attn, counts.sparse_mask, counts.sparse_mask_nodes, counts.dsa_sparse_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA default compact decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_short_history_compact_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        // During one-token decode, IndexShare top-k is selected from the previous
++        // KV state while attention sees previous+current KV. Even at short
++        // history, this should exercise compact selected-KV flash, not all-KV flash.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs, 4);
++
++        if (counts.compact_get_rows == 0 || counts.flash_attn == 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA short-history compact decode graph counted total=%d compact_get_rows=%d flash_attn=%d sparse_mask=%d sparse_mask_nodes=%d dsa_sparse_attn=%d\n",
++                    counts.total, counts.compact_get_rows, counts.flash_attn, counts.sparse_mask, counts.sparse_mask_nodes, counts.dsa_sparse_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA short-history compact decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_native_top_k_compact_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        // GLM-5.2 uses top_k=768. After a 768-token prefix, the next token sees
++        // 769 visible KV entries while IndexShare produces 768 selected rows.
++        // This is the model-native compact selected-KV decode shape.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs, 768, 1024, 768);
++
++        if (counts.top_k == 0 || counts.max_top_k_width != 768 || counts.compact_get_rows == 0 || counts.max_compact_rows != 768 ||
++                counts.flash_attn == 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA native top-k compact decode graph counted total=%d top_k=%d max_top_k_width=%lld compact_get_rows=%d max_compact_rows=%lld flash_attn=%d sparse_mask=%d sparse_mask_nodes=%d dsa_sparse_attn=%d\n",
++                    counts.total, counts.top_k, (long long) counts.max_top_k_width, counts.compact_get_rows, (long long) counts.max_compact_rows,
++                    counts.flash_attn, counts.sparse_mask, counts.sparse_mask_nodes, counts.dsa_sparse_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA native top-k compact decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_compact_disabled_decode_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env compact_decode_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_DECODE_MAX_TOP_K", "4");
++        scoped_test_env compact_disabled("SKIPPY_GLM_DSA_DISABLE_COMPACT_FLASH_ATTN", "1");
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_decode_graph_after_prefill(seed, devs);
++
++        if (counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA compact-disabled decode graph counted total=%d sparse_mask=%d sparse_mask_nodes=%d compact_get_rows=%d dsa_sparse_attn=%d flash_attn=%d\n",
++                    counts.total, counts.sparse_mask, counts.sparse_mask_nodes, counts.compact_get_rows, counts.dsa_sparse_attn, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA compact-disabled decode graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_verify_dense_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_verify_graph_after_prefill(seed, devs);
++
++        if (counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA verification graph counted total=%d dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.dsa_sparse_attn, counts.compact_get_rows, counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA verification dense graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_native_top_k_verify_dense_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        // Verification requests logits for the whole candidate span. Even with
++        // GLM-5.2's native top_k=768 shape, this phase is intentionally kept on
++        // the dense/auto path until verifier-specific sparse parity is proven.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_verify_graph_after_prefill(seed, devs, 768, 4, 1024, 768);
++
++        if (counts.top_k == 0 || counts.max_top_k_width != 768 ||
++                counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA native top-k verification graph counted total=%d top_k=%d max_top_k_width=%lld dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.top_k, (long long) counts.max_top_k_width, counts.dsa_sparse_attn, counts.compact_get_rows,
++                    counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA native top-k verification dense graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_short_prefill_dense_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph(seed, devs, 8);
++
++        if (counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA short prefill graph counted total=%d dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.dsa_sparse_attn, counts.compact_get_rows, counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA short prefill dense graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_native_top_k_short_prefill_dense_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "2048");
++        // GLM-5.2's package policy keeps short prefill dense below the
++        // threshold. Use output_all=false so this remains prefill rather than
++        // speculative verification, while still exercising native top_k=768.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph(seed, devs, 768, 1024, 768, false);
++
++        if (counts.top_k == 0 || counts.max_top_k_width != 768 ||
++                counts.sparse_mask_nodes == 0 || counts.compact_get_rows != 0 || counts.dsa_sparse_attn != 0) {
++            fprintf(stderr,
++                    "GLM_DSA native top-k short prefill graph counted total=%d top_k=%d max_top_k_width=%lld dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.top_k, (long long) counts.max_top_k_width, counts.dsa_sparse_attn, counts.compact_get_rows,
++                    counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA native top-k short prefill dense graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_long_prefill_dense_mask_guard_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env direct_sparse_prefill("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        scoped_test_env dense_mask_limit("SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES", "1");
++        scoped_test_env large_prefill_enabled("SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL", "1");
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph(seed, devs, 16);
++
++        if (counts.dsa_sparse_attn == 0 || counts.compact_get_rows != 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0) {
++            fprintf(stderr,
++                    "GLM_DSA long prefill dense-mask guard graph counted total=%d dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.dsa_sparse_attn, counts.compact_get_rows, counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA long prefill dense-mask guard graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
++static bool test_glm_dsa_native_top_k_long_prefill_dense_mask_guard_graph(
++        const size_t seed, const std::vector<ggml_backend_dev_t> & devs) {
++    try {
++        scoped_test_env graph_reuse_disabled("LLAMA_GRAPH_REUSE_DISABLE", "1");
++        scoped_test_env direct_sparse_prefill("SKIPPY_GLM_DSA_ENABLE_DIRECT_SPARSE_PREFILL", "1");
++        scoped_test_env prefill_cap("SKIPPY_GLM_DSA_DIRECT_SPARSE_PREFILL_MAX_TOKENS", "8");
++        scoped_test_env dense_mask_limit("SKIPPY_GLM_DSA_DENSE_SPARSE_MASK_MAX_BYTES", "1");
++        scoped_test_env large_prefill_enabled("SKIPPY_GLM_DSA_ENABLE_UNPROVEN_LARGE_DIRECT_SPARSE_PREFILL", "1");
++        // GLM-5.2's configured top_k=768 would otherwise require a large dense
++        // sparse mask during long-context prefill. Warm the KV first, then
++        // assert the measured continuation selects native direct sparse
++        // attention and avoids materializing that mask.
++        const glm_dsa_graph_op_counts counts = run_glm_dsa_prefill_graph_after_prefill(seed, devs, 768, 64, 1024, 768);
++
++        if (counts.top_k == 0 || counts.max_top_k_width != 768 || counts.dsa_sparse_attn == 0 ||
++                counts.compact_get_rows != 0 || counts.sparse_mask != 0 || counts.sparse_mask_nodes != 0) {
++            fprintf(stderr,
++                    "GLM_DSA native top-k long prefill dense-mask guard graph counted total=%d top_k=%d max_top_k_width=%lld dsa_sparse_attn=%d compact_get_rows=%d sparse_mask=%d sparse_mask_nodes=%d flash_attn=%d\n",
++                    counts.total, counts.top_k, (long long) counts.max_top_k_width, counts.dsa_sparse_attn, counts.compact_get_rows,
++                    counts.sparse_mask, counts.sparse_mask_nodes, counts.flash_attn);
++            return false;
++        }
++        return true;
++    } catch (const std::exception & err) {
++        fprintf(stderr, "GLM_DSA native top-k long prefill dense-mask guard graph test failed: %s\n", err.what());
++        return false;
++    }
++}
++
+ static std::vector<float> get_logits(
+         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+@@ -552,6 +1306,31 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+     const std::string template_row_res = "%15s %10s|%20s|\n";
+ 
+     bool all_ok = true;
++    if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_GLM_DSA) {
++        const bool glm_dsa_contract_ok =
++                test_glm_dsa_rejects_conflicting_indexshare_metadata(seed) &&
++                test_glm_dsa_rejects_shared_first_indexshare_metadata(seed) &&
++                test_glm_dsa_full_shared_indexshare_graph(seed, {}) &&
++                test_glm_dsa_full_shared_shared_indexshare_graph(seed, {}) &&
++                test_glm_dsa_periodic_full_shared_indexshare_graph(seed, {}) &&
++                test_glm_dsa_direct_sparse_decode_graph(seed, {}) &&
++                test_glm_dsa_compact_decode_graph(seed, {}) &&
++                test_glm_dsa_compact_min_kv_decode_graph(seed, {}) &&
++                test_glm_dsa_default_compact_decode_graph(seed, {}) &&
++                test_glm_dsa_short_history_compact_decode_graph(seed, {}) &&
++                test_glm_dsa_native_top_k_compact_decode_graph(seed, {}) &&
++                test_glm_dsa_compact_disabled_decode_graph(seed, {}) &&
++                test_glm_dsa_verify_dense_graph(seed, {}) &&
++                test_glm_dsa_native_top_k_verify_dense_graph(seed, {}) &&
++                test_glm_dsa_short_prefill_dense_graph(seed, {}) &&
++                test_glm_dsa_native_top_k_short_prefill_dense_graph(seed, {}) &&
++                test_glm_dsa_long_prefill_dense_mask_guard_graph(seed, {}) &&
++                test_glm_dsa_native_top_k_long_prefill_dense_mask_guard_graph(seed, {});
++        if (!glm_dsa_contract_ok) {
++            fprintf(stderr, "GLM_DSA IndexShare metadata contract test failed\n");
++            all_ok = false;
++        }
++    }
+     common_log_flush(common_log_main());
+     printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
+     printf("|");
+-- 
+2.54.0 (Apple Git-157)
+
