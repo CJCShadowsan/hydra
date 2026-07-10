@@ -4,6 +4,7 @@ mod decode_binary;
 mod distributed;
 mod glm_dsa_layer_microbench;
 mod glm_dsa_microbench_summary;
+mod glm_dsa_multi_session_batch;
 mod glm_dsa_op_report;
 mod glm_dsa_report_aggregate;
 mod local_single;

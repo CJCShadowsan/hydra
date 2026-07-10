@@ -115,6 +115,14 @@ pub fn glm_dsa_layer_microbench(args: GlmDsaLayerMicrobenchArgs) -> Result<()> {
     let input_frame = stage_wire_roundtrip
         .as_ref()
         .map_or(&input.frame, |roundtrip| &roundtrip.frame);
+    if args.multi_session_batch_parity {
+        return crate::glm_dsa_multi_session_batch::run_glm_dsa_multi_session_batch_parity(
+            &args,
+            &selected.absolute_paths,
+            &runtime_config,
+            input_frame,
+        );
+    }
     let candidate_warmup_source = native_indexshare_candidate_warmup_source(&args)?;
     let comparison = if args.compare_native_indexshare_producer_consumer {
         Some(run_native_indexshare_producer_consumer_comparison(
@@ -2234,6 +2242,13 @@ fn validate_args(args: &GlmDsaLayerMicrobenchArgs) -> Result<()> {
     if args.tokens == 0 {
         bail!("tokens must be greater than zero");
     }
+    if args.multi_session_batch_parity
+        && (args.tokens < 2 || args.position_start != 0 || args.kv_warmup_tokens != 0)
+    {
+        bail!(
+            "multi_session_batch_parity requires tokens>=2, position_start=0, and kv_warmup_tokens=0"
+        );
+    }
     if args.iterations == 0 {
         bail!("iterations must be greater than zero");
     }
@@ -2823,7 +2838,7 @@ fn package_request(args: &GlmDsaLayerMicrobenchArgs) -> PackageStageRequest {
     package_request_for_range(args, args.layer_start, args.layer_end)
 }
 
-fn package_request_for_range(
+pub(super) fn package_request_for_range(
     args: &GlmDsaLayerMicrobenchArgs,
     layer_start: u32,
     layer_end: u32,
@@ -2844,7 +2859,7 @@ fn runtime_config(args: &GlmDsaLayerMicrobenchArgs) -> Result<RuntimeConfig> {
     runtime_config_for_range(args, args.layer_start, args.layer_end)
 }
 
-fn runtime_config_for_range(
+pub(super) fn runtime_config_for_range(
     args: &GlmDsaLayerMicrobenchArgs,
     layer_start: u32,
     layer_end: u32,
@@ -10028,6 +10043,7 @@ mod tests {
             ctx_size: 4096,
             activation_width: 4,
             tokens: 1,
+            multi_session_batch_parity: false,
             position_start: 0,
             kv_warmup_tokens: 0,
             kv_warmup_chunk_tokens: None,

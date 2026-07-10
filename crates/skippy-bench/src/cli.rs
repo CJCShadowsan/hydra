@@ -338,6 +338,13 @@ pub struct GlmDsaLayerMicrobenchArgs {
     pub tokens: usize,
     #[arg(
         long,
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Compare independent GLM-DSA sessions executed serially against one native llama decode batch. --tokens selects the session count."
+    )]
+    pub multi_session_batch_parity: bool,
+    #[arg(
+        long,
         default_value_t = 0,
         help = "Starting token position for GLM-DSA layer microbench inputs."
     )]

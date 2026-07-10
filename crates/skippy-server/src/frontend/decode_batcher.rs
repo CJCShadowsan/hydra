@@ -6,7 +6,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::*;
@@ -21,6 +21,7 @@ struct DecodeBatcherShared {
     state: Mutex<DecodeBatcherState>,
     ready: Condvar,
     max_batch_size: usize,
+    collection_window: Duration,
     owner_count: AtomicUsize,
 }
 
@@ -54,6 +55,7 @@ impl DecodeBatcher {
             state: Mutex::new(DecodeBatcherState::default()),
             ready: Condvar::new(),
             max_batch_size: max_batch_size.max(1),
+            collection_window: crate::decode_batch_policy::collection_window(max_batch_size),
             owner_count: AtomicUsize::new(1),
         });
         let worker = Arc::downgrade(&shared);
@@ -133,8 +135,33 @@ impl DecodeBatcherShared {
         if state.pending.is_empty() && state.stopping {
             return None;
         }
+        state = self.collect_until_deadline(state);
         let batch_size = self.max_batch_size.min(state.pending.len());
         Some(state.pending.drain(..batch_size).collect())
+    }
+
+    fn collect_until_deadline<'a>(
+        &self,
+        mut state: std::sync::MutexGuard<'a, DecodeBatcherState>,
+    ) -> std::sync::MutexGuard<'a, DecodeBatcherState> {
+        if self.collection_window.is_zero() || state.pending.len() >= self.max_batch_size {
+            return state;
+        }
+        let deadline = Instant::now() + self.collection_window;
+        while !state.stopping && state.pending.len() < self.max_batch_size {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .expect("decode batcher lock poisoned");
+            state = next;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        state
     }
 
     fn run_batch(&self, batch: Vec<PendingDecode>) {
