@@ -38,12 +38,32 @@ target/release/skippy-bench chat-corpus \
   --enable-thinking false \
   --output "$output"
 
-jq '{
+jq '
+([.results[] | select(.completion_tokens > 0) | .completion_tokens - 1] | add // 0) as $decode_tokens |
+(
+  if .concurrency_depth == 1 then
+    ([.results[] | select(.ttft_ms != null) | .elapsed_ms - .ttft_ms] | add // 0)
+  elif .concurrency_depth >= .request_count then
+    (([.results[].elapsed_ms] | max // 0) - ([.results[].ttft_ms | select(. != null)] | min // 0))
+  else
+    null
+  end
+) as $decode_wall_ms |
+{
   request_count,
   concurrency_depth,
   completion_tokens: .summary.completion_tokens,
   total_wall_ms: .summary.total_wall_ms,
   completion_tok_s: .summary.completion_tok_s,
+  aggregate_decode_tokens: $decode_tokens,
+  aggregate_decode_wall_ms: $decode_wall_ms,
+  aggregate_decode_tok_s: (
+    if $decode_wall_ms != null and $decode_wall_ms > 0 then
+      $decode_tokens * 1000 / $decode_wall_ms
+    else
+      null
+    end
+  ),
   ttft_ms_p50: .summary.ttft_ms_p50,
   ttft_ms_p95: .summary.ttft_ms_p95,
   errors: .summary.errors,
