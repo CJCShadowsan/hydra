@@ -72,6 +72,7 @@ use crate::{
 mod admission;
 mod backend;
 mod decode_batcher;
+mod decode_scheduler;
 mod embedded_execution;
 mod embedded_generation;
 mod generation_flow;
@@ -92,6 +93,7 @@ mod wire_messages;
 use self::{
     admission::{GenerationTokenBudget, GenerationTokenBudgetRequest},
     decode_batcher::DecodeBatcher,
+    decode_scheduler::*,
     native_mtp::*,
     prefill::*,
     request::*,

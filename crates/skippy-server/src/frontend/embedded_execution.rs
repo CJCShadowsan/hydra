@@ -3,6 +3,14 @@ use super::*;
 const DIRECT_RETURN_FALLBACK_POLL: Duration = Duration::from_millis(10);
 const DIRECT_RETURN_FALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
+pub(super) struct DispatchedEmbeddedStage {
+    started: Instant,
+    stats: StageReplyStats,
+    execution: EmbeddedExecutionStats,
+    message_kind: WireMessageKind,
+    token_count: i32,
+}
+
 impl StageOpenAiBackend {
     pub(super) fn execute_embedded_stage_message(
         &self,
@@ -13,7 +21,25 @@ impl StageOpenAiBackend {
         token_ids: &[i32],
         expected_reply: WireReplyKind,
     ) -> OpenAiResult<EmbeddedStageExecution> {
-        let timer = PhaseTimer::start();
+        let dispatched = self.dispatch_embedded_stage_message(
+            request,
+            downstream,
+            session_key,
+            message,
+            token_ids,
+        )?;
+        self.complete_dispatched_stage_message(request, downstream, dispatched, expected_reply)
+    }
+
+    pub(super) fn dispatch_embedded_stage_message(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        downstream: &mut TcpStream,
+        session_key: &str,
+        message: &StageWireMessage,
+        token_ids: &[i32],
+    ) -> OpenAiResult<DispatchedEmbeddedStage> {
+        let started = Instant::now();
         let mut stats = StageReplyStats::default();
         let stage0_timer = PhaseTimer::start();
         let output = {
@@ -83,29 +109,10 @@ impl StageOpenAiBackend {
         )
         .map_err(openai_io_error)?;
         let forward_write_ms = write_timer.elapsed_ms();
-        let wait_timer = PhaseTimer::start();
-        let reply = receive_embedded_stage_reply(
-            downstream,
-            request.prediction_return.as_ref(),
-            expected_reply,
-        )?;
-        let downstream_wait_ms = wait_timer.elapsed_ms();
-        stats.merge(reply.stats);
-        if message.kind == WireMessageKind::VerifyWindow {
-            stats.verify_window_compute_us += ms_to_us(stage0_compute_ms);
-            stats.verify_window_forward_write_us += ms_to_us(forward_write_ms);
-            stats.verify_window_downstream_wait_us += ms_to_us(downstream_wait_ms);
-            stats.verify_window_total_us += ms_to_us(timer.elapsed_ms());
-            stats.verify_window_stage_count += 1;
-            stats.verify_window_request_count += 1;
-            stats.verify_window_token_count += i64::from(message.token_count.max(0));
-            stats.verify_window_max_tokens = stats
-                .verify_window_max_tokens
-                .max(i64::from(message.token_count.max(0)));
-        }
-        Ok(EmbeddedStageExecution {
-            reply: StageReply { stats, ..reply },
-            stats: EmbeddedExecutionStats {
+        Ok(DispatchedEmbeddedStage {
+            started,
+            stats,
+            execution: EmbeddedExecutionStats {
                 stage0_compute_ms,
                 runtime_lock_wait_ms: output.runtime_lock_wait_ms,
                 runtime_lock_hold_ms: output.runtime_lock_hold_ms,
@@ -113,9 +120,52 @@ impl StageOpenAiBackend {
                 output_activation_bytes: output.output.payload.len(),
                 forward_activation_bytes: forwarded.message.activation.len(),
                 forward_write_ms,
-                downstream_wait_ms,
+                downstream_wait_ms: 0.0,
             },
-            elapsed_ms: timer.elapsed_ms(),
+            message_kind: message.kind,
+            token_count: message.token_count,
+        })
+    }
+
+    pub(super) fn complete_dispatched_stage_message(
+        &self,
+        request: &EmbeddedStageZeroGeneration<'_>,
+        downstream: &mut TcpStream,
+        mut dispatched: DispatchedEmbeddedStage,
+        expected_reply: WireReplyKind,
+    ) -> OpenAiResult<EmbeddedStageExecution> {
+        let wait_timer = PhaseTimer::start();
+        let reply = receive_embedded_stage_reply(
+            downstream,
+            request.prediction_return.as_ref(),
+            expected_reply,
+        )?;
+        dispatched.execution.downstream_wait_ms = wait_timer.elapsed_ms();
+        dispatched.stats.merge(reply.stats);
+        if dispatched.message_kind == WireMessageKind::VerifyWindow {
+            dispatched.stats.verify_window_compute_us +=
+                ms_to_us(dispatched.execution.stage0_compute_ms);
+            dispatched.stats.verify_window_forward_write_us +=
+                ms_to_us(dispatched.execution.forward_write_ms);
+            dispatched.stats.verify_window_downstream_wait_us +=
+                ms_to_us(dispatched.execution.downstream_wait_ms);
+            dispatched.stats.verify_window_total_us +=
+                ms_to_us(dispatched.started.elapsed().as_secs_f64() * 1000.0);
+            dispatched.stats.verify_window_stage_count += 1;
+            dispatched.stats.verify_window_request_count += 1;
+            dispatched.stats.verify_window_token_count += i64::from(dispatched.token_count.max(0));
+            dispatched.stats.verify_window_max_tokens = dispatched
+                .stats
+                .verify_window_max_tokens
+                .max(i64::from(dispatched.token_count.max(0)));
+        }
+        Ok(EmbeddedStageExecution {
+            reply: StageReply {
+                stats: dispatched.stats,
+                ..reply
+            },
+            stats: dispatched.execution,
+            elapsed_ms: dispatched.started.elapsed().as_secs_f64() * 1000.0,
         })
     }
 
