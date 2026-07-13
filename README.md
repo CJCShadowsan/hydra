@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/hydra/hydra-logo.svg" alt="Hydra logo" width="180">
+</p>
+
 <h1 align="center">Hydra</h1>
 
 Hydra is a downstream fork of [Mesh LLM](https://github.com/Mesh-LLM/mesh-llm)

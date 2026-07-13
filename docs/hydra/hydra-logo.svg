@@ -1,0 +1,65 @@
+<svg width="320" height="320" viewBox="0 0 320 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Hydra logo</title>
+  <desc id="desc">Three stylized Hydra heads rising from a connected network core.</desc>
+  <defs>
+    <linearGradient id="badge" x1="64" y1="38" x2="274" y2="294" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102033"/>
+      <stop offset="0.58" stop-color="#0b1728"/>
+      <stop offset="1" stop-color="#06111f"/>
+    </linearGradient>
+    <linearGradient id="leftHead" x1="55" y1="56" x2="136" y2="176" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6ee7b7"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="centerHead" x1="131" y1="30" x2="190" y2="179" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#a7f3d0"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <linearGradient id="rightHead" x1="185" y1="58" x2="267" y2="181" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <linearGradient id="core" x1="98" y1="142" x2="221" y2="257" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#60a5fa"/>
+      <stop offset="0.52" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#34d399"/>
+    </linearGradient>
+    <filter id="softShadow" x="-24" y="-24" width="368" height="368" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#020617" flood-opacity="0.32"/>
+    </filter>
+  </defs>
+
+  <rect x="22" y="22" width="276" height="276" rx="68" fill="url(#badge)" filter="url(#softShadow)"/>
+  <path d="M72 246c28 24 61 36 99 36 36 0 66-10 91-31" fill="none" stroke="#13263a" stroke-width="18" stroke-linecap="round"/>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M112 198c-2-36-1-67 15-90 9-14 9-28-2-43" stroke="#0f766e" stroke-width="24" opacity="0.55"/>
+    <path d="M112 198c-2-36-1-67 15-90 9-14 9-28-2-43" stroke="url(#leftHead)" stroke-width="16"/>
+    <path d="M160 201c1-36 1-75 0-118" stroke="#15803d" stroke-width="25" opacity="0.5"/>
+    <path d="M160 201c1-36 1-75 0-118" stroke="url(#centerHead)" stroke-width="17"/>
+    <path d="M208 198c2-36 1-67-15-90-9-14-9-28 2-43" stroke="#0369a1" stroke-width="24" opacity="0.5"/>
+    <path d="M208 198c2-36 1-67-15-90-9-14-9-28 2-43" stroke="url(#rightHead)" stroke-width="16"/>
+  </g>
+
+  <g>
+    <path d="M106 58c-24-1-42 15-47 40 21-4 40 3 54 20 13-20 12-44-7-60Z" fill="url(#leftHead)"/>
+    <path d="M160 38c-23 9-35 29-30 55 17-13 43-13 60 0 5-26-7-46-30-55Z" fill="url(#centerHead)"/>
+    <path d="M214 58c24-1 42 15 47 40-21-4-40 3-54 20-13-20-12-44 7-60Z" fill="url(#rightHead)"/>
+    <path d="M86 89h18M216 89h18M150 70h20" stroke="#052e2b" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="91" cy="83" r="4" fill="#ecfeff"/>
+    <circle cx="153" cy="63" r="4" fill="#ecfdf5"/>
+    <circle cx="229" cy="83" r="4" fill="#eff6ff"/>
+  </g>
+
+  <g stroke-linecap="round" stroke-linejoin="round">
+    <path d="M160 130l58 33v66l-58 33-58-33v-66l58-33Z" fill="#071626" stroke="url(#core)" stroke-width="6"/>
+    <path d="M160 130v132M102 163l116 66M218 163l-116 66" fill="none" stroke="#1f8a9b" stroke-width="3" opacity="0.72"/>
+    <circle cx="160" cy="130" r="8" fill="#d1fae5" stroke="#34d399" stroke-width="3"/>
+    <circle cx="218" cy="163" r="8" fill="#dbeafe" stroke="#60a5fa" stroke-width="3"/>
+    <circle cx="218" cy="229" r="8" fill="#ccfbf1" stroke="#2dd4bf" stroke-width="3"/>
+    <circle cx="160" cy="262" r="8" fill="#dcfce7" stroke="#22c55e" stroke-width="3"/>
+    <circle cx="102" cy="229" r="8" fill="#ccfbf1" stroke="#2dd4bf" stroke-width="3"/>
+    <circle cx="102" cy="163" r="8" fill="#dbeafe" stroke="#60a5fa" stroke-width="3"/>
+    <circle cx="160" cy="196" r="13" fill="#0b1728" stroke="#a7f3d0" stroke-width="5"/>
+  </g>
+</svg>
