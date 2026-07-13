@@ -14,6 +14,12 @@ pub(crate) enum ConfiguredExternalPlugin {
 pub(crate) fn configured_external_plugin_spec(
     entry: &PluginConfigEntry,
 ) -> Result<ConfiguredExternalPlugin> {
+    if entry.url.is_some() && !entry.urls.is_empty() {
+        bail!(
+            "Plugin '{}' cannot set both `url` and `urls`; use one or the other",
+            entry.name
+        );
+    }
     let startup = PluginStartupOptions::from_config(&entry.startup);
     let command = entry
         .command
@@ -40,6 +46,7 @@ pub(crate) fn configured_external_plugin_spec(
         command,
         args: entry.args.clone(),
         url: entry.url.clone(),
+        urls: entry.urls.clone(),
         env: BTreeMap::new(),
         startup,
     }))
@@ -112,6 +119,7 @@ fn installed_plugin_spec(metadata: &InstalledPluginMetadata) -> ExternalPluginSp
         command: installed_plugin_command(metadata).display().to_string(),
         args: Vec::new(),
         url: None,
+        urls: Vec::new(),
         env: BTreeMap::new(),
         startup: PluginStartupOptions::default(),
     }

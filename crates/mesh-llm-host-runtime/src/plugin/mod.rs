@@ -1957,6 +1957,7 @@ mod tests {
                 command: Some("mesh-llm-plugin-demo".into()),
                 args: vec!["--stdio".into()],
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],
@@ -1981,6 +1982,7 @@ mod tests {
                 command: Some("mesh-llm-plugin-metrics".into()),
                 args: Vec::new(),
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: PluginStartupConfig {
                     connect_timeout_secs: Some(75),
@@ -2015,6 +2017,7 @@ mod tests {
                 command: None,
                 args: Vec::new(),
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: PluginStartupConfig {
                     optional: true,
@@ -2063,6 +2066,7 @@ mod tests {
                 command: None,
                 args: Vec::new(),
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],
@@ -2083,6 +2087,7 @@ mod tests {
                 command: Some("endpoint-plugin".into()),
                 args: Vec::new(),
                 url: Some("http://gpu-box:8000/v1".into()),
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],
@@ -2100,6 +2105,33 @@ mod tests {
     }
 
     #[test]
+    fn external_plugin_can_be_enabled_with_urls() {
+        let config = MeshConfig {
+            plugins: vec![PluginConfigEntry {
+                name: "endpoint-plugin".into(),
+                enabled: Some(true),
+                command: Some("endpoint-plugin".into()),
+                args: Vec::new(),
+                url: None,
+                urls: vec![
+                    "http://gpu-box-a:8000/v1".into(),
+                    "http://gpu-box-b:8000/v1".into(),
+                ],
+                settings: Default::default(),
+                startup: Default::default(),
+            }],
+            defaults: None,
+            ..MeshConfig::default()
+        };
+        let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+        let spec = &resolved.externals[0];
+        assert_eq!(
+            spec.urls,
+            ["http://gpu-box-a:8000/v1", "http://gpu-box-b:8000/v1"]
+        );
+    }
+
+    #[test]
     fn external_plugin_can_be_enabled_with_command_args() {
         let config = MeshConfig {
             plugins: vec![PluginConfigEntry {
@@ -2108,6 +2140,7 @@ mod tests {
                 command: Some("/opt/plugins/endpoint-plugin".into()),
                 args: vec!["--verbose".into()],
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],
@@ -2132,6 +2165,7 @@ mod tests {
                 command: None,
                 args: Vec::new(),
                 url: Some("http://gpu-box:8000/v1".into()),
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],
@@ -2166,6 +2200,7 @@ mod tests {
                 command: Some("/tmp/demo".into()),
                 args: vec!["--flag".into()],
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],
@@ -2187,6 +2222,7 @@ mod tests {
                 command: "mesh-llm-definitely-missing-plugin-binary".into(),
                 args: vec!["--stdio".into()],
                 url: None,
+                urls: Vec::new(),
                 env: BTreeMap::new(),
                 startup: PluginStartupOptions::default(),
             }],
@@ -2214,6 +2250,7 @@ mod tests {
                 command: "mesh-llm-definitely-missing-plugin-binary".into(),
                 args: Vec::new(),
                 url: None,
+                urls: Vec::new(),
                 env: BTreeMap::new(),
                 startup: PluginStartupOptions {
                     optional: true,

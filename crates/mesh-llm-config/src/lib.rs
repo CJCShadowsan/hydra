@@ -268,7 +268,7 @@ ctx_size = 4096
                 config
                     .upsert_plugin("endpoint-plugin")?
                     .enabled(true)
-                    .url("http://localhost:8000/v1");
+                    .urls(["http://localhost:8000/v1", "http://gpu-box:8000/v1"]);
                 config.upsert_external_plugin("custom-tool", "mesh-tool", ["--serve"])?;
                 Ok(())
             })
@@ -280,8 +280,11 @@ ctx_size = 4096
                 .plugins
                 .iter()
                 .find(|plugin| plugin.name == "endpoint-plugin")
-                .and_then(|plugin| plugin.url.as_deref()),
-            Some("http://localhost:8000/v1")
+                .map(|plugin| plugin.urls.clone()),
+            Some(vec![
+                "http://localhost:8000/v1".to_string(),
+                "http://gpu-box:8000/v1".to_string(),
+            ])
         );
         assert!(fs::read_to_string(path).unwrap().contains("[[plugin]]"));
     }
@@ -622,6 +625,10 @@ gpu_id = "pci:0000:65:00.0"
                 vec!["plugin.<plugin-name>.args"],
             ),
             ("PluginConfigEditor::url", vec!["plugin.<plugin-name>.url"]),
+            (
+                "PluginConfigEditor::urls",
+                vec!["plugin.<plugin-name>.urls"],
+            ),
             (
                 "PluginConfigEditor::connect_timeout_secs",
                 vec!["plugin.<plugin-name>.startup.connect_timeout_secs"],

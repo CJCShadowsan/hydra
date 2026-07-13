@@ -271,6 +271,8 @@ pub struct ExternalPluginSpec {
     pub args: Vec<String>,
     /// Optional plugin URL passed through the generic plugin launch contract.
     pub url: Option<String>,
+    /// Optional plugin URLs passed through `MESH_LLM_PLUGIN_URLS`.
+    pub urls: Vec<String>,
     /// Extra environment passed only to the plugin process.
     pub env: BTreeMap<String, String>,
     pub startup: PluginStartupOptions,
@@ -341,6 +343,7 @@ pub fn blobstore_plugin_spec() -> Result<ExternalPluginSpec> {
             BLOBSTORE_PLUGIN_ID.into(),
         ],
         url: None,
+        urls: Vec::new(),
         env: BTreeMap::new(),
         startup: PluginStartupOptions::default(),
     })

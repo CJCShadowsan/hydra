@@ -733,6 +733,9 @@ name = "openai-endpoint"
 url = "http://localhost:8000/api/v1"
 ```
 
+Use `urls = ["http://localhost:8000/api/v1", "http://gpu-box:8000/v1"]`
+to configure multiple OpenAI-compatible endpoints in one plugin instance.
+
 If you are running the plugin binary yourself instead of using
 `mesh-llm plugins install`, set `command = "openai-endpoint"` in the same
 plugin block.
@@ -766,7 +769,8 @@ Notes:
 
 - mesh-llm does not start or supervise Lemonade; run it separately with the Desktop app or CLI.
 - Use the exact model ID returned by Lemonade's `/api/v1/models`.
-- mesh-llm passes the configured URL to the plugin through `MESH_LLM_PLUGIN_URL`.
+- mesh-llm passes `url` through `MESH_LLM_PLUGIN_URL` and `urls` through
+  `MESH_LLM_PLUGIN_URLS`.
 
 Useful model commands:
 

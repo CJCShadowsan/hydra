@@ -489,6 +489,7 @@ impl ConfigEditor {
                     command: None,
                     args: Vec::new(),
                     url: None,
+                    urls: Vec::new(),
                     settings: Default::default(),
                     startup: Default::default(),
                 });
@@ -694,6 +695,11 @@ impl PluginConfigEditor<'_> {
 
     pub fn url(&mut self, url: impl Into<String>) -> &mut Self {
         self.plugin.url = Some(url.into());
+        self
+    }
+
+    pub fn urls(&mut self, urls: impl IntoIterator<Item = impl Into<String>>) -> &mut Self {
+        self.plugin.urls = urls.into_iter().map(Into::into).collect();
         self
     }
 

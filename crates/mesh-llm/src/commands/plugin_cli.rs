@@ -153,6 +153,7 @@ fn resolve_installed_cli_plugin(command: &str) -> Result<Option<plugin::External
         command: executable.display().to_string(),
         args: Vec::new(),
         url: None,
+        urls: Vec::new(),
         env: Default::default(),
         startup: Default::default(),
     }))

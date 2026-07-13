@@ -2049,6 +2049,7 @@ alias = "model-alias"
                 command: Some("mesh-llm".to_string()),
                 args: vec!["--plugin".to_string()],
                 url: None,
+                urls: Vec::new(),
                 settings: Default::default(),
                 startup: Default::default(),
             }],

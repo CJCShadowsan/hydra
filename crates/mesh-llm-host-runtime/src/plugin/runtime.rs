@@ -155,6 +155,11 @@ impl ExternalPlugin {
         if let Some(ref url) = self.spec.url {
             child.env("MESH_LLM_PLUGIN_URL", url);
         }
+        if !self.spec.urls.is_empty() {
+            let urls = serde_json::to_string(&self.spec.urls)
+                .expect("plugin endpoint URLs should always serialize");
+            child.env("MESH_LLM_PLUGIN_URLS", urls);
+        }
         for (key, value) in &self.spec.env {
             child.env(key, value);
         }

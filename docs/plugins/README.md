@@ -63,6 +63,7 @@ details through environment variables:
 | `MESH_LLM_PLUGIN_TRANSPORT` | Transport kind, such as `unix` or `pipe` |
 | `MESH_LLM_PLUGIN_NAME` | Configured plugin name |
 | `MESH_LLM_PLUGIN_URL` | Optional `[[plugin]].url` value from config |
+| `MESH_LLM_PLUGIN_URLS` | Optional `[[plugin]].urls` values as a JSON array |
 
 Plugin-specific configuration should live in the plugin process or use generic
 plugin config fields. The host should not special-case behavior for a plugin by

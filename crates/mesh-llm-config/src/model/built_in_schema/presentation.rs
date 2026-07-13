@@ -742,6 +742,16 @@ fn model_and_plugin_presentation(rendered: &str) -> Option<SettingPresentation> 
             .placeholder("http://localhost:8000/v1")
             .hint("text"),
         ),
+        "plugin.<plugin-name>.urls" => Some(
+            sp(
+                "Base URLs",
+                "URLs used by endpoint-style plugins.",
+                PLUGIN_HOST_CATEGORY,
+                21,
+            )
+            .placeholder("[\"http://localhost:8000/v1\"]")
+            .hint("text"),
+        ),
         "plugin.<plugin-name>.command" => Some(
             sp(
                 "Plugin command",

@@ -271,6 +271,12 @@ fn plugin_entry_settings() -> Vec<ConfigSettingSchema> {
         ),
         plugin_setting(&format!("{plugin_prefix}.url"), ConfigValueSchema::Url),
         plugin_setting(
+            &format!("{plugin_prefix}.urls"),
+            ConfigValueSchema::Array {
+                items: Box::new(ConfigValueSchema::Url),
+            },
+        ),
+        plugin_setting(
             &format!("{plugin_prefix}.startup.connect_timeout_secs"),
             ConfigValueSchema::Integer,
         ),
