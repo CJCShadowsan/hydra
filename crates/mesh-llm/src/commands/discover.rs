@@ -44,8 +44,9 @@ async fn run_nostr_discover(
     relays: Vec<String>,
 ) -> Result<()> {
     let relays = discovery::nostr_relays(&relays);
+    let app_id = discovery::discovery_app_id();
 
-    eprintln!("🔍 Searching Nostr relays for mesh-llm meshes...");
+    eprintln!("🔍 Searching Nostr relays for {app_id} meshes...");
     let meshes = nostr::discover(&relays, &filter, None).await?;
 
     if meshes.is_empty() {
@@ -110,13 +111,13 @@ async fn run_nostr_discover(
         let best = &meshes[0];
         eprintln!("Auto-joining best match: {}", best);
         eprintln!("\nRun:");
-        eprintln!("  mesh-llm --join {}", best.listing.invite_token);
+        eprintln!("  {app_id} --join {}", best.listing.invite_token);
         println!("{}", best.listing.invite_token);
     } else {
         eprintln!("To join a mesh:");
-        eprintln!("  mesh-llm --join <token>");
-        eprintln!("  mesh-llm --discover <name>       # join by mesh name");
-        eprintln!("  mesh-llm client --discover <name> # join as client by mesh name");
+        eprintln!("  {app_id} --join <token>");
+        eprintln!("  {app_id} --discover <name>       # join by mesh name");
+        eprintln!("  {app_id} client --discover <name> # join as client by mesh name");
     }
 
     Ok(())
@@ -128,9 +129,10 @@ async fn run_lan_discover(
     supplied_join_tokens: Vec<String>,
 ) -> Result<()> {
     let supplied_join_token = supplied_join_tokens.first().map(String::as_str);
+    let app_id = discovery::discovery_app_id();
     eprintln!(
-        "Searching local LAN for mesh-llm meshes via {}...",
-        discovery::LAN_SERVICE_TYPE
+        "Searching local LAN for {app_id} meshes via {}...",
+        discovery::lan_service_type()
     );
     let meshes = discovery::discover_lan(
         &filter,
@@ -191,8 +193,8 @@ async fn run_lan_discover(
         }
     } else {
         eprintln!("To join a LAN mesh:");
-        eprintln!("  mesh-llm --join <token>");
-        eprintln!("  mesh-llm --join <token> discover --mesh-discovery-mode mdns --auto");
+        eprintln!("  {app_id} --join <token>");
+        eprintln!("  {app_id} --join <token> discover --mesh-discovery-mode mdns --auto");
     }
 
     Ok(())

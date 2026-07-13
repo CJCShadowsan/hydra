@@ -44,6 +44,32 @@ use std::path::Path;
 pub const BUILD_VERSION: &str = mesh_llm_build_info::BUILD_VERSION;
 pub const RELEASE_VERSION: &str = mesh_llm_build_info::RELEASE_VERSION;
 pub const VERSION: &str = RELEASE_VERSION;
+pub const UPSTREAM_DISCOVERY_APP_ID: &str = "mesh-llm";
+pub const HYDRA_DISCOVERY_APP_ID: &str = "hydra";
+
+pub fn discovery_app_id() -> &'static str {
+    static APP_ID: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    *APP_ID.get_or_init(|| {
+        discovery_app_id_from_env()
+            .or_else(discovery_app_id_from_exe)
+            .unwrap_or(UPSTREAM_DISCOVERY_APP_ID)
+    })
+}
+
+fn discovery_app_id_from_env() -> Option<&'static str> {
+    match std::env::var("MESH_LLM_DISCOVERY_APP_ID").ok()?.as_str() {
+        HYDRA_DISCOVERY_APP_ID => Some(HYDRA_DISCOVERY_APP_ID),
+        UPSTREAM_DISCOVERY_APP_ID => Some(UPSTREAM_DISCOVERY_APP_ID),
+        _ => None,
+    }
+}
+
+fn discovery_app_id_from_exe() -> Option<&'static str> {
+    let exe = std::env::current_exe().ok()?;
+    let stem = exe.file_stem()?.to_str()?;
+    stem.eq_ignore_ascii_case(HYDRA_DISCOVERY_APP_ID)
+        .then_some(HYDRA_DISCOVERY_APP_ID)
+}
 
 pub use runtime::{
     MeshGuardrailMode, RuntimeOptions, RuntimeSurface, console_session_mode_for_runtime_surface,

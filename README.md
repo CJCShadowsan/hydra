@@ -60,16 +60,16 @@ migration path.
 
 ## Quick Start
 
-Join the public mesh and start serving:
+Start a private Hydra mesh on this machine:
 
 ```bash
-hydra serve --auto
+hydra serve --model Qwen3-8B-Q4_K_M
 ```
 
-That command chooses a backend flavor, downloads a suitable model if needed,
-joins the best discovered public mesh, starts the OpenAI-compatible API on
-`http://localhost:9337/v1`, and starts the web console/management API on
-`http://localhost:3131`.
+That command loads the model locally, starts the OpenAI-compatible API on
+`http://localhost:9337/v1`, starts the web console/management API on
+`http://localhost:3131`, and prints an invite token for nodes you explicitly
+choose to add.
 
 Check available models:
 
@@ -89,8 +89,13 @@ For server deployments, add `--headless` to hide the web UI while keeping the
 management API on the `--console` port:
 
 ```bash
-hydra serve --auto --headless
+hydra serve --model Qwen3-8B-Q4_K_M --headless
 ```
+
+`hydra serve --auto` is still available, but Hydra now uses its own discovery
+namespace. It searches for Hydra Nostr publications and, in LAN mode, the
+`_hydra._tcp.local.` mDNS service. It should not auto-join ordinary upstream
+Mesh LLM discovery records.
 
 ## Enable Hydra Scheduling
 
@@ -112,7 +117,7 @@ unknown_remote_penalty_ms = 75
 Run with the config:
 
 ```bash
-hydra serve --auto --config hydra.toml
+hydra serve --model Qwen3-8B-Q4_K_M --config hydra.toml
 ```
 
 Inspect Hydra network cost and scheduler state:
@@ -181,11 +186,11 @@ API form and VAST deployment notes.
 
 | Goal | Command | Full guide |
 |---|---|---|
-| Try the public mesh | `hydra serve --auto` | [docs/MESHES.md](docs/MESHES.md) |
-| Start a private mesh | `hydra serve --model Qwen3-8B-Q4_K_M` | [docs/MESHES.md](docs/MESHES.md) |
+| Start a private Hydra mesh | `hydra serve --model Qwen3-8B-Q4_K_M` | [docs/MESHES.md](docs/MESHES.md) |
 | Publish your own mesh | `hydra serve --model Qwen3-8B-Q4_K_M --publish` | [docs/MESHES.md](docs/MESHES.md) |
 | Join by invite token | `hydra serve --join <token>` | [docs/MESHES.md](docs/MESHES.md) |
-| Run an API-only client | `hydra client --auto` | [docs/MESHES.md](docs/MESHES.md) |
+| Join Hydra public discovery | `hydra serve --auto` | [docs/MESHES.md](docs/MESHES.md) |
+| Run an API-only client by token | `hydra client --join <token>` | [docs/MESHES.md](docs/MESHES.md) |
 | Run a big model with splits | `hydra serve --model hf://meshllm/<repo>@<rev> --split` | [docs/SKIPPY_SPLITS.md](docs/SKIPPY_SPLITS.md) |
 | Place model/layer/cache artifacts | `hydra placement prefetch ...` | [docs/hydra/VAST_PLACEMENT.md](docs/hydra/VAST_PLACEMENT.md) |
 | Use Goose, OpenCode, Claude Code, or Pi | `hydra goose`, `hydra opencode`, `hydra claude`, `hydra pi` | [docs/AGENTS.md](docs/AGENTS.md) |
@@ -194,8 +199,10 @@ API form and VAST deployment notes.
 ## How Hydra Works
 
 - **Upstream mesh runtime.** Hydra inherits Mesh LLM's distributed runtime,
-  OpenAI-compatible API, public/private mesh discovery, model routing, and
-  Skippy stage splits.
+  OpenAI-compatible API, model routing, and Skippy stage splits.
+- **Hydra discovery namespace.** Hydra publishes and discovers Hydra records
+  under the `hydra` Nostr tag and `_hydra._tcp.local.` LAN service so automatic
+  discovery does not join ordinary upstream Mesh LLM records.
 - **Hydra network telemetry.** Each node records bounded, local-only route and
   artifact cost observations. `/api/status` exposes summaries and compact
   advisory hints.

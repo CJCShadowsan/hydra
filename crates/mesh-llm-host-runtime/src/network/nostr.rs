@@ -1,6 +1,7 @@
-//! Publish and discover mesh-llm meshes via Nostr relays.
+//! Publish and discover meshes via Nostr relays.
 //!
-//! A running mesh publishes a replaceable event (kind 31990, d-tag "mesh-llm")
+//! A running mesh publishes a replaceable event (kind 31990) under the current
+//! discovery app id (`mesh-llm` for the upstream binary, `hydra` for Hydra)
 //! containing bootstrap metadata, a join token, served models, VRAM, node count, etc.
 //! Other nodes can discover available meshes and auto-join.
 
@@ -255,10 +256,11 @@ impl Publisher {
     pub async fn publish(&self, listing: &MeshListing, ttl_secs: u64) -> Result<()> {
         let expiration = Timestamp::now().as_secs() + ttl_secs;
         let content = serde_json::to_string(listing)?;
+        let service_tag = crate::discovery_app_id().to_string();
 
         let tags = vec![
-            Tag::custom(TagKind::Custom("d".into()), vec!["mesh-llm".to_string()]),
-            Tag::custom(TagKind::Custom("k".into()), vec!["mesh-llm".to_string()]),
+            Tag::custom(TagKind::Custom("d".into()), vec![service_tag.clone()]),
+            Tag::custom(TagKind::Custom("k".into()), vec![service_tag]),
             Tag::custom(
                 TagKind::Custom("expiration".into()),
                 vec![expiration.to_string()],
@@ -574,7 +576,7 @@ pub async fn discover(
         .kind(Kind::Custom(MESH_SERVICE_KIND))
         .custom_tag(
             SingleLetterTag::lowercase(Alphabet::K),
-            "mesh-llm".to_string(),
+            crate::discovery_app_id().to_string(),
         )
         .limit(100);
 
@@ -1062,16 +1064,17 @@ fn parse_discovered_mesh(event: &Event, now: u64) -> Option<DiscoveredMesh> {
 
 /// Is this mesh eligible for `--auto` when the user did not specify `--mesh-name`?
 ///
-/// `--auto` joins the default community mesh. Eligible listings are:
+/// `--auto` joins the default community mesh for the current discovery app id.
+/// Eligible listings are:
 ///   - unnamed (the implicit default), or
-///   - the blessed community name "mesh-llm".
+///   - a listing named after the current discovery app id.
 ///
 /// Any other named mesh is still publicly discoverable on Nostr, but it is
 /// not the default — the user must opt in by name via `--mesh-name`.
 pub fn is_auto_eligible(mesh: &DiscoveredMesh) -> bool {
     match mesh.listing.name.as_deref() {
         None => true,
-        Some(name) => name.eq_ignore_ascii_case("mesh-llm"),
+        Some(name) => name.eq_ignore_ascii_case(crate::discovery_app_id()),
     }
 }
 
@@ -1085,10 +1088,8 @@ pub fn score_mesh(mesh: &DiscoveredMesh, _now_secs: u64, last_mesh_id: Option<&s
     // The canonical community mesh is an unnamed listing (`name: None`) — that
     // is what you get by default when you don't pass `--mesh-name`, and it's
     // what the public relay shows today. Give it a bonus so it ranks above
-    // anything else in `--auto`. The literal name "mesh-llm" is treated as a
-    // defensive alias for the same thing: nothing in the wild publishes with
-    // that name right now, but older docs and test runs may, and if one ever
-    // appears it should rank alongside unnamed rather than below it.
+    // anything else in `--auto`. A listing named after the current discovery
+    // app id is treated as a defensive alias for the same thing.
     //
     // Other named meshes are excluded from `--auto` entirely by
     // `is_auto_eligible`, so they don't get a score adjustment here — when
@@ -1096,7 +1097,7 @@ pub fn score_mesh(mesh: &DiscoveredMesh, _now_secs: u64, last_mesh_id: Option<&s
     // and any bonus or penalty would skew ranking.
     match mesh.listing.name.as_deref() {
         None => score += 300,
-        Some(n) if n.eq_ignore_ascii_case("mesh-llm") => score += 300,
+        Some(n) if n.eq_ignore_ascii_case(crate::discovery_app_id()) => score += 300,
         Some(_) => {}
     }
 
@@ -1159,9 +1160,10 @@ pub fn smart_auto(
     let last_mesh_id = crate::mesh::load_last_mesh_id();
 
     // If target name is set, only consider meshes with that exact name.
-    // Otherwise `--auto` considers only the community mesh: unnamed listings
-    // plus the blessed name "mesh-llm". Other named meshes are still publicly
-    // discoverable on Nostr but must be opted into by name via `--mesh-name`.
+    // Otherwise `--auto` considers only the current app's community mesh:
+    // unnamed listings plus the current discovery app id. Other named meshes
+    // are still publicly discoverable on Nostr but must be opted into by name
+    // via `--mesh-name`.
     let candidates: Vec<&DiscoveredMesh> = if let Some(target) = target_name {
         meshes
             .iter()

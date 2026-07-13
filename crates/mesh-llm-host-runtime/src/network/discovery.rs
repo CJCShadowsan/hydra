@@ -9,6 +9,7 @@ pub(crate) use crate::discovery::{DiscoveryScope, MeshDiscoveryMode};
 use crate::network::nostr;
 
 pub const LAN_SERVICE_TYPE: &str = "_mesh-llm._tcp.local.";
+pub const HYDRA_LAN_SERVICE_TYPE: &str = "_hydra._tcp.local.";
 pub(crate) const LAN_DETAILS_PATH: &str = "/api/discovery/lan-details";
 const TXT_SCHEMA_VERSION: u8 = 1;
 const TXT_LIST_SEPARATOR: char = '|';
@@ -18,6 +19,13 @@ const LAN_INVITE_TOKEN_FINGERPRINT_DOMAIN: &[u8] = b"mesh-llm-lan-invite-token-v
 const LAN_DETAILS_CHALLENGE_DOMAIN: &[u8] = b"mesh-llm-lan-details-challenge-v1\0";
 const LAN_DETAILS_TOKEN_PROOF_DOMAIN: &[u8] = b"mesh-llm-lan-details-proof-v1\0";
 const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub fn lan_service_type() -> &'static str {
+    match crate::discovery_app_id() {
+        crate::HYDRA_DISCOVERY_APP_ID => HYDRA_LAN_SERVICE_TYPE,
+        _ => LAN_SERVICE_TYPE,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,7 +134,7 @@ impl LanMeshAdvertisement {
 
     pub(crate) fn to_txt_properties(&self) -> Result<Vec<(String, String)>> {
         let mut txt = vec![
-            ("svc".to_string(), "mesh-llm".to_string()),
+            ("svc".to_string(), crate::discovery_app_id().to_string()),
             ("schema".to_string(), TXT_SCHEMA_VERSION.to_string()),
             ("join".to_string(), "token-fingerprint".to_string()),
             ("nodes".to_string(), self.node_count.to_string()),
@@ -307,7 +315,7 @@ impl LanDetailsResponse {
             mode: MeshDiscoveryMode::Mdns.as_str(),
             scope: MeshDiscoveryMode::Mdns.scope(),
             source: MeshDiscoveryMode::Mdns.source(),
-            service_type: LAN_SERVICE_TYPE,
+            service_type: lan_service_type(),
             listing,
             token_fingerprint,
             join_material: LanJoinMaterial::RequiresSuppliedToken,
@@ -336,7 +344,10 @@ pub(crate) async fn publish_lan_loop(node: crate::mesh::Node, config: LanPublish
 
     let instance_name = lan_instance_name(&node).await;
     let host_name = format!("{instance_name}.local.");
-    eprintln!("Publishing mesh on local LAN via mDNS ({LAN_SERVICE_TYPE})");
+    eprintln!(
+        "Publishing mesh on local LAN via mDNS ({})",
+        lan_service_type()
+    );
 
     let mut last_reported = None;
     loop {
@@ -519,11 +530,12 @@ pub async fn discover_lan_on_interface(
 ) -> Result<Vec<LanDiscoveredMesh>> {
     let daemon = ServiceDaemon::new().context("create mDNS daemon")?;
     restrict_daemon_to_interface(&daemon, lan_ip);
-    let receiver = match daemon.browse(LAN_SERVICE_TYPE) {
+    let service_type = lan_service_type();
+    let receiver = match daemon.browse(service_type) {
         Ok(receiver) => receiver,
         Err(err) => {
             shutdown_lan_daemon(daemon).await;
-            return Err(anyhow::Error::new(err).context(format!("browse {LAN_SERVICE_TYPE}")));
+            return Err(anyhow::Error::new(err).context(format!("browse {service_type}")));
         }
     };
     let deadline = tokio::time::Instant::now() + timeout;
@@ -561,7 +573,7 @@ async fn next_resolved_lan_service(
 
 async fn stop_lan_browse(receiver: mdns_sd::Receiver<ServiceEvent>, daemon: ServiceDaemon) {
     drop(receiver);
-    if let Err(err) = daemon.stop_browse(LAN_SERVICE_TYPE) {
+    if let Err(err) = daemon.stop_browse(lan_service_type()) {
         tracing::debug!("Failed to stop mDNS LAN browse before daemon shutdown: {err}");
     }
     shutdown_lan_daemon(daemon).await;
@@ -795,7 +807,7 @@ fn lan_discovered_mesh(
         mode: MeshDiscoveryMode::Mdns.as_str(),
         scope: MeshDiscoveryMode::Mdns.scope(),
         source: MeshDiscoveryMode::Mdns.source(),
-        service_type: LAN_SERVICE_TYPE,
+        service_type: lan_service_type(),
         instance_name: service.get_fullname().to_string(),
         host: service.get_hostname().to_string(),
         port: service.get_port(),
@@ -901,7 +913,7 @@ async fn lan_instance_name(node: &crate::mesh::Node) -> String {
     // nodes sharing an instance name would clobber each other in mDNS, hiding
     // peers from reverse-dial. Use the node's endpoint id, which is unique.
     let suffix = sanitize_dns_label(&node.id().fmt_short().to_string());
-    format!("mesh-llm-{suffix}")
+    format!("{}-{suffix}", crate::discovery_app_id())
 }
 
 fn service_info_for_advertisement(
@@ -912,7 +924,7 @@ fn service_info_for_advertisement(
 ) -> Result<ServiceInfo> {
     let txt = advert.to_txt_properties()?;
     ServiceInfo::new(
-        LAN_SERVICE_TYPE,
+        lan_service_type(),
         instance_name,
         host_name,
         "",
@@ -924,9 +936,10 @@ fn service_info_for_advertisement(
 }
 
 fn parse_txt_properties(props: &HashMap<&str, &str>) -> Result<LanMeshAdvertisement> {
+    let expected_app_id = crate::discovery_app_id();
     anyhow::ensure!(
-        props.get("svc") == Some(&"mesh-llm"),
-        "not a mesh-llm advertisement"
+        props.get("svc").copied() == Some(expected_app_id),
+        "not a {expected_app_id} advertisement"
     );
     let schema = props
         .get("schema")

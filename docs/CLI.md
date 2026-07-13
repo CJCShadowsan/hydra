@@ -3,6 +3,9 @@
 Hydra users should run these commands with `hydra`. This guide is inherited
 from upstream Mesh LLM and may still show `mesh-llm` in examples while the fork
 is being renamed incrementally.
+Hydra discovery is namespaced: `hydra --auto`, `hydra serve --auto`, and
+`hydra client --auto` search Hydra discovery records, not ordinary upstream
+Mesh LLM records.
 
 This is a practical user guide to Hydra's inherited Mesh LLM CLI surface.
 It explains what to run for common tasks, then documents each command and switch.

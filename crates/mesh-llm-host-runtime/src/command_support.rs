@@ -11,9 +11,12 @@ pub mod discovery {
         };
     }
 
+    pub use crate::discovery_app_id;
     pub use crate::discovery::{DiscoveryScope, MeshDiscoveryMode};
     pub use crate::mesh::load_last_mesh_id;
-    pub use crate::network::discovery::{LAN_SERVICE_TYPE, LanDiscoveredMesh, discover_lan};
+    pub use crate::network::discovery::{
+        LAN_SERVICE_TYPE, LanDiscoveredMesh, discover_lan, lan_service_type,
+    };
     pub use crate::runtime::instance::{
         RuntimeProcessTarget, collect_runtime_stop_targets, runtime_root,
     };

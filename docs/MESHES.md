@@ -1,18 +1,45 @@
 # Mesh Workflows
 
-Mesh LLM nodes expose an OpenAI-compatible inference API on `9337` and a
+Hydra inherits Mesh LLM's mesh protocol and discovery surfaces. Hydra nodes
+expose an OpenAI-compatible inference API on `9337` and a
 management API plus optional web console on `3131`. A node can serve models,
 join as an API-only client, or do both.
 
-## Try the public mesh
+For Hydra-controlled deployments, start with a private mesh and add peers
+explicitly. `hydra serve --auto` uses Hydra's discovery namespace: Nostr
+publications tagged as `hydra`, and `_hydra._tcp.local.` for LAN mDNS. It should
+not auto-join ordinary upstream Mesh LLM discovery records.
+
+## Start a private Hydra mesh
 
 ```bash
-mesh-llm serve --auto
+hydra serve --model Qwen3-8B-Q4_K_M
 ```
 
-`--auto` discovers published meshes, chooses the best candidate, joins it, and
-starts serving if this machine has usable hardware. Use this when you just want
-the system to work end to end.
+This starts a private mesh, loads the requested model, opens the local API and
+console, and prints an invite token. Only nodes with the token can join.
+
+Join from another GPU node:
+
+```bash
+hydra serve --join <token>
+```
+
+Join from an API-only client:
+
+```bash
+hydra client --join <token>
+```
+
+## Optional public discovery
+
+```bash
+hydra serve --auto
+```
+
+`--auto` discovers published Hydra meshes, chooses the best candidate, joins it,
+and starts serving if this machine has usable hardware. It does not search the
+upstream `mesh-llm` Nostr tag or `_mesh-llm._tcp.local.` mDNS service.
 
 ## Immutable mesh requirements
 
@@ -42,13 +69,13 @@ private meshes still keep the older unsigned invite-token path.
 Create an unrestricted mesh:
 
 ```bash
-mesh-llm serve --model Qwen3-8B-Q4_K_M
+hydra serve --model Qwen3-8B-Q4_K_M
 ```
 
 Create a release-attestation-required public mesh:
 
 ```bash
-mesh-llm serve --model Qwen3-8B-Q4_K_M --publish \
+hydra serve --model Qwen3-8B-Q4_K_M --publish \
   --require-release-attestation \
   --release-signer-key ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   --owner-key ~/.mesh-llm/owner-keystore.json \
@@ -72,7 +99,7 @@ release_signer_keys = ["ed25519:0123456789abcdef0123456789abcdef0123456789abcdef
 Join via signed bootstrap token:
 
 ```bash
-mesh-llm serve --join <signed-bootstrap-token>
+hydra serve --join <signed-bootstrap-token>
 ```
 
 If a node does not satisfy the certified-build gate, the human-facing outcome is
@@ -86,28 +113,7 @@ recreate the mesh, republish it, and issue new signed bootstrap tokens.
 For an API-only node that does not serve models:
 
 ```bash
-mesh-llm client --auto
-```
-
-## Start a private mesh
-
-```bash
-mesh-llm serve --model Qwen3-8B-Q4_K_M
-```
-
-This starts a private mesh, loads the requested model, opens the local API and
-console, and prints an invite token. Only nodes with the token can join.
-
-Join from another GPU node:
-
-```bash
-mesh-llm serve --join <token>
-```
-
-Join from an API-only client:
-
-```bash
-mesh-llm client --join <token>
+hydra client --join <token>
 ```
 
 ### Multi-interface Linux and Docker hosts
@@ -209,7 +215,7 @@ The management API stays available even when the UI is hidden with
 `--headless`:
 
 ```bash
-mesh-llm serve --auto --headless
+hydra serve --model Qwen3-8B-Q4_K_M --headless
 curl -s http://localhost:3131/api/status | jq .
 curl -s http://localhost:3131/api/discover | jq .
 ```
