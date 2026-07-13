@@ -5,6 +5,7 @@ while allowing divergence for network-aware low-latency inference.
 
 Initial Hydra divergence:
 
+- Adds `hydra` as the primary CLI binary for this fork.
 - Adds Hydra-owned passive network cost tracking and compact advisory hints.
 - Adds shadow/active SLO-aware scheduler scoring for target selection.
 - Adds POSIX/S3 artifact placement with manifests, checksums, pin, evict, and

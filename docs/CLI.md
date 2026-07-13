@@ -1,20 +1,24 @@
 # CLI User Guide
 
-This is a practical user guide to the `mesh-llm` CLI.
+Hydra users should run these commands with `hydra`. This guide is inherited
+from upstream Mesh LLM and may still show `mesh-llm` in examples while the fork
+is being renamed incrementally.
+
+This is a practical user guide to Hydra's inherited Mesh LLM CLI surface.
 It explains what to run for common tasks, then documents each command and switch.
 
-Catalog id definition: a catalog id is the model id shown in `mesh-llm models recommended` (for example `Qwen3-0.6B-Q4_K_M`).
+Catalog id definition: a catalog id is the model id shown in `hydra models recommended` (for example `Qwen3-0.6B-Q4_K_M`).
 
 ## Get help
 
 ```bash
-mesh-llm --help
-mesh-llm <command> --help
-mesh-llm setup --help
-mesh-llm uninstall --help
-mesh-llm doctor --help
-mesh-llm models --help
-mesh-llm models <subcommand> --help
+hydra --help
+hydra <command> --help
+hydra setup --help
+hydra uninstall --help
+hydra doctor --help
+hydra models --help
+hydra models <subcommand> --help
 ```
 
 ## Start here (common tasks)
@@ -24,51 +28,51 @@ If you want to:
 1. Finish a fresh install:
 
 ```bash
-mesh-llm setup
+hydra setup
 ```
 
 2. Start serving on this machine:
 
 ```bash
-mesh-llm serve --model Qwen3-0.6B-Q4_K_M
+hydra serve --model Qwen3-0.6B-Q4_K_M
 ```
 
 3. Join the public mesh:
 
 ```bash
-mesh-llm serve --auto
+hydra serve --auto
 ```
 
 4. Find a model you can run:
 
 ```bash
-mesh-llm models search gemma --gguf
-mesh-llm models search smoll --mlx
+hydra models search gemma --gguf
+hydra models search smoll --mlx
 ```
 
 5. Inspect a model before downloading:
 
 ```bash
-mesh-llm models show unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
+hydra models show unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
 ```
 
 6. Download a model:
 
 ```bash
-mesh-llm models download unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
+hydra models download unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL
 ```
 
 7. Check what is already installed:
 
 ```bash
-mesh-llm models installed
+hydra models installed
 ```
 
 8. Remove the executable and setup-owned files:
 
 ```bash
-mesh-llm uninstall --dry-run
-mesh-llm uninstall --yes
+hydra uninstall --dry-run
+hydra uninstall --yes
 ```
 
 ## Runtime entrypoints (`serve` / `client`)
@@ -78,17 +82,17 @@ If you want to start serving, join a mesh, or run as an API-only client, start h
 Examples:
 
 ```bash
-mesh-llm setup
-mesh-llm serve
-mesh-llm serve --model Qwen3-0.6B-Q4_K_M
-mesh-llm client --auto
+hydra setup
+hydra serve
+hydra serve --model Qwen3-0.6B-Q4_K_M
+hydra client --auto
 ```
 
 ### `setup`
 
 Use this to finish a fresh install after the executable is on your `PATH`.
 
-`mesh-llm setup` downloads and configures the native runtime, can install and
+`hydra setup` downloads and configures the native runtime, can install and
 enable the background service on supported macOS and Linux machines, and only
 shows the GitHub star prompt when it is interactive and eligible. The star
 prompt defaults to Yes, and `--yes` or `--no-interactive` skip it without
@@ -98,11 +102,11 @@ service paths, commands, log locations, and detailed setup status.
 Usage:
 
 ```bash
-mesh-llm setup
-mesh-llm setup --service
-mesh-llm setup --no-service --skip-runtime
-mesh-llm setup --yes
-mesh-llm setup --verbose
+hydra setup
+hydra setup --service
+hydra setup --no-service --skip-runtime
+hydra setup --yes
+hydra setup --verbose
 ```
 
 Switches:
