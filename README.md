@@ -133,6 +133,99 @@ After shadow decisions look correct, switch to active mode:
 mode = "active"
 ```
 
+## Performance Tuning
+
+For local model/runtime tuning, start with Hydra's inherited benchmark tuner.
+It measures the already-downloaded model on the current machine, then can write
+the recommended runtime profile into `~/.mesh-llm/config.toml`:
+
+```bash
+hydra benchmark tune --model /models/qwen3-8b.gguf --apply
+```
+
+For a controlled sweep, pin the search space:
+
+```bash
+hydra benchmark tune --model /models/qwen3-8b.gguf \
+  --ctx-sizes 4096,8192,16384 \
+  --batch-sizes 1024,2048 \
+  --ubatch-sizes 256,512 \
+  --mmap-values auto,true,false \
+  --mlock-values true,false \
+  --flash-attention on,off \
+  --throughput-tolerance-pct 2.5
+```
+
+Hydra exposes several tuning layers:
+
+- **Route policy:** `[scheduler]` controls shadow/active mode, TTFT and TPOT
+  budgets, affinity override threshold, stale metric fallback, failure
+  penalties, and unknown-remote penalties.
+- **Network telemetry:** Hydra records bounded local observations for queue
+  wait, RTT, jitter, bandwidth estimate, TTFT, ITL/TPOT, tokens/sec, cache
+  hit/miss, KV transfer, artifact materialization, and failure rate. Inspect
+  summaries with `curl -s http://localhost:3131/api/status | jq '.network_costs, .scheduler'`.
+- **Model fit and cache:** `[defaults.model_fit]` controls context length,
+  batch and micro-batch size, flash attention, KV cache policy, KV dtype,
+  offload/unified cache behavior, prompt cache, and prefix-cache limits.
+- **Hardware placement:** `[defaults.hardware]` controls runtime/backend
+  selection, device, GPU layers, split mode, tensor split, mmap/mlock/direct IO,
+  warmup, safety margin, and MoE CPU placement.
+- **Throughput and CPU:** `[defaults.throughput]` controls parallel slots,
+  continuous batching, decode and batch threads, tuning profile, priority,
+  NUMA policy, CPU affinity, and slot prompt similarity.
+- **Skippy staged inference:** `[defaults.skippy]` controls activation wire
+  dtype, binary stage transport, prefill chunking, lifecycle probe timing, and
+  manual stage overrides for package-backed splits.
+- **Speculative decoding:** `[defaults.speculative]` and the benchmark tuner
+  can evaluate draft-model strategies, draft token counts, and acceptance
+  thresholds.
+- **Artifact placement and VAST:** `[placement]` controls POSIX or
+  S3-compatible namespace roots/buckets, cache TTL/capacity, prefetch
+  thresholds, and optional VAST DataEngine/webhook trigger fields.
+
+A compact starting profile looks like this:
+
+```toml
+[defaults.model_fit]
+ctx_size = 8192
+batch = 1024
+ubatch = 256
+flash_attention = "auto"
+kv_cache_policy = "balanced"
+
+[defaults.model_fit.prefix_cache]
+enabled = true
+max_entries = 64
+min_tokens = 64
+payload_mode = "auto"
+
+[defaults.hardware]
+model_runtime = "auto"
+device = "auto"
+gpu_layers = "auto"
+mmap = "auto"
+mlock = false
+safety_margin_gb = 2.0
+
+[defaults.throughput]
+parallel = 1
+threads = 8
+threads_batch = 4
+tuning_profile = "balanced"
+
+[defaults.skippy]
+activation_wire_dtype = "auto"
+binary_stage_transport = "auto"
+prefill_chunking = "fixed"
+prefill_chunk_size = 512
+```
+
+Some inherited knobs are backend-dependent or schema-reserved until a runtime
+implements them. Use [docs/skippy/CONFIGURATION.md](docs/skippy/CONFIGURATION.md)
+as the detailed tuning matrix, and use [docs/design/METRICS.md](docs/design/METRICS.md)
+for the metric semantics Hydra feeds into routing.
+
 ## Place Artifacts
 
 Hydra can publish artifacts into a mounted namespace, including a VAST
@@ -191,6 +284,7 @@ API form and VAST deployment notes.
 | Join by invite token | `hydra serve --join <token>` | [docs/MESHES.md](docs/MESHES.md) |
 | Join Hydra public discovery | `hydra serve --auto` | [docs/MESHES.md](docs/MESHES.md) |
 | Run an API-only client by token | `hydra client --join <token>` | [docs/MESHES.md](docs/MESHES.md) |
+| Tune local runtime | `hydra benchmark tune --model /models/qwen3-8b.gguf --apply` | [docs/CLI.md](docs/CLI.md) |
 | Run a big model with splits | `hydra serve --model hf://meshllm/<repo>@<rev> --split` | [docs/SKIPPY_SPLITS.md](docs/SKIPPY_SPLITS.md) |
 | Place model/layer/cache artifacts | `hydra placement prefetch ...` | [docs/hydra/VAST_PLACEMENT.md](docs/hydra/VAST_PLACEMENT.md) |
 | Use Goose, OpenCode, Claude Code, or Pi | `hydra goose`, `hydra opencode`, `hydra claude`, `hydra pi` | [docs/AGENTS.md](docs/AGENTS.md) |
@@ -298,6 +392,8 @@ builds.
 | [docs/EXO_COMPARISON.md](docs/EXO_COMPARISON.md) | Balanced comparison with Exo |
 | [docs/CLI.md](docs/CLI.md) | Command reference and JSON automation |
 | [docs/USAGE.md](docs/USAGE.md) | Longer operational usage guide, runtime control, owner-control operator flows |
+| [docs/skippy/CONFIGURATION.md](docs/skippy/CONFIGURATION.md) | Runtime tuning matrix for model fit, hardware, throughput, Skippy, cache, and speculative settings |
+| [docs/design/METRICS.md](docs/design/METRICS.md) | Routing, runtime, and network metric semantics |
 | [docs/design/TESTING.md](docs/design/TESTING.md) | Testing playbook, mixed-version QA, remote deploy checks |
 | [docs/plugins/flash-moe.md](docs/plugins/flash-moe.md) | Optional Flash-MoE SSD expert streaming backend setup |
 | [docs/skippy/FAMILY_STATUS.md](docs/skippy/FAMILY_STATUS.md) | Certified Skippy model-family status |

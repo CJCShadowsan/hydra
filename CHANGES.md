@@ -16,6 +16,8 @@ Initial Hydra divergence:
 - Adds exact KV/recurrent/activation cache compatibility checks.
 - Adds local management API and CLI placement commands.
 - Adds Hydra upstream-sync docs, scripts, and drift workflow.
+- Documents Hydra performance tuning, including benchmark tuning, scheduler,
+  network telemetry, runtime, Skippy, speculative, placement, and VAST knobs.
 
 Upstream tracking:
 
