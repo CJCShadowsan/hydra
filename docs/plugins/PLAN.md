@@ -151,7 +151,7 @@ archives for install and update.
 The canonical file is `plugins.jsonl`, with one plugin per line:
 
 ```json
-{"name":"blackboard","description":"Shared mesh blackboard for agent status, findings, questions, answers, and searchable coordination notes.","github_url":"https://github.com/mesh-llm/blackboard","author_email":"maintainers@meshllm.cloud","author_name":"Mesh LLM"}
+{"name":"blackboard","description":"Shared mesh blackboard for agent status, findings, questions, answers, and searchable coordination notes.","github_url":"https://github.com/mesh-llm/blackboard","author_email":"maintainers@hydra-llm.cloud","author_name":"Mesh LLM"}
 ```
 
 Required fields:

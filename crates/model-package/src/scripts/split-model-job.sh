@@ -664,8 +664,8 @@ tags:
 ---
 
 <div align="center">
-  <a href="https://www.meshllm.cloud">
-    <img src="https://meshllm.cloud/assets/images/jelly-logo-wordmark.png" alt="Mesh LLM" width="220">
+  <a href="https://www.hydra-llm.cloud">
+    <img src="https://hydra-llm.cloud/assets/images/jelly-logo-wordmark.png" alt="Mesh LLM" width="220">
   </a>
 
   <h1>{display_name}</h1>
@@ -675,7 +675,7 @@ tags:
   </p>
 
   <p>
-    <a href="https://www.meshllm.cloud"><img alt="Website" src="https://img.shields.io/badge/Website-meshllm.cloud-111111?style=for-the-badge"></a>
+    <a href="https://www.hydra-llm.cloud"><img alt="Website" src="https://img.shields.io/badge/Website-hydra-llm.cloud-111111?style=for-the-badge"></a>
     <a href="https://github.com/Mesh-LLM/mesh-llm"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-Mesh--LLM-24292f?style=for-the-badge&logo=github"></a>
     <a href="https://discord.gg/rs6fmc63eN"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=for-the-badge&logo=discord&logoColor=white"></a>
   </p>
@@ -772,7 +772,7 @@ skippy-model-package write-package "{source_path}" --out-dir "{package_dir}"
 ## Links
 
 - Source model: [{source_repo}](https://huggingface.co/{source_repo})
-- Mesh LLM website: [meshllm.cloud](https://www.meshllm.cloud)
+- Mesh LLM website: [hydra-llm.cloud](https://www.hydra-llm.cloud)
 - Mesh LLM: [github.com/Mesh-LLM/mesh-llm](https://github.com/Mesh-LLM/mesh-llm)
 - Discord: [discord.gg/rs6fmc63eN](https://discord.gg/rs6fmc63eN)
 - Package catalog: [meshllm/catalog](https://huggingface.co/datasets/meshllm/catalog)

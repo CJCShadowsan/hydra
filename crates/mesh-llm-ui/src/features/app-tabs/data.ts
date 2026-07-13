@@ -2038,7 +2038,7 @@ export const DASHBOARD_HARNESS: DashboardHarnessData = {
     description:
       'Build personal AI from open models. Pool machines across your home, office, or friends — no cloud needed.',
     actions: [
-      { label: 'Learn more', href: 'https://meshllm.cloud/', tone: 'link' },
+      { label: 'Learn more', href: 'https://hydra-llm.cloud/', tone: 'link' },
       { label: 'GitHub', href: 'https://github.com/Mesh-LLM/mesh-llm', tone: 'secondary' }
     ]
   },
@@ -2049,7 +2049,7 @@ export const DASHBOARD_HARNESS: DashboardHarnessData = {
   meshNodeSeeds: MESH_NODES,
   meshId: 'dashboard-mesh',
   connect: {
-    installHref: 'https://meshllm.cloud/#install',
+    installHref: 'https://hydra-llm.cloud/#install',
     apiStatus: 'configured target',
     runCommand: 'mesh-llm --auto --join <mesh-invite-token>',
     description: 'contribute compute to the mesh'
@@ -2075,11 +2075,11 @@ export const DASHBOARD_HARNESS: DashboardHarnessData = {
 export const SHELL_HARNESS: ShellHarnessData = {
   productName: 'mesh-llm',
   brand: { primary: 'mesh', accent: 'llm' },
-  footerLinks: [{ label: 'Docs', href: 'https://meshllm.cloud/' }],
+  footerLinks: [{ label: 'Docs', href: 'https://hydra-llm.cloud/' }],
   footerTrailingLink: { label: 'GitHub', href: 'https://github.com/Mesh-LLM/mesh-llm' },
   topNavApiAccessLinks: [
-    { href: 'https://meshllm.cloud/', label: 'Docs' },
-    { href: 'https://meshllm.cloud/#install', label: 'Install' }
+    { href: 'https://hydra-llm.cloud/', label: 'Docs' },
+    { href: 'https://hydra-llm.cloud/#install', label: 'Install' }
   ],
   topNavJoinCommands: [
     {
@@ -2097,9 +2097,9 @@ export const SHELL_HARNESS: ShellHarnessData = {
     { label: 'Client-only join command', value: 'mesh-llm client --join <mesh-invite-token>', prefix: '$' }
   ],
   topNavJoinLinks: [
-    { href: 'https://meshllm.cloud/', label: 'Setup' },
-    { href: 'https://meshllm.cloud/#install', label: 'Install' },
-    { href: 'https://meshllm.cloud/#blackboard', label: 'Blackboard' }
+    { href: 'https://hydra-llm.cloud/', label: 'Setup' },
+    { href: 'https://hydra-llm.cloud/#install', label: 'Install' },
+    { href: 'https://hydra-llm.cloud/#blackboard', label: 'Blackboard' }
   ]
 }
 

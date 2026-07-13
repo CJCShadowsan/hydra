@@ -4,62 +4,45 @@ title: Installing on macOS
 
 # Installing on macOS
 
-Install Mesh on every Mac that should serve a model or call into a mesh.
+Install Hydra on every Mac that should serve a model or call into a mesh.
 
 ## Quick install
 
 ```sh
-curl -fsSL https://meshllm.cloud/install.sh | bash
+cargo install --git https://github.com/CJCShadowsan/hydra.git --package mesh-llm --bin hydra
 ```
 
-Open a new terminal after install if the installer added Mesh to your `PATH`.
+Hydra source installs currently require Rust, `cmake`, and the native build
+dependencies for your selected runtime backend.
 
 Check the install:
 
 ```sh
-mesh-llm --version
+hydra --version
 ```
 
 ## Homebrew
 
-If you use Homebrew:
+Hydra does not have a Homebrew tap yet.
 
-```sh
-brew install mesh-llm/tap/mesh-llm
-```
+## Release installers
 
-## What the installer does
-
-The installer downloads the `mesh-llm` executable and adds `~/.local/bin` to your user `PATH` when needed. After install, run `mesh-llm setup` to finish runtime configuration and, if you want it, the background service.
+Hydra release installers are not published yet. The inherited shell installer
+will be reworked once Hydra publishes its own signed release archives.
 
 ## Next step
 
-Run `mesh-llm setup` to finish machine setup. See the [CLI guide](/docs/pages/CLI/) for the setup flags.
+Run `hydra setup` to finish machine setup. See the [CLI guide](/docs/pages/CLI/) for the setup flags.
 
 ## Uninstall
 
 ```sh
-mesh-llm uninstall --dry-run
-mesh-llm uninstall --yes
+cargo uninstall mesh-llm
 ```
 
 On macOS, uninstall boots out the per-user launchd agent when present, removes
 setup-owned service files, removes the native-runtime cache, and removes the
-executable last. It preserves `~/.mesh-llm` unless you pass `--purge-config`.
-
-## Advanced install
-
-Install the latest prerelease:
-
-```sh
-curl -fsSL https://meshllm.cloud/install.sh | bash -s -- --pre-release
-```
-
-Install to a custom location:
-
-```sh
-curl -fsSL https://meshllm.cloud/install.sh | bash -s -- --install-dir "$HOME/bin"
-```
+The inherited runtime configuration remains under `~/.mesh-llm` for now.
 
 ## See also
 

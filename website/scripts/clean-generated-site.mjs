@@ -13,6 +13,7 @@ const generatedPaths = [
   "docs/CNAME",
   "docs/install.sh",
   "docs/install.ps1",
+  "docs/hydra-logo.svg",
   "docs/mesh-llm-logo.svg",
   "docs/assets",
   "docs/catalog",

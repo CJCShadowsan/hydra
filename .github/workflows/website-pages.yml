@@ -60,6 +60,7 @@ jobs:
           cp docs/funding.json "$artifact_dir/"
           cp docs/install.sh "$artifact_dir/"
           cp docs/install.ps1 "$artifact_dir/"
+          cp docs/hydra-logo.svg "$artifact_dir/"
           cp docs/mesh-llm-logo.svg "$artifact_dir/"
           cp -R docs/assets "$artifact_dir/"
           cp -R docs/catalog "$artifact_dir/"

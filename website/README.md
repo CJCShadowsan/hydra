@@ -1,6 +1,6 @@
-# Mesh LLM Website
+# Hydra Website
 
-The public website is built with Eleventy and emitted into `../docs` for static hosting.
+The public Hydra website is built with Eleventy and emitted into `../docs` for static hosting.
 
 ```sh
 cd website

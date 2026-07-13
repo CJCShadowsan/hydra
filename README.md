@@ -396,6 +396,7 @@ builds.
 | [docs/EXO_COMPARISON.md](docs/EXO_COMPARISON.md) | Balanced comparison with Exo |
 | [docs/CLI.md](docs/CLI.md) | Command reference and JSON automation |
 | [docs/USAGE.md](docs/USAGE.md) | Longer operational usage guide, runtime control, owner-control operator flows |
+| [docs/hydra/WEBSITE_PUBLISHING.md](docs/hydra/WEBSITE_PUBLISHING.md) | Publishing the Hydra website to `hydra-llm.cloud` |
 | [docs/skippy/CONFIGURATION.md](docs/skippy/CONFIGURATION.md) | Runtime tuning matrix for model fit, hardware, throughput, Skippy, cache, and speculative settings |
 | [docs/design/METRICS.md](docs/design/METRICS.md) | Routing, runtime, and network metric semantics |
 | [docs/design/TESTING.md](docs/design/TESTING.md) | Testing playbook, mixed-version QA, remote deploy checks |

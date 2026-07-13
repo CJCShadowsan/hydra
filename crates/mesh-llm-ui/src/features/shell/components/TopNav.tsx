@@ -260,8 +260,8 @@ function HeaderLinks({ links }: { links: { href: string; label: string }[] }) {
 }
 
 const DEFAULT_API_ACCESS_LINKS: LinkItem[] = [
-  { href: 'https://meshllm.cloud/', label: 'Docs' },
-  { href: 'https://meshllm.cloud/#install', label: 'Install' }
+  { href: 'https://hydra-llm.cloud/', label: 'Docs' },
+  { href: 'https://hydra-llm.cloud/#install', label: 'Install' }
 ]
 
 function ApiAccessContent({ apiUrl, dataMode, links }: { apiUrl: string; dataMode: DataMode; links?: LinkItem[] }) {
@@ -329,9 +329,9 @@ const DEFAULT_JOIN_COMMANDS: TopNavJoinCommand[] = [
 ]
 
 const DEFAULT_JOIN_LINKS: LinkItem[] = [
-  { href: 'https://meshllm.cloud/', label: 'Setup' },
-  { href: 'https://meshllm.cloud/#install', label: 'Install' },
-  { href: 'https://meshllm.cloud/#blackboard', label: 'Blackboard' }
+  { href: 'https://hydra-llm.cloud/', label: 'Setup' },
+  { href: 'https://hydra-llm.cloud/#install', label: 'Install' },
+  { href: 'https://hydra-llm.cloud/#blackboard', label: 'Blackboard' }
 ]
 
 function JoinInviteContent({ commands, links }: { commands?: TopNavJoinCommand[]; links?: LinkItem[] }) {

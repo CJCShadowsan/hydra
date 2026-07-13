@@ -33,6 +33,7 @@ export default function(eleventyConfig) {
 
   eleventyConfig.addPassthroughCopy("src/funding.json");
   eleventyConfig.addPassthroughCopy("src/.well-known");
+  eleventyConfig.addPassthroughCopy({ "../docs/hydra/hydra-logo.svg": "hydra-logo.svg" });
   eleventyConfig.addPassthroughCopy("src/mesh-llm-logo.svg");
   eleventyConfig.addPassthroughCopy("src/CNAME");
   eleventyConfig.addPassthroughCopy("src/assets");

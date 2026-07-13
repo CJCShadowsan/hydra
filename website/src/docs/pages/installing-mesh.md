@@ -1,10 +1,10 @@
 ---
-title: Installing Mesh
+title: Installing Hydra
 ---
 
-# Installing Mesh
+# Installing Hydra
 
-Mesh runs on macOS, Linux, and Windows. Choose your platform for detailed install instructions.
+Hydra runs on macOS, Linux, and Windows. Choose your platform for detailed install instructions.
 
 ## Choose your platform
 
@@ -12,43 +12,34 @@ Mesh runs on macOS, Linux, and Windows. Choose your platform for detailed instal
 - [Installing on Linux](/docs/pages/installing-linux/) (platform details)
 - [Installing on Windows](/docs/pages/installing-windows/) (platform details)
 
-## What the installer does
+## Current install path
 
-The installer downloads the `mesh-llm` executable and adds the install directory to your user `PATH` when needed. After install, run `mesh-llm setup` to finish runtime configuration and service setup.
+Hydra packaged installers are not published yet. Install from source:
 
-Default install locations:
+```sh
+cargo install --git https://github.com/CJCShadowsan/hydra.git --package mesh-llm --bin hydra
+```
 
-| Platform | Default location |
-|---|---|
-| macOS/Linux | `~/.local/bin` |
-| Windows | `%LOCALAPPDATA%\mesh-llm\bin` |
+After install, run `hydra setup` to finish runtime configuration and service
+setup.
 
 ## Verify the install
 
 ```sh
-mesh-llm --version
+hydra --version
 ```
 
 ## Next step
 
-Run `mesh-llm setup` to finish machine setup, then follow the [Quickstart](/docs/pages/quickstart/) to start a private node and open the console.
+Run `hydra setup` to finish machine setup, then follow the [Quickstart](/docs/pages/quickstart/) to start a private node and open the console.
 
 ## Uninstall
 
-Preview what Mesh would remove:
-
 ```sh
-mesh-llm uninstall --dry-run
+cargo uninstall mesh-llm
 ```
 
-Remove the executable, setup-owned service files, and native-runtime cache:
-
-```sh
-mesh-llm uninstall --yes
-```
-
-Uninstall preserves `~/.mesh-llm` configuration and identity data by default.
-Use `--purge-config` only when you intentionally want to remove that data too.
+The inherited runtime configuration remains under `~/.mesh-llm` for now.
 
 ## See also
 

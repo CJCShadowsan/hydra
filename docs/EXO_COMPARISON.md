@@ -258,7 +258,7 @@ Mesh LLM's API supports:
 ### Mesh LLM
 
 - Models served as GGUF files locally or as layer packages
-- Public model catalog at meshllm.cloud/catalog
+- Public model catalog at hydra-llm.cloud/catalog
 - Catalog-backed model references (`hf://meshllm/<repo>@<rev>`)
 - Layer package repositories with formal manifest and artifact layout
 - Certification workflow for model families

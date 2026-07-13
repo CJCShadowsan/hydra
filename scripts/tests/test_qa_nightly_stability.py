@@ -170,7 +170,7 @@ class NightlyStabilityHarnessTests(unittest.TestCase):
             "post_json",
             side_effect=RuntimeError("HTTP 403: error code: 1010"),
         ):
-            result = self.harness.run_chat_probe("https://meshllm.cloud/v1", "auto", 1, 1.0)
+            result = self.harness.run_chat_probe("https://hydra-llm.cloud/v1", "auto", 1, 1.0)
 
         self.assertFalse(result.ok)
         self.assertEqual(result.model, "auto")
@@ -187,7 +187,7 @@ class NightlyStabilityHarnessTests(unittest.TestCase):
             "choices": [{"message": {"content": "WRONG"}}],
         }
         with mock.patch.object(self.harness, "post_json", return_value=(response, 202)):
-            result = self.harness.run_chat_probe("https://meshllm.cloud/v1", "auto", 1, 1.0)
+            result = self.harness.run_chat_probe("https://hydra-llm.cloud/v1", "auto", 1, 1.0)
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status_code, 202)
@@ -202,7 +202,7 @@ class NightlyStabilityHarnessTests(unittest.TestCase):
             "post_json_stream",
             side_effect=RuntimeError("HTTP 403: error code: 1010"),
         ):
-            result = self.harness.run_stream_chat_probe("https://meshllm.cloud/v1", "mesh", 1, 1.0)
+            result = self.harness.run_stream_chat_probe("https://hydra-llm.cloud/v1", "mesh", 1, 1.0)
 
         self.assertFalse(result.ok)
         self.assertEqual(result.model, "mesh")
@@ -218,7 +218,7 @@ class NightlyStabilityHarnessTests(unittest.TestCase):
             {"usage": {"completion_tokens": 7}},
         ]
         with mock.patch.object(self.harness, "post_json_stream", return_value=(chunks, 206, 123)):
-            result = self.harness.run_stream_chat_probe("https://meshllm.cloud/v1", "mesh", 1, 1.0)
+            result = self.harness.run_stream_chat_probe("https://hydra-llm.cloud/v1", "mesh", 1, 1.0)
 
         self.assertFalse(result.ok)
         self.assertEqual(result.status_code, 206)

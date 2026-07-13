@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn parses_and_searches_catalog_jsonl() {
         let catalog = PluginCatalog::parse_jsonl(
-            r#"{"name":"blackboard","description":"Shared notes","github_url":"https://github.com/mesh-llm/blackboard","author_email":"maintainers@meshllm.cloud","author_name":"Mesh LLM"}
+            r#"{"name":"blackboard","description":"Shared notes","github_url":"https://github.com/mesh-llm/blackboard","author_email":"maintainers@hydra-llm.cloud","author_name":"Mesh LLM"}
 {"name":"notes","description":"Team notes","github_url":"https://github.com/acme/notes","author_email":"dev@example.com","author_name":"Acme"}
 "#,
         )

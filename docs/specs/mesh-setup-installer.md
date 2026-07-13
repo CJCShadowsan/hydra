@@ -7,14 +7,14 @@ This spec defines the v1 install and setup boundary for Mesh LLM.
 The public install flow is two-stage:
 
 ```sh
-curl -fsSL https://meshllm.cloud/install.sh | bash
+curl -fsSL https://hydra-llm.cloud/install.sh | bash
 mesh-llm setup
 ```
 
 On Windows:
 
 ```powershell
-irm https://meshllm.cloud/install.ps1 | iex
+irm https://hydra-llm.cloud/install.ps1 | iex
 mesh-llm.exe setup
 ```
 

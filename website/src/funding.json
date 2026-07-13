@@ -4,24 +4,24 @@
   "entity": {
     "type": "organisation",
     "role": "owner",
-    "name": "Mesh LLM",
+    "name": "Hydra",
     "email": "michael.neale@gmail.com",
-    "description": "Democratize and Decentralize Models and Agents. Mesh LLM pools GPUs and memory across machines and exposes the result as one OpenAI-compatible API for distributed AI/LLM inference.",
+    "description": "Hydra is a network-aware Mesh LLM fork for low-latency distributed AI/LLM inference.",
     "webpageUrl": {
-      "url": "https://meshllm.cloud"
+      "url": "https://hydra-llm.cloud"
     }
   },
   "projects": [
     {
-      "guid": "mesh-llm",
-      "name": "Mesh LLM",
-      "description": "Distributed AI/LLM for the people. Share compute privately or publicly to power your agents and chat. Pools GPUs and memory across machines for distributed LLM inference using llama.cpp.",
+      "guid": "hydra",
+      "name": "Hydra",
+      "description": "Network-aware distributed AI/LLM inference with Hydra-owned scheduling, placement, and VAST-backed artifact movement.",
       "webpageUrl": {
-        "url": "https://meshllm.cloud"
+        "url": "https://hydra-llm.cloud"
       },
       "repositoryUrl": {
-        "url": "https://github.com/Mesh-LLM/mesh-llm",
-        "wellKnown": "https://github.com/Mesh-LLM/mesh-llm/blob/main/.well-known/funding-manifest-urls"
+        "url": "https://github.com/CJCShadowsan/hydra",
+        "wellKnown": "https://github.com/CJCShadowsan/hydra/blob/main/.well-known/funding-manifest-urls"
       },
       "licenses": [
         "spdx:Apache-2.0"
@@ -52,7 +52,7 @@
         "guid": "any-amount",
         "status": "active",
         "name": "General support",
-        "description": "Support Mesh LLM development with any amount via GitHub Sponsors.",
+        "description": "Support Hydra development with any amount via GitHub Sponsors.",
         "amount": 0,
         "currency": "USD",
         "frequency": "one-time",
@@ -64,7 +64,7 @@
         "guid": "monthly-support",
         "status": "active",
         "name": "Monthly supporter",
-        "description": "Recurring monthly support for ongoing Mesh LLM development and infrastructure.",
+        "description": "Recurring monthly support for ongoing Hydra development and infrastructure.",
         "amount": 0,
         "currency": "USD",
         "frequency": "monthly",

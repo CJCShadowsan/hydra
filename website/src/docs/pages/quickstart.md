@@ -4,50 +4,30 @@ title: Quickstart
 
 # Quickstart
 
-The easiest way to try Mesh is to create your own private mesh. Start one node on this machine, finish setup, send a chat message, then try an agent. Later, you can add more machines or invite other people to join the same private mesh.
+The easiest way to try Hydra is to create your own private mesh. Start one node on this machine, finish setup, send a chat message, then try an agent. Later, you can add more machines or invite other people to join the same private mesh.
 
 ## 1. Install the executable
 
-Choose your platform for the fastest path:
-
-**macOS**:
+Hydra packaged installers are not published yet. Install from source with Cargo:
 
 ```sh
-curl -fsSL https://meshllm.cloud/install.sh | bash
+cargo install --git https://github.com/CJCShadowsan/hydra.git --package mesh-llm --bin hydra
 ```
 
-Full guide: [Installing on macOS](/docs/pages/installing-macos/)
-
-**Linux**:
-
-```sh
-curl -fsSL https://meshllm.cloud/install.sh | bash
-```
-
-Full guide: [Installing on Linux](/docs/pages/installing-linux/)
-
-**Windows**:
-
-```powershell
-irm https://meshllm.cloud/install.ps1 | iex
-```
-
-Full guide: [Installing on Windows](/docs/pages/installing-windows/)
-
-Open a new terminal after install if the installer added Mesh to your `PATH`.
+Full guides: [macOS](/docs/pages/installing-macos/), [Linux](/docs/pages/installing-linux/), [Windows](/docs/pages/installing-windows/)
 
 ## 2. Finish setup
 
 Run the setup command after the executable is installed:
 
 ```sh
-mesh-llm setup
+hydra setup
 ```
 
 On Windows PowerShell:
 
 ```powershell
-mesh-llm.exe setup
+hydra.exe setup
 ```
 
 On interactive macOS and Linux terminals, setup can offer to install and enable the background service. The GitHub star prompt only appears when interactive and eligible, and it defaults to Yes.
@@ -57,13 +37,13 @@ On interactive macOS and Linux terminals, setup can offer to install and enable 
 Use this model first on a 12GB+ machine:
 
 ```sh
-mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
+hydra serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 ```
 
 On Windows PowerShell:
 
 ```powershell
-mesh-llm serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
+hydra serve --discover my-private-mesh --model unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL
 ```
 
 Keep this terminal open. A ready node exposes:
@@ -73,10 +53,10 @@ Keep this terminal open. A ready node exposes:
 | Console | `http://localhost:3131` |
 | OpenAI-compatible API | `http://localhost:9337/v1` |
 
-If the model does not load, stop Mesh and use the [model picker](/docs/pages/choose-a-model/) to choose a smaller starting point.
+If the model does not load, stop Hydra and use the [model picker](/docs/pages/choose-a-model/) to choose a smaller starting point.
 
 ```sh
-mesh-llm stop
+hydra stop
 ```
 
 ## 4. Chat in the console

@@ -1,12 +1,11 @@
 const site = {
-  title: 'Mesh LLM',
-  description: 'Mesh serves large local models across multiple machines through one OpenAI-compatible endpoint.',
-  url: 'https://meshllm.cloud',
-  publicMeshUrl: 'https://public.meshllm.cloud',
-  githubUrl: 'https://github.com/Mesh-LLM/mesh-llm',
-  githubRepo: 'Mesh-LLM/mesh-llm',
+  title: 'Hydra',
+  description: 'Hydra is a network-aware fork of Mesh LLM for low-latency distributed inference.',
+  url: 'https://hydra-llm.cloud',
+  githubUrl: 'https://github.com/CJCShadowsan/hydra',
+  githubRepo: 'CJCShadowsan/hydra',
   githubStarsFallback: '1.1k',
-  githubReleaseFallback: 'v0.71.0',
+  githubReleaseFallback: 'source',
 };
 
 const fetchLatestReleaseTag = async (repo) => {
@@ -17,7 +16,7 @@ const fetchLatestReleaseTag = async (repo) => {
     const response = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
       headers: {
         Accept: 'application/vnd.github+json',
-        'User-Agent': 'mesh-llm-website',
+        'User-Agent': 'hydra-website',
       },
       signal: controller.signal,
     });

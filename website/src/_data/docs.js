@@ -1,18 +1,18 @@
 export default [
   {
     title: "Get Started",
-    description: "Install Mesh, run the quickstart, and serve your first model.",
+    description: "Install Hydra, run the quickstart, and serve your first model.",
     links: [
       ["Quickstart", "/docs/pages/quickstart/"],
       ["Installing on macOS", "/docs/pages/installing-macos/"],
       ["Installing on Linux", "/docs/pages/installing-linux/"],
       ["Installing on Windows", "/docs/pages/installing-windows/"],
-      ["Updating Mesh", "/docs/pages/updating-mesh/"]
+      ["Updating Hydra", "/docs/pages/updating-mesh/"]
     ]
   },
   {
     title: "Configuration",
-    description: "Configure mesh-llm behavior, models, and defaults.",
+    description: "Configure Hydra behavior, models, and defaults.",
     links: [
       ["Config File", "/docs/pages/config-toml/"],
       ["Config Defaults", "/docs/pages/config-defaults/"],
@@ -33,7 +33,7 @@ export default [
   },
   {
     title: "Capabilities",
-    description: "Use Mesh through OpenAI-compatible clients and model-serving features.",
+    description: "Use Hydra through OpenAI-compatible clients and model-serving features.",
     links: [
       ["OpenAI-compatible API", "/docs/pages/openai-compatible-api/"],
       ["Streaming", "/docs/pages/openai-compatible-api/#streaming"],
@@ -43,7 +43,7 @@ export default [
   },
   {
     title: "Plugins",
-    description: "Extend mesh-llm with managed plugin processes, MCP tools, and HTTP bindings.",
+    description: "Extend Hydra with managed plugin processes, MCP tools, and HTTP bindings.",
     links: [
       ["Plugins overview", "/docs/pages/plugins/"],
       ["Plugin architecture", "/docs/pages/plugin-architecture/"],
@@ -62,9 +62,9 @@ export default [
   },
   {
     title: "Meshes",
-    description: "Join the public mesh, create private meshes, and publish your own mesh.",
+    description: "Create private Hydra meshes and publish Hydra meshes you operate.",
     links: [
-      ["Join the public mesh", "/docs/pages/public-mesh/"],
+      ["Hydra discovery", "/docs/pages/public-mesh/"],
       ["Private meshes", "/docs/pages/private-meshes/"],
       ["Publish mesh", "/docs/pages/publish-mesh/"]
     ]
@@ -99,9 +99,9 @@ export default [
     title: "Contributing",
     description: "Understand the roadmap, testing requirements, and project contribution workflow.",
     links: [
-      ["Contributing guide", "https://github.com/Mesh-LLM/mesh-llm/blob/main/CONTRIBUTING.md"],
+      ["Contributing guide", "https://github.com/CJCShadowsan/hydra/blob/main/CONTRIBUTING.md"],
       ["Testing playbook", "/docs/pages/testing/"],
-      ["Roadmap", "https://github.com/Mesh-LLM/mesh-llm/blob/main/ROADMAP.md"]
+      ["Roadmap", "https://github.com/CJCShadowsan/hydra/blob/main/ROADMAP.md"]
     ]
   }
 ];

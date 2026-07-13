@@ -4,7 +4,7 @@
   <div class="shell">
     {{ sectionHead(
       "Built for the way you actually run models.",
-      "Mesh handles discovery, placement, routing, and model serving so tools just see a single OpenAI endpoint."
+      "Hydra handles discovery, placement, routing, and model serving so tools just see a single OpenAI endpoint."
     ) }}
 
     <div class="features grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-6 xl:auto-rows-[minmax(16rem,auto)]">
@@ -62,9 +62,9 @@
         <div class="glow g"></div>
         <div class="head">
           <h3>Your boundary, your rules.</h3>
-          <p>Join the public mesh, keep a private mesh for your own machines, or publish a mesh you operate. Discovery via Nostr — no central directory, no cloud handshake.</p>
+          <p>Keep a private Hydra mesh for your own machines, or publish a Hydra mesh you operate. Discovery uses the Hydra namespace so nodes do not auto-join upstream Mesh LLM discovery records.</p>
           <div class="mt-3 flex flex-wrap gap-1.5">
-            {{ badge("public.meshllm.cloud") }}
+            {{ badge("hydra namespace") }}
             {{ badge("private", "blue") }}
             {{ badge("--publish") }}
           </div>
@@ -87,7 +87,7 @@
         </div>
         <div class="code-thumb">
 <span class="c"># pull from the catalog ref</span>
-<span class="p">$</span> mesh-llm <span class="f">serve</span> <span class="v">\</span>
+<span class="p">$</span> hydra <span class="f">serve</span> <span class="v">\</span>
     <span class="f">--model</span> <span class="v">unsloth/Qwen3-32B-GGUF:Q4_K_M</span>
   <span class="k">▸</span> match: <span class="v">qwen3-32B</span>  <span class="c">/ paired draft: qwen2.5-3B</span></div>
       </div>

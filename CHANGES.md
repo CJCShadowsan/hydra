@@ -7,6 +7,7 @@ Initial Hydra divergence:
 
 - Adds a Hydra logo to the README and stores the source SVG in
   `docs/hydra/hydra-logo.svg`.
+- Repoints the website source and publishing notes at `hydra-llm.cloud`.
 - Adds `hydra` as the primary CLI binary for this fork.
 - Namespaces Hydra discovery so `hydra --auto` finds Hydra Nostr and mDNS
   records instead of ordinary upstream Mesh LLM records.

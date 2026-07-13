@@ -139,10 +139,10 @@ mod tests {
         assert!(EMBEDDED_SCRIPT.contains("## What Is Included"));
         assert!(EMBEDDED_SCRIPT.contains("## Validation"));
         assert!(
-            EMBEDDED_SCRIPT.contains("https://meshllm.cloud/assets/images/jelly-logo-wordmark.png")
+            EMBEDDED_SCRIPT.contains("https://hydra-llm.cloud/assets/images/jelly-logo-wordmark.png")
         );
         assert!(EMBEDDED_SCRIPT.contains("style=for-the-badge"));
-        assert!(EMBEDDED_SCRIPT.contains("https://www.meshllm.cloud"));
+        assert!(EMBEDDED_SCRIPT.contains("https://www.hydra-llm.cloud"));
         assert!(EMBEDDED_SCRIPT.contains("https://discord.gg/rs6fmc63eN"));
         assert!(EMBEDDED_SCRIPT.contains("Distributed GGUF inference package for Mesh LLM"));
         assert!(EMBEDDED_SCRIPT.contains(
