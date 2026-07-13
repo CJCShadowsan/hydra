@@ -395,6 +395,14 @@ pub(crate) struct StatusPayload {
     /// Local-only routing outcome and current-node pressure snapshot measured on
     /// this node only; not mesh-wide aggregates.
     pub(crate) routing_metrics: metrics::RoutingMetricsStatusSnapshot,
+    /// Hydra-owned bounded latency/cache/artifact cost observations. Detailed
+    /// entries remain local-only; peer gossip should advertise only small hints.
+    pub(crate) network_costs: hydra::NetworkCostStatusSnapshot,
+    /// Current Hydra scheduler policy, including whether decisions are shadowed
+    /// or actively allowed to override final target choice.
+    pub(crate) scheduler: hydra::SchedulerStatusSnapshot,
+    /// Hydra placement operations observed by this API process.
+    pub(crate) placement: hydra::PlacementCacheSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) first_joined_mesh_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1118,6 +1126,9 @@ mod tests {
             gpus: vec![],
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
+            network_costs: hydra::NetworkCostStatusSnapshot::default(),
+            scheduler: hydra::SchedulerConfig::default().status_snapshot(),
+            placement: hydra::PlacementCacheSnapshot::default(),
             first_joined_mesh_ts: None,
             mesh_requirements: None,
             recent_mesh_rejections: vec![],
@@ -1180,6 +1191,9 @@ mod tests {
             gpus: vec![],
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
+            network_costs: hydra::NetworkCostStatusSnapshot::default(),
+            scheduler: hydra::SchedulerConfig::default().status_snapshot(),
+            placement: hydra::PlacementCacheSnapshot::default(),
             first_joined_mesh_ts: None,
             mesh_requirements: None,
             recent_mesh_rejections: vec![],
@@ -1246,6 +1260,9 @@ mod tests {
             gpus: vec![],
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
+            network_costs: hydra::NetworkCostStatusSnapshot::default(),
+            scheduler: hydra::SchedulerConfig::default().status_snapshot(),
+            placement: hydra::PlacementCacheSnapshot::default(),
             first_joined_mesh_ts: None,
             mesh_requirements: None,
             recent_mesh_rejections: vec![],
@@ -1307,6 +1324,9 @@ mod tests {
             gpus: vec![],
             routing_affinity: affinity::AffinityStatsSnapshot::default(),
             routing_metrics: metrics::RoutingMetricsStatusSnapshot::default(),
+            network_costs: hydra::NetworkCostStatusSnapshot::default(),
+            scheduler: hydra::SchedulerConfig::default().status_snapshot(),
+            placement: hydra::PlacementCacheSnapshot::default(),
             first_joined_mesh_ts: None,
             mesh_requirements: None,
             recent_mesh_rejections: vec![],

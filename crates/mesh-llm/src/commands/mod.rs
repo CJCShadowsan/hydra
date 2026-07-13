@@ -3,6 +3,7 @@ mod discover;
 mod doctor;
 mod download;
 mod models;
+mod placement;
 mod plugin_cli;
 mod runtime;
 mod setup;
@@ -15,6 +16,7 @@ use self::discover::{DiscoverOptions, run_discover, run_stop};
 use self::doctor::dispatch_doctor_command;
 use self::download::dispatch_download_command;
 use self::models::dispatch_models_command;
+use self::placement::dispatch_placement_command;
 use self::plugin_cli::run_external_plugin_command;
 use self::runtime::{dispatch_runtime_command, run_drop, run_load, run_status};
 use self::setup::dispatch_setup_command;
@@ -52,6 +54,7 @@ async fn dispatch_general_command(cli: &Cli, cmd: &Command) -> Result<()> {
         Command::Runtime { command } => {
             dispatch_runtime_command(command.as_ref(), cli.config.as_deref()).await
         }
+        Command::Placement { command } => dispatch_placement_command(command).await,
         Command::Setup { .. } => dispatch_setup_command(cmd, cli.config.as_deref()).await,
         Command::Uninstall {
             dry_run,

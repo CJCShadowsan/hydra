@@ -1,0 +1,25 @@
+[package]
+name = "hydra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hydra scheduling, network-cost, and placement primitives for mesh-llm"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde.workspace = true
+serde_json.workspace = true
+tar = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

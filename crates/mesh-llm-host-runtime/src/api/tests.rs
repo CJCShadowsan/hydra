@@ -821,6 +821,8 @@ async fn build_test_mesh_api_with_api_port(api_port: u16) -> MeshApi {
         affinity_router: affinity::AffinityRouter::default(),
         runtime_data_collector,
         runtime_data_producer,
+        hydra_scheduler_config: hydra::SchedulerConfig::from_env(),
+        placement_vast_trigger_config: None,
     })
 }
 
@@ -1004,6 +1006,8 @@ async fn build_test_mesh_api_with_plugin_manager(
         affinity_router: affinity::AffinityRouter::default(),
         runtime_data_collector,
         runtime_data_producer,
+        hydra_scheduler_config: hydra::SchedulerConfig::from_env(),
+        placement_vast_trigger_config: None,
     })
 }
 

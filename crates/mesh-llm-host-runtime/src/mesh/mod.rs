@@ -2288,6 +2288,44 @@ fn default_plugin_event_source(endpoint_id: EndpointId, source_peer_id: &mut Str
     }
 }
 
+fn fork_network_key(
+    model: Option<&str>,
+    target: &crate::network::metrics::AttemptTarget,
+) -> hydra::TargetNetworkKey {
+    match target {
+        crate::network::metrics::AttemptTarget::Local(label) => {
+            hydra::TargetNetworkKey::new(model, label.clone(), "local")
+        }
+        crate::network::metrics::AttemptTarget::Remote(label) => {
+            hydra::TargetNetworkKey::new(model, label.clone(), "remote")
+        }
+        crate::network::metrics::AttemptTarget::Endpoint(label) => {
+            hydra::TargetNetworkKey::new(model, label.clone(), "endpoint")
+        }
+    }
+}
+
+fn fork_network_observation(
+    queue_wait: std::time::Duration,
+    attempt_time: std::time::Duration,
+    outcome: crate::network::metrics::AttemptOutcome,
+    completion_tokens: Option<u64>,
+) -> hydra::NetworkCostObservation {
+    let attempt_secs = attempt_time.as_secs_f64();
+    hydra::NetworkCostObservation {
+        queue_wait_ms: Some(queue_wait.as_secs_f64() * 1000.0),
+        attempt_ms: Some(attempt_secs * 1000.0),
+        tokens_per_second: completion_tokens
+            .filter(|tokens| *tokens > 0 && attempt_secs > 0.0)
+            .map(|tokens| tokens as f64 / attempt_secs),
+        success: matches!(
+            outcome,
+            crate::network::metrics::AttemptOutcome::Success
+        ),
+        ..hydra::NetworkCostObservation::default()
+    }
+}
+
 #[derive(Clone)]
 pub struct Node {
     endpoint: Endpoint,
@@ -2329,6 +2367,8 @@ pub struct Node {
     inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
     inflight_change_tx: watch::Sender<u64>,
     routing_metrics: crate::network::metrics::RoutingMetrics,
+    hydra_network_costs: hydra::NetworkCostCollector,
+    hydra_scheduler_config: Arc<std::sync::Mutex<hydra::SchedulerConfig>>,
     routing_telemetry:
         Arc<std::sync::Mutex<Option<Arc<dyn crate::network::metrics::RoutingTelemetrySink>>>>,
     swarm_capture: Arc<std::sync::Mutex<Option<crate::capture::SwarmCaptureRecorder>>>,
@@ -3202,6 +3242,24 @@ impl Node {
         &self.routing_metrics
     }
 
+    pub fn hydra_network_costs(&self) -> &hydra::NetworkCostCollector {
+        &self.hydra_network_costs
+    }
+
+    pub fn set_hydra_scheduler_config(&self, config: hydra::SchedulerConfig) {
+        *self
+            .hydra_scheduler_config
+            .lock()
+            .expect("Hydra scheduler config lock poisoned") = config;
+    }
+
+    pub fn hydra_scheduler_config(&self) -> hydra::SchedulerConfig {
+        self.hydra_scheduler_config
+            .lock()
+            .expect("Hydra scheduler config lock poisoned")
+            .clone()
+    }
+
     pub fn inflight_change_rx(&self) -> watch::Receiver<u64> {
         self.inflight_change_tx.subscribe()
     }
@@ -3636,6 +3694,10 @@ impl Node {
             outcome,
             completion_tokens,
         );
+        self.hydra_network_costs.observe(
+            fork_network_key(model, &attempt_target),
+            fork_network_observation(queue_wait, attempt_time, outcome, completion_tokens),
+        );
         if let Some(sink) = self.routing_telemetry_sink() {
             sink.record_route_attempt(model, &attempt_target, outcome);
         }
@@ -3660,6 +3722,10 @@ impl Node {
             attempt_time,
             outcome,
             completion_tokens,
+        );
+        self.hydra_network_costs.observe(
+            fork_network_key(model_ref.as_deref(), &attempt_target),
+            fork_network_observation(queue_wait, attempt_time, outcome, completion_tokens),
         );
         if let Some(sink) = self.routing_telemetry_sink() {
             sink.record_route_attempt(model_ref.as_deref(), &attempt_target, outcome);
@@ -3843,6 +3909,10 @@ impl Node {
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
             routing_metrics: crate::network::metrics::RoutingMetrics::default(),
+            hydra_network_costs: hydra::NetworkCostCollector::default(),
+            hydra_scheduler_config: Arc::new(std::sync::Mutex::new(
+                hydra::SchedulerConfig::from_env(),
+            )),
             routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
             swarm_capture: Arc::new(std::sync::Mutex::new(None)),
             local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
@@ -4006,6 +4076,10 @@ impl Node {
             inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inflight_change_tx,
             routing_metrics: crate::network::metrics::RoutingMetrics::default(),
+            hydra_network_costs: hydra::NetworkCostCollector::default(),
+            hydra_scheduler_config: Arc::new(std::sync::Mutex::new(
+                hydra::SchedulerConfig::from_env(),
+            )),
             routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
             swarm_capture: Arc::new(std::sync::Mutex::new(None)),
             local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
@@ -7821,8 +7895,23 @@ impl Node {
         {
             return Ok(());
         }
-        self.fetch_stage_package_artifacts_from_peer(coordinator_id, load)
-            .await
+        let started = std::time::Instant::now();
+        let result = self
+            .fetch_stage_package_artifacts_from_peer(coordinator_id, load)
+            .await;
+        self.hydra_network_costs.observe(
+            hydra::TargetNetworkKey::new(
+                Some(&load.model_id),
+                coordinator_id.fmt_short().to_string(),
+                "remote",
+            ),
+            hydra::NetworkCostObservation {
+                artifact_materialization_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
+                success: result.is_ok(),
+                ..hydra::NetworkCostObservation::default()
+            },
+        );
+        result
     }
 
     async fn peer_supports_skippy_subprotocol_feature(

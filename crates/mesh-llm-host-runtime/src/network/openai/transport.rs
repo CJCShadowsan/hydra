@@ -3644,6 +3644,95 @@ fn no_context_eligible_target_reason(model: &str, required_tokens: Option<u32>) 
     }
 }
 
+fn fork_scheduler_target_metadata(
+    target: &election::InferenceTarget,
+) -> Option<(String, hydra::TargetKind, &'static str)> {
+    match target {
+        election::InferenceTarget::Local(port) => Some((
+            format!("127.0.0.1:{port}"),
+            hydra::TargetKind::Local,
+            "local",
+        )),
+        election::InferenceTarget::Remote(peer_id) => Some((
+            peer_id.fmt_short().to_string(),
+            hydra::TargetKind::Remote,
+            "remote",
+        )),
+        election::InferenceTarget::None => None,
+    }
+}
+
+fn apply_fork_scheduler(
+    node: &mesh::Node,
+    model: &str,
+    ordered_candidates: &[election::InferenceTarget],
+    selection: &mut TargetSelection,
+) {
+    let scheduler_config = node.hydra_scheduler_config();
+    let existing_label =
+        fork_scheduler_target_metadata(&selection.target).map(|(label, _, _)| label);
+    let scheduler_candidates = ordered_candidates
+        .iter()
+        .filter_map(|target| {
+            let (label, kind, kind_label) = fork_scheduler_target_metadata(target)?;
+            let key = hydra::TargetNetworkKey::new(Some(model), label.clone(), kind_label);
+            Some(hydra::SchedulerTargetCandidate {
+                target: label,
+                kind,
+                network: node.hydra_network_costs().snapshot_for(&key),
+                affinity_cached: selection
+                    .cached_target
+                    .as_ref()
+                    .map(|cached| cached == target)
+                    .unwrap_or(false),
+                cache_ready: selection
+                    .cached_target
+                    .as_ref()
+                    .map(|cached| cached == target)
+                    .unwrap_or(false),
+                estimated_prefill_ms: None,
+                estimated_decode_pressure_ms: None,
+                estimated_cold_start_ms: None,
+                estimated_kv_transfer_ms: None,
+                estimated_artifact_ms: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let decision = scheduler_config.decide(existing_label.as_deref(), &scheduler_candidates);
+    tracing::info!(
+        model = model,
+        mode = ?decision.mode,
+        existing_target = ?decision.existing_target,
+        selected_target = ?decision.selected_target,
+        shadow_target = ?decision.shadow_target,
+        active_override = decision.active_override,
+        candidate_count = decision.candidates.len(),
+        reason = %decision.reason,
+        "Hydra scheduler route decision"
+    );
+
+    if !decision.active_override {
+        return;
+    }
+    let Some(selected_target_label) = decision.selected_target.as_deref() else {
+        return;
+    };
+    let Some(target) = ordered_candidates.iter().find(|candidate| {
+        fork_scheduler_target_metadata(candidate)
+            .map(|(label, _, _)| label == selected_target_label)
+            .unwrap_or(false)
+    }) else {
+        tracing::warn!(
+            model = model,
+            selected_target = selected_target_label,
+            "Hydra scheduler selected target that is no longer eligible"
+        );
+        return;
+    };
+    selection.target = target.clone();
+    selection.cached_target = None;
+}
+
 async fn route_model_request_inner(args: RouteModelRequestArgs<'_>) -> bool {
     let RouteModelRequestArgs {
         node,
@@ -3666,13 +3755,14 @@ async fn route_model_request_inner(args: RouteModelRequestArgs<'_>) -> bool {
         return true;
     }
 
-    let selection = crate::network::affinity::select_model_target_from_candidates(
+    let mut selection = crate::network::affinity::select_model_target_from_candidates(
         targets,
         &ordered_candidates,
         model,
         request.body_json.as_ref(),
         affinity,
     );
+    apply_fork_scheduler(&node, model, &ordered_candidates, &mut selection);
     if matches!(selection.target, election::InferenceTarget::None) {
         return send_route_model_none_target(&node, tcp_stream, model).await;
     }

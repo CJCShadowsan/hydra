@@ -7,6 +7,7 @@ mod mesh_hook;
 mod model_interests;
 mod model_targets;
 mod objects;
+mod placement;
 mod plugins;
 pub(crate) mod runtime;
 pub(crate) mod runtime_control_state;
@@ -89,6 +90,17 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                 }
                 ("GET", "/api/model-targets") => {
                     model_targets::handle(stream, state).await?;
+                    Ok(true)
+                }
+                ("POST", "/api/placement/prefetch")
+                | ("GET", "/api/placement/cache")
+                | ("POST", "/api/placement/pin")
+                | ("POST", "/api/placement/evict") => {
+                    placement::handle(stream, state, method, path_only, body).await?;
+                    Ok(true)
+                }
+                ("GET", p) if p.starts_with("/api/placement/status/") => {
+                    placement::handle(stream, state, method, path_only, body).await?;
                     Ok(true)
                 }
                 ("DELETE", p) if p.starts_with("/api/model-interests/") => {

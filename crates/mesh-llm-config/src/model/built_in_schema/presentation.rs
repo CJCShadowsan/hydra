@@ -38,6 +38,18 @@ const TELEMETRY_CATEGORY: CategoryPresentation = CategoryPresentation {
     summary: "Opt-in metrics export and local telemetry queue settings",
     order: 40,
 };
+const HYDRA_SCHEDULER_CATEGORY: CategoryPresentation = CategoryPresentation {
+    id: "hydra-scheduler",
+    label: "Hydra Scheduler",
+    summary: "Hydra-owned latency-aware routing policy",
+    order: 50,
+};
+const HYDRA_PLACEMENT_CATEGORY: CategoryPresentation = CategoryPresentation {
+    id: "hydra-placement",
+    label: "Hydra Placement",
+    summary: "Hydra-owned namespace placement and VAST trigger settings",
+    order: 60,
+};
 const RUNTIME_POLICY_CATEGORY: CategoryPresentation = CategoryPresentation {
     id: "runtime-policy",
     label: "Runtime Policy",
@@ -178,6 +190,189 @@ fn process_setting_presentation(rendered: &str) -> Option<SettingPresentation> {
             70,
         )
         .unit("events")
+        .hint("number")),
+        "scheduler.mode" => Some(sp(
+            "Scheduler mode",
+            "Run the Hydra SLO scheduler off, in shadow diagnostics, or as the active target picker.",
+            HYDRA_SCHEDULER_CATEGORY,
+            10,
+        )
+        .hint("segmented")),
+        "scheduler.ttft_budget_ms" => Some(sp(
+            "TTFT budget",
+            "Target first-token latency budget used by network-aware routing.",
+            HYDRA_SCHEDULER_CATEGORY,
+            20,
+        )
+        .unit("ms")
+        .hint("number")),
+        "scheduler.tpot_budget_ms" => Some(sp(
+            "TPOT budget",
+            "Per-output-token latency budget used by network-aware routing.",
+            HYDRA_SCHEDULER_CATEGORY,
+            30,
+        )
+        .unit("ms")
+        .hint("number")),
+        "scheduler.affinity_override_threshold_ms" => Some(sp(
+            "Affinity override",
+            "Minimum predicted latency improvement before routing away from an affinity target.",
+            HYDRA_SCHEDULER_CATEGORY,
+            40,
+        )
+        .unit("ms")
+        .hint("number")),
+        "scheduler.stale_after_ms" => Some(sp(
+            "Metric stale age",
+            "Maximum metric age before scheduler scoring falls back to conservative penalties.",
+            HYDRA_SCHEDULER_CATEGORY,
+            50,
+        )
+        .unit("ms")
+        .hint("number")),
+        "scheduler.cache_affinity_credit_ms" => Some(sp(
+            "Cache affinity credit",
+            "Latency credit applied when a target is expected to have reusable prefix or cache state.",
+            HYDRA_SCHEDULER_CATEGORY,
+            60,
+        )
+        .unit("ms")
+        .hint("number")),
+        "scheduler.failure_penalty_ms" => Some(sp(
+            "Failure penalty",
+            "Latency penalty applied to peers with recent failed attempts.",
+            HYDRA_SCHEDULER_CATEGORY,
+            70,
+        )
+        .unit("ms")
+        .hint("number")),
+        "scheduler.unknown_remote_penalty_ms" => Some(sp(
+            "Unknown remote penalty",
+            "Latency penalty applied to remote targets without fresh local observations.",
+            HYDRA_SCHEDULER_CATEGORY,
+            80,
+        )
+        .unit("ms")
+        .hint("number")),
+        "placement.provider" => Some(sp(
+            "Placement provider",
+            "Namespace provider used for artifact pre-positioning.",
+            HYDRA_PLACEMENT_CATEGORY,
+            10,
+        )
+        .hint("segmented")),
+        "placement.posix_root" => Some(sp(
+            "POSIX namespace root",
+            "Mounted namespace root for artifact manifests and payloads, such as a VAST DataSpace path.",
+            HYDRA_PLACEMENT_CATEGORY,
+            20,
+        )
+        .placeholder("/vast/global/mesh-llm")
+        .hint("text")),
+        "placement.s3_endpoint" => Some(sp(
+            "S3 endpoint",
+            "S3-compatible namespace endpoint used for artifact manifests and payloads.",
+            HYDRA_PLACEMENT_CATEGORY,
+            30,
+        )
+        .placeholder("https://s3.example.internal")
+        .hint("text")),
+        "placement.s3_bucket" => Some(sp(
+            "S3 bucket",
+            "Bucket name for S3-compatible artifact placement.",
+            HYDRA_PLACEMENT_CATEGORY,
+            40,
+        )
+        .hint("text")),
+        "placement.s3_prefix" => Some(sp(
+            "S3 prefix",
+            "Optional object prefix for S3-compatible artifact placement.",
+            HYDRA_PLACEMENT_CATEGORY,
+            50,
+        )
+        .hint("text")),
+        "placement.cache_ttl_secs" => Some(sp(
+            "Cache TTL",
+            "Default lifetime for placement cache manifests.",
+            HYDRA_PLACEMENT_CATEGORY,
+            60,
+        )
+        .unit("sec")
+        .hint("number")),
+        "placement.max_cache_bytes" => Some(sp(
+            "Cache cap",
+            "Maximum local placement cache budget.",
+            HYDRA_PLACEMENT_CATEGORY,
+            70,
+        )
+        .unit("bytes")
+        .hint("number")),
+        "placement.prefetch_threshold_ms" => Some(sp(
+            "Prefetch threshold",
+            "Minimum predicted latency win before background artifact prefetch should be triggered.",
+            HYDRA_PLACEMENT_CATEGORY,
+            80,
+        )
+        .unit("ms")
+        .hint("number")),
+        "placement.vast_trigger_endpoint" => Some(sp(
+            "VAST trigger endpoint",
+            "Webhook or DataEngine endpoint called after an artifact manifest commits.",
+            HYDRA_PLACEMENT_CATEGORY,
+            90,
+        )
+        .placeholder("https://vast-dataengine.example.internal/mesh-llm/ship")
+        .hint("text")),
+        "placement.vast_trigger_auth_header" => Some(sp(
+            "VAST auth header",
+            "Optional Authorization header value for the VAST trigger endpoint.",
+            HYDRA_PLACEMENT_CATEGORY,
+            100,
+        )
+        .placeholder("Bearer ...")
+        .hint("text")),
+        "placement.vast_tenant" => Some(sp(
+            "VAST tenant",
+            "Tenant label included in VAST trigger payloads.",
+            HYDRA_PLACEMENT_CATEGORY,
+            110,
+        )
+        .hint("text")),
+        "placement.vast_dataspace" => Some(sp(
+            "VAST DataSpace",
+            "DataSpace label included in VAST trigger payloads.",
+            HYDRA_PLACEMENT_CATEGORY,
+            120,
+        )
+        .hint("text")),
+        "placement.vast_source_namespace" => Some(sp(
+            "VAST source namespace",
+            "Source namespace hint included in VAST trigger payloads.",
+            HYDRA_PLACEMENT_CATEGORY,
+            130,
+        )
+        .hint("text")),
+        "placement.vast_destination_namespace" => Some(sp(
+            "VAST destination namespace",
+            "Destination namespace hint included in VAST trigger payloads.",
+            HYDRA_PLACEMENT_CATEGORY,
+            140,
+        )
+        .hint("text")),
+        "placement.vast_target_sites" => Some(sp(
+            "VAST target sites",
+            "Destination site names included in VAST trigger payloads.",
+            HYDRA_PLACEMENT_CATEGORY,
+            150,
+        )
+        .hint("textarea")),
+        "placement.vast_trigger_timeout_secs" => Some(sp(
+            "VAST trigger timeout",
+            "HTTP timeout for the VAST trigger call.",
+            HYDRA_PLACEMENT_CATEGORY,
+            160,
+        )
+        .unit("sec")
         .hint("number")),
         "runtime.reconcile_model_targets" => Some(sp(
             "Reconcile model targets",

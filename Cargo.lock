@@ -3766,6 +3766,7 @@ dependencies = [
  "mesh-llm-cli",
  "mesh-llm-client",
  "mesh-llm-commands",
+ "hydra",
  "mesh-llm-host-runtime",
  "mesh-llm-plugin",
  "mesh-llm-plugin-manager",
@@ -3935,6 +3936,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra"
+version = "0.72.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "mesh-llm-ffi"
 version = "0.72.1"
 dependencies = [
@@ -4008,6 +4024,7 @@ dependencies = [
  "mesh-llm-client",
  "mesh-llm-config",
  "mesh-llm-events",
+ "hydra",
  "mesh-llm-guardrails",
  "mesh-llm-identity",
  "mesh-llm-native-runtime",

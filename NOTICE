@@ -1,0 +1,14 @@
+Hydra
+Copyright 2026 Hydra contributors
+
+Hydra is a downstream fork of Mesh LLM:
+
+  https://github.com/Mesh-LLM/mesh-llm
+
+Hydra includes software derived from Mesh LLM and preserves upstream Mesh LLM
+license terms, copyright notices, and attribution. Hydra-specific changes are
+distributed under the Apache License, Version 2.0, unless a file states
+otherwise.
+
+Mesh LLM is developed by its upstream contributors. Hydra is an independent
+downstream project and is not presented as the upstream Mesh LLM project.

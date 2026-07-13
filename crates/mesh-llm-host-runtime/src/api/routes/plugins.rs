@@ -567,6 +567,8 @@ mod tests {
             affinity_router: affinity::AffinityRouter::default(),
             runtime_data_collector,
             runtime_data_producer,
+            hydra_scheduler_config: hydra::SchedulerConfig::from_env(),
+            placement_vast_trigger_config: None,
         })
     }
 

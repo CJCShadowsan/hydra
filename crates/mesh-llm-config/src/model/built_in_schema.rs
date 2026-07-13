@@ -168,6 +168,8 @@ fn build_built_in_config_schema() -> ConfigSchema {
         ),
     ];
 
+    settings.extend(fork_scheduler_settings());
+    settings.extend(fork_placement_settings());
     settings.extend(model_defaults_settings());
     settings.extend(model_entry_settings());
     settings.extend(plugin_entry_settings());
@@ -211,6 +213,66 @@ fn model_defaults_settings() -> Vec<ConfigSettingSchema> {
     ));
     settings.extend(advanced_settings("defaults.advanced"));
     settings
+}
+
+fn fork_scheduler_settings() -> Vec<ConfigSettingSchema> {
+    vec![
+        top_level_setting("scheduler.mode", string_enum(["off", "shadow", "active"])),
+        top_level_setting("scheduler.ttft_budget_ms", ConfigValueSchema::Integer),
+        top_level_setting("scheduler.tpot_budget_ms", ConfigValueSchema::Integer),
+        top_level_setting(
+            "scheduler.affinity_override_threshold_ms",
+            ConfigValueSchema::Integer,
+        ),
+        top_level_setting("scheduler.stale_after_ms", ConfigValueSchema::Integer),
+        top_level_setting(
+            "scheduler.cache_affinity_credit_ms",
+            ConfigValueSchema::Integer,
+        ),
+        top_level_setting("scheduler.failure_penalty_ms", ConfigValueSchema::Integer),
+        top_level_setting(
+            "scheduler.unknown_remote_penalty_ms",
+            ConfigValueSchema::Integer,
+        ),
+    ]
+}
+
+fn fork_placement_settings() -> Vec<ConfigSettingSchema> {
+    vec![
+        top_level_setting("placement.provider", string_enum(["posix", "s3"])),
+        top_level_setting("placement.posix_root", ConfigValueSchema::Path),
+        top_level_setting("placement.s3_endpoint", ConfigValueSchema::Url),
+        top_level_setting("placement.s3_bucket", ConfigValueSchema::String),
+        top_level_setting("placement.s3_prefix", ConfigValueSchema::String),
+        top_level_setting("placement.cache_ttl_secs", ConfigValueSchema::Integer),
+        top_level_setting("placement.max_cache_bytes", ConfigValueSchema::Integer),
+        top_level_setting("placement.prefetch_threshold_ms", ConfigValueSchema::Integer),
+        top_level_setting("placement.vast_trigger_endpoint", ConfigValueSchema::Url),
+        top_level_setting(
+            "placement.vast_trigger_auth_header",
+            ConfigValueSchema::String,
+        ),
+        top_level_setting("placement.vast_tenant", ConfigValueSchema::String),
+        top_level_setting("placement.vast_dataspace", ConfigValueSchema::String),
+        top_level_setting(
+            "placement.vast_source_namespace",
+            ConfigValueSchema::String,
+        ),
+        top_level_setting(
+            "placement.vast_destination_namespace",
+            ConfigValueSchema::String,
+        ),
+        top_level_setting(
+            "placement.vast_target_sites",
+            ConfigValueSchema::Array {
+                items: Box::new(ConfigValueSchema::String),
+            },
+        ),
+        top_level_setting(
+            "placement.vast_trigger_timeout_secs",
+            ConfigValueSchema::Integer,
+        ),
+    ]
 }
 
 fn model_entry_settings() -> Vec<ConfigSettingSchema> {

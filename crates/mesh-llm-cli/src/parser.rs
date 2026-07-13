@@ -723,6 +723,11 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<RuntimeCommand>,
     },
+    /// Manage artifact placement and prefetch operations.
+    Placement {
+        #[command(subcommand)]
+        command: PlacementCommand,
+    },
     /// Inspect and validate mesh-llm configuration files.
     Config {
         #[command(subcommand)]
@@ -986,6 +991,82 @@ pub enum Command {
     /// Run a CLI command contributed by a configured plugin.
     #[command(external_subcommand)]
     ExternalPlugin(Vec<OsString>),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlacementCommand {
+    /// Publish an artifact into a POSIX-mounted namespace and record a manifest.
+    Prefetch {
+        /// Artifact kind: model_weights, layer_package, kv_state, recurrent_state, activation_frame.
+        kind: String,
+        /// Stable artifact identity to publish.
+        artifact_id: String,
+        /// Local source file or directory to stage into the namespace.
+        source: PathBuf,
+        /// POSIX namespace root, for example a mounted VAST DataSpace path.
+        #[arg(long)]
+        posix_root: PathBuf,
+        /// Optional VAST DataEngine/webhook endpoint to trigger after manifest commit.
+        #[arg(long = "vast-trigger-endpoint")]
+        vast_trigger_endpoint: Option<String>,
+        /// Optional Authorization header value for the VAST trigger endpoint.
+        #[arg(long = "vast-trigger-auth-header")]
+        vast_trigger_auth_header: Option<String>,
+        /// Optional VAST tenant label to include in the trigger payload.
+        #[arg(long = "vast-tenant")]
+        vast_tenant: Option<String>,
+        /// Optional VAST DataSpace name to include in the trigger payload.
+        #[arg(long = "vast-dataspace")]
+        vast_dataspace: Option<String>,
+        /// Optional source namespace/path hint for the VAST trigger payload.
+        #[arg(long = "vast-source-namespace")]
+        vast_source_namespace: Option<String>,
+        /// Optional destination namespace/path hint for the VAST trigger payload.
+        #[arg(long = "vast-destination-namespace")]
+        vast_destination_namespace: Option<String>,
+        /// VAST destination site to include in the trigger payload; repeat for multiple sites.
+        #[arg(long = "vast-target-site")]
+        vast_target_sites: Vec<String>,
+        /// VAST trigger HTTP timeout in seconds.
+        #[arg(long = "vast-trigger-timeout-secs")]
+        vast_trigger_timeout_secs: Option<u64>,
+        /// Console/API port of the running mesh-llm instance.
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
+    /// Show a placement operation by id.
+    Status {
+        operation_id: String,
+        /// Console/API port of the running mesh-llm instance.
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
+    /// List placement operations known to this node.
+    Cache {
+        /// Console/API port of the running mesh-llm instance.
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
+    /// Pin an artifact in the placement cache index.
+    Pin {
+        artifact_id: String,
+        /// Console/API port of the running mesh-llm instance.
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
+    /// Evict an artifact from the placement cache index and optionally a POSIX namespace.
+    Evict {
+        artifact_id: String,
+        /// Artifact kind to remove from the namespace.
+        #[arg(long)]
+        kind: Option<String>,
+        /// POSIX namespace root to remove from.
+        #[arg(long)]
+        posix_root: Option<PathBuf>,
+        /// Console/API port of the running mesh-llm instance.
+        #[arg(long, default_value = "3131")]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]

@@ -38,8 +38,8 @@ pub use validate::{
 mod tests {
     use super::{
         ConfigStore, GpuAssignment, LocalServingNodeConfig, MeshConfig, ModelRuntimeKind,
-        built_in_config_schema, canonicalize_built_in_config_identifier, parse_config_toml,
-        validate_config,
+        PlacementProviderConfigName, SchedulerModeConfig, built_in_config_schema,
+        canonicalize_built_in_config_identifier, parse_config_toml, validate_config,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -105,6 +105,61 @@ connect_timeout_secs = 0
                 .contains("plugin[0].startup.connect_timeout_secs must be at least 1"),
             "unexpected validation error: {err}"
         );
+    }
+
+    #[test]
+    fn fork_scheduler_and_placement_sections_parse() {
+        let config: MeshConfig = toml::from_str(
+            r#"
+version = 1
+
+[scheduler]
+mode = "active"
+ttft_budget_ms = 450
+tpot_budget_ms = 40
+affinity_override_threshold_ms = 100
+stale_after_ms = 15000
+cache_affinity_credit_ms = 80
+failure_penalty_ms = 500
+unknown_remote_penalty_ms = 75
+
+[placement]
+provider = "posix"
+posix_root = "/vast/global/mesh-llm"
+cache_ttl_secs = 3600
+max_cache_bytes = 1099511627776
+prefetch_threshold_ms = 250
+vast_trigger_endpoint = "https://vast-dataengine.example.internal/mesh-llm/ship"
+vast_tenant = "acme-ai"
+vast_dataspace = "prod-dataspace"
+vast_source_namespace = "/vast/global/mesh-llm"
+vast_destination_namespace = "/vast/site-b/mesh-llm"
+vast_target_sites = ["site-b"]
+vast_trigger_timeout_secs = 30
+"#,
+        )
+        .expect("Hydra config sections should parse");
+
+        assert_eq!(config.scheduler.mode, SchedulerModeConfig::Active);
+        assert_eq!(config.scheduler.ttft_budget_ms, Some(450));
+        assert_eq!(
+            config.placement.provider,
+            Some(PlacementProviderConfigName::Posix)
+        );
+        assert_eq!(
+            config.placement.posix_root.as_deref(),
+            Some("/vast/global/mesh-llm")
+        );
+        assert_eq!(config.placement.prefetch_threshold_ms, Some(250));
+        assert_eq!(
+            config.placement.vast_trigger_endpoint.as_deref(),
+            Some("https://vast-dataengine.example.internal/mesh-llm/ship")
+        );
+        assert_eq!(
+            config.placement.vast_target_sites,
+            vec!["site-b".to_string()]
+        );
+        assert_eq!(config.placement.vast_trigger_timeout_secs, Some(30));
     }
 
     #[test]

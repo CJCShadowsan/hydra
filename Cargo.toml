@@ -5,6 +5,7 @@ members = [
     "crates/mesh-llm-commands",
     "crates/mesh-llm-config",
     "crates/mesh-llm-events",
+    "crates/hydra",
     "crates/mesh-llm-build-info",
     "crates/mesh-llm-gpu-bench",
     "crates/mesh-llm-host-runtime",
@@ -65,7 +66,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 version = "0.72.1"
 
 [workspace.dependencies]

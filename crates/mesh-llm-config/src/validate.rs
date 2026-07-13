@@ -134,6 +134,12 @@ pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic>
     if let Err(diagnostic) = validate_runtime_config(&config.runtime) {
         diagnostics.push(diagnostic);
     }
+    if let Err(diagnostic) = validate_scheduler_config(&config.scheduler) {
+        diagnostics.push(diagnostic);
+    }
+    if let Err(diagnostic) = validate_placement_config(&config.placement) {
+        diagnostics.push(diagnostic);
+    }
     if let Err(diagnostic) = validate_plugin_entries(&config.plugins) {
         diagnostics.push(diagnostic);
     }
@@ -1678,6 +1684,109 @@ fn validate_telemetry_config(config: &TelemetryConfig) -> DiagnosticResult {
             "telemetry.prompt_shape_metrics",
             "telemetry.prompt_shape_metrics is not supported yet and must remain false",
         ));
+    }
+    Ok(())
+}
+
+fn validate_scheduler_config(config: &SchedulerConfig) -> DiagnosticResult {
+    validate_optional_min_u64(
+        config.ttft_budget_ms,
+        "scheduler.ttft_budget_ms",
+        1,
+        "scheduler.ttft_budget_ms must be at least 1",
+    )?;
+    validate_optional_min_u64(
+        config.tpot_budget_ms,
+        "scheduler.tpot_budget_ms",
+        1,
+        "scheduler.tpot_budget_ms must be at least 1",
+    )?;
+    validate_optional_min_u64(
+        config.stale_after_ms,
+        "scheduler.stale_after_ms",
+        1,
+        "scheduler.stale_after_ms must be at least 1",
+    )?;
+    Ok(())
+}
+
+fn validate_placement_config(config: &PlacementConfig) -> DiagnosticResult {
+    match config.provider {
+        Some(PlacementProviderConfigName::Posix) if config.posix_root.is_none() => {
+            return Err(validation_diagnostic(
+                "placement.posix_root",
+                "placement.posix_root is required when placement.provider = \"posix\"",
+            ));
+        }
+        Some(PlacementProviderConfigName::S3) => {
+            if config.s3_bucket.as_deref().unwrap_or_default().trim().is_empty() {
+                return Err(validation_diagnostic(
+                    "placement.s3_bucket",
+                    "placement.s3_bucket is required when placement.provider = \"s3\"",
+                ));
+            }
+            validate_optional_http_url(config.s3_endpoint.as_deref(), "placement.s3_endpoint")?;
+            if config.s3_endpoint.is_none() {
+                return Err(validation_diagnostic(
+                    "placement.s3_endpoint",
+                    "placement.s3_endpoint is required when placement.provider = \"s3\"",
+                ));
+            }
+        }
+        _ => {}
+    }
+    validate_optional_min_u64(
+        config.cache_ttl_secs,
+        "placement.cache_ttl_secs",
+        1,
+        "placement.cache_ttl_secs must be at least 1",
+    )?;
+    validate_optional_min_u64(
+        config.max_cache_bytes,
+        "placement.max_cache_bytes",
+        1,
+        "placement.max_cache_bytes must be at least 1",
+    )?;
+    validate_optional_min_u64(
+        config.prefetch_threshold_ms,
+        "placement.prefetch_threshold_ms",
+        1,
+        "placement.prefetch_threshold_ms must be at least 1",
+    )?;
+    validate_optional_http_url(
+        config.vast_trigger_endpoint.as_deref(),
+        "placement.vast_trigger_endpoint",
+    )?;
+    validate_optional_min_u64(
+        config.vast_trigger_timeout_secs,
+        "placement.vast_trigger_timeout_secs",
+        1,
+        "placement.vast_trigger_timeout_secs must be at least 1",
+    )?;
+    if let Some((index, _)) = config
+        .vast_target_sites
+        .iter()
+        .enumerate()
+        .find(|(_, site)| site.trim().is_empty())
+    {
+        return Err(validation_diagnostic(
+            &format!("placement.vast_target_sites[{index}]"),
+            "placement.vast_target_sites entries must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_min_u64(
+    value: Option<u64>,
+    path: &str,
+    min: u64,
+    message: &'static str,
+) -> DiagnosticResult {
+    if let Some(value) = value
+        && value < min
+    {
+        return Err(validation_diagnostic(path, message));
     }
     Ok(())
 }

@@ -32,6 +32,7 @@ mesh-llm-build-info.workspace = true
 mesh-mixture-of-agents = { path = "../mesh-mixture-of-agents", version = "0.72.1"  }
 mesh-llm-config = { path = "../mesh-llm-config", version = "0.72.1"  }
 mesh-llm-events = { path = "../mesh-llm-events", version = "0.72.1"  }
+hydra = { path = "../hydra", version = "0.72.1"  }
 mesh-llm-plugin = { path = "../mesh-llm-plugin", version = "0.72.1"  }
 mesh-llm-plugin-manager = { path = "../mesh-llm-plugin-manager", version = "0.72.1"  }
 mesh-llm-identity = { path = "../mesh-llm-identity", version = "0.72.1", features = ["host-io"]  }

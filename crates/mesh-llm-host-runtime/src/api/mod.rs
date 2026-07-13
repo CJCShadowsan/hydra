@@ -171,6 +171,8 @@ pub struct MeshApiConfig {
     pub(crate) affinity_router: affinity::AffinityRouter,
     pub(crate) runtime_data_collector: runtime_data::RuntimeDataCollector,
     pub(crate) runtime_data_producer: runtime_data::RuntimeDataProducer,
+    pub(crate) hydra_scheduler_config: hydra::SchedulerConfig,
+    pub(crate) placement_vast_trigger_config: Option<hydra::VastTriggerConfig>,
 }
 
 impl MeshApi {
@@ -185,8 +187,11 @@ impl MeshApi {
             affinity_router,
             runtime_data_collector,
             runtime_data_producer,
+            hydra_scheduler_config,
+            placement_vast_trigger_config,
         } = config;
 
+        node.set_hydra_scheduler_config(hydra_scheduler_config.clone());
         runtime_data_producer.publish_runtime_status(|runtime_status| {
             if runtime_status.primary_model.as_deref() == Some(model_name.as_str()) {
                 return false;
@@ -230,6 +235,9 @@ impl MeshApi {
                 affinity_router,
                 runtime_data_collector,
                 runtime_data_producer,
+                hydra_scheduler_config,
+                placement_vast_trigger_config,
+                placement_manager: hydra::PlacementManager::default(),
                 headless: false,
                 is_host: false,
                 is_client: false,
@@ -283,6 +291,61 @@ impl MeshApi {
                 .then_with(|| left.model_ref.cmp(&right.model_ref))
         });
         interests
+    }
+
+    pub(super) async fn placement_prefetch(
+        &self,
+        mut request: hydra::PlacementPrefetchRequest,
+    ) -> anyhow::Result<hydra::PlacementOperationSnapshot> {
+        let (manager, default_vast_trigger) = {
+            let inner = self.inner.lock().await;
+            (
+                inner.placement_manager.clone(),
+                inner.placement_vast_trigger_config.clone(),
+            )
+        };
+        if request.vast_trigger.is_none() {
+            request.vast_trigger = default_vast_trigger;
+        }
+        tokio::task::spawn_blocking(move || manager.prefetch(request))
+            .await
+            .map_err(|err| anyhow::anyhow!("placement prefetch task failed: {err}"))?
+    }
+
+    pub(super) async fn placement_status(
+        &self,
+        operation_id: &str,
+    ) -> Option<hydra::PlacementOperationSnapshot> {
+        self.inner
+            .lock()
+            .await
+            .placement_manager
+            .status(operation_id)
+    }
+
+    pub(super) async fn placement_cache(&self) -> hydra::PlacementCacheSnapshot {
+        self.inner
+            .lock()
+            .await
+            .placement_manager
+            .cache_snapshot()
+    }
+
+    pub(super) async fn placement_pin(
+        &self,
+        request: hydra::PlacementPinRequest,
+    ) -> hydra::PlacementOperationSnapshot {
+        self.inner.lock().await.placement_manager.pin(request)
+    }
+
+    pub(super) async fn placement_evict(
+        &self,
+        request: hydra::PlacementEvictRequest,
+    ) -> anyhow::Result<hydra::PlacementOperationSnapshot> {
+        let manager = self.inner.lock().await.placement_manager.clone();
+        tokio::task::spawn_blocking(move || manager.evict(request))
+            .await
+            .map_err(|err| anyhow::anyhow!("placement evict task failed: {err}"))?
     }
 
     pub(super) async fn upsert_model_interest(
@@ -855,6 +918,8 @@ impl MeshApi {
             wakeable_inventory,
             openai_guardrails,
             plugin_manager,
+            hydra_scheduler_config,
+            placement_manager,
         ) = {
             let inner = self.inner.lock().await;
             (
@@ -876,6 +941,8 @@ impl MeshApi {
                 inner.wakeable_inventory.clone(),
                 inner.openai_guardrails.clone(),
                 inner.plugin_manager.clone(),
+                inner.hydra_scheduler_config.clone(),
+                inner.placement_manager.clone(),
             )
         };
         let token = node.invite_token().await;
@@ -943,6 +1010,9 @@ impl MeshApi {
             },
         ));
         payload.runtime = runtime;
+        payload.network_costs = node.hydra_network_costs().status_snapshot();
+        payload.scheduler = hydra_scheduler_config.status_snapshot();
+        payload.placement = placement_manager.cache_snapshot();
         payload.wanted_model_refs = self.wanted_model_refs().await;
         payload.mesh_requirements = node.mesh_requirement_policy_summary().await;
         payload.recent_mesh_rejections = node.recent_mesh_requirement_rejections().await;

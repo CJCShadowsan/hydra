@@ -410,6 +410,10 @@ async fn make_test_node_with_requirements(
         inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         inflight_change_tx,
         routing_metrics: crate::network::metrics::RoutingMetrics::default(),
+        hydra_network_costs: hydra::NetworkCostCollector::default(),
+        hydra_scheduler_config: Arc::new(std::sync::Mutex::new(
+            hydra::SchedulerConfig::from_env(),
+        )),
         routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
         swarm_capture: Arc::new(std::sync::Mutex::new(None)),
         local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
@@ -1334,6 +1338,8 @@ async fn build_mesh_api_for_control_tests(node: Node) -> api::MeshApi {
         affinity_router: affinity::AffinityRouter::default(),
         runtime_data_collector,
         runtime_data_producer,
+        hydra_scheduler_config: hydra::SchedulerConfig::from_env(),
+        placement_vast_trigger_config: None,
     })
 }
 

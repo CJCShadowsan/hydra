@@ -3707,6 +3707,60 @@ fn apply_runtime_config_options(options: &mut RuntimeOptions, config: &plugin::M
     options.listen_all |= config.runtime.listen_all;
 }
 
+fn hydra_scheduler_config_from_mesh_config(
+    config: &plugin::MeshConfig,
+) -> hydra::SchedulerConfig {
+    let mut scheduler = hydra::SchedulerConfig::from_env();
+    if config.scheduler.is_default() {
+        return scheduler;
+    }
+    scheduler.mode = match config.scheduler.mode {
+        mesh_llm_config::SchedulerModeConfig::Off => hydra::SchedulerMode::Off,
+        mesh_llm_config::SchedulerModeConfig::Shadow => hydra::SchedulerMode::Shadow,
+        mesh_llm_config::SchedulerModeConfig::Active => hydra::SchedulerMode::Active,
+    };
+    if let Some(value) = config.scheduler.ttft_budget_ms {
+        scheduler.ttft_budget_ms = value as f64;
+    }
+    if let Some(value) = config.scheduler.tpot_budget_ms {
+        scheduler.tpot_budget_ms = value as f64;
+    }
+    if let Some(value) = config.scheduler.affinity_override_threshold_ms {
+        scheduler.affinity_override_threshold_ms = value as f64;
+    }
+    if let Some(value) = config.scheduler.stale_after_ms {
+        scheduler.stale_after_ms = value;
+    }
+    if let Some(value) = config.scheduler.cache_affinity_credit_ms {
+        scheduler.cache_affinity_credit_ms = value as f64;
+    }
+    if let Some(value) = config.scheduler.failure_penalty_ms {
+        scheduler.failure_penalty_ms = value as f64;
+    }
+    if let Some(value) = config.scheduler.unknown_remote_penalty_ms {
+        scheduler.unknown_remote_penalty_ms = value as f64;
+    }
+    scheduler
+}
+
+fn placement_vast_trigger_config_from_mesh_config(
+    config: &plugin::MeshConfig,
+) -> Option<hydra::VastTriggerConfig> {
+    let endpoint = config.placement.vast_trigger_endpoint.clone()?;
+    Some(hydra::VastTriggerConfig {
+        mode: hydra::VastTriggerMode::DataEngineWebhook,
+        endpoint: Some(endpoint),
+        authorization_header: config.placement.vast_trigger_auth_header.clone(),
+        tenant: config.placement.vast_tenant.clone(),
+        dataspace: config.placement.vast_dataspace.clone(),
+        source_namespace: config.placement.vast_source_namespace.clone(),
+        destination_namespace: config.placement.vast_destination_namespace.clone(),
+        target_sites: config.placement.vast_target_sites.clone(),
+        timeout_secs: config.placement.vast_trigger_timeout_secs,
+        headers: std::collections::BTreeMap::new(),
+    })
+}
+
 #[cfg(test)]
 fn runtime_options_for_test(args: &[&str]) -> RuntimeOptions {
     let mut options = RuntimeOptions::default();
@@ -6710,6 +6764,7 @@ struct PassiveConsoleRuntime {
 
 struct PassiveConsoleSetupContext<'a> {
     options: &'a RuntimeOptions,
+    config: &'a plugin::MeshConfig,
     node: &'a mesh::Node,
     is_client: bool,
     plugin_manager: &'a plugin::PluginManager,
@@ -6721,6 +6776,7 @@ struct PassiveConsoleSetupContext<'a> {
 
 struct RunAutoConsoleStateContext<'a> {
     options: &'a RuntimeOptions,
+    config: &'a plugin::MeshConfig,
     node: &'a mesh::Node,
     console_enabled: bool,
     model_name: &'a str,
@@ -7047,6 +7103,7 @@ async fn run_auto_runtime_loop_and_shutdown(ctx: RunAutoRuntimeLifecycleContext<
 
     shutdown_run_auto_runtime(RunAutoShutdownContext {
         options,
+        config,
         node,
         plugin_manager,
         api_proxy_handle,
@@ -7895,6 +7952,8 @@ async fn setup_run_auto_console_state(
         affinity_router: ctx.affinity_router.clone(),
         runtime_data_collector,
         runtime_data_producer,
+        hydra_scheduler_config: hydra_scheduler_config_from_mesh_config(ctx.config),
+        placement_vast_trigger_config: placement_vast_trigger_config_from_mesh_config(ctx.config),
     });
     console_state.set_primary_backend("skippy".into()).await;
     console_state
@@ -8489,6 +8548,7 @@ async fn run_auto(ctx: RunAutoContext) -> Result<()> {
     let runtime_owner_key_path = resolve_runtime_owner_key_path(&options)?;
     let console_state = setup_run_auto_console_state(RunAutoConsoleStateContext {
         options: &options,
+        config: &config,
         node: &node,
         console_enabled: console_port.is_some(),
         model_name: &model_name_for_console,
@@ -8656,6 +8716,8 @@ async fn setup_passive_console_runtime(
         affinity_router: affinity_router.clone(),
         runtime_data_collector,
         runtime_data_producer,
+        hydra_scheduler_config: hydra_scheduler_config_from_mesh_config(config),
+        placement_vast_trigger_config: placement_vast_trigger_config_from_mesh_config(config),
     });
     console_state.set_runtime_control(control_tx.clone()).await;
     console_state
@@ -8800,6 +8862,7 @@ async fn run_passive(
     api_listener: Option<tokio::net::TcpListener>,
     embedded_control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<api::RuntimeControlRequest>>,
 ) -> Result<Option<String>> {
+    let config = plugin::load_config(options.config.as_deref())?;
     let local_port = options.port;
     let affinity_router = affinity::AffinityRouter::new();
     node.set_display_name(node_display_name(options, &node))
@@ -8836,6 +8899,7 @@ async fn run_passive(
     } = setup_passive_console_runtime(
         PassiveConsoleSetupContext {
             options,
+            config: &config,
             node: &node,
             is_client,
             plugin_manager: &plugin_manager,
@@ -9687,6 +9751,8 @@ mod tests {
             affinity_router: affinity::AffinityRouter::default(),
             runtime_data_collector,
             runtime_data_producer,
+            hydra_scheduler_config: hydra::SchedulerConfig::from_env(),
+            placement_vast_trigger_config: None,
         })
     }
 

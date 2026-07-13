@@ -1,0 +1,30 @@
+name: Hydra upstream drift
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * 1"
+  pull_request:
+    paths:
+      - "crates/hydra/**"
+      - "docs/hydra/**"
+      - "scripts/hydra/**"
+      - "crates/mesh-llm-host-runtime/src/network/openai/transport.rs"
+      - "crates/mesh-llm-host-runtime/src/mesh/mod.rs"
+      - "crates/mesh-llm-host-runtime/src/api/**"
+      - "crates/mesh-llm-config/**"
+      - "crates/mesh-llm-cli/**"
+      - "crates/mesh-llm/src/commands/**"
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure upstream remote
+        run: |
+          git remote add upstream https://github.com/Mesh-LLM/mesh-llm.git || true
+      - name: Report upstream drift
+        run: scripts/hydra/check-upstream-sync.sh

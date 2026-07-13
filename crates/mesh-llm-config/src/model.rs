@@ -30,6 +30,10 @@ pub struct MeshConfig {
     pub defaults: Option<ModelConfigDefaults>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default, skip_serializing_if = "SchedulerConfig::is_default")]
+    pub scheduler: SchedulerConfig,
+    #[serde(default, skip_serializing_if = "PlacementConfig::is_default")]
+    pub placement: PlacementConfig,
     #[serde(default)]
     pub models: Vec<ModelConfigEntry>,
     #[serde(rename = "plugin", default)]
@@ -107,6 +111,107 @@ pub struct NativeRuntimeConfig {
     pub skippy_abi: Option<String>,
     #[serde(default)]
     pub selection: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerModeConfig {
+    Off,
+    #[default]
+    Shadow,
+    Active,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerConfig {
+    #[serde(default)]
+    pub mode: SchedulerModeConfig,
+    #[serde(default)]
+    pub ttft_budget_ms: Option<u64>,
+    #[serde(default)]
+    pub tpot_budget_ms: Option<u64>,
+    #[serde(default)]
+    pub affinity_override_threshold_ms: Option<u64>,
+    #[serde(default)]
+    pub stale_after_ms: Option<u64>,
+    #[serde(default)]
+    pub cache_affinity_credit_ms: Option<u64>,
+    #[serde(default)]
+    pub failure_penalty_ms: Option<u64>,
+    #[serde(default)]
+    pub unknown_remote_penalty_ms: Option<u64>,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            mode: SchedulerModeConfig::Shadow,
+            ttft_budget_ms: None,
+            tpot_budget_ms: None,
+            affinity_override_threshold_ms: None,
+            stale_after_ms: None,
+            cache_affinity_credit_ms: None,
+            failure_penalty_ms: None,
+            unknown_remote_penalty_ms: None,
+        }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementProviderConfigName {
+    Posix,
+    S3,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementConfig {
+    #[serde(default)]
+    pub provider: Option<PlacementProviderConfigName>,
+    #[serde(default)]
+    pub posix_root: Option<String>,
+    #[serde(default)]
+    pub s3_endpoint: Option<String>,
+    #[serde(default)]
+    pub s3_bucket: Option<String>,
+    #[serde(default)]
+    pub s3_prefix: Option<String>,
+    #[serde(default)]
+    pub cache_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub max_cache_bytes: Option<u64>,
+    #[serde(default)]
+    pub prefetch_threshold_ms: Option<u64>,
+    #[serde(default)]
+    pub vast_trigger_endpoint: Option<String>,
+    #[serde(default)]
+    pub vast_trigger_auth_header: Option<String>,
+    #[serde(default)]
+    pub vast_tenant: Option<String>,
+    #[serde(default)]
+    pub vast_dataspace: Option<String>,
+    #[serde(default)]
+    pub vast_source_namespace: Option<String>,
+    #[serde(default)]
+    pub vast_destination_namespace: Option<String>,
+    #[serde(default)]
+    pub vast_target_sites: Vec<String>,
+    #[serde(default)]
+    pub vast_trigger_timeout_secs: Option<u64>,
+}
+
+impl PlacementConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -912,6 +1017,10 @@ struct RawMeshConfig {
     #[serde(default)]
     runtime: RuntimeConfig,
     #[serde(default)]
+    scheduler: SchedulerConfig,
+    #[serde(default)]
+    placement: PlacementConfig,
+    #[serde(default)]
     models: Vec<ModelConfigEntry>,
     #[serde(rename = "plugin", default)]
     plugins: Vec<PluginConfigEntry>,
@@ -1010,6 +1119,8 @@ impl<'de> Deserialize<'de> for MeshConfig {
             telemetry: raw.telemetry,
             defaults: raw.defaults,
             runtime: raw.runtime,
+            scheduler: raw.scheduler,
+            placement: raw.placement,
             models: raw.models,
             plugins: raw.plugins,
             extra: raw.extra,

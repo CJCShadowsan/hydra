@@ -20,11 +20,33 @@ pub(super) fn apply_runtime_controls_behavior(setting: &mut ConfigSettingSchema,
             push_requires_constraint(setting, "owner_control.bind");
         }
         "telemetry.enabled" => set_static_options(setting),
+        "scheduler.mode" | "placement.provider" => set_static_options(setting),
+        "scheduler.ttft_budget_ms"
+        | "scheduler.tpot_budget_ms"
+        | "scheduler.affinity_override_threshold_ms"
+        | "scheduler.stale_after_ms"
+        | "scheduler.cache_affinity_credit_ms"
+        | "scheduler.failure_penalty_ms"
+        | "scheduler.unknown_remote_penalty_ms" => {
+            set_numeric(setting, Some(1.0), None, Some(1.0), Some("ms"));
+        }
+        "placement.cache_ttl_secs" | "placement.vast_trigger_timeout_secs" => {
+            set_numeric(setting, Some(1.0), None, Some(1.0), Some("sec"));
+        }
+        "placement.max_cache_bytes" => {
+            set_numeric(setting, Some(1.0), None, Some(1.0), Some("bytes"));
+        }
+        "placement.prefetch_threshold_ms" => {
+            set_numeric(setting, Some(1.0), None, Some(1.0), Some("ms"));
+        }
         "telemetry.service_name" => {
             push_non_empty_constraint(setting);
             push_allowed_pattern_constraint(setting, r"^[A-Za-z0-9_-]+$");
         }
-        "telemetry.endpoint" | "telemetry.metrics.endpoint" => {
+        "telemetry.endpoint"
+        | "telemetry.metrics.endpoint"
+        | "placement.s3_endpoint"
+        | "placement.vast_trigger_endpoint" => {
             push_non_empty_constraint(setting);
         }
         "telemetry.export_interval_secs" => {

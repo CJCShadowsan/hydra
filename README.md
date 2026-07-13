@@ -1,3 +1,16 @@
+<h1 align="center">Hydra</h1>
+
+Hydra is a downstream fork of [Mesh LLM](https://github.com/Mesh-LLM/mesh-llm)
+focused on network-aware low-latency inference, resilient scheduling, and
+artifact placement across distant locations. The name is intentional: if one
+head is cut off, the system keeps going and grows back.
+
+Hydra preserves upstream Mesh LLM attribution and tracks upstream changes while
+allowing product-level divergence. See [NOTICE](NOTICE), [CHANGES.md](CHANGES.md),
+and [docs/hydra/UPSTREAM_SYNC.md](docs/hydra/UPSTREAM_SYNC.md).
+
+## Upstream Mesh LLM
+
 <p align="center">
   <img src="docs/mesh-llm-wordmark.png" alt="Mesh LLM" width="420">
 </p>
